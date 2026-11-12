@@ -96,6 +96,22 @@ pub(super) struct WorkflowGuard {
     capacity_exhausted: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
+    acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
+    acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
+}
+
+enum AcceptanceAuthority {
+    Unbound,
+    RecoveryOnly,
+    Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
+}
+
+fn source_from_workflow(id:&str)->Option<crate::autoship_contract::AcceptanceSource> {
+    use crate::autoship_contract::AcceptanceSource;
+    if let Some((_,number))=id.rsplit_once('#') {
+        return number.parse::<u64>().ok().filter(|n|*n>0).map(AcceptanceSource::Issue);
+    }
+    id.rsplit_once("/pr/").and_then(|(_,number)|number.parse::<u64>().ok()).filter(|n|*n>0).map(AcceptanceSource::PullRequest)
 }
 
 /// A run-local view of durable admissions. It survives guard consumption on
@@ -469,6 +485,8 @@ impl SweepGuard {
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_source:source_from_workflow(&id),
             released: false,
         };
         inner.install_model_accounting()?;
@@ -751,6 +769,8 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_source:source_from_workflow(&id),
         };
         guard.install_model_accounting()?;
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
@@ -838,10 +858,29 @@ impl WorkflowGuard {
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
+        let acceptance_authority=self.acceptance_authority.clone();let worktree=self.worktree.clone();
         self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
-            anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
+            anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
+            acceptance::require_retained_native_custody(&worktree,&custody)?;
+            if !augmentagent_channel_core::native_session::is_fresh_review() {
+                let state=store.snapshot(&lease.workflow)?.context("workflow missing")?;
+                let authority=acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?;
+                match &*authority {
+                    AcceptanceAuthority::Qualified {prepared,control}=> {
+                        acceptance::require_qualified_baseline(&worktree,control,prepared)?;
+                        if state.checkpoint.binding.contract.starts_with("registered:") {
+                            anyhow::ensure!(state.checkpoint.binding.contract==format!("registered:{}",prepared.baseline.registration.contract_hash()),"builder qualification belongs to another registered contract");
+                        }
+                    },
+                    AcceptanceAuthority::RecoveryOnly=>anyhow::bail!("baseline_witness_unqualified: recovery metadata cannot authorize a builder"),
+                    AcceptanceAuthority::Unbound if state.checkpoint.binding.contract.starts_with("registered:") || matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review)=>anyhow::bail!("baseline_witness_unqualified: builder admission requires protected original-production qualification"),
+                    AcceptanceAuthority::Unbound=>{},
+                }
+            }
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let bounded=BOUNDED_NATIVE_CALL.try_with(Clone::clone).ok();
             if let Some(bounded)=&bounded {
@@ -896,6 +935,8 @@ impl WorkflowGuard {
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_source:None,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
@@ -1034,8 +1075,26 @@ impl WorkflowGuard {
     pub(super) fn bind_acceptance(
         &mut self,
         prepared: &acceptance::PreparedAcceptance,
+        control:&Path,
     ) -> Result<()> {
+        self.validate_acceptance_source(prepared)?;
+        acceptance::require_qualified_baseline(&self.worktree,control,prepared)?;
+        self.bind_acceptance_identity(prepared)?;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Qualified {prepared:prepared.clone(),control:control.canonicalize()?};
+        Ok(())
+    }
+
+    /// This metadata is needed by independent repair of an invalid legacy
+    /// verifier. It deliberately grants no builder/verification/merge proof.
+    pub(super) fn bind_acceptance_for_recovery(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        self.bind_acceptance_identity(prepared)?;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        Ok(())
+    }
+
+    fn bind_acceptance_identity(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
         self.healthy_lease()?;
+        self.validate_acceptance_source(prepared)?;
         self.contract = format!(
             "registered:{}",
             prepared.baseline.registration.contract_hash()
@@ -1045,6 +1104,11 @@ impl WorkflowGuard {
             .registration
             .binding(prepared.baseline.registration.baseline_head())?
             .environment_id;
+        Ok(())
+    }
+
+    pub(super) fn validate_acceptance_source(&self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        anyhow::ensure!(self.acceptance_source==Some(prepared.proposal.contract.source()?),"baseline qualification belongs to a different issue or PR");
         Ok(())
     }
 
@@ -1924,6 +1988,22 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn baseline_source_uses_the_resolved_workflow_not_a_pr_alias() {
+        use crate::autoship_contract::AcceptanceSource;
+        assert_eq!(source_from_workflow("owner/repo#2014"),Some(AcceptanceSource::Issue(2014)));
+        assert_eq!(source_from_workflow("owner/repo/pr/2027"),Some(AcceptanceSource::PullRequest(2027)));
+        assert_eq!(source_from_workflow("autoship-observation/probe"),None);
+        assert_eq!(source_from_workflow("owner/repo#0"),None);
+    }
+    async fn scripted_independent_admission(guard:&WorkflowGuard) {
+        use augmentagent_channel_core::{native_session,ProviderKind};
+        native_session::fresh_review_scope(ProviderKind::Codex,async {
+            let session=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut native=session.begin(ProviderKind::Codex)?;
+            guard.audit_logger().model_call_admitted("codex")?;native.observe("scripted-independent-accounting-fixture")?;native.finish()?;
+            Ok::<_,anyhow::Error>(())
+        }).await.unwrap();
+    }
     fn control_dir() -> tempfile::TempDir {
         // Managed Cargo puts TMPDIR inside the writable build cache. Control
         // evidence must live outside every worker write root even in fixtures.
@@ -3084,18 +3164,19 @@ mod tests {
     async fn ci_gate_consumption_defers_revisions_before_repair_and_preserves_paid_accounting() {
         for stage in [Stage::Build, Stage::Review, Stage::Reconcile] {
             for (infrastructure, already_paid) in [(true, false), (true, true), (false, false)] {
-                let dir = repo();
-                let state = control_dir();
+                let (dir,state,prepared)=acceptance::qualification_fixture();
+                acceptance::qualify_fixture(dir.path(),state.path(),&prepared).unwrap();
                 let path = state.path().join("workflow.db");
                 let mut guard = WorkflowGuard::acquire_at(&path, Start {
                     repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
-                    source_issue: Some(77), pr: Some(88), branch: "fixture", contract: "C1",
+                    source_issue: None, pr: Some(840), branch: "fixture", contract: "C1",
                     environment: "rust-a",
                 }, millis()).await.unwrap().unwrap();
+                guard.bind_acceptance(&prepared,state.path()).unwrap();
                 guard.checkpoint(stage, "candidate_ready", "run_verifier", 0,
                     &["protected-receipt".into()]).await.unwrap();
                 let accounting = guard.capacity_accounting(true).unwrap();
-                if already_paid { guard.audit_logger().model_call_admitted("codex").unwrap(); }
+                if already_paid { scripted_independent_admission(&guard).await; }
                 let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
                 let allowance = WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap();
                 let mut repairs = 0;
@@ -3181,7 +3262,7 @@ mod tests {
         let paid_run = guard.capacity_accounting(false).unwrap();
         // Deterministic observer fixture: one protected admission in this run,
         // then a resumed run sees that admission only as historical spend.
-        guard.audit_logger().model_call_admitted("codex").unwrap();
+        scripted_independent_admission(&guard).await;
         let subsequent_run = guard.capacity_accounting(true).unwrap();
         let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         guard.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"completed","exhausted":true,"memory_events":{"oom_kill":1}})).unwrap();

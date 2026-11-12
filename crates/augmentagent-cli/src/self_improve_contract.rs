@@ -17,9 +17,12 @@ mod amendment;
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
 mod initial_repair;
+#[path = "self_improve_baseline_witness.rs"]
+mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
+pub(super) use scope_authority::require_retained_native_custody;
 #[path = "self_improve_readiness.rs"]
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
@@ -996,6 +999,50 @@ pub(super) struct PreparedAcceptance {
     pub baseline: BaselineEvidence,
 }
 
+pub(super) fn require_qualified_baseline(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    baseline_witness::assert_current(root,control,prepared)
+}
+
+async fn qualify_original_baseline(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
+    if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    let directory=tempfile::Builder::new().prefix("witness-baseline-").tempdir_in(control)?;
+    let baseline=directory.path().join("checkout");let path=baseline.to_str().context("original baseline checkout UTF8")?;
+    trusted_git(root,&["worktree","add","--detach",path,prepared.baseline.registration.baseline_head()]).await?;
+    let result=async {
+        install_harness(&baseline,&prepared.proposal)?;
+        baseline_witness::qualify(&baseline,control,prepared,workflow).await
+    }.await;
+    let cleanup=trusted_git(root,&["worktree","remove","--force",path]).await;
+    if result.is_ok() {cleanup.context("remove original witness checkout")?;}
+    result
+}
+
+/// Reconcile existing enrolled artifacts before admitting another builder.
+/// Valid old measurements gain a separate qualification receipt; an invalid
+/// verifier requires the existing independent, versioned amendment authority.
+pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:AcceptanceSource,title:&str,root:&Path,control:&Path,prepared:&mut PreparedAcceptance,workflow:&mut workflow::WorkflowGuard)->Result<()> {
+    workflow.validate_acceptance_source(prepared)?;
+    ensure!(prepared.proposal.contract.source()?==source,"witness repair source differs from original contract");
+    if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    let legacy=prepared.proposal.contract.verifiers.iter().any(|v|!v.command.controller_asserted());
+    let checked=if legacy {Err(anyhow::anyhow!("legacy in-process verifier requires independent behavioral-oracle migration"))}else {
+        qualify_original_baseline(root,control,prepared,workflow).await
+    };
+    match checked {
+        Ok(())=>Ok(()),
+        Err(error)=> {
+            if error.downcast_ref::<initial_repair::Hold>().is_some() {return Err(error);}
+            let failure=format!("{error:#}");
+            if !(legacy || failure.contains("baseline_witness_invalid")) {return Err(error);}
+            recovery::commit_candidate_named(root,&format!("fix: preserve candidate before original witness repair ({source})")).await?;
+            match amendment::try_amend(reasoner,source,title,root,prepared,control,workflow,&failure,false,None).await? {
+                Some(next)=>{*prepared=next;qualify_original_baseline(root,control,prepared,workflow).await},
+                None=>Err(error.context(initial_repair::Hold::Exhausted)),
+            }
+        }
+    }
+}
+
 async fn trusted_git(root: &Path, args: &[&str]) -> Result<String> {
     let result = Command::new("/usr/bin/git")
         .args(["-c", "core.hooksPath=/dev/null"])
@@ -1213,14 +1260,14 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     Ok(Some(RunReport::held(hold.to_string())))
 }
 
-async fn initial_baseline_candidates(root:&Path,source:AcceptanceSource,base:&str,scope:&str,
+async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
     required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<(ContractProposal,BaselineEvidence)> {
     // This private call owns a newly detached original-baseline checkout.
     trusted_git(root,&["reset","--hard",base]).await?;
     trusted_git(root,&["clean","-fdx"]).await?;
     let environment=environment_id(root)?;
     let epoch=amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow.id(),
-        &workflow.binding().contract,source,base,&environment,scope,required_criteria))?);
+        &workflow.binding().contract,source,base,&environment,scope,required_criteria,baseline_witness::policy_hash()))?);
     let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,
@@ -1252,8 +1299,45 @@ async fn initial_baseline_candidates(root:&Path,source:AcceptanceSource,base:&st
             workflow.check_resource_policy()?;
             trusted_git(root,&["reset","--hard",base]).await?;
             trusted_git(root,&["clean","-fdx"]).await?;
-            register_and_reproduce(root,proposal,&workflow.audit_logger()).await
+            let baseline=retain_initial_measurement(root,control,&proposal,workflow,
+                register_and_reproduce(root,proposal.clone(),&workflow.audit_logger())).await?;
+            let prepared=PreparedAcceptance {proposal,baseline:baseline.clone()};
+            baseline_witness::qualify(root,control,&prepared,workflow).await?;
+            Ok(baseline)
         }).await
+}
+
+/// Retain the actual successful measurement before any qualification model is
+/// admitted. Re-executing after a restart can change stderr/timing digests and
+/// must not turn one original observation into a new paid qualification input.
+async fn retain_initial_measurement<F>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
+where F:std::future::Future<Output=Result<BaselineEvidence>> {
+    let base=actual_head(root).await?;let environment=environment_id(root)?;
+    let execution=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?);
+    let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?);
+    let path=|hash:&str|control.join(format!("baseline-measurement-{key}-{hash}.json"));
+    if let Some(hash)=workflow.scope_stage_response(&key).map_err(initial_scope_error)? {
+        return (||->Result<BaselineEvidence> {
+            ensure!(hash.len()==64 && hash.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid retained measurement identity");
+            let bytes=baseline_witness::private_bytes(&path(&hash),4*1024*1024)?;
+            ensure!(amendment::digest(&bytes)==hash,"original baseline measurement changed");
+            let baseline:BaselineEvidence=serde_json::from_slice(&bytes)?;
+            ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
+                && baseline.registration.binding(&base)?.environment_id==environment
+                && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"retained original measurement belongs to another input");
+            install_candidate_harness(root,&PreparedAcceptance {proposal:proposal.clone(),baseline:baseline.clone()})?;
+            Ok(baseline)
+        })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown));
+    }
+    let baseline=measure.await?;
+    ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
+        && baseline.registration.binding(&base)?.environment_id==environment
+        && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");
+    let bytes=serde_json::to_vec(&baseline)?;let hash=amendment::digest(&bytes);let file=path(&hash);
+    if file.try_exists()? {ensure!(baseline_witness::private_bytes(&file,4*1024*1024)?==bytes,"retained measurement file changed");}
+    else {persist_baseline(&file,&baseline,&worker_roots(root))?;}
+    workflow.record_scope_stage_response(&key,&hash)?;
+    Ok(baseline)
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current
@@ -1392,7 +1476,7 @@ pub(super) async fn prepare_acceptance_for(
         trusted_git(repo, &["worktree", "add", "--detach", checkout, base]).await?;
         // Legacy candidates may already contain a fix. Generate the independent
         // harness against the original trusted base checkout, never their head.
-        let result=initial_baseline_candidates(&baseline_root,source,base,scope,required_criteria,workflow).await;
+        let result=initial_baseline_candidates(&baseline_root,&control,source,base,scope,required_criteria,workflow).await;
         let cleanup = trusted_git(repo, &["worktree", "remove", "--force", checkout]).await;
         let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;
@@ -1524,8 +1608,14 @@ mod workflow_tests {
         assert_eq!(green.exit_code, Some(0), "{}", green.stderr);
         assert_eq!(green.stdout.trim(), "[true]", "the candidate fixture must actually execute unchanged production");
         let candidate = vec![registration.observe(root.path(), "observe", registration.binding(&head).unwrap(), &green).unwrap()];
-        assert!(!registration.candidate_passes(&baseline, &candidate, &registration.binding(&head).unwrap()).unwrap(),
-            "missing baseline tests and candidate-only markers certified red/green without any production change");
+        assert!(registration.candidate_passes(&baseline,&candidate,&registration.binding(&head).unwrap()).unwrap(),
+            "keep the raw counterexample: data comparison alone cannot establish production semantics");
+        let control=tempfile::tempdir_in("/tmp").unwrap();
+        let prepared=PreparedAcceptance {proposal,baseline:BaselineEvidence {registration,receipts:baseline}};
+        baseline_witness::persist_scripted(root.path(),control.path(),&prepared,false).unwrap();
+        let qualified=baseline_witness::candidate_passes(root.path(),control.path(),&prepared,&candidate,&prepared.baseline.registration.binding(&head).unwrap());
+        assert!(qualified.is_err(),"missing baseline tests and candidate-only markers certified red/green without any production change");
+        assert!(qualified.unwrap_err().downcast_ref::<BaselineNotRed>().is_some(),"the authoritative rejection must identify the invalid witness, not setup failure");
     }
 
     #[tokio::test]
@@ -1624,7 +1714,14 @@ mod workflow_tests {
         assert!(registration
             .candidate_passes(&baseline, &candidate, &registration.binding(&head).unwrap())
             .unwrap());
+        let control=tempfile::tempdir_in("/tmp").unwrap();
+        let qualified=PreparedAcceptance {proposal:proposal.clone(),baseline:BaselineEvidence {registration:registration.clone(),receipts:baseline.clone()}};
+        assert!(baseline_witness::assert_current(root.path(),control.path(),&qualified).is_err());
+        baseline_witness::persist_scripted(root.path(),control.path(),&qualified,true).unwrap();
+        assert!(!baseline_witness::candidate_passes(root.path(),control.path(),&qualified,&baseline,&registration.binding(&base).unwrap()).unwrap(),"qualification alone must not turn unchanged red production green");
+        assert!(baseline_witness::candidate_passes(root.path(),control.path(),&qualified,&candidate,&registration.binding(&head).unwrap()).unwrap(),"a qualified direct production observation must retain real RED/GREEN support");
         std::fs::write(root.path().join(path), "# removed assertions").unwrap();
+        assert!(baseline_witness::assert_current(root.path(),control.path(),&qualified).is_err(),"a current native judgment cannot approve a modified harness");
         assert!(registration.verify_integrity(root.path()).is_err());
         let prepared = PreparedAcceptance {
             proposal,
@@ -2359,7 +2456,7 @@ pub(super) async fn verify_with_repair_for(
         {
             Ok(Some(next)) => {
                 *prepared = next;
-                workflow.bind_acceptance(prepared)?;
+                workflow.bind_acceptance(prepared,control)?;
             }
             Ok(None) => {
                 workflow
@@ -2393,7 +2490,7 @@ pub(super) async fn verify_with_repair_for(
             let mut reference =
                 verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree), &workflow.audit_logger())
                     .await?;
-            workflow.bind_acceptance(prepared)?;
+            workflow.bind_acceptance(prepared,control)?;
             workflow
                 .checkpoint(
                     crate::autoship_workflow::Stage::Verify,
@@ -2418,7 +2515,7 @@ pub(super) async fn verify_with_repair_for(
         .await;
         match verified {
             Ok(reference) => {
-                workflow.bind_acceptance(prepared)?;
+                workflow.bind_acceptance(prepared,control)?;
                 workflow
                     .checkpoint(
                         crate::autoship_workflow::Stage::Verify,
@@ -2580,6 +2677,8 @@ pub(super) async fn assert_receipt_current(
     reference: &CandidateReceiptReference,
 ) -> Result<()> {
     assert_verifier_receipt_current(worktree, prepared, reference).await?;
+    let candidate:CandidateArtifact=private_json(&reference.artifact)?;
+    ensure!(baseline_witness::candidate_passes(worktree,reference.artifact.parent().context("candidate receipt lacks protected control directory")?,prepared,&candidate.receipts,&reference.binding)?,"qualified candidate did not satisfy the original behavioral contract");
     alignment::assert_current(
         worktree,
         prepared,
@@ -2887,6 +2986,12 @@ pub(super) fn historical_fixture(root:&Path, modern:&PreparedAcceptance)->Result
     }).collect();
     Ok(PreparedAcceptance{proposal,baseline:BaselineEvidence{registration,receipts}})
 }
+#[cfg(test)]
+pub(super) fn qualify_fixture(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    baseline_witness::persist_scripted(root,control,prepared,true)
+}
+#[cfg(test)]
+pub(super) fn qualification_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {baseline_witness::prepared_fixture()}
 #[cfg(test)]
 pub(super) async fn persist_historical_fixture_receipt(root:&Path, prepared:&PreparedAcceptance,control:&Path)->Result<CandidateReceiptReference> {
     let binding=prepared.baseline.registration.binding(&actual_head(root).await?)?;

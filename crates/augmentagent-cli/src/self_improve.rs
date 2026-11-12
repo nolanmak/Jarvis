@@ -6758,7 +6758,11 @@ async fn resume_draft_pr(
     for criterion in &prepared_acceptance.proposal.contract.criteria {
         if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
     }
-    workflow.bind_acceptance(&prepared_acceptance)?;
+    if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow).await {
+        if let Some(report)=acceptance::hold_initial_error(&mut workflow,&error).await? {return Ok(report);}
+        return Err(error);
+    }
+    workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
 
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
@@ -8275,7 +8279,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     for criterion in &prepared_acceptance.proposal.contract.criteria {
         if !criteria.contains(&criterion.requirement) { criteria.push(criterion.requirement.clone()); }
     }
-    workflow_guard.bind_acceptance(&prepared_acceptance)?;
+    if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow_guard).await {
+        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+        return Err(error);
+    }
+    workflow_guard.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.

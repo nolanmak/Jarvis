@@ -322,7 +322,11 @@ async fn execute(
             return Err(error);
         },
     };
-    guard.bind_acceptance(&prepared)?;
+    if let Err(error)=acceptance::qualify_or_amend(reasoner,source,&pr.title,worktree,&control,&mut prepared,guard).await {
+        if let Some(report)=acceptance::hold_initial_error(guard,&error).await? {return Ok(report);}
+        return Err(error);
+    }
+    guard.bind_acceptance(&prepared,&control)?;
     // Preserve interrupted edits before integrating either upstream. The pinned
     // verifier and full gate judge every recovered or conflict-resolution edit.
     recovery::commit_candidate_named(

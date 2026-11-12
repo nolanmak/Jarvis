@@ -195,7 +195,7 @@ pub(crate) async fn apply(
     match result {
         Ok(Some(next)) => {
             *prepared = next;
-            workflow.bind_acceptance(prepared)?;
+            workflow.bind_acceptance(prepared,control)?;
             workflow
                 .transition(
                     crate::autoship_workflow::Stage::Verify,

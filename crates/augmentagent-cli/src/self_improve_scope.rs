@@ -138,6 +138,26 @@ fn validate_native_custody(control:&Path,observations:&[crate::autoship_workflow
     Ok(())
 }
 
+/// Validate the physical evidence referenced by controller-owned custody rows
+/// at the existing actual model-admission boundary, including fresh reviewers.
+pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    (||->Result<()> {
+        for observation in observations {
+            let reference:NativeReplyReference=serde_json::from_str(&observation.provenance)?;
+            let directory=reference.artifact.parent().context("original native proof has no authority directory")?;
+            ensure!(directory.is_absolute() && directory.canonicalize()?==directory,"original native authority directory changed");
+            let metadata=directory.metadata()?;
+            ensure!(metadata.is_dir() && metadata.uid()==unsafe{libc::geteuid()} && metadata.mode()&0o022==0,"original native authority directory is writable by another user");
+            for writable in worker_roots(root) {
+                if writable.exists() {ensure!(!directory.starts_with(writable.canonicalize()?),"original native authority overlaps worker storage");}
+            }
+            validate_native_custody(directory,std::slice::from_ref(observation))?;
+        }
+        Ok(())
+    })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))
+}
+
 fn require_witness_custody(control:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
     (||->Result<()> {
         validate_native_custody(control,&workflow.baseline_native_custody()?)
@@ -165,6 +185,24 @@ fn source_allowed(path:&str)->bool {
             || matches!(part.as_str(),".credentials.json"|".npmrc"|".netrc"|".git-credentials"|"id_rsa"|"id_dsa"|"id_ecdsa"|"id_ed25519")
             || part.ends_with(".pem") || part.ends_with(".key")
     })
+}
+pub(super) fn witness_source_allowed(path:&str)->bool {source_allowed(path)}
+
+pub(super) fn verify_witness_reply(control:&Path,base:&str,context:&str,reply:&NativeReply)->Result<()> {
+    verify_native_reply(control,base,CallPurpose::BaselineWitness,Some(context),reply).map(|_|())
+}
+
+#[cfg(test)]
+pub(super) fn scripted_witness_reply(control:&Path,base:&str,context:&str,raw:&str)->Result<NativeReply> {
+    use std::io::Write;
+    let proof=NativeReplyProvenance {version:1,head:base.into(),provider:"codex".into(),native_session:"scripted-baseline-witness-fixture".into(),
+        supplied_request_hash:amendment::digest(b"scripted measurement qualification"),response_hash:amendment::digest(raw.as_bytes()),purpose:Some(CallPurpose::BaselineWitness),
+        scope_context_hash:Some(context.into()),native_input_hash:Some(amendment::digest(b"scripted native admission")),
+        scope_request_hash:Some(amendment::digest(b"scripted measurement qualification")),scope_policy_hash:Some(witness_policy_hash())};
+    let bytes=serde_json::to_vec(&proof)?;let mut file=tempfile::NamedTempFile::new_in(control)?;
+    file.write_all(&bytes)?;file.as_file().sync_all()?;
+    let artifact=control.join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));file.persist_noclobber(&artifact).map_err(|e|e.error)?;
+    Ok(NativeReply {text:raw.into(),provenance:NativeReplyReference {artifact,artifact_sha256:amendment::digest(&bytes)}})
 }
 fn source_entry_allowed(metadata:&str,path:&str)->bool {
     metadata.split_whitespace().nth(1)==Some("blob") && source_allowed(path)
@@ -595,7 +633,7 @@ pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,p
 /// changes. Such a hold requires original-outcome recovery, not a fresh call.
 /// `epoch` must bind the original requirements/source/observations and
 /// `witness_policy_hash()`. Changed policy is a new qualification input.
-pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::WorkflowGuard,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<(T,NativeReplyReference)> {
+pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::WorkflowGuard,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<(T,NativeReply)> {
     ensure!(epoch.len()==64 && epoch.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid baseline-witness input identity");
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance.canonicalize()?;
     require_witness_custody(&control,workflow)?;
@@ -624,7 +662,7 @@ pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::Workflo
         },validate).await
 }
 
-async fn recoverable_native_witness<T,R,W,G,F,V>(control:&Path,head:&str,context:Option<&str>,prompt:&str,read:R,write:W,mut generate:G,validate:V)->Result<(T,NativeReplyReference)>
+async fn recoverable_native_witness<T,R,W,G,F,V>(control:&Path,head:&str,context:Option<&str>,prompt:&str,read:R,write:W,mut generate:G,validate:V)->Result<(T,NativeReply)>
 where R:Fn(u32)->Result<Option<(String,String)>>,W:Fn(u32,&str,&str)->Result<()>,
     G:FnMut(String)->F,F:std::future::Future<Output=Result<NativeReply>>,V:Fn(&str)->Result<T> {
     let reference=std::sync::Mutex::new(None::<NativeReplyReference>);
@@ -661,7 +699,7 @@ where R:Fn(u32)->Result<Option<(String,String)>>,W:Fn(u32,&str,&str)->Result<()>
                 Ok(reply.text)
             }
         },
-        |text|Ok((validate(text)?,current()?))).await
+        |text|Ok((validate(text)?,NativeReply {text:text.into(),provenance:current()?}))).await
 }
 
 fn correction_prompt(prompt:&str,error:&str,previous:&str)->String {
@@ -690,7 +728,11 @@ where R:Fn(u32,&str)->Result<Option<String>>,W:Fn(u32,&str,&str)->Result<()>,G:F
         let raw=if let Some(raw)=read(attempt,&request)? {raw} else {
             let raw=generate(request.clone()).await?;write(attempt,&request,&raw)?;raw
         };
-        match validate(&raw) {Ok(value)=>return Ok(value),Err(problem)=>{error=format!("{problem:#}");previous=raw;}}
+        match validate(&raw) {
+            Ok(value)=>return Ok(value),
+            Err(problem) if problem.downcast_ref::<initial_repair::Hold>().is_some()=>return Err(problem),
+            Err(problem)=>{error=format!("{problem:#}");previous=raw;}
+        }
     }
     Err(CompletedInvalid(error).into())
 }
@@ -768,6 +810,13 @@ mod native_reply_tests {
         assert_eq!(recovered.unwrap().text,"7");
         assert!(run_native_scope_at(repo.path(),control.path(),&guard,"A different scoping request",ResponseFormat::BaselineWitness,Some(&context),&[]).await.is_err(),"a different request reused the old judgment");
         assert!(run_native_scope_at(repo.path(),control.path(),&guard,prompt,ResponseFormat::BaselineWitness,Some(&"e".repeat(64)),&[]).await.is_err(),"a different context reused the old judgment");
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,1);
+        std::fs::remove_file(&completed.provenance.artifact).unwrap();
+        let admission=guard.bounded_native_calls("independent-repair-after-recovery".into(),1,
+            native_session::fresh_review_scope(ProviderKind::Codex,async {
+                guard.audit_logger().model_call_admitted("codex")
+            })).await;
+        assert!(admission.is_err(),"fresh independent repair spent another call after original native proof disappeared");
         assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,1);
         guard.finish().unwrap();
     }
@@ -950,7 +999,7 @@ mod native_reply_tests {
             |_|std::future::ready(Err(anyhow::anyhow!("cached native response triggered generation"))),
             |raw|Ok(serde_json::from_str::<u64>(raw)?)).await.unwrap();
         assert_eq!(replay.0,7);
-        assert_eq!(replay.1.artifact_sha256,result.1.artifact_sha256);
+        assert_eq!(replay.1.provenance.artifact_sha256,result.1.provenance.artifact_sha256);
     }
 
     #[tokio::test]
