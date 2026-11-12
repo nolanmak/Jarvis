@@ -34,9 +34,16 @@ hold, distinct from budget exhaustion. Its immutable decision and all charges
 survive. During candidate verification against an already-qualified verifier,
 a declined amendment or spent amendment budget leaves the unchanged contract
 in force and continues existing bounded implementation repair or infrastructure
-classification. It grants no extra implementation attempt. Original-baseline
+classification. Amendment work deliberately changes builder authority to
+RecoveryOnly. Before an unchanged-contract implementation continuation, invoke
+the existing bind_acceptance with the protected positive witness, then enter
+Build; recovery metadata alone cannot authorize a builder. Missing/negative
+qualification remains a durable hold. It grants no extra implementation attempt. Original-baseline
 qualification, legacy migration and the final spent-implementation-budget path
-keep their restrictive holds. Ineligible/no-op
+keep their restrictive holds. Persist enrolled typed holds before propagating
+an error, preserve the original private cause for custody classification and
+diagnostics, and return only the fixed safe hold. Legacy/adjudicated generic
+retry writers must not overwrite those holds. Ineligible/no-op
 results do not masquerade as a spent budget.
 
 D4. Recover an already-declined legacy handoff only through the existing unpaid
@@ -145,3 +152,26 @@ handling and the existing environment-bound budget. Prior 1,982-test validation
 covers the earlier head. Corrected full CLI validation passed 1,984 tests, zero
 failures, 39 explicit ignores, in 288.06 seconds. Exact-head hosted checks and
 independent re-review remain pending; no merge or rollout is claimed.
+
+## Complete caller handling after independent source review
+
+The full-diff review found two additional caller-state defects before merge:
+final-budget error propagation could leave a runnable amendment checkpoint, and
+an unchanged-contract continuation retained RecoveryOnly authority so the actual
+builder admission failed. Both failures were reproduced first. The stateful
+regressions now exercise all five typed hold classes, nonzero prior charges,
+unchanged claims after restart/day change, fixed public errors, and the real
+model-admission observer with positive versus negative qualification. Scripted
+admissions in disposable fixtures are not live provider calls or ship evidence.
+
+| Caller | Outcome handling |
+| --- | --- |
+| Original qualification | Existing qualification handler persists the enrolled hold and private diagnostic before returning its safe report. |
+| Legacy migration | Persist typed holds and return before generic migration retry handling. |
+| Early candidate amendment | Consume only Declined/Exhausted as unchanged contract; persist remaining typed errors. Revalidate positive qualification before any bounded builder continuation. |
+| Final spent implementation budget | Persist every typed hold before propagation; no implementation attempt is added. |
+| Adjudicated contract | Persist typed custody/input holds before generic retry handling. Existing untyped adjudicated denial and epoch-budget dependency classification remain unchanged. |
+
+These handlers share the original private diagnostic persistence function rather
+than creating another ledger or authority. Corrected caller tests pass; the new
+complete CLI run and final source re-review are pending at this checkpoint.

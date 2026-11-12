@@ -1478,7 +1478,9 @@ pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,er
     workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),false,Some(plan)).await
 }
 
-pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+/// One private persistence path for enrolled qualification/repair failures.
+/// Inspect the original cause before returning any public-safe typed error.
+async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error)->Result<Option<initial_repair::Hold>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
     let diagnostic=format!("{error:#}");
@@ -1486,6 +1488,11 @@ pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGua
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
     workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
         .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
+    Ok(Some(hold))
+}
+
+pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+    let Some(hold)=persist_enrolled_acceptance_error(workflow,prepared,error).await? else{return Ok(None)};
     Ok(Some(accounting.retry_report(hold.to_string())?))
 }
 
@@ -2778,14 +2785,30 @@ print('[]')
     }
 }
 
-async fn enter_implementation_repair(workflow:&mut workflow::WorkflowGuard,_prepared:&PreparedAcceptance,_control:&Path)->Result<()> {
+async fn enter_implementation_repair(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,control:&Path)->Result<()> {
+    // Independent amendment work deliberately revokes builder authority. An
+    // unchanged-contract continuation must re-earn it from the positive witness.
+    if let Err(error)=workflow.bind_acceptance(prepared,control) {
+        let error=if error.downcast_ref::<initial_repair::Hold>().is_some() {error}
+            else if error.is::<BaselineNotRed>() {error.context(initial_repair::Hold::ContractInvalid)}
+            else {error.context(initial_repair::Hold::EvidenceUnknown)};
+        let hold=persist_enrolled_acceptance_error(workflow,prepared,&error).await?.context("qualified repair hold missing")?;
+        return Err(hold.into());
+    }
     workflow.transition(crate::autoship_workflow::Stage::Build,"acceptance_failed","repair_implementation",0).await
 }
 
 /// Restrictive amendment callers must durably retain typed holds before
 /// returning through outer verification accounting.
-async fn restrictive_amendment_result(_workflow:&mut workflow::WorkflowGuard,_prepared:&PreparedAcceptance,
-    result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {result}
+async fn restrictive_amendment_result(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,
+    result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {
+    if let Err(error)=&result {
+        if let Some(hold)=persist_enrolled_acceptance_error(workflow,prepared,error).await? {
+            return Err(hold.into());
+        }
+    }
+    result
+}
 
 #[cfg(test)]
 mod restrictive_amendment_outcome_tests {
@@ -2824,7 +2847,8 @@ mod restrictive_amendment_outcome_tests {
     #[tokio::test]
     async fn final_amendment_refusal_persists_input_hold_and_fences_unchanged_reclaims() {
         use crate::autoship_workflow::{WorkflowStore,ResourceCharge,Stage};
-        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted] {
+        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted,initial_repair::Hold::EvidenceUnknown,
+            initial_repair::Hold::InfrastructureUnavailable,initial_repair::Hold::ContractInvalid] {
             let (root,control,prepared)=baseline_witness::prepared_fixture();let path=control.path().join("workflow.db");
             let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
                 branch:"fixture",contract:"original complete owner request",environment:"frontend environment"};
@@ -2840,7 +2864,8 @@ mod restrictive_amendment_outcome_tests {
                 else {(Stage::Verify,"candidate_failed","verify_candidate")};
             guard.checkpoint(stage,reason,action,0,&evidence).await.unwrap();
             let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
-            let failure=restrictive_amendment_result(&mut guard,&prepared,Err(anyhow::Error::from(hold))).await.unwrap_err();
+            let failure=restrictive_amendment_result(&mut guard,&prepared,Err(anyhow::Error::from(hold).context("PRIVATE_AMENDMENT_CAUSE"))).await.unwrap_err();
+            assert_eq!(format!("{failure:#}"),hold.to_string(),"private amendment cause escaped typed propagation");
             assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&hold));
             let held=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
             assert_eq!(held.checkpoint.stage,Stage::Scope);
@@ -2952,6 +2977,7 @@ pub(super) async fn verify_with_repair_for(
                     .await?;
                 bail!("legacy verifier migration requires a valid independently red behavioral oracle");
             }
+            Err(error) if error.downcast_ref::<initial_repair::Hold>().is_some()=>return Err(error),
             Err(error) => {
                 if linked_claims::report(&error).is_some() {return Err(error);}
                 workflow
@@ -3028,11 +3054,12 @@ pub(super) async fn verify_with_repair_for(
                 };
                 let detail = format!("{error:#}");
                 if round < 2 && !scope_rejected {
-                    if let Some(amended) = candidate_amendment_result(amendment::try_amend(
+                    let amendment_result=amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
                         false, None,
-                    ).await)?
-                    {
+                    ).await;
+                    let amendment_result=candidate_amendment_result(amendment_result);
+                    if let Some(amended) = restrictive_amendment_result(workflow,prepared,amendment_result).await? {
                         *prepared = amended;
                         continue;
                     }

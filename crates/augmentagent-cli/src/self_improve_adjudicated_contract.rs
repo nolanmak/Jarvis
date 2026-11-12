@@ -208,6 +208,9 @@ pub(crate) async fn apply(
         }
         Ok(None) => bail!("adjudicated amendment produced no executable revision"),
         Err(error) => {
+            if let Some(hold)=persist_enrolled_acceptance_error(workflow,prepared,&error).await? {
+                return Err(hold.into());
+            }
             let detail = format!("{error:#}");
             let (outcome, action) = if detail.contains("protected repository controls") {
                 ("immutable_authorization_conflict","dependency_owner_requirement_decision")
