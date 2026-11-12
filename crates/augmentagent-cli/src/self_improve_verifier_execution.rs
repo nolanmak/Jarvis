@@ -197,18 +197,23 @@ impl<'a> OriginalExecution<'a> {
     }
 
     fn require_result_commands(workflow:&workflow::WorkflowGuard,plan:&str,attempt:&str,baseline:&BaselineEvidence,sources:&BTreeMap<String,String>)->Result<()> {
+        Self::require_result_commands_read(workflow.id(),|key,kind|workflow.verifier_evidence(key,kind),plan,attempt,baseline,sources)
+    }
+
+    fn require_result_commands_read<F>(workflow:&str,mut read:F,plan:&str,attempt:&str,baseline:&BaselineEvidence,sources:&BTreeMap<String,String>)->Result<()>
+    where F:FnMut(&str,&str)->Result<Option<String>> {
         ensure!(sources.keys().all(|id|baseline.receipts.iter().any(|receipt|&receipt.verifier_id==id)),"result references an unrelated original verifier");
         for receipt in &baseline.receipts {
             let source=sources.get(&receipt.verifier_id).map_or(attempt,String::as_str);
             if source!=attempt {ensure!(source.len()==64 && source.bytes().all(|byte|byte.is_ascii_hexdigit()),"invalid original command attempt reference");}
             let key=command_key(plan,source,&receipt.verifier_id);
-            let raw=workflow.verifier_evidence(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
+            let raw=read(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
             let admitted:Admission=serde_json::from_str(&raw)?;
-            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow.id()
+            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow
                 && admitted.plan==plan && admitted.attempt==source && admitted.verifier==receipt.verifier_id,"result belongs to another command");
-            let raw_proof=workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
+            let raw_proof=read(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
             let proof:Quiescence=serde_json::from_str(&raw_proof)?;
-            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow.id()
+            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow
                 && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
                 && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"result lacks matching kernel quiescence");
             if source!=attempt {
@@ -340,9 +345,35 @@ impl<'a> OriginalExecution<'a> {
 }
 
 /// Read original data without claiming, replaying, installing or remeasuring.
-pub(super) fn retained_original_prepared(_root:&Path,_source:AcceptanceSource,
-    _binding:&crate::autoship_workflow::Binding,_evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
-    ->Result<Vec<PreparedAcceptance>> {Ok(Vec::new())}
+pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Vec<PreparedAcceptance>> {
+    let mut cursor=0;let mut prepared=Vec::new();
+    loop {
+        let rows=evidence.page("original_verifier_result",cursor)?;
+        if rows.is_empty() {break;}
+        for row in rows {
+            cursor=row.sequence;
+            let result:RecordedResult=serde_json::from_str(&row.body)?;
+            ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==evidence.workflow()
+                && result_key(&result.plan,&result.attempt)==row.key,"retained original result identity changed");
+            let body=evidence.record(&result.plan,"original_verifier_plan")?.context("retained original result lost its plan")?;
+            ensure!(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan identity changed");
+            let plan:Plan=serde_json::from_str(&body)?;
+            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty(),"retained original plan owner or role changed");
+            if plan.binding!=*binding || plan.proposal.contract.source()?!=source {continue;}
+            let registration=&result.baseline.registration;
+            ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
+                && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
+            registration.verify_source_files(root,&plan.proposal.files)?;
+            OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
+                &result.plan,&result.attempt,&result.baseline,&result.command_sources)?;
+            if registration.baseline_result(&result.baseline.receipts)?!=BaselineResult::Reproduced {continue;}
+            prepared.push(PreparedAcceptance {proposal:plan.proposal,baseline:result.baseline});
+        }
+    }
+    Ok(prepared)
+}
 
 /// Execute only the protected original recipe. Qualification and correction
 /// remain ordinary paid pipeline work after this inspection lease is released.
