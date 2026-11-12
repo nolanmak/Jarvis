@@ -278,6 +278,22 @@ mod tests {
     }
 
     #[test]
+    fn automatic_owner_resume_rechecks_uncertain_operation_in_productive_claim_transaction() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,id)=automatic_resume_fixture(&path);
+        assert_eq!(store.reserve_owner_resume_turn("owner/repo",1000).unwrap(),Some(id.clone()));
+        let observer=store.claim(&id,"free-observer",1000,100).unwrap().unwrap();
+        store.begin_operation(&observer,OperationKind::Push,&binding(),1000).unwrap();
+        store.release(&observer,1000).unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();
+        assert!(store.claim_productive(&id,"resumed-worker",1001,100).unwrap().is_none(),"operation appearing after selection bypassed atomic owner-resume admission");
+        assert!(pending_resume(&store.conn,&id).unwrap().is_some(),"refused claim consumed accepted owner intent");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);
+        assert_eq!(before.model_calls,3);
+        assert_eq!(store.pending_operations(&id).unwrap().len(),1);
+    }
+
+    #[test]
     fn automatic_owner_resume_survives_restart_and_is_consumed_only_by_productive_claim() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
         let (mut store,id)=automatic_resume_fixture(&path);
