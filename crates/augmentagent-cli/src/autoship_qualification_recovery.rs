@@ -84,6 +84,15 @@ impl WorkflowStore {
         Ok((cue.binding==*binding).then_some(cue))
     }
 
+    pub(crate) fn hold_semantic_source_unavailable(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {
+        let cue=self.semantic_reconsideration(&lease.workflow,binding)?.context("semantic source reference missing")?;
+        ensure!(cue.key==cue_key,"semantic source reference changed");
+        let mut checkpoint=self.snapshot(&lease.workflow)?.context("semantic workflow missing")?.checkpoint;
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
+        self.checkpoint_native_custody_hold(lease,&checkpoint,now,false)
+    }
+
     /// Queue consideration of authenticated negative source data. This grants
     /// neither a lease nor positive qualification and never creates a budget.
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
@@ -273,6 +282,91 @@ mod tests {
             if obstruction=="storage" {assert!(result.is_err());}else{assert!(!result.unwrap(),"{obstruction} bypassed recovery guard");}
             assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
             assert_eq!(store.events(&lease.workflow).unwrap(),events,"{obstruction} published a partial handoff");
+        }
+    }
+
+    fn queued_semantic_source()->(tempfile::TempDir,WorkflowStore,Lease,Checkpoint,SemanticReconsideration) {
+        let (dir,mut store,original,hold)=fixture();
+        for _ in 0..4 {assert!(store.admit_epoch_attempt(&original,"verifier-amend-total","original-epoch",4,4).unwrap());}
+        store.checkpoint_native_custody_hold(&original,&hold,5,false).unwrap();store.release(&original,6).unwrap();
+        let expected=store.snapshot(&original.workflow).unwrap().unwrap();
+        assert!(store.recover_semantic_qualification(&expected,None,&"b".repeat(64),7,|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        let lease=store.claim_productive(&original.workflow,"normal-repair",8,1000).unwrap().unwrap();
+        let cue=store.semantic_reconsideration(&lease.workflow,&hold.binding).unwrap().unwrap();
+        (dir,store,lease,hold,cue)
+    }
+
+    #[test]
+    fn semantic_source_loss_restores_the_same_episode_without_new_budget_or_reconsideration() {
+        let (dir,mut store,lease,hold,cue)=queued_semantic_source();
+        store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+        let events=store.events(&lease.workflow).unwrap();
+        store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+        assert_eq!(store.events(&lease.workflow).unwrap(),events,"duplicate missing source created another loss episode");
+        store.release(&lease,10).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let waiting=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(store.claim_productive(&lease.workflow,"unchanged retry",11,1000).unwrap().is_none());
+        for identity in [None,Some("d".repeat(64))] {
+            let events=store.events(&lease.workflow).unwrap();
+            assert!(!store.recover_semantic_qualification(&waiting,None,&"e".repeat(64),11,|_,_|Ok(identity)).unwrap());
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),waiting);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+        assert!(store.recover_semantic_qualification(&waiting,None,&"e".repeat(64),12,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"original source was restored but its consumed cue stranded recovery");
+        let restored=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((restored.generation,restored.attempts,restored.model_calls,restored.tokens,restored.wall_ms),(waiting.generation,waiting.attempts,waiting.model_calls,waiting.tokens,waiting.wall_ms));
+        assert_eq!(store.semantic_reconsideration(&lease.workflow,&hold.binding).unwrap().unwrap(),cue,"restoration replaced original policy/key");
+        let next=store.claim_productive(&lease.workflow,"continued repair",13,1000).unwrap().unwrap();
+        assert!(!store.admit_epoch_attempt(&next,"verifier-amend-total","original-epoch",4,13).unwrap());
+        store.hold_semantic_source_unavailable(&next,&hold.binding,&cue.key,14).unwrap();store.release(&next,15).unwrap();
+        let waiting=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(store.recover_semantic_qualification(&waiting,None,&cue.policy,16,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"a later real source loss could not restore the same episode");
+        let rejected=store.claim_productive(&lease.workflow,"actual independent result",17,1000).unwrap().unwrap();
+        store.checkpoint_native_custody_hold(&rejected,&hold,18,false).unwrap();store.release(&rejected,19).unwrap();
+        let rejected=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(!store.recover_semantic_qualification(&rejected,None,&cue.policy,20,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"old loss marker re-queued a completed independent rejection");
+        let events=store.events(&lease.workflow).unwrap();
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),2);
+    }
+
+    #[test]
+    fn semantic_source_loss_checkpoint_and_reference_are_atomic_and_lease_bound() {
+        for fault in ["key","binding","lease","storage"] {
+            let (_dir,mut store,lease,hold,cue)=queued_semantic_source();
+            if fault=="lease" {store.release(&lease,9).unwrap();}
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_source_loss BEFORE INSERT ON workflow_event WHEN NEW.kind='semantic_source_unavailable' BEGIN SELECT RAISE(ABORT,'source loss marker unavailable'); END;").unwrap();}
+            let mut binding=hold.binding.clone();if fault=="binding" {binding.head="wrong head".into();}
+            let key=if fault=="key" {"d".repeat(64)}else{cue.key};
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            assert!(store.hold_semantic_source_unavailable(&lease,&binding,&key,10).is_err(),"{fault} admitted a partial source hold");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+
+    #[test]
+    fn semantic_source_restoration_preserves_owner_and_uncertain_effect_guards() {
+        for fault in ["pause","revision","operation","inbox","lease","storage"] {
+            let (_dir,mut store,lease,hold,cue)=queued_semantic_source();
+            store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+            if fault=="operation" {store.begin_operation(&lease,OperationKind::Push,&hold.binding,10).unwrap();}
+            if fault!="lease" {store.release(&lease,10).unwrap();}
+            if fault=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,11).unwrap();}
+            if fault=="revision" {store.set_owner_pause(&lease.workflow,"github:owner",0,false,11).unwrap();}
+            if fault=="inbox" {
+                let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+                let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(7),provider:None,until:submission::Milestone::Merged};
+                store.submit_discord_authorized(&origin,&request,&"a".repeat(64),11).unwrap();
+                let origin=super::super::discord_ingress::DiscordOrigin {message:45,..origin};
+                assert!(store.enqueue_owner_message(&origin,&lease.workflow,"Owner message remains pending",None,11).unwrap().accepted);
+            }
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_source_restore BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_source_restored' BEGIN SELECT RAISE(ABORT,'source restoration unavailable'); END;").unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            let result=store.recover_semantic_qualification(&before,None,&cue.policy,12,|_,_|{
+                assert_eq!(fault,"storage","{fault} reached source inspection");Ok(Some(cue.judgment))
+            });
+            if fault=="storage" {assert!(result.is_err(),"restoration did not atomically record its source reference");}else{assert!(!result.unwrap());}
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
         }
     }
 
