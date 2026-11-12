@@ -433,3 +433,42 @@ admission never authorizes new execution; inspection results and wake hints
 supply no witness, review or merge approval. Full #1952 closure, #1917 host sizing,
 productive CLI/private Discord sessions and #1703 live/soak acceptance retain
 their separate scope and required evidence.
+
+## Semantic reconsideration (#2038, rollout incomplete)
+
+A completed, authenticated `measurement: unknown` is negative source data.
+It cannot qualify the baseline, but the existing independent authority may
+consider correcting its verifier definition. Missing physical evidence keeps
+its unpaid evidence-recovery hold. The distinction does not depend on parsing
+free-form reasons from the judgment.
+
+The semantic inspector authenticates the complete original proposal, measured
+baseline, native admission and private response provenance. An old policy
+context can identify negative source data; it cannot provide current positive
+qualification. A prepared manifest or a unique original-baseline orphan is
+read without rewriting files or installing an adapter.
+
+The store handoff compares the exact checkpoint, binding, generation, owner
+revision, lease, eligibility and unsettled effects in one transaction. Its
+one-use key combines workflow, authenticated judgment identity and current
+qualification policy. Generation changes and pause/resume do not renew that
+key. The transaction queues
+`reconcile / original_semantic_witness_recovered / reconsider_verifier` without
+claiming execution or changing attempts, model calls, charges or budgets.
+The existing normal selector consumes this wake hint; it grants no approval.
+
+Normal re-entry must preserve the registered execution context and admit only
+independent recovery until current positive qualification succeeds. Reuse the
+completed negative judgment rather than ask the witness the same question
+again. Existing amendment admission remains authoritative: its environment
+identity hashes runner, dependency, configuration and executable inputs, not
+classifier/controller Rust source. The separate raw-execution cache identity
+must not be mistaken for a new amendment-budget epoch.
+
+Release remains incomplete until the free controller, normal caller, retained
+unenrolled plan/result source, source-loss/restoration exits and transactional
+race/restart tests all connect. Source loss must not become a paid retry loop
+or permanently consume recovery with no supported restoration path. Required
+hosted checks, normal deployment and actual ordinary #2014 recovery remain
+necessary. Component tests and the read-only production compatibility probe
+are not autonomous shipping evidence.

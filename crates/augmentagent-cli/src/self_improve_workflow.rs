@@ -717,7 +717,8 @@ impl WorkflowGuard {
         let existing = store.snapshot(&id)?;
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
-                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered";
+                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered";
             if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let context=context.filter(|context|context.source_request==start.contract
@@ -793,7 +794,7 @@ impl WorkflowGuard {
             })?;
             store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         }
-        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || matches!(snapshot.checkpoint.next.reason.as_str(),"original_native_custody_recovered"|"original_semantic_witness_recovered") {
             AcceptanceAuthority::RecoveryOnly
         }else {AcceptanceAuthority::Unbound};
         let guard = Self {
@@ -2100,6 +2101,22 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn semantic_recovery_reuses_registered_context_without_builder_authority() {
+        let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+        let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        original.bind_acceptance_for_recovery(&prepared).unwrap();
+        original.checkpoint(Stage::Reconcile,"original_semantic_witness_recovered","reconsider_verifier",0,&[]).await.unwrap();
+        let binding=original.binding().clone();let workflow=original.id().to_owned();original.finish().unwrap();
+        let resumed=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(resumed.binding(),&binding,"semantic recovery lost its original registered binding");
+        assert!(matches!(*resumed.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"reconsideration entered with ordinary builder authority");
+        assert!(resumed.audit_logger().model_call_admitted("codex").is_err(),"negative qualification metadata admitted a builder");
+        let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        resumed.finish().unwrap();
+    }
+
     #[test]
     fn baseline_source_uses_the_resolved_workflow_not_a_pr_alias() {
         use crate::autoship_contract::AcceptanceSource;
