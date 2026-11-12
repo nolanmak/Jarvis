@@ -11,6 +11,7 @@ mod provider_migration_tests;
 mod model_tool;
 mod composio_auth_tool;
 mod calendar_rsvp;
+mod calendar_reschedule;
 mod voice_tool;
 mod phone_runtime;
 mod phone_attention;
@@ -1580,6 +1581,33 @@ enum CalendarOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post: bool,
     },
+    /// #2039 — move an event you organize to a new time. Previews by
+    /// default; `--post true` raises a Discord approval card, and the event
+    /// moves only when the operator clicks Approve. Keeps the current length
+    /// unless `--duration-min` is given. Refuses events you don't organize,
+    /// all-day events, and cancelled events. Moves one occurrence of a
+    /// recurring series, never the whole series.
+    Reschedule {
+        /// Event id from `calendar list-events --json true`
+        #[arg(long)]
+        event_id: String,
+        /// New RFC3339 start with offset, e.g. 2026-07-10T15:00:00-04:00
+        #[arg(long)]
+        start: String,
+        /// New length in minutes (5-480; default: keep the current length)
+        #[arg(long)]
+        duration_min: Option<i64>,
+        /// Account that organizes the event (default: whichever does)
+        #[arg(long)]
+        account: Option<String>,
+        /// Email guests the new time (Google's sendUpdates=all)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        notify: bool,
+        /// Post the Discord approval card. Without it this prints a
+        /// preview and exits — nothing is written anywhere.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
     /// #1224 — turn invite auto-accept on/off for one account, or for every
     /// account without its own setting when --account is absent.
     SetAutoAccept {
@@ -2984,7 +3012,7 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event/rsvp/reschedule, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events, social DMs and comments, and iMessage texts are raised as Discord approval cards and happen only when approved.
     Ask {
@@ -5324,6 +5352,25 @@ async fn main() -> Result<()> {
                 series,
                 post,
             } => calendar_rsvp::run_rsvp(store, event_id, response, account, series, post).await,
+            CalendarOp::Reschedule {
+                event_id,
+                start,
+                duration_min,
+                account,
+                notify,
+                post,
+            } => {
+                calendar_reschedule::run_reschedule(
+                    store,
+                    event_id,
+                    start,
+                    duration_min,
+                    account,
+                    notify,
+                    post,
+                )
+                .await
+            }
             CalendarOp::SetAutoAccept { on, account } => {
                 calendar_rsvp::run_set_auto_accept(store, on, account)
             }
@@ -6186,7 +6233,7 @@ async fn run_gmail_search(
     // healthy accounts' results always come through regardless.
     let mut total = 0usize;
     for account in &accounts {
-        match gmail.fetch_with_query(&account.entity_id, &query, limit).await {
+        match gmail.search_hits(&account.entity_id, &query, limit).await {
             Err(e) => {
                 // Also mirror to stderr so it shows up in logs, but stdout is
                 // what the user sees — never a silent skip.
@@ -6210,36 +6257,8 @@ async fn run_gmail_search(
                     account.email,
                     emails.len()
                 );
-                for (i, email) in emails.iter().enumerate() {
-                    // threadId is what compose --thread-id / send-now --thread-id
-                    // actually need; printing only messageId forced callers to
-                    // guess (#381).
-                    println!(
-                        "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
-                        i + 1,
-                        email.from,
-                        email.subject,
-                        email.date,
-                        email.message_id,
-                        email.thread_id.as_deref().unwrap_or("-")
-                    );
-                    // #629 — surface the full recipient set so reply-all /
-                    // compose callers can enumerate everyone on the chain
-                    // instead of only addresses that appear as senders.
-                    if !email.to.is_empty() {
-                        println!("     to: {}", email.to);
-                    }
-                    if !email.cc.is_empty() {
-                        println!("     cc: {}", email.cc);
-                    }
-                    // #811 — attachment metadata was invisible here, so an
-                    // attachment-only email looked like an empty message.
-                    if !email.attachments.is_empty() {
-                        println!("     attachments: {}", email.attachments.join(", "));
-                    }
-                    if full {
-                        println!("     body:\n{}\n", indent_body(&email.body, 7));
-                    }
+                for (i, hit) in emails.iter().enumerate() {
+                    print!("{}", format_gmail_search_hit(i + 1, hit, full));
                 }
                 println!();
             }
@@ -6249,6 +6268,91 @@ async fn run_gmail_search(
         println!("(no results across {} account(s))", accounts.len());
     }
     Ok(())
+}
+
+/// One `gmail search` result. #2040 — a saved draft reply rendered exactly
+/// like a sent one, so the first line now says UNSENT DRAFT and every hit
+/// lists its Gmail labels.
+fn format_gmail_search_hit(
+    n: usize,
+    hit: &augmentagent_channel_email::gmail::SearchHit,
+    full: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let email = &hit.email;
+    let mut out = String::new();
+    let status = if hit.is_draft() { "UNSENT DRAFT (never sent) — " } else { "" };
+    // threadId is what compose --thread-id / send-now --thread-id actually
+    // need; printing only messageId forced callers to guess (#381).
+    let _ = writeln!(
+        out,
+        "[{n:>2}] {status}from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
+        email.from,
+        email.subject,
+        email.date,
+        email.message_id,
+        email.thread_id.as_deref().unwrap_or("-")
+    );
+    if !hit.labels.is_empty() {
+        let _ = writeln!(out, "     labels: {}", hit.labels.join(", "));
+    }
+    // #629 — the full recipient set, so reply-all / compose callers can
+    // enumerate everyone on the chain, not only addresses seen as senders.
+    if !email.to.is_empty() {
+        let _ = writeln!(out, "     to: {}", email.to);
+    }
+    if !email.cc.is_empty() {
+        let _ = writeln!(out, "     cc: {}", email.cc);
+    }
+    // #811 — attachment metadata was invisible here, so an attachment-only
+    // email looked like an empty message.
+    if !email.attachments.is_empty() {
+        let _ = writeln!(out, "     attachments: {}", email.attachments.join(", "));
+    }
+    if full {
+        let _ = writeln!(out, "     body:\n{}\n", indent_body(&email.body, 7));
+    }
+    out
+}
+
+#[cfg(test)]
+mod gmail_search_hit_format_tests {
+    use super::format_gmail_search_hit;
+    use augmentagent_channel_email::gmail::SearchHit;
+    use augmentagent_store::Email;
+
+    fn hit(labels: &[&str]) -> SearchHit {
+        SearchHit {
+            email: Email {
+                message_id: "m1".into(),
+                thread_id: Some("t1".into()),
+                from: "Owner <owner@example.com>".into(),
+                to: "matt@example.com".into(),
+                cc: String::new(),
+                attachments: Vec::new(),
+                subject: "Re: CRM link".into(),
+                body: "reply".into(),
+                date: "2026-11-12T13:28:00Z".into(),
+                account_entity_id: None,
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            },
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_draft_reply_is_marked_unsent_and_a_sent_reply_is_not() {
+        let draft = format_gmail_search_hit(1, &hit(&["DRAFT"]), false);
+        assert!(draft.starts_with("[ 1] UNSENT DRAFT (never sent) — from: Owner"), "{draft}");
+        assert!(draft.contains("\n     labels: DRAFT\n"), "{draft}");
+
+        let sent = format_gmail_search_hit(1, &hit(&["SENT", "INBOX"]), false);
+        assert!(sent.starts_with("[ 1] from: Owner"), "{sent}");
+        assert!(!sent.contains("DRAFT"), "{sent}");
+        assert!(sent.contains("\n     labels: SENT, INBOX\n"), "{sent}");
+        assert!(sent.contains("     threadId: t1\n"), "{sent}");
+    }
 }
 
 #[cfg(test)]
@@ -14816,6 +14920,7 @@ impl ApprovalActionHandler for ReplyApprover {
             outcome,
             ApprovalActionOutcome::Approved
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
+                | ApprovalActionOutcome::CalendarRescheduled { already_there: false, .. }
                 | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
                 | ApprovalActionOutcome::ManualSendReady { .. }
@@ -14984,6 +15089,11 @@ impl ReplyApprover {
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
+        }
+        if action.email.platform == "gcal"
+            && action.email.kind == augmentagent_channel_calendar::RESCHEDULE_CARD_KIND
+        {
+            return self.approve_gcal_reschedule(action_id, action).await;
         }
         if action.email.platform == "gcal" && action.email.kind == calendar_rsvp::RSVP_CARD_KIND {
             return self.approve_gcal_rsvp(action_id, action).await;
