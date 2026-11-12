@@ -304,6 +304,55 @@ impl WorkflowStore {
         }tx.commit()?;Ok(())
     }
 
+    /// A protected response and its native provenance are one completed fact.
+    /// A half-pair is missing evidence, never permission for another model call.
+    pub fn scope_stage_response_pair(&mut self,lease:&Lease,binding:&Binding,key:&str,provenance_key:&str,now:i64)->Result<Option<(String,String)>> {
+        ensure!(key != provenance_key, "scope response and provenance keys must differ");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let mut values=Vec::new();
+        for current in [key,provenance_key] {
+            let value:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if value.is_none() {
+                let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND (NOT json_valid(payload) OR json_extract(payload,'$.key')=?2))",params![lease.workflow,current],|r|r.get(0))?;
+                if recorded {return Err(MissingScopeResponse.into());}
+            }
+            values.push(value);
+        }
+        let provenance=values.pop().unwrap();let response=values.pop().unwrap();
+        let result=match (response,provenance) {
+            (None,None)=>None,
+            (Some(response),Some(provenance))=>Some((response,provenance)),
+            _=>return Err(MissingScopeResponse.into()),
+        };
+        tx.commit()?;Ok(result)
+    }
+
+    pub fn record_scope_stage_response_pair(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,provenance_key:&str,provenance:&str,now:i64)->Result<()> {
+        ensure!(key != provenance_key && key.len()==64 && provenance_key.len()==64
+            && response.len()<=2*1024*1024 && provenance.len()<=2*1024*1024, "invalid bounded scope response pair");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let mut existing=Vec::new();
+        for current in [key,provenance_key] {
+            let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if prior.is_none() {
+                let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND (NOT json_valid(payload) OR json_extract(payload,'$.key')=?2))",params![lease.workflow,current],|r|r.get(0))?;
+                if recorded {return Err(MissingScopeResponse.into());}
+            }
+            existing.push(prior);
+        }
+        if existing[0].is_some() != existing[1].is_some() {return Err(MissingScopeResponse.into());}
+        for (current,value) in [(key,response),(provenance_key,provenance)] {
+            let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if let Some(prior)=prior {ensure!(prior==value,"scope response is immutable");} else {
+                tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,current,value])?;
+                event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":current}).to_string(),now)?;
+            }
+        }
+        tx.commit()?;Ok(())
+    }
+
     pub fn set_readiness_dependency(&mut self,lease:&Lease,binding:&Binding,repository:&str,issue:u64,record:Option<(&str,&str,&str,&str)>,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
@@ -2532,6 +2581,36 @@ mod tests {
         assert!(store.scope_stage_response(&lease,&binding(),&key,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
         assert!(store.scope_stage_response(&lease,&binding(),&unused,32).unwrap().is_none());
         assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|row|row.get::<_,u32>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn scope_response_pair_commits_atomically_and_survives_restart() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.conn.execute_batch(&format!("CREATE TRIGGER refuse_proof BEFORE INSERT ON scope_stage_response WHEN NEW.key='{proof}' BEGIN SELECT RAISE(ABORT,'synthetic proof write failure'); END;")).unwrap();
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",31).is_err());
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap().is_none(), "response escaped the failed proof transaction");
+        store.conn.execute_batch("DROP TRIGGER refuse_proof").unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",33).unwrap();
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"changed",&proof,"native proof",34).is_err());
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let next=store.claim(&lease.workflow,"next",1021,1000).unwrap().unwrap();
+        assert_eq!(store.scope_stage_response_pair(&next,&binding(),&raw,&proof,1022).unwrap(),Some(("response".into(),"native proof".into())));
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,1022).is_err(), "expired worker read protected qualification");
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|r|r.get::<_,i64>(0)).unwrap(),0, "transport custody created approval");
+    }
+
+    #[test]
+    fn scope_response_pair_missing_proof_cannot_be_recreated_or_rebilled() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",31).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        store.conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,proof]).unwrap();
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"replacement",33).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((before.model_calls,before.tokens,before.checkpoint),(after.model_calls,after.tokens,after.checkpoint));
     }
 
     #[test]

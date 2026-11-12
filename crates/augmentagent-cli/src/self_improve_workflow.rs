@@ -1369,6 +1369,18 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
     }
 
+    pub(super) fn scope_stage_response_pair(&self,key:&str,provenance_key:&str)->Result<Option<(String,String)>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .scope_stage_response_pair(&self.lease,&self.binding,key,provenance_key,millis())
+    }
+
+    pub(super) fn record_scope_stage_response_pair(&self,key:&str,response:&str,provenance_key:&str,provenance:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_scope_stage_response_pair(&self.lease,&self.binding,key,response,provenance_key,provenance,millis())
+    }
+
     pub(super) fn set_pr_readiness_dependency(&self,pr:u64,record:Option<(&str,&str,&str)>)->Result<()> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?.set_pr_readiness_dependency(&self.lease,&self.binding,&self.repository,pr,record,millis())
