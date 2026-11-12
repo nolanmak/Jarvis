@@ -448,9 +448,30 @@ fn persist_baseline_with_writer(path:&Path,evidence:&BaselineEvidence,writable_r
     file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
     write(file.as_file_mut(),&serde_json::to_vec(evidence)?)?;
     file.as_file().sync_all()?;
-    file.persist_noclobber(destination).map_err(|error|error.error)?;
+    publish_baseline_exclusive(file.path(),&destination)?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// The reader requires exactly one link. A link-then-unlink emulation can
+/// strand a published file with two links after process loss or unlink error.
+/// Require the native exclusive rename and fail before publishing otherwise.
+fn publish_baseline_exclusive(source:&Path,destination:&Path)->Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source=std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let destination=std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    #[cfg(target_os="linux")]
+    let result=unsafe {libc::syscall(libc::SYS_renameat2,libc::AT_FDCWD as libc::c_long,source.as_ptr(),
+        libc::AT_FDCWD as libc::c_long,destination.as_ptr(),libc::RENAME_NOREPLACE as libc::c_long)};
+    #[cfg(target_os="macos")]
+    let result=unsafe {libc::renamex_np(source.as_ptr(),destination.as_ptr(),libc::RENAME_EXCL)} as libc::c_long;
+    #[cfg(any(target_os="linux",target_os="macos"))]
+    {
+        if result!=0 {return Err(std::io::Error::last_os_error()).context("atomic exclusive baseline rename failed");}
+        Ok(())
+    }
+    #[cfg(not(any(target_os="linux",target_os="macos")))]
+    bail!("atomic exclusive baseline publication is unavailable on this platform")
 }
 
 /// Install the identical proposal harness in the candidate before building;

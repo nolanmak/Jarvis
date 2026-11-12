@@ -231,6 +231,13 @@ SQLite index. The partial-write regression then performs unpaid handoff from
 the protected raw result with one measurement attempt and zero model calls.
 The subprocess-crash regression exits during the write and verifies that a
 subsequent complete publication succeeds without overwriting any final name.
+Publication requires the native exclusive-rename primitive: Linux
+`renameat2(RENAME_NOREPLACE)` or macOS `renamex_np(RENAME_EXCL)`. Unsupported
+storage fails before creating the final name. There is no link/unlink fallback,
+which could strand a final file with two links and violate private evidence
+validation. A disposable-child syscall filter forces unavailable rename plus
+failed unlink; the regression reproduced the pinned library's fallback before
+the fix and now verifies no final file is published.
 
 The inspection replayer loads only the held protected plan and requires the
 same workflow binding, original base, environment and executor identity. It
