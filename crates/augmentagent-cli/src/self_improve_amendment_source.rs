@@ -123,6 +123,11 @@ pub(super) async fn read(
     read_bounded(root, control, base, custody, context, 384 * 1024).await
 }
 
+pub(super) async fn read_projected(
+    root:&Path,control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    context:Option<&str>,_replay:Option<&str>,
+)->Result<Evidence> {read(root,control,base,custody,context).await}
+
 pub(super) async fn read_bounded(
     root: &Path, control: &Path, base: &str,
     custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, budget: usize,
@@ -250,6 +255,33 @@ mod tests {
         let bytes=serde_json::to_vec(&proof).unwrap();std::fs::write(&reference.artifact,&bytes).unwrap();reference.artifact_sha256=digest(&bytes);
         custody[0].provenance=serde_json::to_string(&reference).unwrap();
         assert!(read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap_err().to_string().contains("unsupported producer"));
+    }
+
+    #[tokio::test]
+    async fn amendment_source_uses_only_exact_recorded_historical_projection() {
+        let (root,control,base,mut custody)=fixture().await;
+        let mut old_ref:scope_authority::NativeReplyReference=serde_json::from_str(&custody[0].provenance).unwrap();
+        let mut old:serde_json::Value=serde_json::from_slice(&std::fs::read(&old_ref.artifact).unwrap()).unwrap();
+        old["scope_policy_hash"]="bd44467c5c2ddedd493a2c8ce392578669b5ec8570b622403d05d92625f20771".into();
+        let bytes=serde_json::to_vec(&old).unwrap();std::fs::write(&old_ref.artifact,&bytes).unwrap();old_ref.artifact_sha256=digest(&bytes);
+        custody[0].provenance=serde_json::to_string(&old_ref).unwrap();
+        let current="b".repeat(64);let current_request=digest(b"current original qualification");
+        let reply=scope_authority::scripted_witness_reply(control.path(),&base,&current,"current negative diagnosis").unwrap();
+        let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+        proof["scope_request_hash"]=current_request.clone().into();
+        let bytes=serde_json::to_vec(&proof).unwrap();std::fs::write(&reply.provenance.artifact,&bytes).unwrap();
+        let reference=scope_authority::NativeReplyReference {artifact:reply.provenance.artifact,artifact_sha256:digest(&bytes)};
+        custody.push(crate::autoship_workflow::NativeScopeCustody {input:proof["native_input_hash"].as_str().unwrap().into(),response:reply.text,provenance:serde_json::to_string(&reference).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex});
+        let replay=serde_json::json!({"version":1,"current_epoch":current,"current_request":current_request,
+            "original_epoch":old["scope_context_hash"],"original_request":old["scope_request_hash"],"original_policy":old["scope_policy_hash"],
+            "original_choose":old["supplied_request_hash"],"original_input":custody[0].input,"provider":"codex"});
+        let evidence=read_projected(root.path(),control.path(),&base,&custody,Some(&current),Some(&replay.to_string())).await.expect("existing authenticated source projection cannot supply amendment evidence");
+        assert_eq!(evidence.sources["behavior.rs"],"pub fn behavior() -> bool { false }\n");
+        assert!(read_projected(root.path(),control.path(),&base,&custody,Some(&current),None).await.is_err(),"old source policy accepted without its recorded projection");
+        for field in ["current_epoch","current_request","original_epoch","original_request","original_policy","original_choose","original_input","provider"] {
+            let mut changed=replay.clone();changed[field]="f".repeat(64).into();
+            assert!(read_projected(root.path(),control.path(),&base,&custody,Some(&current),Some(&changed.to_string())).await.is_err(),"changed replay field {field} accepted");
+        }
     }
 
     #[tokio::test]
