@@ -7841,6 +7841,18 @@ fn finish_selected_command_attempt(
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
+    run_once_with_dispatch(repo_root,dry_run,dispatch_selected).await
+}
+
+fn dispatch_selected(repo:&Path,dry_run:bool,selected:Option<targeted::Resolved>)->futures::future::BoxFuture<'_,Result<RunReport>> {
+    Box::pin(run_selected(repo,dry_run,selected,targeted::ExecutionMode::Background))
+}
+
+// Scheduling and authenticated target selection share this implementation.
+// Production always supplies the full guarded dispatcher above; component
+// tests can observe the exact handoff without admitting a native execution.
+async fn run_once_with_dispatch<F>(repo_root:&Path,dry_run:bool,dispatch:F)->Result<RunReport>
+where F:for<'a> FnOnce(&'a Path,bool,Option<targeted::Resolved>)->futures::future::BoxFuture<'a,Result<RunReport>> {
     if !dry_run {
         // An empty/legacy store preserves the existing read-only readiness path.
         let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
@@ -7877,10 +7889,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
             .reserve_owner_resume_turn(&repository,chrono::Utc::now().timestamp_millis())?
     }else{None};
-    run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background,owner_resume.as_deref()).await
+    let selected=if let Some(id)=owner_resume {
+        match adoption::current_owner_resume(repo_root,&workflow::path(),&id).await? {
+            Some(pr)=>Some(targeted::Resolved::Pr(pr)),
+            None=>return Ok(RunReport::held("Owner resume awaits current source, binding or dependency revalidation".into())),
+        }
+    }else{None};
+    let resumed=selected.is_some();
+    dispatch(repo_root,dry_run,selected).await.map(|mut report|{report.resumed|=resumed;report})
 }
 
-async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode, owner_resume:Option<&str>) -> Result<RunReport> {
+async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
         // Read-only, before lock/state creation, issue selection or model spend.
@@ -7980,15 +7999,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             }
         }
     }};
-
-    if red_main_issue.is_none() {
-        if let Some(id)=owner_resume {
-            if let Some(pr)=adoption::current_owner_resume(repo_root,&workflow::path(),id).await? {
-                return targeted::execute_pr(repo_root,pr,dry_run).await.map(|mut report|{report.resumed=true;report});
-            }
-            return Ok(RunReport::held("Owner resume awaits current source, binding or dependency revalidation".into()));
-        }
-    }
 
     // #866 — sitting draft PRs outrank new work: they are mostly-finished
     // diffs that only lack an approving review, and until now the dedup guard
@@ -12486,6 +12496,63 @@ mod tests {
             .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
             .env("AUGMENTAGENT_NATIVE_VM_POLICY",root.path().join("unavailable-native-policy"))
             .output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[tokio::test]
+    async fn owner_resume_scheduler_hands_authorized_target_to_normal_dispatch_once() {
+        const CHILD:&str="AUTOSHIP_OWNER_RESUME_HANDOFF_FIXTURE";
+        if let Some(root)=std::env::var_os(CHILD).map(PathBuf::from) {
+            let path=workflow::path();let candidate=owner_resumed_automatic_fixture(&path);
+            AttemptLedger::mark_persist(&attempt_ledger_path(),utc_day_now(),7);
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap().snapshot(&id).unwrap().unwrap();
+            // The real scheduler, authorization, inventory, PR association and
+            // claim transaction run. Only expensive native execution is replaced.
+            fn observe_dispatch(repo:&Path,dry_run:bool,selected:Option<targeted::Resolved>)->futures::future::BoxFuture<'_,Result<RunReport>> {
+                Box::pin(async move {
+                    assert!(!dry_run);
+                    let Some(targeted::Resolved::Pr(pr))=selected else {return Ok(RunReport::idle())};
+                    assert_eq!((pr.pr,pr.source_issue,pr.branch.as_str()),(42,Some(7),"agent-fix/issue-7"));
+                    let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+                    let id=store.resolve_pr("owner/repo",42)?.expect("bound original workflow");
+                    assert!(store.owner_resume_ready_for_dispatch(&id,chrono::Utc::now().timestamp_millis())?);
+                    assert!(!store.has_command_jobs()?);
+                    let lease=store.claim_productive(&id,"normal-selected-dispatch",chrono::Utc::now().timestamp_millis(),1000)?.expect("normal productive claim");
+                    store.release(&lease,chrono::Utc::now().timestamp_millis())?;
+                    std::fs::write(repo.join("selected-once"),pr.pr.to_string())?;
+                    Ok(RunReport::idle())
+                })
+            }
+            let report=targeted::COMMAND_LANE.scope(Lane::Combined,run_once_with_dispatch(&root,false,observe_dispatch)).await.unwrap();
+            assert!(report.resumed);
+            assert_eq!(std::fs::read_to_string(root.join("selected-once")).unwrap(),candidate.pr.to_string());
+            let second=targeted::COMMAND_LANE.scope(Lane::Combined,run_once_with_dispatch(&root,false,observe_dispatch)).await.unwrap();
+            assert!(!second.resumed,"consumed owner intent dispatched again");
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!((after.attempts,after.model_calls,after.tokens),(before.attempts+1,before.model_calls,before.tokens));
+            assert_eq!(store.events(&id).unwrap().iter().filter(|e|e.1=="owner_dispatch_resume_consumed").count(),1);
+            assert!(!store.has_command_jobs().unwrap());return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
+        std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json,sys
+args=sys.argv[1:]
+if args[:2]==['repo','view']:print('ADMIN' if 'viewerPermission' in args else 'owner/repo')
+elif args[:2]==['api','graphql']:
+ assert 'AutoshipViewer' in ' '.join(args);print(json.dumps({'data':{'viewer':{'login':'owner'}}}))
+elif args[:2]==['pr','list']:
+ print(json.dumps([{'number':42,'isDraft':True,'headRefName':'agent-fix/issue-7','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':False,'author':{'login':'owner'},'title':'Ordinary production bug','body':'Preserve original requirements','closingIssuesReferences':[{'number':7}]}]))
+else:raise Exception('unexpected fixture call '+repr(args))
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::tests::owner_resume_scheduler_hands_authorized_target_to_normal_dispatch_once","--nocapture"])
+            .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+            .env(TRUSTED_AUTHORS_ENV,"owner").env(GH_OWNER_ENV,"owner").output().unwrap();
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
     }
 

@@ -531,7 +531,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
     COMMAND_LANE
         .scope(
             Lane::Combined,
-            run_selected(repo, false, Some(selected), mode, None),
+            run_selected(repo, false, Some(selected), mode),
         )
         .await.map_err(linked_claims::command_error)
 }
@@ -985,7 +985,7 @@ else: raise Exception('unexpected request '+repr(a))
     #[tokio::test]
     async fn local_execution_cannot_skip_deployment_without_an_explicit_target() {
         let dir = tempfile::tempdir().unwrap();
-        let error = run_selected(dir.path(), false, None, ExecutionMode::Local, None)
+        let error = run_selected(dir.path(), false, None, ExecutionMode::Local)
             .await
             .err()
             .unwrap();

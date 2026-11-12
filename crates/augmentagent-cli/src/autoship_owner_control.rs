@@ -165,8 +165,8 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             event(tx,workflow,generation,"owner_execution_retry_requested",&serde_json::json!({"principal":principal,"owner_revision":revision,"cleanup_pending":pending}).to_string(),now)?;
         }
         if !paused && prior.as_ref().is_some_and(|control|control.paused) {
-            let current:Option<(String,i64)>=tx.query_row("SELECT checkpoint,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((raw,generation))=current {
+            let current:Option<(String,i64,Option<u64>)>=tx.query_row("SELECT checkpoint,generation,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            if let Some((raw,generation,Some(_)))=current {
                 let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
                 event(tx,workflow,generation,"owner_dispatch_resume_requested",&serde_json::to_string(&DispatchResume {revision,binding:checkpoint.binding})?,now)?;
             }
@@ -591,6 +591,7 @@ mod tests {
         let mut owner=WorkflowStore::open(&path).unwrap();
         assert!(owner.set_owner_pause(&lease.workflow,"github:owner",0,false,9).is_err(),"stale resume cleared a later owner decision");
         owner.set_owner_pause(&lease.workflow,"github:owner",control.revision,false,10).unwrap();
+        assert!(pending_resume(&owner.conn,&lease.workflow).unwrap().is_none(),"pre-publication owner control invented a PR dispatch hint");
         assert!(worker.claim_productive(&lease.workflow,"next",11,1000).unwrap().is_some());
     }
 }
