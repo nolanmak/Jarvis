@@ -2778,6 +2778,50 @@ print('[]')
     }
 }
 
+/// Restrictive amendment callers must durably retain typed holds before
+/// returning through outer verification accounting.
+async fn restrictive_amendment_result(_workflow:&mut workflow::WorkflowGuard,_prepared:&PreparedAcceptance,
+    result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {result}
+
+#[cfg(test)]
+mod restrictive_amendment_outcome_tests {
+    use super::*;
+    #[tokio::test]
+    async fn final_amendment_refusal_persists_input_hold_and_fences_unchanged_reclaims() {
+        use crate::autoship_workflow::{WorkflowStore,ResourceCharge,Stage};
+        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted] {
+            let (root,control,prepared)=baseline_witness::prepared_fixture();let path=control.path().join("workflow.db");
+            let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original complete owner request",environment:"frontend environment"};
+            let guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();let id=guard.id().to_owned();guard.finish().unwrap();
+            let now=chrono::Utc::now().timestamp_millis();let mut store=WorkflowStore::open(&path).unwrap();
+            let prior=store.claim(&id,"prior-native-admission-fixture",now,1000).unwrap().unwrap();
+            store.charge(&prior,"preserved-original-charge",ResourceCharge {model_calls:3,tokens:321,wall_ms:25},now).unwrap();
+            store.release(&prior,now).unwrap();drop(store);
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();
+            guard.bind_acceptance_for_recovery(&prepared).unwrap();
+            let evidence=vec![format!("amendment-input:{}","a".repeat(64))];
+            let (stage,reason,action)=if hold==initial_repair::Hold::Declined {(Stage::Scope,"verifier_definition_disputed","independent_verifier_authority")}
+                else {(Stage::Verify,"candidate_failed","verify_candidate")};
+            guard.checkpoint(stage,reason,action,0,&evidence).await.unwrap();
+            let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+            let failure=restrictive_amendment_result(&mut guard,&prepared,Err(anyhow::Error::from(hold))).await.unwrap_err();
+            assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&hold));
+            let held=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(held.checkpoint.stage,Stage::Scope);
+            assert_eq!(held.checkpoint.next.reason,hold.reason(),"final refusal left a runnable transient checkpoint");
+            assert_eq!(held.checkpoint.next.action,hold.action());assert_eq!(held.checkpoint.evidence,evidence);
+            assert_eq!(held.model_calls,before.model_calls);assert_eq!(held.tokens,before.tokens);assert!(held.wall_ms>=before.wall_ms);
+            guard.finish().unwrap();
+            let mut restarted=WorkflowStore::open(&path).unwrap();let settled=restarted.snapshot(&id).unwrap().unwrap();let events=restarted.events(&id).unwrap();
+            for offset in [1000,86_400_000,2*86_400_000] {
+                assert!(restarted.claim_productive_for_binding(&id,"unchanged-restart",now+offset,1000,&held.checkpoint.binding).unwrap().is_none(),"unchanged final refusal was reclaimed after lease/day change");
+                assert_eq!(restarted.snapshot(&id).unwrap().unwrap(),settled);assert_eq!(restarted.events(&id).unwrap(),events);
+            }
+        }
+    }
+}
+
 /// Candidate-only amendment outcome boundary. Original qualification and
 /// exhausted implementation repair retain their separate restrictive holds.
 fn candidate_amendment_result(result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {
@@ -2844,7 +2888,7 @@ pub(super) async fn verify_with_repair_for(
                 0,
             )
             .await?;
-        match amendment::try_amend(
+        let amendment_result=amendment::try_amend(
             reasoner,
             source,
             title,
@@ -2856,8 +2900,8 @@ pub(super) async fn verify_with_repair_for(
             false,
             None,
         )
-        .await
-        {
+        .await;
+        match restrictive_amendment_result(workflow,prepared,amendment_result).await {
             Ok(Some(next)) => {
                 *prepared = next;
                 workflow.bind_acceptance(prepared,control)?;
@@ -2997,12 +3041,11 @@ pub(super) async fn verify_with_repair_for(
                     // Invalid implementation paths do not authorize changing
                     // the pinned verifier or expanding its registered scope.
                     if !scope_rejected {
-                        if let Some(amended) = amendment::try_amend(
+                        let amendment_result=amendment::try_amend(
                             reasoner, source, title, worktree, prepared, control, workflow, &detail,
                             true, None,
-                        )
-                        .await?
-                        {
+                        ).await;
+                        if let Some(amended) = restrictive_amendment_result(workflow,prepared,amendment_result).await? {
                             *prepared = amended;
                             workflow
                                 .transition(
