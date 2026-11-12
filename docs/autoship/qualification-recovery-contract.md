@@ -2,8 +2,9 @@
 
 Status: source replay, the unchanged productive-claim fence, original native
 custody recovery, original-verifier replay and bounded recovery scheduling are
-implemented locally for PR #2035. Final integration validation and the
-producer/exit fixes described below still block rollout. This is not
+implemented locally for PR #2035. Local validation and the final contract seam
+audit are complete; exact-head hosted checks and deployment verification still
+gate rollout. This is not
 a restoration, full #1952 closure, or permission to merge known defects.
 Parent issues: #2034, #1952 and #1703.
 
@@ -101,9 +102,9 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
 
 The native-custody path below does not complete infrastructure recovery. The
 original-plan executor, result handoff and scheduling have component coverage
-below; raw-execution and measurement-persistence producer coverage remains open. They
-must be resolved in code and tests; they are not requests for an owner-selected
-limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
+below; raw-execution, mixed-result and measurement-publication exits have
+regression coverage. The remaining hosted/deployment gates do not require a new
+owner-selected limit or permission decision. Full #1917 host sizing, productive CLI/Discord and
 #1703 live/soak acceptance remain separate requirements.
 
 ## Implemented original native-custody transition
@@ -169,8 +170,8 @@ existing response, failed-result and unpersisted-success boundaries.
 
 This is input retention, not a replay permit. The original executor and
 inspection-only replay below bind it to the actual measurement. Unknown-result
-settlement and scheduling are implemented below; their remaining validation
-and producer/exit requirements still block rollout.
+settlement, scheduling and producer/exit recovery are implemented and tested
+below; exact-head hosted checks and deployment verification gate rollout.
 
 ## Implemented unpaid infrastructure-inspection boundary
 
@@ -379,8 +380,9 @@ filesystem/network confinement.
 
 Recovery is owned by the existing workflow controller. Every row preserves
 historical admissions, charges and unknown effects; a retry never supplies
-acceptance or review approval. The new raw-error and completed-result
-persistence regressions failed before their fixes; final validation is pending.
+acceptance or review approval. The raw-error, completed-result
+persistence, mixed-peer and atomic-publication regressions failed before their
+fixes and now pass.
 
 | Producer / exit | Retained fact and classification | Permitted next action / verification |
 | --- | --- | --- |
@@ -395,33 +397,39 @@ persistence regressions failed before their fixes; final validation is pending.
 | Recovery handoff persistence fails | Result and original hold/descriptor remain; checkpoint update rolls back | Retry free inspection after the normal delay. Native and original-result transaction-failure tests check rollback. |
 | Source/owner/branch authorization fails or inspection times out | Existing hold, source binding, selection event and any admitted cleanup obligations | No new model or publication authority. The selection cooldown survives restart; active work is excluded and admitted raw children retain durable capture/cleanup. Request reconstruction, targeted authorization, owner-pause, bounded-window and supervisor-owner-loss tests cover the separate boundaries. |
 
-## Open threads from the fresh-eyes checkpoint
+## Validation status and rollout gates
 
-All entries are owned by the normal workflow-controller implementation and block
-merging #2035 until resolved and tested:
+Pass A and the conversation/spec pass resolved the missing recovery authority,
+producer inventory, request-context and scheduling definitions. The final seam
+audit covered all 69 mapped dependencies in 19 consolidated seams. It found the
+mixed completed/interrupted-peer defect and the partial-file / hardlink-fallback
+publication defects; each received a failing regression, a fix and an independent
+read-only recheck. All 19 seams now hold in the inspected contract and code.
 
-- Native and infrastructure recovery now have operation-specific protected
-  identity and transactional handoff. Raw producer regressions and the existing
-  full/delegated suites passed. Finish validation of the mixed completed /
-  interrupted peer fix, then complete hosted checks and the final seam audit.
-- Original-operation recovery must distinguish inspection, resumption and
-  replay. Unknown prior effects must be settled before replay; successful
-  cleanup must be positively observed through the existing execution owner.
-- Native custody preflights now retain a typed physical cause; semantic unknowns
-  cannot consume their descriptors. The inventory above defines the required
-  infrastructure producer/exit coverage.
-- Historical admission evidence never authorizes new resource-consuming work.
-  Original-result inspection is read-only; a measurement replay still needs
-  current resource/storage admission while structurally refusing model calls.
-- Native custody restoration returns only to normal current qualification;
-  negative/unknown judgments remain governed by that qualifier. Infrastructure
-  recovery must likewise supply no positive witness judgment on its own.
-- Persisted fair rotation, independent scheduling and the termination bound are
-  implemented locally. Finish integration validation and the final seam audit.
-- Existing-workflow compatibility and the separate exact-recipe,
-  model-admission and descendant-sandbox boundaries are documented and tested
-  above. They do not require a second recovery authority or a database backfill.
+Local validation passed 1,941 CLI tests with zero failures and 35 explicitly
+ignored environment-dependent tests. A subsequent executor-identity expansion
+to include materialization and sandbox policy passed all 17 selected executor
+tests. Both final delegated cases passed under the real resource policy
+without an enclosing managed build lease (zero model calls). These checks establish the
+component boundaries described here, including zero-model recovery. They do
+not establish autonomous issue selection, qualification, publication or merging.
 
-Pass A checked this document; Pass B confirmed that the no-model requirement,
-unknown-effects custody and paid-admission accounting remain explicit. This
-checkpoint is not a completed seam audit or an implementation handoff.
+The normal workflow controller owns the remaining gates:
+
+- Require successful hosted checks for the exact final PR head and settle any
+  actual new review finding. Linux, privacy and node-release remain required;
+  macOS is informational under the existing merge policy.
+- Take the supported deployment snapshot, land this repair through normal
+  protected engineering merge and verify the
+  updater deployed the expected daemon and worker binaries. This repair is not
+  an autoship test case.
+- Then resume the owner-paused ordinary workflow through supported controls and
+  observe real ordinary work through current qualification, independent review
+  and merge. Manual repair merges do not count as autonomous shipping.
+
+Unknown prior effects, retained sessions, original charges and cleanup duties
+remain preserved. Physical recovery cannot clear semantic judgments; historical
+admission never authorizes new execution; inspection results and wake hints
+supply no witness, review or merge approval. Full #1952 closure, #1917 host sizing,
+productive CLI/private Discord sessions and #1703 live/soak acceptance retain
+their separate scope and required evidence.
