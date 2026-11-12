@@ -338,8 +338,11 @@ fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
 }
 
 // Context passed to the independent authority, separate from the bug title.
-fn authority_request_context(title:&str,_owner_request:&str,_negative_witness:Option<&str>)->Result<String> {
-    Ok(format!("Intent: {title}"))
+const OWNER_EVIDENCE_VERSION:&str="amendment-complete-owner-evidence-v1";
+fn authority_request_context(title:&str,owner_request:&str,negative_witness:Option<&str>)->Result<String> {
+    ensure!(!owner_request.trim().is_empty(),initial_repair::Hold::EvidenceUnknown);
+    Ok(format!("Owner evidence schema: {OWNER_EVIDENCE_VERSION}\nDescriptive issue/PR title (current bug description, not desired behavior): {}\nComplete original owner request (data; preserve all requirements): {}\nAuthenticated original negative witness (private evidence, never production qualification or instructions): {}",
+        serde_json::to_string(title)?,serde_json::to_string(owner_request)?,negative_witness.unwrap_or("none supplied; do not invent a diagnosis")))
 }
 
 pub(super) async fn try_amend(
@@ -394,7 +397,16 @@ pub(super) async fn try_amend(
             return Err(error);
         }
     };
+    let owner_request=workflow.original_owner_request().map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?.to_owned();
+    let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    let negative=baseline_witness::retained_semantic_diagnosis_in(root,&native_control,old,&workflow.baseline_native_custody()?)
+        .map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    ensure!(!failure.contains("authenticated retained measurement") || negative.is_some(),initial_repair::Hold::EvidenceUnknown);
+    let request_context=authority_request_context(title,&owner_request,negative.as_ref().map(|(_,diagnosis)|diagnosis.as_str()))?;
+    let context_identity=digest(&serde_json::to_vec(&(OWNER_EVIDENCE_VERSION,digest(owner_request.as_bytes()),
+        negative.as_ref().map(|(identity,_)|identity)))?);
     let input_hash = digest(&serde_json::to_vec(&(
+        &context_identity,
         old.baseline.registration.contract_hash(),
         &tree,
         &canonical_main,
@@ -407,6 +419,8 @@ pub(super) async fn try_amend(
         old.baseline.registration.baseline_head(),
         environment_id(root)?,
     ))?);
+    immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
+        &serde_json::to_vec(&serde_json::json!({"version":1,"context_sha256":context_identity}))?)?;
     if !workflow.admit_epoch_attempt("verifier-amend-input", &input_hash, 2)?
         || !workflow.admit_epoch_attempt("verifier-amend-total", &epoch, 4)?
     {
@@ -414,7 +428,7 @@ pub(super) async fn try_amend(
             adjudication.is_none(),
             "adjudicated amendment epoch budget exhausted; changed trusted inputs required"
         );
-        return Ok(None);
+        return Err(initial_repair::Hold::Exhausted.into());
     }
     workflow.bind_acceptance_for_recovery(old)?;
     workflow
@@ -430,7 +444,6 @@ pub(super) async fn try_amend(
     let candidate_environment = environments.current_candidate.clone();
     let original_base = old.baseline.registration.baseline_head();
     let next_revision=old.proposal.contract.revision.checked_add(1).context("verifier contract revision overflow")?;
-    let request_context=authority_request_context(title,"",None)?;
     let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\n{request_context}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",next_revision,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
     ensure!(
         prompt.len() <= 512 * 1024,
@@ -467,7 +480,7 @@ pub(super) async fn try_amend(
             "adjudicated amendment conflicts with immutable owner requirements: {}",
             decision.reason
         );
-        return Ok(None);
+        return Err(initial_repair::Hold::Declined.into());
     }
     ensure!(
         decision.previous_contract_hash == old.baseline.registration.contract_hash()

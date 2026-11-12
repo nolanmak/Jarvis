@@ -1146,7 +1146,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
             workflow.checkpoint_qualification_source(prepared).await?;
             match amendment::try_amend(reasoner,source,title,root,prepared,control,workflow,&failure,false,None).await? {
                 Some(next)=>{*prepared=next;qualify_original_baseline(root,control,prepared,workflow).await},
-                None=>Err(error.context(initial_repair::Hold::Exhausted)),
+                None=>Err(error.context(initial_repair::Hold::ContractInvalid)),
             }
         }
     }

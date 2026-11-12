@@ -114,7 +114,7 @@ fn code(value:&str,fallback:&str)->String {
         "await_owner_resume"|"claim_workflow"|"awaiting-worker-claim"|
         "merge-allowance-exhausted"|"merge-reconciliation-required"|
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|"target_closed"|
-        "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
+        "acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_verifier_evidence_unknown"|
         "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
         "readiness_assessment_invalid"|"await_readiness_input_change"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
@@ -145,7 +145,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     if linked_hold {kind="blocked".into();}
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
         (c.next.reason.as_str(),c.next.action.as_str()),
-        ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
         ("readiness_assessment_invalid","await_readiness_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));

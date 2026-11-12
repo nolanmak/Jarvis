@@ -15,6 +15,7 @@ pub(super) enum FailureKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Hold {
     Exhausted,
+    Declined,
     EvidenceUnknown,
     ContractInvalid,
     InfrastructureUnavailable,
@@ -23,6 +24,7 @@ impl Hold {
     pub(super) fn reason(self) -> &'static str {
         match self {
             Self::Exhausted => "acceptance_verifier_repair_exhausted",
+            Self::Declined => "acceptance_verifier_amendment_declined",
             Self::EvidenceUnknown => "acceptance_verifier_evidence_unknown",
             Self::ContractInvalid => "acceptance_contract_invalid",
             Self::InfrastructureUnavailable => "acceptance_verifier_infrastructure_unavailable",

@@ -1276,6 +1276,14 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Original protected frontend request, never a replacement inferred from a title.
+    pub(super) fn original_owner_request(&self)->Result<&str> {
+        self.healthy_lease()?;
+        self.source_request.as_ref().map(|(request,_)|request.as_str())
+            .filter(|request|!request.trim().is_empty())
+            .context("original owner request unavailable")
+    }
+
     fn execution_context(&self,binding:&Binding)->Result<Option<durable::RecoveryContext>> {
         let Some((request,pr))=&self.source_request else{return Ok(None)};
         Ok(Some(durable::RecoveryContext {version:1,workflow:self.id().into(),repository:self.repository.clone(),

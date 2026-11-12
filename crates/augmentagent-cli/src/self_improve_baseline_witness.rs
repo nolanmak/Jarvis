@@ -164,6 +164,20 @@ pub(super) fn retained_semantic_judgment_in(root:&Path,control:&Path,prepared:&P
     retained_semantic_judgment(root,prepared,custody)
 }
 
+/// Private authenticated original evidence for the existing independent authority.
+/// The public failure remains a fixed safe code; no private diagnosis enters it.
+pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<(String,String)>> {
+    let Some(identity)=retained_semantic_judgment_in(root,control,prepared,custody)? else{return Ok(None)};
+    for observation in custody {
+        if retained_semantic_judgment(root,prepared,std::slice::from_ref(observation))?.as_ref()==Some(&identity) {
+            let judgment:Judgment=serde_json::from_str(&observation.response)?;
+            return Ok(Some((identity,serde_json::to_string(&judgment)?)));
+        }
+    }
+    bail!("authenticated negative witness disappeared")
+}
+
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());
     immutable(control,&raw_path(control,context,&hash),reply.text.as_bytes())?;
@@ -503,7 +517,12 @@ mod tests {
         let custody=[observation];
         assert!(retained_semantic_judgment(root.path(),&prepared,&custody).unwrap().is_some(),"retained authenticated semantic judgment has no supported reconsideration evidence");
         assert!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some());
+        let (identity,diagnosis)=retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap().unwrap();
+        assert_eq!(Some(identity),retained_semantic_judgment(root.path(),&prepared,&custody).unwrap());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&diagnosis).unwrap(),judgment);
+        assert!(diagnosis.contains("Original fixture is absent and the observer measures candidate-owned test markers"));
         let foreign=tempfile::tempdir_in("/tmp").unwrap();
+        assert!(retained_semantic_diagnosis_in(root.path(),foreign.path(),&prepared,&custody).is_err());
         assert!(retained_semantic_judgment_in(root.path(),foreign.path(),&prepared,&custody).is_err(),"negative source crossed workflow authority directories");
         let mut different=prepared.clone();different.proposal.contract.criteria[0].requirement="A different owner requirement".into();
         assert!(retained_semantic_judgment(root.path(),&different,&custody).is_err(),"changed original contract must not reuse judgment");
