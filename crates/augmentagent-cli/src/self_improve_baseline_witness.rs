@@ -106,7 +106,10 @@ fn validate(root:&Path,proposal:&ContractProposal,baseline:&BaselineEvidence,exp
     Ok(judgment)
 }
 fn disposition(judgment:&Judgment)->Result<()> {
-    if judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {return Err(initial_repair::Hold::EvidenceUnknown.into());}
+    // This is a completed, authenticated semantic judgment. Unknown does not
+    // qualify production behavior, but it may dispute the verifier definition
+    // through the existing bounded independent amendment path. Missing or
+    // unauthenticated physical evidence is held before disposition is reached.
     if judgment.verifiers.iter().any(|v|v.measurement!=Measurement::DirectProduction || !v.original_fixture_available) {
         // Free-form native reasons/citations stay in the private artifact, not
         // the generic error path that can feed issue/PR activity notes.
