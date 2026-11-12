@@ -21,25 +21,78 @@ struct ReadRequest {
 #[serde(deny_unknown_fields)]
 struct Selection { requests: Vec<ReadRequest> }
 
+// The already-supported frozen data projection in scope_authority. This
+// constant admits only that indexed-source protocol, never an old judgment.
+const PREDEPLOYMENT_SOURCE_POLICY:&str="bd44467c5c2ddedd493a2c8ce392578669b5ec8570b622403d05d92625f20771";
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceReplay {
+    version:u32,current_epoch:String,current_request:String,
+    original_epoch:String,original_request:String,original_policy:String,original_choose:String,
+    original_input:String,provider:String,
+}
+
+fn proof(control:&Path,observation:&crate::autoship_workflow::NativeScopeCustody)->Result<(scope_authority::NativeReplyReference,serde_json::Value)> {
+    let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observation.provenance)?;
+    ensure!(reference.artifact.parent()==Some(control),"amendment source belongs to another workflow");
+    let bytes=baseline_witness::private_bytes(&reference.artifact,64*1024)?;
+    ensure!(digest(&bytes)==reference.artifact_sha256,"amendment source proof changed during inspection");
+    Ok((reference,serde_json::from_slice(&bytes)?))
+}
+
+fn current_request(control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],context:&str)->Result<Option<String>> {
+    let mut selected=None;
+    for observation in custody {
+        let (reference,actual)=proof(control,observation)?;
+        if actual["head"]!=base || actual["purpose"]!="baseline_witness" || actual["scope_context_hash"]!=context {continue;}
+        let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:reference};
+        scope_authority::verify_witness_reply(control,base,context,&reply)?;
+        ensure!(selected.is_none(),"ambiguous current source-replay witness");
+        selected=Some(actual["scope_request_hash"].as_str().context("current witness request missing")?.to_owned());
+    }
+    Ok(selected)
+}
+
+pub(super) fn replay_key(root:&Path,control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],context:Option<&str>)->Result<Option<String>> {
+    scope_authority::require_retained_native_custody(root,custody)?;
+    let control=control.canonicalize()?;
+    let Some(context)=context else{return Ok(None)};
+    Ok(current_request(&control,base,custody,context)?.map(|request|digest(&serde_json::to_vec(&("original-source-data-replay-v1",context,request)).expect("source replay key"))))
+}
+
 /// Frozen indexed-source protocol: this only reuses selections produced under
 /// the unchanged current scope producer. It imports data, never an old ruling.
 fn selection(
     root: &Path, control: &Path, base: &str,
-    custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>,
+    custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, replay:Option<&str>,
 ) -> Result<(String, Selection)> {
     ensure!(matches!(base.len(), 40 | 64) && base.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid original source commit");
     scope_authority::require_retained_native_custody(root, custody)?;
     let control = control.canonicalize()?;
+    let replay=replay.map(|raw|->Result<SourceReplay> {
+        ensure!(raw.len()<=4096,"source replay exceeds bound");
+        let replay:SourceReplay=serde_json::from_str(raw)?;
+        ensure!(replay.version==1 && Some(replay.current_epoch.as_str())==context
+            && replay.original_policy==PREDEPLOYMENT_SOURCE_POLICY,"source replay belongs to another request or protocol");
+        let request=current_request(&control,base,custody,context.context("source replay has no current witness context")?)?
+            .context("source replay current witness unavailable")?;
+        ensure!(replay.current_request==request,"source replay current request changed");
+        Ok(replay)
+    }).transpose()?;
     let mut selected = None;
     for observation in custody {
-        let reference: scope_authority::NativeReplyReference = serde_json::from_str(&observation.provenance)?;
-        ensure!(reference.artifact.parent() == Some(control.as_path()), "amendment source belongs to another workflow");
-        let bytes = baseline_witness::private_bytes(&reference.artifact, 64 * 1024)?;
-        ensure!(digest(&bytes) == reference.artifact_sha256, "amendment source proof changed during inspection");
-        let proof: serde_json::Value = serde_json::from_slice(&bytes)?;
-        if proof["head"] != base || proof["purpose"] != "source_selection"
-            || context.is_some_and(|expected| proof["scope_context_hash"].as_str() != Some(expected)) { continue; }
-        ensure!(proof["scope_policy_hash"].as_str() == Some(scope_authority::witness_policy_hash().as_str()), "original source selection uses an unsupported producer protocol");
+        let (reference,proof)=proof(&control,observation)?;
+        if proof["head"] != base || proof["purpose"] != "source_selection" {continue;}
+        let direct=context.is_none_or(|expected|proof["scope_context_hash"]==expected)
+            && proof["scope_policy_hash"]==scope_authority::witness_policy_hash();
+        let projected=replay.as_ref().is_some_and(|replay| observation.input==replay.original_input
+            && proof["provider"]==replay.provider && proof["supplied_request_hash"]==replay.original_choose
+            && proof["native_input_hash"]==replay.original_input && proof["scope_context_hash"]==replay.original_epoch
+            && proof["scope_request_hash"]==replay.original_request && proof["scope_policy_hash"]==replay.original_policy);
+        if !direct && !projected {
+            ensure!(!context.is_none_or(|expected|proof["scope_context_hash"]==expected),"original source selection uses an unsupported producer protocol");
+            continue;
+        }
         ensure!(selected.is_none(), "ambiguous original source selection");
         let raw = observation.response.trim();
         let raw = raw.strip_prefix("```json\n").and_then(|s| s.strip_suffix("```")).unwrap_or(raw);
@@ -49,7 +102,8 @@ fn selection(
             ensure!(request.start_line > 0 && request.end_line >= request.start_line && request.end_line - request.start_line < 600, "invalid original source range");
             ensure!(request.needle.as_ref().is_none_or(|needle| !needle.is_empty() && needle.len() <= 256), "invalid original source search");
         }
-        let identity = digest(&serde_json::to_vec(&("amendment-original-source-selection-v1", base, &observation.input, &observation.response, &reference))?);
+        let identity = digest(&serde_json::to_vec(&("amendment-original-source-selection-v1", base, &observation.input, &observation.response, &reference,
+            if projected {replay.as_ref()}else{None}))?);
         selected = Some((identity, selection));
     }
     selected.context("original source selection unavailable")
@@ -120,20 +174,20 @@ pub(super) async fn read(
     root: &Path, control: &Path, base: &str,
     custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>,
 ) -> Result<Evidence> {
-    read_bounded(root, control, base, custody, context, 384 * 1024).await
+    read_bounded(root, control, base, custody, context, None,384 * 1024).await
 }
 
 pub(super) async fn read_projected(
     root:&Path,control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],
-    context:Option<&str>,_replay:Option<&str>,
-)->Result<Evidence> {read(root,control,base,custody,context).await}
+    context:Option<&str>,replay:Option<&str>,
+)->Result<Evidence> {read_bounded(root,control,base,custody,context,replay,384*1024).await}
 
 pub(super) async fn read_bounded(
     root: &Path, control: &Path, base: &str,
-    custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, budget: usize,
+    custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, replay:Option<&str>,budget: usize,
 ) -> Result<Evidence> {
     ensure!((1024..=512 * 1024).contains(&budget), "invalid amendment source budget");
-    let (identity, selected) = selection(root, control, base, custody, context)?;
+    let (identity, selected) = selection(root, control, base, custody, context,replay)?;
     let tree = trusted_git(root, &["--no-replace-objects", "ls-tree", "-r", "--long", "-z", base]).await?;
     ensure!(tree.len() <= 1024 * 1024, "original source table exceeds bound");
     // Preserve the original producer's ordinals, including literal Git paths.
@@ -299,7 +353,10 @@ mod tests {
         let (prepared,_)=super::super::retained_semantic_source(&recovery.worktree,&control,source,&before.checkpoint.binding,&custody,&store.inspect_verifier_evidence(&id)).unwrap().unwrap();
         let (_,diagnosis)=baseline_witness::retained_semantic_diagnosis_in(&recovery.worktree,&control,&prepared,&custody).unwrap().unwrap();
         let diagnosis:serde_json::Value=serde_json::from_str(&diagnosis).unwrap();
-        let evidence=read(&recovery.worktree,&control,prepared.baseline.registration.baseline_head(),&custody,diagnosis["context"].as_str()).await.unwrap();
+        let base=prepared.baseline.registration.baseline_head();let context=diagnosis["context"].as_str();
+        let key=replay_key(&recovery.worktree,&control,base,&custody,context).unwrap();
+        let replay=key.map(|key|store.inspect_verifier_evidence(&id).scope_response(&key).unwrap()).flatten();
+        let evidence=read_projected(&recovery.worktree,&control,base,&custody,context,replay.as_deref()).await.unwrap();
         let bytes=serde_json::to_vec(&evidence).unwrap();
         assert!(!evidence.sources.is_empty());
         let after=store.snapshot(&id).unwrap().unwrap();

@@ -35,6 +35,9 @@ pub(crate) struct VerifierEvidenceInspection<'a> {
 impl<'a> VerifierEvidenceInspection<'a> {
     pub(super) fn new(conn:&'a Connection,workflow:&'a str)->Self {Self {conn,workflow}}
     pub(crate) fn workflow(&self)->&str {self.workflow}
+    pub(crate) fn scope_response(&self,key:&str)->Result<Option<String>> {
+        read_scope_response(self.conn,self.workflow,key)
+    }
     pub(crate) fn record(&self,key:&str,kind:&str)->Result<Option<String>> {
         let hash:Option<String>=self.conn.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![self.workflow,key,kind],|r|r.get(0)).optional()?;
         let body:Option<String>=self.conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![self.workflow,key],|r|r.get(0)).optional()?;
