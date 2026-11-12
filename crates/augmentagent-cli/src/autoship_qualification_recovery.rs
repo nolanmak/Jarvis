@@ -109,6 +109,48 @@ mod tests {
     }
 
     #[test]
+    fn qualification_recovery_inspection_does_not_consume_productive_attempts() {
+        let (_dir,mut store,lease,mut hold)=fixture();
+        hold.next.reason="acceptance_verifier_infrastructure_unavailable".into();hold.next.action="await_verifier_infrastructure_recovery".into();
+        store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        let recovery=store.claim_reconciliation(&lease.workflow,"unpaid-recovery",7,1000).unwrap().unwrap();
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!(after.attempts,before.attempts,"unpaid verifier recovery consumed a productive attempt");
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);
+        assert_eq!(after.checkpoint,before.checkpoint,"inspection supplied qualification or changed its input");
+        store.release(&recovery,8).unwrap();
+    }
+
+    #[test]
+    fn qualification_recovery_inspection_cannot_launch_models_or_publish_mutations() {
+        let (_dir,mut store,lease,mut hold)=fixture();
+        hold.next.reason="acceptance_verifier_infrastructure_unavailable".into();hold.next.action="await_verifier_infrastructure_recovery".into();
+        store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+        let recovery=store.claim_reconciliation(&lease.workflow,"unpaid-recovery",7,1000).unwrap().unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        for reviewer in [false,true] {
+            for provider in [submission::Provider::Codex,submission::Provider::Claude] {
+                assert!(store.charge_admitted_model(&recovery,"must-not-dispatch",8,None,None,Some(provider),reviewer).is_err(),"free recovery admitted a paid builder or fresh reviewer");
+            }
+        }
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","b".repeat(64));
+        assert!(store.charge_admitted_model(&recovery,"new-witness",8,None,Some((&purpose,&hold.binding,1)),Some(submission::Provider::Codex),true).is_err());
+        assert!(store.charge_bounded_call(&recovery,"new-bounded",8,None,"amendment",&hold.binding,3).is_err());
+        assert!(store.charge(&recovery,"unattributed-model",ResourceCharge {model_calls:1,..Default::default()},8).is_err());
+        for kind in [OperationKind::CreatePr,OperationKind::Push,OperationKind::MergePr,OperationKind::ReadyPr,OperationKind::RetirePr,OperationKind::RetargetPr] {
+            assert!(store.begin_operation(&recovery,kind,&hold.binding,8).is_err(),"free verification authorized a publication mutation");
+        }
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,before.model_calls);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().tokens,before.tokens);
+        // Raw command admission still uses the same owner/lease authority;
+        // model and publication restrictions must not disable the verifier.
+        store.validate_dispatch(&recovery,&hold.binding,8).unwrap();
+        store.charge(&recovery,"raw-verifier-usage",ResourceCharge {wall_ms:19,tokens:0,model_calls:0},8).unwrap();
+        store.release(&recovery,9).unwrap();
+    }
+
+    #[test]
     fn native_custody_recovery_hold_and_descriptor_commit_atomically() {
         let (_dir,mut store,lease,hold)=fixture();
         let before=store.snapshot(&lease.workflow).unwrap().unwrap();
