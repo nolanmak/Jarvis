@@ -409,12 +409,76 @@ mod tests {
             let lost=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
             assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"lost original source became semantic repair admission");
             assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
-            guard.finish().unwrap();return;
+            #[cfg(target_os="linux")]
+            {
+                guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
+                let id=guard.id().to_owned();guard.finish().unwrap();
+                std::fs::write(&retained,&bytes).unwrap();std::fs::set_permissions(&retained,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let source=AcceptanceSource::PullRequest(840);let policy=semantic_reconsideration_policy();
+                let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+                let held=store.snapshot(&id).unwrap().unwrap();
+                assert!(store.recover_semantic_qualification(&held,None,&policy,chrono::Utc::now().timestamp_millis(),|custody,evidence|
+                    inspect_retained_semantic(root.path(),&native_control,source,&held.checkpoint.binding,custody,evidence)).unwrap());drop(store);
+                let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"};
+                let mut resumed=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                let accounting=resumed.capacity_accounting(true).unwrap();
+                augmentagent_channel_core::run_resources::check_requirement("codex",Some(&resumed.audit_logger())).unwrap();
+                std::fs::remove_file(&retained).unwrap();
+                let error=augmentagent_channel_core::run_resources::check_requirement("codex",Some(&resumed.audit_logger()))
+                    .expect_err("missing original source reached native launch admission");
+                assert!(!resumed.audit_logger().resource_capacity_seen(),"missing source was misclassified as host capacity");
+                let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+                let waiting=store.snapshot(&id).unwrap().unwrap();
+                assert_eq!(waiting.checkpoint.stage,crate::autoship_workflow::Stage::Scope);
+                assert_eq!(waiting.checkpoint.next.reason,"acceptance_verifier_evidence_unknown");
+                assert_eq!(waiting.model_calls,before.model_calls);
+                assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="semantic_source_unavailable").count(),1);drop(store);
+                // Provider wrappers may replace the error type; durable source
+                // wait must still prevent generic retries or initial enrollment.
+                let wrapped=anyhow::anyhow!("synthetic provider wrapper around local source refusal");
+                let report=hold_initial_error(&mut resumed,&wrapped).await.unwrap().expect("source hold was lost by preparation wrapper");
+                assert!(report.held && !report.billed);
+                assert!(resumed.checkpoint(crate::autoship_workflow::Stage::Reconcile,"generic_failure","retry",0,&[]).await.is_err(),"generic failure overwrote the source wait");
+                let report=accounting.report().unwrap().expect("source wait disappeared from command accounting");
+                assert!(report.held && !report.billed);let _=error;
+                resumed.finish().unwrap();
+                std::fs::write(&retained,&bytes).unwrap();std::fs::set_permissions(&retained,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let held=store.snapshot(&id).unwrap().unwrap();
+                assert!(store.recover_semantic_qualification(&held,None,&policy,chrono::Utc::now().timestamp_millis(),|custody,evidence|
+                    inspect_retained_semantic(root.path(),&native_control,source,&held.checkpoint.binding,custody,evidence)).unwrap());
+                assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);drop(store);
+                let mut next=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+                let mut recovered=prepare_acceptance_for(root.path(),root.path(),&native_control,source,prepared.baseline.registration.baseline_head(),"original requirement",&reasoner,&worker_roots(root.path()),&[],&next)
+                    .await.expect("normal preparation rescoped instead of consuming retained source");
+                assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
+                assert!(native_control.join(format!("{}-workflow.json",source.key())).exists());
+                let base=prepared.baseline.registration.baseline_head();
+                let script=PathBuf::from(std::env::var_os("GH_BIN").unwrap());
+                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n").replace("\\\"","\"")).unwrap();
+                std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let epoch=amendment::digest(&serde_json::to_vec(&(source,base,environment_id(root.path()).unwrap())).unwrap());
+                for _ in 0..4 {assert!(next.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
+                let accounting=next.capacity_accounting(true).unwrap();
+                let exhausted=qualify_or_amend(&reasoner,source,"original requirement",root.path(),&native_control,&mut recovered,&mut next).await.unwrap_err();
+                assert_eq!(exhausted.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted));
+                assert!(hold_qualification_error(&mut next,&recovered,&exhausted,&accounting).await.unwrap().unwrap().held);
+                let state=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+                assert_eq!(state.checkpoint.binding.head,actual_head(root.path()).await.unwrap(),"exhausted hold retained the head from before controller commit");
+                let expected=workflow::git_binding(root.path(),&format!("registered:{}",prepared.baseline.registration.contract_hash()),&prepared.baseline.registration.binding(base).unwrap().environment_id,&state.checkpoint.evidence).await.unwrap();
+                assert_eq!(state.checkpoint.binding,expected,"qualification hold lost controller-installed inputs");
+                assert_eq!(state.model_calls,before.model_calls);
+                next.finish().unwrap();
+                assert!(workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().is_none(),"controller preparation bought an unchanged exhausted retry");
+            }
+            #[cfg(not(target_os="linux"))]
+            guard.finish().unwrap();
+            return;
         }
         let scripts=tempfile::tempdir_in("/tmp").unwrap();
         let out=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::acceptance::baseline_witness::tests::retained_unknown_reenters_existing_repair_without_requerying_witness","--nocapture"])
-            .env(CHILD,"1").env("AUGMENTAGENT_RUN_RESOURCES","1").env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env(CHILD,"1").env("GH_BIN",scripts.path().join("gh")).env("AUGMENTAGENT_RUN_RESOURCES","1").env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
             .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
     }
