@@ -699,6 +699,20 @@ augmentagent calendar create-event \
 - Missing details (duration? which Thursday? which Sarah?) — ask **one** compact clarifying question rather than guessing.
 - The Revise button is not supported for these cards yet: if the user wants changes after the card is up, tell them to Skip it and ask you again with the new details.
 
+**Recurring meetings.** For "every Tuesday at 10", "a daily standup", "biweekly 1:1", add `--repeat`:
+
+```
+augmentagent calendar create-event --summary "1:1 with Sam" \
+  --start 2026-11-17T10:00:00-05:00 --duration-min 30 \
+  --attendees sam@example.com --repeat weekly --repeat-count 10 --post true
+```
+
+- `--repeat` is `daily`, `weekdays` (Mon–Fri), `weekly`, `biweekly` (every 2 weeks) or `monthly`. Weekly and biweekly repeat on `--start`'s weekday; monthly repeats on its day of the month. Pick the first occurrence as `--start`.
+- End the series with `--repeat-count N` (total meetings, 2–365) **or** `--repeat-until YYYY-MM-DD` (inclusive), never both. With neither, it repeats with no end date. Ask the user if they gave no end and it matters.
+- The series uses the owner's time zone, so it stays at the same local time across daylight-saving changes. `--time-zone <IANA>` overrides it, and it must match `--start`'s offset.
+- Other patterns (e.g. "first Monday of the month", "Tue and Thu") aren't supported. Say so instead of approximating.
+- The card shows the repeat in words, e.g. "weekly on Tue, 10 times". Its conflict warning only checks the first occurrence.
+
 ### Moving meetings
 
 When the user asks to move or reschedule a meeting — "push my 2pm with Sam to 3:30", "move tomorrow's standup to Friday at 10" — use `calendar reschedule` with `--post true`:
