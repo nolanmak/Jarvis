@@ -39,6 +39,8 @@ milestones and blockers; do not restart the canceled benchmark campaign.
   for targets merged or closed outside autoship, preserving owner controls,
   accounting and unresolved operations. Terminal state queues native retirement;
   it does not certify teardown. Verify the deployed build before using it.
+- The proposed [automatic retained-session count semantics](auto-session-count-contract.md)
+  settle one #1918 decision; they do not enable host sizing or close C0.
 - #1917 remains the automatic host-capacity epic. Native retained-state storage
   reservations and host memory are different limits. Neither free disk nor the
   old fixed retained-state budget is evidence of automatic RAM sizing.
