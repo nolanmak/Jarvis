@@ -1235,7 +1235,10 @@ mod initial_diagnostic_tests {
         assert!(!public.contains("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS"),"private enrolled diagnosis escaped into public progress");
         assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"held qualification metadata authorized a paid builder");
         assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
-        guard.finish().unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        assert!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap()
+            .claim_productive(&id,"unchanged-retry",chrono::Utc::now().timestamp_millis(),1_000).unwrap().is_none(),
+            "released enrolled evidence hold admitted another unchanged productive claim");
         }
     }
 
