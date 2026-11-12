@@ -428,6 +428,37 @@ pub fn spawn_command_with_storage_at(command:&tokio::process::Command,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires isolated delegated systemd service with daemon subgroup"]
+    fn raw_verifier_cleanup_hold_survives_owner_drop_until_kernel_quiescence() {
+        crate::build_storage_ci_holds::with_test_registry(|root,_| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let source=root.join("source");let session=root.join("runtime");let target=root.join("target");
+                for path in [&source,&session,&target] {std::fs::create_dir(path).unwrap();}
+                let mut hold=crate::build_storage_ci_holds::Hold::begin(root,&source,&session,&target,&"a".repeat(64)).unwrap();
+                let mut command=tokio::process::Command::new("/usr/bin/python3");
+                command.args(["-I","-c","import os,sys; assert 'JARVIS_STORAGE_LEASE_FDS' not in os.environ; sys.stdin.readline()"])
+                    .env_clear().env("PATH","/usr/bin:/bin");
+                let (mut child,resources)=super::spawn_command(&command,None).unwrap();
+                resources.admit_with_observer("raw_verifier_cleanup_test",None,|admission|hold.bind(admission)).await.unwrap();
+                assert!(!crate::build_storage_ci_holds::may_cleanup(&source).unwrap());
+                // Lose the controller's hold object while the admitted child
+                // is still live. Actual kernel evidence must retain the fence.
+                drop(hold);
+                assert!(crate::build_storage_ci_holds::reconcile_before_admission().is_err());
+                assert!(!crate::build_storage_ci_holds::may_cleanup(&target).unwrap());
+                child.stdin.take().unwrap().write_all(b"finish\n").await.unwrap();
+                assert!(child.wait().await.unwrap().success());
+                resources.record_outcome("raw_verifier_cleanup_test",None).unwrap();
+                resources.verified_quiescence().unwrap();
+                crate::build_storage_ci_holds::reconcile_before_admission().unwrap();
+                assert!(crate::build_storage_ci_holds::may_cleanup(&source).unwrap());
+                assert!(crate::build_storage_ci_holds::may_cleanup(&target).unwrap());
+            });
+        });
+    }
+
     /// Execute in an isolated delegated transient service, never the daemon unit.
     #[test]
     #[ignore = "requires isolated delegated systemd service with daemon subgroup"]
