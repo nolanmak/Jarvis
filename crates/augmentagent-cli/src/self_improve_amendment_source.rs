@@ -327,6 +327,25 @@ mod tests {
         assert_eq!(buffer.finish().unwrap().1.as_deref(),Some("1: first\r\n2: second\r\n3: final  "),"excerpt invented a source terminator");
     }
 
+    #[test]
+    fn amendment_source_unmatched_history_does_not_poison_later_valid_windows() {
+        let request=ReadRequest {file_index:0,start_line:1,end_line:600,needle:Some("needle_here".into())};
+        let long=format!("{}\n","x".repeat(256));
+        let mut buffer=SourceBuffer::new(&request,4096);
+        for _ in 0..100 {buffer.push(&long).unwrap();}
+        for _ in 0..60 {buffer.push("short\n").unwrap();}
+        buffer.push("needle_here\n").unwrap();
+        for _ in 0..99 {buffer.push("tail\n").unwrap();}
+        let (full,partial)=buffer.finish().unwrap();
+        assert!(full.is_none());
+        let partial=partial.expect("irrelevant unmatched history poisoned a later complete required window");
+        assert!(partial.starts_with("111: short\n"));assert!(partial.contains("161: needle_here\n"));assert!(partial.ends_with("260: tail\n"));
+        let mut missing=SourceBuffer::new(&request,4096);
+        for _ in 0..100 {missing.push(&long).unwrap();}
+        missing.push("needle_here\n").unwrap();
+        assert!(missing.finish().unwrap().1.is_none(),"a real required preceding window exceeding budget was silently dropped");
+    }
+
     #[tokio::test]
     async fn amendment_source_and_construction_task_reach_actual_authority_call() {
         let (root,control,base,custody)=fixture().await;

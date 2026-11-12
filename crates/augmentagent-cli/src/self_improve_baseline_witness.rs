@@ -187,6 +187,10 @@ pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&
     selected.map(|(identity,judgment)|Ok((identity,serde_json::to_string(&judgment)?))).transpose()
 }
 
+/// Source data may use a positive original witness without importing approval.
+pub(super) fn retained_source_context_in(_root:&Path,_control:&Path,_prepared:&PreparedAcceptance,
+    _custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {Ok(None)}
+
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());
     immutable(control,&raw_path(control,context,&hash),reply.text.as_bytes())?;
@@ -532,6 +536,9 @@ mod tests {
             assert_eq!(diagnosis.is_some(),negative,"authenticated {measurement:?} diagnosis omitted or positive witness misclassified");
             if let Some((identity,text))=diagnosis {assert_eq!(identity.len(),64);assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(),judgment);}
             assert_eq!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some(),measurement==Measurement::Unknown,"diagnosis broadened legacy reconsideration");
+            if !negative {
+                assert_eq!(retained_source_context_in(root.path(),control.path(),&prepared,&custody).unwrap().as_deref(),Some(context),"positive qualified witness cannot identify its historical source projection");
+            }
             let foreign=tempfile::tempdir().unwrap();assert!(retained_semantic_diagnosis_in(root.path(),foreign.path(),&prepared,&custody).is_err());
             custody[0].response.push(' ');
             assert!(retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).is_err(),"changed response bypassed original custody");
