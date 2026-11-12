@@ -109,9 +109,9 @@ impl<'a> OriginalExecution<'a> {
         Ok(())
     }
 
-    pub(super) fn retained_result(root:&Path,workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Option<BaselineEvidence>> {
+    pub(super) fn retained_result(root:&Path,workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Option<(String,BaselineEvidence)>> {
         let (plan,body)=plan_input(workflow,proposal,base,environment,executor)?;
-        (||->Result<Option<BaselineEvidence>> {
+        (||->Result<Option<(String,BaselineEvidence)>> {
             let saved=workflow.verifier_evidence(&plan,"original_verifier_plan")?;
             if let Some(saved)=&saved {ensure!(saved==&body,"original verifier plan changed");}
             let mut cursor=0;
@@ -132,9 +132,9 @@ impl<'a> OriginalExecution<'a> {
                     record.baseline.registration.baseline_result(&record.baseline.receipts)?;
                     Self::require_result_commands(workflow,&plan,&record.attempt,&record.baseline)?;
                     if record.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
-                    if let Some(previous)=&conclusive {
+                    if let Some((_,previous))=&conclusive {
                         ensure!(serde_json::to_vec(previous)?==serde_json::to_vec(&record.baseline)?,"original operation has conflicting conclusive results");
-                    } else {conclusive=Some(record.baseline);}
+                    } else {conclusive=Some((row.key,record.baseline));}
                 }
             }
             if conclusive.is_some() {Self::quiesce_previous(workflow)?;}
@@ -219,6 +219,38 @@ impl<'a> OriginalExecution<'a> {
     }
 }
 
+/// Execute only the protected original recipe. Qualification and correction
+/// remain ordinary paid pipeline work after this inspection lease is released.
+pub(in crate::self_improve) async fn recover_original_verifier(repo:&Path,control:&Path,workflow:&workflow::WorkflowGuard)->Result<bool> {
+    let Some((key,body))=workflow.original_verifier_recovery_plan()? else {return Ok(false)};
+    let plan:Plan=serde_json::from_str(&body).map_err(|e|anyhow::Error::from(e).context(initial_repair::Hold::EvidenceUnknown))?;
+    ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow.id()
+        && plan.binding==*workflow.binding() && plan.executor==verifier_executor_id()?,initial_repair::Hold::EvidenceUnknown);
+    let temporary=tempfile::Builder::new().prefix("original-verifier-recovery-").tempdir_in(control)?;
+    let checkout=temporary.path().join("checkout");
+    let path=checkout.to_str().context("original verifier checkout UTF8")?;
+    trusted_git(repo,&["worktree","add","--detach",path,&plan.base]).await?;
+    let recovered=async {
+        ensure!(actual_head(&checkout).await?==plan.base && environment_id(&checkout)?==plan.environment,initial_repair::Hold::EvidenceUnknown);
+        ensure!(plan_input(workflow,&plan.proposal,&plan.base,&plan.environment,&plan.executor)?.0==key,initial_repair::Hold::EvidenceUnknown);
+        let result=retain_initial_measurement(&checkout,control,&plan.proposal,workflow,|original|
+            register_and_reproduce_original(&checkout,plan.proposal.clone(),workflow.audit_logger(),original)).await;
+        if let Err(error)=result {
+            // An actual conclusive non-red result returns to the existing
+            // coordinator, which records the original slot before correction.
+            if !error.downcast_ref::<BaselineNotRed>().is_some_and(|failure|failure.kind.is_some()) {return Err(error);}
+        }
+        let (result,_)=OriginalExecution::retained_result(&checkout,workflow,&plan.proposal,&plan.base,&plan.environment,&plan.executor)?
+            .context(initial_repair::Hold::EvidenceUnknown)?;
+        workflow.complete_original_verifier_recovery(&key,&result).await?;
+        Ok::<_,anyhow::Error>(true)
+    }.await;
+    // Verifiers consume a separate managed export. This staging worktree is
+    // never their writable runtime or live command source.
+    let cleanup=trusted_git(repo,&["worktree","remove","--force",path]).await;
+    let recovered=recovered?;cleanup?;Ok(recovered)
+}
+
 #[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
@@ -270,6 +302,89 @@ mod tests {
             assert_eq!(crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
             drop(original);guard.finish().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn original_verifier_recovery_hands_off_only_conclusive_results_without_native_ownership() {
+        for (reproduced,hold) in [(true,initial_repair::Hold::InfrastructureUnavailable),
+            (false,initial_repair::Hold::InfrastructureUnavailable),(true,initial_repair::Hold::EvidenceUnknown)] {
+            let (root,control,prepared,mut guard)=fixture().await;
+            let database=control.path().join("workflow.db");
+            let base=prepared.baseline.registration.baseline_head();
+            let environment=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,&prepared.proposal,base,&environment,&verifier_executor_id().unwrap()).unwrap();
+            original.retain_admission("observe",&gone_scope()).unwrap();
+            OriginalExecution::quiesce_previous(&guard).unwrap();
+            let mut baseline=prepared.baseline.clone();
+            if !reproduced {
+                let observation=Observation {exit_code:Some(0),stdout:"true\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+                baseline.receipts=vec![baseline.registration.observe(root.path(),"observe",baseline.registration.binding(base).unwrap(),&observation).unwrap()];
+            }
+            original.retain_result(root.path(),&baseline).unwrap();
+            let plan=original.plan.clone();
+            let error=original.failed(anyhow::Error::from(hold));
+            drop(original);
+            hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            let conn=rusqlite::Connection::open(&database).unwrap();
+            let owners:i64=conn.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+            let guard=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().expect("original verifier inspection was not claimable");
+            assert_eq!(guard.original_verifier_recovery_plan().unwrap().unwrap().0,plan);
+            // Exercise the actual replayer against retained synthetic receipt
+            // data. No live verifier or native-model execution is claimed here.
+            conn.execute_batch("CREATE TRIGGER deny_recovered_result BEFORE INSERT ON workflow_event WHEN NEW.kind='original_verifier_result_recovered' BEGIN SELECT RAISE(ABORT,'recovery event unavailable'); END;").unwrap();
+            assert!(recover_original_verifier(root.path(),control.path(),&guard).await.is_err());
+            let failed=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(failed.checkpoint,before.checkpoint,"failed handoff partially released the original hold");
+            conn.execute_batch("DROP TRIGGER deny_recovered_result;").unwrap();
+            assert!(recover_original_verifier(root.path(),control.path(),&guard).await.unwrap());
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.checkpoint.next.action,if reproduced {"qualify_original_measurement"}else{"correct_original_verifier"});
+            assert_eq!(conn.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),owners,"inspection allocated another native runtime owner");
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"handoff enabled a model inside the inspection generation");
+            assert!(guard.intent(crate::autoship_workflow::OperationKind::Push).is_err(),"handoff enabled publication inside the inspection generation");
+            assert!(baseline_witness::assert_current(root.path(),control.path(),&prepared).is_err(),"raw result manufactured a qualification witness");
+            guard.finish().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires isolated delegated service and no enclosing managed build lease; executor owns normal build admission"]
+    fn original_verifier_recovery_executes_the_frozen_recipe_without_a_model() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (root,control,prepared,mut guard)=fixture().await;
+            let database=control.path().join("workflow.db");
+            let original=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),
+                &environment_id(root.path()).unwrap(),&verifier_executor_id().unwrap()).unwrap();
+            // Inject an interruption after recipe retention but before command
+            // admission. Recovery must execute this exact original proposal.
+            let error=original.failed(anyhow::Error::from(initial_repair::Hold::InfrastructureUnavailable));
+            drop(original);hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            let guard=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().unwrap();
+            assert!(recover_original_verifier(root.path(),control.path(),&guard).await.unwrap());
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,0);
+            assert_eq!(after.checkpoint.next.action,"qualify_original_measurement");
+            assert_eq!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().len(),1);
+            assert_eq!(guard.verifier_evidence_page("original_verifier_command_quiescent",0).unwrap().len(),1);
+            let results=guard.verifier_evidence_page("original_verifier_result",0).unwrap();assert_eq!(results.len(),1);
+            let actual:RecordedResult=serde_json::from_str(&results[0].body).unwrap();
+            assert_eq!(actual.baseline.registration.baseline_result(&actual.baseline.receipts).unwrap(),BaselineResult::Reproduced);
+            assert!(baseline_witness::assert_current(root.path(),control.path(),&prepared).is_err());
+            guard.finish().unwrap();
+        });
     }
 
     #[tokio::test]

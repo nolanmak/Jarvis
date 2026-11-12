@@ -389,6 +389,17 @@ pub fn spawn_command(
     Ok((child, CommandGuard(guard)))
 }
 
+/// Launch a raw verifier with receipts owned by a durable cleanup hold. No VM
+/// composition or inherited storage capability is added. Only pre-spawn work
+/// may return an error; admission installs the resource audit before release.
+pub fn spawn_command_at(command:&tokio::process::Command,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,directory:&Path)
+    ->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory)?;
+    Ok((child,CommandGuard(guard)))
+}
+
 fn build_policy_or_defer(policy: Result<serde_json::Value>, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> Result<serde_json::Value> {
     match policy {
         Ok(policy) => Ok(policy),
@@ -433,15 +444,17 @@ mod tests {
     fn raw_verifier_cleanup_hold_survives_owner_drop_until_kernel_quiescence() {
         crate::build_storage_ci_holds::with_test_registry(|root,_| {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
                 let source=root.join("source");let session=root.join("runtime");let target=root.join("target");
                 for path in [&source,&session,&target] {std::fs::create_dir(path).unwrap();}
                 let mut hold=crate::build_storage_ci_holds::Hold::begin(root,&source,&session,&target,&"a".repeat(64)).unwrap();
                 let mut command=tokio::process::Command::new("/usr/bin/python3");
-                command.args(["-I","-c","import os,sys; assert 'JARVIS_STORAGE_LEASE_FDS' not in os.environ; sys.stdin.readline()"])
+                command.args(["-I","-c","import os,sys; assert 'JARVIS_STORAGE_LEASE_FDS' not in os.environ; print('ready',flush=True); sys.stdin.readline()"])
                     .env_clear().env("PATH","/usr/bin:/bin");
-                let (mut child,resources)=super::spawn_command(&command,None).unwrap();
+                let (mut child,resources)=super::spawn_command_at(&command,None,hold.supervisor()).unwrap();
                 resources.admit_with_observer("raw_verifier_cleanup_test",None,|admission|hold.bind(admission)).await.unwrap();
+                let mut output=BufReader::new(child.stdout.take().unwrap());let mut ready=String::new();
+                output.read_line(&mut ready).await.unwrap();assert_eq!(ready,"ready\n");
                 assert!(!crate::build_storage_ci_holds::may_cleanup(&source).unwrap());
                 // Lose the controller's hold object while the admitted child
                 // is still live. Actual kernel evidence must retain the fence.

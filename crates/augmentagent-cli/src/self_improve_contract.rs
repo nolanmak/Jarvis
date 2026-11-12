@@ -19,6 +19,7 @@ mod scope_authority;
 mod initial_repair;
 #[path = "self_improve_verifier_execution.rs"]
 mod verifier_execution;
+pub(super) use verifier_execution::recover_original_verifier;
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
@@ -605,6 +606,19 @@ async fn isolated_observation(
     isolated_observation_with_custody(root,target,invocation,audit,None).await
 }
 
+struct VerifierRuntime(Option<tempfile::TempDir>);
+impl VerifierRuntime {
+    fn path(&self)->&Path {self.0.as_ref().expect("owned verifier runtime").path()}
+}
+impl Drop for VerifierRuntime {
+    fn drop(&mut self) {
+        if let Some(directory)=self.0.take() {
+            if crate::build_storage::ci_holds::may_cleanup(directory.path()).unwrap_or(false) {drop(directory);}
+            else {let _=directory.keep();tracing::error!("verifier runtime preserved for verified cleanup recovery");}
+        }
+    }
+}
+
 async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:crate::autoship_contract::Invocation,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<(&verifier_execution::OriginalExecution<'_>,&str)>)->Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let canonical_target = target.canonicalize()?;
@@ -612,9 +626,10 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
         !root.starts_with(&canonical_target),
         "build cache cannot contain verifier source"
     );
-    let private = tempfile::Builder::new()
+    let private = VerifierRuntime(Some(tempfile::Builder::new()
         .prefix("autoship-verifier-")
-        .tempdir()?;
+        .tempdir()?));
+    std::fs::set_permissions(private.path(),std::fs::Permissions::from_mode(0o700))?;
     let runtime = private.path().join("runtime");
     std::fs::create_dir(&runtime)?;
     let home = runtime.join("home");
@@ -691,10 +706,24 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&cmd, Some(audit))?;
-    if let Some((context,verifier))=original {
-        resources.admit_with_observer("acceptance_verifier",Some(audit),|admission|context.admitted(verifier,admission)).await?;
-    }else {resources.admit("acceptance_verifier", Some(audit)).await?;}
+    let observed=original.is_some() || audit.run_resources_required()
+        || augmentagent_channel_core::run_resources::declared_policy()?.is_some();
+    let mut cleanup=if observed {Some(crate::build_storage::ci_holds::Hold::begin(root,root,private.path(),target,
+        &amendment::digest(&serde_json::to_vec(&(root,target))?))?)}else{None};
+    let spawned=if let Some(cleanup)=&cleanup {
+        augmentagent_channel_core::run_resources::spawn_command_at(&cmd,Some(audit),cleanup.supervisor())
+    } else {augmentagent_channel_core::run_resources::spawn_command(&cmd,Some(audit))};
+    let (mut child,resources)=match spawned {
+        Ok(spawned)=>spawned,
+        Err(error)=>{if let Some(cleanup)=&mut cleanup {cleanup.not_spawned()?;}return Err(error);},
+    };
+    if let Some(cleanup)=&mut cleanup {
+        resources.admit_with_observer("acceptance_verifier",Some(audit),|admission| {
+            cleanup.bind(admission)?;
+            if let Some((context,verifier))=original {context.admitted(verifier,admission)?;}
+            Ok(())
+        }).await?;
+    } else {resources.admit("acceptance_verifier",Some(audit)).await?;}
     drop(child.stdin.take());
     async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -724,6 +753,7 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
     }else {Ok(())};
     resource_outcome?;
     quiescence.map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    if let Some(cleanup)=&mut cleanup {cleanup.settle().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;}
     if invocation.program == "cargo" {
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
     }
@@ -1412,7 +1442,7 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
 async fn retain_initial_measurement<'a,F,Fut>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&'a workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
 where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::Future<Output=Result<BaselineEvidence>> {
     let base=actual_head(root).await?;let environment=environment_id(root)?;
-    let execution=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?);
+    let execution=verifier_executor_id()?;
     let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?);
     let path=|hash:&str|control.join(format!("baseline-measurement-{key}-{hash}.json"));
     if let Some(hash)=workflow.scope_stage_response(&key).map_err(initial_scope_error)? {
@@ -1429,7 +1459,7 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
         })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown));
     }
     let retained=verifier_execution::OriginalExecution::retained_result(root,workflow,proposal,&base,&environment,&execution)?;
-    let baseline=if let Some(retained)=retained {reproduce_observation(retained)?} else {
+    let baseline=if let Some((_,retained))=retained {reproduce_observation(retained)?} else {
         let original=verifier_execution::OriginalExecution::begin(workflow,proposal,&base,&environment,&execution)?;
         measure(original.clone()).await.map_err(|error|original.failed(error))?
     };
@@ -1441,6 +1471,10 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
     else {persist_baseline(&file,&baseline,&worker_roots(root))?;}
     workflow.record_scope_stage_response(&key,&hash)?;
     Ok(baseline)
+}
+
+fn verifier_executor_id()->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?))
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current

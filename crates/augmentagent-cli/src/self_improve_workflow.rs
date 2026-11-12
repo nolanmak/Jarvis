@@ -106,6 +106,9 @@ enum AcceptanceAuthority {
     Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
 }
 
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum AcquireMode {Productive,OwnerTurn,VerifierRecovery}
+
 fn source_from_workflow(id:&str)->Option<crate::autoship_contract::AcceptanceSource> {
     use crate::autoship_contract::AcceptanceSource;
     if let Some((_,number))=id.rsplit_once('#') {
@@ -675,12 +678,19 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
-        Self::acquire_mode_at(&path(),start,millis(),true).await
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::OwnerTurn).await
+    }
+    pub(super) async fn acquire_verifier_recovery(start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::VerifierRecovery).await
+    }
+    #[cfg(test)]
+    pub(super) async fn acquire_verifier_recovery_fixture(state:&Path,start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(state,start,millis(),AcquireMode::VerifierRecovery).await
     }
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
-        Self::acquire_mode_at(state,start,now,false).await
+        Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
-    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
+    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -715,14 +725,25 @@ impl WorkflowGuard {
         {
             binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
         }
-        if owner_turn {
+        if mode==AcquireMode::OwnerTurn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
+        } else if mode==AcquireMode::VerifierRecovery {
+            if !existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding && s.branch==start.branch
+                && s.checkpoint.stage==Stage::Scope && matches!((s.checkpoint.next.reason.as_str(),s.checkpoint.next.action.as_str()),
+                    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")|
+                    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"))) {return Ok(None);}
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
-        refresh_native_capacity(&mut store,&id,now)?;
+        if mode!=AcquireMode::VerifierRecovery {refresh_native_capacity(&mut store,&id,now)?;}
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
-        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
-            else {store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?};
+        let lease=match mode {
+            AcquireMode::OwnerTurn=>store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease),
+            AcquireMode::VerifierRecovery=>store.claim_reconciliation(&id,&owner,now,LEASE_MS)?,
+            AcquireMode::Productive=>store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?,
+        };
         let Some(lease)=lease else {return Ok(None);};
+        if mode==AcquireMode::VerifierRecovery && store.original_verifier_recovery_plan(&lease,&binding,now)?.is_none() {
+            store.release(&lease,now)?;return Ok(None);
+        }
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -750,11 +771,13 @@ impl WorkflowGuard {
         }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
-        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
-            workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
-        })?;
-        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let acceptance_authority=if snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
+        if mode!=AcquireMode::VerifierRecovery {
+            audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
+            })?;
+            store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        }
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
             AcceptanceAuthority::RecoveryOnly
         }else {AcceptanceAuthority::Unbound};
         let guard = Self {
@@ -1469,6 +1492,18 @@ impl WorkflowGuard {
             .record_verifier_evidence(&self.lease,&self.binding,key,kind,body,millis())
     }
 
+    pub(super) fn original_verifier_recovery_plan(&self)->Result<Option<(String,String)>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .original_verifier_recovery_plan(&self.lease,&self.binding,millis())
+    }
+
+    pub(super) async fn complete_original_verifier_recovery(&self,plan:&str,result:&str)->Result<()> {
+        self.validate_before_side_effect()?;self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .complete_original_verifier_recovery(&self.lease,&self.binding,plan,result,millis())
+    }
+
     pub(super) fn verifier_evidence_page(&self,kind:&str,after:i64)->Result<Vec<durable::VerifierEvidence>> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
@@ -2156,7 +2191,7 @@ mod tests {
         let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap().admission.workflow;
         let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
         store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
-        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),AcquireMode::OwnerTurn).await.unwrap().unwrap();
         guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
         assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
         let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;

@@ -98,9 +98,10 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
   rotate inspection work so one unresolved request does not block peers or
   final merge reconciliation. Inspection does not create productive progress.
 
-The native-custody path below does not complete infrastructure recovery. Its
-operation-specific descriptor/API, all-cause producer coverage, exact replay
-recipe and release/reclaim tests remain open. They
+The native-custody path below does not complete infrastructure recovery. The
+original-plan executor and result handoff now have component coverage below;
+unknown-result settlement, all-cause producer coverage and fair scheduling
+remain open. They
 must be resolved in code and tests; they are not requests for an owner-selected
 limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
 #1703 live/soak acceptance remain separate requirements.
@@ -164,15 +165,18 @@ must succeed before another semantic correction. Tests distinguish these two
 boundaries and cover process exit before/after intent persistence as well as
 existing response, failed-result and unpersisted-success boundaries.
 
-This is input retention, not a replay permit. The complete operation recipe,
-actual command-admission custody, original-command quiescence, isolated replay
-and normal qualification handoff below still need implementation.
+This is input retention, not a replay permit. The original executor and
+inspection-only replay below bind it to the actual measurement. Unknown-result
+settlement and scheduling still block rollout.
 
 ## Implemented unpaid infrastructure-inspection boundary
 
 The existing reconciliation claim recognizes a verifier-infrastructure hold
 inside its claim transaction. It records `qualification_recovery_claimed` for
 the exact new lease generation without incrementing productive attempts.
+An original raw-verifier evidence-unknown hold is inspectable only when its
+controller-retained plan classification matches the exact checkpoint. This
+does not make an unrelated semantic unknown inspectable or recoverable.
 Claims are spaced at least five minutes apart for the same workflow/input
 binding, including across restart. Genuinely changed inputs do not inherit an
 older operation's retry delay. Owner pauses, pending mutations, uncertain merge dispatch and
@@ -206,11 +210,35 @@ An isolated delegated-service test exercised a live command, refusal to call
 its live scope quiescent, and successful quiescence after exit. This verifies
 the existing kernel boundary, not an autonomous workflow or a recovery replay.
 
-This boundary is not the infrastructure replayer. Replaying the retained plan
-through the existing isolated executor, retaining its actual result, and wiring
-fair five-minute wake/selection remain required. The raw verifier currently
-holds storage leases in the controller; lease lifetime across controller loss
-also needs checking before replay is enabled.
+The executor now retains its actual registered result before classifying red,
+non-red or infrastructure failure. Conclusive original results re-enter the
+normal measurement coordinator without another command. Exact original-plan,
+registration, command admission and kernel-quiescence evidence are checked;
+missing, altered or conflicting results remain unknown. A conclusive non-red
+result feeds the original bounded correction slot, never acceptance success.
+
+The inspection replayer loads only the held protected plan and requires the
+same workflow binding, original base, environment and executor identity. It
+uses the existing isolated raw executor and normal storage/resource admission,
+without a native-model runtime owner. Its transaction hands a retained result
+back to ordinary qualification or correction while preserving binding, evidence,
+charges and productive attempts. The inspection generation remains unable to
+admit models or publication after that handoff. Failure to retain the recovery
+event rolls back the checkpoint transition.
+
+Resource-backed raw verifiers now use the existing durable CI cleanup hold for
+their supervisor receipts, source, runtime and target. If the controller exits,
+normal cleanup and build admission require verified original scope quiescence.
+The raw child receives no inherited storage-lock capability. A real delegated
+kernel test confirms that losing the hold object while the child is live keeps
+cleanup fenced until that exact scope is empty. Unprotected fixtures without a
+resource declaration retain their existing non-resource execution path.
+
+Recovery is not ready for rollout. An earlier admitted command can have an
+unknown result even after quiescence; original-result settlement is still
+required before another attempt. Bounded fair five-minute wake/selection is
+also unfinished. The saved-result component tests do not prove unattended
+selection, independent qualification, publication or merging.
 
 ## Open threads from the fresh-eyes checkpoint
 

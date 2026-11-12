@@ -944,9 +944,9 @@ impl WorkflowStore {
         };
         let mut cp: Checkpoint = serde_json::from_str(&raw)?;
         let qualification_inspection=purpose==ClaimPurpose::MergeReconciliation
-            && qualification_recovery::infrastructure_hold(&cp);
+            && (qualification_recovery::infrastructure_hold(&cp) || verifier_custody::original_hold_matches(&tx,workflow,&cp)?);
         if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
-            && cp.next.reason=="acceptance_verifier_evidence_unknown" {return Ok(None);}
+            && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
             ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|

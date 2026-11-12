@@ -601,6 +601,12 @@ pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<Atom
     -> std::io::Result<(Child, ProcessGroup)> {
     spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None)
 }
+/// Raw command with externally retained supervisor receipts. Its declared
+/// resource policy is unchanged, and no storage descriptors reach the child.
+pub(crate) fn spawn_admitted_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path)
+    ->std::io::Result<(Child,ProcessGroup)> {
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory))
+}
 /// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
 /// supervisor's own declaration lookup (the builder tier).
 pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
