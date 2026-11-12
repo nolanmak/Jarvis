@@ -39,9 +39,40 @@ pub(super) async fn preflight(
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<()> {
     audit.dispatch_allowed()?;
-    use sha2::{Digest, Sha256};
     let tree = shared_ci::git(root, &["write-tree"]).await?;
     let tree = tree.trim();
+    if let Err(error)=policy_check(root,tree).await {
+        if let Some(dependency)=inherited_policy_drift(root,tree,"HEAD").await? {
+            audit.record_controller(serde_json::json!({"kind":"hosted_ci_main_reconciliation_required",
+                "index_tree":tree,"main":dependency.main,"shipping_authority":false}))?;
+            return Err(dependency.into());
+        }
+        return Err(error);
+    }
+    audit.record_controller(
+        serde_json::json!({"kind":"hosted_ci_pending_publication", "index_tree":tree.trim(),
+        "backend":"github-actions", "shipping_authority":false}),
+    )?;
+    Err(AwaitingHostedCi.into())
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MainPolicyReconciliation {
+    pub main: String,
+}
+impl std::fmt::Display for MainPolicyReconciliation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "retained candidate requires reviewed-main reconciliation to {}",
+            self.main
+        )
+    }
+}
+impl std::error::Error for MainPolicyReconciliation {}
+
+async fn policy_check(root: &Path, tree: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
     let contract: Value = serde_json::from_str(CONTRACT)?;
     let workflows = contract["workflows"]
         .as_object()
@@ -76,11 +107,62 @@ pub(super) async fn preflight(
             "hosted CI command policy changed; reviewed controller rollout required: {path}"
         );
     }
-    audit.record_controller(
-        serde_json::json!({"kind":"hosted_ci_pending_publication", "index_tree":tree.trim(),
-        "backend":"github-actions", "shipping_authority":false}),
-    )?;
-    Err(AwaitingHostedCi.into())
+    Ok(())
+}
+
+/// A dependency only: never authorizes publication or accepts candidate pins.
+/// Compare immutable Git objects, including inventory and modes, against the
+/// actual merge base. Main must independently match the controller's pins.
+pub(super) async fn inherited_policy_drift(
+    root: &Path,
+    tree: &str,
+    head: &str,
+) -> Result<Option<MainPolicyReconciliation>> {
+    let main = match shared_ci::git(
+        root,
+        &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+    )
+    .await
+    {
+        Ok(main) => main.trim().to_owned(),
+        Err(_) => return Ok(None),
+    };
+    if policy_check(root, &main).await.is_err() {
+        return Ok(None);
+    }
+    let base = match shared_ci::git(root, &["merge-base", &main, head]).await {
+        Ok(base) => base.trim().to_owned(),
+        Err(_) => return Ok(None),
+    };
+    let entries = |revision: &str| {
+        vec![
+            "ls-tree".to_owned(),
+            "-r".into(),
+            revision.to_owned(),
+            "--".into(),
+            ".github/workflows".into(),
+            "scripts/ci-contract.py".into(),
+            "scripts/ci-contract.json".into(),
+            "scripts/ci-apt-install.py".into(),
+            "scripts/ci-pinned-tools.py".into(),
+        ]
+    };
+    let candidate = entries(tree);
+    let baseline = entries(&base);
+    let candidate = shared_ci::git(
+        root,
+        &candidate.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await?;
+    let baseline = shared_ci::git(
+        root,
+        &baseline.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(
+        (candidate == baseline && policy_check(root, tree).await.is_err())
+            .then_some(MainPolicyReconciliation { main }),
+    )
 }
 
 pub(super) async fn observe(root: &Path, pr: Option<u64>, head: Option<&str>) -> Result<Evidence> {
@@ -323,6 +405,274 @@ mod tests {
             MainVerdict::Pending(why) if why.contains("p1") && why.contains("failed")));
         assert!(matches!(decide_main(&obs(&[("h", "pending"), ("p1", "pending")])), MainVerdict::Pending(_)));
         assert!(matches!(decide_main(&[]), MainVerdict::Pending(_)));
+    }
+
+    async fn policy_git(root: &Path, args: &[&str]) -> String {
+        let (ok, stdout, stderr) = run("git", args, root).await.unwrap();
+        assert!(ok, "{args:?}: {stderr}");
+        stdout.trim().into()
+    }
+    async fn commit_policy_fixture(root: &Path, message: &str) -> String {
+        policy_git(root, &["add", "-A"]).await;
+        policy_git(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ],
+        )
+        .await;
+        policy_git(root, &["rev-parse", "HEAD"]).await
+    }
+    async fn retained_policy_fixture(root: &Path) -> (String, String) {
+        use sha2::{Digest, Sha256};
+        std::fs::create_dir(root).unwrap();
+        policy_git(root, &["init", "-q", "-b", "main"]).await;
+        let contract: Value = serde_json::from_str(CONTRACT).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for path in contract["workflows"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain([
+                "scripts/ci-contract.py",
+                "scripts/ci-contract.json",
+                "scripts/ci-apt-install.py",
+                "scripts/ci-pinned-tools.py",
+            ])
+        {
+            let destination = root.join(path);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(source.join(path), destination).unwrap();
+        }
+        let path = ".github/workflows/apple-notes.yml";
+        let current = std::fs::read(root.join(path)).unwrap();
+        let mut legacy = current.clone();
+        legacy.extend_from_slice(b"\n# previous reviewed policy\n");
+        std::fs::write(root.join(path), &legacy).unwrap();
+        let mut older = contract.clone();
+        older["workflows"][path]["sha256"] = format!("{:x}", Sha256::digest(&legacy)).into();
+        std::fs::write(
+            root.join("scripts/ci-contract.json"),
+            serde_json::to_vec_pretty(&older).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("product"), "before").unwrap();
+        let old = commit_policy_fixture(root, "older reviewed base").await;
+        std::fs::write(root.join(path), current).unwrap();
+        std::fs::write(root.join("scripts/ci-contract.json"), CONTRACT).unwrap();
+        let main = commit_policy_fixture(root, "current reviewed policy").await;
+        policy_git(root, &["update-ref", "refs/remotes/origin/main", &main]).await;
+        policy_git(root, &["checkout", "-q", "-b", "candidate", &old]).await;
+        std::fs::write(root.join("product"), "preserved fix").unwrap();
+        policy_git(root, &["add", "product"]).await;
+        (old, main)
+    }
+    #[tokio::test]
+    async fn inherited_policy_drift_requests_reconciliation_without_blessing_stale_ci() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().join("repo");
+        let (old, main) = retained_policy_fixture(&root).await;
+        let audit = test_resource_audit(directory.path());
+        let before = policy_git(&root, &["write-tree"]).await;
+        let error = preflight(&root, &audit).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("retained candidate requires reviewed-main reconciliation"),
+            "wrong custody for inherited policy: {error:#}"
+        );
+        assert!(
+            error.downcast_ref::<AwaitingHostedCi>().is_none(),
+            "stale policy must not grant publication/verification"
+        );
+        assert_eq!(policy_git(&root, &["write-tree"]).await, before);
+        assert_eq!(policy_git(&root, &["rev-parse", "HEAD"]).await, old);
+        assert_eq!(policy_git(&root, &["rev-parse", "origin/main"]).await, main);
+        assert_eq!(
+            std::fs::read_to_string(root.join("product")).unwrap(),
+            "preserved fix"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_policy_edits_cannot_masquerade_as_inherited_drift() {
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().join("repo");
+        retained_policy_fixture(&root).await;
+        let path = ".github/workflows/apple-notes.yml";
+        let mut bytes = std::fs::read(root.join(path)).unwrap();
+        bytes.extend_from_slice(b"# candidate edit\n");
+        std::fs::write(root.join(path), &bytes).unwrap();
+        let mut contract: Value =
+            serde_json::from_slice(&std::fs::read(root.join("scripts/ci-contract.json")).unwrap())
+                .unwrap();
+        contract["workflows"][path]["sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
+        std::fs::write(
+            root.join("scripts/ci-contract.json"),
+            serde_json::to_vec_pretty(&contract).unwrap(),
+        )
+        .unwrap();
+        policy_git(&root, &["add", path, "scripts/ci-contract.json"]).await;
+        let audit = test_resource_audit(directory.path());
+        let error = preflight(&root, &audit).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<MainPolicyReconciliation>().is_none(),
+            "candidate edits must not be called inherited policy"
+        );
+        assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
+    }
+    #[tokio::test]
+    async fn unreviewed_main_policy_cannot_supply_reconciliation_authority() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().join("repo");
+        let (old, _) = retained_policy_fixture(&root).await;
+        let path = ".github/workflows/apple-notes.yml";
+        let original = std::fs::read(root.join(path)).unwrap();
+        let mut bytes = original.clone();
+        bytes.extend_from_slice(b"# not in deployed controller\n");
+        std::fs::write(root.join(path), bytes).unwrap();
+        policy_git(&root, &["add", path]).await;
+        let tree = policy_git(&root, &["write-tree"]).await;
+        let future = policy_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                &tree,
+                "-p",
+                &old,
+                "-m",
+                "future policy",
+            ],
+        )
+        .await;
+        policy_git(&root, &["update-ref", "refs/remotes/origin/main", &future]).await;
+        std::fs::write(root.join(path), original).unwrap();
+        policy_git(&root, &["add", path]).await;
+        let audit = test_resource_audit(directory.path());
+        let error = preflight(&root, &audit).await.unwrap_err();
+        assert!(error.downcast_ref::<MainPolicyReconciliation>().is_none());
+        assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_parked_policy_drift_gets_a_same_day_reconciliation_without_state_edits() {
+        use crate::autoship_workflow::{Binding, NextAction, Stage, WorkflowStore};
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().join("repo");
+        retained_policy_fixture(&root).await;
+        let head = commit_policy_fixture(&root, "preserved candidate").await;
+        let path = directory.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let id = "owner/repo#7";
+        store
+            .register(
+                id,
+                "candidate",
+                Binding {
+                    head: head.clone(),
+                    contract: "contract".into(),
+                    evidence_hash: "evidence".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let lease = store
+            .claim(id, "previous-worker", 2, 1000)
+            .unwrap()
+            .unwrap();
+        store
+            .attach_pr_in_repo(&lease, "owner/repo", 42, 3)
+            .unwrap();
+        let mut checkpoint = store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.stage = Stage::Reconcile;
+        checkpoint.next = NextAction {
+            reason: "draft_parked".into(),
+            action: "resume".into(),
+            eligible_at_ms: 4,
+        };
+        store.checkpoint(&lease, &checkpoint, 4).unwrap();
+        store.release(&lease, 5).unwrap();
+        let candidate = adoption::AdoptedPr {
+            repository: "owner/repo".into(),
+            pr: 42,
+            source_issue: Some(7),
+            branch: "candidate".into(),
+            head,
+            base: "main".into(),
+            author: "owner".into(),
+            title: "ordinary fix".into(),
+            body: "source issue".into(),
+            dependency: adoption::Dependency::Main,
+        };
+        let candidates = [candidate];
+        let before = store.snapshot(id).unwrap().unwrap();
+        let mut ledger = AttemptLedger::default();
+        ledger.mark(1, 7);
+        let retries = adoption::policy_reconciliation_retries(&root, &path, &candidates, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            adoption::select_linked_with_retries(
+                &candidates,
+                &ledger,
+                1,
+                &Default::default(),
+                None,
+                0,
+                &retries
+            )
+            .map(|p| p.0),
+            Some(42),
+            "inherited CI policy must not wait for the next UTC day"
+        );
+        assert_eq!(
+            store.snapshot(id).unwrap().unwrap(),
+            before,
+            "eligibility observation must not edit workflow state or accounting"
+        );
+        store
+            .set_owner_pause(id, "github:owner", 0, true, 11)
+            .unwrap();
+        assert!(
+            adoption::policy_reconciliation_retries(&root, &path, &candidates, 12)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .set_owner_pause(id, "github:owner", 1, false, 13)
+            .unwrap();
+        let lease = store
+            .claim_productive(id, "resuming-worker", 20, 1000)
+            .unwrap()
+            .unwrap();
+        let mut checkpoint = store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.next = NextAction {
+            reason: "resume_started".into(),
+            action: "reconcile_main".into(),
+            eligible_at_ms: 20,
+        };
+        store.checkpoint(&lease, &checkpoint, 21).unwrap();
+        store.release(&lease, 22).unwrap();
+        assert!(
+            adoption::policy_reconciliation_retries(&root, &path, &candidates, 23)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unchanged policy after a started attempt must not buy another same-day retry"
+        );
     }
 
     #[tokio::test]

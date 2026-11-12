@@ -193,6 +193,56 @@ pub(super) fn episode_retries(
     Ok(result)
 }
 
+pub(super) async fn policy_reconciliation_retries(
+    repo: &Path,
+    path: &Path,
+    candidates: &[AdoptedPr],
+    now: i64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let mut retries = std::collections::BTreeSet::new();
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(retries);
+    };
+    for candidate in candidates {
+        if !candidate.ready_for_review()
+            || candidate.source_issue.is_none()
+            || !matches!(candidate.head.len(), 40 | 64)
+            || !candidate.head.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
+            continue;
+        };
+        let Some(snapshot) = store.snapshot(&id)? else {
+            continue;
+        };
+        if snapshot.lease_until_ms > now
+            || snapshot.checkpoint.next.eligible_at_ms > now
+            || snapshot.pr != Some(candidate.pr)
+            || snapshot.checkpoint.binding.head != candidate.head
+            || snapshot.checkpoint.stage != crate::autoship_workflow::Stage::Reconcile
+            || snapshot.checkpoint.next.reason != "draft_parked"
+            || snapshot.checkpoint.next.action != "resume"
+            || store
+                .owner_control(&id)?
+                .is_some_and(|control| control.paused)
+            || store.pending_owner_messages(&id)? > 0
+        {
+            continue;
+        }
+        // Only the unmodified inherited policy can reopen this legacy state.
+        // Missing objects/policy evidence never create a scheduling grant.
+        if matches!(
+            hosted_ci::inherited_policy_drift(repo, &candidate.head, &candidate.head).await,
+            Ok(Some(_))
+        ) {
+            retries.insert(candidate.pr);
+        }
+    }
+    Ok(retries)
+}
+
 pub(super) fn select_linked_with_retries(
     candidates: &[AdoptedPr],
     ledger: &AttemptLedger,
