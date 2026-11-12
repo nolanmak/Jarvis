@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(selected.len(),1,"semantic holds never reach authenticated free inspection");
         assert_eq!(selected[0].snapshot.workflow,id);
         assert_eq!(store.snapshot(id).unwrap().unwrap(),before,"selection claimed or charged execution");
-        assert!(store.recover_semantic_qualification(&before,None,&"b".repeat(64),11,|_|Ok(Some("c".repeat(64)))).unwrap());
+        assert!(store.recover_semantic_qualification(&before,None,&"b".repeat(64),11,|_,_|Ok(Some("c".repeat(64)))).unwrap());
         assert!(store.has_due_qualification_recovery(Some("owner/repo"),11).unwrap(),"semantic handoff never wakes existing normal dispatch");
         assert_eq!(store.due_qualification_recovery(Some("owner/repo"),11).unwrap(),vec![id.to_string()]);
         let after=store.snapshot(id).unwrap().unwrap();

@@ -2045,7 +2045,8 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
 
 pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
-    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    _binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    _evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
     let Some(prepared)=retained_prepared(root,control,source)? else{return Ok(None)};
     baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)
 }

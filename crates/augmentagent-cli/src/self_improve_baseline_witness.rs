@@ -381,6 +381,20 @@ mod tests {
             let (response_key,proof_key)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
             guard.record_scope_stage_response_pair(&response_key,&raw,&proof_key,&provenance).unwrap();
             assert!(retained_semantic_judgment(root.path(),&prepared,&guard.baseline_native_custody().unwrap()).unwrap().is_some());
+            #[cfg(target_os="linux")]
+            {
+                verifier_execution::retain_scripted_original_data(root.path(),&native_control,&prepared,&guard).unwrap();
+                for path in prepared.proposal.files.keys() {std::fs::remove_file(root.path().join(path)).unwrap();}
+                let store=crate::autoship_workflow::WorkflowStore::open_read_only(&database).unwrap().unwrap();
+                let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+                let custody=store.inspect_baseline_native_custody(guard.id()).unwrap();
+                let recovered=inspect_retained_semantic(root.path(),&native_control,AcceptanceSource::PullRequest(840),guard.binding(),&custody,&store.inspect_verifier_evidence(guard.id())).unwrap();
+                assert!(recovered.is_some(),"free semantic inspector cannot consume a retained unenrolled result");
+                assert!(!root.path().join(prepared.proposal.files.keys().next().unwrap()).exists(),"semantic inspection installed an adapter");
+                assert!(prepared.baseline.registration.verify_integrity(root.path()).is_err());
+                assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+                install_harness(root.path(),&prepared.proposal).unwrap();
+            }
             let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
             let error=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
             assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"authenticated retained unknown did not enter existing repair: {error:#}");
@@ -444,7 +458,7 @@ mod tests {
         let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
         let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
         let custody=store.inspect_baseline_native_custody(&id).unwrap();
-        let identity=inspect_retained_semantic(&root,path.parent().unwrap(),prepared.proposal.contract.source().unwrap(),&custody).unwrap().expect("free controller cannot authenticate retained production judgment");
+        let identity=inspect_retained_semantic(&root,path.parent().unwrap(),prepared.proposal.contract.source().unwrap(),&before.checkpoint.binding,&custody,&store.inspect_verifier_evidence(&id)).unwrap().expect("free controller cannot authenticate retained production judgment");
         assert_eq!(identity.len(),64);
         assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);
         assert_eq!(store.events(&id).unwrap(),events);

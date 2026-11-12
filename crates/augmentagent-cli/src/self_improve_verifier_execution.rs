@@ -408,6 +408,14 @@ pub(in crate::self_improve) async fn recover_original_verifier(repo:&Path,contro
 }
 
 #[cfg(all(test,target_os="linux"))]
+pub(super) fn retain_scripted_original_data(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
+    let original=OriginalExecution::begin(workflow,control,&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment_id(root)?,"scripted old executor")?;
+    for verifier in &prepared.proposal.contract.verifiers {original.retain_admission(&verifier.id,&tests::gone_scope())?;}
+    OriginalExecution::quiesce_previous(workflow)?;
+    original.retain_result(root,&prepared.baseline)
+}
+
+#[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
     use std::cell::Cell;
@@ -423,7 +431,7 @@ mod tests {
 
     // Script only historical admission metadata. The kernel checker is real,
     // but a nonexistent random scope is not evidence of a live command test.
-    fn gone_scope()->serde_json::Value {
+    pub(super) fn gone_scope()->serde_json::Value {
         use sha2::{Digest,Sha256};
         serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),

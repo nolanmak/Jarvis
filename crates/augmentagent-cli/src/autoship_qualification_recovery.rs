@@ -55,7 +55,7 @@ impl WorkflowStore {
     /// neither a lease nor positive qualification and never creates a budget.
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
         policy:&str,now:i64,validate:F)->Result<bool>
-    where F:FnOnce(&[NativeScopeCustody])->Result<Option<String>> {
+    where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<String>> {
         let valid_hash=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         ensure!(valid_hash(policy),"semantic recovery policy identity is invalid");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -70,7 +70,8 @@ impl WorkflowStore {
         if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
             || pending_mutation(&tx,&expected.workflow)? || super::owner_inbox::pending(&tx,&expected.workflow)?>0 {return Ok(false);}
         let custody=baseline_native_custody(&tx,&expected.workflow)?;
-        let Some(identity)=validate(&custody)? else{return Ok(false)};
+        let inspection=VerifierEvidenceInspection::new(&tx,&expected.workflow);
+        let Some(identity)=validate(&custody,&inspection)? else{return Ok(false)};
         ensure!(valid_hash(&identity),"semantic recovery judgment identity is invalid");
         // Generation and owner revisions fence this transaction, but must not
         // turn the same original judgment into a fresh reconsideration budget.
@@ -200,21 +201,21 @@ mod tests {
                 .query_map([&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
         };
         let original_budgets=budgets(&store);let policy="b".repeat(64);let judgment="c".repeat(64);
-        assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody|{assert_eq!(custody.len(),1);Ok(Some(judgment.clone()))}).unwrap(),"authenticated semantic uncertainty never leaves its unchanged-input hold");
+        assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody,_|{assert_eq!(custody.len(),1);Ok(Some(judgment.clone()))}).unwrap(),"authenticated semantic uncertainty never leaves its unchanged-input hold");
         let after=store.snapshot(&lease.workflow).unwrap().unwrap();
         assert_eq!((after.generation,after.attempts,after.model_calls,after.tokens,after.wall_ms,after.lease_until_ms),
             (before.generation,before.attempts,before.model_calls,before.tokens,before.wall_ms,before.lease_until_ms));
         assert_eq!(after.checkpoint.binding,hold.binding);assert_eq!(after.checkpoint.evidence,hold.evidence);
         assert_eq!(after.checkpoint.stage,Stage::Reconcile);assert_eq!(after.checkpoint.next.action,"reconsider_verifier");
         assert_eq!(budgets(&store),original_budgets,"free re-entry rewrote the original repair budgets");
-        assert!(!store.recover_semantic_qualification(&before,None,&policy,8,|_|panic!("stale checkpoint reached semantic inspection")).unwrap());
+        assert!(!store.recover_semantic_qualification(&before,None,&policy,8,|_,_|panic!("stale checkpoint reached semantic inspection")).unwrap());
         // A later normal attempt must not make this same result new again.
         let normal=store.claim_productive(&lease.workflow,"normal-repair",9,1000).unwrap().unwrap();
         assert!(!store.admit_epoch_attempt(&normal,"verifier-amend-total","original-epoch",4,9).unwrap(),"re-entry reset exhausted original budget");
         store.checkpoint_native_custody_hold(&normal,&hold,10,false).unwrap();store.release(&normal,11).unwrap();
         drop(store);let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
         let repeated=store.snapshot(&lease.workflow).unwrap().unwrap();
-        assert!(!store.recover_semantic_qualification(&repeated,None,&policy,12,|_|Ok(Some(judgment))).unwrap(),"new generation/restart reused the same semantic recovery authority");
+        assert!(!store.recover_semantic_qualification(&repeated,None,&policy,12,|_,_|Ok(Some(judgment))).unwrap(),"new generation/restart reused the same semantic recovery authority");
         assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),repeated);
         assert_eq!(budgets(&store),original_budgets);
     }
@@ -233,7 +234,7 @@ mod tests {
             if obstruction=="revision" {store.set_owner_pause(&lease.workflow,"github:owner",0,false,7).unwrap();}
             if obstruction=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_semantic BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_witness_recovered' BEGIN SELECT RAISE(ABORT,'handoff store unavailable'); END;").unwrap();}
             let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
-            let result=store.recover_semantic_qualification(&expected,None,&"b".repeat(64),8,|_| {
+            let result=store.recover_semantic_qualification(&expected,None,&"b".repeat(64),8,|_,_| {
                 assert!(matches!(obstruction,"storage"|"no-judgment"),"{obstruction} reached semantic validation");
                 Ok(if obstruction=="no-judgment" {None}else{Some("c".repeat(64))})
             });

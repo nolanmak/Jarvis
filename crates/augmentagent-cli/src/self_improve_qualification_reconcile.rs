@@ -180,7 +180,7 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
     let owner_revision=store.owner_control(&snapshot.workflow)?.map(|control|control.revision);
     if store.recover_semantic_qualification(&snapshot,owner_revision,
         &acceptance::semantic_reconsideration_policy(),chrono::Utc::now().timestamp_millis(),
-        |custody|acceptance::inspect_retained_semantic(&context.worktree,&control,source,custody))? {
+        |custody,evidence|acceptance::inspect_retained_semantic(&context.worktree,&control,source,&snapshot.checkpoint.binding,custody,evidence))? {
         return Ok(());
     }
     drop(store);
