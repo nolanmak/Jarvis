@@ -2778,6 +2778,10 @@ print('[]')
     }
 }
 
+async fn enter_implementation_repair(workflow:&mut workflow::WorkflowGuard,_prepared:&PreparedAcceptance,_control:&Path)->Result<()> {
+    workflow.transition(crate::autoship_workflow::Stage::Build,"acceptance_failed","repair_implementation",0).await
+}
+
 /// Restrictive amendment callers must durably retain typed holds before
 /// returning through outer verification accounting.
 async fn restrictive_amendment_result(_workflow:&mut workflow::WorkflowGuard,_prepared:&PreparedAcceptance,
@@ -2786,6 +2790,37 @@ async fn restrictive_amendment_result(_workflow:&mut workflow::WorkflowGuard,_pr
 #[cfg(test)]
 mod restrictive_amendment_outcome_tests {
     use super::*;
+    #[tokio::test]
+    async fn unchanged_candidate_repair_restores_only_qualified_builder_admission() {
+        use crate::autoship_workflow::{WorkflowStore,Stage};
+        for qualified in [true,false] {
+            let (root,control,prepared)=baseline_witness::prepared_fixture();
+            baseline_witness::persist_scripted(root.path(),control.path(),&prepared,qualified).unwrap();
+            let path=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original complete owner request",environment:"frontend environment",
+            }).await.unwrap().unwrap();
+            guard.bind_acceptance_for_recovery(&prepared).unwrap();
+            guard.checkpoint(Stage::Scope,"verifier_definition_disputed","independent_verifier_authority",0,
+                &[format!("amendment-input:{}","a".repeat(64))]).await.unwrap();
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"recovery metadata authorized builder before positive revalidation");
+            let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let result=enter_implementation_repair(&mut guard,&prepared,control.path()).await;
+            if qualified {
+                result.unwrap();
+                guard.audit_logger().model_call_admitted("codex").expect("unchanged candidate repair lost qualified builder admission after amendment refusal/no-op");
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.model_calls,before.model_calls+1,"scripted admission must remain accounted exactly once");
+            }else {
+                assert!(result.is_err(),"negative witness restored builder authority");
+                assert!(guard.audit_logger().model_call_admitted("codex").is_err());
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint.stage,Stage::Scope);assert_eq!(after.model_calls,before.model_calls);
+            }
+            guard.finish().unwrap();
+        }
+    }
     #[tokio::test]
     async fn final_amendment_refusal_persists_input_hold_and_fences_unchanged_reclaims() {
         use crate::autoship_workflow::{WorkflowStore,ResourceCharge,Stage};
@@ -3071,14 +3106,7 @@ pub(super) async fn verify_with_repair_for(
                     return Err(error)
                         .context("acceptance repair budget consumed; autonomous re-scope queued");
                 }
-                workflow
-                    .transition(
-                        crate::autoship_workflow::Stage::Build,
-                        "acceptance_failed",
-                        "repair_implementation",
-                        0,
-                    )
-                    .await?;
+                enter_implementation_repair(workflow,prepared,control).await?;
                 let prompt = format!("Repair {} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", source, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
                 adoption::revise(
                     reasoner,
