@@ -179,6 +179,11 @@ pub(super) fn candidate_passes(root:&Path,control:&Path,prepared:&PreparedAccept
 /// production qualification always uses the protected native producer above.
 #[cfg(test)]
 pub(super) fn persist_scripted(root:&Path,control:&Path,prepared:&PreparedAcceptance,direct:bool)->Result<()> {
+    persist_scripted_measurement(root,control,prepared,if direct {Measurement::DirectProduction}else{Measurement::MissingFixture})
+}
+#[cfg(test)]
+fn persist_scripted_measurement(root:&Path,control:&Path,prepared:&PreparedAcceptance,measurement:Measurement)->Result<()> {
+    let direct=measurement==Measurement::DirectProduction;
     std::fs::create_dir_all(control)?;let control=control.canonicalize()?;
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     if artifact_path(&control,&expected).try_exists()? {return assert_current(root,&control,prepared);}
@@ -191,7 +196,7 @@ pub(super) fn persist_scripted(root:&Path,control:&Path,prepared:&PreparedAccept
     }else{vec![]};
     let judgment=Judgment {version:1,context:expected.clone(),verifiers:prepared.proposal.contract.verifiers.iter().map(|v|Witness {
         verifier_id:v.id.clone(),criterion_ids:prepared.proposal.contract.criteria.iter().filter(|c|c.verifier_ids.contains(&v.id)).map(|c|c.id.clone()).collect(),
-        measurement:if direct {Measurement::DirectProduction}else{Measurement::MissingFixture},original_fixture_available:direct,
+        measurement,original_fixture_available:direct,
         concrete_input:"scripted fixture's pinned production inputs".into(),reason:if direct {"Scripted authority confirms the direct production measurement in this synthetic fixture"}else{"Original fixture is absent and the observer measures candidate-owned test markers"}.into(),production_citations:citations.clone(),
     }).collect()};
     let raw=serde_json::to_string(&judgment)?;validate(root,&prepared.proposal,&prepared.baseline,&expected,&raw)?;
@@ -229,6 +234,60 @@ mod tests {
         let artifact:Artifact=serde_json::from_slice(&private_bytes(&artifact_path(control,&expected),64*1024).unwrap()).unwrap();
         serde_json::from_slice(&private_bytes(&raw_path(control,&expected,&artifact.response_sha256),2*1024*1024).unwrap()).unwrap()
     }
+    #[test]
+    fn authenticated_unknown_judgment_is_repairable_without_qualifying_or_replacing_evidence() {
+        let (root,control,prepared)=fixture();
+        persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+        let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
+        let artifact_bytes=private_bytes(&artifact_path(control.path(),&expected),64*1024).unwrap();
+        let artifact:Artifact=serde_json::from_slice(&artifact_bytes).unwrap();
+        let response=raw_path(control.path(),&expected,&artifact.response_sha256);
+        let original=private_bytes(&response,2*1024*1024).unwrap();
+        for _ in 0..2 {
+            let error=assert_current(root.path(),control.path(),&prepared).unwrap_err();
+            assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"completed authenticated uncertainty must reach bounded independent repair: {error:#}");
+            assert!(error.downcast_ref::<initial_repair::Hold>().is_none(),"semantic uncertainty became unavailable physical custody");
+            assert!(format!("{error:#}").contains("baseline_witness_invalid"));
+            assert_eq!(private_bytes(&response,2*1024*1024).unwrap(),original);
+            assert_eq!(private_bytes(&artifact_path(control.path(),&expected),64*1024).unwrap(),artifact_bytes);
+        }
+        std::fs::remove_file(&response).unwrap();
+        let lost=assert_current(root.path(),control.path(),&prepared).unwrap_err();
+        assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"missing physical evidence must remain an unpaid hold");
+    }
+
+    #[tokio::test]
+    async fn authenticated_unknown_reaches_existing_amendment_budget_without_new_models() {
+        const CHILD:&str="AUTOSHIP_UNKNOWN_AMENDMENT_FIXTURE";
+        if let Some(script)=std::env::var_os(CHILD).map(PathBuf::from) {
+            let (root,control,mut prepared)=fixture();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+            let base=prepared.baseline.registration.baseline_head().to_owned();
+            std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let database=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
+            let epoch=amendment::digest(&serde_json::to_vec(&(AcceptanceSource::PullRequest(840),&base,environment_id(root.path()).unwrap())).unwrap());
+            for _ in 0..4 {assert!(guard.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
+            let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            for _ in 0..2 {
+                let error=qualify_or_amend(&reasoner,AcceptanceSource::PullRequest(840),"original requirement",root.path(),control.path(),&mut prepared,&mut guard).await.unwrap_err();
+                assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted),"completed unknown never reached the existing bounded amendment authority: {error:#}");
+                let state=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(state.model_calls,0,"exhausted independent repair cannot query another model");
+                assert!(guard.bind_acceptance(&prepared,control.path()).is_err(),"unknown judgment authorized a builder");
+            }
+            guard.finish().unwrap();return;
+        }
+        let scripts=tempfile::tempdir().unwrap();let script=scripts.path().join("gh");
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::authenticated_unknown_reaches_existing_amendment_budget_without_new_models","--nocapture"])
+            .env(CHILD,&script).env("GH_BIN",&script).env("AUGMENTAGENT_RUN_RESOURCES","1")
+            .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn qualification_preserves_every_criterion_and_exact_original_source() {
         let (root,control,prepared)=fixture();persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
