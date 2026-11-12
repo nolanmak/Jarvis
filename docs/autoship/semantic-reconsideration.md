@@ -65,7 +65,11 @@ Read all retained baseline-native admissions and their paired response/proof.
 Require original charged custody, private immutable proof bytes, input/provider,
 witness purpose/base/context, supported producer policy, complete judgment
 schema/coverage and the exact full request hash reconstructed from proposal and
-baseline. A historical context is negative data only. The proof must belong to
+baseline. Only matching judgments containing Unknown are semantic recovery
+candidates. Identical identity duplicates are allowed; two distinct matching
+Unknown judgment identities are ambiguous and hold. Other judgment kinds are
+not semantic recovery inputs and cannot be promoted by this path; the current
+positive artifact, if any, is checked by normal qualification first. A historical context is negative data only. The proof must belong to
 this workflow's native namespace. Raw diagnostics stay private; public status
 exposes the blocker, not response text or private file contents.
 
@@ -94,8 +98,14 @@ requirements, not inherited approval from inspection.
 
 ## 4. Guarded preparation and launch boundary
 
-The guard authenticates the stored cue header, key and event generation, and
-uses it only for its exact current binding. Intermediate reasons such as
+The guard reads the latest semantic cue and requires its recorded event generation
+to equal its payload original generation and be no greater than the current
+workflow generation. It verifies the key and exact current binding; equality
+with the new productive generation is deliberately not required. A cue remains
+negative source context across intermediate checkpoints, not dispatch authority:
+normal eligibility, unchanged-input, lease and budget checks still decide entry.
+A changed binding or terminal workflow ends applicability. A current positive
+qualification takes the normal positive fast path. Intermediate reasons such as
 `resume_started` do not erase the cue or registered execution context. A recovered
 checkpoint without its source reference fails before a new claim. Enter with
 RecoveryOnly authority; this cannot authorize a builder.
@@ -149,7 +159,12 @@ remain billed independently of being held. Source absence is not host capacity.
 After lease release, the same free controller validates the restored source,
 owner/revision, pending input/effects and exact checkpoint/generation. Require
 the original judgment identity, including when the current inspection policy
-has changed. Atomically queue normal reconsideration and record
+has changed. Restoration always runs the current source/custody authentication
+rules, including the currently supported native producer policy; it never
+replays historical authentication rules. Unsupported old producer policy or
+source rejected by current rules stays held. The cue policy is the historical
+deduplication identity, not an authentication override. Atomically queue normal
+reconsideration and record
 `original_semantic_source_restored` with the loss event's sequence. Keep the
 original cue's key/policy and consumed budget. Consume each loss sequence once.
 
