@@ -1375,6 +1375,12 @@ impl WorkflowGuard {
             .scope_stage_response_pair(&self.lease,&self.binding,key,provenance_key,millis())
     }
 
+    pub(super) fn baseline_native_custody(&self)->Result<Vec<durable::NativeScopeCustody>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .baseline_native_custody(&self.lease,&self.binding,millis())
+    }
+
     pub(super) fn record_scope_stage_response_pair(&self,key:&str,response:&str,provenance_key:&str,provenance:&str)->Result<()> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
@@ -2969,6 +2975,35 @@ mod tests {
         let progress=store.progress_events(guard.id()).unwrap();
         assert_eq!(progress.last().unwrap().requested_provider,None);
         assert_eq!(progress.last().unwrap().actual_provider.as_deref(),Some("codex"),"native admission must project the provider that actually ran, independently of the requested pin");
+    }
+
+    #[tokio::test]
+    async fn workflow_restart_cannot_spend_a_second_witness_call_for_changed_inputs() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=||Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
+        let original=format!("{}{}",durable::BASELINE_NATIVE_PURPOSE_PREFIX,"a".repeat(64));
+        let result=guard.bounded_native_calls(original,1,
+            augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    guard.audit_logger().model_call_admitted("codex")?;
+                    Err::<(),_>(anyhow::anyhow!("scripted original response loss after admission"))
+                })).await;
+        assert!(result.is_err());
+        assert!(guard.baseline_native_custody().is_err());
+        let workflow=guard.id().to_owned();guard.finish().unwrap();
+        let next=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
+        let changed=format!("{}{}",durable::BASELINE_NATIVE_PURPOSE_PREFIX,"b".repeat(64));
+        let refused=next.bounded_native_calls(changed,1,
+            augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    next.audit_logger().model_call_admitted("codex")
+                })).await.unwrap_err();
+        assert!(refused.is::<durable::NativeScopeOutcomeUnresolved>(),"native admission lost its durable custody refusal: {refused:#}");
+        let store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,1);
+        assert_eq!(store.events(&workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),1);
+        next.finish().unwrap();
     }
 
     #[tokio::test]
