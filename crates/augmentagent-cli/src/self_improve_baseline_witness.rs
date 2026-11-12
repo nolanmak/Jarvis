@@ -283,7 +283,7 @@ mod tests {
             repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
             branch:"fixture",contract:"original owner requirements",environment:"fixture",
         }).await.unwrap().unwrap();
-        let observed=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+        let observed=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
             let conn=rusqlite::Connection::open(&database).unwrap();
             let plan:Option<String>=conn.query_row("SELECT response FROM scope_stage_response WHERE json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan'",[],|r|r.get(0)).optional().unwrap();
             let plan:serde_json::Value=serde_json::from_str(&plan.expect("original verifier could start without a frozen operation recipe")).unwrap();
@@ -297,23 +297,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_original_verifier_keeps_its_exact_recovery_plan() {
+        use rusqlite::OptionalExtension;
+        let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let error=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
+            Err::<BaselineEvidence,_>(BaselineNotRed {detail:"scripted original infrastructure failure".into(),kind:None}.into())
+        }).await.unwrap_err().context(initial_repair::Hold::InfrastructureUnavailable);
+        let conn=rusqlite::Connection::open(&database).unwrap();
+        let before:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+        conn.execute_batch("CREATE TRIGGER deny_original_hold BEFORE INSERT ON workflow_event WHEN NEW.kind='original_verifier_recovery_held' BEGIN SELECT RAISE(ABORT,'recovery history unavailable'); END;").unwrap();
+        assert!(hold_initial_error(&mut guard,&error).await.is_err());
+        let after:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+        assert_eq!(after,before,"hold committed without its exact recovery plan");
+        conn.execute_batch("DROP TRIGGER deny_original_hold;").unwrap();
+        hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+        let plan:String=conn.query_row("SELECT key FROM scope_stage_response WHERE json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan'",[],|r|r.get(0)).unwrap();
+        let held:Option<String>=conn.query_row("SELECT payload FROM workflow_event WHERE kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",[],|r|r.get(0)).optional().unwrap();
+        let held:serde_json::Value=serde_json::from_str(&held.expect("the infrastructure hold discarded its exact original operation")).unwrap();
+        assert_eq!(held["plan"],plan);assert_eq!(held["workflow"],guard.id());
+        assert_eq!(held["binding"],serde_json::to_value(guard.binding()).unwrap());
+        // A later semantic unknown must revoke the raw-operation recovery
+        // classification even when the candidate binding has not changed.
+        let semantic=anyhow::Error::from(initial_repair::Hold::EvidenceUnknown);
+        hold_initial_error(&mut guard,&semantic).await.unwrap().unwrap();
+        let latest:String=conn.query_row("SELECT payload FROM workflow_event WHERE kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+        let latest:serde_json::Value=serde_json::from_str(&latest).unwrap();
+        assert!(latest["plan"].is_null(),"semantic unknown inherited an older raw-operation recovery plan");
+        assert_eq!(latest["binding"],held["binding"]);
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn original_measurement_survives_restart_without_regeneration_or_lost_file_retry() {
         use std::cell::Cell;
         let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
         let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original scope",environment:"test"};
         let guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
-        let first=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {Ok(prepared.baseline.clone())}).await.unwrap();
+        let first=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {Ok(prepared.baseline.clone())}).await.unwrap();
         guard.finish().unwrap();
         let guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
         let reexecuted=Cell::new(false);
-        let second=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+        let second=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
             reexecuted.set(true);let mut noisy=prepared.baseline.clone();noisy.receipts[0].output_digest="b".repeat(64);Ok(noisy)
         }).await.unwrap();
         assert!(!reexecuted.get(),"a restart reran the original observation before native qualification");
         assert_eq!(serde_json::to_vec(&first).unwrap(),serde_json::to_vec(&second).unwrap());
         let retained=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().path()).find(|p|p.file_name().unwrap().to_string_lossy().starts_with("baseline-measurement-")).unwrap();
         std::fs::remove_file(retained).unwrap();
-        let lost=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+        let lost=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
             reexecuted.set(true);Ok(prepared.baseline.clone())
         }).await.unwrap_err();
         assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));

@@ -193,10 +193,24 @@ can remove the generation's model/publication restriction. It ends only with
 that fenced lease; a later ordinary productive claim for a real changed input
 uses the normal admission rules and original cumulative budgets.
 
-This boundary is not the infrastructure replayer. Capturing the exact original
-measurement recipe and command admission, proving that original descendants
-are quiescent, replaying through the existing isolated executor, retaining its
-actual result, and wiring fair five-minute wake/selection remain required.
+The original executor now retains its complete proposal, base, environment and
+executor identity before constructing the measurement future. The supervised
+command admission callback records the actual kernel scope before release;
+completion records its matching quiescence proof. Before another measurement,
+every earlier admitted scope in the workflow must be proven quiescent, including
+scopes from a different proposal or candidate binding. Missing or changed
+admission evidence blocks execution. Infrastructure holds retain the exact plan
+in the checkpoint transaction; a later semantic hold clears that classification.
+
+An isolated delegated-service test exercised a live command, refusal to call
+its live scope quiescent, and successful quiescence after exit. This verifies
+the existing kernel boundary, not an autonomous workflow or a recovery replay.
+
+This boundary is not the infrastructure replayer. Replaying the retained plan
+through the existing isolated executor, retaining its actual result, and wiring
+fair five-minute wake/selection remain required. The raw verifier currently
+holds storage leases in the controller; lease lifetime across controller loss
+also needs checking before replay is enabled.
 
 ## Open threads from the fresh-eyes checkpoint
 

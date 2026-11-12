@@ -17,6 +17,8 @@ mod amendment;
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
 mod initial_repair;
+#[path = "self_improve_verifier_execution.rs"]
+mod verifier_execution;
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
@@ -369,7 +371,14 @@ pub(super) async fn register_and_reproduce(
     proposal: ContractProposal,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<BaselineEvidence> {
-    let evidence=register_and_observe(root,proposal,audit).await?;
+    reproduce_observation(register_and_observe(root,proposal,audit).await?)
+}
+
+async fn register_and_reproduce_original(root:&Path,proposal:ContractProposal,audit:Arc<augmentagent_channel_core::AuditLogger>,original:verifier_execution::OriginalExecution<'_>)->Result<BaselineEvidence> {
+    reproduce_observation(register_and_observe_with_custody(root,proposal,&audit,Some(&original)).await?)
+}
+
+fn reproduce_observation(evidence:BaselineEvidence)->Result<BaselineEvidence> {
     match evidence.registration.baseline_result(&evidence.receipts)? {
         BaselineResult::Reproduced=>Ok(evidence),
         result=> {
@@ -383,6 +392,10 @@ pub(super) async fn register_and_reproduce(
     }
 }
 async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<augmentagent_channel_core::AuditLogger>)->Result<BaselineEvidence> {
+    register_and_observe_with_custody(root,proposal,audit,None).await
+}
+
+async fn register_and_observe_with_custody(root:&Path,proposal:ContractProposal,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<&verifier_execution::OriginalExecution<'_>>)->Result<BaselineEvidence> {
     let status = Command::new("/usr/bin/git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
@@ -398,7 +411,7 @@ async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<au
     install_harness(root, &proposal)?;
     let registration =
         RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
-    let receipts = execute_registered(root, &registration, audit).await?;
+    let receipts = execute_registered_with_custody(root, &registration, audit,original).await?;
     Ok(BaselineEvidence {registration,receipts})
 }
 /// Persist only under controller-owned state outside every admitted worker
@@ -485,10 +498,15 @@ async fn execute_registered(
     registration: &RegisteredContract,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
+    execute_registered_with_custody(root,registration,audit,None).await
+}
+
+async fn execute_registered_with_custody(root:&Path,registration:&RegisteredContract,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<&verifier_execution::OriginalExecution<'_>>)->Result<Vec<VerifierReceipt>> {
     let root = root.canonicalize()?;
     let head = actual_head(&root).await?;
     let binding = registration.binding(&head)?;
     registration.verify_integrity(&root)?;
+    if let Some(original)=original {original.require_registration(&root,registration)?;}
     let target = protected_verifier_target(&root, registration)?;
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
@@ -498,7 +516,7 @@ async fn execute_registered(
     for verifier in &registration.contract().verifiers {
         registration.verify_integrity(&root)?;
         let invocation = verifier.command.invocation()?;
-        let observation = isolated_observation(committed.path(), &target, invocation, audit).await?;
+        let observation = isolated_observation_with_custody(committed.path(), &target, invocation, audit,original.map(|context|(context,verifier.id.as_str()))).await?;
         ensure!(
             actual_head(&root).await? == head,
             "checkout changed while verifying"
@@ -582,6 +600,10 @@ async fn isolated_observation(
     invocation: crate::autoship_contract::Invocation,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Observation> {
+    isolated_observation_with_custody(root,target,invocation,audit,None).await
+}
+
+async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:crate::autoship_contract::Invocation,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<(&verifier_execution::OriginalExecution<'_>,&str)>)->Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let canonical_target = target.canonicalize()?;
     ensure!(
@@ -668,7 +690,9 @@ async fn isolated_observation(
         .kill_on_drop(true)
         .process_group(0);
     let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&cmd, Some(audit))?;
-    resources.admit("acceptance_verifier", Some(audit)).await?;
+    if let Some((context,verifier))=original {
+        resources.admit_with_observer("acceptance_verifier",Some(audit),|admission|context.admitted(verifier,admission)).await?;
+    }else {resources.admit("acceptance_verifier", Some(audit)).await?;}
     drop(child.stdin.take());
     async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -692,7 +716,12 @@ async fn isolated_observation(
         )
     })
     .await;
-    resources.record_outcome("acceptance_verifier", Some(audit))?;
+    let resource_outcome=resources.record_outcome("acceptance_verifier", Some(audit));
+    let quiescence=if let Some((context,verifier))=original {
+        resources.verified_quiescence().and_then(|proof|context.quiescent(verifier,&proof))
+    }else {Ok(())};
+    resource_outcome?;
+    quiescence.map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     if invocation.program == "cargo" {
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
     }
@@ -1295,7 +1324,8 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     // Record the safe hold first: loss of private diagnostic storage cannot
     // make the workflow runnable or publish the underlying source/output.
-    workflow.hold_initial_acceptance_custody(hold.reason(),hold.action(),native_custody_failure(error)).await?;
+    let original=error.downcast_ref::<verifier_execution::OriginalExecutionFailed>().map(|failure|failure.plan.as_str());
+    workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),native_custody_failure(error),original).await?;
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&(
         "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
@@ -1367,7 +1397,7 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
             trusted_git(root,&["reset","--hard",base]).await?;
             trusted_git(root,&["clean","-fdx"]).await?;
             let baseline=retain_initial_measurement(root,control,&proposal,workflow,
-                register_and_reproduce(root,proposal.clone(),&workflow.audit_logger())).await?;
+                |original|register_and_reproduce_original(root,proposal.clone(),workflow.audit_logger(),original)).await?;
             let prepared=PreparedAcceptance {proposal,baseline:baseline.clone()};
             baseline_witness::qualify(root,control,&prepared,workflow).await?;
             Ok(baseline)
@@ -1377,8 +1407,8 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
 /// Retain the actual successful measurement before any qualification model is
 /// admitted. Re-executing after a restart can change stderr/timing digests and
 /// must not turn one original observation into a new paid qualification input.
-async fn retain_initial_measurement<F>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
-where F:std::future::Future<Output=Result<BaselineEvidence>> {
+async fn retain_initial_measurement<'a,F,Fut>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&'a workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
+where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::Future<Output=Result<BaselineEvidence>> {
     let base=actual_head(root).await?;let environment=environment_id(root)?;
     let execution=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?);
     let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?);
@@ -1396,7 +1426,8 @@ where F:std::future::Future<Output=Result<BaselineEvidence>> {
             Ok(baseline)
         })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown));
     }
-    let baseline=measure.await?;
+    let original=verifier_execution::OriginalExecution::begin(workflow,proposal,&base,&environment,&execution)?;
+    let baseline=measure(original.clone()).await.map_err(|error|original.failed(error))?;
     ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
         && baseline.registration.binding(&base)?.environment_id==environment
         && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");

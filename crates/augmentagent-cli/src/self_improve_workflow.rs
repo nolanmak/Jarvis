@@ -1368,6 +1368,10 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn hold_initial_acceptance_custody(&mut self,reason:&str,action:&str,physical:bool)->Result<()> {
+        self.hold_initial_acceptance_verifier(reason,action,physical,None).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_verifier(&mut self,reason:&str,action:&str,physical:bool,plan:Option<&str>)->Result<()> {
         self.healthy_lease()?;
         self.audit_health().await?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -1378,7 +1382,7 @@ impl WorkflowGuard {
             "initial acceptance hold requires unchanged unenrolled scope");
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
-        store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
+        store.checkpoint_verifier_recovery_hold(&self.lease,&checkpoint,millis(),physical,plan)?;
         Ok(())
     }
 
@@ -1457,6 +1461,24 @@ impl WorkflowGuard {
     }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
+    }
+
+    pub(super) fn record_verifier_evidence(&self,key:&str,kind:&str,body:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_verifier_evidence(&self.lease,&self.binding,key,kind,body,millis())
+    }
+
+    pub(super) fn verifier_evidence_page(&self,kind:&str,after:i64)->Result<Vec<durable::VerifierEvidence>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence_page(&self.lease,&self.binding,kind,after,millis())
+    }
+
+    pub(super) fn verifier_evidence(&self,key:&str,kind:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence(&self.lease,&self.binding,key,kind,millis())
     }
 
     pub(super) fn scope_stage_response_pair(&self,key:&str,provenance_key:&str)->Result<Option<(String,String)>> {
