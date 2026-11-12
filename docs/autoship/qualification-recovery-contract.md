@@ -220,6 +220,18 @@ registration, command admission and kernel-quiescence evidence are checked;
 missing, altered or conflicting results remain unknown. A conclusive non-red
 result feeds the original bounded correction slot, never acceptance success.
 
+Baseline-file publication writes a private same-directory temporary file,
+syncs the complete content, exclusively publishes its final name and syncs the
+parent directory. Ordinary write errors remove the unpublished temporary file;
+process-exit leftovers remain unpublished in controller-owned state and are
+never treated as baseline evidence. Existing final names remain immutable.
+When a retry finds the exact completed file after an earlier directory-sync
+failure, it syncs that file and directory before committing the measurement's
+SQLite index. The partial-write regression then performs unpaid handoff from
+the protected raw result with one measurement attempt and zero model calls.
+The subprocess-crash regression exits during the write and verifies that a
+subsequent complete publication succeeds without overwriting any final name.
+
 The inspection replayer loads only the held protected plan and requires the
 same workflow binding, original base, environment and executor identity. It
 uses the existing isolated raw executor and normal storage/resource admission,

@@ -430,7 +430,7 @@ pub(super) fn persist_baseline(
 
 fn persist_baseline_with_writer(path:&Path,evidence:&BaselineEvidence,writable_roots:&[PathBuf],
     write:impl FnOnce(&mut std::fs::File,&[u8])->Result<()>)->Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
     let parent = path
         .parent()
         .context("evidence parent missing")?
@@ -442,14 +442,13 @@ fn persist_baseline_with_writer(path:&Path,evidence:&BaselineEvidence,writable_r
         );
     }
     let destination = parent.join(path.file_name().context("evidence filename missing")?);
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(destination)?;
-    write(&mut file,&serde_json::to_vec(evidence)?)?;
-    file.sync_all()?;
+    // An interrupted write must never occupy the content-addressed final
+    // name. Recovery may recreate it from the protected original result.
+    let mut file=tempfile::NamedTempFile::new_in(&parent)?;
+    file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    write(file.as_file_mut(),&serde_json::to_vec(evidence)?)?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(destination).map_err(|error|error.error)?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -1550,7 +1549,14 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
         && baseline.registration.binding(&base)?.environment_id==environment
         && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");
     let bytes=serde_json::to_vec(&baseline)?;let hash=amendment::digest(&bytes);let file=path(&hash);
-    if file.try_exists()? {ensure!(baseline_witness::private_bytes(&file,4*1024*1024)?==bytes,"retained measurement file changed");}
+    if file.try_exists()? {
+        use std::os::unix::fs::OpenOptionsExt;
+        ensure!(baseline_witness::private_bytes(&file,4*1024*1024)?==bytes,"retained measurement file changed");
+        // A previous publication may have returned after a directory-sync
+        // failure. Establish durability before committing its SQLite index.
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&file)?.sync_all()?;
+        std::fs::File::open(file.parent().context("measurement parent missing")?)?.sync_all()?;
+    }
     else {persist_baseline(&file,&baseline,&worker_roots(root))?;}
     workflow.record_scope_stage_response(&key,&hash)?;
     Ok(baseline)

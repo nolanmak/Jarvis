@@ -621,6 +621,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_atomic_publication_never_links_final_evidence() {
+        const CHILD:&str="AUTOSHIP_MEASUREMENT_RENAME_UNSUPPORTED";
+        if let Some(path)=std::env::var_os(CHILD) {
+            let path=PathBuf::from(path);
+            let evidence:BaselineEvidence=serde_json::from_slice(&std::fs::read(path.with_extension("input")).unwrap()).unwrap();
+            assert!(persist_baseline(&path,&evidence,&[]).is_err(),"unsupported atomic rename published evidence through a non-atomic fallback");
+            assert!(!path.exists(),"failed publication left a final hard link");return;
+        }
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let path=control.path().join("baseline.json");
+        std::fs::write(path.with_extension("input"),serde_json::to_vec(&prepared.baseline).unwrap()).unwrap();
+        // Exercise the real pinned library/kernel boundary in a disposable
+        // child: force the unavailable-rename path and a failed link cleanup.
+        let filter=r#"import ctypes, errno, os, sys
+s=ctypes.CDLL('libseccomp.so.2',use_errno=True)
+s.seccomp_init.argtypes=[ctypes.c_uint32];s.seccomp_init.restype=ctypes.c_void_p
+s.seccomp_syscall_resolve_name.argtypes=[ctypes.c_char_p];s.seccomp_syscall_resolve_name.restype=ctypes.c_int
+s.seccomp_rule_add.argtypes=[ctypes.c_void_p,ctypes.c_uint32,ctypes.c_int,ctypes.c_uint]
+s.seccomp_load.argtypes=[ctypes.c_void_p];s.seccomp_release.argtypes=[ctypes.c_void_p]
+c=s.seccomp_init(0x7fff0000)
+assert c
+for name,error in [(b'renameat2',errno.ENOSYS),(b'unlink',errno.EACCES),(b'unlinkat',errno.EACCES)]:
+    number=s.seccomp_syscall_resolve_name(name)
+    assert number>=0 and s.seccomp_rule_add(c,0x00050000|error,number,0)==0
+libc=ctypes.CDLL(None,use_errno=True)
+assert libc.prctl(38,1,0,0,0)==0 and s.seccomp_load(c)==0
+s.seccomp_release(c)
+os.execv(sys.argv[1],sys.argv[1:])
+"#;
+        let status=std::process::Command::new("/usr/bin/python3").args(["-I","-c",filter])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::verifier_execution::tests::unsupported_atomic_publication_never_links_final_evidence","--nocapture"])
+            .env(CHILD,&path).status().unwrap();
+        assert!(status.success(),"unsupported publication child failed");assert!(!path.exists());
+        persist_baseline(&path,&prepared.baseline,&worker_roots(root.path())).unwrap();
+        assert_eq!(baseline_witness::private_bytes(&path,4*1024*1024).unwrap(),serde_json::to_vec(&prepared.baseline).unwrap());
+    }
+
+    #[tokio::test]
     async fn infrastructure_only_result_does_not_install_a_harness_before_retry() {
         let (root,control,prepared,guard)=fixture().await;
         let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();let executor=verifier_executor_id().unwrap();
