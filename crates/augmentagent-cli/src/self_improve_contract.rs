@@ -375,7 +375,9 @@ pub(super) async fn register_and_reproduce(
 }
 
 async fn register_and_reproduce_original(root:&Path,proposal:ContractProposal,audit:Arc<augmentagent_channel_core::AuditLogger>,original:verifier_execution::OriginalExecution<'_>)->Result<BaselineEvidence> {
-    reproduce_observation(register_and_observe_with_custody(root,proposal,&audit,Some(&original)).await?)
+    let observed=register_and_observe_with_custody(root,proposal,&audit,Some(&original)).await?;
+    original.retain_result(root,&observed).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    reproduce_observation(observed)
 }
 
 fn reproduce_observation(evidence:BaselineEvidence)->Result<BaselineEvidence> {
@@ -1426,8 +1428,11 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
             Ok(baseline)
         })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown));
     }
-    let original=verifier_execution::OriginalExecution::begin(workflow,proposal,&base,&environment,&execution)?;
-    let baseline=measure(original.clone()).await.map_err(|error|original.failed(error))?;
+    let retained=verifier_execution::OriginalExecution::retained_result(root,workflow,proposal,&base,&environment,&execution)?;
+    let baseline=if let Some(retained)=retained {reproduce_observation(retained)?} else {
+        let original=verifier_execution::OriginalExecution::begin(workflow,proposal,&base,&environment,&execution)?;
+        measure(original.clone()).await.map_err(|error|original.failed(error))?
+    };
     ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
         && baseline.registration.binding(&base)?.environment_id==environment
         && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");

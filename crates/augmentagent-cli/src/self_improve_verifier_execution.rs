@@ -28,6 +28,25 @@ struct Quiescence {
     version:u32,kind:String,workflow:String,admission_sha256:String,evidence:serde_json::Value,
 }
 
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedResult {
+    version:u32,kind:String,workflow:String,plan:String,attempt:String,
+    baseline:BaselineEvidence,
+}
+
+fn result_key(plan:&str,attempt:&str)->String {
+    amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",plan,attempt)).unwrap())
+}
+
+fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
+    let plan=Plan {version:1,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding:workflow.binding().clone(),
+        base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone()};
+    let body=serde_json::to_string(&plan)?;
+    let key=amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?);
+    Ok((key,body))
+}
+
 fn command_key(plan:&str,attempt:&str,verifier:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-command-v1",plan,attempt,verifier)).unwrap())
 }
@@ -50,10 +69,7 @@ pub(super) struct OriginalExecution<'a> {
 
 impl<'a> OriginalExecution<'a> {
     pub(super) fn begin(workflow:&'a workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Self> {
-        let plan=Plan {version:1,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding:workflow.binding().clone(),
-            base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone()};
-        let body=serde_json::to_string(&plan)?;
-        let key=amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?);
+        let (key,body)=plan_input(workflow,proposal,base,environment,executor)?;
         workflow.record_verifier_evidence(&key,"original_verifier_plan",&body)?;
         Self::quiesce_previous(workflow).map_err(|e|e.context(OriginalExecutionFailed {plan:key.clone()}))?;
         let attempt=amendment::digest(uuid::Uuid::new_v4().as_bytes());
@@ -63,6 +79,70 @@ impl<'a> OriginalExecution<'a> {
         Ok(Self {workflow,plan:key,attempt,verifiers:proposal.contract.verifiers.iter().map(|v|v.id.clone()).collect(),
             base:base.into(),environment:environment.into(),contract:proposal.contract.clone(),
             files:proposal.files.iter().map(|(path,body)|(path.clone(),amendment::digest(body.as_bytes()))).collect()})
+    }
+
+    /// Retain the actual executor result before semantic classification. A
+    /// conclusive non-red observation must survive recovery too; it supplies
+    /// correction feedback, never passing acceptance or a witness judgment.
+    pub(super) fn retain_result(&self,root:&Path,baseline:&BaselineEvidence)->Result<()> {
+        self.require_registration(root,&baseline.registration)?;
+        baseline.registration.baseline_result(&baseline.receipts)?;
+        Self::require_result_commands(self.workflow,&self.plan,&self.attempt,baseline)?;
+        let record=RecordedResult {version:1,kind:"original_verifier_result".into(),workflow:self.workflow.id().into(),
+            plan:self.plan.clone(),attempt:self.attempt.clone(),baseline:baseline.clone()};
+        self.workflow.record_verifier_evidence(&result_key(&self.plan,&self.attempt),"original_verifier_result",&serde_json::to_string(&record)?)
+    }
+
+    fn require_result_commands(workflow:&workflow::WorkflowGuard,plan:&str,attempt:&str,baseline:&BaselineEvidence)->Result<()> {
+        for receipt in &baseline.receipts {
+            let key=command_key(plan,attempt,&receipt.verifier_id);
+            let raw=workflow.verifier_evidence(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
+            let admitted:Admission=serde_json::from_str(&raw)?;
+            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow.id()
+                && admitted.plan==plan && admitted.attempt==attempt && admitted.verifier==receipt.verifier_id,"result belongs to another command");
+            let raw_proof=workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
+            let proof:Quiescence=serde_json::from_str(&raw_proof)?;
+            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow.id()
+                && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
+                && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"result lacks matching kernel quiescence");
+        }
+        Ok(())
+    }
+
+    pub(super) fn retained_result(root:&Path,workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Option<BaselineEvidence>> {
+        let (plan,body)=plan_input(workflow,proposal,base,environment,executor)?;
+        (||->Result<Option<BaselineEvidence>> {
+            let saved=workflow.verifier_evidence(&plan,"original_verifier_plan")?;
+            if let Some(saved)=&saved {ensure!(saved==&body,"original verifier plan changed");}
+            let mut cursor=0;
+            let mut conclusive=None;
+            loop {
+                let rows=workflow.verifier_evidence_page("original_verifier_result",cursor)?;
+                if rows.is_empty() {break;}
+                for row in rows {
+                    cursor=row.sequence;
+                    let record:RecordedResult=serde_json::from_str(&row.body)?;
+                    ensure!(record.version==1 && record.kind=="original_verifier_result" && record.workflow==workflow.id()
+                        && result_key(&record.plan,&record.attempt)==row.key,"invalid original verifier result identity");
+                    if record.plan!=plan {continue;}
+                    ensure!(saved.is_some(),"original result lost its input plan");
+                    install_harness(root,proposal)?;
+                    let registered=RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment.into())?;
+                    ensure!(registered==record.baseline.registration,"retained result differs from original registration");
+                    record.baseline.registration.baseline_result(&record.baseline.receipts)?;
+                    Self::require_result_commands(workflow,&plan,&record.attempt,&record.baseline)?;
+                    if record.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
+                    if let Some(previous)=&conclusive {
+                        ensure!(serde_json::to_vec(previous)?==serde_json::to_vec(&record.baseline)?,"original operation has conflicting conclusive results");
+                    } else {conclusive=Some(record.baseline);}
+                }
+            }
+            if conclusive.is_some() {Self::quiesce_previous(workflow)?;}
+            Ok(conclusive)
+        })().map_err(|error| {
+            let error=if error.downcast_ref::<initial_repair::Hold>().is_some(){error}else{error.context(initial_repair::Hold::EvidenceUnknown)};
+            error.context(OriginalExecutionFailed {plan})
+        })
     }
 
     pub(super) fn require_registration(&self,root:&Path,registration:&RegisteredContract)->Result<()> {
