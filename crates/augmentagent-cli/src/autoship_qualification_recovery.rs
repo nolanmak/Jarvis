@@ -53,10 +53,38 @@ pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkp
 impl WorkflowStore {
     /// Queue consideration of authenticated negative source data. This grants
     /// neither a lease nor positive qualification and never creates a budget.
-    pub(crate) fn recover_semantic_qualification<F>(&mut self,_expected:&Snapshot,_owner_revision:Option<i64>,
-        _policy:&str,_now:i64,_validate:F)->Result<bool>
+    pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
+        policy:&str,now:i64,validate:F)->Result<bool>
     where F:FnOnce(&[NativeScopeCustody])->Result<Option<String>> {
-        Ok(false)
+        let valid_hash=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        ensure!(valid_hash(policy),"semantic recovery policy identity is invalid");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row:Option<(String,i64,i64,String,Option<u64>)>=tx.query_row(
+            "SELECT checkpoint,lease_until,generation,branch,pr FROM workflow WHERE id=?1",[&expected.workflow],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
+        let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        if !native_hold(&checkpoint) || checkpoint!=expected.checkpoint || generation!=expected.generation
+            || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
+        let control=owner_control::read(&tx,&expected.workflow)?;
+        if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
+            || pending_mutation(&tx,&expected.workflow)? || super::owner_inbox::pending(&tx,&expected.workflow)?>0 {return Ok(false);}
+        let custody=baseline_native_custody(&tx,&expected.workflow)?;
+        let Some(identity)=validate(&custody)? else{return Ok(false)};
+        ensure!(valid_hash(&identity),"semantic recovery judgment identity is invalid");
+        // Generation and owner revisions fence this transaction, but must not
+        // turn the same original judgment into a fresh reconsideration budget.
+        let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-reconsideration-v1",&expected.workflow,&identity,policy))?));
+        let consumed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' AND json_extract(payload,'$.key')=?2)",params![expected.workflow,key],|r|r.get(0))?;
+        if consumed {return Ok(false);}
+        checkpoint.stage=Stage::Reconcile;
+        checkpoint.next=NextAction {reason:"original_semantic_witness_recovered".into(),action:"reconsider_verifier".into(),eligible_at_ms:now};
+        let raw=serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
+        event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
+        event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
+            &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"qualification_required":true}).to_string(),now)?;
+        tx.commit()?;Ok(true)
     }
 
     /// Positive read-only restoration queues normal qualification. No lease,
