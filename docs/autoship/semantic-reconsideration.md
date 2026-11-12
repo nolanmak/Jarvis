@@ -86,21 +86,11 @@ body, PR dependency, retained checkout/branch/head and exact context binding.
 The authenticated frontend request must still match the retained context. A
 retained unpublished head needs the existing ownership/ancestor checks.
 
-The workflow branch names the authorized remote branch, not necessarily a
-symbolic HEAD in the retained checkout. The normal PR resume producer creates a
-registered detached worktree at its canonical per-PR resume path, while the
-published branch may remain attached to the original issue checkout (#2046).
-Checkout inspection accepts the expected attached branch, or a detached HEAD
-only at that same producer-derived canonical resume path for the matching PR.
-Use the shared path helper; do not reattach or rewrite a branch during inspection.
-Both shapes still require the complete unchanged protected context/binding and
-fresh remote branch/source identity. A published head must match exactly; an
-unpublished head still needs the existing confirmed-publication ownership and
-ancestor proof. Wrong attached refs, arbitrary detached paths, foreign linked
-repositories, changed inputs and unowned retained heads remain held. A detached
-issue-only checkout has no normal resume producer and is not authorized by this
-exception. Tests must drive the real producer into the same checkout validator
-used by recovery; the explicit production compatibility probe is read-only.
+The workflow branch identifies the authorized remote branch; a normal PR resume
+checkout can be detached. The producer/consumer amendment and its exact path,
+binding, ownership and refusal rules are specified in
+[detached qualification recovery](detached-qualification-recovery.md) (#2046).
+All source, budget, inspection, claim and qualification gates below still apply.
 
 Inside one Immediate transaction compare the exact held checkpoint, binding,
 generation, branch/PR, eligibility, idle lease, current owner pause/revision,

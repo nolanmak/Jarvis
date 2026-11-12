@@ -85,10 +85,17 @@ async fn validate_recovery_checkout(
     context:&crate::autoship_workflow::RecoveryContext,pr:Option<&adoption::AdoptedPr>,
 )->Result<crate::autoship_workflow::Binding> {
     recovery::existing_checkout(root, &context.worktree).await?;
-    anyhow::ensure!(
-        git(&context.worktree, &["symbolic-ref", "--short", "HEAD"]).await? == snapshot.branch,
-        "original recovery branch changed"
-    );
+    let reference=git(&context.worktree,&["rev-parse","--verify","--symbolic-full-name","HEAD"]).await?;
+    if reference=="HEAD" {
+        let pr=pr.filter(|pr|snapshot.pr==Some(pr.pr) && snapshot.branch==pr.branch)
+            .context("detached recovery requires its original PR identity")?;
+        let expected=workflow::resume_worktree_path(root,pr.pr).await?;
+        anyhow::ensure!(context.worktree.canonicalize()?==expected.canonicalize()?,
+            "detached recovery is not the original resume checkout");
+    }else {
+        anyhow::ensure!(reference==format!("refs/heads/{}",snapshot.branch),
+            "original recovery branch changed");
+    }
     let binding = workflow::git_binding(
         &context.worktree,
         &context.contract,
