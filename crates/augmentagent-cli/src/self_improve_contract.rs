@@ -1540,6 +1540,7 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
         let original=verifier_execution::OriginalExecution::begin(workflow,control,proposal,&base,&environment,&execution)?;
         measure(original.clone()).await.map_err(|error|original.failed(error))?
     };
+    let retained=(||->Result<BaselineEvidence> {
     ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
         && baseline.registration.binding(&base)?.environment_id==environment
         && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");
@@ -1548,6 +1549,8 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
     else {persist_baseline(&file,&baseline,&worker_roots(root))?;}
     workflow.record_scope_stage_response(&key,&hash)?;
     Ok(baseline)
+    })();
+    retained.map_err(|error|verifier_execution::result_retention_failure(workflow,proposal,&base,&environment,&execution,error))
 }
 
 fn verifier_executor_id()->Result<String> {

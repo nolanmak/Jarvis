@@ -2,8 +2,8 @@
 
 Status: source replay, the unchanged productive-claim fence, original native
 custody recovery, original-verifier replay and bounded recovery scheduling are
-implemented locally for PR #2035. Final integration validation, legacy-context
-recovery and the remaining producer/exit audit still block rollout. This is not
+implemented locally for PR #2035. Final integration validation and the
+producer/exit fixes described below still block rollout. This is not
 a restoration, full #1952 closure, or permission to merge known defects.
 Parent issues: #2034, #1952 and #1703.
 
@@ -101,7 +101,7 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
 
 The native-custody path below does not complete infrastructure recovery. The
 original-plan executor, result handoff and scheduling have component coverage
-below; all-cause producer coverage and legacy-context recovery remain open. They
+below; raw-execution and measurement-persistence producer coverage remains open. They
 must be resolved in code and tests; they are not requests for an owner-selected
 limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
 #1703 live/soak acceptance remain separate requirements.
@@ -170,7 +170,7 @@ existing response, failed-result and unpersisted-success boundaries.
 This is input retention, not a replay permit. The original executor and
 inspection-only replay below bind it to the actual measurement. Unknown-result
 settlement and scheduling are implemented below; their remaining validation
-and legacy-context requirements still block rollout.
+and producer/exit requirements still block rollout.
 
 ## Implemented unpaid infrastructure-inspection boundary
 
@@ -307,12 +307,61 @@ authorize execution. Recovered work may pass the old daily-refusal selection
 filter, but all productive claims, model accounting, current qualification,
 independent review and merge requirements remain mandatory.
 
-Legacy holds written before this context existed need a verified reconstruction
-from their original protected records. The selector currently skips missing or
-invalid context. A new context must not be guessed from current issue prose or
-used to turn registration metadata into a fictitious owner-input change. This
-is a rollout blocker, owned by the workflow controller, including the existing
-#2014 incident.
+Existing frontend-bound workflows acquire execution context through their
+ordinary authenticated resume, before binding registration metadata or writing
+a new recovery hold. The compatibility regression starts with the deployed
+`reconcile / resume_started` shape and no context table, then checks successful
+context capture and an unchanged-input fence after an enrolled hold. The
+November 12 read-only inventory found zero existing recovery holds, zero native
+physical classifications and zero raw recovery descriptors; these authorities
+are introduced by this PR. #2014 is paused at that frontend-bound resume shape,
+and its current issue/PR request hash exactly matches its checkpoint contract.
+It does not need a legacy-context migration. No database backfill is introduced.
+Missing or invalid context for an unsupported recovery record remains held;
+current issue prose never manufactures historical authority.
+
+## Raw-command authorization and descendant confinement
+
+The original replayer supplies a private, non-deserializable `OriginalExecution`
+to the registered executor. `require_registration` checks original base,
+environment, complete contract and pinned adapter bytes before materialization
+and command iteration. Commands come from that registration's typed invocation;
+the release observer records only a verifier present in the frozen plan and
+binds its plan/attempt/verifier to the actual kernel admission and private
+capture. The shared raw launcher supplies supervision and resource admission;
+it is not a substitute for those earlier exact-recipe checks.
+
+The raw child starts with a cleared environment, a separate empty home and
+explicit read/write roots through `scripts/codex-command-sandbox.py`. Linux
+Landlock, `no_new_privs` and seccomp restrictions inherit across descendant
+execution. Socket creation/connection, process introspection and namespace or
+cleanup-group escape are denied. The actual compiler-descendant test
+`isolated_cargo_finds_operator_compiler_and_preserves_confinement` verifies
+private reads, writes and network access are refused. Frozen-registration tests
+reject changed base/environment/adapter bytes; inspection-store tests reject
+new audited model admissions and publication. These are different boundaries:
+neither resource accounting alone nor the model-admission fence supplies the
+filesystem/network confinement.
+
+## Producer/exit inventory
+
+Recovery is owned by the existing workflow controller. Every row preserves
+historical admissions, charges and unknown effects; a retry never supplies
+acceptance or review approval. The new raw-error and completed-result
+persistence regressions failed before their fixes; final validation is pending.
+
+| Producer / exit | Retained fact and classification | Permitted next action / verification |
+| --- | --- | --- |
+| Proposal or intent persistence fails before raw dispatch | Existing cached proposal and any committed intent; no new command admission | Existing coordinator requires the original cached proposal on intent resumption. `original_measurement_intent_is_durable_before_executor` and `infrastructure_resume_only_reads_the_original_proposal` cover the boundaries. |
+| Native result/provenance is physically unavailable | Exact original admission history and physical-cause descriptor; evidence-unknown hold | Validate the original pair/private custody, then queue current qualification. Semantic judgments cannot use physical restoration. Native-custody transaction and same-generation invalidation tests cover both paths. |
+| Native judgment or contract validation is negative/unknown | Original reply, provenance and private diagnosis; no physical-cause grant | Existing normal qualification or independent bounded amendment decides the outcome. Restoring files never turns a judgment into approval. Source-compatibility tests retain strict current-policy judgment checks. |
+| Raw resource admission or executor fails after plan retention | Original proposal/base/environment/executor plan; typed resource/IO failures become infrastructure holds, unclassified failures become evidence-unknown holds | Inspect that exact plan with zero model calls. Typed holds and conclusive `BaselineNotRed` results keep their existing classification. `raw_measurement_failures_retain_the_plan_and_enter_a_durable_recovery_hold` covers an actual ENOSPC error and an unclassified outcome. |
+| Controller exits after command admission | Actual kernel admission, capture reference and cleanup responsibility | Reconcile original scope and captured terminal manifest. Quiescence without an outcome remains unknown. `quiescent_original_without_result_cannot_start_another_attempt`, changed-capture/scope negatives and delegated recovery tests cover this boundary. |
+| Captured command was interrupted | Verified terminal interruption plus exact scope quiescence; original attempt retained | Only explicit interruption can permit a new raw attempt of the same plan. Completed peers are reused. `captured_original_resumes_its_attempt_and_interruption_is_explicit` and the partial two-verifier delegated test cover this. |
+| Completed raw result is conclusive | Original registered receipts plus each admission and quiescence proof | Reuse without another command. Intended red queues current qualification; non-red queues existing bounded correction. `retained_original_verifier_result_reenters_without_executing_again` and the no-native-owner handoff test cover both. |
+| Completed measurement cannot persist its file/index | Original plan and raw registered result remain protected; evidence-unknown hold retains the plan reference | Restore storage and reuse the original result during unpaid recovery. `completed_measurement_storage_failure_retains_its_recovery_plan` injects an index-write failure and verifies handoff with one attempt and zero model calls. |
+| Recovery handoff persistence fails | Result and original hold/descriptor remain; checkpoint update rolls back | Retry free inspection after the normal delay. Native and original-result transaction-failure tests check rollback. |
+| Source/owner/branch authorization fails or inspection times out | Existing hold, source binding, selection event and any admitted cleanup obligations | No new model or publication authority. The selection cooldown survives restart; active work is excluded and admitted raw children retain durable capture/cleanup. Request reconstruction, targeted authorization, owner-pause, bounded-window and supervisor-owner-loss tests cover the separate boundaries. |
 
 ## Open threads from the fresh-eyes checkpoint
 
@@ -320,14 +369,14 @@ All entries are owned by the normal workflow-controller implementation and block
 merging #2035 until resolved and tested:
 
 - Native and infrastructure recovery now have operation-specific protected
-  identity and transactional handoff. Complete the producer/exit audit against
-  every infrastructure failure before treating those paths as covered.
+  identity and transactional handoff. Finish validation of the two raw producer
+  fixes identified by the inventory above.
 - Original-operation recovery must distinguish inspection, resumption and
   replay. Unknown prior effects must be settled before replay; successful
   cleanup must be positively observed through the existing execution owner.
 - Native custody preflights now retain a typed physical cause; semantic unknowns
-  cannot consume their descriptors. Complete infrastructure producer/exit
-  coverage is still required.
+  cannot consume their descriptors. The inventory above defines the required
+  infrastructure producer/exit coverage.
 - Historical admission evidence never authorizes new resource-consuming work.
   Original-result inspection is read-only; a measurement replay still needs
   current resource/storage admission while structurally refusing model calls.
@@ -336,13 +385,9 @@ merging #2035 until resolved and tested:
   recovery must likewise supply no positive witness judgment on its own.
 - Persisted fair rotation, independent scheduling and the termination bound are
   implemented locally. Finish integration validation and the final seam audit.
-- Reconstruct legacy execution context from protected original records, with
-  positive and negative migration tests; preserve legacy holds until verified.
-- Verify the exact-plan/attempt command permit at the shared raw-dispatch
-  boundary and document the scope of the no-model guarantee for descendants.
-  The store tests prove that inspection leases cannot authorize audited model
-  admissions or publication; they do not independently prove an OS-level
-  restriction on every action of an arbitrary child program.
+- Existing-workflow compatibility and the separate exact-recipe,
+  model-admission and descendant-sandbox boundaries are documented and tested
+  above. They do not require a second recovery authority or a database backfill.
 
 Pass A checked this document; Pass B confirmed that the no-model requirement,
 unknown-effects custody and paid-admission accounting remain explicit. This

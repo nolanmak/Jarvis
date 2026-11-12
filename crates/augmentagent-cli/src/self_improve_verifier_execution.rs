@@ -51,6 +51,18 @@ fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:
     Ok((key,body))
 }
 
+/// This reference is checked against the protected original plan by the hold
+/// transaction. It retains recovery after a completed result cannot be indexed;
+/// deriving its identity neither creates a plan nor permits another execution.
+pub(super) fn result_retention_failure(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,
+    base:&str,environment:&str,executor:&str,error:anyhow::Error)->anyhow::Error {
+    let error=error.context(initial_repair::Hold::EvidenceUnknown);
+    match plan_input(workflow,proposal,base,environment,executor) {
+        Ok((plan,_))=>error.context(OriginalExecutionFailed {plan}),
+        Err(_)=>error,
+    }
+}
+
 fn command_key(plan:&str,attempt:&str,verifier:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-command-v1",plan,attempt,verifier)).unwrap())
 }
@@ -295,9 +307,12 @@ impl<'a> OriginalExecution<'a> {
     }
 
     pub(super) fn failed(&self,error:anyhow::Error)->anyhow::Error {
-        let error=if matches!(error.downcast_ref::<augmentagent_channel_core::reasoner::ReasonerError>(),Some(augmentagent_channel_core::reasoner::ReasonerError::ResourceCapacity {..})) {
+        let error=if error.downcast_ref::<initial_repair::Hold>().is_some() || error.downcast_ref::<BaselineNotRed>().is_some() {
+            error
+        }else if error.downcast_ref::<std::io::Error>().is_some()
+            || matches!(error.downcast_ref::<augmentagent_channel_core::reasoner::ReasonerError>(),Some(augmentagent_channel_core::reasoner::ReasonerError::ResourceCapacity {..})) {
             error.context(initial_repair::Hold::InfrastructureUnavailable)
-        }else {error};
+        }else {error.context(initial_repair::Hold::EvidenceUnknown)};
         error.context(OriginalExecutionFailed {plan:self.plan.clone()})
     }
 }
@@ -457,6 +472,37 @@ mod tests {
             assert_eq!(snapshot.model_calls,0);assert_eq!(snapshot.attempts,1);
             drop(store);guard.finish().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn completed_measurement_storage_failure_retains_its_recovery_plan() {
+        let (root,control,prepared,mut guard)=fixture().await;let database=control.path().join("workflow.db");
+        let base=actual_head(root.path()).await.unwrap();let environment=environment_id(root.path()).unwrap();let executor=verifier_executor_id().unwrap();
+        let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,&prepared.proposal,&executor)).unwrap());
+        let conn=rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER refuse_measurement_index BEFORE INSERT ON scope_stage_response WHEN NEW.key='{key}' BEGIN SELECT RAISE(ABORT,'measurement index unavailable'); END;")).unwrap();
+        let baseline=prepared.baseline.clone();let source=root.path();
+        let error=retain_initial_measurement(source,control.path(),&prepared.proposal,&guard,|original|async move {
+            original.retain_admission("observe",&gone_scope())?;
+            OriginalExecution::quiesce_previous(original.workflow)?;
+            original.retain_result(source,&baseline)?;
+            Ok(baseline)
+        }).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"completed-result persistence escaped its hold: {error:#}");
+        assert!(error.downcast_ref::<OriginalExecutionFailed>().is_some(),"completed-result persistence lost its original plan");
+        hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        conn.execute_batch("DROP TRIGGER refuse_measurement_index;").unwrap();drop(conn);
+        let recovery=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original scope",environment:"test",
+        }).await.unwrap().unwrap();
+        assert!(recover_original_verifier(root.path(),control.path(),&recovery).await.unwrap());
+        assert_eq!(recovery.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1,"saved result created a second measurement attempt");
+        recovery.finish().unwrap();
+        let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.reason,"original_verifier_measurement_recovered");
+        assert_eq!(after.attempts,1);assert_eq!(after.model_calls,0);
     }
 
     #[tokio::test]
