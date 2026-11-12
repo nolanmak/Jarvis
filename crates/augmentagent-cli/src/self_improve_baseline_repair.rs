@@ -190,6 +190,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_measurement_intent_is_durable_before_executor() {
+        let records=Mutex::new(BTreeMap::<String,String>::new());
+        let result=run(&"a".repeat(64),
+            |key|Ok(records.lock().unwrap().get(key).cloned()),
+            |key,raw|{records.lock().unwrap().insert(key.into(),raw.into());Ok(())},
+            |_,cached,_|async move {assert!(!cached);Ok(41u32)},
+            |proposal| {
+                assert_eq!(proposal,41);
+                assert_eq!(records.lock().unwrap().len(),1,"original measurement began without its retained input");
+                std::future::ready(Ok::<_,anyhow::Error>("actual scripted observation"))
+            }).await.unwrap();
+        assert_eq!(result,(41,"actual scripted observation"));
+    }
+
+    #[tokio::test]
+    async fn infrastructure_resume_only_reads_the_original_proposal() {
+        let records=Mutex::new(BTreeMap::<String,String>::new());
+        let fresh_proposals=AtomicUsize::new(0);
+        for resume in [false,true] {
+            let result=run(&"a".repeat(64),
+                |key|Ok(records.lock().unwrap().get(key).cloned()),
+                |key,raw|{records.lock().unwrap().insert(key.into(),raw.into());Ok(())},
+                |slot,cached,_| {
+                    assert_eq!(slot,0,"infrastructure failure consumed a semantic correction slot");
+                    if !cached {fresh_proposals.fetch_add(1,Ordering::SeqCst);}
+                    std::future::ready(Ok::<_,anyhow::Error>(41u32))
+                },
+                |proposal|std::future::ready(if resume {assert_eq!(proposal,41);Ok("recovered original measurement")}else {
+                    Err(BaselineNotRed {detail:"original executor infrastructure failure".into(),kind:None}.into())
+                })).await;
+            if resume {assert_eq!(result.unwrap(),(41,"recovered original measurement"));}
+            else {assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::InfrastructureUnavailable));}
+        }
+        assert_eq!(fresh_proposals.load(Ordering::SeqCst),1,"infrastructure recovery requested a replacement proposal instead of the original cached result");
+    }
+
+    #[tokio::test]
     async fn invalid_original_and_first_correction_can_reach_second_independent_correction() {
         let records = Mutex::new(BTreeMap::<String, String>::new());
         let proposals = Mutex::new(BTreeMap::<u32, u32>::new());
