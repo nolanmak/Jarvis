@@ -143,6 +143,31 @@ admission, semantic unknowns, crash resumption, concurrent claims, paused work,
 and injected transaction failures. Store-only transaction tests explicitly
 script filesystem validation; they do not claim live model acceptance.
 
+## Implemented original measurement-input retention
+
+Before invoking the original executor, the existing bounded initial-verifier
+coordinator commits an immutable measurement intent containing its epoch,
+correction slot, proposal digest and prior failure-record digest. The intent
+contains no copied model response, successful measurement or approval.
+Infrastructure failure retains this input identity without consuming a semantic
+correction slot.
+
+On resume, the coordinator validates the complete failure prefix and all
+intents before any proposal/executor callback. A retained intent forces the
+existing proposal producer into its cache-only mode. The original cached
+proposal must still be available and match its saved digest; missing or changed
+data cannot become a replacement model request. Legacy failed prefixes continue
+to use their existing proposal-digest validation without rewriting old records.
+
+Intent persistence must succeed before execution. Failure-result persistence
+must succeed before another semantic correction. Tests distinguish these two
+boundaries and cover process exit before/after intent persistence as well as
+existing response, failed-result and unpersisted-success boundaries.
+
+This is input retention, not a replay permit. The complete operation recipe,
+actual command-admission custody, original-command quiescence, isolated replay
+and normal qualification handoff below still need implementation.
+
 ## Implemented unpaid infrastructure-inspection boundary
 
 The existing reconciliation claim recognizes a verifier-infrastructure hold
