@@ -310,6 +310,7 @@ impl WhatsappControlSurface {
             }
             receipt @ (ApprovalActionOutcome::CalendarCreated { .. }
             | ApprovalActionOutcome::CalendarResponded { .. }
+            | ApprovalActionOutcome::CalendarRescheduled { .. }
             | ApprovalActionOutcome::DocumentSigned { .. }
             | ApprovalActionOutcome::ManualSendReady { .. }) => {
                 self.active_card.lock().await.remove(chat_jid);

@@ -2120,7 +2120,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   search/recent. `memory_write` is deliberately not granted.
 /// - A scoped Bash allowlist of `augmentagent` subcommands (all of `gmail`,
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
-///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
+///   `calendar` list-events/create-event/rsvp/reschedule; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
 ///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`, `imessage compose`,
 ///   and read-only `imessage allowlist`) and
@@ -2200,6 +2200,11 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // `--post true` raises an approval card. Args always required.
     let bash_calendar_rsvp_abs = format!("Bash({} calendar rsvp *)", bin.display());
     let bash_calendar_rsvp_bare = "Bash(augmentagent calendar rsvp *)".to_string();
+    // #2039 — `calendar reschedule` PROPOSES moving an event the owner
+    // organizes: like `create-event`, its only effect is one approval card;
+    // the event moves only when the operator clicks Approve. Args required.
+    let bash_calendar_reschedule_abs = format!("Bash({} calendar reschedule *)", bin.display());
+    let bash_calendar_reschedule_bare = "Bash(augmentagent calendar reschedule *)".to_string();
     // #571 / #572 — operator-initiated social drafts. Same safety argument
     // as `gmail compose --post` and `calendar create-event`: these verbs
     // touch no social API at all. They write a pending action row and post
@@ -2486,6 +2491,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_calendar_create_bare,
             bash_calendar_rsvp_abs,
             bash_calendar_rsvp_bare,
+            bash_calendar_reschedule_abs,
+            bash_calendar_reschedule_bare,
             bash_socialapi_dm_abs,
             bash_socialapi_dm_bare,
             bash_socialapi_comment_abs,
@@ -3895,6 +3902,21 @@ mod tests {
                 repo.path().join("target/release/augmentagent").display())));
         }
         assert!(!opts.allowed_tools.contains(&"Bash(augmentagent gdrive *)".into()));
+    }
+
+    /// #2039 AC10 — the agent can propose a move (card only), and no
+    /// `calendar *` wildcard hands it poll-once/backfill.
+    #[test]
+    fn ask_opts_can_propose_a_calendar_reschedule() {
+        let repo = tempfile::tempdir().unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        let opts = ask_opts(wiki.path().into(), repo.path().into());
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent calendar reschedule *)".into()));
+        assert!(opts.allowed_tools.contains(&format!(
+            "Bash({} calendar reschedule *)",
+            repo.path().join("target/release/augmentagent").display()
+        )));
+        assert!(!opts.allowed_tools.contains(&"Bash(augmentagent calendar *)".into()));
     }
 
     #[test]
