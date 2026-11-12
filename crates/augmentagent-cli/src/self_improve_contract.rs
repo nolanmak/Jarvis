@@ -2780,7 +2780,13 @@ print('[]')
 
 /// Candidate-only amendment outcome boundary. Original qualification and
 /// exhausted implementation repair retain their separate restrictive holds.
-fn candidate_amendment_result(result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {result}
+fn candidate_amendment_result(result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {
+    match result {
+        Err(error) if matches!(error.downcast_ref::<initial_repair::Hold>(),
+            Some(initial_repair::Hold::Declined|initial_repair::Hold::Exhausted))=>Ok(None),
+        other=>other,
+    }
+}
 
 #[cfg(test)]
 mod candidate_amendment_outcome_tests {

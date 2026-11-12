@@ -17,7 +17,10 @@ owner answer for the retained original request.
 
 D2. The existing original witness reader authenticates custody, exact original
 proposal/baseline, workflow namespace and native proof before exposing a private
-structured negative judgment to the amendment prompt. Its identity and complete
+structured negative judgment to the amendment prompt. Diagnosis selection covers
+all non-production measurements and absent original fixtures, including test
+outcomes and setup failures; that selection does not broaden the existing
+Unknown-only legacy reconsideration gate. Its identity and complete
 original diagnosis accompany the full owner request. Negative evidence disputes
 a verifier; it never certifies production behavior or permits merging. Public
 status and diagnostic errors contain only fixed safe reason codes. Candidate
@@ -25,16 +28,22 @@ text and witness prose are evidence, never new authority or instructions.
 
 D3. Owner-request and authenticated-negative-evidence digests plus an explicit
 amendment context version bind the paid input fingerprint. Existing per-input
-limit two and total limit four remain; controller changes do not mint a new
-total epoch. A completed decline is a typed input hold, distinct from budget
-exhaustion. Its immutable decision and all charges survive. Ineligible/no-op
+limit two and total limit four remain; this Rust-only evidence correction does not change the execution-environment
+inputs or mint a new total epoch. A completed decline during original-baseline qualification is a typed input
+hold, distinct from budget exhaustion. Its immutable decision and all charges
+survive. During candidate verification against an already-qualified verifier,
+a declined amendment or spent amendment budget leaves the unchanged contract
+in force and continues existing bounded implementation repair or infrastructure
+classification. It grants no extra implementation attempt. Original-baseline
+qualification, legacy migration and the final spent-implementation-budget path
+keep their restrictive holds. Ineligible/no-op
 results do not masquerade as a spent budget.
 
 D4. Recover an already-declined legacy handoff only through the existing unpaid
 qualification inspector, atomic semantic cue and normal selection/claim. Extend
 eligibility narrowly to the declined/exhausted Scope/input hold with an exact
 amendment-input checkpoint, matching private completed decline for the current
-contract and original authenticated negative witness. Require the complete
+contract and original authenticated Unknown witness. Require the complete
 original protected request and all existing fresh remote authorization, exact
 checkout/binding, idle lease, owner pause/revision, inbox and unresolved-effect
 fences. Missing/ambiguous evidence remains held.
@@ -62,7 +71,11 @@ judgment as canonical serde JSON. Rewriting retained JSON bytes invalidates
 custody rather than creating new evidence; presentation-only reserialization
 after validation does not change the retained identity.
 
-Counters remain under the original total epoch. Normal qualification still
+Counters remain under the existing (source, original baseline, execution
+environment) total epoch. This migration changes none of those inputs. A real
+trusted compiler/dependency/executor-input transition follows the existing
+environment-bound epoch contract; no separate budget-reference authority is
+introduced. Normal qualification still
 requires actual original-base behavioral red and separate candidate green.
 
 ## Testable build order
@@ -88,18 +101,20 @@ requires actual original-base behavioral red and separate candidate green.
 
 No changes to warning-versus-refusal semantics, baseline, candidate, verifier
 criteria, total repair allowance, independent review or merge policy. No new
-queue/allocator. Independent authority may still decline the complete evidence;
-that is a truthful held outcome, not proof of feature restoration. #1703 remains
+queue/allocator. Independent authority may still decline the complete evidence; handle that
+outcome by stage as D3 defines. A qualification hold or continued bounded
+candidate repair is not proof of feature restoration. #1703 remains
 open for end-to-end and unattended acceptance. The implementation and measured
 rollout outcome of this amendment are pending; owner: current repair agent.
 
 ## Audit and local evidence
 
 Fresh-eyes findings about record ownership, crash continuation and fingerprint
-payload were resolved in D5. All 25 mapped seams were checked. The authority
+payload were resolved in D5. The initial 25 mapped seams and new candidate-outcome seam were rechecked:
+all 26 mapped seams hold. The authority
 identity omission found at S3 is corrected: both retained identity and complete
 structured diagnosis reach the actual scripted authority boundary. The private
-free-form reason was also removed from the adjudicated-denial error. All 25
+free-form reason was also removed from the adjudicated-denial error. All 26
 seams now hold at the specification boundary; independent engineering review
 and exact-head hosted checks remain separate gates.
 
@@ -114,3 +129,18 @@ validated without workflow mutation or model calls. This proves eligibility,
 not an independent amendment approval or autonomous merge. Full CLI validation passed: 1,982 tests, zero failures, 39 explicitly ignored
 tests in 282.81 seconds. Exact-head hosted checks, independent engineering
 review, merge and the deployed ordinary outcome are pending.
+
+Independent engineering review of head 70819c75 completed and found two
+functional issues before merge: a candidate-stage amendment denial incorrectly
+stopped ordinary implementation repair, and diagnosis selection inherited the
+Unknown-only legacy gate, dropping other negative measurement classes. Both
+findings were reproduced by failing tests before correction. Candidate-stage
+refusal/exhaustion now leaves bounded implementation repair available while
+other typed holds propagate. Six independently authenticated measurement/fixture
+cases verify complete negative diagnosis, positive exclusion, namespace and
+tamper rejection, and unchanged Unknown-only legacy recovery. Both regressions
+pass, as does the actual retained #2014 read-only probe (2.41 seconds). A fresh
+reader and all 26 mapped seams were rechecked, including stage-specific refusal
+handling and the existing environment-bound budget. Prior 1,982-test validation
+covers the earlier head; corrected-head full validation and re-review remain
+pending.
