@@ -360,7 +360,8 @@ pub(super) async fn try_amend(
     if !(repair_exhausted
         || failure.contains("environment changed")
         || failure.contains("unexpected_failure")
-        || failure.contains("legacy in-process"))
+        || failure.contains("legacy in-process")
+        || failure.contains("baseline_witness_invalid"))
     {
         return Ok(None);
     }
@@ -410,7 +411,7 @@ pub(super) async fn try_amend(
         );
         return Ok(None);
     }
-    workflow.bind_acceptance(old)?;
+    workflow.bind_acceptance_for_recovery(old)?;
     workflow
         .checkpoint(
             crate::autoship_workflow::Stage::Scope,
@@ -534,13 +535,15 @@ pub(super) async fn try_amend(
             "amended verifier failed intended-red baseline: {}",
             serde_json::to_string(&receipts)?
         );
-        Ok::<_, anyhow::Error>(PreparedAcceptance {
+        let prepared=PreparedAcceptance {
             proposal,
             baseline: BaselineEvidence {
                 registration,
                 receipts,
             },
-        })
+        };
+        baseline_witness::qualify(&baseline_root,control,&prepared,workflow).await?;
+        Ok::<_, anyhow::Error>(prepared)
     }
     .await;
     let cleanup = trusted_git(root, &["worktree", "remove", "--force", checkout]).await;
@@ -1401,6 +1404,7 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
     let measured=register_and_reproduce(&baseline,proposal.clone(), &test_resource_audit(control)).await;
     trusted_git(root,&["worktree","remove","--force",baseline.to_str().unwrap()]).await?;
     let next=PreparedAcceptance{proposal:proposal.clone(),baseline:measured?};
+    baseline_witness::persist_scripted(root,control,&next,true)?;
     augmentagent_channel_core::autoship_write_scope::register(root,old.baseline.registration.contract_hash(),old.proposal.contract.allowed_paths.iter().map(|scope| {
         let (path,directory)=match scope {crate::autoship_contract::PathScope::File(path)=>(path,false),crate::autoship_contract::PathScope::Directory(path)=>(path,true)};
         augmentagent_channel_core::autoship_write_scope::DeclaredPath{path:path.clone(),directory}

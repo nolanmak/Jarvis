@@ -259,11 +259,77 @@ impl std::fmt::Display for MissingScopeResponse {
 }
 impl std::error::Error for MissingScopeResponse {}
 
+pub(crate) const BASELINE_NATIVE_PURPOSE_PREFIX:&str="baseline-witness-native-v1:";
+
+#[derive(Debug)]
+pub(crate) struct NativeScopeOutcomeUnresolved;
+impl std::fmt::Display for NativeScopeOutcomeUnresolved {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        write!(f,"original baseline-witness native outcome requires evidence recovery")
+    }
+}
+impl std::error::Error for NativeScopeOutcomeUnresolved {}
+
+/// This namespace identifies an exact controller request, independently of
+/// later candidate bindings. It reuses the protected scope-response store.
+pub(crate) fn baseline_native_response_keys(purpose:&str)->Result<(String,String)> {
+    let input=purpose.strip_prefix(BASELINE_NATIVE_PURPOSE_PREFIX).context("not a baseline native request")?;
+    ensure!(input.len()==64 && input.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid baseline native request identity");
+    let proof=format!("{:x}",Sha256::digest(serde_json::to_vec(&("native-scope-response-provenance-v1",input))?));
+    Ok((input.into(),proof))
+}
+
+pub(crate) struct NativeScopeCustody {
+    pub input:String,
+    pub response:String,
+    pub provenance:String,
+    pub provider:submission::Provider,
+}
+
+fn baseline_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+    let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
+    let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
+    let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();
+    for admission in admissions {
+        let admission:serde_json::Value=serde_json::from_str(&admission?)?;
+        let Some(purpose)=admission["bounded"]["purpose"].as_str().filter(|p|p.starts_with(BASELINE_NATIVE_PURPOSE_PREFIX)) else {continue};
+        let (raw,proof)=baseline_native_response_keys(purpose)?;
+        ensure!(seen.insert(purpose.to_owned()),"baseline native input has multiple actual admissions");
+        ensure!(admission["reviewer"]==true && admission["bounded"]["limit"]==1,"baseline admission lacks fresh-review attribution");
+        let provider:submission::Provider=serde_json::from_value(admission["provider"].clone())?;
+        let binding:Binding=serde_json::from_value(admission["bounded"]["binding"].clone())?;
+        let receipt=admission["receipt"].as_str().context("baseline admission lost its accounting receipt")?;
+        let charged:Option<u32>=tx.query_row("SELECT model_calls FROM resource_charge WHERE workflow=?1 AND id=?2",params![workflow,receipt],|r|r.get(0)).optional()?;
+        let counted:Option<u32>=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![workflow,purpose,serde_json::to_string(&binding)?],|r|r.get(0)).optional()?;
+        if charged!=Some(1) || counted!=Some(1) {return Err(NativeScopeOutcomeUnresolved.into());}
+        let response:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,raw],|r|r.get(0)).optional()?;
+        let provenance:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,proof],|r|r.get(0)).optional()?;
+        match (response,provenance) {
+            (Some(response),Some(provenance))=>custody.push(NativeScopeCustody {input:raw,response,provenance,provider}),
+            _=>return Err(NativeScopeOutcomeUnresolved.into()),
+        }
+    }
+    let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get(0))?;
+    if counted!=custody.len() as u64 {return Err(NativeScopeOutcomeUnresolved.into());}
+    // This returns original custody, not semantic qualification. The consumer
+    // must validate every private native provenance file before new dispatch.
+    Ok(custody)
+}
+
 pub struct WorkflowStore {
     conn: Connection,
 }
 
 impl WorkflowStore {
+    pub(crate) fn require_baseline_native_custody(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
+        self.baseline_native_custody(lease,binding,now).map(|_|())
+    }
+    pub(crate) fn baseline_native_custody(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<Vec<NativeScopeCustody>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let custody=baseline_native_custody(&tx,&lease.workflow)?;
+        tx.commit()?;Ok(custody)
+    }
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
         use std::os::unix::fs::MetadataExt;
@@ -302,6 +368,55 @@ impl WorkflowStore {
             tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,response])?;
             event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
         }tx.commit()?;Ok(())
+    }
+
+    /// A protected response and its native provenance are one completed fact.
+    /// A half-pair is missing evidence, never permission for another model call.
+    pub fn scope_stage_response_pair(&mut self,lease:&Lease,binding:&Binding,key:&str,provenance_key:&str,now:i64)->Result<Option<(String,String)>> {
+        ensure!(key != provenance_key, "scope response and provenance keys must differ");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let mut values=Vec::new();
+        for current in [key,provenance_key] {
+            let value:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if value.is_none() {
+                let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND (NOT json_valid(payload) OR json_extract(payload,'$.key')=?2))",params![lease.workflow,current],|r|r.get(0))?;
+                if recorded {return Err(MissingScopeResponse.into());}
+            }
+            values.push(value);
+        }
+        let provenance=values.pop().unwrap();let response=values.pop().unwrap();
+        let result=match (response,provenance) {
+            (None,None)=>None,
+            (Some(response),Some(provenance))=>Some((response,provenance)),
+            _=>return Err(MissingScopeResponse.into()),
+        };
+        tx.commit()?;Ok(result)
+    }
+
+    pub fn record_scope_stage_response_pair(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,provenance_key:&str,provenance:&str,now:i64)->Result<()> {
+        ensure!(key != provenance_key && key.len()==64 && provenance_key.len()==64
+            && response.len()<=2*1024*1024 && provenance.len()<=2*1024*1024, "invalid bounded scope response pair");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let mut existing=Vec::new();
+        for current in [key,provenance_key] {
+            let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if prior.is_none() {
+                let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND (NOT json_valid(payload) OR json_extract(payload,'$.key')=?2))",params![lease.workflow,current],|r|r.get(0))?;
+                if recorded {return Err(MissingScopeResponse.into());}
+            }
+            existing.push(prior);
+        }
+        if existing[0].is_some() != existing[1].is_some() {return Err(MissingScopeResponse.into());}
+        for (current,value) in [(key,response),(provenance_key,provenance)] {
+            let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,current],|r|r.get(0)).optional()?;
+            if let Some(prior)=prior {ensure!(prior==value,"scope response is immutable");} else {
+                tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,current,value])?;
+                event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":current}).to_string(),now)?;
+            }
+        }
+        tx.commit()?;Ok(())
     }
 
     pub fn set_readiness_dependency(&mut self,lease:&Lease,binding:&Binding,repository:&str,issue:u64,record:Option<(&str,&str,&str,&str)>,now:i64)->Result<()> {
@@ -1347,7 +1462,18 @@ impl WorkflowStore {
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
-        let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
+        let actual_native_reviewer=admission.is_some_and(|(provider,reviewer)|provider.is_some() && reviewer);
+        let admission=admission.map(|(provider,reviewer)| {
+            let mut attribution=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
+            // Keep the actual charge and its exact bounded input in one fact.
+            // Recovery must not infer this link from adjacent event times, and
+            // an idempotent receipt cannot be reassigned to a different input.
+            // Unbounded calls retain their previous serialized shape.
+            if let Some((purpose,binding,limit))=bounded {
+                attribution["bounded"]=serde_json::json!({"purpose":purpose,"binding":binding,"limit":limit});
+            }
+            attribution.to_string()
+        });
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -1368,9 +1494,19 @@ impl WorkflowStore {
             }
         } else {
             if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
+            // Changing to a builder, amendment or another provider is not
+            // original-outcome recovery. Fence every new actual admission;
+            // late usage/accounting for the original call remains recordable.
+            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
+                if purpose.starts_with(BASELINE_NATIVE_PURPOSE_PREFIX) {
+                    baseline_native_response_keys(purpose)?;
+                    ensure!(limit==1 && actual_native_reviewer,"baseline native requests require exactly one attributed fresh native reviewer admission");
+                    let admitted:u32=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
+                    ensure!(admitted==0,"baseline native request already admitted; recover its original response");
+                }
                 // Calibration uses one observation identity per UTC day. An
                 // admitted lost response still counts after audit recovery
                 // changes its evidence binding; never count only successes.
@@ -2535,6 +2671,46 @@ mod tests {
     }
 
     #[test]
+    fn scope_response_pair_commits_atomically_and_survives_restart() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.conn.execute_batch(&format!("CREATE TRIGGER refuse_proof BEFORE INSERT ON scope_stage_response WHEN NEW.key='{proof}' BEGIN SELECT RAISE(ABORT,'synthetic proof write failure'); END;")).unwrap();
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",31).is_err());
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap().is_none(), "response escaped the failed proof transaction");
+        store.conn.execute_batch("DROP TRIGGER refuse_proof").unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",33).unwrap();
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"changed",&proof,"native proof",34).is_err());
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let next=store.claim(&lease.workflow,"next",1021,1000).unwrap().unwrap();
+        assert_eq!(store.scope_stage_response_pair(&next,&binding(),&raw,&proof,1022).unwrap(),Some(("response".into(),"native proof".into())));
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,1022).is_err(), "expired worker read protected qualification");
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|r|r.get::<_,i64>(0)).unwrap(),0, "transport custody created approval");
+    }
+
+    #[test]
+    fn scope_response_pair_missing_proof_cannot_be_recreated_or_rebilled() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"native proof",31).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        store.conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,proof]).unwrap();
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"replacement",33).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((before.model_calls,before.tokens,before.checkpoint),(after.model_calls,after.tokens,after.checkpoint));
+    }
+
+    #[test]
+    fn scope_response_pair_malformed_history_is_missing_evidence() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'scope_stage_response_recorded','not JSON',31)",params![lease.workflow,lease.generation]).unwrap();
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"proof",33).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM scope_stage_response",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
     fn expired_controller_cannot_install_or_clear_readiness_dependency() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,old)=setup(&path);
         store.set_readiness_dependency(&old,&binding(),"repo",970,Some(("request","base","external_decision","evidence")),30).unwrap();
@@ -2778,6 +2954,140 @@ mod tests {
         assert_eq!(latest.actual_provider_role.as_deref(),Some("workflow"));
         assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
         assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),2);
+    }
+
+    #[test]
+    fn admitted_receipt_retains_exact_bounded_input_attribution() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let input=binding();
+        store.charge_admitted_model(&lease,"witness-call",30,None,Some(("witness-input",&input,1)),Some(submission::Provider::Codex),true).unwrap();
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let admission:serde_json::Value=store.events(&lease.workflow).unwrap().into_iter()
+            .find(|(_,kind,_,_)|kind=="native_model_admitted")
+            .map(|(_,_,payload,_)|serde_json::from_str(&payload).unwrap()).unwrap();
+        assert_eq!(admission["bounded"],serde_json::json!({"purpose":"witness-input","binding":input,"limit":1}),
+            "the charged receipt must identify its input in the admission transaction");
+        // Exact replay is free; the same charge cannot be attributed to another
+        // input, allowance or unbounded call after a restart.
+        store.charge_admitted_model(&lease,"witness-call",31,None,Some(("witness-input",&input,1)),Some(submission::Provider::Codex),true).unwrap();
+        let mut changed=input.clone();changed.head="different-head".into();
+        for bounded in [Some(("other-input",&input,1)),Some(("witness-input",&changed,1)),Some(("witness-input",&input,2)),None] {
+            assert!(store.charge_admitted_model(&lease,"witness-call",32,None,bounded,Some(submission::Provider::Codex),true).is_err(),
+                "original charge was silently assigned to a different native input");
+        }
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+        assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),1);
+    }
+
+    #[test]
+    fn unanswered_baseline_native_call_blocks_admission_after_binding_change() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let purpose=format!("baseline-witness-native-v1:{}","a".repeat(64));
+        store.charge_admitted_model(&lease,"original-native-call",30,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+        // No response was returned. A changed head and a fresh controller
+        // lease do not prove that the original native call did not run.
+        let mut cp=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        cp.binding.head="new-main-integrated-head".into();
+        store.checkpoint(&lease,&cp,31).unwrap();
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let next=store.claim(&lease.workflow,"restarted",1021,1000).unwrap().unwrap();
+        let changed_purpose=format!("baseline-witness-native-v1:{}","b".repeat(64));
+        for input in [&purpose,&changed_purpose] {
+            assert!(store.charge_admitted_model(&next,"duplicate-native-call",1022,None,Some((input,&cp.binding,1)),Some(submission::Provider::Codex),true).is_err(),
+                "binding or input changes bypassed custody of the original unanswered native call");
+        }
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+    }
+
+    #[test]
+    fn completed_baseline_native_custody_allows_new_input_but_never_a_second_charge_for_old_input() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        let next_purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","b".repeat(64));
+        let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+        store.require_baseline_native_custody(&lease,&binding(),29).unwrap();
+        store.charge_admitted_model(&lease,"first",30,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+        assert!(store.require_baseline_native_custody(&lease,&binding(),31).unwrap_err().is::<NativeScopeOutcomeUnresolved>());
+        store.record_scope_stage_response(&lease,&binding(),&raw,"original reply",32).unwrap();
+        assert!(store.require_baseline_native_custody(&lease,&binding(),33).is_err(),"half custody was accepted");
+        // This synthetic private proof stands for storage custody only; the
+        // consumer must separately reject it as invalid native provenance.
+        store.record_scope_stage_response(&lease,&binding(),&proof,"private proof reference",34).unwrap();
+        store.require_baseline_native_custody(&lease,&binding(),35).unwrap();
+        let mut cp=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        cp.binding.head="later-head".into();store.checkpoint(&lease,&cp,36).unwrap();
+        assert!(store.charge_admitted_model(&lease,"duplicate",37,None,Some((&purpose,&cp.binding,1)),Some(submission::Provider::Codex),true).is_err());
+        store.charge_admitted_model(&lease,"second",38,None,Some((&next_purpose,&cp.binding,1)),Some(submission::Provider::Claude),true).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
+        assert!(store.require_baseline_native_custody(&lease,&cp.binding,39).is_err());
+        assert!(store.require_baseline_native_custody(&lease,&binding(),39).is_err(),"stale binding queried private custody");
+    }
+
+    #[test]
+    fn baseline_native_admission_requires_actual_fresh_native_reviewer_attribution() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","c".repeat(64));
+        for (provider,reviewer) in [(None,true),(Some(submission::Provider::Codex),false)] {
+            assert!(store.charge_admitted_model(&lease,"unqualified",30,None,Some((&purpose,&binding(),1)),provider,reviewer).is_err(),
+                "non-native or builder admission was recorded as a baseline witness");
+            store.require_baseline_native_custody(&lease,&binding(),31).unwrap();
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        }
+        store.conn.execute_batch("CREATE TRIGGER refuse_scope_projection BEFORE INSERT ON workflow_progress_event BEGIN SELECT RAISE(ABORT,'projection refused'); END;").unwrap();
+        assert!(store.charge_admitted_model(&lease,"refused",32,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).is_err());
+        store.require_baseline_native_custody(&lease,&binding(),33).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        store.conn.execute_batch("DROP TRIGGER refuse_scope_projection;").unwrap();
+        store.charge_admitted_model(&lease,"actual",34,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+    }
+
+    #[test]
+    fn baseline_native_custody_loss_never_becomes_an_unused_admission() {
+        for lost in ["counter","charge","admission","raw","proof"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut store,lease)=setup(&path);
+            let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+            let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+            store.charge_admitted_model(&lease,"original",30,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+            store.record_scope_stage_response_pair(&lease,&binding(),&raw,"observed text",&proof,"private reference",31).unwrap();
+            store.require_baseline_native_custody(&lease,&binding(),32).unwrap();
+            match lost {
+                "counter"=>{store.conn.execute("DELETE FROM bounded_attempt WHERE workflow=?1",[&lease.workflow]).unwrap();},
+                "charge"=>{store.conn.execute("DELETE FROM resource_charge WHERE workflow=?1",[&lease.workflow]).unwrap();},
+                "admission"=>{store.conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted'",[&lease.workflow]).unwrap();},
+                "raw"|"proof"=>{store.conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,if lost=="raw" {&raw}else{&proof}]).unwrap();},
+                _=>unreachable!(),
+            }
+            drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+            assert!(store.require_baseline_native_custody(&lease,&binding(),33).is_err(),"lost {lost} was treated as no prior call");
+            let next=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","b".repeat(64));
+            assert!(store.charge_admitted_model(&lease,"replacement",34,None,Some((&next,&binding(),1)),Some(submission::Provider::Claude),true).is_err(),"lost {lost} allowed a replacement call");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+        }
+    }
+
+    #[test]
+    fn unanswered_witness_blocks_other_native_purposes_but_retains_late_usage() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        store.charge_admitted_model(&lease,"original",30,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+        for (bounded,reviewer) in [(None,false),(None,true),(Some(("amendment",&binding(),2)),true)] {
+            assert!(store.charge_admitted_model(&lease,"replacement",31,None,bounded,Some(submission::Provider::Claude),reviewer).is_err(),
+                "a builder, reviewer or amendment bypassed the original unanswered witness");
+        }
+        store.charge(&lease,"late-original-usage",ResourceCharge {tokens:17,wall_ms:5,model_calls:0},32).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!((before.model_calls,before.tokens),(1,17));
+        let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"original result",&proof,"private reference",33).unwrap();
+        store.charge_admitted_model(&lease,"next",34,None,None,Some(submission::Provider::Claude),false).unwrap();
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!((after.model_calls,after.tokens),(2,17));
     }
 
     #[test]

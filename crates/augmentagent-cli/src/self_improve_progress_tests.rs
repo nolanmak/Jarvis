@@ -389,16 +389,19 @@ else: raise Exception('unexpected call '+repr(a))
         review.recorded_verdict()
     };
     let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
-        repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:Some(20),
+        repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:None,
         branch:"agent-fix/issue-10",contract:"synthetic arithmetic",environment:"fixture-bootstrap",
     }).await.unwrap().unwrap();
+    // The issue owns the contract; PR publication adds an alias to that workflow.
+    let publication = workflow.intent(crate::autoship_workflow::OperationKind::CreatePr).unwrap();
+    workflow.observe_remote(&publication,"github-pr:20",Some(20)).unwrap();
     let directories = acceptance::control_directories("fixture-owner/project",workflow.id()).unwrap();
     std::fs::create_dir_all(&directories.workflow_acceptance).unwrap();
     acceptance::persist_fixture_registration(&directories.workflow_acceptance,&prepared).unwrap();
     let mut receipt = acceptance::persist_historical_fixture_receipt(&root,&prepared,&directories.workflow_acceptance).await.unwrap();
     receipt.alignment = Some(alignment::persist_shipping_fixture(&root,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
     assert!(format!("{:#}",acceptance::assert_receipt_current(&root,&prepared,&receipt).await.unwrap_err()).contains("legacy in-process"));
-    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.bind_acceptance_for_recovery(&prepared).unwrap();
     workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"acceptance_passed","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
     workflow.record_review("scripted-independent-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
     workflow.finish().unwrap();
@@ -422,7 +425,7 @@ else: raise Exception('unexpected call '+repr(a))
     let mut receipt=acceptance::verify_and_persist_candidate(&candidate,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&candidate), &test_resource_audit(&directories.workflow_acceptance)).await.unwrap();
     receipt.alignment=Some(alignment::persist_shipping_fixture(&candidate,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
     acceptance::assert_receipt_current(&candidate,&prepared,&receipt).await.unwrap();
-    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.bind_acceptance(&prepared,&directories.workflow_acceptance).unwrap();
     workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"migration_verified","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
     workflow.record_review("scripted-independent-migrated-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
     workflow.finish().unwrap();
