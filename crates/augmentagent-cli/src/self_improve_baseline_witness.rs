@@ -498,6 +498,38 @@ mod tests {
     }
 
     #[test]
+    fn negative_diagnosis_covers_all_measurements_without_widening_legacy_recovery() {
+        use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
+        use std::os::unix::fs::PermissionsExt;
+        for (measurement,original_fixture) in [(Measurement::Unknown,false),(Measurement::MissingFixture,false),
+            (Measurement::TestOutcome,false),(Measurement::SetupFailure,false),
+            (Measurement::DirectProduction,false),(Measurement::DirectProduction,true)] {
+            let (root,control,prepared)=fixture();
+            std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,measurement).unwrap();
+            let mut judgment=saved_judgment(control.path(),&prepared);
+            for witness in judgment["verifiers"].as_array_mut().unwrap() {witness["original_fixture_available"]=original_fixture.into();}
+            let context=judgment["context"].as_str().unwrap();let raw=judgment.to_string();
+            let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-diagnosis-fixture",
+                "supplied_request_hash":amendment::digest(b"scripted original source"),"response_hash":amendment::digest(raw.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":context,"native_input_hash":"a".repeat(64),
+                "scope_request_hash":amendment::digest(qualification_prompt(context,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut custody=[NativeScopeCustody {input:"a".repeat(64),response:raw,provider:Provider::Codex,
+                provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact,artifact_sha256:amendment::digest(&bytes)}).unwrap()}];
+            let diagnosis=retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap();
+            let negative=measurement!=Measurement::DirectProduction || !original_fixture;
+            assert_eq!(diagnosis.is_some(),negative,"authenticated {measurement:?} diagnosis omitted or positive witness misclassified");
+            if let Some((identity,text))=diagnosis {assert_eq!(identity.len(),64);assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(),judgment);}
+            assert_eq!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some(),measurement==Measurement::Unknown,"diagnosis broadened legacy reconsideration");
+            let foreign=tempfile::tempdir().unwrap();assert!(retained_semantic_diagnosis_in(root.path(),foreign.path(),&prepared,&custody).is_err());
+            custody[0].response.push(' ');
+            assert!(retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).is_err(),"changed response bypassed original custody");
+        }
+    }
+
+    #[test]
     fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
         let (root,control,prepared)=fixture();

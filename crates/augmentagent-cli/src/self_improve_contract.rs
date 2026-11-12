@@ -2778,6 +2778,29 @@ print('[]')
     }
 }
 
+/// Candidate-only amendment outcome boundary. Original qualification and
+/// exhausted implementation repair retain their separate restrictive holds.
+fn candidate_amendment_result(result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {result}
+
+#[cfg(test)]
+mod candidate_amendment_outcome_tests {
+    use super::*;
+    #[test]
+    fn candidate_amendment_refusal_preserves_the_existing_implementation_repair_lane() {
+        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted] {
+            assert!(candidate_amendment_result(Err(anyhow::Error::from(hold)))
+                .expect("amendment refusal wrongly stopped qualified implementation repair").is_none());
+        }
+        for hold in [initial_repair::Hold::EvidenceUnknown,initial_repair::Hold::InfrastructureUnavailable,initial_repair::Hold::ContractInvalid] {
+            assert_eq!(candidate_amendment_result(Err(anyhow::Error::from(hold))).unwrap_err().downcast_ref::<initial_repair::Hold>(),Some(&hold));
+        }
+        let (_root,_control,prepared)=baseline_witness::prepared_fixture();
+        let before=serde_json::to_vec(&prepared).unwrap();
+        let allowed=candidate_amendment_result(Ok(Some(prepared))).unwrap().unwrap();
+        assert_eq!(serde_json::to_vec(&allowed).unwrap(),before);
+    }
+}
+
 pub(super) async fn verify_with_repair_for(
     reasoner: &FallbackReasoner,
     source: AcceptanceSource,
@@ -2920,11 +2943,10 @@ pub(super) async fn verify_with_repair_for(
                 };
                 let detail = format!("{error:#}");
                 if round < 2 && !scope_rejected {
-                    if let Some(amended) = amendment::try_amend(
+                    if let Some(amended) = candidate_amendment_result(amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
                         false, None,
-                    )
-                    .await?
+                    ).await)?
                     {
                         *prepared = amended;
                         continue;
