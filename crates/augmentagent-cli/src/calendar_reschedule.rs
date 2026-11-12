@@ -579,7 +579,7 @@ mod tests {
             description: Some(
                 "Owner-authorized reschedule QA. Temporary; deleted after verification.".into(),
             ),
-            create_meeting_room: false,
+            create_meeting_room: false, recurrence: vec![], time_zone: None,
         };
         let created = api.create_event(&entity, "primary", &draft).await?;
         let event_id = created.id.clone().context("created event id")?;
