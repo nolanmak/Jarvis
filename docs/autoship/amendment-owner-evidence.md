@@ -111,5 +111,6 @@ ordinary #2014 read-only compatibility probe passed in 3.11 seconds: fresh remot
 authorization, complete original request, detached owned candidate, authenticated
 original witness, exact registered contract and completed legacy decline were
 validated without workflow mutation or model calls. This proves eligibility,
-not an independent amendment approval or autonomous merge. Full CLI validation,
-merge and deployed ordinary outcome are pending.
+not an independent amendment approval or autonomous merge. Full CLI validation passed: 1,982 tests, zero failures, 39 explicitly ignored
+tests in 282.81 seconds. Exact-head hosted checks, independent engineering
+review, merge and the deployed ordinary outcome are pending.
