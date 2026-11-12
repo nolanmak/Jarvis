@@ -472,3 +472,23 @@ or permanently consume recovery with no supported restoration path. Required
 hosted checks, normal deployment and actual ordinary #2014 recovery remain
 necessary. Component tests and the read-only production compatibility probe
 are not autonomous shipping evidence.
+
+The read-only semantic source provider now also reads protected original
+plan/result records when no prepared file is available. It reuses the leased
+executor's command-admission/quiescence validator through read-only evidence
+accessors, verifies source/binding/base/environment and the pinned source map,
+and authenticates the complete prepared data against the original native
+judgment. Existing manifest metadata still constrains any fallback. Different
+matching source identities remain ambiguous; none is chosen by timestamp.
+Missing candidate adapters are not installed by inspection and do not become
+positive integrity/qualification receipts. Existing changed or symlinked
+adapter paths are rejected. The old executor identity is source context only,
+not authority to run an old recipe under today's policy.
+
+Local tests cover no-manifest/no-candidate-harness recovery, mismatched source
+or binding, lost plan/result/admission/quiescence, changed adapters, normal
+witness handoff and existing executor compatibility. The actual #2014 read-only
+probe still authenticates its two original responses without changing state or
+admitting models. Normal preparation must still carry that exact queued source
+across `resume_started` restarts and unavailable/restored evidence before this
+rollout is complete.

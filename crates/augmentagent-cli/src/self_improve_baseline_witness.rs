@@ -124,11 +124,12 @@ fn disposition(judgment:&Judgment)->Result<()> {
 pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
-    prepared.baseline.registration.verify_integrity(root)?;
+    prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
         "retained semantic judgment lacks its original measured baseline");
     scope_authority::require_retained_native_custody(root,custody)?;
-    for observation in custody.iter().rev() {
+    let mut selected=None;
+    for observation in custody {
         let Ok(judgment)=serde_json::from_str::<Judgment>(&observation.response) else {continue};
         if !judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {continue;}
         let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:serde_json::from_str(&observation.provenance)?};
@@ -142,10 +143,12 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
         let request=amendment::digest(qualification_prompt(&judgment.context,prepared)?.as_bytes());
         if provenance["scope_request_hash"].as_str()!=Some(request.as_str()) {continue;}
         validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
-        return Ok(Some(amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
-            &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?)));
+        let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
+            &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
+        ensure!(selected.as_ref().is_none_or(|previous|previous==&identity),"retained semantic judgment is ambiguous");
+        selected=Some(identity);
     }
-    Ok(None)
+    Ok(selected)
 }
 
 /// Bind source-only inspection to this workflow's existing native authority.
@@ -154,7 +157,6 @@ pub(super) fn retained_semantic_judgment_in(root:&Path,control:&Path,prepared:&P
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
     if custody.is_empty() {return Ok(None);}
     let expected=control.canonicalize()?;
-    ensure!(expected==control,"retained semantic authority directory changed");
     for observation in custody {
         let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observation.provenance)?;
         ensure!(reference.artifact.parent()==Some(expected.as_path()),"retained semantic proof belongs to another workflow");

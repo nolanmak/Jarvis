@@ -2045,10 +2045,49 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
 
 pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
-    _binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
-    _evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
-    let Some(prepared)=retained_prepared(root,control,source)? else{return Ok(None)};
-    baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)
+    binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+    Ok(retained_semantic_source(root,control,source,binding,custody,evidence)?.map(|(_,identity)|identity))
+}
+
+/// The same authenticated source producer serves free inspection and normal
+/// guarded preparation. Old measurements never become positive qualification.
+pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<(PreparedAcceptance,String)>> {
+    let mut candidates=match retained_prepared(root,control,source) {
+        Ok(Some(prepared))=>vec![prepared],
+        Ok(None)=>verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>
+            verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
+        Err(error)=>return Err(error),
+    };
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if index.try_exists()? {
+        let manifest:WorkflowManifest=private_json(&index)?;
+        validate_retained_manifest(control,&manifest,source)?;
+        candidates.retain(|prepared|prepared.baseline.registration.baseline_head()==manifest.original_base
+            && prepared.baseline.registration.contract_hash()==manifest.contract_hash
+            && prepared.proposal.contract.revision==manifest.contract_revision);
+    }
+    let mut selected:Option<(PreparedAcceptance,String)>=None;
+    for prepared in candidates {
+        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
+        if let Some((previous,key))=&selected {
+            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
+        }else{selected=Some((prepared,identity));}
+    }
+    Ok(selected)
+}
+
+fn validate_retained_manifest(control:&Path,manifest:&WorkflowManifest,source:AcceptanceSource)->Result<()> {
+    ensure!(manifest.version==1 && manifest.source()?==source && manifest.contract_revision>0
+        && manifest.contract_hash.len()==64 && manifest.contract_hash.bytes().all(|b|b.is_ascii_hexdigit()),"retained prepared manifest identity changed");
+    evidence_path(control,source,&manifest.original_base)?;
+    if let Some(name)=&manifest.evidence_file {
+        ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"retained prepared evidence path changed");
+    }
+    Ok(())
 }
 
 /// Inspect existing prepared evidence only. Free reconsideration may not
@@ -2063,8 +2102,7 @@ pub(super) fn retained_prepared(root:&Path,control:&Path,source:AcceptanceSource
     let index=control.join(format!("{}-workflow.json",source.key()));
     let manifest:Option<WorkflowManifest>=if index.try_exists()? {Some(private_json(&index)?)}else{None};
     let path=if let Some(manifest)=&manifest {
-        ensure!(manifest.version==1 && manifest.source()?==source && manifest.contract_revision>0
-            && manifest.contract_hash.len()==64 && manifest.contract_hash.bytes().all(|b|b.is_ascii_hexdigit()),"retained prepared manifest identity changed");
+        validate_retained_manifest(&control,manifest,source)?;
         let original=evidence_path(&control,source,&manifest.original_base)?;
         if let Some(name)=&manifest.evidence_file {
             ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"retained prepared evidence path changed");
@@ -2090,7 +2128,7 @@ pub(super) fn retained_prepared(root:&Path,control:&Path,source:AcceptanceSource
         ensure!(registered.baseline_head()==manifest.original_base && registered.contract_hash()==manifest.contract_hash
             && prepared.proposal.contract.revision==manifest.contract_revision,"retained manifest and prepared evidence disagree");
     }else{ensure!(evidence_path(&control,source,registered.baseline_head())?==path,"retained original filename differs from baseline");}
-    registered.verify_integrity(root)?;
+    registered.verify_source_files(root,&prepared.proposal.files)?;
     Ok(Some(prepared))
 }
 
