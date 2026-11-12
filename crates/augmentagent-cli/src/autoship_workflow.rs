@@ -41,6 +41,7 @@ pub(crate) mod tool_capacity;
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
 mod qualification_recovery;
+pub(crate) use qualification_recovery::SemanticReconsideration;
 #[path="autoship_qualification_schedule.rs"]
 mod qualification_schedule;
 pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};

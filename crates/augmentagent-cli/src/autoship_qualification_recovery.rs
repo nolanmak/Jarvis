@@ -50,14 +50,46 @@ pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkp
     Ok(value.as_deref()==Some(serde_json::json!({"physical":true,"checkpoint":checkpoint}).to_string().as_str()))
 }
 
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SemanticReconsideration {
+    version:u32,
+    pub key:String,
+    pub judgment:String,
+    pub policy:String,
+    original_generation:i64,
+    pub binding:Binding,
+    qualification_required:bool,
+}
+
+fn semantic_key(workflow:&str,identity:&str,policy:&str)->Result<String> {
+    Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-reconsideration-v1",workflow,identity,policy))?)))
+}
+fn semantic_hash(value:&str)->bool {
+    value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl WorkflowStore {
+    /// Recover the existing source reference across intermediate checkpoints,
+    /// not a fresh reconsideration, qualification or model admission.
+    pub(crate) fn semantic_reconsideration(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
+        if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
+        let saved:Option<(i64,String)>=self.conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((generation,raw))=saved else{return Ok(None)};
+        let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
+        ensure!(cue.version==1 && cue.qualification_required && cue.original_generation==generation
+            && generation<=snapshot.generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment)
+            && cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration reference changed");
+        Ok((cue.binding==*binding).then_some(cue))
+    }
+
     /// Queue consideration of authenticated negative source data. This grants
     /// neither a lease nor positive qualification and never creates a budget.
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
         policy:&str,now:i64,validate:F)->Result<bool>
     where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<String>> {
-        let valid_hash=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        ensure!(valid_hash(policy),"semantic recovery policy identity is invalid");
+        ensure!(semantic_hash(policy),"semantic recovery policy identity is invalid");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row:Option<(String,i64,i64,String,Option<u64>)>=tx.query_row(
             "SELECT checkpoint,lease_until,generation,branch,pr FROM workflow WHERE id=?1",[&expected.workflow],
@@ -72,10 +104,10 @@ impl WorkflowStore {
         let custody=baseline_native_custody(&tx,&expected.workflow)?;
         let inspection=VerifierEvidenceInspection::new(&tx,&expected.workflow);
         let Some(identity)=validate(&custody,&inspection)? else{return Ok(false)};
-        ensure!(valid_hash(&identity),"semantic recovery judgment identity is invalid");
+        ensure!(semantic_hash(&identity),"semantic recovery judgment identity is invalid");
         // Generation and owner revisions fence this transaction, but must not
         // turn the same original judgment into a fresh reconsideration budget.
-        let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-reconsideration-v1",&expected.workflow,&identity,policy))?));
+        let key=semantic_key(&expected.workflow,&identity,policy)?;
         let consumed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' AND json_extract(payload,'$.key')=?2)",params![expected.workflow,key],|r|r.get(0))?;
         if consumed {return Ok(false);}
         checkpoint.stage=Stage::Reconcile;

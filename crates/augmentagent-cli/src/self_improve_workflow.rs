@@ -715,10 +715,12 @@ impl WorkflowGuard {
             )?
         };
         let existing = store.snapshot(&id)?;
+        let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
+        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered") || semantic.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
-                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered";
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
             if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let context=context.filter(|context|context.source_request==start.contract
@@ -794,7 +796,8 @@ impl WorkflowGuard {
             })?;
             store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         }
-        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || matches!(snapshot.checkpoint.next.reason.as_str(),"original_native_custody_recovered"|"original_semantic_witness_recovered") {
+        let semantic=store.semantic_reconsideration(&id,&binding)?;
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() {
             AcceptanceAuthority::RecoveryOnly
         }else {AcceptanceAuthority::Unbound};
         let guard = Self {
