@@ -142,5 +142,6 @@ tamper rejection, and unchanged Unknown-only legacy recovery. Both regressions
 pass, as does the actual retained #2014 read-only probe (2.41 seconds). A fresh
 reader and all 26 mapped seams were rechecked, including stage-specific refusal
 handling and the existing environment-bound budget. Prior 1,982-test validation
-covers the earlier head; corrected-head full validation and re-review remain
-pending.
+covers the earlier head. Corrected full CLI validation passed 1,984 tests, zero
+failures, 39 explicit ignores, in 288.06 seconds. Exact-head hosted checks and
+independent re-review remain pending; no merge or rollout is claimed.
