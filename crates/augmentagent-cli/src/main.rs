@@ -12,6 +12,7 @@ mod model_tool;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
+mod calendar_repeat;
 mod voice_tool;
 mod phone_runtime;
 mod phone_attention;
@@ -1545,6 +1546,9 @@ enum CalendarOp {
         /// preview and exits — nothing is written anywhere.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post: bool,
+        /// #2042 — recurring series (--repeat weekly --repeat-count 10 …)
+        #[command(flatten)]
+        repeat: calendar_repeat::RepeatArgs,
     },
     /// #399 — read-only schedule lookup across active accounts. Query
     /// mode's calendar tool; applies NO engagement filter (solo events,
@@ -5330,6 +5334,7 @@ async fn main() -> Result<()> {
                 meet,
                 account,
                 post,
+                repeat,
             } => {
                 run_calendar_create_event(
                     store,
@@ -5341,6 +5346,7 @@ async fn main() -> Result<()> {
                     meet,
                     account,
                     post,
+                    repeat,
                 )
                 .await?;
                 Ok(())
@@ -21449,6 +21455,7 @@ async fn run_calendar_create_event(
     meet: bool,
     account: Option<String>,
     post: bool,
+    repeat: calendar_repeat::RepeatArgs,
 ) -> Result<()> {
     use augmentagent_channel_calendar::{
         AlertCandidate, CalendarApi, ComposioCalendarClient, EventDraft,
@@ -21460,6 +21467,11 @@ async fn run_calendar_create_event(
          (compute the date from `calendar list-events`'s now: header)",
     )?;
     let start_utc = start_dt.with_timezone(&Utc);
+    let planned_repeat = calendar_repeat::plan(
+        &repeat,
+        start_dt,
+        augmentagent_approval_discord::timeparse::owner_zone(),
+    )?;
     let now = Utc::now();
     if start_utc < now - chrono::Duration::minutes(5) {
         anyhow::bail!(
@@ -21544,6 +21556,8 @@ async fn run_calendar_create_event(
         attendees: attendee_list.clone(),
         description: description.clone(),
         create_meeting_room: meet,
+        recurrence: planned_repeat.iter().map(|p| p.rule.clone()).collect(),
+        time_zone: planned_repeat.as_ref().map(|p| p.time_zone.clone()),
     };
     let payload_json =
         serde_json::to_string_pretty(&draft).context("serialize event draft")?;
@@ -21571,6 +21585,12 @@ async fn run_calendar_create_event(
     );
     if let Some(d) = &description {
         human.push_str(&format!("• notes:     {d}\n"));
+    }
+    if let Some(p) = &planned_repeat {
+        human.push_str(&format!("• repeats:   {} ({})\n", p.words, p.time_zone));
+        if !conflict_lines.is_empty() {
+            human.push_str("(conflict check covers the first occurrence only)\n");
+        }
     }
     for line in &conflict_lines {
         human.push_str(&format!("{line}\n"));

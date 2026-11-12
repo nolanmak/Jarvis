@@ -16,6 +16,7 @@ pub mod gcal;
 pub mod google_direct;
 pub mod guest;
 pub mod recurrence;
+pub mod repeat;
 pub mod reschedule;
 pub mod rsvp;
 pub mod trigger;
