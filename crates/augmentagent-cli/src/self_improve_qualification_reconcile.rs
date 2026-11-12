@@ -395,6 +395,86 @@ mod tests {
         assert!(fixture_git(&candidate,&["status","--porcelain=v1","--untracked-files=all"]).is_empty());
     }
 
+    async fn retained_checkout_fixture(mode:&str)->(tempfile::TempDir,tempfile::TempDir,WorkflowStore,crate::autoship_workflow::Snapshot,crate::autoship_workflow::RecoveryContext,adoption::AdoptedPr) {
+        let root=tempfile::tempdir().unwrap();let data=tempfile::tempdir().unwrap();
+        fixture_git(root.path(),&["init","-q","-b","main"]);
+        fixture_git(root.path(),&["config","user.name","Fixture"]);fixture_git(root.path(),&["config","user.email","fixture@example.invalid"]);
+        std::fs::write(root.path().join("code"),"original production\n").unwrap();fixture_git(root.path(),&["add","code"]);fixture_git(root.path(),&["commit","-qm","original"]);
+        fixture_git(root.path(),&["remote","add","origin",root.path().to_str().unwrap()]);fixture_git(root.path(),&["fetch","-q","origin","main"]);
+        let branch="agent-fix/issue-7";let original=root.path().join("workers/original-issue");
+        recovery::prepare(root.path(),&original,branch).await.unwrap();
+        std::fs::write(original.join("code"),"published candidate\n").unwrap();fixture_git(&original,&["add","code"]);fixture_git(&original,&["commit","-qm","published candidate"]);
+        let published=fixture_git(&original,&["rev-parse","HEAD"]);
+        let candidate=workflow::prepare_resume_worktree_at_head(root.path(),42,branch,Some(&published)).await.unwrap();
+        let original_binding=workflow::git_binding(&candidate,"owner request","fixture environment",&[]).await.unwrap();
+        if matches!(mode,"owned"|"unowned"|"sibling") {
+            if mode=="sibling" {
+                let sibling=fixture_git(&candidate,&["commit-tree","HEAD^{tree}","-p","origin/main","-m","not a published descendant"]);
+                fixture_git(&candidate,&["checkout","-q","--detach",&sibling]);
+            }else {
+                std::fs::write(candidate.join("code"),"retained unpublished candidate\n").unwrap();fixture_git(&candidate,&["add","code"]);fixture_git(&candidate,&["commit","-qm","retained candidate"]);
+            }
+        }
+        let binding=workflow::git_binding(&candidate,"owner request","fixture environment",&[]).await.unwrap();
+        let mut store=WorkflowStore::open(&data.path().join("workflow.db")).unwrap();let now=chrono::Utc::now().timestamp_millis();let id="owner/repo#7";
+        store.register(id,branch,original_binding.clone(),now).unwrap();let lease=store.claim(id,"fixture",now,60_000).unwrap().unwrap();store.attach_pr_in_repo(&lease,"owner/repo",42,now).unwrap();
+        if matches!(mode,"owned"|"sibling") {
+            let operation=store.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&original_binding,now).unwrap();store.complete_operation(&lease,&operation.id,&format!("git-head:{published}"),now).unwrap();
+        }
+        let context=crate::autoship_workflow::RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:candidate,source_request:"owner request".into(),source_pr:Some(42),contract:"owner request".into(),environment:"fixture environment".into(),binding:binding.clone()};
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.binding=binding.clone();cp.stage=crate::autoship_workflow::Stage::Scope;cp.next=crate::autoship_workflow::NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&cp,now).unwrap();store.record_recovery_context(&lease,&binding,&context,now).unwrap();store.release(&lease,now).unwrap();
+        let snapshot=store.snapshot(id).unwrap().unwrap();
+        let pr=adoption::AdoptedPr {repository:"owner/repo".into(),pr:42,source_issue:Some(7),branch:branch.into(),head:published,base:"main".into(),author:"owner".into(),title:"Fixture".into(),body:"Original request".into(),dependency:adoption::Dependency::Main};
+        (root,data,store,snapshot,context,pr)
+    }
+
+    #[tokio::test]
+    async fn recovery_checkout_preserves_path_binding_and_original_publication_fences() {
+        let mut failures=vec![];
+        for mode in ["published","owned","attached","wrong-attached","arbitrary-detached","canonical-alias","parent-alias","dangling-alias","foreign-repository","changed-input","changed-head","missing-pr","wrong-pr","wrong-branch","issue-only","unowned","sibling"] {
+            let (root,data,store,mut snapshot,mut context,mut pr)=retained_checkout_fixture(mode).await;
+            match mode {
+                "attached"=>context.worktree=root.path().join("workers/original-issue"),
+                "wrong-attached"=>{fixture_git(&context.worktree,&["checkout","-q","-b","wrong-owner-branch"]);},
+                "arbitrary-detached"=>{
+                    let other=root.path().join("workers/arbitrary-detached");fixture_git(root.path(),&["worktree","add","--detach",other.to_str().unwrap(),&pr.head]);context.worktree=other;
+                },
+                "canonical-alias"|"parent-alias"|"dangling-alias"=>{
+                    let canonical=context.worktree.clone();let moved=root.path().join(if mode=="parent-alias" {"workers/resume-pr-42"}else{"workers/moved-resume"});
+                    fixture_git(root.path(),&["worktree","move",canonical.to_str().unwrap(),moved.to_str().unwrap()]);context.worktree=moved.clone();
+                    if mode=="parent-alias" {
+                        std::fs::remove_dir(canonical.parent().unwrap()).unwrap();std::os::unix::fs::symlink(moved.parent().unwrap(),canonical.parent().unwrap()).unwrap();
+                    }else {
+                        std::os::unix::fs::symlink(if mode=="dangling-alias" {root.path().join("missing")}else{moved},canonical).unwrap();
+                    }
+                },
+                "foreign-repository"=>{
+                    let foreign=root.path().join("workers/foreign");fixture_git(root.path(),&["clone","-q","--no-hardlinks",root.path().to_str().unwrap(),foreign.to_str().unwrap()]);context.worktree=foreign;
+                },
+                "changed-input"=>std::fs::write(context.worktree.join("code"),"owner's uncommitted changes\n").unwrap(),
+                "changed-head"=>{fixture_git(&context.worktree,&["commit","--allow-empty","-qm","unrecorded candidate"]);},
+                "wrong-pr"=>pr.pr=43,
+                "wrong-branch"=>pr.branch="other-published-branch".into(),
+                "issue-only"=>{snapshot.pr=None;context.source_pr=None;},
+                _=>{},
+            }
+            let identity=|path:&Path|(
+                fixture_git(path,&["rev-parse","HEAD"]),fixture_git(path,&["rev-parse","--verify","--symbolic-full-name","HEAD"]),
+                fixture_git(path,&["diff","--binary","HEAD","--"]),fixture_git(path,&["status","--porcelain=v1","--untracked-files=all"]));
+            let before_checkout=identity(&context.worktree);let before_snapshot=store.snapshot(&snapshot.workflow).unwrap();let before_events=store.events(&snapshot.workflow).unwrap();
+            let metadata=if matches!(mode,"missing-pr"|"issue-only") {None}else{Some(&pr)};
+            let checked=validate_recovery_checkout(&data.path().join("workflow.db"),root.path(),&snapshot,&context,metadata).await;
+            let expected=matches!(mode,"published"|"owned"|"attached");
+            if checked.is_ok()!=expected {failures.push(format!("{mode}: expected allowed={expected}, got {checked:?}"));}
+            if mode=="foreign-repository" {assert!(format!("{:?}",checked.unwrap_err()).contains("another repository"));}
+            assert_eq!(identity(&context.worktree),before_checkout,"inspection changed {mode} checkout");
+            assert_eq!(fixture_git(root.path(),&["rev-parse","refs/heads/agent-fix/issue-7"]),pr.head,"inspection rewrote {mode} published branch");
+            assert_eq!(store.snapshot(&snapshot.workflow).unwrap(),before_snapshot,"inspection changed {mode} state");assert_eq!(store.events(&snapshot.workflow).unwrap(),before_events,"inspection changed {mode} events");
+        }
+        assert!(failures.is_empty(),"checkout boundary mismatches: {failures:#?}");
+    }
+
     #[tokio::test]
     #[ignore = "explicit read-only retained recovery checkout compatibility; no model calls"]
     async fn production_retained_checkout_recovery_compatibility() {
