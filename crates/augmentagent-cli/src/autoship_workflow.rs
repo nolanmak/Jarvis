@@ -1723,6 +1723,14 @@ impl WorkflowStore {
 
     /// Strategy budgets belong to a contract/base/runner epoch, not a mutable
     /// candidate head. Committing an unsuccessful fix cannot reset this budget.
+    pub(crate) fn epoch_attempts(&self,lease:&Lease,purpose:&str,epoch:&str,now:i64)->Result<u32> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len()<=1024,"bounded epoch purpose required");
+        let tx=self.conn.unchecked_transaction()?;require_lease(&tx,lease,now)?;
+        let count=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",
+            params![lease.workflow,purpose,format!("epoch:{epoch}")],|row|row.get(0)).optional()?.unwrap_or(0);
+        tx.commit()?;Ok(count)
+    }
+
     pub fn admit_epoch_attempt(
         &mut self,
         lease: &Lease,

@@ -399,6 +399,8 @@ pub(super) fn legacy_decline_omits_owner_evidence(control:&Path,source:Acceptanc
     Ok(selected.is_some())
 }
 
+pub(super) fn decline_omits_source_evidence(_control:&Path,_source:AcceptanceSource,_contract:&str,_input:&str)->Result<bool> {Ok(false)}
+
 struct AuthorityFacts<'a> {
     source:AcceptanceSource,request_context:&'a str,failure:&'a str,canonical_main:&'a str,
     scope_base:&'a str,head:&'a str,diff:&'a str,upstream_paths:&'a str,
@@ -452,6 +454,14 @@ pub(super) async fn try_amend(
         return Ok(None);
     }
     old.baseline.registration.verify_integrity(root)?;
+    let initial_environment=environment_id(root)?;
+    let epoch=digest(&serde_json::to_vec(&(source,old.baseline.registration.baseline_head(),&initial_environment))?);
+    // A spent total budget remains spent even when source evidence is missing.
+    // This reads the existing counter only; final admission stays atomic below.
+    if workflow.epoch_attempts("verifier-amend-total",&epoch)? >= 4 {
+        ensure!(adjudication.is_none(),"adjudicated amendment epoch budget exhausted; changed trusted inputs required");
+        return Err(initial_repair::Hold::Exhausted.into());
+    }
     let head = actual_head(root).await?;
     let tree = trusted_git(root, &["--no-replace-objects", "rev-parse", &format!("{head}^{{tree}}")]).await?;
     // GitHub supplies the canonical main identity; a candidate can mutate its
@@ -484,6 +494,7 @@ pub(super) async fn try_amend(
     let request_context=authority_request_context(title,&owner_request,negative.as_ref().map(|(identity,diagnosis)|(identity.as_str(),diagnosis.as_str())))?;
     let environments = environment_evidence_against_main(root, control, old,&canonical_main).await?;
     let candidate_environment = environments.current_candidate.clone();
+    ensure!(candidate_environment==initial_environment,"amendment candidate environment changed before request preparation");
     let original_base=old.baseline.registration.baseline_head();
     let prompt=authority_base_request(old,AuthorityFacts {source,request_context:&request_context,failure,
         canonical_main:&canonical_main,scope_base:&scope_base,head:&head,diff:&diff,upstream_paths:&upstream_paths,
@@ -512,11 +523,6 @@ pub(super) async fn try_amend(
         &scope_base,
         candidate_environment.clone(),
         adjudication.map(|text| digest(text.as_bytes())),
-    ))?);
-    let epoch = digest(&serde_json::to_vec(&(
-        source,
-        old.baseline.registration.baseline_head(),
-        candidate_environment.clone(),
     ))?);
     immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
         &serde_json::to_vec(&serde_json::json!({"version":2,"context_sha256":context_identity,"source_evidence_sha256":source_sha256}))?)?;
@@ -1021,6 +1027,27 @@ pub(super) async fn resume_pending(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_owner_only_decline_requires_exact_v1_context() {
+        let (_root,old)=fixture();let source=old.proposal.contract.source().unwrap();let contract=old.baseline.registration.contract_hash();
+        let input="a".repeat(64);
+        for (context,expected) in [
+            (serde_json::json!({"version":1,"context_sha256":"b".repeat(64)}),true),
+            (serde_json::json!({"version":2,"context_sha256":"b".repeat(64),"source_evidence_sha256":"c".repeat(64)}),false),
+            (serde_json::json!({"version":3,"context_sha256":"b".repeat(64)}),false),
+            (serde_json::json!({"version":1}),false),
+            (serde_json::json!({"version":1,"context_sha256":"bad"}),false),
+            (serde_json::json!({"version":1,"context_sha256":"b".repeat(64),"unknown":true}),false),
+        ] {
+            let control=tempfile::tempdir().unwrap();
+            let name=format!("{}-amendment-decision-{input}-{}.json",source.key(),uuid::Uuid::new_v4());
+            immutable(control.path(),&name,authority_json(&old,false,None).as_bytes()).unwrap();
+            immutable(control.path(),&format!("{}-amendment-context-{input}.json",source.key()),&serde_json::to_vec(&context).unwrap()).unwrap();
+            assert_eq!(decline_omits_source_evidence(control.path(),source,contract,&input).unwrap(),expected,"known owner-only evidence omission is not distinguished from complete/future/malformed context");
+            assert!(!decline_omits_source_evidence(control.path(),source,&"f".repeat(64),&input).unwrap());
+        }
+    }
+
     #[test]
     fn legacy_decline_is_recoverable_only_without_a_successor_context_record() {
         let (_root,old)=fixture();let control=tempfile::tempdir().unwrap();
