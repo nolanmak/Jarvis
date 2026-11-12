@@ -1589,6 +1589,7 @@ fn verifier_executor_id()->Result<String> {
     let sources:&[&[u8]]=&[
         include_bytes!("autoship_contract.rs"),include_bytes!("self_improve_contract.rs"),
         include_bytes!("self_improve_verifier_execution.rs"),include_bytes!("self_improve_verifier_capture.rs"),
+        include_bytes!("self_improve_verifier_checkout.rs"),include_bytes!("../../../scripts/codex-command-sandbox.py"),
         include_bytes!("../../augmentagent-channel-core/src/process_tree.rs"),
         include_bytes!("../../augmentagent-channel-core/src/run_resources.rs"),
         include_bytes!("../../../scripts/run-resource-scope.py"),
