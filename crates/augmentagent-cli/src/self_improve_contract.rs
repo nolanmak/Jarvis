@@ -510,6 +510,17 @@ async fn execute_registered_with_custody(root:&Path,registration:&RegisteredCont
     let binding = registration.binding(&head)?;
     registration.verify_integrity(&root)?;
     if let Some(original)=original {original.require_registration(&root,registration)?;}
+    let mut retained=BTreeMap::new();
+    if let Some(original)=original {
+        for verifier in &registration.contract().verifiers {
+            if let Some(observation)=original.captured_observation(&verifier.id)? {
+                retained.insert(verifier.id.clone(),registration.observe(&root,&verifier.id,binding.clone(),&observation)?);
+            }
+        }
+        if retained.len()==registration.contract().verifiers.len() {
+            return Ok(registration.contract().verifiers.iter().map(|v|retained.remove(&v.id).unwrap()).collect());
+        }
+    }
     let target = protected_verifier_target(&root, registration)?;
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
@@ -517,6 +528,7 @@ async fn execute_registered_with_custody(root:&Path,registration:&RegisteredCont
     let committed = verifier_checkout::materialize(&root, &head, registration, &target).await?;
     let mut receipts = Vec::new();
     for verifier in &registration.contract().verifiers {
+        if let Some(receipt)=retained.remove(&verifier.id) {receipts.push(receipt);continue;}
         registration.verify_integrity(&root)?;
         let invocation = verifier.command.invocation()?;
         let observation = isolated_observation_with_custody(committed.path(), &target, invocation, audit,original.map(|context|(context,verifier.id.as_str()))).await?;
@@ -535,6 +547,8 @@ fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> 
     let key = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
+            "verifier-cache-v2",
+            crate::build_storage::repo_id(root)?,
             registration.contract_hash(),
             &binding.environment_id
         ))?)
@@ -710,8 +724,10 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
         || augmentagent_channel_core::run_resources::declared_policy()?.is_some();
     let mut cleanup=if observed {Some(crate::build_storage::ci_holds::Hold::begin(root,root,private.path(),target,
         &amendment::digest(&serde_json::to_vec(&(root,target))?))?)}else{None};
+    let capture=original.map(|(context,verifier)|context.capture_path(verifier)).transpose()?;
     let spawned=if let Some(cleanup)=&cleanup {
-        augmentagent_channel_core::run_resources::spawn_command_at(&cmd,Some(audit),cleanup.supervisor())
+        if let Some(capture)=&capture {augmentagent_channel_core::run_resources::spawn_recorded_command_at(&cmd,Some(audit),cleanup.supervisor(),capture)}
+        else {augmentagent_channel_core::run_resources::spawn_command_at(&cmd,Some(audit),cleanup.supervisor())}
     } else {augmentagent_channel_core::run_resources::spawn_command(&cmd,Some(audit))};
     let (mut child,resources)=match spawned {
         Ok(spawned)=>spawned,
@@ -756,6 +772,9 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
     if let Some(cleanup)=&mut cleanup {cleanup.settle().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;}
     if invocation.program == "cargo" {
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
+    }
+    if let Some((context,verifier))=original {
+        return context.captured_observation(verifier)?.context(initial_repair::Hold::EvidenceUnknown);
     }
     match result {
         Ok((status, stdout, stderr)) => Ok(Observation {
@@ -1460,7 +1479,7 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
     }
     let retained=verifier_execution::OriginalExecution::retained_result(root,workflow,proposal,&base,&environment,&execution)?;
     let baseline=if let Some((_,retained))=retained {reproduce_observation(retained)?} else {
-        let original=verifier_execution::OriginalExecution::begin(workflow,proposal,&base,&environment,&execution)?;
+        let original=verifier_execution::OriginalExecution::begin(workflow,control,proposal,&base,&environment,&execution)?;
         measure(original.clone()).await.map_err(|error|original.failed(error))?
     };
     ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
@@ -1474,7 +1493,8 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
 }
 
 fn verifier_executor_id()->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?))
+    Ok(amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
+        amendment::digest(include_bytes!("../../../scripts/provider-supervisor.py"))))?))
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current
@@ -2897,6 +2917,19 @@ mod control_namespace_tests {
 #[cfg(test)]
 mod verifier_cache_tests {
     use super::*;
+    #[tokio::test]
+    async fn verifier_cache_separates_repositories_and_reuses_their_worktrees() {
+        let (first,control,prepared)=baseline_witness::prepared_fixture();
+        let (second,_other_control,other)=baseline_witness::prepared_fixture();
+        assert_eq!(prepared.baseline.registration.contract_hash(),other.baseline.registration.contract_hash());
+        let target=protected_verifier_target(first.path(),&prepared.baseline.registration).unwrap();
+        assert_ne!(target,protected_verifier_target(second.path(),&other.baseline.registration).unwrap(),"separate repository owners received the same verifier target");
+        let linked=control.path().join("linked");let linked_path=linked.to_str().unwrap();
+        trusted_git(first.path(),&["worktree","add","--detach",linked_path,prepared.baseline.registration.baseline_head()]).await.unwrap();
+        assert_eq!(target,protected_verifier_target(&linked,&prepared.baseline.registration).unwrap(),"a worktree lost its repository's warm verifier cache");
+        trusted_git(first.path(),&["worktree","remove","--force",linked_path]).await.unwrap();
+    }
+
     #[test]
     fn verifier_cache_is_a_distinct_sibling_and_symlink_alias_is_refused() {
         let parent = tempfile::tempdir().unwrap();

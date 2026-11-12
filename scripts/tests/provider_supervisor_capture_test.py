@@ -72,6 +72,29 @@ class CaptureTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(touched.exists())
 
+    def test_cancellation_before_release_is_retained_without_running_child(self):
+        (self.session / 'launch-continue').unlink()
+        touched = self.root / 'child-ran'
+        process = subprocess.Popen([sys.executable, '-I', str(SUPERVISOR),
+                                    str(self.session / 'cleanup-complete'), sys.executable, '-I', '-c',
+                                    f"from pathlib import Path; Path({str(touched)!r}).touch()"],
+                                   env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.session / 'launch-ready').exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue((self.session / 'launch-ready').exists())
+            process.terminate()
+            process.communicate(timeout=5)
+            record = self.manifest()
+            self.assertTrue(record['interrupted'])
+            self.assertEqual(record['terminal_cause'], 'cancelled_before_dispatch')
+            self.assertFalse(touched.exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+
     def test_owner_death_retains_an_interrupted_result_and_reaps_child(self):
         started = self.root / 'started'
         child_code = f"import os,time; from pathlib import Path; print('before owner exit',flush=True); Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(60)"

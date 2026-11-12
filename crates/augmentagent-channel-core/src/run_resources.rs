@@ -400,6 +400,16 @@ pub fn spawn_command_at(command:&tokio::process::Command,logger:Option<&Arc<crat
     Ok((child,CommandGuard(guard)))
 }
 
+/// Record raw output in a separately retained controller directory before the
+/// supervisor exits. The capability is stripped from the sandboxed child.
+pub fn spawn_recorded_command_at(command:&tokio::process::Command,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,directory:&Path,capture:&Path)
+    ->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_recorded_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory,capture)?;
+    Ok((child,CommandGuard(guard)))
+}
+
 fn build_policy_or_defer(policy: Result<serde_json::Value>, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> Result<serde_json::Value> {
     match policy {
         Ok(policy) => Ok(policy),
@@ -440,6 +450,7 @@ pub fn spawn_command_with_storage_at(command:&tokio::process::Command,
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(target_os="linux")]
     #[ignore = "requires isolated delegated systemd service with daemon subgroup"]
     fn raw_verifier_cleanup_hold_survives_owner_drop_until_kernel_quiescence() {
         crate::build_storage_ci_holds::with_test_registry(|root,_| {
@@ -522,7 +533,8 @@ s.close();p.wait()
             }))
             .unwrap();
         let mut command = tokio::process::Command::new("/usr/bin/python3");
-        command.args(["-I", "-c", "print('actual observable value')"]);
+        command.args(["-I", "-c", "import os; assert 'JARVIS_RAW_VERIFIER_CAPTURE' not in os.environ; print('actual observable value')"])
+            .env("JARVIS_RAW_VERIFIER_CAPTURE","/nonexistent/untrusted-capture");
         let (mut child, guard) = spawn_command(&command, Some(&logger)).unwrap();
         guard.admit("verification", Some(&logger)).await.unwrap();
         drop(child.stdin.take());

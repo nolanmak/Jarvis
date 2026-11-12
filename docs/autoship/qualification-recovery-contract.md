@@ -100,7 +100,7 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
 
 The native-custody path below does not complete infrastructure recovery. The
 original-plan executor and result handoff now have component coverage below;
-unknown-result settlement, all-cause producer coverage and fair scheduling
+all-cause producer coverage and fair scheduling
 remain open. They
 must be resolved in code and tests; they are not requests for an owner-selected
 limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
@@ -234,11 +234,36 @@ kernel test confirms that losing the hold object while the child is live keeps
 cleanup fenced until that exact scope is empty. Unprotected fixtures without a
 resource declaration retain their existing non-resource execution path.
 
-Recovery is not ready for rollout. An earlier admitted command can have an
-unknown result even after quiescence; original-result settlement is still
-required before another attempt. Bounded fair five-minute wake/selection is
-also unfinished. The saved-result component tests do not prove unattended
-selection, independent qualification, publication or merging.
+The trusted supervisor now captures bounded stdout/stderr and terminal status
+outside both worker writes and the controller's output pipes. It syncs the
+streams before publishing an exclusive, atomic manifest after descendant
+reaping. The manifest binds the original command and actual resource identity,
+with stream lengths/hashes and explicit completion/interruption status. The
+capture capability is removed from child environments. Capture storage checks
+private ownership, original directory device/inode, request identity and all
+output hashes before returning any observation.
+
+Quiescence without an original outcome no longer permits another attempt.
+Complete captured commands resume the same attempt and reconstruct their
+registered receipts; only never-started verifiers execute. A recorded actual
+interruption permits a new attempt after quiescence and normal admission,
+without consuming a semantic correction slot. Its manifest references remain
+in protected history. Missing or changed evidence stays unknown; no clock,
+checkpoint edit or model replacement manufactures its outcome.
+
+Real delegated-service tests cover fresh execution, loss of whole-result
+retention after actual capture, and partial completion of a two-verifier recipe.
+They verify original attempt/receipt preservation and zero model calls. Actual
+subprocess tests separately kill the owner process and verify interrupted
+capture plus child reaping, including cancellation before child release.
+
+Verifier cache names now include storage's canonical Git common-directory
+identity. Worktrees share their repository's cache; identical contracts in
+different repositories cannot collide or bypass ownership checks (#2036).
+
+Recovery is not ready for rollout. Bounded fair five-minute wake/selection and
+fresh source authorization remain unfinished. These component tests do not
+prove unattended selection, independent qualification, publication or merging.
 
 ## Open threads from the fresh-eyes checkpoint
 

@@ -1,5 +1,7 @@
 //! Original verifier execution custody. Evidence data never grants a witness.
 use super::*;
+#[path="self_improve_verifier_capture.rs"]
+mod capture;
 
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +22,8 @@ impl std::error::Error for OriginalExecutionFailed {}
 struct Admission {
     version:u32,kind:String,workflow:String,plan:String,attempt:String,verifier:String,
     identity:serde_json::Value,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    capture:Option<capture::Capture>,
 }
 
 #[derive(Serialize,Deserialize)]
@@ -65,20 +69,92 @@ pub(super) struct OriginalExecution<'a> {
     environment:String,
     contract:AcceptanceContract,
     files:BTreeMap<String,String>,
+    control:PathBuf,
 }
 
 impl<'a> OriginalExecution<'a> {
-    pub(super) fn begin(workflow:&'a workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Self> {
+    pub(super) fn begin(workflow:&'a workflow::WorkflowGuard,control:&Path,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Self> {
         let (key,body)=plan_input(workflow,proposal,base,environment,executor)?;
         workflow.record_verifier_evidence(&key,"original_verifier_plan",&body)?;
-        Self::quiesce_previous(workflow).map_err(|e|e.context(OriginalExecutionFailed {plan:key.clone()}))?;
-        let attempt=amendment::digest(uuid::Uuid::new_v4().as_bytes());
-        let record=serde_json::json!({"version":1,"kind":"original_verifier_attempt","workflow":workflow.id(),"plan":key,"attempt":attempt});
-        let attempt_key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-v1",&key,&attempt))?);
-        workflow.record_verifier_evidence(&attempt_key,"original_verifier_attempt",&record.to_string())?;
+        let resume=Self::quiesce_previous(workflow).and_then(|_|Self::settle_previous_results(workflow,&key))
+            .map_err(|error| {
+                let error=if error.downcast_ref::<initial_repair::Hold>().is_some(){error}else{error.context(initial_repair::Hold::EvidenceUnknown)};
+                error.context(OriginalExecutionFailed {plan:key.clone()})
+            })?;
+        let attempt=if let Some(attempt)=resume {attempt}else {
+            let attempt=amendment::digest(uuid::Uuid::new_v4().as_bytes());
+            let record=serde_json::json!({"version":1,"kind":"original_verifier_attempt","workflow":workflow.id(),"plan":key,"attempt":attempt});
+            let attempt_key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-v1",&key,&attempt))?);
+            workflow.record_verifier_evidence(&attempt_key,"original_verifier_attempt",&record.to_string())?;attempt
+        };
         Ok(Self {workflow,plan:key,attempt,verifiers:proposal.contract.verifiers.iter().map(|v|v.id.clone()).collect(),
             base:base.into(),environment:environment.into(),contract:proposal.contract.clone(),
-            files:proposal.files.iter().map(|(path,body)|(path.clone(),amendment::digest(body.as_bytes()))).collect()})
+            files:proposal.files.iter().map(|(path,body)|(path.clone(),amendment::digest(body.as_bytes()))).collect(),control:control.canonicalize()?})
+    }
+
+    fn settle_previous_results(workflow:&workflow::WorkflowGuard,current_plan:&str)->Result<Option<String>> {
+        let mut cursor=0;let mut unfinished:BTreeMap<(String,String),Vec<(String,capture::Recovered)>>=BTreeMap::new();
+        loop {
+            let rows=workflow.verifier_evidence_page("original_verifier_command_admission",cursor)?;
+            if rows.is_empty(){break;}
+            for row in rows {
+                cursor=row.sequence;
+                let admitted:Admission=serde_json::from_str(&row.body)?;
+                if let Some(saved)=workflow.verifier_evidence(&result_key(&admitted.plan,&admitted.attempt),"original_verifier_result")? {
+                    let result:RecordedResult=serde_json::from_str(&saved)?;
+                    ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==workflow.id()
+                        && result.plan==admitted.plan && result.attempt==admitted.attempt,"original result identity changed");
+                    result.baseline.registration.baseline_result(&result.baseline.receipts)?;
+                    Self::require_result_commands(workflow,&admitted.plan,&admitted.attempt,&result.baseline)?;
+                    ensure!(result.baseline.receipts.iter().any(|r|r.verifier_id==admitted.verifier),"original result omitted an admitted command");
+                    continue;
+                }
+                let captured=admitted.capture.as_ref().context("original command result was not retained")?
+                    .read(&row.key,&admitted.identity)?.context("original command result is not yet published")?;
+                unfinished.entry((admitted.plan,admitted.attempt)).or_default().push((row.key,captured));
+            }
+        }
+        let mut resume=None;
+        for ((plan,attempt),commands) in unfinished {
+            if commands.iter().any(|(_,result)|result.observation.interrupted || !result.observation.output_complete) {
+                let key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-interrupted-v1",&plan,&attempt))?);
+                let references:Vec<_>=commands.iter().map(|(key,result)|serde_json::json!({"command":key,"manifest_sha256":result.manifest_sha256})).collect();
+                workflow.record_verifier_evidence(&key,"original_verifier_attempt_interrupted",&serde_json::json!({"version":1,
+                    "kind":"original_verifier_attempt_interrupted","workflow":workflow.id(),"plan":plan,"attempt":attempt,"commands":references}).to_string())?;
+            } else if plan==current_plan {
+                ensure!(resume.is_none(),"multiple original attempts have unreconciled results");resume=Some(attempt);
+            }
+        }
+        Ok(resume)
+    }
+
+    fn prepare_capture(&self,verifier:&str)->Result<capture::Capture> {
+        ensure!(self.verifiers.iter().any(|id|id==verifier),"capture is not in the original verifier plan");
+        capture::Capture::prepare(&self.control,self.workflow.publication_inputs().1,&command_key(&self.plan,&self.attempt,verifier))
+    }
+
+    pub(super) fn capture_path(&self,verifier:&str)->Result<PathBuf> {
+        self.prepare_capture(verifier).map(|capture|capture.path().to_owned())
+            .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))
+    }
+
+    pub(super) fn captured_observation(&self,verifier:&str)->Result<Option<Observation>> {
+        self.read_captured_observation(verifier).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))
+    }
+
+    fn read_captured_observation(&self,verifier:&str)->Result<Option<Observation>> {
+        let key=command_key(&self.plan,&self.attempt,verifier);
+        let Some(raw)=self.workflow.verifier_evidence(&key,"original_verifier_command_admission")? else {return Ok(None)};
+        let admitted:Admission=serde_json::from_str(&raw)?;
+        ensure!(admitted.workflow==self.workflow.id() && admitted.plan==self.plan && admitted.attempt==self.attempt && admitted.verifier==verifier,"original capture belongs to another operation");
+        let proof=self.workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result has no quiescence proof")?;
+        let proof:Quiescence=serde_json::from_str(&proof)?;
+        ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==self.workflow.id()
+            && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
+            && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"original capture quiescence changed");
+        let result=admitted.capture.context("original command lacks durable output")?.read(&key,&admitted.identity)?
+            .context("original command output unavailable")?;
+        Ok(Some(result.observation))
     }
 
     /// Retain the actual executor result before semantic classification. A
@@ -137,7 +213,7 @@ impl<'a> OriginalExecution<'a> {
                     } else {conclusive=Some((row.key,record.baseline));}
                 }
             }
-            if conclusive.is_some() {Self::quiesce_previous(workflow)?;}
+            if conclusive.is_some() {Self::quiesce_previous(workflow)?;Self::settle_previous_results(workflow,&plan)?;}
             Ok(conclusive)
         })().map_err(|error| {
             let error=if error.downcast_ref::<initial_repair::Hold>().is_some(){error}else{error.context(initial_repair::Hold::EvidenceUnknown)};
@@ -185,13 +261,17 @@ impl<'a> OriginalExecution<'a> {
     }
 
     pub(super) fn admitted(&self,verifier:&str,admission:&augmentagent_channel_core::run_resources::CommandAdmission)->Result<()> {
-        self.retain_admission(verifier,admission.identity())
+        self.retain_admission_with_capture(verifier,admission.identity(),Some(self.prepare_capture(verifier)?))
     }
 
     fn retain_admission(&self,verifier:&str,identity:&serde_json::Value)->Result<()> {
+        self.retain_admission_with_capture(verifier,identity,None)
+    }
+
+    fn retain_admission_with_capture(&self,verifier:&str,identity:&serde_json::Value,capture:Option<capture::Capture>)->Result<()> {
         ensure!(self.verifiers.iter().any(|id|id==verifier),"command is not in the original verifier plan");
         let record=Admission {version:1,kind:"original_verifier_command_admission".into(),workflow:self.workflow.id().into(),
-            plan:self.plan.clone(),attempt:self.attempt.clone(),verifier:verifier.into(),identity:identity.clone()};
+            plan:self.plan.clone(),attempt:self.attempt.clone(),verifier:verifier.into(),identity:identity.clone(),capture};
         let raw=serde_json::to_string(&record)?;
         ensure!(raw.len()<=65536,"verifier admission exceeds bound");
         self.workflow.record_verifier_evidence(&command_key(&self.plan,&self.attempt,verifier),"original_verifier_command_admission",&raw)
@@ -276,15 +356,84 @@ mod tests {
 
     #[tokio::test]
     async fn quiescent_original_without_result_cannot_start_another_attempt() {
-        let (_root,_control,prepared,guard)=fixture().await;
-        let original=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
+        let (_root,control,prepared,guard)=fixture().await;
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
         original.retain_admission("observe",&gone_scope()).unwrap();
         OriginalExecution::quiesce_previous(&guard).unwrap();
-        let retry=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor");
+        let retry=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor");
         let failure=retry.err().expect("quiescence was used as a result receipt and admitted another execution");
         assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
         assert_eq!(guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1);
         drop(original);guard.finish().unwrap();
+    }
+
+    fn captured_fixture(original:&OriginalExecution<'_>,identity:&serde_json::Value,interrupted:bool)->PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let capture=original.prepare_capture("observe").unwrap();
+        original.retain_admission_with_capture("observe",identity,Some(capture.clone())).unwrap();
+        let write=|name:&str,bytes:&[u8]| {
+            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(capture.path().join(name)).unwrap();
+            file.write_all(bytes).unwrap();file.sync_all().unwrap();
+        };
+        write("stdout",b"false\n");write("stderr",b"");
+        write("result.json",serde_json::json!({"version":1,"command":command_key(&original.plan,&original.attempt,"observe"),
+            "identity":identity,"exit_code":if interrupted {None}else{Some(0)},"interrupted":interrupted,"output_complete":true,
+            "terminal_cause":if interrupted {"controller_stopped"}else{"completed"},
+            "stdout_bytes":6,"stderr_bytes":0,"stdout_sha256":amendment::digest(b"false\n"),"stderr_sha256":amendment::digest(b"")}).to_string().as_bytes());
+        capture.path().to_owned()
+    }
+
+    #[tokio::test]
+    async fn captured_original_resumes_its_attempt_and_interruption_is_explicit() {
+        for interrupted in [false,true] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
+            captured_fixture(&original,&gone_scope(),interrupted);
+            let resumed=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
+            let attempts=guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len();
+            if interrupted {
+                assert_ne!(resumed.attempt,original.attempt);assert_eq!(attempts,2);
+                assert_eq!(guard.verifier_evidence_page("original_verifier_attempt_interrupted",0).unwrap().len(),1);
+                assert!(resumed.captured_observation("observe").unwrap().is_none());
+            }else {
+                assert_eq!(resumed.attempt,original.attempt);assert_eq!(attempts,1);
+                assert_eq!(resumed.captured_observation("observe").unwrap().unwrap().stdout,"false\n");
+                let receipts=execute_registered_with_custody(root.path(),&prepared.baseline.registration,&guard.audit_logger(),Some(&resumed)).await.unwrap();
+                assert_eq!(receipts,prepared.baseline.receipts,"captured output did not reconstruct the original registered receipt");
+            }
+            drop((resumed,original));guard.finish().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_captured_output_or_scope_cannot_authorize_another_attempt() {
+        for changed in ["stdout","scope","request","directory"] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
+            let path=captured_fixture(&original,&gone_scope(),false);
+            match changed {
+                "stdout"=>std::fs::write(path.join("stdout"),b"true\n").unwrap(),
+                "scope"=>{
+                    let file=path.join("result.json");let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                    value["identity"]["inode"]=2.into();std::fs::write(file,value.to_string()).unwrap();
+                },
+                "request"=>std::fs::write(path.join("request.json"),"{}").unwrap(),
+                "directory"=>{
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o755)).unwrap();
+                },
+                _=>unreachable!(),
+            }
+            OriginalExecution::quiesce_previous(&guard).unwrap();
+            assert_eq!(original.captured_observation("observe").err().unwrap().downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+            let retry=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor");
+            assert_eq!(retry.err().expect("changed capture authorized execution").downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+            assert_eq!(guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1);
+            drop(original);guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -293,8 +442,8 @@ mod tests {
             let (root,control,prepared,guard)=fixture().await;
             let base=prepared.baseline.registration.baseline_head();
             let environment=environment_id(root.path()).unwrap();
-            let executor=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")))).unwrap());
-            let original=OriginalExecution::begin(&guard,&prepared.proposal,base,&environment,&executor).unwrap();
+            let executor=verifier_executor_id().unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,&executor).unwrap();
             original.retain_admission("observe",&gone_scope()).unwrap();
             OriginalExecution::quiesce_previous(&guard).unwrap();
             let mut baseline=prepared.baseline.clone();
@@ -325,7 +474,7 @@ mod tests {
             let database=control.path().join("workflow.db");
             let base=prepared.baseline.registration.baseline_head();
             let environment=environment_id(root.path()).unwrap();
-            let original=OriginalExecution::begin(&guard,&prepared.proposal,base,&environment,&verifier_executor_id().unwrap()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,&verifier_executor_id().unwrap()).unwrap();
             original.retain_admission("observe",&gone_scope()).unwrap();
             OriginalExecution::quiesce_previous(&guard).unwrap();
             let mut baseline=prepared.baseline.clone();
@@ -374,7 +523,7 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let (root,control,prepared,mut guard)=fixture().await;
             let database=control.path().join("workflow.db");
-            let original=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),
                 &environment_id(root.path()).unwrap(),&verifier_executor_id().unwrap()).unwrap();
             // Inject an interruption after recipe retention but before command
             // admission. Recovery must execute this exact original proposal.
@@ -400,20 +549,76 @@ mod tests {
         });
     }
 
+    #[test]
+    #[ignore = "requires isolated delegated service and no enclosing managed build lease; executor owns normal build admission"]
+    fn original_verifier_recovery_reconciles_captured_output_without_reexecution() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for partial in [false,true] {
+            let (root,control,prepared,mut guard)=fixture().await;
+            let database=control.path().join("workflow.db");let base=prepared.baseline.registration.baseline_head();
+            let mut proposal=prepared.proposal.clone();
+            if partial {
+                let mut remaining=proposal.contract.verifiers[0].clone();remaining.id="observe_remaining".into();
+                proposal.contract.criteria[0].verifier_ids.push(remaining.id.clone());proposal.contract.verifiers.push(remaining);
+            }
+            let original=OriginalExecution::begin(&guard,control.path(),&proposal,base,
+                &environment_id(root.path()).unwrap(),&verifier_executor_id().unwrap()).unwrap();
+            let attempt=original.attempt.clone();
+            let stage=control.path().join("original-stage");let stage_path=stage.to_str().unwrap();
+            trusted_git(root.path(),&["worktree","add","--detach",stage_path,base]).await.unwrap();
+            let actual=if partial {
+                install_harness(&stage,&proposal).unwrap();
+                let registration=RegisteredContract::register(&stage,proposal.contract.clone(),base.into(),environment_id(&stage).unwrap()).unwrap();
+                original.require_registration(&stage,&registration).unwrap();
+                let target=protected_verifier_target(&stage,&registration).unwrap();
+                let _lease=crate::build_storage::admit(&stage,&target).await.unwrap();
+                let committed=verifier_checkout::materialize(&stage,base,&registration,&target).await.unwrap();
+                let verifier=&registration.contract().verifiers[0];
+                let observation=isolated_observation_with_custody(committed.path(),&target,verifier.command.invocation().unwrap(),
+                    &guard.audit_logger(),Some((&original,&verifier.id))).await.unwrap();
+                vec![registration.observe(&stage,&verifier.id,registration.binding(base).unwrap(),&observation).unwrap()]
+            }else {register_and_observe_with_custody(&stage,proposal,&guard.audit_logger(),Some(&original)).await.unwrap().receipts};
+            trusted_git(root.path(),&["worktree","remove","--force",stage_path]).await.unwrap();
+            assert!(guard.verifier_evidence_page("original_verifier_result",0).unwrap().is_empty());
+            // Cut the production path after real command capture/quiescence,
+            // before the controller could retain the whole registered result.
+            let error=original.failed(anyhow::Error::from(initial_repair::Hold::InfrastructureUnavailable));
+            drop(original);hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            let guard=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().unwrap();
+            assert!(recover_original_verifier(root.path(),control.path(),&guard).await.unwrap());
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,0);
+            assert_eq!(after.checkpoint.next.action,"qualify_original_measurement");
+            assert_eq!(guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1,"recovery created another raw attempt");
+            assert_eq!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().len(),if partial{2}else{1},"recovery executed a completed verifier again");
+            let results=guard.verifier_evidence_page("original_verifier_result",0).unwrap();assert_eq!(results.len(),1);
+            let recovered:RecordedResult=serde_json::from_str(&results[0].body).unwrap();
+            assert_eq!(recovered.attempt,attempt);assert!(recovered.baseline.receipts.starts_with(&actual));
+            assert!(baseline_witness::assert_current(root.path(),control.path(),&prepared).is_err());
+            guard.finish().unwrap();
+            }
+        });
+    }
+
     #[tokio::test]
     async fn verifier_command_custody_requires_the_frozen_registration_and_adapter() {
-        let (root,_control,prepared,guard)=fixture().await;
+        let (root,control,prepared,guard)=fixture().await;
         let base=prepared.baseline.registration.baseline_head();
         let environment=prepared.baseline.registration.binding(base).unwrap().environment_id;
-        let original=OriginalExecution::begin(&guard,&prepared.proposal,base,&environment,"executor").unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
         original.require_registration(root.path(),&prepared.baseline.registration).unwrap();
-        let wrong_base=OriginalExecution::begin(&guard,&prepared.proposal,&"f".repeat(40),&environment,"executor").unwrap();
+        let wrong_base=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,&"f".repeat(40),&environment,"executor").unwrap();
         assert!(wrong_base.require_registration(root.path(),&prepared.baseline.registration).is_err());
-        let wrong_environment=OriginalExecution::begin(&guard,&prepared.proposal,base,"another-environment","executor").unwrap();
+        let wrong_environment=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,"another-environment","executor").unwrap();
         assert!(wrong_environment.require_registration(root.path(),&prepared.baseline.registration).is_err());
         let mut changed=prepared.proposal.clone();
         changed.files.values_mut().next().unwrap().push_str("\nprint('different input')\n");
-        let changed_adapter=OriginalExecution::begin(&guard,&changed,base,&environment,"executor").unwrap();
+        let changed_adapter=OriginalExecution::begin(&guard,control.path(),&changed,base,&environment,"executor").unwrap();
         assert!(changed_adapter.require_registration(root.path(),&prepared.baseline.registration).is_err(),"a valid registration for different adapter bytes was used");
         drop((original,wrong_base,wrong_environment,changed_adapter));guard.finish().unwrap();
     }
@@ -421,7 +626,8 @@ mod tests {
     #[tokio::test]
     async fn verifier_command_custody_settles_the_exact_prior_scope_and_preserves_its_input() {
         let (root,control,prepared,guard)=fixture().await;
-        let first=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","original-executor").unwrap();
+        let environment=environment_id(root.path()).unwrap();
+        let first=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment,"original-executor").unwrap();
         let identity=gone_scope();first.retain_admission("observe",&identity).unwrap();
         let command=command_key(&first.plan,&first.attempt,"observe");
         assert!(first.retain_admission("foreign-verifier",&identity).is_err());
@@ -429,7 +635,10 @@ mod tests {
         assert!(first.retain_admission("observe",&foreign).is_err(),"original command admission was overwritten");
         let raw=guard.verifier_evidence(&command,"original_verifier_command_admission").unwrap().unwrap();
         assert!(OriginalExecution::retain_quiescence(&guard,&command,&raw,serde_json::json!({"identity":foreign,"verified_state":"removed_empty_subtree"})).is_err());
-        let next=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","changed-executor").unwrap();
+        let blocked=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment,"changed-executor");
+        assert_eq!(blocked.err().unwrap().downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+        first.retain_result(root.path(),&prepared.baseline).unwrap();
+        let next=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment,"changed-executor").unwrap();
         assert_ne!(first.plan,next.plan,"fixture did not change the current plan");
         let proof:Quiescence=serde_json::from_str(&guard.verifier_evidence(&quiet_key(&command),"original_verifier_command_quiescent").unwrap().unwrap()).unwrap();
         assert_eq!(proof.evidence["identity"],identity);assert_eq!(proof.admission_sha256,amendment::digest(raw.as_bytes()));
@@ -440,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn verifier_command_custody_unknown_scope_blocks_the_real_executor_boundary() {
         let (root,control,prepared,guard)=fixture().await;
-        let first=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","original-executor").unwrap();
+        let first=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","original-executor").unwrap();
         let mut identity=gone_scope();identity["host_sha256"]="another-host".into();
         first.retain_admission("observe",&identity).unwrap();
         let executed=Cell::new(false);
@@ -457,7 +666,7 @@ mod tests {
     async fn verifier_command_custody_rejects_lost_or_modified_original_admission() {
         for lost in [true,false] {
             let (root,control,prepared,guard)=fixture().await;
-            let original=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
             original.retain_admission("observe",&gone_scope()).unwrap();
             let key=command_key(&original.plan,&original.attempt,"observe");
             let conn=rusqlite::Connection::open(control.path().join("workflow.db")).unwrap();
