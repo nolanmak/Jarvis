@@ -12432,6 +12432,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn recovered_qualification_wakes_the_normal_worker_without_a_command_job() {
+        use super::*;
+        use crate::autoship_workflow::{Binding,Checkpoint,NextAction,Stage,WorkflowStore};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        for ready in [true,false] {
+            let state=tempfile::tempdir().unwrap();
+            let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+            worker.dry_run=false;worker.command_repository=Some("owner/repo".into());
+            let path=worker.workflow_path.clone();
+            let stop=tokio_util::sync::CancellationToken::new();let timer_stop=stop.clone();
+            let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+            let recovered=async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let now=chrono::Utc::now().timestamp_millis();let mut store=WorkflowStore::open(&path).unwrap();
+                let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+                store.register("owner/repo#7","candidate",binding.clone(),now).unwrap();
+                let lease=store.claim("owner/repo#7","fixture",now,1000).unwrap().unwrap();
+                store.checkpoint(&lease,&Checkpoint {stage:Stage::Reconcile,binding,evidence:vec![],next:NextAction {
+                    reason:if ready {"original_verifier_measurement_recovered"}else{"acceptance_verifier_evidence_unknown"}.into(),
+                    action:if ready {"qualify_original_measurement"}else{"await_original_evidence_recovery"}.into(),eligible_at_ms:now,
+                }},now).unwrap();store.release(&lease,now).unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(26)).await;timer_stop.cancel();
+            };
+            let run=worker.run_with(stop,move || {observed.fetch_add(1,Ordering::SeqCst);async {Ok(RunReport::idle())}},||async{0});
+            let (result,())=tokio::join!(run,recovered);result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst),usize::from(ready),"qualification recovery waited for the regular poll or woke an unresolved hold");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn queued_command_wakes_sleeping_worker_without_waiting_for_normal_tick() {
         use super::*;
         use crate::autoship_workflow::{WorkflowStore, submission::{Request,Target,Milestone}};
