@@ -2084,13 +2084,19 @@ pub(super) async fn prepare_resume_worktree(
     prepare_resume_worktree_at_head(repo_root,pr,branch,None).await
 }
 
+/// Read-only identity shared by the resume producer and recovery inspector.
+pub(super) async fn resume_worktree_path(repo_root:&Path,pr:u64)->Result<PathBuf> {
+    anyhow::ensure!(pr>0,"PR identity required");
+    let primary=workspace::primary_root(repo_root).await?;
+    let path=primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
+    recovery::checkout_path(&primary,&path)?;
+    Ok(path)
+}
+
 pub(super) async fn prepare_resume_worktree_at_head(
     repo_root:&Path, pr:u64, branch:&str, expected_head:Option<&str>,
 )->Result<PathBuf> {
-    anyhow::ensure!(pr > 0, "PR identity required");
-    let primary = workspace::primary_root(repo_root).await?;
-    let path = primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
-    recovery::checkout_path(&primary, &path)?;
+    let path=resume_worktree_path(repo_root,pr).await?;
     let exists = path.try_exists()?;
     if exists {
         recovery::existing_checkout(repo_root, &path).await?;

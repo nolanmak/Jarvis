@@ -21,7 +21,8 @@ pub(super) fn require_mutation_allowed(conn:&Connection,workflow:&str)->Result<(
 }
 
 pub(super) fn pending_mutation(conn:&Connection,workflow:&str)->Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state='dispatched')",[workflow],|row|row.get(0))?)
+    let unreceipted:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL)",[workflow],|row|row.get(0))?;
+    Ok(unreceipted || super::merge_allowance::merge_reconciliation_needed(conn,workflow)?)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +278,56 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    #[test]
+    fn free_recovery_preserves_confirmed_but_unreconciled_merge_effects() {
+        let mut failures=vec![];
+        for phase in ["initial","restoration"] {
+            for boundary in ["selection","transaction"] {
+                let (dir,mut store,lease,hold,cue)=if phase=="restoration" {
+                    let (dir,store,lease,hold,cue)=queued_semantic_source();(dir,store,lease,hold,Some(cue))
+                }else {
+                    let (dir,store,lease,hold)=fixture();(dir,store,lease,hold,None)
+                };
+                store.attach_pr_in_repo(&lease,"owner/repo",42,4+lease.generation*10).unwrap();
+                let now=20+lease.generation*10;
+                let op=store.begin_operation(&lease,OperationKind::MergePr,&hold.binding,now).unwrap();
+                store.reserve_merge(&lease,&op,"owner/repo",42,"PR_42",now,5).unwrap();
+                let marker=store.dispatch_marked_merge(&lease,&op,now,5).unwrap();
+                let proof=serde_json::json!({"client_mutation_id":op.id,"expected_head":hold.binding.head,"pr_number":42,"pr_node_id":"PR_42","merge_commit":"f".repeat(40),"merged_by":"fixture","merged_at":"1970-01-01T00:00:00.007Z","merge_message":marker});
+                store.confirm_merge_dispatch(&op,&proof,now).unwrap();
+                store.complete_operation(&lease,&op.id,&format!("github:pr:42:merged:{}",hold.binding.head),now).unwrap();
+                if let Some(cue)=&cue {store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,now).unwrap();}
+                else {store.checkpoint_native_custody_hold(&lease,&hold,now,false).unwrap();}
+                store.record_recovery_context(&lease,&hold.binding,&RecoveryContext {version:1,workflow:lease.workflow.clone(),repository:"owner/repo".into(),worktree:dir.path().into(),source_request:"original request".into(),source_pr:Some(42),contract:"original request".into(),environment:"original environment".into(),binding:hold.binding.clone()},now).unwrap();
+                store.release(&lease,now).unwrap();
+                assert!(store.pending_operations(&lease.workflow).unwrap().is_empty(),"fixture still has an unreceipted operation");
+                assert_eq!(store.merge_dispatch(&op.id).unwrap().unwrap().state,"confirmed");
+                assert!(store.merge_reconciliation_needed(&lease.workflow).unwrap(),"fixture does not require original merge reconciliation");
+                let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();let allowance=store.merge_allowance(now,5).unwrap();
+                if boundary=="selection" {
+                    let selected=store.reserve_qualification_recovery("owner/repo",now+1,4,&Default::default()).unwrap();
+                    if !selected.is_empty() {failures.push(format!("{phase}: free selection admitted unsettled confirmed merge"));}
+                    assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+                    let after=store.events(&lease.workflow).unwrap();
+                    assert_eq!(&after[..events.len()],events.as_slice());
+                    assert!(after[events.len()..].iter().all(|(_,kind,_,_)|kind=="qualification_recovery_selected"),"inspection fairness created execution authority");
+                }else {
+                    let mut inspected=false;
+                    let queued=store.recover_semantic_qualification(&before,None,&"b".repeat(64),now+1,|_,_|{inspected=true;Ok(Some("c".repeat(64)))}).unwrap();
+                    if queued || inspected || store.snapshot(&lease.workflow).unwrap().unwrap()!=before || store.events(&lease.workflow).unwrap()!=events {
+                        failures.push(format!("{phase}: atomic source recovery changed an unsettled confirmed merge"));
+                    }
+                }
+                assert_eq!(store.merge_allowance(now,5).unwrap(),allowance,"free inspection rewrote confirmed allowance");
+                assert!(store.reconcile_confirmed_workflow(&op.id,now+2).unwrap(),"original merge authority cannot settle its own confirmed proof");
+                assert!(!store.merge_reconciliation_needed(&lease.workflow).unwrap());
+                assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.stage,Stage::Merged);
+                assert_eq!(store.merge_allowance(now,5).unwrap(),allowance,"normal terminal reconciliation rebilled the merge");
+            }
+        }
+        assert!(failures.is_empty(),"unresolved-effect fence mismatches: {failures:#?}");
     }
 
     #[test]
