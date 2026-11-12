@@ -4,6 +4,26 @@ use super::*;
 type CustodyValidator = fn(&Path, &[NativeScopeCustody]) -> Result<()>;
 pub(super) type CustodyCheck<'a> = (&'a Path, CustodyValidator);
 
+pub(super) fn infrastructure_hold(checkpoint:&Checkpoint)->bool {
+    checkpoint.stage==Stage::Scope
+        && checkpoint.next.reason=="acceptance_verifier_infrastructure_unavailable"
+        && checkpoint.next.action=="await_verifier_infrastructure_recovery"
+}
+
+pub(super) fn is_inspection(conn:&Connection,lease:&Lease)->Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='qualification_recovery_claimed')",params![lease.workflow,lease.generation],|row|row.get(0))?)
+}
+
+pub(super) fn require_mutation_allowed(conn:&Connection,workflow:&str)->Result<()> {
+    let recovery:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow w JOIN workflow_event e ON e.workflow=w.id AND e.generation=w.generation WHERE w.id=?1 AND e.kind='qualification_recovery_claimed')",[workflow],|row|row.get(0))?;
+    ensure!(!recovery,"qualification recovery cannot authorize publication mutations");
+    Ok(())
+}
+
+pub(super) fn pending_mutation(conn:&Connection,workflow:&str)->Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state='dispatched')",[workflow],|row|row.get(0))?)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeRecovery {
@@ -84,8 +104,7 @@ pub(super) fn recovered(tx: &Transaction<'_>, workflow: &str, generation: i64, c
     }
     let Ok(custody) = baseline_native_custody(tx,workflow) else { return Ok(false); };
     if custody.is_empty() || (check.1)(check.0,&custody).is_err() { return Ok(false); }
-    let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state='dispatched')", [workflow], |row| row.get(0))?;
-    Ok(!pending)
+    Ok(!pending_mutation(tx,workflow)?)
 }
 
 #[cfg(test)]
@@ -138,6 +157,9 @@ mod tests {
         assert!(store.charge_admitted_model(&recovery,"new-witness",8,None,Some((&purpose,&hold.binding,1)),Some(submission::Provider::Codex),true).is_err());
         assert!(store.charge_bounded_call(&recovery,"new-bounded",8,None,"amendment",&hold.binding,3).is_err());
         assert!(store.charge(&recovery,"unattributed-model",ResourceCharge {model_calls:1,..Default::default()},8).is_err());
+        let original_purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        assert!(store.charge_admitted_model(&recovery,"original",8,None,Some((&original_purpose,&hold.binding,1)),Some(submission::Provider::Codex),true).is_err(),"an old receipt authorized model dispatch during free recovery");
+        store.charge(&recovery,"original",ResourceCharge {model_calls:1,..Default::default()},8).unwrap();
         for kind in [OperationKind::CreatePr,OperationKind::Push,OperationKind::MergePr,OperationKind::ReadyPr,OperationKind::RetirePr,OperationKind::RetargetPr] {
             assert!(store.begin_operation(&recovery,kind,&hold.binding,8).is_err(),"free verification authorized a publication mutation");
         }
@@ -148,6 +170,54 @@ mod tests {
         store.validate_dispatch(&recovery,&hold.binding,8).unwrap();
         store.charge(&recovery,"raw-verifier-usage",ResourceCharge {wall_ms:19,tokens:0,model_calls:0},8).unwrap();
         store.release(&recovery,9).unwrap();
+    }
+
+    #[test]
+    fn qualification_recovery_inspection_fence_survives_restart_and_ends_with_its_lease() {
+        let (dir,mut store,lease,mut hold)=fixture();
+        hold.next.reason="acceptance_verifier_infrastructure_unavailable".into();hold.next.action="await_verifier_infrastructure_recovery".into();
+        store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+        let recovery=store.claim_reconciliation(&lease.workflow,"free",7,1000).unwrap().unwrap();drop(store);
+        let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let mut inspected=hold.clone();inspected.next.eligible_at_ms=17;
+        store.checkpoint(&recovery,&inspected,8).unwrap();
+        assert!(store.charge_admitted_model(&recovery,"after-checkpoint",9,None,None,Some(submission::Provider::Claude),true).is_err());
+        store.release(&recovery,10).unwrap();
+        assert!(store.claim_reconciliation(&lease.workflow,"too-soon",18,1000).unwrap().is_none());
+        let recovery=store.claim_reconciliation(&lease.workflow,"next-window",300_007,1000).unwrap().unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().attempts,1);
+        store.release(&recovery,300_008).unwrap();
+        let mut changed=hold.binding.clone();changed.contract="new-owner-criteria".into();
+        let productive=store.claim_productive_for_binding(&lease.workflow,"new-input",300_009,1000,&changed).unwrap().unwrap();
+        inspected.binding=changed;inspected.stage=Stage::Reconcile;inspected.next.reason="inputs_changed".into();
+        store.checkpoint(&productive,&inspected,300_010).unwrap();
+        store.charge_admitted_model(&productive,"ordinary-new-input",300_011,None,None,Some(submission::Provider::Claude),true).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().attempts,2);
+        // A new failed operation with genuinely changed criteria must not
+        // inherit the previous input's inspection backoff.
+        let mut fresh_hold=hold.clone();fresh_hold.binding=inspected.binding;
+        store.checkpoint(&productive,&fresh_hold,300_012).unwrap();store.release(&productive,300_013).unwrap();
+        assert!(store.claim_reconciliation(&lease.workflow,"new-operation",300_014,1000).unwrap().is_some(),"new owner input inherited an unrelated operation's recovery delay");
+    }
+
+    #[test]
+    fn qualification_recovery_inspection_cannot_fence_unknown_mutations_or_native_results() {
+        for unknown in ["publication","native","pause"] {
+            let (_dir,mut store,lease,mut hold)=fixture();
+            if unknown=="publication" {store.begin_operation(&lease,OperationKind::Push,&hold.binding,5).unwrap();}
+            if unknown=="native" {
+                let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+                let (_,proof)=baseline_native_response_keys(&purpose).unwrap();
+                store.conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,proof]).unwrap();
+            }
+            hold.next.reason="acceptance_verifier_infrastructure_unavailable".into();hold.next.action="await_verifier_infrastructure_recovery".into();
+            store.checkpoint(&lease,&hold,6).unwrap();store.release(&lease,7).unwrap();
+            if unknown=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,8).unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert!(store.claim_reconciliation(&lease.workflow,"unsafe-inspection",9,1000).unwrap().is_none(),"free recovery fenced an original unknown {unknown}");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+        }
     }
 
     #[test]

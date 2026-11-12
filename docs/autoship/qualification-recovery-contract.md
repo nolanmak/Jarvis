@@ -143,6 +143,36 @@ admission, semantic unknowns, crash resumption, concurrent claims, paused work,
 and injected transaction failures. Store-only transaction tests explicitly
 script filesystem validation; they do not claim live model acceptance.
 
+## Implemented unpaid infrastructure-inspection boundary
+
+The existing reconciliation claim recognizes a verifier-infrastructure hold
+inside its claim transaction. It records `qualification_recovery_claimed` for
+the exact new lease generation without incrementing productive attempts.
+Claims are spaced at least five minutes apart for the same workflow/input
+binding, including across restart. Genuinely changed inputs do not inherit an
+older operation's retry delay. Owner pauses, pending mutations, uncertain merge dispatch and
+unresolved original native outcomes prevent the claim. Physical native-custody
+holds use their read-only positive check above rather than fencing the missing
+original outcome with another inspection lease.
+
+This lease generation cannot admit a model through attributed, bounded or
+generic new model-charge paths. A reused original receipt cannot authorize
+another actual dispatch. Idempotent historical accounting and new zero-model
+wall/resource usage remain recordable. Publication intent, publication dispatch
+and merge reservation/dispatch enforce the same inspection restriction.
+
+Ordinary raw-command dispatch retains the existing owner/lease check and fresh
+resource/storage admission: blocking every command would also block the
+original verifier needed for recovery. No checkpoint edit or process restart
+can remove the generation's model/publication restriction. It ends only with
+that fenced lease; a later ordinary productive claim for a real changed input
+uses the normal admission rules and original cumulative budgets.
+
+This boundary is not the infrastructure replayer. Capturing the exact original
+measurement recipe and command admission, proving that original descendants
+are quiescent, replaying through the existing isolated executor, retaining its
+actual result, and wiring fair five-minute wake/selection remain required.
+
 ## Open threads from the fresh-eyes checkpoint
 
 All entries are owned by the normal workflow-controller implementation and block

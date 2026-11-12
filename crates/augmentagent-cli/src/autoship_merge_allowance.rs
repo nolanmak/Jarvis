@@ -603,6 +603,7 @@ impl WorkflowStore {
         require_binding(&tx, lease, &op.binding, now)?;
         super::submission::require_merge_authority(&tx, &op.workflow, &repo, pr)?;
         super::owner_control::require_dispatch(&tx,&op.workflow)?;
+        super::qualification_recovery::require_mutation_allowed(&tx,&op.workflow)?;
         let (workflow, kind, binding): (String, String, String) = tx.query_row(
             "SELECT workflow,kind,binding FROM operation WHERE id=?1",
             [&op.id],
@@ -724,6 +725,7 @@ impl WorkflowStore {
         super::submission::require_merge_authority(&tx, &op.workflow, &repository, pr)?;
         super::owner_control::require_dispatch(&tx,&op.workflow)?;
         let status = allowance(&tx, now, cap)?;
+        super::qualification_recovery::require_mutation_allowed(&tx,&op.workflow)?;
         ensure!(
             status.confirmed.saturating_add(status.pending) <= cap,
             "merge allowance changed before dispatch"

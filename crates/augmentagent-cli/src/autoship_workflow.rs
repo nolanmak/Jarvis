@@ -882,7 +882,8 @@ impl WorkflowStore {
         Ok(inserted)
     }
 
-    /// Free merge reconciliation preserves command holds and merge ceilings.
+    /// Free reconciliation preserves command holds and merge ceilings. A
+    /// verifier-infrastructure inspection cannot admit models or mutations.
     /// Eligibility and ownership are checked atomically with the new lease.
     pub fn claim_reconciliation(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
         self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation, None, None)
@@ -939,6 +940,10 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let mut cp: Checkpoint = serde_json::from_str(&raw)?;
+        let qualification_inspection=purpose==ClaimPurpose::MergeReconciliation
+            && qualification_recovery::infrastructure_hold(&cp);
+        if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
+            && cp.next.reason=="acceptance_verifier_evidence_unknown" {return Ok(None);}
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
             ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
@@ -961,7 +966,7 @@ impl WorkflowStore {
                     params![workflow, serde_json::to_string(&OperationKind::MergePr)?], |r| r.get(0))?;
                 if cp.stage == Stage::Held || pending_merge
                     || (purpose == ClaimPurpose::Productive && matches!(cp.stage, Stage::AwaitChecks | Stage::Merge))
-                    || (purpose == ClaimPurpose::MergeReconciliation && until == submission::Milestone::Pr) {
+                    || (purpose == ClaimPurpose::MergeReconciliation && !qualification_inspection && until == submission::Milestone::Pr) {
                     return Ok(None);
                 }
             }
@@ -972,6 +977,14 @@ impl WorkflowStore {
         {
             return Ok(None);
         }
+        if qualification_inspection {
+            let last:Option<i64>=tx.query_row("SELECT MAX(at_ms) FROM workflow_event WHERE workflow=?1 AND kind='qualification_recovery_claimed'
+                AND json_extract(payload,'$.binding.head')=?2 AND json_extract(payload,'$.binding.contract')=?3 AND json_extract(payload,'$.binding.evidence_hash')=?4",
+                params![workflow,cp.binding.head,cp.binding.contract,cp.binding.evidence_hash],|row|row.get(0))?;
+            if last.is_some_and(|at|now_ms<at.saturating_add(300_000))
+                || qualification_recovery::pending_mutation(&tx,workflow)?
+                || baseline_native_custody(&tx,workflow).is_err() {return Ok(None);}
+        }
         if requires_recovery {
             let Some(check)=custody else {return Ok(None)};
             if !qualification_recovery::recovered(&tx,workflow,generation,&cp,check)? {return Ok(None);}
@@ -981,8 +994,9 @@ impl WorkflowStore {
             event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation}).to_string(),now_ms)?;
         }
         let generation = generation.checked_add(1).context("generation overflow")?;
-        tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+1 WHERE id=?1",
-            params![workflow, owner, generation, until, now_ms])?;
+        tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+?6 WHERE id=?1",
+            params![workflow, owner, generation, until, now_ms,i64::from(!qualification_inspection)])?;
+        if qualification_inspection {event(&tx,workflow,generation,"qualification_recovery_claimed",&serde_json::to_string(&cp)?,now_ms)?;}
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
         tx.commit()?;
         Ok(Some(Lease {
@@ -1119,6 +1133,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(
@@ -1510,6 +1525,8 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        let recovery_inspection=qualification_recovery::is_inspection(&tx,lease)?;
+        ensure!(!(recovery_inspection && admission.is_some()),"qualification recovery cannot dispatch a model");
         let prior: Option<(i64,i64,i64)> = tx.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some(prior) = prior {
@@ -1519,6 +1536,7 @@ impl WorkflowStore {
                 ensure!(recorded.as_ref()==Some(expected),"model admission attribution conflict");
             }
         } else {
+            ensure!(!(recovery_inspection && charge.model_calls>0),"qualification recovery cannot spend a model call");
             if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
@@ -2008,6 +2026,7 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,&operation.binding,now)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
         ensure!(owner==lease.workflow,"publication operation ownership mismatch");
         let prior:Option<(i64,i64,Option<u64>)>=tx.query_row("SELECT attempt,dispatched_at,pr FROM publication_dispatch WHERE operation=?1",[&operation.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
