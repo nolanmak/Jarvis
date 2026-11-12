@@ -58,7 +58,10 @@ matching source identities are ambiguous; never choose by timestamp.
 Verify registration metadata and its complete pinned source map. Missing
 candidate adapters may be inspected as source data; changed/symlinked existing
 adapters are rejected. Inspection installs no files, creates no manifest or
-baseline, starts no command/model/runtime, and changes no attempts or charges.
+baseline, executes no verifier or model, prepares no runtime, and changes no
+attempts or charges. Source authentication may run the existing fixed read-only
+Git operations to inspect original tracked files and authenticate production
+citations; this is not verifier execution or a replay of the observation.
 The positive `verify_integrity` and observation gates remain strict.
 
 Read all retained baseline-native admissions and their paired response/proof.
@@ -197,8 +200,14 @@ actual final PR head; macOS is informational under existing policy. Take only
 the updater deploy. Verify both process executable hashes and selected policy.
 Repair PRs are manual engineering, never autoship test cases.
 
-Open work owned by this repair: audit every producer/consumer seam; finish
-required exact-head CI/review, snapshot/main rollout, and observe ordinary
+Audit: fresh-eyes findings about generation continuation, judgment cardinality
+and restoration policy are resolved above. All 50 mapped producer/consumer and
+outer seams were checked against the referenced code, contracts and retained
+test evidence. One seam finding clarified read-only Git authentication versus
+verifier/model/runtime execution; the corrected seam now holds.
+
+Open work owned by this repair: finish required exact-head CI/review,
+snapshot/main rollout, and observe ordinary
 #2014 leaving its retained hold through this path. A read-only probe, a manual
 repair merge, or an exhausted hold alone is not restoration. Keep #1703 active
 until its complete ordinary shipping, five-confirmed-merges-per-UTC-day,
