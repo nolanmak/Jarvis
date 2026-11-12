@@ -1274,6 +1274,25 @@ mod initial_diagnostic_tests {
     }
 
     #[tokio::test]
+    async fn registered_qualification_wait_is_not_a_new_owner_request_after_restart() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let database=control.path().join("workflow.db");
+        let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"unchanged owner request",environment:"frontend environment"};
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        guard.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&[]).await.unwrap();
+        let accounting=guard.capacity_accounting(true).unwrap();
+        hold_qualification_error(&mut guard,&prepared,&anyhow::Error::from(initial_repair::Hold::EvidenceUnknown),&accounting).await.unwrap().unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        let retry=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap();
+        assert!(retry.is_none(),"registered metadata made an unchanged owner request look like changed input");
+        let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint,before.checkpoint);
+    }
+
+    #[tokio::test]
     async fn qualified_recovery_holds_an_enrolled_reconcile_checkpoint_without_losing_custody() {
         for paid in [false,true] {
         let (repo,control,prepared)=baseline_witness::prepared_fixture();
