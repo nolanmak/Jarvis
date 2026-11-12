@@ -332,6 +332,10 @@ Only configured source aliases are accepted. Each list/get fetches the latest co
 
 `get` preserves the original bytes and filename, stages the file inside the wiki, and prints an `ATTACH:` marker. Copy that marker into the final answer to deliver the original file. Do not re-render it or claim temporary-file restrictions prevent delivery. The existing attachment size/count limits still apply; deliver larger inventories in batches. These commands cannot push, edit, or create remote content. Setup uses a separate GitHub deploy key with write access disabled; no owner-login fallback.
 
+### Drafts are not replies (#2040)
+
+`gmail search` lists each message's Gmail labels on a `labels:` line, and a message that is only a saved draft starts with `UNSENT DRAFT (never sent)`. A draft is never a reply: say an email was answered only when the reply carries `SENT`. If the only reply in a thread is a draft, the email is still unanswered.
+
 ### Read an email attachment (#937, #939)
 
 `gmail search` prints `attachments: <name> (<mime>)` on each message that has any. To read one, download it by name — pass the `<name>` part verbatim (including any odd spacing before the extension); the ` (<mime>)` suffix is tolerated but not needed:

@@ -6186,7 +6186,7 @@ async fn run_gmail_search(
     // healthy accounts' results always come through regardless.
     let mut total = 0usize;
     for account in &accounts {
-        match gmail.fetch_with_query(&account.entity_id, &query, limit).await {
+        match gmail.search_hits(&account.entity_id, &query, limit).await {
             Err(e) => {
                 // Also mirror to stderr so it shows up in logs, but stdout is
                 // what the user sees — never a silent skip.
@@ -6210,36 +6210,8 @@ async fn run_gmail_search(
                     account.email,
                     emails.len()
                 );
-                for (i, email) in emails.iter().enumerate() {
-                    // threadId is what compose --thread-id / send-now --thread-id
-                    // actually need; printing only messageId forced callers to
-                    // guess (#381).
-                    println!(
-                        "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
-                        i + 1,
-                        email.from,
-                        email.subject,
-                        email.date,
-                        email.message_id,
-                        email.thread_id.as_deref().unwrap_or("-")
-                    );
-                    // #629 — surface the full recipient set so reply-all /
-                    // compose callers can enumerate everyone on the chain
-                    // instead of only addresses that appear as senders.
-                    if !email.to.is_empty() {
-                        println!("     to: {}", email.to);
-                    }
-                    if !email.cc.is_empty() {
-                        println!("     cc: {}", email.cc);
-                    }
-                    // #811 — attachment metadata was invisible here, so an
-                    // attachment-only email looked like an empty message.
-                    if !email.attachments.is_empty() {
-                        println!("     attachments: {}", email.attachments.join(", "));
-                    }
-                    if full {
-                        println!("     body:\n{}\n", indent_body(&email.body, 7));
-                    }
+                for (i, hit) in emails.iter().enumerate() {
+                    print!("{}", format_gmail_search_hit(i + 1, hit, full));
                 }
                 println!();
             }
@@ -6249,6 +6221,91 @@ async fn run_gmail_search(
         println!("(no results across {} account(s))", accounts.len());
     }
     Ok(())
+}
+
+/// One `gmail search` result. #2040 — a saved draft reply rendered exactly
+/// like a sent one, so the first line now says UNSENT DRAFT and every hit
+/// lists its Gmail labels.
+fn format_gmail_search_hit(
+    n: usize,
+    hit: &augmentagent_channel_email::gmail::SearchHit,
+    full: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let email = &hit.email;
+    let mut out = String::new();
+    let status = if hit.is_draft() { "UNSENT DRAFT (never sent) — " } else { "" };
+    // threadId is what compose --thread-id / send-now --thread-id actually
+    // need; printing only messageId forced callers to guess (#381).
+    let _ = writeln!(
+        out,
+        "[{n:>2}] {status}from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
+        email.from,
+        email.subject,
+        email.date,
+        email.message_id,
+        email.thread_id.as_deref().unwrap_or("-")
+    );
+    if !hit.labels.is_empty() {
+        let _ = writeln!(out, "     labels: {}", hit.labels.join(", "));
+    }
+    // #629 — the full recipient set, so reply-all / compose callers can
+    // enumerate everyone on the chain, not only addresses seen as senders.
+    if !email.to.is_empty() {
+        let _ = writeln!(out, "     to: {}", email.to);
+    }
+    if !email.cc.is_empty() {
+        let _ = writeln!(out, "     cc: {}", email.cc);
+    }
+    // #811 — attachment metadata was invisible here, so an attachment-only
+    // email looked like an empty message.
+    if !email.attachments.is_empty() {
+        let _ = writeln!(out, "     attachments: {}", email.attachments.join(", "));
+    }
+    if full {
+        let _ = writeln!(out, "     body:\n{}\n", indent_body(&email.body, 7));
+    }
+    out
+}
+
+#[cfg(test)]
+mod gmail_search_hit_format_tests {
+    use super::format_gmail_search_hit;
+    use augmentagent_channel_email::gmail::SearchHit;
+    use augmentagent_store::Email;
+
+    fn hit(labels: &[&str]) -> SearchHit {
+        SearchHit {
+            email: Email {
+                message_id: "m1".into(),
+                thread_id: Some("t1".into()),
+                from: "Owner <owner@example.com>".into(),
+                to: "matt@example.com".into(),
+                cc: String::new(),
+                attachments: Vec::new(),
+                subject: "Re: CRM link".into(),
+                body: "reply".into(),
+                date: "2026-11-12T13:28:00Z".into(),
+                account_entity_id: None,
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            },
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_draft_reply_is_marked_unsent_and_a_sent_reply_is_not() {
+        let draft = format_gmail_search_hit(1, &hit(&["DRAFT"]), false);
+        assert!(draft.starts_with("[ 1] UNSENT DRAFT (never sent) — from: Owner"), "{draft}");
+        assert!(draft.contains("\n     labels: DRAFT\n"), "{draft}");
+
+        let sent = format_gmail_search_hit(1, &hit(&["SENT", "INBOX"]), false);
+        assert!(sent.starts_with("[ 1] from: Owner"), "{sent}");
+        assert!(!sent.contains("DRAFT"), "{sent}");
+        assert!(sent.contains("\n     labels: SENT, INBOX\n"), "{sent}");
+        assert!(sent.contains("     threadId: t1\n"), "{sent}");
+    }
 }
 
 #[cfg(test)]

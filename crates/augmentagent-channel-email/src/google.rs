@@ -710,6 +710,17 @@ impl GoogleGmail {
         query: &str,
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        let hits = self.search_hits(email, query, max_total).await?;
+        Ok(hits.into_iter().map(|h| h.email).collect())
+    }
+
+    /// [`Self::search`] keeping each message's Gmail labels (#2040).
+    pub async fn search_hits(
+        &self,
+        email: &str,
+        query: &str,
+        max_total: u32,
+    ) -> Result<Vec<crate::gmail::SearchHit>, GmailError> {
         if max_total == 0 {
             return Ok(Vec::new());
         }
@@ -746,18 +757,27 @@ impl GoogleGmail {
         self.fetch_messages(email, &ids).await
     }
 
-    async fn fetch_messages(&self, email: &str, ids: &[String]) -> Result<Vec<Email>, GmailError> {
-        let fetched: Vec<Result<Option<Email>, GmailError>> = stream::iter(ids.iter().cloned())
+    async fn fetch_messages(
+        &self,
+        email: &str,
+        ids: &[String],
+    ) -> Result<Vec<crate::gmail::SearchHit>, GmailError> {
+        let fetched: Vec<Result<Option<crate::gmail::SearchHit>, GmailError>> =
+            stream::iter(ids.iter().cloned())
             .map(|id| async move {
                 let path = format!("users/me/messages/{id}");
                 match self.get(email, &path, &[("format", "full".to_string())]).await? {
                     // Deleted between list and get.
                     None => Ok(None),
                     Some(v) => {
-                        let msg: GmailMessage = serde_json::from_value(v)
+                        let mut msg: GmailMessage = serde_json::from_value(v)
                             .map_err(|e| GmailError::Decode(format!("messages.get {id}: {e}")))?;
                         self.record_sender_auth(&msg);
-                        Ok(Some(msg.into_email(&entity_id_for(email))))
+                        let labels = std::mem::take(&mut msg.label_ids);
+                        Ok(Some(crate::gmail::SearchHit {
+                            email: msg.into_email(&entity_id_for(email)),
+                            labels,
+                        }))
                     }
                 }
             })
@@ -1258,6 +1278,9 @@ pub(crate) struct GmailMessage {
     internal_date: Option<String>,
     #[serde(default)]
     payload: Option<MessagePart>,
+    /// `DRAFT`, `SENT`, `INBOX`, ... (#2040).
+    #[serde(default)]
+    label_ids: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1792,6 +1815,30 @@ mod tests {
         let a = store.email_sender_auth("m1").unwrap().expect("m1 carries Google's header");
         assert!(a.dmarc_pass && a.trusted());
         assert_eq!(store.email_sender_auth("m2").unwrap(), None, "no Google header => None");
+    }
+
+    #[tokio::test]
+    async fn search_hits_keep_labels_so_a_draft_is_not_a_sent_reply() {
+        // #2040: the direct path must carry `labelIds` from messages.get.
+        let fake = FakeGoogle::start(vec![
+            token_route("at-1"),
+            ("GET", "/users/me/messages?", 200,
+             r#"{"messages":[{"id":"d1"},{"id":"s1"}],"resultSizeEstimate":2}"#.into()),
+            ("GET", "/users/me/messages/d1", 200,
+             serde_json::json!({"id":"d1","threadId":"t1","labelIds":["DRAFT"],"payload":{
+                 "mimeType":"text/plain","headers":[{"name":"Subject","value":"Re: x"}],
+                 "body":{"data": b64url("unsent")}}}).to_string()),
+            ("GET", "/users/me/messages/s1", 200,
+             serde_json::json!({"id":"s1","threadId":"t1","labelIds":["SENT"],"payload":{
+                 "mimeType":"text/plain","headers":[{"name":"Subject","value":"Re: x"}],
+                 "body":{"data": b64url("sent")}}}).to_string()),
+        ])
+        .await;
+        let g = client_with_token(&fake, Some(stored(MAILBOX)));
+        let hits = g.search_hits(MAILBOX, "subject:x", 10).await.unwrap();
+        let got: Vec<(&str, bool)> = hits.iter().map(|h| (h.email.message_id.as_str(), h.is_draft())).collect();
+        assert_eq!(got, [("d1", true), ("s1", false)]);
+        assert_eq!(hits[1].labels, ["SENT"]);
     }
 
     #[tokio::test]
