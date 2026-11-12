@@ -213,6 +213,13 @@ fn validate_native_custody(control:&Path,observations:&[crate::autoship_workflow
 
 /// Validate the physical evidence referenced by controller-owned custody rows
 /// at the existing actual model-admission boundary, including fresh reviewers.
+#[derive(Debug)]
+pub(super) struct NativeCustodyUnavailable;
+impl std::fmt::Display for NativeCustodyUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"original native custody is unavailable")}
+}
+impl std::error::Error for NativeCustodyUnavailable {}
+
 pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
     use std::os::unix::fs::MetadataExt;
     (||->Result<()> {
@@ -251,13 +258,15 @@ pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::a
             validate_native_custody(directory,std::slice::from_ref(observation))?;
         }
         Ok(())
-    })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))
+    })().map_err(|e|e.context(NativeCustodyUnavailable).context(initial_repair::Hold::EvidenceUnknown))
 }
 
-fn require_witness_custody(control:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
+fn require_witness_custody(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
     (||->Result<()> {
-        validate_native_custody(control,&workflow.baseline_native_custody()?)
-    })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))
+        let custody=workflow.baseline_native_custody()?;
+        validate_native_custody(control,&custody)?;
+        require_retained_native_custody(root,&custody)
+    })().map_err(|e|e.context(NativeCustodyUnavailable).context(initial_repair::Hold::EvidenceUnknown))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -427,7 +436,7 @@ async fn call(
         let input=amendment::digest(&serde_json::to_vec(&("baseline-native-input-v2",workflow.id(),&head,provider.name(),purpose,context.epoch,&context.request_hash,&context.policy_hash,system,prompt))?);
         let admission=format!("{}{input}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX);
         let (raw,proof)=crate::autoship_workflow::baseline_native_response_keys(&admission)?;
-        require_witness_custody(control,workflow)?;
+        require_witness_custody(root,control,workflow)?;
         if let Some((text,encoded))=workflow.scope_stage_response_pair(&raw,&proof).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))? {
             let recovered=(||->Result<NativeReply> {
                 let reply=NativeReply {text,provenance:serde_json::from_str(&encoded)?};
@@ -743,7 +752,7 @@ pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,p
 pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::WorkflowGuard,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<(T,NativeReply)> {
     ensure!(epoch.len()==64 && epoch.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid baseline-witness input identity");
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance.canonicalize()?;
-    require_witness_custody(&control,workflow)?;
+    require_witness_custody(root,&control,workflow)?;
     let head=actual_head(root).await?;
     let keys=|attempt| {
         let raw=response_key("baseline_witness_v1",epoch,&workflow.binding().contract,false,attempt);
@@ -909,6 +918,7 @@ mod native_reply_tests {
         use crate::autoship_workflow::WorkflowStore;
         for semantic_unknown in [true,false] {
             let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(repo.path().join("implementation.py"),"READY = False\n").unwrap();
             for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
                 assert!(Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap().status.success());
@@ -937,6 +947,12 @@ mod native_reply_tests {
             std::fs::write(&completed.provenance.artifact,&bytes).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&completed.provenance.artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            require_retained_native_custody(repo.path(),&[crate::autoship_workflow::NativeScopeCustody {input:raw.clone(),response:completed.text.clone(),provenance:serde_json::to_string(&completed.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex}]).unwrap();
+            if !semantic_unknown {
+                let conn=rusqlite::Connection::open(&database).unwrap();
+                let count:i64=conn.query_row("SELECT count(*) FROM scope_stage_response WHERE response LIKE '%\"admissions\"%'",[],|r|r.get(0)).unwrap();
+                assert_eq!(count,1,"physical hold did not retain its exact admission descriptor");
+            }
             let recovered=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap();
             if semantic_unknown {assert!(recovered.is_none(),"physical availability cleared a completed semantic unknown");continue;}
             let recovered=recovered.expect("the exact restored original custody must release its physical hold without new input or another model call");
@@ -952,6 +968,7 @@ mod native_reply_tests {
     async fn completed_native_witness_recovers_with_no_ready_provider_and_no_second_call() {
         use augmentagent_channel_core::{ProviderKind,native_session};
         let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(repo.path().join("implementation.py"),"def warning_visible(): return False\n").unwrap();
         for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
             let out=Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();

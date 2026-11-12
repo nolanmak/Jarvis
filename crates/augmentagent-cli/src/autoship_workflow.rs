@@ -39,6 +39,8 @@ mod verification_retry;
 pub(crate) mod tool_capacity;
 #[path = "autoship_capacity_retry.rs"]
 mod capacity_retry;
+#[path = "autoship_qualification_recovery.rs"]
+mod qualification_recovery;
 pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
@@ -883,13 +885,13 @@ impl WorkflowStore {
     /// Free merge reconciliation preserves command holds and merge ceilings.
     /// Eligibility and ownership are checked atomically with the new lease.
     pub fn claim_reconciliation(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation, None)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation, None, None)
     }
 
     /// Productive workers cannot restart command holds or spend models on work
     /// awaiting free reconciliation. A stale preview cannot authorize a claim.
     pub fn claim_productive(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive, None)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive, None, None)
     }
 
     /// A changed input binding may re-enter ordinary admission. Checking the
@@ -897,7 +899,14 @@ impl WorkflowStore {
     pub(crate) fn claim_productive_for_binding(&mut self, workflow:&str, owner:&str,
         now_ms:i64, ttl_ms:i64, binding:&Binding)->Result<Option<Lease>> {
         binding.validate()?;
-        self.claim_inner(workflow,owner,now_ms,ttl_ms,ClaimPurpose::Productive,Some(binding))
+        self.claim_inner(workflow,owner,now_ms,ttl_ms,ClaimPurpose::Productive,Some(binding),None)
+    }
+
+    pub(crate) fn claim_productive_recovering_custody(&mut self, workflow:&str, owner:&str,
+        now:i64, ttl:i64, binding:&Binding, root:&Path,
+        validate:fn(&Path,&[NativeScopeCustody])->Result<()>)->Result<Option<Lease>> {
+        binding.validate()?;
+        self.claim_inner(workflow,owner,now,ttl,ClaimPurpose::Productive,Some(binding),Some((root,validate)))
     }
 
     pub fn claim(
@@ -907,10 +916,10 @@ impl WorkflowStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General, None)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General, None, None)
     }
 
-    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose, binding:Option<&Binding>) -> Result<Option<Lease>> {
+    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose, binding:Option<&Binding>, custody:Option<qualification_recovery::CustodyCheck<'_>>) -> Result<Option<Lease>> {
         ensure!(
             !owner.is_empty() && ttl_ms > 0,
             "owner and positive lease ttl required"
@@ -929,17 +938,15 @@ impl WorkflowStore {
         let Some((raw, leased, generation)) = row else {
             bail!("unknown workflow");
         };
-        let cp: Checkpoint = serde_json::from_str(&raw)?;
+        let mut cp: Checkpoint = serde_json::from_str(&raw)?;
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
             ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
             ("readiness_assessment_invalid","await_readiness_input_change")|
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
             ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"));
-        if purpose==ClaimPurpose::Productive && awaiting_input
-            && binding.is_none_or(|binding|binding==&cp.binding) {
-            return Ok(None);
-        }
+        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input
+            && binding.is_none_or(|binding|binding==&cp.binding);
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
         if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
@@ -964,6 +971,14 @@ impl WorkflowStore {
             || matches!(cp.stage, Stage::Merged | Stage::Retired)
         {
             return Ok(None);
+        }
+        if requires_recovery {
+            let Some(check)=custody else {return Ok(None)};
+            if !qualification_recovery::recovered(&tx,workflow,generation,&cp,check)? {return Ok(None);}
+            cp.stage=Stage::Reconcile;
+            cp.next=NextAction {reason:"original_native_custody_recovered".into(),action:"requalify_original".into(),eligible_at_ms:now_ms};
+            tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![workflow,serde_json::to_string(&cp)?])?;
+            event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation}).to_string(),now_ms)?;
         }
         let generation = generation.checked_add(1).context("generation overflow")?;
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+1 WHERE id=?1",
@@ -1002,6 +1017,14 @@ impl WorkflowStore {
         checkpoint: &Checkpoint,
         now_ms: i64,
     ) -> Result<()> {
+        self.checkpoint_with_custody_cause(lease,checkpoint,now_ms,None)
+    }
+
+    pub(crate) fn checkpoint_native_custody_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool)->Result<()> {
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical))
+    }
+
+    fn checkpoint_with_custody_cause(&mut self,lease:&Lease,checkpoint:&Checkpoint,now_ms:i64,physical:Option<bool>)->Result<()> {
         checkpoint.binding.validate()?;
         ensure!(
             !checkpoint.next.reason.is_empty() && !checkpoint.next.action.is_empty(),
@@ -1046,6 +1069,7 @@ impl WorkflowStore {
         if matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {
             tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'terminal_workflow') WHERE workflow=?1 AND retired_at IS NULL",[&lease.workflow])?;
         }
+        if let Some(physical)=physical {qualification_recovery::record(&tx,lease,&checkpoint,physical,now_ms)?;}
         tx.commit()?;
         Ok(())
     }

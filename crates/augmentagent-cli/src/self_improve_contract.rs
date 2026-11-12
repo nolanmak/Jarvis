@@ -1295,7 +1295,7 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     // Record the safe hold first: loss of private diagnostic storage cannot
     // make the workflow runnable or publish the underlying source/output.
-    workflow.hold_initial_acceptance(hold.reason(),hold.action()).await?;
+    workflow.hold_initial_acceptance_custody(hold.reason(),hold.action(),native_custody_failure(error)).await?;
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&(
         "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
@@ -1313,13 +1313,18 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
 
 pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
-    workflow.hold_enrolled_acceptance(prepared,hold.reason(),hold.action()).await?;
+    workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
     workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
         .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
     Ok(Some(accounting.retry_report(hold.to_string())?))
+}
+
+fn native_custody_failure(error:&anyhow::Error)->bool {
+    error.downcast_ref::<scope_authority::NativeCustodyUnavailable>().is_some()
+        || error.downcast_ref::<crate::autoship_workflow::NativeScopeOutcomeUnresolved>().is_some()
 }
 
 async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,

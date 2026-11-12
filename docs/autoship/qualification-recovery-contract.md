@@ -1,8 +1,8 @@
 # Qualification recovery: source data and durable holds
 
-Status: source replay and the unchanged productive-claim fence are implemented
-locally for PR #2035; verified recovery and wake integration below remain a
-load-bearing implementation task. This
+Status: source replay, the unchanged productive-claim fence and original native
+custody recovery are implemented locally for PR #2035. Verifier-infrastructure
+recovery and fair five-minute wake integration remain load-bearing tasks. This
 is not a restoration, full #1952 closure, or permission to merge known defects.
 Parent issues: #2034, #1952 and #1703.
 
@@ -66,9 +66,10 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
 
 - The existing productive-claim fence now covers the two recovery holds. A stale
   preview or a new owner message alone cannot replace missing original results.
-- Define the protected original-recovery observation and its atomic consumption
-  at the existing claim boundary. Preserve the failed binding and append-only
-  history; do not manufacture a changed Git input to force a retry.
+- Native custody uses the protected descriptor and atomic claim described
+  below. Infrastructure recovery still needs its operation-specific record.
+  Preserve the failed binding and append-only history; do not manufacture a
+  changed Git input to force a retry.
 - Recover original native results only after their exact original admission,
   response and private provenance are complete and positively validated. A
   completed semantic `unknown` judgment is different from missing custody:
@@ -86,31 +87,71 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
   rotate inspection work so one unresolved request does not block peers or
   final merge reconciliation. Inspection does not create productive progress.
 
-These points are not implementation-ready merely because the source replay is
-implemented. The exact recovery descriptor/API, all-cause producer coverage,
-original-operation replay recipe and release/reclaim tests remain open. They
+The native-custody path below does not complete infrastructure recovery. Its
+operation-specific descriptor/API, all-cause producer coverage, exact replay
+recipe and release/reclaim tests remain open. They
 must be resolved in code and tests; they are not requests for an owner-selected
 limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
 #1703 live/soak acceptance remain separate requirements.
+
+## Implemented original native-custody transition
+
+The qualification controller classifies a physical private-custody failure or
+an unresolved original native admission separately from a semantic unknown.
+The existing checkpoint transaction records the hold, its cause and an immutable
+descriptor in existing scope-response storage. The descriptor binds workflow,
+failed lease generation, complete checkpoint and the exact original native
+admission-history digest. A failed descriptor write rolls back the hold;
+previously committed original admissions and their charges stay intact.
+
+The existing productive claim can inspect this descriptor without a model or
+subprocess API. In the same claim transaction it requires the original cause,
+checkpoint, generation and admission history; complete accounting and original
+response/provenance pairs; and the normal private-file custody validator.
+Owner pause, active lease, pending mutations and uncertain merge dispatch still
+block claiming. Missing or invalid evidence yields no claim and no new attempt.
+
+A positive inspection atomically claims the next lease and changes the next
+action to `original_native_custody_recovered / requalify_original`, preserving
+binding, evidence and accounting. The recovered guard has recovery-only
+authority: normal current-policy qualification is still required before a
+builder can run. If the worker dies after this transaction, the next normal
+claim resumes requalification. If the transaction itself fails, the original
+hold and descriptor remain available; recovery was not consumed.
+
+A semantic unknown never creates recovery authorization. A later semantic
+unknown in the same lease invalidates the latest physical-cause classification;
+a later generation cannot consume the previous generation's descriptor. No
+file restoration, owner message or stale descriptor can clear those holds.
+Original results and descriptors are retained through the existing store's
+lifecycle; this path neither resets budgets nor retires retained sessions.
+
+Tests cover the actual private validator and admission observer, unchanged
+failure while the proof is missing, exact restoration with one original model
+admission, semantic unknowns, crash resumption, concurrent claims, paused work,
+and injected transaction failures. Store-only transaction tests explicitly
+script filesystem validation; they do not claim live model acceptance.
 
 ## Open threads from the fresh-eyes checkpoint
 
 All entries are owned by the normal workflow-controller implementation and block
 merging #2035 until resolved and tested:
 
-- Recovery authorization needs exact failed-binding identity, permitted issuer,
-  invalidation rules and transactional consumption, including duplicate claims
-  and crashes. A restored file alone is not an authorization record.
+- Native recovery authorization now has exact failed-binding identity,
+  controller-only cause classification, invalidation and transactional claim
+  consumption. Infrastructure needs equivalent operation-specific authority.
 - Original-operation recovery must distinguish inspection, resumption and
   replay. Unknown prior effects must be settled before replay; successful
   cleanup must be positively observed through the existing execution owner.
-- Every hold producer needs a typed cause and exit rule. Missing physical
-  custody, a completed semantic unknown and infrastructure failure are distinct.
+- Native custody preflights now retain a typed physical cause; semantic unknowns
+  cannot consume their descriptors. Complete infrastructure producer/exit
+  coverage is still required.
 - Historical admission evidence never authorizes new resource-consuming work.
   Original-result inspection is read-only; a measurement replay still needs
   current resource/storage admission while structurally refusing model calls.
-- Define the transition for a restored result that is itself negative or
-  unknown; custody restoration supplies no positive witness judgment.
+- Native custody restoration returns only to normal current qualification;
+  negative/unknown judgments remain governed by that qualifier. Infrastructure
+  recovery must likewise supply no positive witness judgment on its own.
 - Recovery inspection needs persisted fair rotation and a termination bound,
   preserving time for final merge reconciliation when an inspection stalls.
 

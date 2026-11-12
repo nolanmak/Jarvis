@@ -721,7 +721,7 @@ impl WorkflowGuard {
         refresh_native_capacity(&mut store,&id,now)?;
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
         let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
-            else {store.claim_productive_for_binding(&id,&owner,now,LEASE_MS,&binding)?};
+            else {store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?};
         let Some(lease)=lease else {return Ok(None);};
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
@@ -754,6 +754,9 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        let acceptance_authority=if snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
+            AcceptanceAuthority::RecoveryOnly
+        }else {AcceptanceAuthority::Unbound};
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -769,7 +772,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
-            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_authority:Arc::new(Mutex::new(acceptance_authority)),
             acceptance_source:source_from_workflow(&id),
         };
         guard.install_model_accounting()?;
@@ -1361,6 +1364,10 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
+        self.hold_initial_acceptance_custody(reason,action,false).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_custody(&mut self,reason:&str,action:&str,physical:bool)->Result<()> {
         self.healthy_lease()?;
         self.audit_health().await?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -1369,17 +1376,19 @@ impl WorkflowGuard {
             && checkpoint.stage==Stage::Reconcile && checkpoint.next.reason=="inputs_changed";
         anyhow::ensure!(checkpoint.binding==self.binding && (matches!(checkpoint.stage,Stage::Intake|Stage::Scope) || readiness_reassessment),
             "initial acceptance hold requires unchanged unenrolled scope");
-        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
-            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
-        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
     }
 
     /// Qualification recovery holds already-enrolled work without turning its
     /// candidate binding into an unenrolled initial scope or granting a builder.
     pub(super) async fn hold_enrolled_acceptance(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str)->Result<()> {
+        self.hold_enrolled_acceptance_custody(prepared,reason,action,false).await
+    }
+
+    pub(super) async fn hold_enrolled_acceptance_custody(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str,physical:bool)->Result<()> {
         self.healthy_lease()?;
         self.validate_acceptance_source(prepared)?;
         self.audit_health().await?;
@@ -1388,11 +1397,9 @@ impl WorkflowGuard {
         anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,
             Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"enrolled acceptance hold binding/stage changed");
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
-        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
-            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
-        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
     }
 
