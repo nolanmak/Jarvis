@@ -196,8 +196,8 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
     let mut store=WorkflowStore::open(&workflow::path())?;
     let owner_revision=store.owner_control(&snapshot.workflow)?.map(|control|control.revision);
     if store.recover_semantic_qualification(&snapshot,owner_revision,
-        &acceptance::semantic_reconsideration_policy(),chrono::Utc::now().timestamp_millis(),
-        |custody,evidence|acceptance::inspect_retained_semantic(&context.worktree,&control,source,&snapshot.checkpoint.binding,custody,evidence))? {
+        &acceptance::semantic_policy_for_hold(&snapshot.checkpoint),chrono::Utc::now().timestamp_millis(),
+        |custody,evidence|acceptance::inspect_semantic_hold(&context.worktree,&control,source,&snapshot.checkpoint,custody,evidence))? {
         return Ok(());
     }
     drop(store);
@@ -494,6 +494,13 @@ mod tests {
         assert!(pr.branch==before.branch && pr.ready_for_review() && pr.source_issue==issue_number,"fresh PR source or dependency changed");
         assert_eq!(source_request(issue.as_ref(),Some(&pr),context.source_pr).unwrap(),context.source_request,"original owner request changed");
         validate_recovery_checkout(&state,&root,&before,&context,Some(&pr)).await.expect("retained ordinary checkout cannot enter recovery");
+        if crate::autoship_workflow::legacy_amendment_input(&before.checkpoint).is_some() {
+            let source=issue_number.map(crate::autoship_contract::AcceptanceSource::Issue)
+                .unwrap_or(crate::autoship_contract::AcceptanceSource::PullRequest(pr.pr));
+            let control=acceptance::control_directories(&context.repository,&id).unwrap().workflow_acceptance;
+            let custody=store.inspect_baseline_native_custody(&id).unwrap();
+            assert!(acceptance::inspect_semantic_hold(&context.worktree,&control,source,&before.checkpoint,&custody,&store.inspect_verifier_evidence(&id)).unwrap().is_some(),"legacy ordinary decline is not eligible for corrected-evidence migration");
+        }
         assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
         println!("Fresh remote authorization, original request, retained checkout and binding verified read-only; no branch rewrite, workflow mutation or model calls");
     }

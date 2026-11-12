@@ -147,7 +147,7 @@ impl WorkflowStore {
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
         let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-        if !native_hold(&checkpoint) || checkpoint!=expected.checkpoint || generation!=expected.generation
+        if !(native_hold(&checkpoint) || legacy_amendment_input(&checkpoint).is_some()) || checkpoint!=expected.checkpoint || generation!=expected.generation
             || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
         let control=owner_control::read(&tx,&expected.workflow)?;
         if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision

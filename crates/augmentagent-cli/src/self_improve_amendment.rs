@@ -347,8 +347,26 @@ fn authority_request_context(title:&str,owner_request:&str,negative_witness:Opti
 
 /// Gate only the historical omitted-evidence handoff; source authentication is
 /// separately mandatory at the caller before this private decision is inspected.
-fn legacy_decline_omits_owner_evidence(_control:&Path,_source:AcceptanceSource,_contract:&str,_input:&str)->Result<bool> {
-    Ok(false)
+pub(super) fn legacy_decline_omits_owner_evidence(control:&Path,source:AcceptanceSource,contract:&str,input:&str)->Result<bool> {
+    ensure!(input.len()==64 && input.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid legacy amendment input");
+    let context=control.join(format!("{}-amendment-context-{input}.json",source.key()));
+    match std::fs::symlink_metadata(context) {
+        Ok(_)=>return Ok(false), // Any successor-context record conservatively ends this migration.
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(error)=>return Err(error.into()),
+    }
+    let prefix=format!("{}-amendment-decision-{input}-",source.key());
+    let mut selected=None;
+    for entry in std::fs::read_dir(control)? {
+        let entry=entry?;let name=entry.file_name();let Some(name)=name.to_str() else{continue};
+        let Some(suffix)=name.strip_prefix(&prefix).and_then(|name|name.strip_suffix(".json")) else{continue};
+        uuid::Uuid::parse_str(suffix).context("invalid retained amendment decision identity")?;
+        ensure!(selected.is_none(),"ambiguous retained amendment decision");
+        let decision:Decision=serde_json::from_slice(&baseline_witness::private_bytes(&entry.path(),2*1024*1024)?)?;
+        if decision.approved || decision.previous_contract_hash!=contract || decision.reason.trim().is_empty() {return Ok(false);}
+        selected=Some(());
+    }
+    Ok(selected.is_some())
 }
 
 pub(super) async fn try_amend(
@@ -483,8 +501,7 @@ pub(super) async fn try_amend(
     if !decision.approved {
         ensure!(
             adjudication.is_none(),
-            "adjudicated amendment conflicts with immutable owner requirements: {}",
-            decision.reason
+            "adjudicated amendment conflicts with immutable owner requirements"
         );
         return Err(initial_repair::Hold::Declined.into());
     }

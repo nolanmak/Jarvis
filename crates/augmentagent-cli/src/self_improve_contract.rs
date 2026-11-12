@@ -2052,6 +2052,25 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
 
+pub(super) fn semantic_policy_for_hold(checkpoint:&crate::autoship_workflow::Checkpoint)->String {
+    if crate::autoship_workflow::legacy_amendment_input(checkpoint).is_some() {
+        // This migration identity must survive unrelated builds and generations.
+        amendment::digest(b"legacy-amendment-owner-evidence-migration-v1")
+    }else{semantic_reconsideration_policy()}
+}
+
+pub(super) fn inspect_semantic_hold(root:&Path,control:&Path,source:AcceptanceSource,
+    checkpoint:&crate::autoship_workflow::Checkpoint,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+    if let Some(input)=crate::autoship_workflow::legacy_amendment_input(checkpoint) {
+        let Some((prepared,identity))=retained_semantic_source(root,control,source,&checkpoint.binding,custody,evidence)? else{return Ok(None)};
+        let contract=prepared.baseline.registration.contract_hash();
+        ensure!(checkpoint.binding.contract==contract || checkpoint.binding.contract==format!("registered:{contract}"),"legacy decline registered contract changed");
+        return Ok(amendment::legacy_decline_omits_owner_evidence(control,source,contract,input)?.then_some(identity));
+    }
+    inspect_retained_semantic(root,control,source,&checkpoint.binding,custody,evidence)
+}
+
 pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
     binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
