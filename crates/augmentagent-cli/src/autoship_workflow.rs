@@ -933,7 +933,9 @@ impl WorkflowStore {
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
             ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
-            ("readiness_assessment_invalid","await_readiness_input_change"));
+            ("readiness_assessment_invalid","await_readiness_input_change")|
+            ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"));
         if purpose==ClaimPurpose::Productive && awaiting_input
             && binding.is_none_or(|binding|binding==&cp.binding) {
             return Ok(None);
