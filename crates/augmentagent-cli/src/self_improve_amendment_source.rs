@@ -149,13 +149,20 @@ impl<'a> SourceBuffer<'a> {
         if self.partial_overflow {return Ok(());}
         if let Some(needle)=&self.request.needle {
             if self.matches<5 && line.contains(needle) {
+                let first=self.line.saturating_sub(50).max(1);
+                if self.line>1 && self.previous.front().map(|(number,_)|*number)!=Some(first) {
+                    self.overflow();return Ok(());
+                }
                 self.matches+=1;self.through=self.line.saturating_add(99);
                 for (number,previous) in self.previous.clone() {self.retain(number,previous)?;}
             }
             if self.line<=self.through {self.retain(self.line,line.clone())?;}
             self.previous_bytes+=line.len();self.previous.push_back((self.line,line));
-            if self.previous.len()>50 {self.previous_bytes-=self.previous.pop_front().unwrap().1.len();}
-            if self.previous_bytes>self.budget {self.overflow();}
+            // Unmatched history is only a bounded look-behind, not yet a
+            // mandatory window. Reject discarded context only at a real match.
+            while self.previous.len()>50 || self.previous_bytes>self.budget {
+                self.previous_bytes-=self.previous.pop_front().unwrap().1.len();
+            }
         }else if (self.request.start_line..=self.request.end_line).contains(&self.line) {
             self.retain(self.line,line)?;
         }

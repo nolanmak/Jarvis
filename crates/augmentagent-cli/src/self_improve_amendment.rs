@@ -539,7 +539,11 @@ pub(super) async fn try_amend(
     let prompt=authority_base_request(old,AuthorityFacts {source,request_context:&request_context,failure,
         canonical_main:&canonical_main,scope_base:&scope_base,head:&head,diff:&diff,upstream_paths:&upstream_paths,
         environments:&environments,adjudication}).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let source_context=negative.as_ref().map(|(_,raw)|negative_source_context(raw)).transpose()?;
+    let source_context=match &negative {
+        Some((_,raw))=>Some(negative_source_context(raw)?),
+        None=>baseline_witness::retained_source_context_in(root,&native_control,old,&custody)
+            .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?,
+    };
     let key=source_evidence::replay_key(root,&native_control,original_base,&custody,source_context.as_deref())
         .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     let replay=key.map(|key|workflow.scope_stage_response(&key)).transpose()?.flatten();

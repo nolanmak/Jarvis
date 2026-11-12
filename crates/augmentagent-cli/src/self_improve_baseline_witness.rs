@@ -188,8 +188,12 @@ pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&
 }
 
 /// Source data may use a positive original witness without importing approval.
-pub(super) fn retained_source_context_in(_root:&Path,_control:&Path,_prepared:&PreparedAcceptance,
-    _custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {Ok(None)}
+pub(super) fn retained_source_context_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    if custody.is_empty() {return Ok(None);}
+    retained_namespace(control,custody)?;
+    Ok(retained_judgment_matching(root,prepared,custody,|_|true)?.map(|(_,judgment)|judgment.context))
+}
 
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());

@@ -25,8 +25,14 @@ must verify private files, byte hashes, provider/input correlation and separatio
 from worker-writable roots. Every proof must belong to the expected workflow
 directory. Select exactly one source-selection observation at the registered
 original commit, matching the authenticated negative judgment's context when
-one is supplied. An amendment without a negative judgment may use the unique
-original-commit source selection from that same custody. Require the unchanged
+one is supplied. Without a negative diagnosis, the shared original-judgment
+reader may supply a positive witness's authenticated context bound to the complete
+same prepared proposal and baseline, solely to locate its source projection.
+This does not qualify an old measurement, reopen a legacy Unknown hold, approve
+a correction or grant budget. Keep the negative-diagnosis and Unknown-recovery
+selectors unchanged. If no original judgment exists, an amendment may still use
+the unique original-commit current-producer source selection from that same
+custody. Require the unchanged
 scope producer policy for direct selections, because its tracked-file ordinals
 and selection schema are the frozen protocol being decoded. For the already
 supported pre-deployment source policy, use only the existing version-1
