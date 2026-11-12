@@ -1098,6 +1098,37 @@ mod native_reply_tests {
     }
 
     #[tokio::test]
+    async fn predeployment_recovery_uses_the_retained_source_correction() {
+        let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(repo.path().join("implementation.py"),"READY = False\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","original base"]] {
+            assert!(Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap().status.success());
+        }
+        let head=actual_head(repo.path()).await.unwrap();let epoch="c".repeat(64);let current_epoch="e".repeat(64);
+        let old=NativeScopeContext {epoch:&epoch,request_hash:amendment::digest(b"original qualification"),policy_hash:PREDEPLOYMENT_SOURCE_POLICY.into()};
+        let current=NativeScopeContext {epoch:&current_epoch,request_hash:amendment::digest(b"current qualification"),policy_hash:witness_policy_hash()};
+        let choose=source_selection_prompt(r#"[[0,"implementation.py"]]"#,&head,"original qualification");
+        let files=vec![("100644 blob","implementation.py")];
+        let rejected=r#"{"requests":[{"file_index":999,"start_line":1,"end_line":1,"needle":null}]}"#;
+        let SourceCheck::Rejected(problem)=source_evidence(repo.path(),&head,rejected,&files).await.unwrap() else {panic!("fixture was not rejected")};
+        let corrected=correction_prompt(&choose,&problem,rejected);
+        let native=|request:&str,text:&str| {
+            let input=amendment::digest(&serde_json::to_vec(&("baseline-native-input-v2","owner/repo#7",&head,"codex",CallPurpose::SourceSelection,old.epoch,&old.request_hash,&old.policy_hash,SOURCE_SELECTION_SYSTEM,request)).unwrap());
+            let mut result=reply(control.path(),Some(CallPurpose::SourceSelection),&head,text);
+            let mut proof:NativeReplyProvenance=serde_json::from_slice(&std::fs::read(&result.provenance.artifact).unwrap()).unwrap();
+            proof.scope_context_hash=Some(epoch.clone());proof.scope_request_hash=Some(old.request_hash.clone());proof.scope_policy_hash=Some(old.policy_hash.clone());
+            proof.supplied_request_hash=amendment::digest(request.as_bytes());proof.native_input_hash=Some(input.clone());
+            let bytes=serde_json::to_vec(&proof).unwrap();std::fs::write(&result.provenance.artifact,&bytes).unwrap();result.provenance.artifact_sha256=amendment::digest(&bytes);
+            crate::autoship_workflow::NativeScopeCustody {input,response:result.text,provenance:serde_json::to_string(&result.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex}
+        };
+        let observations=vec![native(&choose,rejected),native(&corrected,r#"{"requests":[{"file_index":0,"start_line":1,"end_line":1,"needle":null}]}"#)];
+        let replay=project_source_replay(control.path(),"owner/repo#7",&head,&current,&old,&choose,&observations).unwrap().unwrap();
+        let recovered=recover_source_replay(repo.path(),control.path(),&head,&current,&files,&observations,&replay).await.unwrap();
+        assert!(recovered.is_some(),"a completed original correction was discarded, allowing replacement source generation");
+        assert_eq!(replay.original_input,observations[1].input,"the rejected initial response was projected instead of its successful correction");
+    }
+
+    #[tokio::test]
     async fn predeployment_recovery_source_data_survives_a_custody_policy_fix() {
         let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(repo.path().join("implementation.py"),"def warning_visible(): return False\n").unwrap();
