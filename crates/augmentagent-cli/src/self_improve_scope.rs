@@ -904,6 +904,51 @@ mod native_reply_tests {
     }
 
     #[tokio::test]
+    async fn native_custody_recovery_releases_only_the_failed_physical_hold() {
+        use augmentagent_channel_core::{ProviderKind,native_session};
+        use crate::autoship_workflow::WorkflowStore;
+        for semantic_unknown in [true,false] {
+            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::write(repo.path().join("implementation.py"),"READY = False\n").unwrap();
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                assert!(Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap().status.success());
+            }
+            let database=control.path().join("workflow.db");
+            let start=||workflow::Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:Some(7),pr:None,branch:"fixture",contract:"original criteria",environment:"fixture"};
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+            let input="d".repeat(64);let purpose=format!("{}{input}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX);
+            guard.bounded_native_calls(purpose.clone(),1,native_session::fresh_review_scope(ProviderKind::Codex,async {
+                let native=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut lease=native.begin(ProviderKind::Codex)?;
+                guard.audit_logger().model_call_admitted("codex")?;lease.observe("scripted-original-result")?;lease.finish()?;Ok::<_,anyhow::Error>(())
+            })).await.unwrap();
+            let mut completed=reply(control.path(),Some(CallPurpose::SourceSelection),&actual_head(repo.path()).await.unwrap(),"original source data");
+            let mut observed:NativeReplyProvenance=serde_json::from_slice(&std::fs::read(&completed.provenance.artifact).unwrap()).unwrap();
+            observed.scope_context_hash=Some("c".repeat(64));observed.native_input_hash=Some(input);
+            let bytes=serde_json::to_vec(&observed).unwrap();std::fs::write(&completed.provenance.artifact,&bytes).unwrap();completed.provenance.artifact_sha256=amendment::digest(&bytes);
+            let (raw,proof)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
+            guard.record_scope_stage_response_pair(&raw,&completed.text,&proof,&serde_json::to_string(&completed.provenance).unwrap()).unwrap();
+            let original=WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            std::fs::remove_file(&completed.provenance.artifact).unwrap();
+            let error=if semantic_unknown {anyhow::Error::from(initial_repair::Hold::EvidenceUnknown)}else {
+                require_retained_native_custody(repo.path(),&guard.baseline_native_custody().unwrap()).unwrap_err()
+            };
+            hold_initial_error(&mut guard,&error).await.unwrap().unwrap();let id=guard.id().to_owned();guard.finish().unwrap();
+            assert!(workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().is_none(),"unrecovered original result was reclaimed");
+            std::fs::write(&completed.provenance.artifact,&bytes).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&completed.provenance.artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let recovered=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap();
+            if semantic_unknown {assert!(recovered.is_none(),"physical availability cleared a completed semantic unknown");continue;}
+            let recovered=recovered.expect("the exact restored original custody must release its physical hold without new input or another model call");
+            let after=WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.binding,original.checkpoint.binding);assert_eq!(after.model_calls,1);assert_eq!(after.tokens,original.tokens);
+            assert_eq!(after.checkpoint.next.reason,"original_native_custody_recovered");
+            assert!(recovered.audit_logger().model_call_admitted("codex").is_err(),"custody recovery authorized an unqualified builder");
+            recovered.finish().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn completed_native_witness_recovers_with_no_ready_provider_and_no_second_call() {
         use augmentagent_channel_core::{ProviderKind,native_session};
         let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
