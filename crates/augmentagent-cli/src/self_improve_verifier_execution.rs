@@ -275,6 +275,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quiescent_original_without_result_cannot_start_another_attempt() {
+        let (_root,_control,prepared,guard)=fixture().await;
+        let original=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
+        original.retain_admission("observe",&gone_scope()).unwrap();
+        OriginalExecution::quiesce_previous(&guard).unwrap();
+        let retry=OriginalExecution::begin(&guard,&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor");
+        let failure=retry.err().expect("quiescence was used as a result receipt and admitted another execution");
+        assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+        assert_eq!(guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1);
+        drop(original);guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn retained_original_verifier_result_reenters_without_executing_again() {
         for reproduced in [true,false] {
             let (root,control,prepared,guard)=fixture().await;
