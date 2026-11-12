@@ -86,6 +86,22 @@ body, PR dependency, retained checkout/branch/head and exact context binding.
 The authenticated frontend request must still match the retained context. A
 retained unpublished head needs the existing ownership/ancestor checks.
 
+The workflow branch names the authorized remote branch, not necessarily a
+symbolic HEAD in the retained checkout. The normal PR resume producer creates a
+registered detached worktree at its canonical per-PR resume path, while the
+published branch may remain attached to the original issue checkout (#2046).
+Checkout inspection accepts the expected attached branch, or a detached HEAD
+only at that same producer-derived canonical resume path for the matching PR.
+Use the shared path helper; do not reattach or rewrite a branch during inspection.
+Both shapes still require the complete unchanged protected context/binding and
+fresh remote branch/source identity. A published head must match exactly; an
+unpublished head still needs the existing confirmed-publication ownership and
+ancestor proof. Wrong attached refs, arbitrary detached paths, foreign linked
+repositories, changed inputs and unowned retained heads remain held. A detached
+issue-only checkout has no normal resume producer and is not authorized by this
+exception. Tests must drive the real producer into the same checkout validator
+used by recovery; the explicit production compatibility probe is read-only.
+
 Inside one Immediate transaction compare the exact held checkpoint, binding,
 generation, branch/PR, eligibility, idle lease, current owner pause/revision,
 pending owner input and unresolved publication/merge effects. Authenticate source
@@ -203,15 +219,18 @@ actual final PR head; macOS is informational under existing policy. Take only
 the updater deploy. Verify both process executable hashes and selected policy.
 Repair PRs are manual engineering, never autoship test cases.
 
-Audit: fresh-eyes findings about generation continuation, judgment cardinality
+Prior #2045 audit: fresh-eyes findings about generation continuation, judgment cardinality
 and restoration policy are resolved above. All 50 mapped producer/consumer and
 outer seams were checked against the referenced code, contracts and retained
 test evidence. One seam finding clarified read-only Git authentication versus
 verifier/model/runtime execution; the corrected seam now holds.
 
-Open work owned by this repair: finish required exact-head CI/review,
-snapshot/main rollout, and observe ordinary
-#2014 leaving its retained hold through this path. A read-only probe, a manual
+The #2045 exact-head checks and normal rollout are complete at main 173295c8;
+both service executable hashes and selected policy were verified. Its first
+ordinary inspection exposed the detached-resume mismatch tracked in #2046.
+Open work now includes that amendment's producer/consumer regressions and bounded
+seam audit, required final-head CI/review, normal rollout and actual ordinary
+#2014 recovery. The prior 50-seam audit does not certify the new amendment. A read-only probe, a manual
 repair merge, or an exhausted hold alone is not restoration. Keep #1703 active
 until its complete ordinary shipping, five-confirmed-merges-per-UTC-day,
 CLI/private Discord, host sizing, custody and unattended/fault acceptance is

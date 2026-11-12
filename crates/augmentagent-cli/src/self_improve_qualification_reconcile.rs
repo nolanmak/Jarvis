@@ -78,6 +78,55 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(out.trim().into())
 }
 
+/// The caller retains refreshed source authorization and the lane lock. Read
+/// the original checkout and ownership proof without rewriting candidate state.
+async fn validate_recovery_checkout(
+    state:&Path,root:&Path,snapshot:&crate::autoship_workflow::Snapshot,
+    context:&crate::autoship_workflow::RecoveryContext,pr:Option<&adoption::AdoptedPr>,
+)->Result<crate::autoship_workflow::Binding> {
+    recovery::existing_checkout(root, &context.worktree).await?;
+    anyhow::ensure!(
+        git(&context.worktree, &["symbolic-ref", "--short", "HEAD"]).await? == snapshot.branch,
+        "original recovery branch changed"
+    );
+    let binding = workflow::git_binding(
+        &context.worktree,
+        &context.contract,
+        &context.environment,
+        &snapshot.checkpoint.evidence,
+    )
+    .await?;
+    anyhow::ensure!(
+        binding == context.binding && binding == snapshot.checkpoint.binding,
+        "original recovery inputs changed"
+    );
+    if let Some(pr) = pr {
+        if pr.head != binding.head {
+            let store = WorkflowStore::open_read_only(state)?.context("recovery workflow store unavailable")?;
+            anyhow::ensure!(
+                store
+                    .retained_candidate_head(
+                        &context.repository,
+                        pr.pr,
+                        &pr.branch,
+                        &pr.head,
+                        &binding.head,
+                        chrono::Utc::now().timestamp_millis()
+                    )?
+                    .as_deref()
+                    == Some(binding.head.as_str()),
+                "retained recovery head is not owned"
+            );
+            git(
+                &context.worktree,
+                &["merge-base", "--is-ancestor", &pr.head, &binding.head],
+            )
+            .await?;
+        }
+    }
+    Ok(binding)
+}
+
 async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
     let RecoveryCandidate { snapshot, context } = candidate;
     let repository = &context.repository;
@@ -129,46 +178,7 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
     let Some(_lock) = RunLock::try_acquire(&run_lock_path().with_file_name(lock_name))? else {
         return Ok(());
     };
-    recovery::existing_checkout(root, &context.worktree).await?;
-    anyhow::ensure!(
-        git(&context.worktree, &["symbolic-ref", "--short", "HEAD"]).await? == snapshot.branch,
-        "original recovery branch changed"
-    );
-    let binding = workflow::git_binding(
-        &context.worktree,
-        &context.contract,
-        &context.environment,
-        &snapshot.checkpoint.evidence,
-    )
-    .await?;
-    anyhow::ensure!(
-        binding == context.binding && binding == snapshot.checkpoint.binding,
-        "original recovery inputs changed"
-    );
-    if let Some(pr) = &pr {
-        if pr.head != binding.head {
-            let store = WorkflowStore::open(&workflow::path())?;
-            anyhow::ensure!(
-                store
-                    .retained_candidate_head(
-                        repository,
-                        pr.pr,
-                        &pr.branch,
-                        &pr.head,
-                        &binding.head,
-                        chrono::Utc::now().timestamp_millis()
-                    )?
-                    .as_deref()
-                    == Some(binding.head.as_str()),
-                "retained recovery head is not owned"
-            );
-            git(
-                &context.worktree,
-                &["merge-base", "--is-ancestor", &pr.head, &binding.head],
-            )
-            .await?;
-        }
-    }
+    let binding=validate_recovery_checkout(&workflow::path(),root,&snapshot,&context,pr.as_ref()).await?;
     // A completed semantic Unknown is negative source data. Authenticate it
     // under the original workflow namespace before queuing normal repair.
     let source=match issue_number {
@@ -335,6 +345,65 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_git(root:&Path,args:&[&str])->String {
+        let out=std::process::Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+
+    #[tokio::test]
+    async fn normal_detached_resume_checkout_reaches_qualification_recovery() {
+        let root=tempfile::tempdir().unwrap();let data=tempfile::tempdir().unwrap();
+        fixture_git(root.path(),&["init","-q","-b","main"]);
+        fixture_git(root.path(),&["config","user.name","Fixture"]);
+        fixture_git(root.path(),&["config","user.email","fixture@example.invalid"]);
+        std::fs::write(root.path().join("code"),"original production\n").unwrap();
+        fixture_git(root.path(),&["add","code"]);fixture_git(root.path(),&["commit","-qm","original"]);
+        fixture_git(root.path(),&["remote","add","origin",root.path().to_str().unwrap()]);
+        fixture_git(root.path(),&["fetch","-q","origin","main"]);
+        let branch="agent-fix/issue-7";fixture_git(root.path(),&["branch",branch]);
+        let published=fixture_git(root.path(),&["rev-parse","HEAD"]);
+        let candidate=workflow::prepare_resume_worktree_at_head(root.path(),42,branch,Some(&published)).await.unwrap();
+        assert_eq!(fixture_git(&candidate,&["rev-parse","--verify","--symbolic-full-name","HEAD"]),"HEAD","real resume producer no longer creates detached checkout");
+        let binding=workflow::git_binding(&candidate,"owner request","fixture environment",&[]).await.unwrap();
+        let state=data.path().join("workflow.db");let id="owner/repo#7";
+        let mut store=WorkflowStore::open(&state).unwrap();let now=chrono::Utc::now().timestamp_millis();
+        store.register(id,branch,binding.clone(),now).unwrap();
+        let lease=store.claim(id,"fixture",now,60_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",42,now).unwrap();
+        let context=crate::autoship_workflow::RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:candidate.clone(),source_request:"owner request".into(),source_pr:Some(42),contract:"owner request".into(),environment:"fixture environment".into(),binding:binding.clone()};
+        store.record_recovery_context(&lease,&binding,&context,now).unwrap();
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage=crate::autoship_workflow::Stage::Scope;
+        cp.next=crate::autoship_workflow::NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&cp,now).unwrap();store.release(&lease,now).unwrap();
+        let snapshot=store.snapshot(id).unwrap().unwrap();let events=store.events(id).unwrap();
+        let pr=adoption::AdoptedPr {repository:"owner/repo".into(),pr:42,source_issue:Some(7),branch:branch.into(),head:published.clone(),base:"main".into(),author:"owner".into(),title:"Fixture".into(),body:"Original request".into(),dependency:adoption::Dependency::Main};
+        let result=validate_recovery_checkout(&state,root.path(),&snapshot,&context,Some(&pr)).await;
+        assert!(result.is_ok(),"normal detached resume cannot reach free recovery: {result:?}");
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),snapshot);
+        assert_eq!(store.events(id).unwrap(),events);
+        assert_eq!(fixture_git(&candidate,&["rev-parse","--verify","--symbolic-full-name","HEAD"]),"HEAD","inspection reattached candidate");
+        assert_eq!(fixture_git(&candidate,&["rev-parse","HEAD"]),published);
+        assert!(fixture_git(&candidate,&["status","--porcelain=v1","--untracked-files=all"]).is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit read-only retained recovery checkout compatibility; no model calls"]
+    async fn production_retained_checkout_recovery_compatibility() {
+        let state=PathBuf::from(std::env::var_os("AUTOSHIP_RECOVERY_STATE").expect("explicit read-only store"));
+        let root=PathBuf::from(std::env::var_os("AUTOSHIP_RECOVERY_ROOT").expect("explicit controller repository"));
+        let id=std::env::var("AUTOSHIP_RECOVERY_WORKFLOW").expect("explicit workflow identity");
+        let published=std::env::var("AUTOSHIP_RECOVERY_PUBLISHED").expect("fresh public PR head");
+        let store=WorkflowStore::open_read_only(&state).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        let context=store.recovery_context(&id,&before.checkpoint.binding).unwrap().expect("original protected context");
+        let pr=adoption::AdoptedPr {repository:context.repository.clone(),pr:before.pr.unwrap(),source_issue:id.split_once('#').and_then(|(_,n)|n.parse().ok()),branch:before.branch.clone(),head:published,base:"main".into(),author:"nolanmak".into(),title:"Explicit metadata probe".into(),body:String::new(),dependency:adoption::Dependency::Main};
+        validate_recovery_checkout(&state,&root,&before,&context,Some(&pr)).await.expect("retained ordinary checkout cannot enter recovery");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+        println!("Retained recovery checkout and original binding verified read-only; no branch rewrite, workflow mutation or model calls");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn bounded_recovery_window_keeps_peers_moving_and_drains_on_upgrade() {
         use std::sync::atomic::{AtomicUsize, Ordering};
