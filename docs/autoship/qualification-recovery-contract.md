@@ -134,7 +134,7 @@ before a builder can run. If the worker dies after either transaction, the next
 normal claim resumes requalification. If the transaction itself fails, the
 original hold and descriptor remain available; recovery was not consumed.
 
-A semantic unknown never creates recovery authorization. A later semantic
+A semantic unknown never creates physical native-custody recovery authorization. A later semantic
 unknown in the same lease invalidates the latest physical-cause classification;
 a later generation cannot consume the previous generation's descriptor. No
 file restoration, owner message or stale descriptor can clear those holds.
@@ -180,7 +180,7 @@ inside its claim transaction. It records `qualification_recovery_claimed` for
 the exact new lease generation without incrementing productive attempts.
 An original raw-verifier evidence-unknown hold is inspectable only when its
 controller-retained plan classification matches the exact checkpoint. This
-does not make an unrelated semantic unknown inspectable or recoverable.
+does not make an unrelated semantic unknown inspectable or recoverable through the raw-operation grant; semantic reconsideration uses the separate source validation below.
 Claims are spaced at least five minutes apart for the same workflow/input
 binding, including across restart. Genuinely changed inputs do not inherit an
 older operation's retry delay. Owner pauses, pending mutations, uncertain merge dispatch and
@@ -347,7 +347,7 @@ a new recovery hold. The compatibility regression starts with the deployed
 context capture and an unchanged-input fence after an enrolled hold. The
 November 12 read-only inventory found zero existing recovery holds, zero native
 physical classifications and zero raw recovery descriptors; these authorities
-are introduced by this PR. #2014 is paused at that frontend-bound resume shape,
+are introduced by this PR. #2014 was owner-paused at that frontend-bound resume shape in the pre-rollout inventory,
 and its current issue/PR request hash exactly matches its checkpoint contract.
 It does not need a legacy-context migration. No database backfill is introduced.
 Missing or invalid context for an unsupported recovery record remains held;
@@ -503,3 +503,13 @@ Rollback, owner controls, pending input, uncertain operations and lease fences
 are covered by the store tests. Normal dispatch/preparation still needs to
 invoke this protocol and preserve its hold through wrapper errors before the
 release is ready.
+
+
+The normal source consumer is now wired through preparation and the shared
+pre-VM/final-release dispatch observer. Registered qualification captures actual
+installed/committed inputs before holds, and wrapper accounting preserves a
+recorded source wait. Full local CLI validation passed 1,965 tests with zero
+failures (36 explicit ignored); the actual read-only source probe passed too.
+The current implementation contract and pending rollout/live acceptance are in
+[semantic reconsideration](semantic-reconsideration.md). Earlier implementation
+milestones above describe their own historical scope, not current rollout proof.

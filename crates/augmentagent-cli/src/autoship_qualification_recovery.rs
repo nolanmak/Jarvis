@@ -97,7 +97,7 @@ pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previou
     Ok(())
 }
 
-fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<(i64,SemanticReconsideration)>> {
+pub(super) fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<(i64,SemanticReconsideration)>> {
     if !native_hold(checkpoint) {return Ok(None);}
     let saved:Option<(i64,String)>=conn.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((sequence,raw))=saved else{return Ok(None)};
@@ -117,6 +117,12 @@ impl WorkflowStore {
         let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
         if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
         semantic_cue(&self.conn,workflow,binding,snapshot.generation)
+    }
+
+    pub(crate) fn semantic_source_waiting(&self,workflow:&str,binding:&Binding)->Result<bool> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(false)};
+        if snapshot.checkpoint.binding!=*binding {return Ok(false);}
+        Ok(waiting_semantic_source(&self.conn,workflow,snapshot.generation,&snapshot.checkpoint)?.is_some())
     }
 
     pub(crate) fn hold_semantic_source_unavailable(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {

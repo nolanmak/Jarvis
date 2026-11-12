@@ -1131,6 +1131,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
     workflow.validate_acceptance_source(prepared)?;
     ensure!(prepared.proposal.contract.source()?==source,"witness repair source differs from original contract");
     if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    workflow.checkpoint_qualification_source(prepared).await?;
     let legacy=prepared.proposal.contract.verifiers.iter().any(|v|!v.command.controller_asserted());
     let checked=if legacy {Err(anyhow::anyhow!("legacy in-process verifier requires independent behavioral-oracle migration"))}else {
         qualify_original_baseline(root,control,prepared,workflow).await
@@ -1142,6 +1143,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
             let failure=format!("{error:#}");
             if !(legacy || failure.contains("baseline_witness_invalid")) {return Err(error);}
             recovery::commit_candidate_named(root,&format!("fix: preserve candidate before original witness repair ({source})")).await?;
+            workflow.checkpoint_qualification_source(prepared).await?;
             match amendment::try_amend(reasoner,source,title,root,prepared,control,workflow,&failure,false,None).await? {
                 Some(next)=>{*prepared=next;qualify_original_baseline(root,control,prepared,workflow).await},
                 None=>Err(error.context(initial_repair::Hold::Exhausted)),
@@ -1448,6 +1450,7 @@ mod initial_diagnostic_tests {
 }
 
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
+    if workflow.semantic_source_waiting()? {return Ok(Some(RunReport::held("Autoship waiting for original verification evidence; candidate and prior charges preserved".into())));}
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     // Record the safe hold first: loss of private diagnostic storage cannot
     // make the workflow runnable or publish the underlying source/output.
@@ -1629,6 +1632,15 @@ pub(super) async fn prepare_acceptance(
     .await
 }
 
+fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    use std::{io::Write,os::unix::fs::PermissionsExt};
+    let mut staged=tempfile::NamedTempFile::new_in(control)?;
+    staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    staged.write_all(&serde_json::to_vec(prepared)?)?;staged.as_file().sync_all()?;
+    staged.persist_noclobber(path).map_err(|error|error.error)?;
+    std::fs::File::open(control)?.sync_all()?;Ok(())
+}
+
 pub(super) async fn prepare_acceptance_for(
     repo: &Path,
     candidate: &Path,
@@ -1642,8 +1654,8 @@ pub(super) async fn prepare_acceptance_for(
     workflow: &workflow::WorkflowGuard,
 ) -> Result<PreparedAcceptance> {
     source.validate()?;
-    use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let semantic=workflow.semantic_preparation_source()?;
     std::fs::create_dir_all(control)?;
     let control = control.canonicalize()?;
     for root in writable_roots {
@@ -1657,6 +1669,7 @@ pub(super) async fn prepare_acceptance_for(
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
+        .or_else(||semantic.as_ref().map(|prepared|prepared.baseline.registration.baseline_head()))
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
@@ -1679,7 +1692,11 @@ pub(super) async fn prepare_acceptance_for(
         }
         None => evidence_path(&control, source, base)?,
     };
-    let prepared = if path.exists() {
+    let prepared = if let Some(prepared)=semantic {
+        ensure!(prepared.proposal.contract.source()?==source && prepared.baseline.registration.baseline_head()==base,"queued semantic preparation source changed");
+        if !path.try_exists()? {persist_initial_prepared(&control,&path,&prepared)?;}
+        prepared
+    } else if path.exists() {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -1739,16 +1756,7 @@ pub(super) async fn prepare_acceptance_for(
         let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;
         let prepared = PreparedAcceptance { proposal, baseline };
-        let mut staged = tempfile::NamedTempFile::new_in(&control)?;
-        staged
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        staged.write_all(&serde_json::to_vec(&prepared)?)?;
-        staged.as_file().sync_all()?;
-        staged
-            .persist_noclobber(&path)
-            .map_err(|error| error.error)?;
-        std::fs::File::open(&control)?.sync_all()?;
+        persist_initial_prepared(&control,&path,&prepared)?;
         prepared
     };
     for required in required_criteria {

@@ -455,7 +455,7 @@ mod tests {
                 assert!(native_control.join(format!("{}-workflow.json",source.key())).exists());
                 let base=prepared.baseline.registration.baseline_head();
                 let script=PathBuf::from(std::env::var_os("GH_BIN").unwrap());
-                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n").replace("\\\"","\"")).unwrap();
+                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
                 std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let epoch=amendment::digest(&serde_json::to_vec(&(source,base,environment_id(root.path()).unwrap())).unwrap());
                 for _ in 0..4 {assert!(next.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}

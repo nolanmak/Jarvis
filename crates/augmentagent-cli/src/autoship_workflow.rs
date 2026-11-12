@@ -1091,6 +1091,12 @@ impl WorkflowStore {
             [&lease.workflow],
             |r| r.get(0),
         )?;
+        let prior:Checkpoint=serde_json::from_str(&previous)?;
+        if qualification_recovery::waiting_semantic_source(&tx,&lease.workflow,lease.generation,&prior)?.is_some()
+            && !matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {
+            ensure!(checkpoint==prior && !cause.as_ref().is_some_and(|cause|cause.physical || cause.plan.is_some()),
+                "original semantic source must be restored before changing this hold");
+        }
         if let Some(key)=cause.as_ref().and_then(|cause|cause.semantic_source) {
             qualification_recovery::record_source_unavailable(&tx,lease,&serde_json::from_str(&previous)?,&checkpoint,key,now_ms)?;
         }
