@@ -353,6 +353,7 @@ mod tests {
     #[test]
     fn initial_verifier_holds_remain_precise_after_command_attempt_finishes() {
         for (reason,action) in [("readiness_assessment_invalid","await_readiness_input_change"),
+            ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
             ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
             ("acceptance_contract_invalid","await_acceptance_input_change"),

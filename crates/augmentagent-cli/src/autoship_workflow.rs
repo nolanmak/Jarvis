@@ -225,7 +225,7 @@ mod acceptance_input_wait_claim_tests {
     use super::*;
     #[test]
     fn acceptance_input_wait_claim_is_atomic_and_preserves_charges_and_guards() {
-        for reason in ["acceptance_verifier_repair_exhausted","acceptance_contract_invalid","readiness_assessment_invalid"] {
+        for reason in ["acceptance_verifier_amendment_declined","acceptance_verifier_repair_exhausted","acceptance_contract_invalid","readiness_assessment_invalid"] {
             for change in ["head","contract","environment"] {
                 let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
                 let mut store=WorkflowStore::open(&path).unwrap();

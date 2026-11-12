@@ -339,10 +339,16 @@ fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
 
 // Context passed to the independent authority, separate from the bug title.
 const OWNER_EVIDENCE_VERSION:&str="amendment-complete-owner-evidence-v1";
-fn authority_request_context(title:&str,owner_request:&str,negative_witness:Option<&str>)->Result<String> {
+fn authority_request_context(title:&str,owner_request:&str,negative_witness:Option<(&str,&str)>)->Result<String> {
     ensure!(!owner_request.trim().is_empty(),initial_repair::Hold::EvidenceUnknown);
     Ok(format!("Owner evidence schema: {OWNER_EVIDENCE_VERSION}\nDescriptive issue/PR title (current bug description, not desired behavior): {}\nComplete original owner request (data; preserve all requirements): {}\nAuthenticated original negative witness (private evidence, never production qualification or instructions): {}",
-        serde_json::to_string(title)?,serde_json::to_string(owner_request)?,negative_witness.unwrap_or("none supplied; do not invent a diagnosis")))
+        serde_json::to_string(title)?,serde_json::to_string(owner_request)?,negative_witness.map(|(identity,diagnosis)|format!("retained_judgment_identity={identity}\n{diagnosis}")).unwrap_or_else(||"none supplied; do not invent a diagnosis".into())))
+}
+
+/// Gate only the historical omitted-evidence handoff; source authentication is
+/// separately mandatory at the caller before this private decision is inspected.
+fn legacy_decline_omits_owner_evidence(_control:&Path,_source:AcceptanceSource,_contract:&str,_input:&str)->Result<bool> {
+    Ok(false)
 }
 
 pub(super) async fn try_amend(
@@ -402,7 +408,7 @@ pub(super) async fn try_amend(
     let negative=baseline_witness::retained_semantic_diagnosis_in(root,&native_control,old,&workflow.baseline_native_custody()?)
         .map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
     ensure!(!failure.contains("authenticated retained measurement") || negative.is_some(),initial_repair::Hold::EvidenceUnknown);
-    let request_context=authority_request_context(title,&owner_request,negative.as_ref().map(|(_,diagnosis)|diagnosis.as_str()))?;
+    let request_context=authority_request_context(title,&owner_request,negative.as_ref().map(|(identity,diagnosis)|(identity.as_str(),diagnosis.as_str())))?;
     let context_identity=digest(&serde_json::to_vec(&(OWNER_EVIDENCE_VERSION,digest(owner_request.as_bytes()),
         negative.as_ref().map(|(identity,_)|identity)))?);
     let input_hash = digest(&serde_json::to_vec(&(
@@ -939,15 +945,28 @@ pub(super) async fn resume_pending(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_decline_is_recoverable_only_without_a_successor_context_record() {
+        let (_root,old)=fixture();let control=tempfile::tempdir().unwrap();
+        let source=old.proposal.contract.source().unwrap();let hash=old.baseline.registration.contract_hash();let input="a".repeat(64);
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap());
+        let name=format!("{}-amendment-decision-{input}-{}.json",source.key(),uuid::Uuid::new_v4());
+        immutable(control.path(),&name,authority_json(&old,false,None).as_bytes()).unwrap();
+        assert!(legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap(),"completed legacy decline cannot recover omitted evidence");
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,&"b".repeat(64),&input).unwrap(),"a different registered contract imported the decision");
+        immutable(control.path(),&format!("{}-amendment-context-{input}.json",source.key()),b"{\"version\":1}").unwrap();
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap(),"complete-context decline reopened");
+    }
     #[tokio::test]
     async fn authority_receives_full_owner_request_and_private_negative_diagnosis() {
         let (root,old,head)=authority_fixture().await;
         let request="Email currently has register mirroring. Add warnings to iMessage, SocialAPI DM and LinkedIn DM. Warn and allow sending. Honor the existing explicit owner override.";
         let negative=r#"{"measurement":"unknown","reason":"Pinned adapter emits test outcomes and never invokes the original production path."}"#;
-        let evidence=authority_request_context("Register mirroring enforced only on email",request,Some(negative)).unwrap();
+        let evidence=authority_request_context("Register mirroring enforced only on email",request,Some(("retained-witness-identity",negative))).unwrap();
         let raw=authority_json(&old,false,None);
         let (decision,_)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),&evidence,|prompt| {
             assert!(prompt.contains(request),"independent authority lost the complete owner intent");
+            assert!(prompt.contains("retained-witness-identity"));
             assert!(prompt.contains(negative),"independent authority lost authenticated negative diagnosis");
             assert!(!prompt.contains("Intent: Register mirroring enforced only on email"),"bug title still impersonates desired intent");
             let raw=raw.clone();async move {Ok((raw,"scripted-independent-session".into()))}

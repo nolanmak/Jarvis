@@ -281,6 +281,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_decline_rejoins_normal_selection_once_without_new_charges() {
+        for reason in ["acceptance_verifier_amendment_declined","acceptance_verifier_repair_exhausted"] {
+            let (_dir,mut store,lease,mut hold)=fixture();
+            hold.next.reason=reason.into();hold.next.action="await_acceptance_input_change".into();
+            hold.evidence=vec![format!("amendment-input:{}","a".repeat(64))];
+            store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            let policy="b".repeat(64);let identity="c".repeat(64);
+            assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody,_| {
+                assert_eq!(custody.len(),1);Ok(Some(identity.clone()))
+            }).unwrap(),"legacy completed decline cannot rejoin bounded original-evidence repair");
+            let queued=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(queued.checkpoint.stage,Stage::Reconcile);
+            assert_eq!((queued.attempts,queued.model_calls,queued.tokens),(before.attempts,before.model_calls,before.tokens));
+            let next=store.claim(&lease.workflow,"normal-successor",8,1000).unwrap().unwrap();
+            store.checkpoint(&next,&hold,9).unwrap();store.release(&next,10).unwrap();
+            let declined=store.snapshot(&lease.workflow).unwrap().unwrap();
+            for now in [11,86_400_000,2*86_400_000] {
+                assert!(!store.recover_semantic_qualification(&declined,None,&policy,now,|_,_|Ok(Some(identity.clone()))).unwrap(),"same original evidence minted another migration");
+            }
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),declined);
+        }
+    }
+
+    #[test]
     fn free_recovery_preserves_confirmed_but_unreconciled_merge_effects() {
         let mut failures=vec![];
         for phase in ["initial","restoration"] {
