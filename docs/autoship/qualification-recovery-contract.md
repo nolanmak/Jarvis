@@ -492,3 +492,14 @@ probe still authenticates its two original responses without changing state or
 admitting models. Normal preparation must still carry that exact queued source
 across `resume_started` restarts and unavailable/restored evidence before this
 rollout is complete.
+
+The source-loss store protocol records the restrictive checkpoint and its cue
+reference in one lease transaction. Free restoration authenticates the same
+judgment, retains the original cue key/policy and budgets, and consumes that
+loss event's sequence once. It creates no second semantic reconsideration.
+Repeated loss after a real resumed attempt can restore the same episode;
+old generation/checkpoint markers cannot revive a later independent result.
+Rollback, owner controls, pending input, uncertain operations and lease fences
+are covered by the store tests. Normal dispatch/preparation still needs to
+invoke this protocol and preserve its hold through wrapper errors before the
+release is ready.

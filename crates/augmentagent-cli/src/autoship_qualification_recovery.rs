@@ -69,28 +69,63 @@ fn semantic_hash(value:&str)->bool {
     value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)->Result<Option<SemanticReconsideration>> {
+    let saved:Option<(i64,String)>=conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let Some((recorded_generation,raw))=saved else{return Ok(None)};
+    let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
+    ensure!(cue.version==1 && cue.qualification_required && cue.original_generation==recorded_generation
+        && recorded_generation<=generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment)
+        && cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration reference changed");
+    Ok((cue.binding==*binding).then_some(cue))
+}
+
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticSourceUnavailable {version:u32,cue:String,checkpoint:Checkpoint}
+
+/// The restrictive checkpoint and its continuation reference share the lease
+/// transaction. This records source loss, not another judgment or grant.
+pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previous:&Checkpoint,
+    checkpoint:&Checkpoint,cue_key:&str,now:i64)->Result<()> {
+    ensure!(native_hold(checkpoint) && previous.binding==checkpoint.binding
+        && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile),"semantic source loss changed its owned input");
+    let cue=semantic_cue(tx,&lease.workflow,&checkpoint.binding,lease.generation)?.context("semantic source reference missing")?;
+    ensure!(cue.key==cue_key,"semantic source reference changed");
+    let body=serde_json::to_string(&SemanticSourceUnavailable {version:1,cue:cue.key,checkpoint:checkpoint.clone()})?;
+    let old:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
+    if old.as_deref()!=Some(body.as_str()) {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
+    Ok(())
+}
+
+fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<(i64,SemanticReconsideration)>> {
+    if !native_hold(checkpoint) {return Ok(None);}
+    let saved:Option<(i64,String)>=conn.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((sequence,raw))=saved else{return Ok(None)};
+    let saved:SemanticSourceUnavailable=serde_json::from_str(&raw)?;
+    ensure!(saved.version==1,"semantic source loss version changed");
+    if saved.checkpoint!=*checkpoint {return Ok(None);}
+    let cue=semantic_cue(conn,workflow,&checkpoint.binding,generation)?.context("semantic source continuation missing")?;
+    ensure!(saved.cue==cue.key,"semantic source continuation changed");
+    let consumed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_source_restored' AND json_extract(payload,'$.loss_sequence')=?2)",params![workflow,sequence],|r|r.get(0))?;
+    Ok((!consumed).then_some((sequence,cue)))
+}
+
 impl WorkflowStore {
     /// Recover the existing source reference across intermediate checkpoints,
     /// not a fresh reconsideration, qualification or model admission.
     pub(crate) fn semantic_reconsideration(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
         let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
         if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
-        let saved:Option<(i64,String)>=self.conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-        let Some((generation,raw))=saved else{return Ok(None)};
-        let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
-        ensure!(cue.version==1 && cue.qualification_required && cue.original_generation==generation
-            && generation<=snapshot.generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment)
-            && cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration reference changed");
-        Ok((cue.binding==*binding).then_some(cue))
+        semantic_cue(&self.conn,workflow,binding,snapshot.generation)
     }
 
     pub(crate) fn hold_semantic_source_unavailable(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {
-        let cue=self.semantic_reconsideration(&lease.workflow,binding)?.context("semantic source reference missing")?;
-        ensure!(cue.key==cue_key,"semantic source reference changed");
         let mut checkpoint=self.snapshot(&lease.workflow)?.context("semantic workflow missing")?.checkpoint;
+        ensure!(checkpoint.binding==*binding,"semantic source binding changed");
         checkpoint.stage=Stage::Scope;
         checkpoint.next=NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
-        self.checkpoint_native_custody_hold(lease,&checkpoint,now,false)
+        self.checkpoint_with_custody_cause(lease,&checkpoint,now,
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
     }
 
     /// Queue consideration of authenticated negative source data. This grants
@@ -116,16 +151,23 @@ impl WorkflowStore {
         ensure!(semantic_hash(&identity),"semantic recovery judgment identity is invalid");
         // Generation and owner revisions fence this transaction, but must not
         // turn the same original judgment into a fresh reconsideration budget.
-        let key=semantic_key(&expected.workflow,&identity,policy)?;
+        let continuation=waiting_semantic_source(&tx,&expected.workflow,generation,&checkpoint)?;
+        if continuation.as_ref().is_some_and(|(_,cue)|cue.judgment!=identity) {return Ok(false);}
+        let key=if let Some((_,cue))=&continuation {cue.key.clone()}else{semantic_key(&expected.workflow,&identity,policy)?};
         let consumed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' AND json_extract(payload,'$.key')=?2)",params![expected.workflow,key],|r|r.get(0))?;
-        if consumed {return Ok(false);}
+        if consumed && continuation.is_none() {return Ok(false);}
         checkpoint.stage=Stage::Reconcile;
         checkpoint.next=NextAction {reason:"original_semantic_witness_recovered".into(),action:"reconsider_verifier".into(),eligible_at_ms:now};
         let raw=serde_json::to_string(&checkpoint)?;
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
         event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
-        event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
-            &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"binding":checkpoint.binding,"qualification_required":true}).to_string(),now)?;
+        if let Some((sequence,_))=continuation {
+            event(&tx,&expected.workflow,generation,"original_semantic_source_restored",
+                &serde_json::json!({"version":1,"key":key,"loss_sequence":sequence,"qualification_required":true}).to_string(),now)?;
+        }else {
+            event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
+                &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"binding":checkpoint.binding,"qualification_required":true}).to_string(),now)?;
+        }
         tx.commit()?;Ok(true)
     }
 

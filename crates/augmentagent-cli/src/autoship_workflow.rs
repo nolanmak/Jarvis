@@ -329,6 +329,8 @@ pub struct WorkflowStore {
     conn: Connection,
 }
 
+struct CustodyHold<'a> {physical:bool,plan:Option<&'a str>,semantic_source:Option<&'a str>}
+
 impl WorkflowStore {
     /// Inspect already charged original responses without granting a lease or
     /// model authority. Callers must authenticate custody and current inputs.
@@ -1047,22 +1049,22 @@ impl WorkflowStore {
         checkpoint: &Checkpoint,
         now_ms: i64,
     ) -> Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now_ms,None,None,None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now_ms,None,None)
     }
 
     pub(crate) fn checkpoint_native_custody_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),None,None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan:None,semantic_source:None}),None)
     }
 
     pub(crate) fn checkpoint_verifier_recovery_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool,plan:Option<&str>)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),plan,None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan,semantic_source:None}),None)
     }
 
     pub(crate) fn checkpoint_with_execution_context(&mut self,lease:&Lease,checkpoint:&Checkpoint,context:&RecoveryContext,now:i64)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,None,None,Some(context))
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,None,Some(context))
     }
 
-    fn checkpoint_with_custody_cause(&mut self,lease:&Lease,checkpoint:&Checkpoint,now_ms:i64,physical:Option<bool>,plan:Option<&str>,context:Option<&RecoveryContext>)->Result<()> {
+    fn checkpoint_with_custody_cause(&mut self,lease:&Lease,checkpoint:&Checkpoint,now_ms:i64,cause:Option<CustodyHold<'_>>,context:Option<&RecoveryContext>)->Result<()> {
         checkpoint.binding.validate()?;
         ensure!(
             !checkpoint.next.reason.is_empty() && !checkpoint.next.action.is_empty(),
@@ -1089,6 +1091,9 @@ impl WorkflowStore {
             [&lease.workflow],
             |r| r.get(0),
         )?;
+        if let Some(key)=cause.as_ref().and_then(|cause|cause.semantic_source) {
+            qualification_recovery::record_source_unavailable(&tx,lease,&serde_json::from_str(&previous)?,&checkpoint,key,now_ms)?;
+        }
         if previous != raw {
             let previous: Checkpoint = serde_json::from_str(&previous)?;
             let meaningful = previous.stage != checkpoint.stage
@@ -1107,9 +1112,9 @@ impl WorkflowStore {
         if matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {
             tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'terminal_workflow') WHERE workflow=?1 AND retired_at IS NULL",[&lease.workflow])?;
         }
-        if let Some(physical)=physical {
-            qualification_recovery::record(&tx,lease,&checkpoint,physical,now_ms)?;
-            verifier_custody::hold(&tx,lease,&checkpoint,plan,now_ms)?;
+        if let Some(cause)=cause {
+            qualification_recovery::record(&tx,lease,&checkpoint,cause.physical,now_ms)?;
+            verifier_custody::hold(&tx,lease,&checkpoint,cause.plan,now_ms)?;
         }
         if let Some(context)=context {qualification_schedule::record_context(&tx,lease,&checkpoint,context,now_ms)?;}
         tx.commit()?;
