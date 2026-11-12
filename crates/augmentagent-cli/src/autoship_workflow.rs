@@ -1494,13 +1494,16 @@ impl WorkflowStore {
             }
         } else {
             if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
+            // Changing to a builder, amendment or another provider is not
+            // original-outcome recovery. Fence every new actual admission;
+            // late usage/accounting for the original call remains recordable.
+            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
                 if purpose.starts_with(BASELINE_NATIVE_PURPOSE_PREFIX) {
                     baseline_native_response_keys(purpose)?;
                     ensure!(limit==1 && actual_native_reviewer,"baseline native requests require exactly one attributed fresh native reviewer admission");
-                    baseline_native_custody(&tx,&lease.workflow)?;
                     let admitted:u32=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
                     ensure!(admitted==0,"baseline native request already admitted; recover its original response");
                 }
@@ -3068,6 +3071,23 @@ mod tests {
             assert!(store.charge_admitted_model(&lease,"replacement",34,None,Some((&next,&binding(),1)),Some(submission::Provider::Claude),true).is_err(),"lost {lost} allowed a replacement call");
             assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
         }
+    }
+
+    #[test]
+    fn unanswered_witness_blocks_other_native_purposes_but_retains_late_usage() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        store.charge_admitted_model(&lease,"original",30,None,Some((&purpose,&binding(),1)),Some(submission::Provider::Codex),true).unwrap();
+        for (bounded,reviewer) in [(None,false),(None,true),(Some(("amendment",&binding(),2)),true)] {
+            assert!(store.charge_admitted_model(&lease,"replacement",31,None,bounded,Some(submission::Provider::Claude),reviewer).is_err(),
+                "a builder, reviewer or amendment bypassed the original unanswered witness");
+        }
+        store.charge(&lease,"late-original-usage",ResourceCharge {tokens:17,wall_ms:5,model_calls:0},32).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!((before.model_calls,before.tokens),(1,17));
+        let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"original result",&proof,"private reference",33).unwrap();
+        store.charge_admitted_model(&lease,"next",34,None,None,Some(submission::Provider::Claude),false).unwrap();
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!((after.model_calls,after.tokens),(2,17));
     }
 
     #[test]
