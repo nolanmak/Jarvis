@@ -1146,7 +1146,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
             workflow.checkpoint_qualification_source(prepared).await?;
             match amendment::try_amend(reasoner,source,title,root,prepared,control,workflow,&failure,false,None).await? {
                 Some(next)=>{*prepared=next;qualify_original_baseline(root,control,prepared,workflow).await},
-                None=>Err(error.context(initial_repair::Hold::Exhausted)),
+                None=>Err(error.context(initial_repair::Hold::ContractInvalid)),
             }
         }
     }
@@ -1478,7 +1478,9 @@ pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,er
     workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),false,Some(plan)).await
 }
 
-pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+/// One private persistence path for enrolled qualification/repair failures.
+/// Inspect the original cause before returning any public-safe typed error.
+async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error)->Result<Option<initial_repair::Hold>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
     let diagnostic=format!("{error:#}");
@@ -1486,6 +1488,11 @@ pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGua
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
     workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
         .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
+    Ok(Some(hold))
+}
+
+pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+    let Some(hold)=persist_enrolled_acceptance_error(workflow,prepared,error).await? else{return Ok(None)};
     Ok(Some(accounting.retry_report(hold.to_string())?))
 }
 
@@ -2051,6 +2058,25 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_reader(file)?)
 }
 pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
+
+pub(super) fn semantic_policy_for_hold(checkpoint:&crate::autoship_workflow::Checkpoint)->String {
+    if crate::autoship_workflow::legacy_amendment_input(checkpoint).is_some() {
+        // This migration identity must survive unrelated builds and generations.
+        amendment::digest(b"legacy-amendment-owner-evidence-migration-v1")
+    }else{semantic_reconsideration_policy()}
+}
+
+pub(super) fn inspect_semantic_hold(root:&Path,control:&Path,source:AcceptanceSource,
+    checkpoint:&crate::autoship_workflow::Checkpoint,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+    if let Some(input)=crate::autoship_workflow::legacy_amendment_input(checkpoint) {
+        let Some((prepared,identity))=retained_semantic_source(root,control,source,&checkpoint.binding,custody,evidence)? else{return Ok(None)};
+        let contract=prepared.baseline.registration.contract_hash();
+        ensure!(checkpoint.binding.contract==contract || checkpoint.binding.contract==format!("registered:{contract}"),"legacy decline registered contract changed");
+        return Ok(amendment::legacy_decline_omits_owner_evidence(control,source,contract,input)?.then_some(identity));
+    }
+    inspect_retained_semantic(root,control,source,&checkpoint.binding,custody,evidence)
+}
 
 pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
     binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
@@ -2669,7 +2695,9 @@ print('[]')
             trusted_git(root, &["init", "-q"]).await.unwrap();
             std::fs::create_dir(root.join("autoship_verifiers")).unwrap();
             let adapter = "autoship_verifiers/observe.py";
-            std::fs::write(root.join(adapter), "print(0)\n").unwrap();
+            let adapter_body="import json,sys\nfrom pathlib import Path\nsys.path.insert(0,str(Path.cwd()))\nimport behavior\nprint(json.dumps(behavior.READY))\n";
+            std::fs::write(root.join("behavior.py"),"READY = 0\n").unwrap();
+            std::fs::write(root.join(adapter),adapter_body).unwrap();
             trusted_git(root, &["add", "."]).await.unwrap();
             trusted_git(root, &[
                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -2696,14 +2724,18 @@ print('[]')
                         }, pinned_files: vec![adapter.into()],
                         failure_witness: "observed behavior differs".into() }],
                 },
-                files: [(adapter.into(), "print(0)\n".into())].into(),
+                files: [(adapter.into(), adapter_body.into())].into(),
             };
+            let environment=environment_id(root).unwrap();
             let registration = RegisteredContract::register(
-                root, proposal.contract.clone(), base, "fixture-v1".into(),
+                root, proposal.contract.clone(), base.clone(), environment.clone(),
             ).unwrap();
+            let observed=Observation {exit_code:Some(0),stdout:"0\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+            let receipts=vec![registration.observe(root,"observe",registration.binding(&base).unwrap(),&observed).unwrap()];
             let mut prepared = PreparedAcceptance {
-                proposal, baseline: BaselineEvidence { registration, receipts: vec![] },
+                proposal, baseline: BaselineEvidence { registration, receipts },
             };
+            baseline_witness::persist_scripted(root,control.path(),&prepared,true).unwrap();
             std::fs::create_dir(root.join("src")).unwrap();
             // A source name containing "disk" must not classify a known
             // scope rejection as a storage/infrastructure failure.
@@ -2717,7 +2749,7 @@ print('[]')
             let mut guard = workflow::WorkflowGuard::acquire_fixture(&database, workflow::Start {
                 repo_root: root, worktree: root, repository: "owner/repo",
                 source_issue: Some(42), pr: None, branch: "fixture",
-                contract: prepared.baseline.registration.contract_hash(), environment: "fixture-v1",
+                contract: prepared.baseline.registration.contract_hash(), environment: &environment,
             }).await.unwrap().unwrap();
             guard.checkpoint(Stage::Review, "candidate_ready", "run_verifier", 0, &[])
                 .await.unwrap();
@@ -2759,6 +2791,132 @@ print('[]')
     }
 }
 
+async fn enter_implementation_repair(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,control:&Path)->Result<()> {
+    // Independent amendment work deliberately revokes builder authority. An
+    // unchanged-contract continuation must re-earn it from the positive witness.
+    if let Err(error)=workflow.bind_acceptance(prepared,control) {
+        let error=if error.downcast_ref::<initial_repair::Hold>().is_some() {error}
+            else if error.is::<BaselineNotRed>() {error.context(initial_repair::Hold::ContractInvalid)}
+            else {error.context(initial_repair::Hold::EvidenceUnknown)};
+        let hold=persist_enrolled_acceptance_error(workflow,prepared,&error).await?.context("qualified repair hold missing")?;
+        return Err(hold.into());
+    }
+    workflow.transition(crate::autoship_workflow::Stage::Build,"acceptance_failed","repair_implementation",0).await
+}
+
+/// Restrictive amendment callers must durably retain typed holds before
+/// returning through outer verification accounting.
+async fn restrictive_amendment_result(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,
+    result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {
+    if let Err(error)=&result {
+        if let Some(hold)=persist_enrolled_acceptance_error(workflow,prepared,error).await? {
+            return Err(hold.into());
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod restrictive_amendment_outcome_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unchanged_candidate_repair_restores_only_qualified_builder_admission() {
+        use crate::autoship_workflow::{WorkflowStore,Stage};
+        for qualified in [true,false] {
+            let (root,control,prepared)=baseline_witness::prepared_fixture();
+            baseline_witness::persist_scripted(root.path(),control.path(),&prepared,qualified).unwrap();
+            let path=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original complete owner request",environment:"frontend environment",
+            }).await.unwrap().unwrap();
+            guard.bind_acceptance_for_recovery(&prepared).unwrap();
+            guard.checkpoint(Stage::Scope,"verifier_definition_disputed","independent_verifier_authority",0,
+                &[format!("amendment-input:{}","a".repeat(64))]).await.unwrap();
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"recovery metadata authorized builder before positive revalidation");
+            let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let result=enter_implementation_repair(&mut guard,&prepared,control.path()).await;
+            if qualified {
+                result.unwrap();
+                guard.audit_logger().model_call_admitted("codex").expect("unchanged candidate repair lost qualified builder admission after amendment refusal/no-op");
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.model_calls,before.model_calls+1,"scripted admission must remain accounted exactly once");
+            }else {
+                assert!(result.is_err(),"negative witness restored builder authority");
+                assert!(guard.audit_logger().model_call_admitted("codex").is_err());
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint.stage,Stage::Scope);assert_eq!(after.model_calls,before.model_calls);
+            }
+            guard.finish().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn final_amendment_refusal_persists_input_hold_and_fences_unchanged_reclaims() {
+        use crate::autoship_workflow::{WorkflowStore,ResourceCharge,Stage};
+        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted,initial_repair::Hold::EvidenceUnknown,
+            initial_repair::Hold::InfrastructureUnavailable,initial_repair::Hold::ContractInvalid] {
+            let (root,control,prepared)=baseline_witness::prepared_fixture();let path=control.path().join("workflow.db");
+            let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original complete owner request",environment:"frontend environment"};
+            let guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();let id=guard.id().to_owned();guard.finish().unwrap();
+            let now=chrono::Utc::now().timestamp_millis();let mut store=WorkflowStore::open(&path).unwrap();
+            let prior=store.claim(&id,"prior-native-admission-fixture",now,1000).unwrap().unwrap();
+            store.charge(&prior,"preserved-original-charge",ResourceCharge {model_calls:3,tokens:321,wall_ms:25},now).unwrap();
+            store.release(&prior,now).unwrap();drop(store);
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();
+            guard.bind_acceptance_for_recovery(&prepared).unwrap();
+            let evidence=vec![format!("amendment-input:{}","a".repeat(64))];
+            let (stage,reason,action)=if hold==initial_repair::Hold::Declined {(Stage::Scope,"verifier_definition_disputed","independent_verifier_authority")}
+                else {(Stage::Verify,"candidate_failed","verify_candidate")};
+            guard.checkpoint(stage,reason,action,0,&evidence).await.unwrap();
+            let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+            let failure=restrictive_amendment_result(&mut guard,&prepared,Err(anyhow::Error::from(hold).context("PRIVATE_AMENDMENT_CAUSE"))).await.unwrap_err();
+            assert_eq!(format!("{failure:#}"),hold.to_string(),"private amendment cause escaped typed propagation");
+            assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&hold));
+            let held=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+            assert_eq!(held.checkpoint.stage,Stage::Scope);
+            assert_eq!(held.checkpoint.next.reason,hold.reason(),"final refusal left a runnable transient checkpoint");
+            assert_eq!(held.checkpoint.next.action,hold.action());assert_eq!(held.checkpoint.evidence,evidence);
+            assert_eq!(held.model_calls,before.model_calls);assert_eq!(held.tokens,before.tokens);assert!(held.wall_ms>=before.wall_ms);
+            guard.finish().unwrap();
+            let mut restarted=WorkflowStore::open(&path).unwrap();let settled=restarted.snapshot(&id).unwrap().unwrap();let events=restarted.events(&id).unwrap();
+            for offset in [1000,86_400_000,2*86_400_000] {
+                assert!(restarted.claim_productive_for_binding(&id,"unchanged-restart",now+offset,1000,&held.checkpoint.binding).unwrap().is_none(),"unchanged final refusal was reclaimed after lease/day change");
+                assert_eq!(restarted.snapshot(&id).unwrap().unwrap(),settled);assert_eq!(restarted.events(&id).unwrap(),events);
+            }
+        }
+    }
+}
+
+/// Candidate-only amendment outcome boundary. Original qualification and
+/// exhausted implementation repair retain their separate restrictive holds.
+fn candidate_amendment_result(result:Result<Option<PreparedAcceptance>>)->Result<Option<PreparedAcceptance>> {
+    match result {
+        Err(error) if matches!(error.downcast_ref::<initial_repair::Hold>(),
+            Some(initial_repair::Hold::Declined|initial_repair::Hold::Exhausted))=>Ok(None),
+        other=>other,
+    }
+}
+
+#[cfg(test)]
+mod candidate_amendment_outcome_tests {
+    use super::*;
+    #[test]
+    fn candidate_amendment_refusal_preserves_the_existing_implementation_repair_lane() {
+        for hold in [initial_repair::Hold::Declined,initial_repair::Hold::Exhausted] {
+            assert!(candidate_amendment_result(Err(anyhow::Error::from(hold)))
+                .expect("amendment refusal wrongly stopped qualified implementation repair").is_none());
+        }
+        for hold in [initial_repair::Hold::EvidenceUnknown,initial_repair::Hold::InfrastructureUnavailable,initial_repair::Hold::ContractInvalid] {
+            assert_eq!(candidate_amendment_result(Err(anyhow::Error::from(hold))).unwrap_err().downcast_ref::<initial_repair::Hold>(),Some(&hold));
+        }
+        let (_root,_control,prepared)=baseline_witness::prepared_fixture();
+        let before=serde_json::to_vec(&prepared).unwrap();
+        let allowed=candidate_amendment_result(Ok(Some(prepared))).unwrap().unwrap();
+        assert_eq!(serde_json::to_vec(&allowed).unwrap(),before);
+    }
+}
+
 pub(super) async fn verify_with_repair_for(
     reasoner: &FallbackReasoner,
     source: AcceptanceSource,
@@ -2796,7 +2954,7 @@ pub(super) async fn verify_with_repair_for(
                 0,
             )
             .await?;
-        match amendment::try_amend(
+        let amendment_result=amendment::try_amend(
             reasoner,
             source,
             title,
@@ -2808,8 +2966,8 @@ pub(super) async fn verify_with_repair_for(
             false,
             None,
         )
-        .await
-        {
+        .await;
+        match restrictive_amendment_result(workflow,prepared,amendment_result).await {
             Ok(Some(next)) => {
                 *prepared = next;
                 workflow.bind_acceptance(prepared,control)?;
@@ -2825,6 +2983,7 @@ pub(super) async fn verify_with_repair_for(
                     .await?;
                 bail!("legacy verifier migration requires a valid independently red behavioral oracle");
             }
+            Err(error) if error.downcast_ref::<initial_repair::Hold>().is_some()=>return Err(error),
             Err(error) => {
                 if linked_claims::report(&error).is_some() {return Err(error);}
                 workflow
@@ -2901,12 +3060,12 @@ pub(super) async fn verify_with_repair_for(
                 };
                 let detail = format!("{error:#}");
                 if round < 2 && !scope_rejected {
-                    if let Some(amended) = amendment::try_amend(
+                    let amendment_result=amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
                         false, None,
-                    )
-                    .await?
-                    {
+                    ).await;
+                    let amendment_result=candidate_amendment_result(amendment_result);
+                    if let Some(amended) = restrictive_amendment_result(workflow,prepared,amendment_result).await? {
                         *prepared = amended;
                         continue;
                     }
@@ -2950,12 +3109,11 @@ pub(super) async fn verify_with_repair_for(
                     // Invalid implementation paths do not authorize changing
                     // the pinned verifier or expanding its registered scope.
                     if !scope_rejected {
-                        if let Some(amended) = amendment::try_amend(
+                        let amendment_result=amendment::try_amend(
                             reasoner, source, title, worktree, prepared, control, workflow, &detail,
                             true, None,
-                        )
-                        .await?
-                        {
+                        ).await;
+                        if let Some(amended) = restrictive_amendment_result(workflow,prepared,amendment_result).await? {
                             *prepared = amended;
                             workflow
                                 .transition(
@@ -2981,14 +3139,7 @@ pub(super) async fn verify_with_repair_for(
                     return Err(error)
                         .context("acceptance repair budget consumed; autonomous re-scope queued");
                 }
-                workflow
-                    .transition(
-                        crate::autoship_workflow::Stage::Build,
-                        "acceptance_failed",
-                        "repair_implementation",
-                        0,
-                    )
-                    .await?;
+                enter_implementation_repair(workflow,prepared,control).await?;
                 let prompt = format!("Repair {} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", source, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
                 adoption::revise(
                     reasoner,

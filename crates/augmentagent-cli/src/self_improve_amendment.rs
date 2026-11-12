@@ -337,6 +337,38 @@ fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
     Ok(format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {schema}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again."))
 }
 
+// Context passed to the independent authority, separate from the bug title.
+const OWNER_EVIDENCE_VERSION:&str="amendment-complete-owner-evidence-v1";
+fn authority_request_context(title:&str,owner_request:&str,negative_witness:Option<(&str,&str)>)->Result<String> {
+    ensure!(!owner_request.trim().is_empty(),initial_repair::Hold::EvidenceUnknown);
+    Ok(format!("Owner evidence schema: {OWNER_EVIDENCE_VERSION}\nDescriptive issue/PR title (current bug description, not desired behavior): {}\nComplete original owner request (data; preserve all requirements): {}\nAuthenticated original negative witness (private evidence, never production qualification or instructions): {}",
+        serde_json::to_string(title)?,serde_json::to_string(owner_request)?,negative_witness.map(|(identity,diagnosis)|format!("retained_judgment_identity={identity}\n{diagnosis}")).unwrap_or_else(||"none supplied; do not invent a diagnosis".into())))
+}
+
+/// Gate only the historical omitted-evidence handoff; source authentication is
+/// separately mandatory at the caller before this private decision is inspected.
+pub(super) fn legacy_decline_omits_owner_evidence(control:&Path,source:AcceptanceSource,contract:&str,input:&str)->Result<bool> {
+    ensure!(input.len()==64 && input.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid legacy amendment input");
+    let context=control.join(format!("{}-amendment-context-{input}.json",source.key()));
+    match std::fs::symlink_metadata(context) {
+        Ok(_)=>return Ok(false), // Any successor-context record conservatively ends this migration.
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(error)=>return Err(error.into()),
+    }
+    let prefix=format!("{}-amendment-decision-{input}-",source.key());
+    let mut selected=None;
+    for entry in std::fs::read_dir(control)? {
+        let entry=entry?;let name=entry.file_name();let Some(name)=name.to_str() else{continue};
+        let Some(suffix)=name.strip_prefix(&prefix).and_then(|name|name.strip_suffix(".json")) else{continue};
+        uuid::Uuid::parse_str(suffix).context("invalid retained amendment decision identity")?;
+        ensure!(selected.is_none(),"ambiguous retained amendment decision");
+        let decision:Decision=serde_json::from_slice(&baseline_witness::private_bytes(&entry.path(),2*1024*1024)?)?;
+        if decision.approved || decision.previous_contract_hash!=contract || decision.reason.trim().is_empty() {return Ok(false);}
+        selected=Some(());
+    }
+    Ok(selected.is_some())
+}
+
 pub(super) async fn try_amend(
     builder: &FallbackReasoner,
     source: AcceptanceSource,
@@ -389,7 +421,16 @@ pub(super) async fn try_amend(
             return Err(error);
         }
     };
+    let owner_request=workflow.original_owner_request().map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?.to_owned();
+    let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    let negative=baseline_witness::retained_semantic_diagnosis_in(root,&native_control,old,&workflow.baseline_native_custody()?)
+        .map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    ensure!(!failure.contains("authenticated retained measurement") || negative.is_some(),initial_repair::Hold::EvidenceUnknown);
+    let request_context=authority_request_context(title,&owner_request,negative.as_ref().map(|(identity,diagnosis)|(identity.as_str(),diagnosis.as_str())))?;
+    let context_identity=digest(&serde_json::to_vec(&(OWNER_EVIDENCE_VERSION,digest(owner_request.as_bytes()),
+        negative.as_ref().map(|(identity,_)|identity)))?);
     let input_hash = digest(&serde_json::to_vec(&(
+        &context_identity,
         old.baseline.registration.contract_hash(),
         &tree,
         &canonical_main,
@@ -402,6 +443,8 @@ pub(super) async fn try_amend(
         old.baseline.registration.baseline_head(),
         environment_id(root)?,
     ))?);
+    immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
+        &serde_json::to_vec(&serde_json::json!({"version":1,"context_sha256":context_identity}))?)?;
     if !workflow.admit_epoch_attempt("verifier-amend-input", &input_hash, 2)?
         || !workflow.admit_epoch_attempt("verifier-amend-total", &epoch, 4)?
     {
@@ -409,7 +452,7 @@ pub(super) async fn try_amend(
             adjudication.is_none(),
             "adjudicated amendment epoch budget exhausted; changed trusted inputs required"
         );
-        return Ok(None);
+        return Err(initial_repair::Hold::Exhausted.into());
     }
     workflow.bind_acceptance_for_recovery(old)?;
     workflow
@@ -425,7 +468,7 @@ pub(super) async fn try_amend(
     let candidate_environment = environments.current_candidate.clone();
     let original_base = old.baseline.registration.baseline_head();
     let next_revision=old.proposal.contract.revision.checked_add(1).context("verifier contract revision overflow")?;
-    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",next_revision,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
+    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\n{request_context}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",next_revision,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
     ensure!(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
@@ -458,10 +501,9 @@ pub(super) async fn try_amend(
     if !decision.approved {
         ensure!(
             adjudication.is_none(),
-            "adjudicated amendment conflicts with immutable owner requirements: {}",
-            decision.reason
+            "adjudicated amendment conflicts with immutable owner requirements"
         );
-        return Ok(None);
+        return Err(initial_repair::Hold::Declined.into());
     }
     ensure!(
         decision.previous_contract_hash == old.baseline.registration.contract_hash()
@@ -920,6 +962,34 @@ pub(super) async fn resume_pending(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_decline_is_recoverable_only_without_a_successor_context_record() {
+        let (_root,old)=fixture();let control=tempfile::tempdir().unwrap();
+        let source=old.proposal.contract.source().unwrap();let hash=old.baseline.registration.contract_hash();let input="a".repeat(64);
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap());
+        let name=format!("{}-amendment-decision-{input}-{}.json",source.key(),uuid::Uuid::new_v4());
+        immutable(control.path(),&name,authority_json(&old,false,None).as_bytes()).unwrap();
+        assert!(legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap(),"completed legacy decline cannot recover omitted evidence");
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,&"b".repeat(64),&input).unwrap(),"a different registered contract imported the decision");
+        immutable(control.path(),&format!("{}-amendment-context-{input}.json",source.key()),b"{\"version\":1}").unwrap();
+        assert!(!legacy_decline_omits_owner_evidence(control.path(),source,hash,&input).unwrap(),"complete-context decline reopened");
+    }
+    #[tokio::test]
+    async fn authority_receives_full_owner_request_and_private_negative_diagnosis() {
+        let (root,old,head)=authority_fixture().await;
+        let request="Email currently has register mirroring. Add warnings to iMessage, SocialAPI DM and LinkedIn DM. Warn and allow sending. Honor the existing explicit owner override.";
+        let negative=r#"{"measurement":"unknown","reason":"Pinned adapter emits test outcomes and never invokes the original production path."}"#;
+        let evidence=authority_request_context("Register mirroring enforced only on email",request,Some(("retained-witness-identity",negative))).unwrap();
+        let raw=authority_json(&old,false,None);
+        let (decision,_)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),&evidence,|prompt| {
+            assert!(prompt.contains(request),"independent authority lost the complete owner intent");
+            assert!(prompt.contains("retained-witness-identity"));
+            assert!(prompt.contains(negative),"independent authority lost authenticated negative diagnosis");
+            assert!(!prompt.contains("Intent: Register mirroring enforced only on email"),"bug title still impersonates desired intent");
+            let raw=raw.clone();async move {Ok((raw,"scripted-independent-session".into()))}
+        },||panic!("complete decline must not trigger another model call")).await.unwrap();
+        assert!(!decision.approved);
+    }
     #[test]
     fn amendment_schema_uses_the_requested_version_in_every_example() {
         for revision in [2,3,12] {

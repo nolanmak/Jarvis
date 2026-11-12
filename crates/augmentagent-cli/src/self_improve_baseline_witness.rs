@@ -123,15 +123,23 @@ fn disposition(judgment:&Judgment)->Result<()> {
 /// authority. It can never be used as a positive qualification receipt.
 pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    Ok(retained_judgment_matching(root,prepared,custody,
+        |judgment|judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown))?.map(|(identity,_)|identity))
+}
+
+/// Share authentication, not selection: diagnostics accept every negative
+/// class while legacy reconsideration retains its original Unknown predicate.
+fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],select:fn(&Judgment)->bool)->Result<Option<(String,Judgment)>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
     prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
         "retained semantic judgment lacks its original measured baseline");
     scope_authority::require_retained_native_custody(root,custody)?;
-    let mut selected=None;
+    let mut selected:Option<(String,Judgment)>=None;
     for observation in custody {
         let Ok(judgment)=serde_json::from_str::<Judgment>(&observation.response) else {continue};
-        if !judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {continue;}
+        if !select(&judgment) {continue;}
         let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:serde_json::from_str(&observation.provenance)?};
         let control=reply.provenance.artifact.parent().context("retained semantic proof has no authority directory")?;
         if scope_authority::verify_witness_reply(control,prepared.baseline.registration.baseline_head(),&judgment.context,&reply).is_err() {continue;}
@@ -142,11 +150,11 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
         let provenance:serde_json::Value=serde_json::from_slice(&proof)?;
         let request=amendment::digest(qualification_prompt(&judgment.context,prepared)?.as_bytes());
         if provenance["scope_request_hash"].as_str()!=Some(request.as_str()) {continue;}
-        validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
+        let judgment=validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
         let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
             &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
-        ensure!(selected.as_ref().is_none_or(|previous|previous==&identity),"retained semantic judgment is ambiguous");
-        selected=Some(identity);
+        ensure!(selected.as_ref().is_none_or(|(previous,_)|previous==&identity),"retained semantic judgment is ambiguous");
+        selected=Some((identity,judgment));
     }
     Ok(selected)
 }
@@ -156,12 +164,27 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
 pub(super) fn retained_semantic_judgment_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
     if custody.is_empty() {return Ok(None);}
+    retained_namespace(control,custody)?;
+    retained_semantic_judgment(root,prepared,custody)
+}
+fn retained_namespace(control:&Path,custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
     let expected=control.canonicalize()?;
     for observation in custody {
         let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observation.provenance)?;
         ensure!(reference.artifact.parent()==Some(expected.as_path()),"retained semantic proof belongs to another workflow");
     }
-    retained_semantic_judgment(root,prepared,custody)
+    Ok(())
+}
+
+/// Private authenticated original evidence for the existing independent authority.
+/// The public failure remains a fixed safe code; no private diagnosis enters it.
+pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<(String,String)>> {
+    if custody.is_empty() {return Ok(None);}
+    retained_namespace(control,custody)?;
+    let selected=retained_judgment_matching(root,prepared,custody,|judgment|judgment.verifiers.iter()
+        .any(|witness|witness.measurement!=Measurement::DirectProduction || !witness.original_fixture_available))?;
+    selected.map(|(identity,judgment)|Ok((identity,serde_json::to_string(&judgment)?))).transpose()
 }
 
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
@@ -484,6 +507,38 @@ mod tests {
     }
 
     #[test]
+    fn negative_diagnosis_covers_all_measurements_without_widening_legacy_recovery() {
+        use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
+        use std::os::unix::fs::PermissionsExt;
+        for (measurement,original_fixture) in [(Measurement::Unknown,false),(Measurement::MissingFixture,false),
+            (Measurement::TestOutcome,false),(Measurement::SetupFailure,false),
+            (Measurement::DirectProduction,false),(Measurement::DirectProduction,true)] {
+            let (root,control,prepared)=fixture();
+            std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,measurement).unwrap();
+            let mut judgment=saved_judgment(control.path(),&prepared);
+            for witness in judgment["verifiers"].as_array_mut().unwrap() {witness["original_fixture_available"]=original_fixture.into();}
+            let context=judgment["context"].as_str().unwrap();let raw=judgment.to_string();
+            let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-diagnosis-fixture",
+                "supplied_request_hash":amendment::digest(b"scripted original source"),"response_hash":amendment::digest(raw.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":context,"native_input_hash":"a".repeat(64),
+                "scope_request_hash":amendment::digest(qualification_prompt(context,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut custody=[NativeScopeCustody {input:"a".repeat(64),response:raw,provider:Provider::Codex,
+                provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact,artifact_sha256:amendment::digest(&bytes)}).unwrap()}];
+            let diagnosis=retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap();
+            let negative=measurement!=Measurement::DirectProduction || !original_fixture;
+            assert_eq!(diagnosis.is_some(),negative,"authenticated {measurement:?} diagnosis omitted or positive witness misclassified");
+            if let Some((identity,text))=diagnosis {assert_eq!(identity.len(),64);assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(),judgment);}
+            assert_eq!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some(),measurement==Measurement::Unknown,"diagnosis broadened legacy reconsideration");
+            let foreign=tempfile::tempdir().unwrap();assert!(retained_semantic_diagnosis_in(root.path(),foreign.path(),&prepared,&custody).is_err());
+            custody[0].response.push(' ');
+            assert!(retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).is_err(),"changed response bypassed original custody");
+        }
+    }
+
+    #[test]
     fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
         let (root,control,prepared)=fixture();
@@ -503,7 +558,12 @@ mod tests {
         let custody=[observation];
         assert!(retained_semantic_judgment(root.path(),&prepared,&custody).unwrap().is_some(),"retained authenticated semantic judgment has no supported reconsideration evidence");
         assert!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some());
+        let (identity,diagnosis)=retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap().unwrap();
+        assert_eq!(Some(identity),retained_semantic_judgment(root.path(),&prepared,&custody).unwrap());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&diagnosis).unwrap(),judgment);
+        assert!(diagnosis.contains("Original fixture is absent and the observer measures candidate-owned test markers"));
         let foreign=tempfile::tempdir_in("/tmp").unwrap();
+        assert!(retained_semantic_diagnosis_in(root.path(),foreign.path(),&prepared,&custody).is_err());
         assert!(retained_semantic_judgment_in(root.path(),foreign.path(),&prepared,&custody).is_err(),"negative source crossed workflow authority directories");
         let mut different=prepared.clone();different.proposal.contract.criteria[0].requirement="A different owner requirement".into();
         assert!(retained_semantic_judgment(root.path(),&different,&custody).is_err(),"changed original contract must not reuse judgment");

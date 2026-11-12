@@ -163,6 +163,16 @@ pub struct Snapshot {
     pub generation: i64,
 }
 
+/// Shape only; the unpaid consumer separately authenticates the exact private
+/// decline and original source before a transaction can queue reconsideration.
+pub(crate) fn legacy_amendment_input(checkpoint:&Checkpoint)->Option<&str> {
+    if checkpoint.stage!=Stage::Scope || checkpoint.next.action!="await_acceptance_input_change"
+        || !matches!(checkpoint.next.reason.as_str(),"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined")
+        || checkpoint.evidence.len()!=1 {return None;}
+    let input=checkpoint.evidence[0].strip_prefix("amendment-input:")?;
+    (input.len()==64 && input.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some(input)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
@@ -225,7 +235,7 @@ mod acceptance_input_wait_claim_tests {
     use super::*;
     #[test]
     fn acceptance_input_wait_claim_is_atomic_and_preserves_charges_and_guards() {
-        for reason in ["acceptance_verifier_repair_exhausted","acceptance_contract_invalid","readiness_assessment_invalid"] {
+        for reason in ["acceptance_verifier_amendment_declined","acceptance_verifier_repair_exhausted","acceptance_contract_invalid","readiness_assessment_invalid"] {
             for change in ["head","contract","environment"] {
                 let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
                 let mut store=WorkflowStore::open(&path).unwrap();
@@ -962,7 +972,7 @@ impl WorkflowStore {
             && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
-            ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
+            ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
             ("readiness_assessment_invalid","await_readiness_input_change")|
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
             ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"));

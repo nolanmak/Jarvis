@@ -1276,6 +1276,14 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Original protected frontend request, never a replacement inferred from a title.
+    pub(super) fn original_owner_request(&self)->Result<&str> {
+        self.healthy_lease()?;
+        self.source_request.as_ref().map(|(request,_)|request.as_str())
+            .filter(|request|!request.trim().is_empty())
+            .context("original owner request unavailable")
+    }
+
     fn execution_context(&self,binding:&Binding)->Result<Option<durable::RecoveryContext>> {
         let Some((request,pr))=&self.source_request else{return Ok(None)};
         Ok(Some(durable::RecoveryContext {version:1,workflow:self.id().into(),repository:self.repository.clone(),
@@ -3733,6 +3741,7 @@ mod initial_acceptance_hold_tests {
     #[tokio::test]
     async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
         for (reason,action) in [
+            ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
             ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
             ("readiness_assessment_invalid","await_readiness_input_change"),
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),

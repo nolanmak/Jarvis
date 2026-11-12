@@ -147,7 +147,7 @@ impl WorkflowStore {
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
         let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-        if !native_hold(&checkpoint) || checkpoint!=expected.checkpoint || generation!=expected.generation
+        if !(native_hold(&checkpoint) || legacy_amendment_input(&checkpoint).is_some()) || checkpoint!=expected.checkpoint || generation!=expected.generation
             || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
         let control=owner_control::read(&tx,&expected.workflow)?;
         if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
@@ -278,6 +278,31 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    #[test]
+    fn legacy_decline_rejoins_normal_selection_once_without_new_charges() {
+        for reason in ["acceptance_verifier_amendment_declined","acceptance_verifier_repair_exhausted"] {
+            let (_dir,mut store,lease,mut hold)=fixture();
+            hold.next.reason=reason.into();hold.next.action="await_acceptance_input_change".into();
+            hold.evidence=vec![format!("amendment-input:{}","a".repeat(64))];
+            store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            let policy="b".repeat(64);let identity="c".repeat(64);
+            assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody,_| {
+                assert_eq!(custody.len(),1);Ok(Some(identity.clone()))
+            }).unwrap(),"legacy completed decline cannot rejoin bounded original-evidence repair");
+            let queued=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(queued.checkpoint.stage,Stage::Reconcile);
+            assert_eq!((queued.attempts,queued.model_calls,queued.tokens),(before.attempts,before.model_calls,before.tokens));
+            let next=store.claim(&lease.workflow,"normal-successor",8,1000).unwrap().unwrap();
+            store.checkpoint(&next,&hold,9).unwrap();store.release(&next,10).unwrap();
+            let declined=store.snapshot(&lease.workflow).unwrap().unwrap();
+            for now in [11,86_400_000,2*86_400_000] {
+                assert!(!store.recover_semantic_qualification(&declined,None,&policy,now,|_,_|Ok(Some(identity.clone()))).unwrap(),"same original evidence minted another migration");
+            }
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),declined);
+        }
     }
 
     #[test]

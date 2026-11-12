@@ -135,7 +135,7 @@ impl WorkflowStore {
                 FROM workflow w WHERE (instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)
                 AND w.lease_until<=?2 AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
                 AND json_extract(w.checkpoint,'$.stage')='scope'
-                AND json_extract(w.checkpoint,'$.next.reason') IN ('acceptance_verifier_infrastructure_unavailable','acceptance_verifier_evidence_unknown')
+                AND json_extract(w.checkpoint,'$.next.reason') IN ('acceptance_verifier_infrastructure_unavailable','acceptance_verifier_evidence_unknown','acceptance_verifier_repair_exhausted','acceptance_verifier_amendment_declined')
                 AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)
                 ORDER BY selected,w.id LIMIT 128")?;
             let rows = query
@@ -175,7 +175,7 @@ impl WorkflowStore {
                     .unwrap_or(false)
                 // Completed negative judgments need read-only source inspection,
                 // too. Selection grants no qualification or model admission.
-                && !(qualification_recovery::native_hold(&checkpoint)
+                && !((qualification_recovery::native_hold(&checkpoint) || legacy_amendment_input(&checkpoint).is_some())
                     && baseline_native_custody(&tx, &id)
                         .is_ok_and(|custody| !custody.is_empty()))
             {
