@@ -7841,6 +7841,18 @@ fn finish_selected_command_attempt(
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
+    run_once_with_dispatch(repo_root,dry_run,dispatch_selected).await
+}
+
+fn dispatch_selected(repo:&Path,dry_run:bool,selected:Option<targeted::Resolved>)->futures::future::BoxFuture<'_,Result<RunReport>> {
+    Box::pin(run_selected(repo,dry_run,selected,targeted::ExecutionMode::Background))
+}
+
+// Scheduling and authenticated target selection share this implementation.
+// Production always supplies the full guarded dispatcher above; component
+// tests can observe the exact handoff without admitting a native execution.
+async fn run_once_with_dispatch<F>(repo_root:&Path,dry_run:bool,dispatch:F)->Result<RunReport>
+where F:for<'a> FnOnce(&'a Path,bool,Option<targeted::Resolved>)->futures::future::BoxFuture<'a,Result<RunReport>> {
     if !dry_run {
         // An empty/legacy store preserves the existing read-only readiness path.
         let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
@@ -7871,7 +7883,20 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background).await
+    let owner_resume=if !dry_run && lane_from_env()!=Lane::Build && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
+        .map(|store|store.has_due_owner_resume(None,chrono::Utc::now().timestamp_millis())).transpose()?.unwrap_or(false) {
+        let repository=workflow::canonical_repository(repo_root).await?;
+        crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+            .reserve_owner_resume_turn(&repository,chrono::Utc::now().timestamp_millis())?
+    }else{None};
+    let selected=if let Some(id)=owner_resume {
+        match adoption::current_owner_resume(repo_root,&workflow::path(),&id).await? {
+            Some(pr)=>Some(targeted::Resolved::Pr(pr)),
+            None=>return Ok(RunReport::held("Owner resume awaits current source, binding or dependency revalidation".into())),
+        }
+    }else{None};
+    let resumed=selected.is_some();
+    dispatch(repo_root,dry_run,selected).await.map(|mut report|{report.resumed|=resumed;report})
 }
 
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
@@ -12213,6 +12238,7 @@ impl AutoPrLoop {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
                                 .and_then(|store| store.map(|s| -> Result<bool> {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
+                                        || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                         || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
@@ -12233,6 +12259,7 @@ impl AutoPrLoop {
                                 let now = (self.clock)().timestamp_millis();
                                 Ok(store.command_queue_due(repository, now)?
                                     || store.has_due_main_reconciliation(Some(repository), now)?
+                                    || (lane_from_env()!=Lane::Build && store.has_due_owner_resume(Some(repository),now)?)
                                     || store.has_due_qualification_recovery(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
@@ -12401,6 +12428,174 @@ mod tests {
         assert!(blast_radius_hit_in_diff(&recovered_revision_diff(p).await.unwrap()).is_none(),"ordinary recovered adapter should remain checkpointable");
         recovered_git(p,&["commit","-qm","checkpoint ordinary adapter"]).await;recovered_git(p,&["merge","--no-edit","origin/main"]).await;
         assert!(blast_radius_hit_in_diff(&recovered_git(p,&["diff","origin/main","HEAD"]).await).is_some(),"final PR guard lost the original protected change");
+    }
+
+    fn owner_resumed_automatic_fixture(path:&Path)->adoption::AdoptedPr {
+        use crate::autoship_workflow::{WorkflowStore,Binding,Checkpoint,NextAction,Stage,ResourceCharge};
+        let repository="owner/repo";
+        let id=crate::autoship_workflow::workflow_id(repository,7).unwrap();
+        let binding=Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        let mut store=WorkflowStore::open(path).unwrap();
+        store.register(&id,"agent-fix/issue-7",binding.clone(),0).unwrap();
+        let lease=store.claim(&id,"original-worker",0,1).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,repository,42,0).unwrap();
+        store.checkpoint(&lease,&Checkpoint {stage:Stage::Build,binding:binding.clone(),evidence:vec!["original-measurement".into()],
+            next:NextAction {reason:"acceptance_failed".into(),action:"repair_implementation".into(),eligible_at_ms:1_000}},0).unwrap();
+        store.charge(&lease,"original-paid-work",ResourceCharge {model_calls:1,..Default::default()},0).unwrap();
+        store.release(&lease,0).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,10).unwrap();
+        store.set_owner_pause(&id,"github:owner",1,false,20).unwrap();
+        assert!(!store.has_command_jobs().unwrap(),"resume must not invent an execution request or provider pin");
+        adoption::AdoptedPr {repository:repository.into(),pr:42,source_issue:Some(7),branch:"agent-fix/issue-7".into(),head:binding.head,
+            base:"main".into(),author:"owner".into(),title:"Ordinary production bug".into(),body:"Keep original behavior requirements".into(),dependency:adoption::Dependency::Main}
+    }
+
+    #[test]
+    fn owner_resumed_second_issue_pr_preserves_its_explicit_pr_workflow_identity() {
+        use crate::autoship_workflow::{WorkflowStore,Checkpoint,NextAction,Stage,Binding};
+        let state=tempfile::tempdir().unwrap();let path=state.path().join("workflow.db");
+        let mut candidate=owner_resumed_automatic_fixture(&path);
+        candidate.pr=43;candidate.branch="second-fix".into();
+        let id=crate::autoship_workflow::pr_workflow_id("owner/repo",43).unwrap();
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let binding=Binding {head:candidate.head.clone(),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        store.register(&id,&candidate.branch,binding.clone(),0).unwrap();
+        let lease=store.claim(&id,"original-second-pr",0,1).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",43,0).unwrap();
+        store.checkpoint(&lease,&Checkpoint {stage:Stage::Build,binding,evidence:vec![],next:NextAction {reason:"acceptance_failed".into(),action:"repair_implementation".into(),eligible_at_ms:1000}},0).unwrap();
+        store.release(&lease,0).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,10).unwrap();
+        store.set_owner_pause(&id,"github:owner",1,false,20).unwrap();
+        assert_eq!(store.resolve_pr("owner/repo",43).unwrap().as_deref(),Some(id.as_str()));
+        let candidates=vec![candidate];let ledger=AttemptLedger {day:0,issues:vec![7]};
+        let retries=adoption::episode_retries(&path,&candidates,1000).unwrap();
+        let chosen=adoption::select_linked_with_retries(&candidates,&ledger,0,&Default::default(),None,0,&retries);
+        assert_eq!(chosen,Some((43,7,"second-fix".into())),"PR-keyed second repair was stranded behind its source issue's daily ledger");
+    }
+
+    #[tokio::test]
+    async fn owner_resume_does_not_reserve_a_turn_in_the_build_only_lane() {
+        const CHILD:&str="AUTOSHIP_OWNER_RESUME_BUILD_LANE_FIXTURE";
+        if let Some(root)=std::env::var_os(CHILD).map(PathBuf::from) {
+            let path=workflow::path();owner_resumed_automatic_fixture(&path);
+            let result=targeted::COMMAND_LANE.scope(Lane::Build,run_once(&root,false)).await;
+            assert!(result.is_err(),"fixture requires unavailable native preflight before model execution");
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            assert!(!store.events(&id).unwrap().iter().any(|event|event.1=="owner_dispatch_resume_inspected"),"build-only run_once stole an owner-resume turn before preflight");
+            assert!(store.owner_resume_due(&id,chrono::Utc::now().timestamp_millis()).unwrap(),"build lane consumed resume availability");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh");
+        std::fs::write(&gh,"#!/bin/sh\n[ \"$1 $2\" = 'repo view' ] || exit 93\nprintf 'owner/repo\\n'\n").unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::tests::owner_resume_does_not_reserve_a_turn_in_the_build_only_lane","--nocapture"])
+            .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",root.path().join("unavailable-native-policy"))
+            .output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[tokio::test]
+    async fn owner_resume_scheduler_hands_authorized_target_to_normal_dispatch_once() {
+        const CHILD:&str="AUTOSHIP_OWNER_RESUME_HANDOFF_FIXTURE";
+        if let Some(root)=std::env::var_os(CHILD).map(PathBuf::from) {
+            let path=workflow::path();let candidate=owner_resumed_automatic_fixture(&path);
+            AttemptLedger::mark_persist(&attempt_ledger_path(),utc_day_now(),7);
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap().snapshot(&id).unwrap().unwrap();
+            // The real scheduler, authorization, inventory, PR association and
+            // claim transaction run. Only expensive native execution is replaced.
+            fn observe_dispatch(repo:&Path,dry_run:bool,selected:Option<targeted::Resolved>)->futures::future::BoxFuture<'_,Result<RunReport>> {
+                Box::pin(async move {
+                    assert!(!dry_run);
+                    let Some(targeted::Resolved::Pr(pr))=selected else {return Ok(RunReport::idle())};
+                    assert_eq!((pr.pr,pr.source_issue,pr.branch.as_str()),(42,Some(7),"agent-fix/issue-7"));
+                    let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+                    let id=store.resolve_pr("owner/repo",42)?.expect("bound original workflow");
+                    assert!(store.owner_resume_ready_for_dispatch(&id,chrono::Utc::now().timestamp_millis())?);
+                    assert!(!store.has_command_jobs()?);
+                    let lease=store.claim_productive(&id,"normal-selected-dispatch",chrono::Utc::now().timestamp_millis(),1000)?.expect("normal productive claim");
+                    store.release(&lease,chrono::Utc::now().timestamp_millis())?;
+                    std::fs::write(repo.join("selected-once"),pr.pr.to_string())?;
+                    Ok(RunReport::idle())
+                })
+            }
+            let report=targeted::COMMAND_LANE.scope(Lane::Combined,run_once_with_dispatch(&root,false,observe_dispatch)).await.unwrap();
+            assert!(report.resumed);
+            assert_eq!(std::fs::read_to_string(root.join("selected-once")).unwrap(),candidate.pr.to_string());
+            let second=targeted::COMMAND_LANE.scope(Lane::Combined,run_once_with_dispatch(&root,false,observe_dispatch)).await.unwrap();
+            assert!(!second.resumed,"consumed owner intent dispatched again");
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!((after.attempts,after.model_calls,after.tokens),(before.attempts+1,before.model_calls,before.tokens));
+            assert_eq!(store.events(&id).unwrap().iter().filter(|e|e.1=="owner_dispatch_resume_consumed").count(),1);
+            assert!(!store.has_command_jobs().unwrap());return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
+        std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json,sys
+args=sys.argv[1:]
+if args[:2]==['repo','view']:print('ADMIN' if 'viewerPermission' in args else 'owner/repo')
+elif args[:2]==['api','graphql']:
+ assert 'AutoshipViewer' in ' '.join(args);print(json.dumps({'data':{'viewer':{'login':'owner'}}}))
+elif args[:2]==['pr','list']:
+ print(json.dumps([{'number':42,'isDraft':True,'headRefName':'agent-fix/issue-7','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':False,'author':{'login':'owner'},'title':'Ordinary production bug','body':'Preserve original requirements','closingIssuesReferences':[{'number':7}]}]))
+else:raise Exception('unexpected fixture call '+repr(args))
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::tests::owner_resume_scheduler_hands_authorized_target_to_normal_dispatch_once","--nocapture"])
+            .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+            .env(TRUSTED_AUTHORS_ENV,"owner").env(GH_OWNER_ENV,"owner").output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn owner_resumed_automatic_draft_survives_the_daily_attempt_filter() {
+        let state=tempfile::tempdir().unwrap();let path=state.path().join("workflow.db");
+        let candidate=owner_resumed_automatic_fixture(&path);
+        let ledger=AttemptLedger {day:0,issues:vec![7]};
+        let candidates=vec![candidate];
+        let retries=adoption::episode_retries(&path,&candidates,1_000).unwrap();
+        let chosen=adoption::select_linked_with_retries(&candidates,&ledger,0,&Default::default(),None,0,&retries);
+        assert_eq!(chosen,Some((42,7,"agent-fix/issue-7".into())),"accepted owner resume remained hidden until the next UTC day");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_resumed_automatic_work_wakes_and_hands_off_once_without_a_command_job() {
+        use crate::autoship_workflow::WorkflowStore;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let state=tempfile::tempdir().unwrap();
+        let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+        worker.dry_run=false;worker.command_repository=Some("owner/repo".into());
+        worker.clock=Arc::new(||chrono::DateTime::from_timestamp_millis(1_000).unwrap());
+        let path=worker.workflow_path.clone();
+        let candidate=owner_resumed_automatic_fixture(&path);
+        let ledger=AttemptLedger {day:0,issues:vec![7]};
+        let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+        let stop=tokio_util::sync::CancellationToken::new();let timer_stop=stop.clone();
+        let run=worker.run_with(stop,move || {
+            let candidates=vec![candidate.clone()];
+            let retries=adoption::episode_retries(&path,&candidates,1_000).unwrap();
+            let chosen=adoption::select_linked_with_retries(&candidates,&ledger,0,&Default::default(),None,0,&retries);
+            assert_eq!(chosen,Some((42,7,"agent-fix/issue-7".into())),"wake failed to hand off the original already-attempted draft");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            let lease=store.claim_productive(&id,"resumed-worker",1_000,1).unwrap().expect("normal productive claim");
+            store.release(&lease,1_000).unwrap();
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1,"scheduling must not charge another call");
+            observed.fetch_add(1,Ordering::SeqCst);
+            async {Ok(RunReport::idle())}
+        },||async {0});
+        let timer=async move {tokio::time::sleep(std::time::Duration::from_secs(61)).await;timer_stop.cancel();};
+        let (result,())=tokio::join!(run,timer);result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),1,"accepted automatic resume did not dispatch once through the fast queue");
     }
 
     #[tokio::test(start_paused = true)]

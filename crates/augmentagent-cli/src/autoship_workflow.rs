@@ -999,11 +999,13 @@ impl WorkflowStore {
             tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![workflow,serde_json::to_string(&cp)?])?;
             event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation}).to_string(),now_ms)?;
         }
+        if purpose==ClaimPurpose::Productive && owner_control::dispatch_resume_blocked(&tx,workflow)? {return Ok(None);}
         let generation = generation.checked_add(1).context("generation overflow")?;
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+?6 WHERE id=?1",
             params![workflow, owner, generation, until, now_ms,i64::from(!qualification_inspection)])?;
         if qualification_inspection {event(&tx,workflow,generation,"qualification_recovery_claimed",&serde_json::to_string(&cp)?,now_ms)?;}
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
+        if purpose==ClaimPurpose::Productive {owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;}
         tx.commit()?;
         Ok(Some(Lease {
             workflow: workflow.into(),
