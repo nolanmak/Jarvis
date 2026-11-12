@@ -372,6 +372,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn amendment_source_positive_witness_projects_history_into_actual_request() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        baseline_witness::persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        baseline_witness::assert_current(root.path(),control.path(),&prepared).unwrap();
+        let witness=baseline_witness::scripted_native_custody(control.path(),&prepared).unwrap();
+        let (_,current)=proof(control.path(),&witness).unwrap();
+        let base=prepared.baseline.registration.baseline_head();
+        let source_raw=r#"{"requests":[{"file_index":0,"start_line":1,"end_line":1,"needle":null}]}"#;
+        let source_input=digest(b"historical source observation");
+        let old=serde_json::json!({"version":1,"head":base,"provider":"codex","native_session":"historical-source-fixture",
+            "supplied_request_hash":digest(b"historical source question"),"response_hash":digest(source_raw.as_bytes()),"purpose":"source_selection",
+            "scope_context_hash":"a".repeat(64),"native_input_hash":source_input,"scope_request_hash":digest(b"historical baseline question"),
+            "scope_policy_hash":PREDEPLOYMENT_SOURCE_POLICY});
+        let bytes=serde_json::to_vec(&old).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+        std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source=crate::autoship_workflow::NativeScopeCustody {input:source_input,response:source_raw.into(),
+            provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact,artifact_sha256:digest(&bytes)}).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex};
+        let custody=vec![source,witness];
+        assert!(baseline_witness::retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap().is_none());
+        assert!(baseline_witness::retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_none(),"positive data reopened legacy Unknown recovery");
+        let replay=serde_json::json!({"version":1,"current_epoch":current["scope_context_hash"],"current_request":current["scope_request_hash"],
+            "original_epoch":old["scope_context_hash"],"original_request":old["scope_request_hash"],"original_policy":old["scope_policy_hash"],
+            "original_choose":old["supplied_request_hash"],"original_input":custody[0].input,"provider":"codex"}).to_string();
+        let key=digest(&serde_json::to_vec(&("original-source-data-replay-v1",&current["scope_context_hash"],&current["scope_request_hash"])).unwrap());
+        let reads=std::cell::Cell::new(0);
+        let (request,_)=super::sourced_authority_request(root.path(),control.path(),&prepared,&custody,None,
+            "Failure: verifier environment changed; re-register baseline",|requested| {
+                assert_eq!(requested,key,"positive context chose another recorded mapping");reads.set(reads.get()+1);Ok(Some(replay.clone()))
+            }).await.expect("qualified positive context cannot deliver historical source to amendment authority");
+        assert_eq!(reads.get(),1);
+        let expected=prepared.baseline.registration.contract_hash();let calls=std::cell::Cell::new(0);
+        let (decision,_)=super::authority_response(root.path(),base,expected,&request,|actual| {
+            calls.set(calls.get()+1);
+            assert!(actual.contains("READY = False"));assert!(actual.contains("Construct a complete executable correction now"));
+            let raw=serde_json::json!({"approved":false,"previous_contract_hash":expected,"approve_environment_transition":false,
+                "reason":"Independent authority legitimately refuses this environment correction","proposal":null}).to_string();
+            async move {Ok((raw,"scripted-independent-review".into()))}
+        },||panic!("valid refusal cannot consume another correction call")).await.unwrap();
+        assert!(!decision.approved);assert_eq!(calls.get(),1);
+        baseline_witness::assert_current(root.path(),control.path(),&prepared).unwrap();
+    }
+
+    #[tokio::test]
     async fn amendment_source_refuses_duplicate_selection_and_unsupported_producer() {
         let (root,control,base,mut custody)=fixture().await;
         let duplicate=crate::autoship_workflow::NativeScopeCustody {input:custody[0].input.clone(),response:custody[0].response.clone(),provenance:custody[0].provenance.clone(),provider:custody[0].provider};

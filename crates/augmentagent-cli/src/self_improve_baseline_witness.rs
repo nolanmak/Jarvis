@@ -286,8 +286,24 @@ fn persist_scripted_measurement(root:&Path,control:&Path,prepared:&PreparedAccep
         concrete_input:"scripted fixture's pinned production inputs".into(),reason:if direct {"Scripted authority confirms the direct production measurement in this synthetic fixture"}else{"Original fixture is absent and the observer measures candidate-owned test markers"}.into(),production_citations:citations.clone(),
     }).collect()};
     let raw=serde_json::to_string(&judgment)?;validate(root,&prepared.proposal,&prepared.baseline,&expected,&raw)?;
-    let reply=scope_authority::scripted_witness_reply(&control,prepared.baseline.registration.baseline_head(),&expected,&raw)?;
+    let mut reply=scope_authority::scripted_witness_reply(&control,prepared.baseline.registration.baseline_head(),&expected,&raw)?;
+    // Retained-source tests need the same complete-question binding as real
+    // native custody; scripted positive qualification remains test-only.
+    let mut proof:serde_json::Value=serde_json::from_slice(&private_bytes(&reply.provenance.artifact,64*1024)?)?;
+    proof["scope_request_hash"]=amendment::digest(qualification_prompt(&expected,prepared)?.as_bytes()).into();
+    let bytes=serde_json::to_vec(&proof)?;std::fs::write(&reply.provenance.artifact,&bytes)?;
+    reply.provenance.artifact_sha256=amendment::digest(&bytes);
     persist(&control,&expected,&control,&reply)
+}
+
+#[cfg(test)]
+pub(super) fn scripted_native_custody(control:&Path,prepared:&PreparedAcceptance)->Result<crate::autoship_workflow::NativeScopeCustody> {
+    let expected=context(&prepared.proposal,&prepared.baseline)?;
+    let artifact:Artifact=serde_json::from_slice(&private_bytes(&artifact_path(control,&expected),64*1024)?)?;
+    let response=String::from_utf8(private_bytes(&raw_path(control,&expected,&artifact.response_sha256),2*1024*1024)?)?;
+    let proof:serde_json::Value=serde_json::from_slice(&private_bytes(&artifact.provenance.artifact,64*1024)?)?;
+    Ok(crate::autoship_workflow::NativeScopeCustody {input:proof["native_input_hash"].as_str().context("scripted native input missing")?.into(),
+        response,provenance:serde_json::to_string(&artifact.provenance)?,provider:crate::autoship_workflow::submission::Provider::Codex})
 }
 
 #[cfg(test)]

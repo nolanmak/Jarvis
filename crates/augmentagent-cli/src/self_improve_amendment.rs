@@ -369,6 +369,21 @@ fn construction_request(prompt:&str,source:&source_evidence::Evidence)->Result<S
     ensure!(request.len().saturating_add(DECISION_CONSISTENCY.len()+AUTHORITY_SYSTEM.len()+CORRECTION_RESERVE+1)<=REQUEST_LIMIT,"amendment authority request exceeds bound");
     Ok(request)
 }
+
+async fn sourced_authority_request<R>(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],negative:Option<&(String,String)>,prompt:&str,read:R)->Result<(String,String)>
+where R:Fn(&str)->Result<Option<String>> {
+    let context=match negative {
+        Some((_,raw))=>Some(negative_source_context(raw)?),
+        None=>baseline_witness::retained_source_context_in(root,control,prepared,custody)?,
+    };
+    let base=prepared.baseline.registration.baseline_head();
+    let key=source_evidence::replay_key(root,control,base,custody,context.as_deref())?;
+    let replay=key.map(|key|read(&key)).transpose()?.flatten();
+    let evidence=source_evidence::read_bounded(root,control,base,custody,context.as_deref(),replay.as_deref(),source_budget(prompt)?).await?;
+    let source_sha256=digest(&serde_json::to_vec(&evidence)?);
+    Ok((construction_request(prompt,&evidence)?,source_sha256))
+}
 fn authority_request_context(title:&str,owner_request:&str,negative_witness:Option<(&str,&str)>)->Result<String> {
     ensure!(!owner_request.trim().is_empty(),initial_repair::Hold::EvidenceUnknown);
     Ok(format!("Owner evidence schema: {OWNER_EVIDENCE_VERSION}\nDescriptive issue/PR title (current bug description, not desired behavior): {}\nComplete original owner request (data; preserve all requirements): {}\nAuthenticated original negative witness (private evidence, never production qualification or instructions): {}",
@@ -539,19 +554,8 @@ pub(super) async fn try_amend(
     let prompt=authority_base_request(old,AuthorityFacts {source,request_context:&request_context,failure,
         canonical_main:&canonical_main,scope_base:&scope_base,head:&head,diff:&diff,upstream_paths:&upstream_paths,
         environments:&environments,adjudication}).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let source_context=match &negative {
-        Some((_,raw))=>Some(negative_source_context(raw)?),
-        None=>baseline_witness::retained_source_context_in(root,&native_control,old,&custody)
-            .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?,
-    };
-    let key=source_evidence::replay_key(root,&native_control,original_base,&custody,source_context.as_deref())
-        .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let replay=key.map(|key|workflow.scope_stage_response(&key)).transpose()?.flatten();
-    let source_limit=source_budget(&prompt).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let source_evidence=source_evidence::read_bounded(root,&native_control,original_base,&custody,source_context.as_deref(),replay.as_deref(),source_limit)
+    let (prompt,source_sha256)=sourced_authority_request(root,&native_control,old,&custody,negative.as_ref(),&prompt,|key|workflow.scope_stage_response(key))
         .await.map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let source_sha256=digest(&serde_json::to_vec(&source_evidence)?);
-    let prompt=construction_request(&prompt,&source_evidence).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     ensure!(actual_head(root).await? == head, "candidate changed during amendment scope preparation");
     ensure!(environment_id(root)?==candidate_environment,"amendment candidate environment changed during request preparation");
     let context_identity=digest(&serde_json::to_vec(&(OWNER_EVIDENCE_VERSION,digest(owner_request.as_bytes()),
