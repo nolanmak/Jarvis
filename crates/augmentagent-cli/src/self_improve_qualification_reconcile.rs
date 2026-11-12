@@ -481,14 +481,21 @@ mod tests {
         let state=PathBuf::from(std::env::var_os("AUTOSHIP_RECOVERY_STATE").expect("explicit read-only store"));
         let root=PathBuf::from(std::env::var_os("AUTOSHIP_RECOVERY_ROOT").expect("explicit controller repository"));
         let id=std::env::var("AUTOSHIP_RECOVERY_WORKFLOW").expect("explicit workflow identity");
-        let published=std::env::var("AUTOSHIP_RECOVERY_PUBLISHED").expect("fresh public PR head");
         let store=WorkflowStore::open_read_only(&state).unwrap().unwrap();
         let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
         let context=store.recovery_context(&id,&before.checkpoint.binding).unwrap().expect("original protected context");
-        let pr=adoption::AdoptedPr {repository:context.repository.clone(),pr:before.pr.unwrap(),source_issue:id.split_once('#').and_then(|(_,n)|n.parse().ok()),branch:before.branch.clone(),head:published,base:"main".into(),author:"nolanmak".into(),title:"Explicit metadata probe".into(),body:String::new(),dependency:adoption::Dependency::Main};
+        let request=|target|Request {repository:context.repository.clone(),target,provider:None,until:Milestone::Merged};
+        let issue_number=id.strip_prefix(&format!("{}#",context.repository)).map(str::parse::<u64>).transpose().unwrap();
+        let issue=if let Some(number)=issue_number {
+            let targeted::Resolved::Issue(issue)=targeted::resolve_for_recovery(&root,&request(Target::Issue(number))).await.unwrap() else {panic!("original issue did not resolve")};
+            Some(issue)
+        }else {None};
+        let targeted::Resolved::Pr(pr)=targeted::resolve_for_recovery(&root,&request(Target::Pr(before.pr.unwrap()))).await.unwrap() else {panic!("original PR did not resolve")};
+        assert!(pr.branch==before.branch && pr.ready_for_review() && pr.source_issue==issue_number,"fresh PR source or dependency changed");
+        assert_eq!(source_request(issue.as_ref(),Some(&pr),context.source_pr).unwrap(),context.source_request,"original owner request changed");
         validate_recovery_checkout(&state,&root,&before,&context,Some(&pr)).await.expect("retained ordinary checkout cannot enter recovery");
         assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
-        println!("Retained recovery checkout and original binding verified read-only; no branch rewrite, workflow mutation or model calls");
+        println!("Fresh remote authorization, original request, retained checkout and binding verified read-only; no branch rewrite, workflow mutation or model calls");
     }
 
     #[tokio::test(start_paused = true)]

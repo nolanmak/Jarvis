@@ -27,8 +27,8 @@ detached checkout is authorized by this exception.
 D3. Both shapes retain complete original context and current input binding,
 registered linked-worktree and common-repository checks, fresh remote identity,
 write grant, trusted author, open source, issue/PR association, remote branch and
-dependency checks. The context remains protected and digest checked. Its branch,
-PR and checkout must correspond to the refreshed target. A matching published
+dependency checks. The context remains protected and digest checked. The workflow's recorded branch and PR, and the context's checkout, must
+correspond to the refreshed target. A matching published
 head is usable source data. An unpublished head still requires the existing
 read-only `retained_candidate_head` authority, latest confirmed original push
 receipt, exact retained head and Git ancestor proof. Neither source shape grants
@@ -90,8 +90,11 @@ independent authorities.
    resubmit, alter owner input, edit the candidate or production SQLite to buy
    progress. No synthetic benchmark is started.
 
-Current evidence: the disposable real-producer/consumer regression fails at the
-strict symbolic-branch lookup, and the explicit read-only #2014 probe fails at
-the same check. The minimal implementation is being validated; the negative
-matrix, final source probe, full checks/audit, rollout and ordinary outcome remain
+Current local evidence: the real producer/consumer regression and explicit
+read-only #2014 checkout probe first failed at the symbolic-branch lookup, then
+passed after recognizing the exact detached producer shape. The 17-case matrix
+then exposed two canonical-path alias cases; moving the original component
+checks into the shared path helper corrected both. All four recovery-module
+tests pass (one explicit production probe ignored by default). Final full checks,
+fresh-remote composed probe, seam audit, rollout and ordinary outcome remain
 open. An inspection pass or another bounded hold is not #1703 restoration.
