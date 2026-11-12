@@ -440,6 +440,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_measurement_failures_retain_the_plan_and_enter_a_durable_recovery_hold() {
+        for infrastructure in [true,false] {
+            let (root,control,prepared,mut guard)=fixture().await;
+            let failure=if infrastructure {anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC))}
+                else {anyhow::anyhow!("unclassified raw executor outcome")};
+            let error=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,
+                |_original|std::future::ready(Err::<BaselineEvidence,_>(failure))).await.unwrap_err();
+            let expected=if infrastructure {initial_repair::Hold::InfrastructureUnavailable}else {initial_repair::Hold::EvidenceUnknown};
+            assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&expected),"raw executor escaped its durable hold: {error:#}");
+            assert!(error.downcast_ref::<OriginalExecutionFailed>().is_some(),"hold lost the original plan");
+            assert!(hold_initial_error(&mut guard,&error).await.unwrap().is_some());
+            let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+            let snapshot=store.snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(snapshot.checkpoint.next.reason,expected.reason());
+            assert_eq!(snapshot.model_calls,0);assert_eq!(snapshot.attempts,1);
+            drop(store);guard.finish().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn infrastructure_only_result_does_not_install_a_harness_before_retry() {
         let (root,control,prepared,guard)=fixture().await;
         let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();let executor=verifier_executor_id().unwrap();

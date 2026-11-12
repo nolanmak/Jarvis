@@ -1274,6 +1274,38 @@ mod initial_diagnostic_tests {
     }
 
     #[tokio::test]
+    async fn legacy_resume_captures_request_context_before_an_enrolled_recovery_hold() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let database=control.path().join("workflow.db");
+        let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"unchanged owner request",environment:"frontend environment"};
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+        guard.transition(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0).await.unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        // Reproduce the deployed schema/state: a frontend-bound resumed
+        // candidate whose generation predates execution-context retention.
+        let conn=rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("DROP TABLE qualification_execution_context;").unwrap();drop(conn);
+        let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        let mut resumed=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap()
+            .expect("legacy frontend-bound resume was stranded by new metadata requirements");
+        let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let context=store.recovery_context(&id,resumed.binding()).unwrap().expect("resume did not retain original frontend context");
+        assert_eq!(context.source_request,"unchanged owner request");assert_eq!(context.source_pr,Some(840));
+        resumed.bind_acceptance_for_recovery(&prepared).unwrap();
+        resumed.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&[]).await.unwrap();
+        let accounting=resumed.capacity_accounting(true).unwrap();
+        hold_qualification_error(&mut resumed,&prepared,&anyhow::Error::from(initial_repair::Hold::EvidenceUnknown),&accounting).await.unwrap().unwrap();
+        resumed.finish().unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(held.attempts,before.attempts+1);assert_eq!(held.model_calls,before.model_calls);
+        let context=store.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();
+        assert_eq!(context.source_request,"unchanged owner request");
+        assert!(context.contract.starts_with("registered:"));
+        assert!(workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().is_none(),"registered metadata manufactured another changed-input attempt");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);
+    }
+
+    #[tokio::test]
     async fn registered_qualification_wait_is_not_a_new_owner_request_after_restart() {
         let (root,control,prepared)=baseline_witness::prepared_fixture();let database=control.path().join("workflow.db");
         let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
