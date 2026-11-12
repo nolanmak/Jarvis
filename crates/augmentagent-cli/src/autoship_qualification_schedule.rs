@@ -173,6 +173,11 @@ impl WorkflowStore {
             if !verifier_custody::original_hold_matches(&tx, &id, &checkpoint).unwrap_or(false)
                 && !qualification_recovery::physical_hold(&tx, &id, generation, &checkpoint)
                     .unwrap_or(false)
+                // Completed negative judgments need read-only source inspection,
+                // too. Selection grants no qualification or model admission.
+                && !(qualification_recovery::native_hold(&checkpoint)
+                    && baseline_native_custody(&tx, &id)
+                        .is_ok_and(|custody| !custody.is_empty()))
             {
                 continue;
             }
@@ -201,6 +206,31 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn semantic_hold_enters_free_selection_and_queued_reconsideration_wakes_normal_work() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let id="owner/repo#7";let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(id,"candidate",binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,1000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",42,2).unwrap();
+        store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:dir.path().into(),source_request:"original request".into(),source_pr:Some(42),contract:"original request".into(),environment:"environment".into(),binding:binding.clone()},3).unwrap();
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        store.charge_admitted_model(&lease,"original-call",3,None,Some((&purpose,&binding,1)),Some(submission::Provider::Codex),true).unwrap();
+        let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding,&raw,"scripted completed unknown",&proof,"scripted private reference",4).unwrap();
+        let held=Checkpoint {stage:Stage::Scope,binding:binding.clone(),evidence:vec![],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
+        store.checkpoint_native_custody_hold(&lease,&held,5,false).unwrap();store.release(&lease,6).unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();
+        let selected=store.reserve_qualification_recovery("owner/repo",10,1,&Default::default()).unwrap();
+        assert_eq!(selected.len(),1,"semantic holds never reach authenticated free inspection");
+        assert_eq!(selected[0].snapshot.workflow,id);
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),before,"selection claimed or charged execution");
+        assert!(store.recover_semantic_qualification(&before,None,&"b".repeat(64),11,|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        assert!(store.has_due_qualification_recovery(Some("owner/repo"),11).unwrap(),"semantic handoff never wakes existing normal dispatch");
+        assert_eq!(store.due_qualification_recovery(Some("owner/repo"),11).unwrap(),vec![id.to_string()]);
+        let after=store.snapshot(id).unwrap().unwrap();
+        assert_eq!((after.attempts,after.model_calls,after.generation),(before.attempts,before.model_calls,before.generation));
+    }
+
     #[test]
     fn qualification_context_and_checkpoint_commit_together_without_public_request_text() {
         let root = tempfile::tempdir().unwrap();

@@ -101,6 +101,44 @@ pub(super) struct WorkflowGuard {
     acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
 }
 
+#[derive(Debug)]
+struct SemanticSourceUnavailable;
+impl std::fmt::Display for SemanticSourceUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Original verification evidence is unavailable; waiting for its restoration")}
+}
+impl std::error::Error for SemanticSourceUnavailable {}
+
+/// Source data is rechecked at preparation and both launch gates. This has
+/// no subprocess/model API and never substitutes an old positive approval.
+fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,repository:&str)->Result<Option<acceptance::PreparedAcceptance>> {
+    let snapshot=store.snapshot(&lease.workflow)?.context("semantic workflow missing")?;
+    let binding=&snapshot.checkpoint.binding;
+    let cue:Option<durable::SemanticReconsideration>=store.semantic_reconsideration(&lease.workflow,binding)?;
+    let Some(cue)=cue else{return Ok(None)};
+    store.validate_dispatch(lease,binding,millis())?;
+    if store.semantic_source_waiting(&lease.workflow,binding)? {return Err(SemanticSourceUnavailable.into());}
+    let source=(||->Result<acceptance::PreparedAcceptance> {
+        let source=source_from_workflow(&lease.workflow).context("semantic source identity missing")?;
+        let control=acceptance::control_directories(repository,&lease.workflow)?.workflow_acceptance;
+        let custody=store.baseline_native_custody(lease,binding,millis())?;
+        let (prepared,identity)=acceptance::retained_semantic_source(root,&control,source,binding,&custody,&store.inspect_verifier_evidence(&lease.workflow))?
+            .context("original semantic prepared source is unavailable")?;
+        anyhow::ensure!(identity==cue.judgment,"semantic source differs from its queued judgment");
+        Ok(prepared)
+    })();
+    match source {
+        Ok(prepared)=>Ok(Some(prepared)),
+        Err(error)=> {
+            store.hold_semantic_source_unavailable(lease,binding,&cue.key,millis())?;
+            let detail=format!("{error:#}");
+            let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,&cue.key,&detail))?));
+            let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
+            store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+            Err(SemanticSourceUnavailable.into())
+        }
+    }
+}
+
 enum AcceptanceAuthority {
     Unbound,
     RecoveryOnly,
@@ -129,6 +167,12 @@ pub(super) struct CapacityAccounting {
 }
 impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
+        let source_waiting={
+            let store=self.store.lock().map_err(|_|anyhow::anyhow!("source accounting store poisoned"))?;
+            let snapshot=store.snapshot(&self.workflow)?.context("source accounting workflow missing")?;
+            store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?
+        };
+        if source_waiting {return self.report()?.context("source hold has no status report");}
         let Err(error) = &outcome else { return outcome; };
         let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
@@ -152,14 +196,17 @@ impl CapacityAccounting {
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
-        if !paused && !self.audit.resource_capacity_seen() { return Ok(None); }
-        let calls_after = store.snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let snapshot=store.snapshot(&self.workflow)?.context("capacity workflow missing")?;
+        let source_waiting=store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?;
+        if !paused && !source_waiting && !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = snapshot.model_calls;
         let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
         Ok(Some(RunReport {
             message: if paused {format!("Autoship owner pause requested; candidate and evidence preserved ({paid} model admissions this run)")}
+                else if source_waiting {format!("Autoship waiting for original verification evidence; candidate and prior charges preserved ({paid} model admissions this run)")}
                 else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
-            held: paid == 0,
+            held: source_waiting || paid == 0,
             resumed: self.resumed,
         }))
     }
@@ -715,9 +762,12 @@ impl WorkflowGuard {
             )?
         };
         let existing = store.snapshot(&id)?;
+        let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
+        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered") || semantic.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
-                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered";
+                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
             if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let context=context.filter(|context|context.source_request==start.contract
@@ -793,7 +843,8 @@ impl WorkflowGuard {
             })?;
             store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         }
-        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
+        let semantic=store.semantic_reconsideration(&id,&binding)?;
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() {
             AcceptanceAuthority::RecoveryOnly
         }else {AcceptanceAuthority::Unbound};
         let guard = Self {
@@ -881,10 +932,13 @@ impl WorkflowGuard {
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
-            store.validate_dispatch(&dispatch_lease,&binding,millis())
+            store.validate_dispatch(&dispatch_lease,&binding,millis())?;
+            semantic_preparation_source(&mut store,&dispatch_lease,&dispatch_root,&dispatch_repository)?;
+            Ok(())
         }))?;
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
@@ -1495,6 +1549,24 @@ impl WorkflowGuard {
         augmentagent_channel_core::run_resources::check_requirement("workflow_action", Some(&self.audit))
     }
 
+    pub(super) fn semantic_preparation_source(&self)->Result<Option<acceptance::PreparedAcceptance>> {
+        self.validate_before_side_effect()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?;
+        semantic_preparation_source(&mut store,&self.lease,&self.worktree,&self.repository)
+    }
+
+    pub(super) fn semantic_source_waiting(&self)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?
+            .semantic_source_waiting(self.id(),&self.binding)
+    }
+
+    pub(super) async fn checkpoint_qualification_source(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        let evidence=self.store.lock().map_err(|_|anyhow::anyhow!("qualification store poisoned"))?
+            .snapshot(self.id())?.context("qualification workflow missing")?.checkpoint.evidence;
+        self.bind_acceptance_for_recovery(prepared)?;
+        self.checkpoint(Stage::Scope,"baseline_qualification_started","qualify_original_baseline",0,&evidence).await
+    }
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,
@@ -2100,6 +2172,34 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn semantic_recovery_reuses_registered_context_without_builder_authority() {
+        let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+        let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        original.bind_acceptance_for_recovery(&prepared).unwrap();
+        original.checkpoint(Stage::Scope,"acceptance_verifier_evidence_unknown","await_original_evidence_recovery",0,&[]).await.unwrap();
+        let binding=original.binding().clone();let workflow=original.id().to_owned();original.finish().unwrap();
+        {
+            let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&workflow).unwrap().unwrap();
+            assert!(store.recover_semantic_qualification(&held,None,&"b".repeat(64),millis(),|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        }
+        let mut resumed=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(resumed.binding(),&binding,"semantic recovery lost its original registered binding");
+        assert!(matches!(*resumed.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"reconsideration entered with ordinary builder authority");
+        assert!(resumed.audit_logger().model_call_admitted("codex").is_err(),"negative qualification metadata admitted a builder");
+        let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        drop(store);
+        resumed.checkpoint(Stage::Reconcile,"resume_started","inspect_candidate",0,&[]).await.unwrap();
+        resumed.finish().unwrap();
+        let restarted=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(restarted.binding(),&binding,"crash after resume_started discarded the queued source binding");
+        assert!(matches!(*restarted.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"restart discarded semantic recovery-only authority");
+        assert!(restarted.audit_logger().model_call_admitted("codex").is_err(),"restart admitted a builder from negative source data");
+        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        restarted.finish().unwrap();
+    }
+
     #[test]
     fn baseline_source_uses_the_resolved_workflow_not_a_pr_alias() {
         use crate::autoship_contract::AcceptanceSource;

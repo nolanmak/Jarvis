@@ -134,7 +134,7 @@ before a builder can run. If the worker dies after either transaction, the next
 normal claim resumes requalification. If the transaction itself fails, the
 original hold and descriptor remain available; recovery was not consumed.
 
-A semantic unknown never creates recovery authorization. A later semantic
+A semantic unknown never creates physical native-custody recovery authorization. A later semantic
 unknown in the same lease invalidates the latest physical-cause classification;
 a later generation cannot consume the previous generation's descriptor. No
 file restoration, owner message or stale descriptor can clear those holds.
@@ -180,7 +180,7 @@ inside its claim transaction. It records `qualification_recovery_claimed` for
 the exact new lease generation without incrementing productive attempts.
 An original raw-verifier evidence-unknown hold is inspectable only when its
 controller-retained plan classification matches the exact checkpoint. This
-does not make an unrelated semantic unknown inspectable or recoverable.
+does not make an unrelated semantic unknown inspectable or recoverable through the raw-operation grant; semantic reconsideration uses the separate source validation below.
 Claims are spaced at least five minutes apart for the same workflow/input
 binding, including across restart. Genuinely changed inputs do not inherit an
 older operation's retry delay. Owner pauses, pending mutations, uncertain merge dispatch and
@@ -347,7 +347,7 @@ a new recovery hold. The compatibility regression starts with the deployed
 context capture and an unchanged-input fence after an enrolled hold. The
 November 12 read-only inventory found zero existing recovery holds, zero native
 physical classifications and zero raw recovery descriptors; these authorities
-are introduced by this PR. #2014 is paused at that frontend-bound resume shape,
+are introduced by this PR. #2014 was owner-paused at that frontend-bound resume shape in the pre-rollout inventory,
 and its current issue/PR request hash exactly matches its checkpoint contract.
 It does not need a legacy-context migration. No database backfill is introduced.
 Missing or invalid context for an unsupported recovery record remains held;
@@ -433,3 +433,83 @@ admission never authorizes new execution; inspection results and wake hints
 supply no witness, review or merge approval. Full #1952 closure, #1917 host sizing,
 productive CLI/private Discord sessions and #1703 live/soak acceptance retain
 their separate scope and required evidence.
+
+## Semantic reconsideration (#2038, rollout incomplete)
+
+A completed, authenticated `measurement: unknown` is negative source data.
+It cannot qualify the baseline, but the existing independent authority may
+consider correcting its verifier definition. Missing physical evidence keeps
+its unpaid evidence-recovery hold. The distinction does not depend on parsing
+free-form reasons from the judgment.
+
+The semantic inspector authenticates the complete original proposal, measured
+baseline, native admission and private response provenance. An old policy
+context can identify negative source data; it cannot provide current positive
+qualification. A prepared manifest or a unique original-baseline orphan is
+read without rewriting files or installing an adapter.
+
+The store handoff compares the exact checkpoint, binding, generation, owner
+revision, lease, eligibility and unsettled effects in one transaction. Its
+one-use key combines workflow, authenticated judgment identity and current
+qualification policy. Generation changes and pause/resume do not renew that
+key. The transaction queues
+`reconcile / original_semantic_witness_recovered / reconsider_verifier` without
+claiming execution or changing attempts, model calls, charges or budgets.
+The existing normal selector consumes this wake hint; it grants no approval.
+
+Normal re-entry must preserve the registered execution context and admit only
+independent recovery until current positive qualification succeeds. Reuse the
+completed negative judgment rather than ask the witness the same question
+again. Existing amendment admission remains authoritative: its environment
+identity hashes runner, dependency, configuration and executable inputs, not
+classifier/controller Rust source. The separate raw-execution cache identity
+must not be mistaken for a new amendment-budget epoch.
+
+Release remains incomplete until the free controller, normal caller, retained
+unenrolled plan/result source, source-loss/restoration exits and transactional
+race/restart tests all connect. Source loss must not become a paid retry loop
+or permanently consume recovery with no supported restoration path. Required
+hosted checks, normal deployment and actual ordinary #2014 recovery remain
+necessary. Component tests and the read-only production compatibility probe
+are not autonomous shipping evidence.
+
+The read-only semantic source provider now also reads protected original
+plan/result records when no prepared file is available. It reuses the leased
+executor's command-admission/quiescence validator through read-only evidence
+accessors, verifies source/binding/base/environment and the pinned source map,
+and authenticates the complete prepared data against the original native
+judgment. Existing manifest metadata still constrains any fallback. Different
+matching source identities remain ambiguous; none is chosen by timestamp.
+Missing candidate adapters are not installed by inspection and do not become
+positive integrity/qualification receipts. Existing changed or symlinked
+adapter paths are rejected. The old executor identity is source context only,
+not authority to run an old recipe under today's policy.
+
+Local tests cover no-manifest/no-candidate-harness recovery, mismatched source
+or binding, lost plan/result/admission/quiescence, changed adapters, normal
+witness handoff and existing executor compatibility. The actual #2014 read-only
+probe still authenticates its two original responses without changing state or
+admitting models. Normal preparation must still carry that exact queued source
+across `resume_started` restarts and unavailable/restored evidence before this
+rollout is complete.
+
+The source-loss store protocol records the restrictive checkpoint and its cue
+reference in one lease transaction. Free restoration authenticates the same
+judgment, retains the original cue key/policy and budgets, and consumes that
+loss event's sequence once. It creates no second semantic reconsideration.
+Repeated loss after a real resumed attempt can restore the same episode;
+old generation/checkpoint markers cannot revive a later independent result.
+Rollback, owner controls, pending input, uncertain operations and lease fences
+are covered by the store tests. Normal dispatch/preparation still needs to
+invoke this protocol and preserve its hold through wrapper errors before the
+release is ready.
+
+
+The normal source consumer is now wired through preparation and the shared
+pre-VM/final-release dispatch observer. Registered qualification captures actual
+installed/committed inputs before holds, and wrapper accounting preserves a
+recorded source wait. Full local CLI validation passed 1,965 tests with zero
+failures (36 explicit ignored); the actual read-only source probe passed too.
+The current implementation contract and pending rollout/live acceptance are in
+[semantic reconsideration](semantic-reconsideration.md). Earlier implementation
+milestones above describe their own historical scope, not current rollout proof.

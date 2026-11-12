@@ -38,7 +38,7 @@ fn key(generation: i64) -> String {
     format!("{:x}", Sha256::digest(format!("original-native-custody-hold-v1:{generation}")))
 }
 
-fn native_hold(checkpoint: &Checkpoint) -> bool {
+pub(super) fn native_hold(checkpoint: &Checkpoint) -> bool {
     checkpoint.stage == Stage::Scope
         && checkpoint.next.reason == "acceptance_verifier_evidence_unknown"
         && checkpoint.next.action == "await_original_evidence_recovery"
@@ -50,7 +50,133 @@ pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkp
     Ok(value.as_deref()==Some(serde_json::json!({"physical":true,"checkpoint":checkpoint}).to_string().as_str()))
 }
 
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SemanticReconsideration {
+    version:u32,
+    pub key:String,
+    pub judgment:String,
+    pub policy:String,
+    original_generation:i64,
+    pub binding:Binding,
+    qualification_required:bool,
+}
+
+fn semantic_key(workflow:&str,identity:&str,policy:&str)->Result<String> {
+    Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-reconsideration-v1",workflow,identity,policy))?)))
+}
+fn semantic_hash(value:&str)->bool {
+    value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)->Result<Option<SemanticReconsideration>> {
+    let saved:Option<(i64,String)>=conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let Some((recorded_generation,raw))=saved else{return Ok(None)};
+    let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
+    ensure!(cue.version==1 && cue.qualification_required && cue.original_generation==recorded_generation
+        && recorded_generation<=generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment)
+        && cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration reference changed");
+    Ok((cue.binding==*binding).then_some(cue))
+}
+
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticSourceUnavailable {version:u32,cue:String,checkpoint:Checkpoint}
+
+/// The restrictive checkpoint and its continuation reference share the lease
+/// transaction. This records source loss, not another judgment or grant.
+pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previous:&Checkpoint,
+    checkpoint:&Checkpoint,cue_key:&str,now:i64)->Result<()> {
+    ensure!(native_hold(checkpoint) && previous.binding==checkpoint.binding
+        && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile),"semantic source loss changed its owned input");
+    let cue=semantic_cue(tx,&lease.workflow,&checkpoint.binding,lease.generation)?.context("semantic source reference missing")?;
+    ensure!(cue.key==cue_key,"semantic source reference changed");
+    let body=serde_json::to_string(&SemanticSourceUnavailable {version:1,cue:cue.key,checkpoint:checkpoint.clone()})?;
+    let old:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
+    if old.as_deref()!=Some(body.as_str()) {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
+    Ok(())
+}
+
+pub(super) fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<(i64,SemanticReconsideration)>> {
+    if !native_hold(checkpoint) {return Ok(None);}
+    let saved:Option<(i64,String)>=conn.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((sequence,raw))=saved else{return Ok(None)};
+    let saved:SemanticSourceUnavailable=serde_json::from_str(&raw)?;
+    ensure!(saved.version==1,"semantic source loss version changed");
+    if saved.checkpoint!=*checkpoint {return Ok(None);}
+    let cue=semantic_cue(conn,workflow,&checkpoint.binding,generation)?.context("semantic source continuation missing")?;
+    ensure!(saved.cue==cue.key,"semantic source continuation changed");
+    let consumed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_source_restored' AND json_extract(payload,'$.loss_sequence')=?2)",params![workflow,sequence],|r|r.get(0))?;
+    Ok((!consumed).then_some((sequence,cue)))
+}
+
 impl WorkflowStore {
+    /// Recover the existing source reference across intermediate checkpoints,
+    /// not a fresh reconsideration, qualification or model admission.
+    pub(crate) fn semantic_reconsideration(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
+        if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
+        semantic_cue(&self.conn,workflow,binding,snapshot.generation)
+    }
+
+    pub(crate) fn semantic_source_waiting(&self,workflow:&str,binding:&Binding)->Result<bool> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(false)};
+        if snapshot.checkpoint.binding!=*binding {return Ok(false);}
+        Ok(waiting_semantic_source(&self.conn,workflow,snapshot.generation,&snapshot.checkpoint)?.is_some())
+    }
+
+    pub(crate) fn hold_semantic_source_unavailable(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {
+        let mut checkpoint=self.snapshot(&lease.workflow)?.context("semantic workflow missing")?.checkpoint;
+        ensure!(checkpoint.binding==*binding,"semantic source binding changed");
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
+        self.checkpoint_with_custody_cause(lease,&checkpoint,now,
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
+    }
+
+    /// Queue consideration of authenticated negative source data. This grants
+    /// neither a lease nor positive qualification and never creates a budget.
+    pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
+        policy:&str,now:i64,validate:F)->Result<bool>
+    where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+        ensure!(semantic_hash(policy),"semantic recovery policy identity is invalid");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row:Option<(String,i64,i64,String,Option<u64>)>=tx.query_row(
+            "SELECT checkpoint,lease_until,generation,branch,pr FROM workflow WHERE id=?1",[&expected.workflow],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
+        let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        if !native_hold(&checkpoint) || checkpoint!=expected.checkpoint || generation!=expected.generation
+            || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
+        let control=owner_control::read(&tx,&expected.workflow)?;
+        if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
+            || pending_mutation(&tx,&expected.workflow)? || super::owner_inbox::pending(&tx,&expected.workflow)?>0 {return Ok(false);}
+        let custody=baseline_native_custody(&tx,&expected.workflow)?;
+        let inspection=VerifierEvidenceInspection::new(&tx,&expected.workflow);
+        let Some(identity)=validate(&custody,&inspection)? else{return Ok(false)};
+        ensure!(semantic_hash(&identity),"semantic recovery judgment identity is invalid");
+        // Generation and owner revisions fence this transaction, but must not
+        // turn the same original judgment into a fresh reconsideration budget.
+        let continuation=waiting_semantic_source(&tx,&expected.workflow,generation,&checkpoint)?;
+        if continuation.as_ref().is_some_and(|(_,cue)|cue.judgment!=identity) {return Ok(false);}
+        let key=if let Some((_,cue))=&continuation {cue.key.clone()}else{semantic_key(&expected.workflow,&identity,policy)?};
+        let consumed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' AND json_extract(payload,'$.key')=?2)",params![expected.workflow,key],|r|r.get(0))?;
+        if consumed && continuation.is_none() {return Ok(false);}
+        checkpoint.stage=Stage::Reconcile;
+        checkpoint.next=NextAction {reason:"original_semantic_witness_recovered".into(),action:"reconsider_verifier".into(),eligible_at_ms:now};
+        let raw=serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
+        event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
+        if let Some((sequence,_))=continuation {
+            event(&tx,&expected.workflow,generation,"original_semantic_source_restored",
+                &serde_json::json!({"version":1,"key":key,"loss_sequence":sequence,"qualification_required":true}).to_string(),now)?;
+        }else {
+            event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
+                &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"binding":checkpoint.binding,"qualification_required":true}).to_string(),now)?;
+        }
+        tx.commit()?;Ok(true)
+    }
+
     /// Positive read-only restoration queues normal qualification. No lease,
     /// native runtime, model call or review authority is granted here.
     pub(crate) fn recover_native_qualification(&mut self,workflow:&str,binding:&Binding,root:&Path,validate:CustodyValidator,now:i64)->Result<bool> {
@@ -151,6 +277,145 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    #[test]
+    fn semantic_reconsideration_is_unpaid_atomic_and_once_across_generations() {
+        let (dir,mut store,lease,hold)=fixture();
+        for _ in 0..4 {assert!(store.admit_epoch_attempt(&lease,"verifier-amend-total","original-epoch",4,4).unwrap());}
+        store.checkpoint_native_custody_hold(&lease,&hold,5,false).unwrap();store.release(&lease,6).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        let budgets=|store:&WorkflowStore|->Vec<(String,String,u32)> {
+            store.conn.prepare("SELECT purpose,binding,attempts FROM bounded_attempt WHERE workflow=?1 ORDER BY purpose,binding").unwrap()
+                .query_map([&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let original_budgets=budgets(&store);let policy="b".repeat(64);let judgment="c".repeat(64);
+        assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody,_|{assert_eq!(custody.len(),1);Ok(Some(judgment.clone()))}).unwrap(),"authenticated semantic uncertainty never leaves its unchanged-input hold");
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((after.generation,after.attempts,after.model_calls,after.tokens,after.wall_ms,after.lease_until_ms),
+            (before.generation,before.attempts,before.model_calls,before.tokens,before.wall_ms,before.lease_until_ms));
+        assert_eq!(after.checkpoint.binding,hold.binding);assert_eq!(after.checkpoint.evidence,hold.evidence);
+        assert_eq!(after.checkpoint.stage,Stage::Reconcile);assert_eq!(after.checkpoint.next.action,"reconsider_verifier");
+        assert_eq!(budgets(&store),original_budgets,"free re-entry rewrote the original repair budgets");
+        assert!(!store.recover_semantic_qualification(&before,None,&policy,8,|_,_|panic!("stale checkpoint reached semantic inspection")).unwrap());
+        // A later normal attempt must not make this same result new again.
+        let normal=store.claim_productive(&lease.workflow,"normal-repair",9,1000).unwrap().unwrap();
+        assert!(!store.admit_epoch_attempt(&normal,"verifier-amend-total","original-epoch",4,9).unwrap(),"re-entry reset exhausted original budget");
+        store.checkpoint_native_custody_hold(&normal,&hold,10,false).unwrap();store.release(&normal,11).unwrap();
+        drop(store);let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let repeated=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(!store.recover_semantic_qualification(&repeated,None,&policy,12,|_,_|Ok(Some(judgment))).unwrap(),"new generation/restart reused the same semantic recovery authority");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),repeated);
+        assert_eq!(budgets(&store),original_budgets);
+    }
+
+    #[test]
+    fn semantic_reconsideration_keeps_claim_guards_and_rolls_back_partial_handoff() {
+        for obstruction in ["pause","revision","lease","future","binding","operation","no-judgment","storage"] {
+            let (_dir,mut store,lease,mut hold)=fixture();
+            if obstruction=="future" {hold.next.eligible_at_ms=100;}
+            if obstruction=="operation" {store.begin_operation(&lease,OperationKind::Push,&hold.binding,4).unwrap();}
+            store.checkpoint_native_custody_hold(&lease,&hold,5,false).unwrap();
+            if obstruction!="lease" {store.release(&lease,6).unwrap();}
+            let mut expected=store.snapshot(&lease.workflow).unwrap().unwrap();
+            if obstruction=="binding" {expected.checkpoint.binding.head="foreign".into();}
+            if obstruction=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,7).unwrap();}
+            if obstruction=="revision" {store.set_owner_pause(&lease.workflow,"github:owner",0,false,7).unwrap();}
+            if obstruction=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_semantic BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_witness_recovered' BEGIN SELECT RAISE(ABORT,'handoff store unavailable'); END;").unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            let result=store.recover_semantic_qualification(&expected,None,&"b".repeat(64),8,|_,_| {
+                assert!(matches!(obstruction,"storage"|"no-judgment"),"{obstruction} reached semantic validation");
+                Ok(if obstruction=="no-judgment" {None}else{Some("c".repeat(64))})
+            });
+            if obstruction=="storage" {assert!(result.is_err());}else{assert!(!result.unwrap(),"{obstruction} bypassed recovery guard");}
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+            assert_eq!(store.events(&lease.workflow).unwrap(),events,"{obstruction} published a partial handoff");
+        }
+    }
+
+    fn queued_semantic_source()->(tempfile::TempDir,WorkflowStore,Lease,Checkpoint,SemanticReconsideration) {
+        let (dir,mut store,original,hold)=fixture();
+        for _ in 0..4 {assert!(store.admit_epoch_attempt(&original,"verifier-amend-total","original-epoch",4,4).unwrap());}
+        store.checkpoint_native_custody_hold(&original,&hold,5,false).unwrap();store.release(&original,6).unwrap();
+        let expected=store.snapshot(&original.workflow).unwrap().unwrap();
+        assert!(store.recover_semantic_qualification(&expected,None,&"b".repeat(64),7,|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        let lease=store.claim_productive(&original.workflow,"normal-repair",8,1000).unwrap().unwrap();
+        let cue=store.semantic_reconsideration(&lease.workflow,&hold.binding).unwrap().unwrap();
+        (dir,store,lease,hold,cue)
+    }
+
+    #[test]
+    fn semantic_source_loss_restores_the_same_episode_without_new_budget_or_reconsideration() {
+        let (dir,mut store,lease,hold,cue)=queued_semantic_source();
+        store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+        let events=store.events(&lease.workflow).unwrap();
+        store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+        assert_eq!(store.events(&lease.workflow).unwrap(),events,"duplicate missing source created another loss episode");
+        store.release(&lease,10).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let waiting=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(store.claim_productive(&lease.workflow,"unchanged retry",11,1000).unwrap().is_none());
+        for identity in [None,Some("d".repeat(64))] {
+            let events=store.events(&lease.workflow).unwrap();
+            assert!(!store.recover_semantic_qualification(&waiting,None,&"e".repeat(64),11,|_,_|Ok(identity)).unwrap());
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),waiting);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+        assert!(store.recover_semantic_qualification(&waiting,None,&"e".repeat(64),12,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"original source was restored but its consumed cue stranded recovery");
+        let restored=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((restored.generation,restored.attempts,restored.model_calls,restored.tokens,restored.wall_ms),(waiting.generation,waiting.attempts,waiting.model_calls,waiting.tokens,waiting.wall_ms));
+        assert_eq!(store.semantic_reconsideration(&lease.workflow,&hold.binding).unwrap().unwrap(),cue,"restoration replaced original policy/key");
+        let next=store.claim_productive(&lease.workflow,"continued repair",13,1000).unwrap().unwrap();
+        assert!(!store.admit_epoch_attempt(&next,"verifier-amend-total","original-epoch",4,13).unwrap());
+        store.hold_semantic_source_unavailable(&next,&hold.binding,&cue.key,14).unwrap();store.release(&next,15).unwrap();
+        let waiting=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(store.recover_semantic_qualification(&waiting,None,&cue.policy,16,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"a later real source loss could not restore the same episode");
+        let rejected=store.claim_productive(&lease.workflow,"actual independent result",17,1000).unwrap().unwrap();
+        store.checkpoint_native_custody_hold(&rejected,&hold,18,false).unwrap();store.release(&rejected,19).unwrap();
+        let rejected=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(!store.recover_semantic_qualification(&rejected,None,&cue.policy,20,|_,_|Ok(Some(cue.judgment.clone()))).unwrap(),"old loss marker re-queued a completed independent rejection");
+        let events=store.events(&lease.workflow).unwrap();
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),2);
+    }
+
+    #[test]
+    fn semantic_source_loss_checkpoint_and_reference_are_atomic_and_lease_bound() {
+        for fault in ["key","binding","lease","storage"] {
+            let (_dir,mut store,lease,hold,cue)=queued_semantic_source();
+            if fault=="lease" {store.release(&lease,9).unwrap();}
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_source_loss BEFORE INSERT ON workflow_event WHEN NEW.kind='semantic_source_unavailable' BEGIN SELECT RAISE(ABORT,'source loss marker unavailable'); END;").unwrap();}
+            let mut binding=hold.binding.clone();if fault=="binding" {binding.head="wrong head".into();}
+            let key=if fault=="key" {"d".repeat(64)}else{cue.key};
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            assert!(store.hold_semantic_source_unavailable(&lease,&binding,&key,10).is_err(),"{fault} admitted a partial source hold");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+
+    #[test]
+    fn semantic_source_restoration_preserves_owner_and_uncertain_effect_guards() {
+        for fault in ["pause","revision","operation","inbox","lease","storage"] {
+            let (_dir,mut store,lease,hold,cue)=queued_semantic_source();
+            store.hold_semantic_source_unavailable(&lease,&hold.binding,&cue.key,9).unwrap();
+            if fault=="operation" {store.begin_operation(&lease,OperationKind::Push,&hold.binding,10).unwrap();}
+            if fault!="lease" {store.release(&lease,10).unwrap();}
+            if fault=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,11).unwrap();}
+            if fault=="revision" {store.set_owner_pause(&lease.workflow,"github:owner",0,false,11).unwrap();}
+            if fault=="inbox" {
+                let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+                let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(7),provider:None,until:submission::Milestone::Merged};
+                store.submit_discord_authorized(&origin,&request,&"a".repeat(64),11).unwrap();
+                let origin=super::super::discord_ingress::DiscordOrigin {message:45,..origin};
+                assert!(store.enqueue_owner_message(&origin,&lease.workflow,"Owner message remains pending",None,11).unwrap().accepted);
+            }
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_source_restore BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_source_restored' BEGIN SELECT RAISE(ABORT,'source restoration unavailable'); END;").unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            let result=store.recover_semantic_qualification(&before,None,&cue.policy,12,|_,_|{
+                assert_eq!(fault,"storage","{fault} reached source inspection");Ok(Some(cue.judgment))
+            });
+            if fault=="storage" {assert!(result.is_err(),"restoration did not atomically record its source reference");}else{assert!(!result.unwrap());}
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
     }
 
     #[test]

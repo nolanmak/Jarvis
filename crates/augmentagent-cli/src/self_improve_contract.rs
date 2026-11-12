@@ -1131,6 +1131,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
     workflow.validate_acceptance_source(prepared)?;
     ensure!(prepared.proposal.contract.source()?==source,"witness repair source differs from original contract");
     if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    workflow.checkpoint_qualification_source(prepared).await?;
     let legacy=prepared.proposal.contract.verifiers.iter().any(|v|!v.command.controller_asserted());
     let checked=if legacy {Err(anyhow::anyhow!("legacy in-process verifier requires independent behavioral-oracle migration"))}else {
         qualify_original_baseline(root,control,prepared,workflow).await
@@ -1142,6 +1143,7 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
             let failure=format!("{error:#}");
             if !(legacy || failure.contains("baseline_witness_invalid")) {return Err(error);}
             recovery::commit_candidate_named(root,&format!("fix: preserve candidate before original witness repair ({source})")).await?;
+            workflow.checkpoint_qualification_source(prepared).await?;
             match amendment::try_amend(reasoner,source,title,root,prepared,control,workflow,&failure,false,None).await? {
                 Some(next)=>{*prepared=next;qualify_original_baseline(root,control,prepared,workflow).await},
                 None=>Err(error.context(initial_repair::Hold::Exhausted)),
@@ -1448,6 +1450,7 @@ mod initial_diagnostic_tests {
 }
 
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
+    if workflow.semantic_source_waiting()? {return Ok(Some(RunReport::held("Autoship waiting for original verification evidence; candidate and prior charges preserved".into())));}
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     // Record the safe hold first: loss of private diagnostic storage cannot
     // make the workflow runnable or publish the underlying source/output.
@@ -1629,6 +1632,15 @@ pub(super) async fn prepare_acceptance(
     .await
 }
 
+fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    use std::{io::Write,os::unix::fs::PermissionsExt};
+    let mut staged=tempfile::NamedTempFile::new_in(control)?;
+    staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    staged.write_all(&serde_json::to_vec(prepared)?)?;staged.as_file().sync_all()?;
+    staged.persist_noclobber(path).map_err(|error|error.error)?;
+    std::fs::File::open(control)?.sync_all()?;Ok(())
+}
+
 pub(super) async fn prepare_acceptance_for(
     repo: &Path,
     candidate: &Path,
@@ -1642,8 +1654,8 @@ pub(super) async fn prepare_acceptance_for(
     workflow: &workflow::WorkflowGuard,
 ) -> Result<PreparedAcceptance> {
     source.validate()?;
-    use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let semantic=workflow.semantic_preparation_source()?;
     std::fs::create_dir_all(control)?;
     let control = control.canonicalize()?;
     for root in writable_roots {
@@ -1657,6 +1669,7 @@ pub(super) async fn prepare_acceptance_for(
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
+        .or_else(||semantic.as_ref().map(|prepared|prepared.baseline.registration.baseline_head()))
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
@@ -1679,7 +1692,11 @@ pub(super) async fn prepare_acceptance_for(
         }
         None => evidence_path(&control, source, base)?,
     };
-    let prepared = if path.exists() {
+    let prepared = if let Some(prepared)=semantic {
+        ensure!(prepared.proposal.contract.source()?==source && prepared.baseline.registration.baseline_head()==base,"queued semantic preparation source changed");
+        if !path.try_exists()? {persist_initial_prepared(&control,&path,&prepared)?;}
+        prepared
+    } else if path.exists() {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -1739,16 +1756,7 @@ pub(super) async fn prepare_acceptance_for(
         let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;
         let prepared = PreparedAcceptance { proposal, baseline };
-        let mut staged = tempfile::NamedTempFile::new_in(&control)?;
-        staged
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        staged.write_all(&serde_json::to_vec(&prepared)?)?;
-        staged.as_file().sync_all()?;
-        staged
-            .persist_noclobber(&path)
-            .map_err(|error| error.error)?;
-        std::fs::File::open(&control)?.sync_all()?;
+        persist_initial_prepared(&control,&path,&prepared)?;
         prepared
     };
     for required in required_criteria {
@@ -2042,6 +2050,96 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
+pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
+
+pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+    Ok(retained_semantic_source(root,control,source,binding,custody,evidence)?.map(|(_,identity)|identity))
+}
+
+/// The same authenticated source producer serves free inspection and normal
+/// guarded preparation. Old measurements never become positive qualification.
+pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<(PreparedAcceptance,String)>> {
+    let mut candidates=match retained_prepared(root,control,source) {
+        Ok(Some(prepared))=>vec![prepared],
+        Ok(None)=>verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>
+            verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
+        Err(error)=>return Err(error),
+    };
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if index.try_exists()? {
+        let manifest:WorkflowManifest=private_json(&index)?;
+        validate_retained_manifest(control,&manifest,source)?;
+        candidates.retain(|prepared|prepared.baseline.registration.baseline_head()==manifest.original_base
+            && prepared.baseline.registration.contract_hash()==manifest.contract_hash
+            && prepared.proposal.contract.revision==manifest.contract_revision);
+    }
+    let mut selected:Option<(PreparedAcceptance,String)>=None;
+    for prepared in candidates {
+        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
+        if let Some((previous,key))=&selected {
+            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
+        }else{selected=Some((prepared,identity));}
+    }
+    Ok(selected)
+}
+
+fn validate_retained_manifest(control:&Path,manifest:&WorkflowManifest,source:AcceptanceSource)->Result<()> {
+    ensure!(manifest.version==1 && manifest.source()?==source && manifest.contract_revision>0
+        && manifest.contract_hash.len()==64 && manifest.contract_hash.bytes().all(|b|b.is_ascii_hexdigit()),"retained prepared manifest identity changed");
+    evidence_path(control,source,&manifest.original_base)?;
+    if let Some(name)=&manifest.evidence_file {
+        ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"retained prepared evidence path changed");
+    }
+    Ok(())
+}
+
+/// Inspect existing prepared evidence only. Free reconsideration may not
+/// install a harness, create a manifest or generate another baseline.
+pub(super) fn retained_prepared(root:&Path,control:&Path,source:AcceptanceSource)->Result<Option<PreparedAcceptance>> {
+    source.validate()?;
+    if !control.try_exists()? {return Ok(None);}
+    let control=control.canonicalize()?;
+    for writable in worker_roots(root) {
+        if writable.exists() {ensure!(!control.starts_with(writable.canonicalize()?),"retained prepared evidence overlaps worker storage");}
+    }
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    let manifest:Option<WorkflowManifest>=if index.try_exists()? {Some(private_json(&index)?)}else{None};
+    let path=if let Some(manifest)=&manifest {
+        validate_retained_manifest(&control,manifest,source)?;
+        let original=evidence_path(&control,source,&manifest.original_base)?;
+        if let Some(name)=&manifest.evidence_file {
+            ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"retained prepared evidence path changed");
+            control.join(name)
+        }else{original}
+    }else {
+        let prefix=format!("{}-base-",source.key());let mut found=None;
+        for (count,entry) in std::fs::read_dir(&control)?.enumerate() {
+            ensure!(count<4096,"retained evidence directory exceeds inspection bound");
+            let entry=entry?;let name=entry.file_name();let name=name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".json") {
+                ensure!(found.is_none(),"multiple original baselines require bound adjudication");
+                found=Some(entry.path());
+            }
+        }
+        let Some(path)=found else{return Ok(None)};path
+    };
+    let prepared:PreparedAcceptance=private_json(&path)?;
+    let registered=&prepared.baseline.registration;
+    ensure!(registered.contract()==&prepared.proposal.contract && registered.contract().source()?==source
+        && registered.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,"retained original prepared evidence changed");
+    if let Some(manifest)=&manifest {
+        ensure!(registered.baseline_head()==manifest.original_base && registered.contract_hash()==manifest.contract_hash
+            && prepared.proposal.contract.revision==manifest.contract_revision,"retained manifest and prepared evidence disagree");
+    }else{ensure!(evidence_path(&control,source,registered.baseline_head())?==path,"retained original filename differs from baseline");}
+    registered.verify_source_files(root,&prepared.proposal.files)?;
+    Ok(Some(prepared))
+}
+
 fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
     let index = control.join(format!("{}-workflow.json", source.key()));
     if index.try_exists()? {

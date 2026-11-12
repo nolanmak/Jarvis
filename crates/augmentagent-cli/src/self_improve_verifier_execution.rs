@@ -197,18 +197,23 @@ impl<'a> OriginalExecution<'a> {
     }
 
     fn require_result_commands(workflow:&workflow::WorkflowGuard,plan:&str,attempt:&str,baseline:&BaselineEvidence,sources:&BTreeMap<String,String>)->Result<()> {
+        Self::require_result_commands_read(workflow.id(),|key,kind|workflow.verifier_evidence(key,kind),plan,attempt,baseline,sources)
+    }
+
+    fn require_result_commands_read<F>(workflow:&str,mut read:F,plan:&str,attempt:&str,baseline:&BaselineEvidence,sources:&BTreeMap<String,String>)->Result<()>
+    where F:FnMut(&str,&str)->Result<Option<String>> {
         ensure!(sources.keys().all(|id|baseline.receipts.iter().any(|receipt|&receipt.verifier_id==id)),"result references an unrelated original verifier");
         for receipt in &baseline.receipts {
             let source=sources.get(&receipt.verifier_id).map_or(attempt,String::as_str);
             if source!=attempt {ensure!(source.len()==64 && source.bytes().all(|byte|byte.is_ascii_hexdigit()),"invalid original command attempt reference");}
             let key=command_key(plan,source,&receipt.verifier_id);
-            let raw=workflow.verifier_evidence(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
+            let raw=read(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
             let admitted:Admission=serde_json::from_str(&raw)?;
-            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow.id()
+            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow
                 && admitted.plan==plan && admitted.attempt==source && admitted.verifier==receipt.verifier_id,"result belongs to another command");
-            let raw_proof=workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
+            let raw_proof=read(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
             let proof:Quiescence=serde_json::from_str(&raw_proof)?;
-            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow.id()
+            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow
                 && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
                 && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"result lacks matching kernel quiescence");
             if source!=attempt {
@@ -339,6 +344,37 @@ impl<'a> OriginalExecution<'a> {
     }
 }
 
+/// Read original data without claiming, replaying, installing or remeasuring.
+pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Vec<PreparedAcceptance>> {
+    let mut cursor=0;let mut prepared=Vec::new();
+    loop {
+        let rows=evidence.page("original_verifier_result",cursor)?;
+        if rows.is_empty() {break;}
+        for row in rows {
+            cursor=row.sequence;
+            let result:RecordedResult=serde_json::from_str(&row.body)?;
+            ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==evidence.workflow()
+                && result_key(&result.plan,&result.attempt)==row.key,"retained original result identity changed");
+            let body=evidence.record(&result.plan,"original_verifier_plan")?.context("retained original result lost its plan")?;
+            ensure!(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan identity changed");
+            let plan:Plan=serde_json::from_str(&body)?;
+            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty(),"retained original plan owner or role changed");
+            if plan.binding!=*binding || plan.proposal.contract.source()?!=source {continue;}
+            let registration=&result.baseline.registration;
+            ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
+                && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
+            registration.verify_source_files(root,&plan.proposal.files)?;
+            OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
+                &result.plan,&result.attempt,&result.baseline,&result.command_sources)?;
+            if registration.baseline_result(&result.baseline.receipts)?!=BaselineResult::Reproduced {continue;}
+            prepared.push(PreparedAcceptance {proposal:plan.proposal,baseline:result.baseline});
+        }
+    }
+    Ok(prepared)
+}
+
 /// Execute only the protected original recipe. Qualification and correction
 /// remain ordinary paid pipeline work after this inspection lease is released.
 pub(in crate::self_improve) async fn recover_original_verifier(repo:&Path,control:&Path,workflow:&workflow::WorkflowGuard)->Result<bool> {
@@ -372,6 +408,14 @@ pub(in crate::self_improve) async fn recover_original_verifier(repo:&Path,contro
 }
 
 #[cfg(all(test,target_os="linux"))]
+pub(super) fn retain_scripted_original_data(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
+    let original=OriginalExecution::begin(workflow,control,&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment_id(root)?,"scripted old executor")?;
+    for verifier in &prepared.proposal.contract.verifiers {original.retain_admission(&verifier.id,&tests::gone_scope())?;}
+    OriginalExecution::quiesce_previous(workflow)?;
+    original.retain_result(root,&prepared.baseline)
+}
+
+#[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
     use std::cell::Cell;
@@ -387,11 +431,56 @@ mod tests {
 
     // Script only historical admission metadata. The kernel checker is real,
     // but a nonexistent random scope is not evidence of a live command test.
-    fn gone_scope()->serde_json::Value {
+    pub(super) fn gone_scope()->serde_json::Value {
         use sha2::{Digest,Sha256};
         serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
             "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{"memory.max":67108864}})
+    }
+
+    #[tokio::test]
+    async fn unenrolled_original_result_is_read_only_source_without_candidate_harness_or_current_executor() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"old executor data").unwrap();
+        original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+        original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let binding=guard.binding().clone();let workflow=guard.id().to_owned();drop(original);guard.finish().unwrap();
+        for path in prepared.proposal.files.keys() {std::fs::remove_file(root.path().join(path)).unwrap();}
+        let path=control.path().join("workflow.db");
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let before=store.snapshot(&workflow).unwrap().unwrap();let events=store.events(&workflow).unwrap();
+        let evidence=store.inspect_verifier_evidence(&workflow);
+        let loaded=retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&binding,&evidence).unwrap();
+        assert_eq!(loaded.len(),1,"completed unenrolled data has no read-only recovery producer");
+        assert_eq!(serde_json::to_vec(&loaded[0]).unwrap(),serde_json::to_vec(&prepared).unwrap());
+        assert!(prepared.baseline.registration.verify_integrity(root.path()).is_err(),"source inspection manufactured candidate qualification");
+        assert!(!root.path().join(prepared.proposal.files.keys().next().unwrap()).exists(),"free inspection installed an adapter");
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before);assert_eq!(store.events(&workflow).unwrap(),events);
+        assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(841),&binding,&evidence).unwrap().is_empty());
+        let mut changed=binding;changed.head="b".repeat(40);
+        assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&changed,&evidence).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unenrolled_original_source_refuses_lost_or_corrupt_protected_custody() {
+        for fault in ["plan","result","admission","quiescence","adapter"] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"old executor data").unwrap();
+            original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+            original.retain_result(root.path(),&prepared.baseline).unwrap();
+            let command=command_key(&original.plan,&original.attempt,"observe");
+            let key=match fault {"plan"=>original.plan.clone(),"result"=>result_key(&original.plan,&original.attempt),"admission"=>command.clone(),"quiescence"=>quiet_key(&command),"adapter"=>String::new(),_=>unreachable!()};
+            let binding=guard.binding().clone();let workflow=guard.id().to_owned();drop(original);guard.finish().unwrap();
+            let path=control.path().join("workflow.db");
+            if fault=="adapter" {std::fs::write(root.path().join(prepared.proposal.files.keys().next().unwrap()),"changed adapter").unwrap();}
+            else {let conn=rusqlite::Connection::open(&path).unwrap();conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![workflow,key]).unwrap();}
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let before=store.snapshot(&workflow).unwrap().unwrap();let events=store.events(&workflow).unwrap();
+            assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&binding,&store.inspect_verifier_evidence(&workflow)).is_err(),"{fault} was accepted as original source");
+            assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before);assert_eq!(store.events(&workflow).unwrap(),events);
+        }
     }
 
     #[tokio::test]

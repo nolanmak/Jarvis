@@ -585,6 +585,30 @@ impl RegisteredContract {
         ensure!(valid_commit(&self.baseline_head) && !self.environment_id.is_empty(),"invalid registered baseline identity");
         Ok(())
     }
+    /// Authenticate original source data without installing missing adapters.
+    /// This is not candidate integrity or a positive qualification receipt.
+    pub(crate) fn verify_source_files(&self,root:&Path,files:&BTreeMap<String,String>)->Result<()> {
+        self.verify_metadata()?;
+        let pinned=self.contract.verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<BTreeSet<_>>();
+        ensure!(pinned.len()==self.file_hashes.len() && pinned.iter().all(|path|self.file_hashes.contains_key(*path)),"registered source file set changed");
+        let root=root.canonicalize()?;
+        for (file,expected) in &self.file_hashes {
+            let body=files.get(file).context("original pinned source is absent")?;
+            ensure!(body.len() as u64<=MAX_FILE_BYTES && digest(body.as_bytes())==*expected,"original pinned source changed");
+            let mut path=root.clone();let mut present=true;
+            for component in Path::new(file).components() {
+                path.push(component);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata)=>ensure!(!metadata.file_type().is_symlink(),"symlink in original source path"),
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{present=false;break;},
+                    Err(error)=>return Err(error.into()),
+                }
+            }
+            if present {ensure!(hash_file(&root,file)?==*expected,"existing original adapter changed");}
+        }
+        Ok(())
+    }
+
     pub fn verify_integrity(&self, root: &Path) -> Result<()> {
         self.verify_metadata()?;
         for (file, expected) in &self.file_hashes {

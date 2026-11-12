@@ -106,7 +106,10 @@ fn validate(root:&Path,proposal:&ContractProposal,baseline:&BaselineEvidence,exp
     Ok(judgment)
 }
 fn disposition(judgment:&Judgment)->Result<()> {
-    if judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {return Err(initial_repair::Hold::EvidenceUnknown.into());}
+    // This is a completed, authenticated semantic judgment. Unknown does not
+    // qualify production behavior, but it may dispute the verifier definition
+    // through the existing bounded independent amendment path. Missing or
+    // unauthenticated physical evidence is held before disposition is reached.
     if judgment.verifiers.iter().any(|v|v.measurement!=Measurement::DirectProduction || !v.original_fixture_available) {
         // Free-form native reasons/citations stay in the private artifact, not
         // the generic error path that can feed issue/PR activity notes.
@@ -116,6 +119,51 @@ fn disposition(judgment:&Judgment)->Result<()> {
     }
     Ok(())
 }
+/// A negative observation can reopen consideration by the existing independent
+/// authority. It can never be used as a positive qualification receipt.
+pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
+    prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
+    ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
+        "retained semantic judgment lacks its original measured baseline");
+    scope_authority::require_retained_native_custody(root,custody)?;
+    let mut selected=None;
+    for observation in custody {
+        let Ok(judgment)=serde_json::from_str::<Judgment>(&observation.response) else {continue};
+        if !judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {continue;}
+        let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:serde_json::from_str(&observation.provenance)?};
+        let control=reply.provenance.artifact.parent().context("retained semantic proof has no authority directory")?;
+        if scope_authority::verify_witness_reply(control,prepared.baseline.registration.baseline_head(),&judgment.context,&reply).is_err() {continue;}
+        // An old policy context is data, never a current qualification. Bind
+        // its original request to the COMPLETE unchanged proposal and baseline.
+        let proof=private_bytes(&reply.provenance.artifact,64*1024)?;
+        ensure!(amendment::digest(&proof)==reply.provenance.artifact_sha256,"retained semantic proof changed during inspection");
+        let provenance:serde_json::Value=serde_json::from_slice(&proof)?;
+        let request=amendment::digest(qualification_prompt(&judgment.context,prepared)?.as_bytes());
+        if provenance["scope_request_hash"].as_str()!=Some(request.as_str()) {continue;}
+        validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
+        let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
+            &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
+        ensure!(selected.as_ref().is_none_or(|previous|previous==&identity),"retained semantic judgment is ambiguous");
+        selected=Some(identity);
+    }
+    Ok(selected)
+}
+
+/// Bind source-only inspection to this workflow's existing native authority.
+/// Admission correlation alone must not import a different workflow's proof.
+pub(super) fn retained_semantic_judgment_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    if custody.is_empty() {return Ok(None);}
+    let expected=control.canonicalize()?;
+    for observation in custody {
+        let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observation.provenance)?;
+        ensure!(reference.artifact.parent()==Some(expected.as_path()),"retained semantic proof belongs to another workflow");
+    }
+    retained_semantic_judgment(root,prepared,custody)
+}
+
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());
     immutable(control,&raw_path(control,context,&hash),reply.text.as_bytes())?;
@@ -154,6 +202,13 @@ pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptanc
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     std::fs::create_dir_all(control)?;
     if artifact_path(control,&expected).try_exists()? {return assert_current(root,control,prepared);}
+    let retained=workflow.baseline_native_custody().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    if retained_semantic_judgment_in(root,&native_control,prepared,&retained)
+        .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?.is_some() {
+        return Err(BaselineNotRed {kind:Some(initial_repair::FailureKind::NotReproduced),
+            detail:"baseline_witness_invalid: authenticated retained measurement is unknown; exact independent diagnosis retained privately".into()}.into());
+    }
     ensure!(actual_head(root).await?==prepared.baseline.registration.baseline_head(),"qualification must use the original baseline checkout");
     prepared.baseline.registration.verify_integrity(root)?;
     ensure!(environment_id(root)?==prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id,
@@ -179,6 +234,11 @@ pub(super) fn candidate_passes(root:&Path,control:&Path,prepared:&PreparedAccept
 /// production qualification always uses the protected native producer above.
 #[cfg(test)]
 pub(super) fn persist_scripted(root:&Path,control:&Path,prepared:&PreparedAcceptance,direct:bool)->Result<()> {
+    persist_scripted_measurement(root,control,prepared,if direct {Measurement::DirectProduction}else{Measurement::MissingFixture})
+}
+#[cfg(test)]
+fn persist_scripted_measurement(root:&Path,control:&Path,prepared:&PreparedAcceptance,measurement:Measurement)->Result<()> {
+    let direct=measurement==Measurement::DirectProduction;
     std::fs::create_dir_all(control)?;let control=control.canonicalize()?;
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     if artifact_path(&control,&expected).try_exists()? {return assert_current(root,&control,prepared);}
@@ -191,7 +251,7 @@ pub(super) fn persist_scripted(root:&Path,control:&Path,prepared:&PreparedAccept
     }else{vec![]};
     let judgment=Judgment {version:1,context:expected.clone(),verifiers:prepared.proposal.contract.verifiers.iter().map(|v|Witness {
         verifier_id:v.id.clone(),criterion_ids:prepared.proposal.contract.criteria.iter().filter(|c|c.verifier_ids.contains(&v.id)).map(|c|c.id.clone()).collect(),
-        measurement:if direct {Measurement::DirectProduction}else{Measurement::MissingFixture},original_fixture_available:direct,
+        measurement,original_fixture_available:direct,
         concrete_input:"scripted fixture's pinned production inputs".into(),reason:if direct {"Scripted authority confirms the direct production measurement in this synthetic fixture"}else{"Original fixture is absent and the observer measures candidate-owned test markers"}.into(),production_citations:citations.clone(),
     }).collect()};
     let raw=serde_json::to_string(&judgment)?;validate(root,&prepared.proposal,&prepared.baseline,&expected,&raw)?;
@@ -229,6 +289,301 @@ mod tests {
         let artifact:Artifact=serde_json::from_slice(&private_bytes(&artifact_path(control,&expected),64*1024).unwrap()).unwrap();
         serde_json::from_slice(&private_bytes(&raw_path(control,&expected,&artifact.response_sha256),2*1024*1024).unwrap()).unwrap()
     }
+    #[test]
+    fn authenticated_unknown_judgment_is_repairable_without_qualifying_or_replacing_evidence() {
+        let (root,control,prepared)=fixture();
+        persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+        let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
+        let artifact_bytes=private_bytes(&artifact_path(control.path(),&expected),64*1024).unwrap();
+        let artifact:Artifact=serde_json::from_slice(&artifact_bytes).unwrap();
+        let response=raw_path(control.path(),&expected,&artifact.response_sha256);
+        let original=private_bytes(&response,2*1024*1024).unwrap();
+        for _ in 0..2 {
+            let error=assert_current(root.path(),control.path(),&prepared).unwrap_err();
+            assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"completed authenticated uncertainty must reach bounded independent repair: {error:#}");
+            assert!(error.downcast_ref::<initial_repair::Hold>().is_none(),"semantic uncertainty became unavailable physical custody");
+            assert!(format!("{error:#}").contains("baseline_witness_invalid"));
+            assert_eq!(private_bytes(&response,2*1024*1024).unwrap(),original);
+            assert_eq!(private_bytes(&artifact_path(control.path(),&expected),64*1024).unwrap(),artifact_bytes);
+        }
+        std::fs::remove_file(&response).unwrap();
+        let lost=assert_current(root.path(),control.path(),&prepared).unwrap_err();
+        assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"missing physical evidence must remain an unpaid hold");
+    }
+
+    #[tokio::test]
+    async fn authenticated_unknown_reaches_existing_amendment_budget_without_new_models() {
+        const CHILD:&str="AUTOSHIP_UNKNOWN_AMENDMENT_FIXTURE";
+        if let Some(script)=std::env::var_os(CHILD).map(PathBuf::from) {
+            let (root,control,mut prepared)=fixture();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+            let base=prepared.baseline.registration.baseline_head().to_owned();
+            std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let database=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
+            let epoch=amendment::digest(&serde_json::to_vec(&(AcceptanceSource::PullRequest(840),&base,environment_id(root.path()).unwrap())).unwrap());
+            for _ in 0..4 {assert!(guard.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
+            let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            for _ in 0..2 {
+                let error=qualify_or_amend(&reasoner,AcceptanceSource::PullRequest(840),"original requirement",root.path(),control.path(),&mut prepared,&mut guard).await.unwrap_err();
+                assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted),"completed unknown never reached the existing bounded amendment authority: {error:#}");
+                let state=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(state.model_calls,0,"exhausted independent repair cannot query another model");
+                assert!(guard.bind_acceptance(&prepared,control.path()).is_err(),"unknown judgment authorized a builder");
+            }
+            guard.finish().unwrap();return;
+        }
+        let scripts=tempfile::tempdir().unwrap();let script=scripts.path().join("gh");
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::authenticated_unknown_reaches_existing_amendment_budget_without_new_models","--nocapture"])
+            .env(CHILD,&script).env("GH_BIN",&script).env("AUGMENTAGENT_RUN_RESOURCES","1")
+            .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[tokio::test]
+    async fn retained_unknown_reenters_existing_repair_without_requerying_witness() {
+        const CHILD:&str="AUTOSHIP_RETAINED_UNKNOWN_CALLER_FIXTURE";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            let (root,control,prepared)=fixture();
+            std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+            let current=context(&prepared.proposal,&prepared.baseline).unwrap();
+            let mut judgment=saved_judgment(control.path(),&prepared);
+            let original="e".repeat(64);judgment["context"]=serde_json::json!(original);
+            let raw=judgment.to_string();let input="a".repeat(64);
+            let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-retained-caller",
+                "supplied_request_hash":amendment::digest(b"scripted selected sources"),"response_hash":amendment::digest(raw.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":original,"native_input_hash":input,
+                "scope_request_hash":amendment::digest(qualification_prompt(&original,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            
+            // Only the old native response remains; there is no current-policy artifact.
+            std::fs::remove_file(artifact_path(control.path(),&current)).unwrap();
+            let database=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
+            let native_control=control_directories(guard.repository(),guard.id()).unwrap().workflow_acceptance;
+            std::fs::create_dir_all(&native_control).unwrap();
+            std::fs::set_permissions(&native_control,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let retained=native_control.join(artifact.file_name().unwrap());std::fs::rename(&artifact,&retained).unwrap();
+            let provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact:retained.clone(),artifact_sha256:amendment::digest(&bytes)}).unwrap();
+            let purpose=format!("{}{}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,input);
+            guard.bounded_native_calls(purpose.clone(),1,augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    let session=augmentagent_channel_core::native_session::current_for(augmentagent_channel_core::ProviderKind::Codex)?.unwrap();
+                    let mut native=session.begin(augmentagent_channel_core::ProviderKind::Codex)?;
+                    let receipt=guard.audit_logger().model_call_admitted("codex")?;
+                    native.observe("scripted-retained-caller")?;native.finish()?;
+                    Ok::<_,anyhow::Error>(receipt)
+                })).await.unwrap();
+            let (response_key,proof_key)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
+            guard.record_scope_stage_response_pair(&response_key,&raw,&proof_key,&provenance).unwrap();
+            assert!(retained_semantic_judgment(root.path(),&prepared,&guard.baseline_native_custody().unwrap()).unwrap().is_some());
+            #[cfg(target_os="linux")]
+            {
+                verifier_execution::retain_scripted_original_data(root.path(),&native_control,&prepared,&guard).unwrap();
+                for path in prepared.proposal.files.keys() {std::fs::remove_file(root.path().join(path)).unwrap();}
+                let store=crate::autoship_workflow::WorkflowStore::open_read_only(&database).unwrap().unwrap();
+                let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+                let custody=store.inspect_baseline_native_custody(guard.id()).unwrap();
+                let recovered=inspect_retained_semantic(root.path(),&native_control,AcceptanceSource::PullRequest(840),guard.binding(),&custody,&store.inspect_verifier_evidence(guard.id())).unwrap();
+                assert!(recovered.is_some(),"free semantic inspector cannot consume a retained unenrolled result");
+                assert!(!root.path().join(prepared.proposal.files.keys().next().unwrap()).exists(),"semantic inspection installed an adapter");
+                assert!(prepared.baseline.registration.verify_integrity(root.path()).is_err());
+                assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+                install_harness(root.path(),&prepared.proposal).unwrap();
+            }
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let error=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
+            assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"authenticated retained unknown did not enter existing repair: {error:#}");
+            assert!(error.downcast_ref::<initial_repair::Hold>().is_none(),"completed old judgment became missing evidence");
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls,"replayed a completed witness question");
+            assert!(!artifact_path(control.path(),&current).exists(),"negative data became current approval");
+            assert!(guard.bind_acceptance(&prepared,control.path()).is_err());
+            std::fs::remove_file(&retained).unwrap();
+            let lost=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
+            assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"lost original source became semantic repair admission");
+            assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
+            #[cfg(target_os="linux")]
+            {
+                guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
+                let id=guard.id().to_owned();guard.finish().unwrap();
+                std::fs::write(&retained,&bytes).unwrap();std::fs::set_permissions(&retained,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let source=AcceptanceSource::PullRequest(840);let policy=semantic_reconsideration_policy();
+                let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+                let held=store.snapshot(&id).unwrap().unwrap();
+                assert!(store.recover_semantic_qualification(&held,None,&policy,chrono::Utc::now().timestamp_millis(),|custody,evidence|
+                    inspect_retained_semantic(root.path(),&native_control,source,&held.checkpoint.binding,custody,evidence)).unwrap());drop(store);
+                let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"};
+                let mut resumed=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                let accounting=resumed.capacity_accounting(true).unwrap();
+                augmentagent_channel_core::run_resources::check_requirement("codex",Some(&resumed.audit_logger())).unwrap();
+                std::fs::remove_file(&retained).unwrap();
+                let error=augmentagent_channel_core::run_resources::check_requirement("codex",Some(&resumed.audit_logger()))
+                    .expect_err("missing original source reached native launch admission");
+                assert!(!resumed.audit_logger().resource_capacity_seen(),"missing source was misclassified as host capacity");
+                let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+                let waiting=store.snapshot(&id).unwrap().unwrap();
+                assert_eq!(waiting.checkpoint.stage,crate::autoship_workflow::Stage::Scope);
+                assert_eq!(waiting.checkpoint.next.reason,"acceptance_verifier_evidence_unknown");
+                assert_eq!(waiting.model_calls,before.model_calls);
+                assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="semantic_source_unavailable").count(),1);drop(store);
+                // Provider wrappers may replace the error type; durable source
+                // wait must still prevent generic retries or initial enrollment.
+                let wrapped=anyhow::anyhow!("synthetic provider wrapper around local source refusal");
+                let report=hold_initial_error(&mut resumed,&wrapped).await.unwrap().expect("source hold was lost by preparation wrapper");
+                assert!(report.held && !report.billed);
+                assert!(resumed.checkpoint(crate::autoship_workflow::Stage::Reconcile,"generic_failure","retry",0,&[]).await.is_err(),"generic failure overwrote the source wait");
+                let report=accounting.report().unwrap().expect("source wait disappeared from command accounting");
+                assert!(report.held && !report.billed);let _=error;
+                resumed.finish().unwrap();
+                std::fs::write(&retained,&bytes).unwrap();std::fs::set_permissions(&retained,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let held=store.snapshot(&id).unwrap().unwrap();
+                assert!(store.recover_semantic_qualification(&held,None,&policy,chrono::Utc::now().timestamp_millis(),|custody,evidence|
+                    inspect_retained_semantic(root.path(),&native_control,source,&held.checkpoint.binding,custody,evidence)).unwrap());
+                assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);drop(store);
+                let mut next=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+                let mut recovered=prepare_acceptance_for(root.path(),root.path(),&native_control,source,prepared.baseline.registration.baseline_head(),"original requirement",&reasoner,&worker_roots(root.path()),&[],&next)
+                    .await.expect("normal preparation rescoped instead of consuming retained source");
+                assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
+                assert!(native_control.join(format!("{}-workflow.json",source.key())).exists());
+                let base=prepared.baseline.registration.baseline_head();
+                let script=PathBuf::from(std::env::var_os("GH_BIN").unwrap());
+                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+                std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let epoch=amendment::digest(&serde_json::to_vec(&(source,base,environment_id(root.path()).unwrap())).unwrap());
+                for _ in 0..4 {assert!(next.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
+                let accounting=next.capacity_accounting(true).unwrap();
+                let exhausted=qualify_or_amend(&reasoner,source,"original requirement",root.path(),&native_control,&mut recovered,&mut next).await.unwrap_err();
+                assert_eq!(exhausted.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted));
+                assert!(hold_qualification_error(&mut next,&recovered,&exhausted,&accounting).await.unwrap().unwrap().held);
+                let state=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+                assert_eq!(state.checkpoint.binding.head,actual_head(root.path()).await.unwrap(),"exhausted hold retained the head from before controller commit");
+                let expected=workflow::git_binding(root.path(),&format!("registered:{}",prepared.baseline.registration.contract_hash()),&prepared.baseline.registration.binding(base).unwrap().environment_id,&state.checkpoint.evidence).await.unwrap();
+                assert_eq!(state.checkpoint.binding,expected,"qualification hold lost controller-installed inputs");
+                assert_eq!(state.model_calls,before.model_calls);
+                next.finish().unwrap();
+                assert!(workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().is_none(),"controller preparation bought an unchanged exhausted retry");
+            }
+            #[cfg(not(target_os="linux"))]
+            guard.finish().unwrap();
+            return;
+        }
+        let scripts=tempfile::tempdir_in("/tmp").unwrap();
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::retained_unknown_reenters_existing_repair_without_requerying_witness","--nocapture"])
+            .env(CHILD,"1").env("GH_BIN",scripts.path().join("gh")).env("AUGMENTAGENT_RUN_RESOURCES","1").env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
+        use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
+        let (root,control,prepared)=fixture();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+        let judgment=saved_judgment(control.path(),&prepared);let context=judgment["context"].as_str().unwrap();
+        let raw=judgment.to_string();
+        let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-negative-source-fixture",
+            "supplied_request_hash":amendment::digest(b"scripted selected sources"),"response_hash":amendment::digest(raw.as_bytes()),
+            "purpose":"baseline_witness","scope_context_hash":context,"native_input_hash":"a".repeat(64),
+            "scope_request_hash":amendment::digest(qualification_prompt(context,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+        let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+        std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let observation=NativeScopeCustody {input:"a".repeat(64),response:raw,provider:Provider::Codex,
+            provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact:artifact.clone(),artifact_sha256:amendment::digest(&bytes)}).unwrap()};
+        let custody=[observation];
+        assert!(retained_semantic_judgment(root.path(),&prepared,&custody).unwrap().is_some(),"retained authenticated semantic judgment has no supported reconsideration evidence");
+        assert!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some());
+        let foreign=tempfile::tempdir_in("/tmp").unwrap();
+        assert!(retained_semantic_judgment_in(root.path(),foreign.path(),&prepared,&custody).is_err(),"negative source crossed workflow authority directories");
+        let mut different=prepared.clone();different.proposal.contract.criteria[0].requirement="A different owner requirement".into();
+        assert!(retained_semantic_judgment(root.path(),&different,&custody).is_err(),"changed original contract must not reuse judgment");
+        std::fs::remove_file(artifact).unwrap();
+        assert!(retained_semantic_judgment(root.path(),&prepared,&custody).is_err(),"missing physical custody cannot authorize reconsideration");
+    }
+
+    #[test]
+    #[ignore = "read-only compatibility proof for explicit retained production state; no model calls or workflow mutation"]
+    fn retained_semantic_judgment_production_compatibility() {
+        let path=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_PREPARED").expect("explicit original prepared evidence path"));
+        let root=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_WORKTREE").expect("explicit retained worktree"));
+        let state=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_STATE").expect("explicit read-only workflow store"));
+        let id=std::env::var("AUTOSHIP_SEMANTIC_WORKFLOW").expect("explicit workflow id");
+        let original:PreparedAcceptance=private_json(&path).unwrap();
+        let prepared=retained_prepared(&root,path.parent().unwrap(),original.proposal.contract.source().unwrap()).unwrap().expect("original prepared loader could not authenticate retained evidence");
+        assert_eq!(serde_json::to_vec(&prepared).unwrap(),serde_json::to_vec(&original).unwrap());
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        let custody=store.inspect_baseline_native_custody(&id).unwrap();
+        let identity=inspect_retained_semantic(&root,path.parent().unwrap(),prepared.proposal.contract.source().unwrap(),&before.checkpoint.binding,&custody,&store.inspect_verifier_evidence(&id)).unwrap().expect("free controller cannot authenticate retained production judgment");
+        assert_eq!(identity.len(),64);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);
+        assert_eq!(store.events(&id).unwrap(),events);
+        println!("Read-only retained semantic compatibility verified; {} original responses, no workflow mutation or model calls",custody.len());
+    }
+
+    #[test]
+    fn retained_prepared_loader_reads_original_or_orphan_without_rewriting_evidence() {
+        for indexed in [false,true] {
+            let (root,control,prepared)=fixture();let source=AcceptanceSource::PullRequest(840);
+            let file=evidence_path(control.path(),source,prepared.baseline.registration.baseline_head()).unwrap();
+            immutable(control.path(),&file,&serde_json::to_vec(&prepared).unwrap()).unwrap();
+            if indexed {write_manifest(control.path(),&WorkflowManifest::from_prepared(source,&prepared)).unwrap();}
+            let before=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().file_name()).collect::<BTreeSet<_>>();
+            let loaded=retained_prepared(root.path(),control.path(),source).unwrap().expect("free recovery cannot locate retained prepared original evidence");
+            assert_eq!(serde_json::to_vec(&loaded).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            let after=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().file_name()).collect::<BTreeSet<_>>();
+            assert_eq!(after,before,"free inspection wrote a derived manifest or another measurement");
+        }
+    }
+
+    #[test]
+    fn retained_prepared_loader_refuses_corrupt_cross_source_or_worker_owned_evidence() {
+        for fault in ["manifest-source","manifest-contract","manifest-path","proposal","permissions","symlink","worker"] {
+            let (root,control,prepared)=fixture();let source=AcceptanceSource::PullRequest(840);
+            let file=evidence_path(control.path(),source,prepared.baseline.registration.baseline_head()).unwrap();
+            immutable(control.path(),&file,&serde_json::to_vec(&prepared).unwrap()).unwrap();
+            let mut manifest=WorkflowManifest::from_prepared(source,&prepared);
+            if fault=="manifest-source" {manifest.pull_request=Some(841);}
+            if fault=="manifest-contract" {manifest.contract_hash="f".repeat(64);}
+            if fault=="manifest-path" {manifest.evidence_file=Some("../outside.json".into());}
+            if fault=="manifest-source" {
+                // Corrupt this workflow's indexed payload, rather than create
+                // a valid manifest at a different source's normal filename.
+                immutable(control.path(),&control.path().join(format!("{}-workflow.json",source.key())),&serde_json::to_vec(&manifest).unwrap()).unwrap();
+            }else{write_manifest(control.path(),&manifest).unwrap();}
+            if fault=="proposal" {
+                let mut changed=prepared.clone();changed.proposal.contract.criteria[0].requirement="different owner intent".into();
+                std::fs::write(&file,serde_json::to_vec(&changed).unwrap()).unwrap();
+            }
+            if fault=="permissions" {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&file,std::fs::Permissions::from_mode(0o640)).unwrap();}
+            if fault=="symlink" {let actual=control.path().join("actual.json");std::fs::rename(&file,&actual).unwrap();std::os::unix::fs::symlink(actual,&file).unwrap();}
+            let inspected=if fault=="worker" {root.path()} else {control.path()};
+            assert!(retained_prepared(root.path(),inspected,source).is_err(),"{fault} was treated as recoverable original data");
+        }
+    }
+
+    #[test]
+    fn classifier_and_controller_rust_changes_do_not_reset_verifier_budget_environment() {
+        let (root,_control,prepared)=fixture();let before=environment_id(root.path()).unwrap();
+        let epoch=|environment:&str|amendment::digest(&serde_json::to_vec(&(AcceptanceSource::PullRequest(840),prepared.baseline.registration.baseline_head(),environment)).unwrap());
+        let file=root.path().join("crates/augmentagent-cli/src/self_improve_baseline_witness.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file,"// changed classifier/controller source, no runner/toolchain change\n").unwrap();
+        let after=environment_id(root.path()).unwrap();
+        assert_eq!(after,before,"ordinary controller Rust was confused with actual verifier environment");
+        assert_eq!(epoch(&after),epoch(&before),"classifier change created a fresh amendment spending epoch");
+    }
+
     #[test]
     fn qualification_preserves_every_criterion_and_exact_original_source() {
         let (root,control,prepared)=fixture();persist_scripted(root.path(),control.path(),&prepared,true).unwrap();

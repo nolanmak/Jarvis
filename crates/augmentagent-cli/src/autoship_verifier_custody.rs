@@ -27,6 +27,36 @@ pub(crate) struct VerifierEvidence {
     pub body:String,
 }
 
+/// Borrowed data inspection only; it cannot claim execution or mutate state.
+pub(crate) struct VerifierEvidenceInspection<'a> {
+    conn:&'a Connection,
+    workflow:&'a str,
+}
+impl<'a> VerifierEvidenceInspection<'a> {
+    pub(super) fn new(conn:&'a Connection,workflow:&'a str)->Self {Self {conn,workflow}}
+    pub(crate) fn workflow(&self)->&str {self.workflow}
+    pub(crate) fn record(&self,key:&str,kind:&str)->Result<Option<String>> {
+        let hash:Option<String>=self.conn.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![self.workflow,key,kind],|r|r.get(0)).optional()?;
+        let body:Option<String>=self.conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![self.workflow,key],|r|r.get(0)).optional()?;
+        match (hash,body) {
+            (None,None)=>Ok(None),
+            (Some(hash),Some(body))=>{ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");Ok(Some(body))},
+            _=>Err(MissingScopeResponse.into()),
+        }
+    }
+    pub(crate) fn page(&self,kind:&str,after:i64)->Result<Vec<VerifierEvidence>> {
+        let mut query=self.conn.prepare("SELECT e.seq,json_extract(e.payload,'$.key'),s.response,json_extract(e.payload,'$.sha256') FROM workflow_event e LEFT JOIN scope_stage_response s ON s.workflow=e.workflow AND s.key=json_extract(e.payload,'$.key') WHERE e.workflow=?1 AND e.kind='verifier_evidence_recorded' AND json_extract(e.payload,'$.kind')=?2 AND e.seq>?3 ORDER BY e.seq LIMIT 64")?;
+        let rows=query.query_map(params![self.workflow,kind,after],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut records=Vec::new();
+        for (sequence,key,body,hash) in rows {
+            let body=body.ok_or(MissingScopeResponse)?;
+            ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");
+            records.push(VerifierEvidence {sequence,key,body});
+        }
+        Ok(records)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryHold {
@@ -124,33 +154,21 @@ impl WorkflowStore {
         tx.commit()?;Ok(())
     }
 
+    pub(crate) fn inspect_verifier_evidence<'a>(&'a self,workflow:&'a str)->VerifierEvidenceInspection<'a> {
+        VerifierEvidenceInspection::new(&self.conn,workflow)
+    }
+
     pub(crate) fn verifier_evidence_page(&mut self,lease:&Lease,binding:&Binding,kind:&str,after:i64,now:i64)->Result<Vec<VerifierEvidence>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
-        let rows={
-            let mut query=tx.prepare("SELECT e.seq,json_extract(e.payload,'$.key'),s.response,json_extract(e.payload,'$.sha256') FROM workflow_event e LEFT JOIN scope_stage_response s ON s.workflow=e.workflow AND s.key=json_extract(e.payload,'$.key') WHERE e.workflow=?1 AND e.kind='verifier_evidence_recorded' AND json_extract(e.payload,'$.kind')=?2 AND e.seq>?3 ORDER BY e.seq LIMIT 64")?;
-            let rows=query.query_map(params![lease.workflow,kind,after],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        let mut records=Vec::new();
-        for (sequence,key,body,hash) in rows {
-            let body=body.ok_or(MissingScopeResponse)?;
-            ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");
-            records.push(VerifierEvidence {sequence,key,body});
-        }
+        let records=VerifierEvidenceInspection::new(&tx,&lease.workflow).page(kind,after)?;
         tx.commit()?;Ok(records)
     }
 
     pub(crate) fn verifier_evidence(&mut self,lease:&Lease,binding:&Binding,key:&str,kind:&str,now:i64)->Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
-        let hash:Option<String>=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![lease.workflow,key,kind],|r|r.get(0)).optional()?;
-        let body:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        let result=match (hash,body) {
-            (None,None)=>None,
-            (Some(hash),Some(body))=>{ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");Some(body)},
-            _=>return Err(MissingScopeResponse.into()),
-        };
+        let result=VerifierEvidenceInspection::new(&tx,&lease.workflow).record(key,kind)?;
         tx.commit()?;Ok(result)
     }
 }
