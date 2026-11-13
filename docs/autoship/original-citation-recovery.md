@@ -272,3 +272,41 @@ the unresolved reader/caller contracts in section 6:
 
 These points narrow the remaining investigation; they do not close section 6,
 complete the 54-seam audit or establish a supported deployed recovery path.
+
+
+## 10. Additional rollout seams found during source comparison
+
+Both changed checker/contract sources contribute to the qualification policy
+hash. Consequently this rollout also changes the context of previously valid
+v1 qualifications, not only #1830's metadata-invalid replies. Resolve a supported
+cutover for applicable existing positive receipts before rollout. A compatibility
+path must prove the complete unchanged semantic question, original measurement,
+current structural requirements and genuine independent native provenance; it
+cannot import approval solely from an older policy hash. Changed/inapplicable
+questions, negatives, Unknown and uncertain admissions stay held. Do not cause
+new paid qualification merely because this patch or a later unrelated source
+change produced another code hash. This broadens the compatibility investigation;
+it does not authorize a blanket old-positive migration or new budgets.
+
+Main reconciliation and enrollment can change the live binding's head/contract/
+evidence hash. Immutable original facts retain their historical plan binding and
+original base. Map when a cue is read/claimed, when main is integrated, when
+acceptance is bound, and when prepared evidence is published. A legitimate head
+rotation must neither lose the cue nor mint another one. Historical binding is
+data identity, not authority over the current candidate. Source/owner/lease and
+all exact-current-head candidate/review/CI checks remain separate.
+
+`assert_current` and `current_data` currently lack a WorkflowGuard argument, while
+the new fact reader requires protected original-store evidence. Define who
+supplies and authenticates the original workflow/store/control references at
+publication and on every reader/restart, without another authority or ad hoc
+copies. Preserve terminal data-only audit versus permission for new work. Check
+resource/native callback ordering so revalidation cannot fence its own legitimate
+in-flight operation or bypass an unresolved earlier one. Source-context consumers
+must distinguish original native context from current checked qualification
+context; a relabeled JSON field cannot replace that distinction.
+
+These are root-owned load-bearing rollout blockers under section 6. They are
+implementation facts to resolve from the existing services, not requests for a
+new owner product decision. The parser and read-only evidence checkpoint is
+committed on an engineering branch; it is not deployed and has no repair-test PR.
