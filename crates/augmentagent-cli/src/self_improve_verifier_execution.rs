@@ -803,6 +803,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_correction_selects_conclusive_recovery_after_settled_infrastructure() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
+        captured_fixture(&original,&gone_scope(),true);OriginalExecution::quiesce_previous(&guard).unwrap();
+        let receipts=execute_registered_with_custody(root.path(),&prepared.baseline.registration,&guard.audit_logger(),Some(&original)).await.unwrap();
+        assert!(receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure));
+        original.retain_result(root.path(),&BaselineEvidence {registration:prepared.baseline.registration.clone(),receipts}).unwrap();
+        let resumed=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"executor").unwrap();
+        assert_eq!(resumed.plan,original.plan);assert_ne!(resumed.attempt,original.attempt);
+        let digest=amendment::digest(&serde_json::to_vec(&prepared.proposal).unwrap());
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,guard.binding(),&store.inspect_verifier_evidence(guard.id())).is_err(),
+            "settled infrastructure alone became conclusive correction evidence");
+        captured_fixture(&resumed,&gone_scope(),false);OriginalExecution::quiesce_previous(&guard).unwrap();
+        let receipts=execute_registered_with_custody(root.path(),&prepared.baseline.registration,&guard.audit_logger(),Some(&resumed)).await.unwrap();
+        let baseline=BaselineEvidence {registration:prepared.baseline.registration.clone(),receipts};
+        resumed.retain_result(root.path(),&baseline).unwrap();
+        let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+        let (_,loaded)=initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,guard.binding(),&store.inspect_verifier_evidence(guard.id()))
+            .expect("settled earlier infrastructure hid the conclusive original recovery");
+        assert_eq!(serde_json::to_value(loaded.baseline).unwrap(),serde_json::to_value(baseline).unwrap());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+    }
+
+    #[tokio::test]
     async fn interrupted_peer_reuses_completed_commands_with_original_admission_provenance() {
         for retained_interrupted_result in [false,true] {
         let (root,control,mut prepared,guard)=fixture().await;
