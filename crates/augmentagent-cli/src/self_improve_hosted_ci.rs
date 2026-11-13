@@ -211,30 +211,124 @@ async fn observe_with(
 }
 
 fn job_diagnostics(log: &str) -> String {
-    log.split_inclusive('\n')
-        .map(|line| match line.split_once(' ') {
+    let mut previous_step=None;
+    let mut output=String::new();
+    for line in log.split_inclusive('\n') {
+        let columns=line.splitn(3,'\t').collect::<Vec<_>>();
+        let line=if columns.len()==3 {
+            let step=columns[1];
+            if previous_step!=Some(step) {
+                output.push_str(&format!("Step: {step}\n"));
+                previous_step=Some(step);
+            }
+            columns[2].trim_start_matches('\u{feff}')
+        }else {line.trim_start_matches('\u{feff}')};
+        let diagnostic=match line.split_once(' ') {
             Some((timestamp, diagnostic))
                 if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok() =>
             {
                 diagnostic
             }
             _ => line,
-        })
-        .collect()
+        };
+        output.push_str(diagnostic);
+    }
+    output
+}
+
+// GitHub CLI resolves step boundaries from the verified job's own metadata.
+// Keep transport bounded as well as the eventual public excerpt.
+async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String> {
+    use tokio::io::AsyncReadExt;
+    const HALF:usize=64*1024;
+    let mut head=Vec::new();
+    let mut tail=Vec::new();
+    let mut dropped=false;
+    let mut chunk=[0u8;8192];
+    loop {
+        let n=reader.read(&mut chunk).await?;
+        if n==0 {break;}
+        let first=(HALF-head.len()).min(n);
+        head.extend_from_slice(&chunk[..first]);
+        tail.extend_from_slice(&chunk[first..n]);
+        if tail.len()>HALF {
+            tail.drain(..tail.len()-HALF);
+            dropped=true;
+        }
+    }
+    if !dropped {
+        head.extend_from_slice(&tail);
+        return Ok(String::from_utf8_lossy(&head).into_owned());
+    }
+    // Only discarded boundaries may split a valid UTF-8 scalar. Do not add
+    // replacement characters to otherwise valid source logs at those cuts.
+    if let Err(error)=std::str::from_utf8(&head) {
+        if error.error_len().is_none() {head.truncate(error.valid_up_to());}
+    }
+    let start=tail.iter().take_while(|byte|(**byte&0xc0)==0x80).count().min(3);
+    Ok(format!("{}\n[failed-step log truncated in transport; see job URL]\n{}",
+        String::from_utf8_lossy(&head),String::from_utf8_lossy(&tail[start..])))
+}
+
+async fn failed_step_logs(root:&Path,gh:&str,repository:&str,job:u64)->Result<String> {
+    let mut child=Command::new(gh)
+        .args(["run","view","--repo",repository,"--job",&job.to_string(),"--log-failed"])
+        .current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true).process_group(0).spawn()?;
+    let _group=CommandGroup(child.id().context("log reader has no process id")?);
+    let stdout=child.stdout.take().context("log reader stdout unavailable")?;
+    let stderr=child.stderr.take().context("log reader stderr unavailable")?;
+    let (status,logs,_)=tokio::time::timeout(std::time::Duration::from_secs(120),async {
+        tokio::try_join!(async {Ok::<_,anyhow::Error>(child.wait().await?)},capture_log(stdout),capture_log(stderr))
+    }).await??;
+    anyhow::ensure!(status.success() && !logs.trim().is_empty(),"failed-step diagnostics unavailable");
+    Ok(logs)
+}
+
+// Preserve both ends of an oversized failed step, never a whole-job success
+// prelude. The marker counts towards the same byte budget as the evidence.
+fn diagnostic_excerpt(text:&str,budget:usize)->String {
+    if text.len()<=budget {return text.to_owned();}
+    const MARKER:&str="\n[diagnostics truncated; see job URL]\n";
+    if budget<MARKER.len() {
+        let mut end=budget;
+        while !text.is_char_boundary(end) {end-=1;}
+        return text[..end].to_owned();
+    }
+    let half=(budget-MARKER.len())/2;
+    let mut end=half;
+    while !text.is_char_boundary(end) {end-=1;}
+    let mut start=text.len()-(budget-MARKER.len()-half);
+    while !text.is_char_boundary(start) {start+=1;}
+    format!("{}{MARKER}{}",&text[..end],&text[start..])
 }
 
 async fn failed_main_diagnostics(root:&Path,gh:&str,repository:&str,head:&str,failures:&[Value])->RedMain {
+    const BUDGET:usize=2500;
+    const MAX_JOBS:usize=8;
     let mut diagnostics=String::from("GitHub Actions on main failed:\n");
-    for failure in failures {
-        diagnostics.push_str(&format!("{} {}\n",failure["name"],failure["url"]));
-        if let Some(job)=failure["job"].as_u64() {
-            if let Ok((true,logs,_))=run(gh,&["api",&format!("repos/{repository}/actions/jobs/{job}/logs")],root).await {
-                diagnostics.push_str(&truncate_tail(&job_diagnostics(&logs),8000));
-            }
-        }
+    let shown=failures.len().min(MAX_JOBS);
+    for (index,failure) in failures.iter().take(MAX_JOBS).enumerate() {
+        let budget=(BUDGET-diagnostics.len()-80)/(shown-index);
+        let job=failure["job"].as_u64();
+        let header=format!("Check: {} | job {} | {}\n",failure["name"].as_str().unwrap_or("unknown"),
+            job.map(|n|n.to_string()).unwrap_or_else(||"unknown".into()),failure["url"].as_str().unwrap_or("URL unavailable"));
+        let logs=match job {
+            Some(job)=>failed_step_logs(root,gh,repository,job).await.ok(),
+            None=>None,
+        };
+        let text=logs.map(|s|job_diagnostics(&s)).filter(|s|!s.trim().is_empty())
+            .unwrap_or_else(||"Failed-step diagnostics unavailable; failure remains confirmed.\n".into());
+        let header=diagnostic_excerpt(&header,budget/2);
+        let excerpt=diagnostic_excerpt(&text,budget-header.len()-1);
+        diagnostics.push_str(&header);
+        diagnostics.push_str(&excerpt);
+        diagnostics.push('\n');
     }
-    let text=truncate(&diagnostics,24000);
-    RedMain {failing:failing_tests(&text),packages:failing_packages(&text),gate_err:Some(text),sha:head.to_owned()}
+    if failures.len()>shown {
+        diagnostics.push_str(&format!("{} additional failed jobs omitted; inspect Actions.\n",failures.len()-shown));
+    }
+    RedMain {failing:failing_tests(&diagnostics),packages:failing_packages(&diagnostics),gate_err:Some(diagnostics),sha:head.to_owned()}
 }
 
 /// How auto-ship reads `main` from GitHub's evidence, newest commit first.
@@ -339,6 +433,48 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn diagnostic_transport_and_public_excerpts_are_bounded_and_unicode_safe() {
+        let small=format!("{}é🦀finish","a".repeat(65535));
+        assert_eq!(capture_log(small.as_bytes()).await.unwrap(),small);
+        let large=format!("begin{}finish","é🦀".repeat(100_000));
+        let captured=capture_log(large.as_bytes()).await.unwrap();
+        assert!(captured.starts_with("begin") && captured.ends_with("finish"));
+        assert!(captured.contains("truncated in transport") && !captured.contains('\u{fffd}'));
+        assert!(captured.len()<=128*1024+80);
+        for budget in 0..=2500 {
+            let excerpt=diagnostic_excerpt(&large,budget);
+            assert!(excerpt.len()<=budget,"budget {budget} exceeded");
+            assert!(!excerpt.contains('\u{fffd}'));
+        }
+        for count in [0,1,8,100] {
+            let failures=(0..count).map(|n|serde_json::json!({"name":format!("check-{n}"),"job":n+1,"url":format!("https://github.com/o/r/actions/runs/1/job/{}",n+1)})).collect::<Vec<_>>();
+            let root=tempfile::tempdir().unwrap();
+            let red=failed_main_diagnostics(root.path(),"/bin/false","o/r","abc1234def5678",&failures).await;
+            let diagnostics=red.gate_err.unwrap();
+            assert!(diagnostics.len()<=2500);
+            if count>8 {assert!(diagnostics.contains("92 additional failed jobs omitted"));}
+            if count>0 {assert!(diagnostics.contains("diagnostics unavailable"));}
+        }
+    }
+
+    #[tokio::test]
+    #[ignore="read-only replay requires authenticated GitHub access to the recorded failed job"]
+    async fn real_red_main_audit_job_reaches_public_issue_with_failure_evidence() {
+        let root=tempfile::tempdir().unwrap();
+        let (ok,metadata,_)=run("gh",&["api","repos/nolanmak/Jarvis/actions/jobs/131607900507"],root.path()).await.unwrap();
+        assert!(ok);
+        let job:Value=serde_json::from_str(&metadata).unwrap();
+        let head="05e52daf0b1fb3bd1f3157cf61c18cf193ffb55c";
+        assert_eq!(job["head_sha"],head);assert_eq!(job["conclusion"],"failure");
+        let failures=[serde_json::json!({"name":job["name"],"job":job["id"],"url":job["html_url"]})];
+        let red=failed_main_diagnostics(root.path(),"gh","nolanmak/Jarvis",head,&failures).await;
+        let body=red_main_body(&red,"");
+        for text in ["GHSA-4m76-xfj5-7975","Severity: moderate","exit code 1","job/131607900507",head] {assert!(body.contains(text),"missing actual {text}: {body}");}
+        assert!(!body.contains("does not build"));
+        assert!(red.gate_err.as_ref().unwrap().len()<=2500);
+        augmentagent_channel_core::public_report::validate(&red_main_title(&red),&body).unwrap();
+    }
     #[tokio::test]
     async fn red_main_publication_retains_failed_step_instead_of_success_or_cleanup() {
         use std::os::unix::fs::PermissionsExt;
