@@ -164,6 +164,23 @@ resume can still require runtime retirement reconciliation before execution.
 Acceptance, cleanup, model progress, and a confirmed merge are separate results.
 Preserve unrelated owner pauses and inspect the resulting status.
 
+Both fresh-issue selectors consult that same owner control using the canonical
+repository/issue identity before triage. They skip paused issues and consider
+eligible peers without changing pauses, candidates, history or resource charges.
+An all-paused inventory is idle; a supported owner resume restores selection
+eligibility. This free read does not admit execution: on the primary route, the productive
+claim still checks owner controls atomically, including a pause arriving after
+selection. The legacy configured multi-repository route currently has only the
+selection filter; #2056 owns its missing durable claim/model-admission integration.
+Primary-route claim tests do not prove that configured execution is fenced.
+
+A fresh-selection `owner-control-unavailable` hold means the existing protected
+control state or canonical identity could not be read reliably. It is unpaid;
+inspect the configured state and its access rather than treating unknown state
+as permission or clearing owner controls. A missing database for a new
+installation is different: free selection may consider new issues without
+initializing a database or registering workflows.
+
 ## Capacity waits in health readback
 
 After verifying the deployed build and worker, run:

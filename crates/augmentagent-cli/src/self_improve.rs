@@ -61,6 +61,9 @@ mod linked_claims;
 #[cfg(test)]
 #[path = "self_improve_linked_claim_boundaries.rs"]
 mod linked_claim_boundaries;
+#[cfg(test)]
+#[path = "self_improve_paused_selection_tests.rs"]
+mod paused_selection_tests;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
@@ -975,6 +978,9 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // research pipeline files 3/day and the daily cap is 3, so strict
     // newest-first would hand it the entire budget forever and human bug
     // reports would never be reached.
+    let owner_controls=workflow::FreshIssueControls::open()?;
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|error|error.context(workflow::OwnerControlUnavailable))?;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
@@ -983,6 +989,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .into_iter()
         .partition(|i| !i.research_filed);
     for iss in human.into_iter().chain(research) {
+        if owner_controls.paused(&repository,iss.number)? {
+            info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
+            continue;
+        }
         // #851 — an issue already attempted today lost a build to a refusal;
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
@@ -8047,9 +8057,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     let issue = match red_main_issue {
         Some(issue) => issue,
-        None => match pick_issue(repo_root, dry_run).await? {
-            Some(issue) => issue,
-            None => {
+        None => match pick_issue(repo_root, dry_run).await {
+            Ok(Some(issue)) => issue,
+            Err(error) if error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some()=> {
+                return Ok(RunReport::held(workflow::OwnerControlUnavailable.to_string()));
+            },
+            Err(error)=>return Err(error),
+            Ok(None) => {
                 // #1532 — a slot reserved for a build with nothing to build
                 // is spent on a waiting draft, never on idling.
                 if prefer_build {
@@ -10578,9 +10592,14 @@ async fn pick_issue_for_repo(
 ) -> Result<Option<Issue>> {
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
+    let owner_controls=workflow::FreshIssueControls::open()?;
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
+            continue;
+        }
+        if owner_controls.paused(&repo.full_name,number)? {
+            info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
         let title = iss
@@ -14877,9 +14896,10 @@ CODEX-REVIEW: lgtm").0);
         let resume_first = body
             .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
             .expect("the resume-first block yields a reserved slot");
-        let pick = body.find("match pick_issue(repo_root, dry_run).await?").expect("the picker");
+        let pick = body.find("match pick_issue(repo_root, dry_run).await {").expect("the picker");
         assert!(resume_first < pick, "resume-first still precedes the picker");
         let none_arm = &body[pick..];
+        let none_arm = &none_arm[none_arm.find("Ok(None) => {").expect("the empty selector result")..];
         let fallback = none_arm.find("if prefer_build {").expect("the reserved-slot fallback");
         let resume = none_arm.find("find_resumable_draft(repo_root, None, dry_run)").expect("fallback resume");
         let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");

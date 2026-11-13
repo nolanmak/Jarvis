@@ -52,6 +52,31 @@ pub(super) fn path() -> PathBuf {
     durable::default_path()
 }
 
+#[derive(Debug)]
+pub(super) struct OwnerControlUnavailable;
+impl std::fmt::Display for OwnerControlUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("owner-control-unavailable")}
+}
+impl std::error::Error for OwnerControlUnavailable {}
+
+/// Free selection reads the existing owner authority without registering a
+/// workflow or initializing storage. The productive claim still rechecks pause
+/// atomically; this reader is only a fairness filter, never execution admission.
+pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
+impl FreshIssueControls {
+    pub(super) fn open()->Result<Self> {
+        WorkflowStore::open_read_only(&path()).map(|store|Self {store})
+            .map_err(|error|error.context(OwnerControlUnavailable))
+    }
+    pub(super) fn paused(&self,repository:&str,issue:u64)->Result<bool> {
+        (||->Result<bool> {
+            let id=durable::workflow_id(repository,issue)?;
+            let control=self.store.as_ref().map(|store|store.owner_control(&id)).transpose()?.flatten();
+            Ok(control.is_some_and(|control|control.paused))
+        })().map_err(|error|error.context(OwnerControlUnavailable))
+    }
+}
+
 /// Read GitHub's current base, never a possibly stale local tracking ref.
 pub(super) async fn remote_main_head(repo: &Path, repository: &str) -> Result<String> {
     let (ok, out, error) = run(
