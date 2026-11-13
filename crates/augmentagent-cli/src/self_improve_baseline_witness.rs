@@ -531,6 +531,32 @@ mod tests {
     }
 
     #[test]
+    fn amendment_source_prefers_current_witness_over_historical_positive_context() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root,control,prepared)=fixture();
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        let current=scripted_native_custody(control.path(),&prepared).unwrap();
+        let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
+        let historical=context_with_policy(&prepared.proposal,&prepared.baseline,&"a".repeat(64)).unwrap();
+        let mut judgment:Judgment=serde_json::from_str(&current.response).unwrap();
+        judgment.context=historical.clone();
+        let raw=serde_json::to_string(&judgment).unwrap();
+        let mut reply=scope_authority::scripted_witness_reply(control.path(),prepared.baseline.registration.baseline_head(),&historical,&raw).unwrap();
+        let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+        proof["scope_request_hash"]=amendment::digest(qualification_prompt(&historical,&prepared).unwrap().as_bytes()).into();
+        let bytes=serde_json::to_vec(&proof).unwrap();
+        std::fs::write(&reply.provenance.artifact,&bytes).unwrap();reply.provenance.artifact_sha256=amendment::digest(&bytes);
+        let older=crate::autoship_workflow::NativeScopeCustody {input:proof["native_input_hash"].as_str().unwrap().into(),response:raw,
+            provenance:serde_json::to_string(&reply.provenance).unwrap(),provider:current.provider};
+        assert_eq!(retained_source_context_in(root.path(),control.path(),&prepared,std::slice::from_ref(&older)).unwrap().as_deref(),Some(historical.as_str()));
+        let custody=[older,current];
+        assert_current(root.path(),control.path(),&prepared).unwrap();
+        assert_eq!(retained_source_context_in(root.path(),control.path(),&prepared,&custody).unwrap().as_deref(),Some(expected.as_str()),
+            "historical positive evidence blocks current authenticated source context");
+    }
+
+    #[test]
     fn negative_diagnosis_covers_all_measurements_without_widening_legacy_recovery() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
         use std::os::unix::fs::PermissionsExt;

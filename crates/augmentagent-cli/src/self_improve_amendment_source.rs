@@ -276,6 +276,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn amendment_source_uses_correction_after_rejected_empty_range() {
+        let (root,control,base,mut custody)=fixture().await;
+        let mut rejected=crate::autoship_workflow::NativeScopeCustody {
+            input:digest(b"rejected first source selection"),response:r#"{"requests":[{"file_index":0,"start_line":999,"end_line":1000,"needle":null}]}"#.into(),
+            provenance:custody[0].provenance.clone(),provider:custody[0].provider,
+        };
+        let (_,mut original)=proof(control.path(),&custody[0]).unwrap();
+        original["native_input_hash"]=rejected.input.clone().into();
+        original["response_hash"]=digest(rejected.response.as_bytes()).into();
+        let bytes=serde_json::to_vec(&original).unwrap();
+        let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+        std::fs::write(&artifact,&bytes).unwrap();
+        std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+        rejected.provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact,artifact_sha256:digest(&bytes)}).unwrap();
+        custody.insert(0,rejected);
+        let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await
+            .expect("rejected empty-range response must not compete with accepted correction");
+        assert_eq!(evidence.sources["behavior.rs"],"pub fn behavior() -> bool { false }\n");
+    }
+
+    #[tokio::test]
     async fn amendment_source_replays_original_git_bytes_without_reading_dirty_candidate() {
         let (root, control, base, custody) = fixture().await;
         std::fs::write(root.path().join("behavior.rs"), "private uncommitted candidate bytes").unwrap();
