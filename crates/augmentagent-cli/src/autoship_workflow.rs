@@ -3660,6 +3660,37 @@ mod observation_accounting_tests {
     use super::*;
     fn binding() -> Binding { Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()} }
     #[test]
+    fn construction_native_budget_survives_rebinding_restart_and_lost_responses() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
+        let id="autoship-observation/construction";
+        let episode="a".repeat(64);
+        let purpose=|input:u8|format!("verifier-construction-native-v1:{episode}:{input:064x}");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        store.register(id,"probe",binding(),1).unwrap();
+        let mut lease=store.claim(id,"first",2,1000).unwrap().unwrap();
+        // Quota refusal must roll back the episode and exact-input counters too.
+        assert!(store.charge_admitted_model(&lease,"quota-refused",3,Some(0),Some((&purpose(0),&binding(),1)),Some(submission::Provider::Codex),false).is_err());
+        for input in 0..6 {
+            let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
+            cp.binding.head=format!("candidate-{input}");
+            store.checkpoint(&lease,&cp,10+i64::from(input)).unwrap();
+            let receipt=format!("lost-response-{input}");
+            store.charge_admitted_model(&lease,&receipt,20+i64::from(input),None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
+            // Reobserving a dispatch is accounting replay, never a fresh call.
+            store.charge_admitted_model(&lease,&receipt,30+i64::from(input),None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
+            if input==2 {
+                store.release(&lease,40).unwrap();drop(store);
+                store=WorkflowStore::open(&path).unwrap();
+                lease=store.claim(id,"restarted",41,1000).unwrap().unwrap();
+            }
+        }
+        let cp=store.snapshot(id).unwrap().unwrap().checkpoint;
+        assert!(store.charge_admitted_model(&lease,"seventh",50,None,Some((&purpose(6),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"binding changes replenished the construction episode");
+        assert!(store.charge_admitted_model(&lease,"duplicate-input",51,None,Some((&purpose(0),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"lost exact-input response was retried after rebinding");
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,6);
+        assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),6);
+    }
+    #[test]
     fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
         let mut store=WorkflowStore::open(&path).unwrap();let id="autoship-observation/bounded";
