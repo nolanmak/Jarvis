@@ -1,6 +1,8 @@
 //! Durable untrusted proposal production. A measurement intent is not a witness,
 //! an environment approval, or permission to call the amendment authority.
 use super::*;
+#[path="self_improve_construction_stage.rs"]
+mod staging;
 
 const TURNS:u32=6;
 const SLOTS:u32=3;
@@ -238,7 +240,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    async fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode) {
+    pub(super) async fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode) {
         let (root,control,old)=qualification_fixture();
         let path=control.path().join("workflow.db");
         let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
@@ -250,12 +252,12 @@ mod tests {
         let episode=construction_episode_at(root.path(),control.path(),&guard,&old,&environments).unwrap();
         (root,control,old,guard,episode)
     }
-    fn proposal(old:&PreparedAcceptance)->String {
+    pub(super) fn proposal(old:&PreparedAcceptance)->String {
         let mut proposal=old.proposal.clone();proposal.contract.revision+=1;
         proposal.files.values_mut().next().unwrap().push_str("\n# independently constructed correction\n");
         serde_json::json!({"kind":"proposal","proposal":proposal,"additional_files":[],"propose_environment_transition":false}).to_string()
     }
-    fn request<'a>(episode:&'a ConstructionEpisode,old:&'a PreparedAcceptance,model:&'a str)->Request<'a> {
+    pub(super) fn request<'a>(episode:&'a ConstructionEpisode,old:&'a PreparedAcceptance,model:&'a str)->Request<'a> {
         Request {episode,old,candidate_environment:"different-environment",adjudication:None,
             context:"Complete protected request; casing warnings are advisory and owner override suppresses them",
             provider:augmentagent_channel_core::ProviderKind::Codex,model}
@@ -413,7 +415,7 @@ mod tests {
         // A foreign episode has a slot-one record but no slot zero. Use only
         // the supported immutable response API to construct this fixture.
         let mut foreign=ConstructionEpisode {key:"b".repeat(64),workflow:episode.workflow.clone(),original_base:episode.original_base.clone(),
-            registered_contract:episode.registered_contract.clone(),control:episode.control.clone(),source:episode.source};
+            original_environment:episode.original_environment.clone(),registered_contract:episode.registered_contract.clone(),control:episode.control.clone(),source:episode.source};
         if foreign.key==episode.key {foreign.key="c".repeat(64);}
         let mut later=measurement;later.episode=foreign.key.clone();later.slot=1;
         let turn=Turn {version:1,episode:foreign.key.clone(),round:0,prior:None,

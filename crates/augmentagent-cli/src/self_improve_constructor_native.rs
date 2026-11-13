@@ -180,6 +180,36 @@ fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::aut
     Ok((Reply {text,provider:completed.provider,native_session:completed.native_session},encoded))
 }
 
+/// Data-only recovery of an actual completed conversation. Unlike `call`, this
+/// does not require current episode enrollment and can never dispatch. Missing
+/// paired publication remains a hold; ordinary leased exchange owns repair.
+pub(super) fn retained(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {
+    (||->Result<Reply> {
+        workflow.validate_before_side_effect()?;
+        ensure!(workflow.id()==episode.workflow(),"constructor recovery belongs to another workflow");
+        input.require_episode(episode)?;
+        let purpose=input.purpose()?;
+        let provider=workflow.construction_native_admission(&purpose)?.context("constructor lacks original actual admission")?;
+        let (reply,reference)=original_completion(root,episode.control(),input,provider)?;
+        let (raw,proof)=crate::autoship_workflow::construction_native_response_keys(&purpose)?;
+        let (text,encoded)=workflow.scope_stage_response_pair(&raw,&proof)?.context("constructor completion lacks paired publication")?;
+        ensure!(text==reply.text && encoded==reference,"constructor recovered data differs from paired publication");
+        Ok(reply)
+    })().map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))
+}
+
+#[cfg(test)]
+pub(super) async fn scripted_reply(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input,text:String)->Result<Reply> {
+    let audit=workflow.audit_logger();
+    exchange(root,episode.control(),workflow,input,move |provider,_,_|async move {
+        let session=augmentagent_channel_core::native_session::current_for(provider)?.context("test constructor session missing")?;
+        let mut native=session.begin(provider)?;
+        audit.model_call_admitted(provider.name())?;
+        native.observe(&format!("test-constructor-{}",uuid::Uuid::new_v4()))?;native.finish()?;
+        Ok(text)
+    }).await
+}
+
 /// Actual native transport. Callers still need the restricted construction
 /// lease and a controller-computed episode; no proposal is approved here.
 pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {

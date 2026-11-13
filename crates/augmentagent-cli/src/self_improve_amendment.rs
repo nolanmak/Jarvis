@@ -212,11 +212,13 @@ struct EnvironmentEvidence {
 /// Controller-owned budget identity. Proposed registrations, current candidate
 /// bindings and serialized model output cannot manufacture a new episode.
 #[derive(Debug)]
-pub(super) struct ConstructionEpisode {key:String,workflow:String,original_base:String,registered_contract:String,control:PathBuf,source:AcceptanceSource}
+pub(super) struct ConstructionEpisode {key:String,workflow:String,original_base:String,original_environment:String,registered_contract:String,control:PathBuf,source:AcceptanceSource}
 impl ConstructionEpisode {
     pub(super) fn key(&self)->&str {&self.key}
     pub(super) fn workflow(&self)->&str {&self.workflow}
     pub(super) fn original_base(&self)->&str {&self.original_base}
+    pub(super) fn original_environment(&self)->&str {&self.original_environment}
+    pub(super) fn control(&self)->&Path {&self.control}
     pub(super) fn require_current(&self,root:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
         workflow.validate_before_side_effect()?;
         ensure!(self.workflow==workflow.id() && workflow.has_registered_acceptance_context()?
@@ -266,7 +268,7 @@ fn construction_episode_at(root:&Path,control:&Path,workflow:&workflow::Workflow
     ensure!(measured.len()==64 && measured.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"constructor original environment is not measured");
     let key=digest(&serde_json::to_vec(&("verifier-construction-episode-v1",workflow.id(),registered.contract().source()?,
         registered.baseline_head(),registered.contract_hash(),&environments.current_original_baseline))?);
-    Ok(ConstructionEpisode {key,workflow:workflow.id().into(),original_base:registered.baseline_head().into(),registered_contract:registered.contract_hash().into(),control:control.canonicalize()?,source:registered.contract().source()?})
+    Ok(ConstructionEpisode {key,workflow:workflow.id().into(),original_base:registered.baseline_head().into(),original_environment:environments.current_original_baseline.clone(),registered_contract:registered.contract_hash().into(),control:control.canonicalize()?,source:registered.contract().source()?})
 }
 impl EnvironmentEvidence {
     fn transition_required(&self) -> bool {
