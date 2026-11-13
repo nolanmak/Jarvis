@@ -90,6 +90,7 @@ async fn child(case:&str) {
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
         let error=select(&repo).await.err().expect("unknown owner controls authorized fresh work");
         assert_eq!(error.to_string(),"owner-control-unavailable");
+        assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"control uncertainty lost its typed hold");
         return;
     }
     let binding=workflow::git_binding(&repo,"original request","fixture-environment",&[]).await.unwrap();

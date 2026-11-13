@@ -978,6 +978,9 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // research pipeline files 3/day and the daily cap is 3, so strict
     // newest-first would hand it the entire budget forever and human bug
     // reports would never be reached.
+    let owner_controls=workflow::FreshIssueControls::open()?;
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|error|error.context(workflow::OwnerControlUnavailable))?;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
@@ -986,6 +989,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .into_iter()
         .partition(|i| !i.research_filed);
     for iss in human.into_iter().chain(research) {
+        if owner_controls.paused(&repository,iss.number)? {
+            info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
+            continue;
+        }
         // #851 — an issue already attempted today lost a build to a refusal;
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
@@ -8050,9 +8057,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     let issue = match red_main_issue {
         Some(issue) => issue,
-        None => match pick_issue(repo_root, dry_run).await? {
-            Some(issue) => issue,
-            None => {
+        None => match pick_issue(repo_root, dry_run).await {
+            Ok(Some(issue)) => issue,
+            Err(error) if error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some()=> {
+                return Ok(RunReport::held(workflow::OwnerControlUnavailable.to_string()));
+            },
+            Err(error)=>return Err(error),
+            Ok(None) => {
                 // #1532 — a slot reserved for a build with nothing to build
                 // is spent on a waiting draft, never on idling.
                 if prefer_build {
@@ -10581,9 +10592,14 @@ async fn pick_issue_for_repo(
 ) -> Result<Option<Issue>> {
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
+    let owner_controls=workflow::FreshIssueControls::open()?;
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
+            continue;
+        }
+        if owner_controls.paused(&repo.full_name,number)? {
+            info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
         let title = iss
