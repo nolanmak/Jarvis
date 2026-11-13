@@ -61,6 +61,9 @@ mod linked_claims;
 #[cfg(test)]
 #[path = "self_improve_linked_claim_boundaries.rs"]
 mod linked_claim_boundaries;
+#[cfg(test)]
+#[path = "self_improve_paused_selection_tests.rs"]
+mod paused_selection_tests;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
