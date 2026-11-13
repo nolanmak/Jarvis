@@ -290,6 +290,21 @@ impl std::fmt::Display for MissingScopeResponse {
 impl std::error::Error for MissingScopeResponse {}
 
 pub(crate) const BASELINE_NATIVE_PURPOSE_PREFIX:&str="baseline-witness-native-v1:";
+const CONSTRUCTION_NATIVE_PURPOSE_PREFIX:&str="verifier-construction-native-v1:";
+const CONSTRUCTION_NATIVE_EPISODE_LIMIT:u64=6;
+
+/// Controller-computed episode and exact input identities. This accounting
+/// namespace grants neither a workflow lease nor authority to execute models.
+fn construction_native_episode_prefix(purpose:&str)->Result<String> {
+    let identity=purpose.strip_prefix(CONSTRUCTION_NATIVE_PURPOSE_PREFIX)
+        .context("not a construction native request")?;
+    let (episode,input)=identity.split_once(':').context("construction native request lacks exact input")?;
+    for value in [episode,input] {
+        ensure!(value.len()==64 && value.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "invalid construction native request identity");
+    }
+    Ok(format!("{CONSTRUCTION_NATIVE_PURPOSE_PREFIX}{episode}:"))
+}
 
 #[derive(Debug)]
 pub(crate) struct NativeScopeOutcomeUnresolved;
@@ -1592,6 +1607,7 @@ impl WorkflowStore {
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
+        let actual_native=admission.is_some_and(|(provider,_)|provider.is_some());
         let actual_native_reviewer=admission.is_some_and(|(provider,reviewer)|provider.is_some() && reviewer);
         let admission=admission.map(|(provider,reviewer)| {
             let mut attribution=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
@@ -1639,6 +1655,15 @@ impl WorkflowStore {
                     ensure!(limit==1 && actual_native_reviewer,"baseline native requests require exactly one attributed fresh native reviewer admission");
                     let admitted:u32=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
                     ensure!(admitted==0,"baseline native request already admitted; recover its original response");
+                }
+                if purpose.starts_with(CONSTRUCTION_NATIVE_PURPOSE_PREFIX) {
+                    let episode=construction_native_episode_prefix(purpose)?;
+                    ensure!(limit==1 && actual_native,
+                        "construction requests require one attributed actual native admission");
+                    let input_admitted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
+                    ensure!(input_admitted==0,"construction native request already admitted; recover its original response");
+                    let episode_admitted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![lease.workflow,episode],|r|r.get(0))?;
+                    ensure!(episode_admitted<CONSTRUCTION_NATIVE_EPISODE_LIMIT,"construction episode actual native-call budget exhausted");
                 }
                 // Calibration uses one observation identity per UTC day. An
                 // admitted lost response still counts after audit recovery
@@ -3671,24 +3696,55 @@ mod observation_accounting_tests {
         // Quota refusal must roll back the episode and exact-input counters too.
         assert!(store.charge_admitted_model(&lease,"quota-refused",3,Some(0),Some((&purpose(0),&binding(),1)),Some(submission::Provider::Codex),false).is_err());
         for input in 0..6 {
+            let now=10+10*i64::from(input);
             let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
             cp.binding.head=format!("candidate-{input}");
-            store.checkpoint(&lease,&cp,10+i64::from(input)).unwrap();
+            store.checkpoint(&lease,&cp,now).unwrap();
+            if input==1 {
+                let error=store.charge_admitted_model(&lease,"duplicate-before-exhaustion",now,None,Some((&purpose(0),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap_err();
+                assert!(error.to_string().contains("already admitted"));
+            }
             let receipt=format!("lost-response-{input}");
-            store.charge_admitted_model(&lease,&receipt,20+i64::from(input),None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
+            store.charge_admitted_model(&lease,&receipt,now+1,None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
             // Reobserving a dispatch is accounting replay, never a fresh call.
-            store.charge_admitted_model(&lease,&receipt,30+i64::from(input),None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
+            store.charge_admitted_model(&lease,&receipt,now+2,None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
             if input==2 {
-                store.release(&lease,40).unwrap();drop(store);
+                store.release(&lease,now+3).unwrap();drop(store);
                 store=WorkflowStore::open(&path).unwrap();
-                lease=store.claim(id,"restarted",41,1000).unwrap().unwrap();
+                lease=store.claim(id,"restarted",now+4,1000).unwrap().unwrap();
             }
         }
         let cp=store.snapshot(id).unwrap().unwrap().checkpoint;
-        assert!(store.charge_admitted_model(&lease,"seventh",50,None,Some((&purpose(6),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"binding changes replenished the construction episode");
-        assert!(store.charge_admitted_model(&lease,"duplicate-input",51,None,Some((&purpose(0),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"lost exact-input response was retried after rebinding");
+        assert!(store.charge_admitted_model(&lease,"seventh",80,None,Some((&purpose(6),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"binding changes replenished the construction episode");
+        assert!(store.charge_admitted_model(&lease,"duplicate-input",81,None,Some((&purpose(0),&cp.binding,1)),Some(submission::Provider::Codex),false).is_err(),"lost exact-input response was retried after rebinding");
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,6);
         assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),6);
+    }
+    #[test]
+    fn construction_native_budget_rejects_unattributed_or_malformed_requests_atomically() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("ledger.db")).unwrap();
+        let id="owner/repo#construction";
+        store.register(id,"probe",binding(),1).unwrap();
+        let lease=store.claim(id,"constructor",2,1000).unwrap().unwrap();
+        let valid=format!("verifier-construction-native-v1:{}:{}","a".repeat(64),"b".repeat(64));
+        let malformed=[
+            "verifier-construction-native-v1:".to_owned(),
+            format!("verifier-construction-native-v1:{}:{}","A".repeat(64),"b".repeat(64)),
+            format!("{valid}:extra"),
+            format!("verifier-construction-native-v1:{}:{}","%".repeat(64),"b".repeat(64)),
+        ];
+        for purpose in &malformed {
+            assert!(store.charge_admitted_model(&lease,"malformed",3,None,Some((purpose,&binding(),1)),Some(submission::Provider::Codex),false).is_err());
+        }
+        assert!(store.charge_bounded_call(&lease,"not-an-admission",4,None,&valid,&binding(),1).is_err());
+        assert!(store.charge_admitted_model(&lease,"no-provider",5,None,Some((&valid,&binding(),1)),None,false).is_err());
+        assert!(store.charge_admitted_model(&lease,"wrong-limit",6,None,Some((&valid,&binding(),2)),Some(submission::Provider::Codex),false).is_err());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),0);
+        store.charge_admitted_model(&lease,"first",7,None,Some((&valid,&binding(),1)),Some(submission::Provider::Codex),false).unwrap();
+        // Existing ordinary authority accounting remains a separate domain.
+        store.charge_bounded_call(&lease,"authority",8,None,"verifier-amend-input:old",&binding(),2).unwrap();
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
     }
     #[test]
     fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
