@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
+#[cfg(all(test,target_os="linux"))]
+#[path = "self_improve_fixture_probe.rs"]
+mod fixture_probe;
+
 #[path = "self_improve_amendment.rs"]
 mod amendment;
 #[path = "self_improve_scope.rs"]
