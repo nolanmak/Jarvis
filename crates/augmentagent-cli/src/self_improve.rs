@@ -992,6 +992,12 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
+        // An open GitHub issue can outlive its completed workflow. Do not
+        // spend another selection turn on work the claim gate cannot restart.
+        if owner_controls.terminal(&repository,iss.number)? {
+            info!(issue=iss.number,"skip: workflow already merged or retired; preserve completed history");
+            continue;
+        }
         // #851 — an issue already attempted today lost a build to a refusal;
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
@@ -10734,6 +10740,10 @@ async fn pick_issue_for_repo(
         }
         if owner_controls.paused(&repo.full_name,number)? {
             info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
+            continue;
+        }
+        if owner_controls.terminal(&repo.full_name,number)? {
+            info!(repo=%repo.full_name,issue=number,"skip: workflow already merged or retired; preserve completed history");
             continue;
         }
         let title = iss

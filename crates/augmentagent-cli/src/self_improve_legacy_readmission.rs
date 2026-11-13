@@ -174,11 +174,16 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
     let rows = inventory
         .as_array()
         .context("legacy issue inventory malformed")?;
-    let candidates = rows
-        .iter()
-        .filter(|row| eligible_issue(row, &allowlist))
-        .filter_map(|row| row["number"].as_u64())
-        .collect::<Vec<_>>();
+    let controls=workflow::FreshIssueControls::open()?;
+    let mut candidates=Vec::new();
+    for row in rows.iter().filter(|row|eligible_issue(row,&allowlist)) {
+        let Some(number)=row["number"].as_u64() else {continue};
+        if controls.paused(&repository,number)? || controls.terminal(&repository,number)? {
+            info!(issue=number,"skip automatic readmission: paused or terminal workflow; preserve source label");
+            continue;
+        }
+        candidates.push(number);
+    }
     if candidates.is_empty() {
         return Ok(());
     }
@@ -199,6 +204,14 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
             anyhow::ensure!(ok,"current issue unavailable: {}",truncate(&error,200));
             let current:Value=serde_json::from_str(&current)?;
             anyhow::ensure!(current["number"].as_u64()==Some(number) && eligible_issue(&current,&allowlist),"current issue no longer eligible for automatic migration");
+            // Reopen: an initially absent store or workflow may have been
+            // created/retired while GitHub evidence was read. This is still
+            // eligibility for a label mutation, never execution admission.
+            let current_controls=workflow::FreshIssueControls::open()?;
+            if current_controls.paused(&repository,number)? || current_controls.terminal(&repository,number)? {
+                info!(issue=number,"preserve automatic hold: workflow paused or terminal before label mutation");
+                return Ok(());
+            }
             let conn=rusqlite::Connection::open(&path)?;
             conn.execute("INSERT INTO legacy_readmission_receipt VALUES(?1,?2,?3,'pending') ON CONFLICT(repository,issue) DO UPDATE SET proof=excluded.proof,status='pending'",rusqlite::params![repository,number,serde_json::to_string(&evidence)?])?;
             drop(conn);
@@ -219,6 +232,25 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn actual_migration_is_free_and_preserves_manual_and_untrusted_holds() {
+        migration_fixture("normal","actual_migration_is_free_and_preserves_manual_and_untrusted_holds").await;
+    }
+    #[tokio::test]
+    async fn terminal_history_never_readmits_a_valid_obsolete_label() {
+        migration_fixture("terminal","terminal_history_never_readmits_a_valid_obsolete_label").await;
+    }
+    #[tokio::test]
+    async fn terminal_history_arriving_before_label_write_is_rechecked() {
+        migration_fixture("terminal-late","terminal_history_arriving_before_label_write_is_rechecked").await;
+    }
+    #[tokio::test]
+    async fn terminal_history_corruption_preserves_valid_obsolete_label() {
+        migration_fixture("terminal-corrupt","terminal_history_corruption_preserves_valid_obsolete_label").await;
+    }
+    #[tokio::test]
+    async fn terminal_readmission_filter_preserves_owner_pause() {
+        migration_fixture("paused","terminal_readmission_filter_preserves_owner_pause").await;
+    }
+    async fn migration_fixture(case:&str,test:&str) {
         const CHILD: &str = "AUTOSHIP_LEGACY_READMISSION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             use std::os::unix::fs::PermissionsExt;
@@ -235,7 +267,15 @@ r=pathlib.Path(os.environ['AUTOSHIP_LEGACY_READMISSION_FIXTURE']);a=sys.argv[1:]
 if a[:2]==['repo','view']: print('controller/repo')
 elif a[:2]==['api','user']: print('controller')
 elif a[:1]==['api'] and '/timeline?' in a[1]:print((r/'timeline.json').read_text())
-elif a[:1]==['api'] and '/issues/' in a[1]:print((r/'current-issue.json').read_text())
+elif a[:1]==['api'] and '/issues/' in a[1]:
+ if os.environ.get('AUTOSHIP_LEGACY_READMISSION_CASE')=='terminal-late':
+  # Only this disposable fixture DB: simulate concurrent controller retirement.
+  import sqlite3
+  with sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']) as c:
+   cp=json.loads(c.execute('SELECT checkpoint FROM workflow WHERE id=?',('controller/repo#7',)).fetchone()[0])
+   cp['stage']='retired'
+   c.execute('UPDATE workflow SET checkpoint=? WHERE id=?',(json.dumps(cp),'controller/repo#7'))
+ print((r/'current-issue.json').read_text())
 elif a[:2]==['issue','edit']:
  assert a[3:]==['--remove-label','agent-gave-up']
  with (r/'edits').open('a') as f:f.write(a[2]+'\n')
@@ -244,8 +284,8 @@ else:sys.exit(2)
             )
             .unwrap();
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::legacy_readmission::tests::actual_migration_is_free_and_preserves_manual_and_untrusted_holds","--nocapture"])
-                .env(CHILD,root.path()).env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","controller")
+            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&format!("self_improve::legacy_readmission::tests::{test}"),"--nocapture"])
+                .env("AUTOSHIP_LEGACY_READMISSION_CASE",case).env(CHILD,root.path()).env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","controller")
                 .env("XDG_STATE_HOME",root.path().join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
                 .output().unwrap();
             assert!(
@@ -268,6 +308,46 @@ else:sys.exit(2)
             serde_json::to_vec(&history(GIVE_UP_OVERTAKEN)).unwrap(),
         )
         .unwrap();
+        if case!="normal" {
+            use crate::autoship_workflow::{Binding,Checkpoint,NextAction,ResourceCharge,Stage,WorkflowStore,workflow_id};
+            let path=workflow::path();let mut store=WorkflowStore::open(&path).unwrap();
+            let id=workflow_id("controller/repo",7).unwrap();
+            let binding=Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+            store.register(&id,"fixture",binding.clone(),1).unwrap();
+            let lease=store.claim(&id,"original-worker",2,100).unwrap().unwrap();
+            store.charge(&lease,"past-work",ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},3).unwrap();
+            let stage=if case=="terminal" {Stage::Merged}else{Stage::Scope};
+            store.checkpoint(&lease,&Checkpoint {stage,binding,evidence:vec![],next:NextAction {
+                reason:"fixture_archived_state".into(),action:"complete".into(),eligible_at_ms:0}},4).unwrap();
+            store.release(&lease,5).unwrap();
+            if case=="paused" {store.set_owner_pause(&id,"github:controller",0,true,6).unwrap();}
+            let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+            let owner=store.owner_control(&id).unwrap();drop(store);
+            if case=="terminal-corrupt" {
+                rusqlite::Connection::open(&path).unwrap().execute("UPDATE workflow SET checkpoint='not-json' WHERE id=?1",[&id]).unwrap();
+            }
+            let result=sweep(&root,Some(&inventory),false).await;
+            if case=="terminal-corrupt" {assert!(result.is_err(),"unknown protected history authorized automatic readmission");}
+            else {result.unwrap();}
+            assert!(!root.join("edits").exists(),"{case}: automatic sweep removed a protected source label");
+            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            assert_eq!(store.events(&id).unwrap(),events,"sweep changed execution history");
+            assert_eq!(store.owner_control(&id).unwrap(),owner);
+            if case!="terminal-corrupt" {
+                let after=store.snapshot(&id).unwrap().unwrap();
+                if case=="terminal-late" {
+                    assert_eq!(after.checkpoint.stage,Stage::Retired);
+                    assert_eq!((after.model_calls,after.tokens,after.attempts,after.generation),
+                        (before.model_calls,before.tokens,before.attempts,before.generation));
+                }else {assert_eq!(after,before);}
+            }
+            store.query_connection(|conn| {
+                let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_readmission_receipt')",[],|r|r.get(0))?;
+                if exists {assert_eq!(conn.query_row("SELECT COUNT(*) FROM legacy_readmission_receipt",[],|r|r.get::<_,i64>(0))?,0,"blocked work acquired a pending readmission receipt");}
+                Ok(())
+            }).unwrap();
+            return;
+        }
         sweep(&root, Some(&inventory), true).await.unwrap();
         assert!(!workflow::path().exists());
         sweep(&root, Some(&inventory), false).await.unwrap();
