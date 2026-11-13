@@ -8,14 +8,50 @@ mod capture;
 pub(super) struct Plan {
     version:u32,kind:String,workflow:String,binding:crate::autoship_workflow::Binding,
     base:String,environment:String,executor:String,proposal:ContractProposal,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    approved:Option<ApprovedPlan>,
+}
+/// Frozen evidence recipe only. It cannot mint the live approved capability or
+/// authorize execution from a deserialized record.
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedPlan {
+    authority:amendment::ApprovedOriginalReference,
+    registration:RegisteredContract,
 }
 impl Plan {
     pub(super) fn checked(workflow:&str,key:&str,body:&str)->Result<Self> {
         ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
         let plan:Self=serde_json::from_str(body)?;
-        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
-            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
+        ensure!(plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
+            && plan.identity(body)?==key,"original plan accounting identity changed");
         Ok(plan)
+    }
+    fn identity(&self,body:&str)->Result<String> {
+        match (self.version,&self.approved) {
+            (1,None)=>Ok(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)),
+            (2,Some(approved))=> {
+                approved.authority.validate_plan_data(&self.workflow,&self.binding,&self.proposal,&approved.registration)?;
+                ensure!(approved.registration.baseline_head()==self.base
+                    && approved.registration.binding(&self.base)?.environment_id==self.environment,"approved original plan environment changed");
+                // Binding/publication metadata is frozen in the retained body,
+                // but cannot create a second command phase or another budget.
+                Ok(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v2",&self.workflow,
+                    &self.base,&self.environment,&self.executor,&self.proposal,&approved.registration,
+                    approved.authority.semantic_identity()?))?))
+            },
+            _=>anyhow::bail!("original plan version or approved registration mode changed"),
+        }
+    }
+    fn require_registration_data(&self,registration:&RegisteredContract)->Result<()> {
+        if let Some(approved)=&self.approved {
+            ensure!(registration==&approved.registration,"approved original registration differs from frozen mode recipe");
+        }else {
+            ensure!(!registration.has_environment_transition(),"baseline-only original plan cannot bind a transition result");
+        }
+        ensure!(registration.contract()==&self.proposal.contract && registration.baseline_head()==self.base
+            && registration.binding(&self.base)?.environment_id==self.environment,"retained original result differs from frozen plan");
+        Ok(())
     }
     pub(super) fn inputs(&self)->(&crate::autoship_workflow::Binding,&str,&str,&ContractProposal) {
         (&self.binding,&self.base,&self.environment,&self.proposal)
@@ -105,7 +141,7 @@ pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::a
 
 pub(super) fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
     let plan=Plan {version:1,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding:workflow.binding().clone(),
-        base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone()};
+        base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone(),approved:None};
     let body=serde_json::to_string(&plan)?;
     let key=amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?);
     Ok((key,body))
@@ -407,6 +443,7 @@ pub(super) fn retained_original_plan_budget_contexts(root:&Path,native_control:&
     fn checked(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,key:&str,body:&str)->Result<Option<String>> {
         let plan=Plan::checked(workflow.id(),key,body)?;
         if amendment::construction_plan_owned(root,control,workflow,key,body)? {return Ok(None);}
+        ensure!(plan.version==1,"approved original plan lacks constructor ownership; cannot grant initial-scoping budget");
         Ok(Some(initial_plan_budget_context(workflow.id(),&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)?))
     }
     let mut cursor=0;let mut contexts=std::collections::BTreeSet::new();let mut indexed=std::collections::BTreeSet::new();let mut count=0usize;
@@ -431,8 +468,12 @@ pub(super) fn retained_original_plan_budget_contexts(root:&Path,native_control:&
             let body=workflow.recorded_scope_stage_response(&key)?.context("recorded scope body missing")?;
             ensure!(body.len()<=2*1024*1024,"scope accounting body exceeds bound");
             if let Ok(value)=serde_json::from_str::<serde_json::Value>(&body) {
-                if value["kind"]=="original_verifier_plan"
-                    && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key {
+                // Legacy raw-key discovery must survive malformed owner data.
+                // A native JSON reply cannot match this controller key without
+                // a hash collision; v2 uses its separately validated identity.
+                if value["kind"]=="original_verifier_plan" &&
+                    (amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key
+                        || Plan::checked(workflow.id(),&key,&body).is_ok()) {
                     ensure!(indexed.contains(&key),"original plan lost its verifier index");
                     if let Some(context)=checked(root,native_control,workflow,&key,&body)? {contexts.insert(context);}
                 }
@@ -452,9 +493,7 @@ pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
 }
 fn validate_retained_outcome(plan:&Plan,result:&RecordedResult,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<BaselineResult> {
     let registration=&result.baseline.registration;
-    ensure!(!registration.has_environment_transition(),"baseline-only retained original plan cannot bind a transition result");
-    ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
-        && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
+    plan.require_registration_data(registration)?;
     OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
         &result.plan,&result.attempt,&result.baseline,&result.command_sources)?;
     registration.baseline_result(&result.baseline.receipts)
@@ -473,10 +512,7 @@ fn visit_original_outcomes(root:&Path,source:AcceptanceSource,binding:&crate::au
             ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==evidence.workflow()
                 && result_key(&result.plan,&result.attempt)==row.key,"retained original result identity changed");
             let body=evidence.record(&result.plan,"original_verifier_plan")?.context("retained original result lost its plan")?;
-            ensure!(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan identity changed");
-            let plan:Plan=serde_json::from_str(&body)?;
-            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
-                && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan owner or role changed");
+            let plan=Plan::checked(evidence.workflow(),&result.plan,&body)?;
             let classified=if selected.is_some(){Some(validate_retained_outcome(&plan,&result,evidence)?)}else{None};
             if plan.binding!=*binding || plan.proposal.contract.source()?!=source {continue;}
             if let Some((base,proposal_sha256))=selected {
@@ -522,9 +558,7 @@ pub(super) fn require_correction_commands(evidence:&crate::autoship_workflow::Ve
                         "original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"),"unknown original evidence role");
                     ensure!(evidence.record(&key,kind)?.as_deref()==Some(body.as_str()),"original evidence lost its role index");
                     if kind=="original_verifier_plan" {
-                        let plan:Plan=serde_json::from_str(&body)?;
-                        ensure!(plan.version==1 && plan.kind==kind && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
-                            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key,"original plan discovery identity changed");
+                        let plan=Plan::checked(evidence.workflow(),&key,&body)?;
                         plan.proposal.contract.source()?;
                     }
                 }
@@ -543,10 +577,8 @@ pub(super) fn require_correction_commands(evidence:&crate::autoship_workflow::Ve
             ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==evidence.workflow()
                 && command_key(&admitted.plan,&admitted.attempt,&admitted.verifier)==row.key,"original admission identity changed");
             let body=evidence.record(&admitted.plan,"original_verifier_plan")?.context("admitted original plan missing")?;
-            let plan:Plan=serde_json::from_str(&body)?;
-            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
-                && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==admitted.plan
-                && plan.proposal.contract.verifiers.iter().any(|verifier|verifier.id==admitted.verifier),"admitted original plan changed");
+            let plan=Plan::checked(evidence.workflow(),&admitted.plan,&body)?;
+            ensure!(plan.proposal.contract.verifiers.iter().any(|verifier|verifier.id==admitted.verifier),"admitted original verifier changed");
             let proof=evidence.record(&quiet_key(&row.key),"original_verifier_command_quiescent")?.context("admitted original command is not quiescent")?;
             require_stored_quiescence(evidence.workflow(),&row.body,&admitted,&proof)?;
             if let Some(raw)=evidence.record(&result_key(&admitted.plan,&admitted.attempt),"original_verifier_result")? {
@@ -687,6 +719,125 @@ mod tests {
             branch:"fixture",contract:"original scope",environment:"test",
         }).await.unwrap().unwrap();
         (root,control,prepared,guard)
+    }
+
+    // Synthetic DTOs exercise decoding/identity only. They are deliberately
+    // not native approvals and must never admit a command or a model call.
+    fn approved_plan_dto(prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Plan {
+        let registration=prepared.baseline.registration.clone();
+        let proposal=prepared.proposal.clone();
+        let mut binding=workflow.binding().clone();binding.contract="a".repeat(64);
+        let attempt=crate::autoship_workflow::authority_native::DispatchIntent {
+            version:2,workflow:workflow.id().into(),episode:"b".repeat(64),input:"c".repeat(64),epoch:"dto-test-only".into(),
+            stage_sha256:"d".repeat(64),provider:"codex".into(),round:0,request_sha256:"e".repeat(64),model:Some("fixture-model".into()),
+        };
+        let authority=serde_json::from_value(serde_json::json!({
+            "version":1,"kind":"approved_original_authority","intent_sha256":amendment::digest(serde_json::to_string(&attempt).unwrap().as_bytes()),
+            "attempt":attempt,"response_sha256":"1".repeat(64),"completion_sha256":"2".repeat(64),"session":"dto-only-no-native-approval",
+            "proposal_sha256":amendment::digest(&serde_json::to_vec(&proposal).unwrap()),"old_contract":binding.contract,
+            "original_plan":"3".repeat(64),"original_result":"4".repeat(64),"base":registration.baseline_head(),
+            "original_environment":registration.binding(registration.baseline_head()).unwrap().environment_id,
+            "candidate_environment":registration.candidate_environment_id(),"transition":false,
+        })).unwrap();
+        Plan {version:2,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding,
+            base:registration.baseline_head().into(),environment:registration.binding(registration.baseline_head()).unwrap().environment_id,
+            executor:"fixture-executor".into(),proposal,approved:Some(ApprovedPlan {authority,registration})}
+    }
+    fn encode_plan(plan:&Plan)->(String,String) {
+        let body=serde_json::to_string(plan).unwrap();(plan.identity(&body).unwrap(),body)
+    }
+
+    #[tokio::test]
+    async fn approved_plan_dto_identity_does_not_mint_a_phase_from_routing_or_publication_metadata() {
+        let (_root,_control,prepared,guard)=fixture().await;
+        let mut plan=approved_plan_dto(&prepared,&guard);
+        let (key,body)=encode_plan(&plan);
+        Plan::checked(guard.id(),&key,&body).unwrap();
+        plan.binding.head="f".repeat(40);
+        plan.binding.evidence_hash="routing-only".into();
+        let mut value=serde_json::to_value(&plan).unwrap();
+        value["approved"]["authority"]["original_plan"]="5".repeat(64).into();
+        value["approved"]["authority"]["original_result"]="6".repeat(64).into();
+        value["approved"]["authority"]["completion_sha256"]="7".repeat(64).into();
+        let routed:Plan=serde_json::from_value(value).unwrap();
+        assert_eq!(encode_plan(&routed).0,key,"routing or publication metadata created another original command phase");
+        assert!(guard.verifier_evidence_page("original_verifier_plan",0).unwrap().is_empty());
+        assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty());
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_plan_dto_binds_exact_registration_mode_and_executor_without_granting_initial_budget() {
+        let (root,control,prepared,guard)=fixture().await;
+        let plan=approved_plan_dto(&prepared,&guard);let (normal,body)=encode_plan(&plan);
+        let mut transition:Plan=serde_json::from_str(&body).unwrap();
+        let registration=RegisteredContract::register_transition(root.path(),prepared.proposal.contract.clone(),plan.base.clone(),
+            plan.environment.clone(),plan.environment.clone()).unwrap();
+        assert!(plan.require_registration_data(&registration).is_err(),"equal environment strings erased registration mode");
+        transition.approved.as_mut().unwrap().registration=registration.clone();
+        assert!(transition.identity(&serde_json::to_string(&transition).unwrap()).is_err(),"mode changed without matching authority data");
+        let mut value=serde_json::to_value(&transition).unwrap();value["approved"]["authority"]["transition"]=true.into();
+        transition=serde_json::from_value(value).unwrap();let (changed,encoded)=encode_plan(&transition);
+        assert_ne!(changed,normal,"approved transition reused provisional/baseline-only command identity");
+        Plan::checked(guard.id(),&changed,&encoded).unwrap().require_registration_data(&registration).unwrap();
+        let mut executor:Plan=serde_json::from_str(&encoded).unwrap();executor.executor="different executor".into();
+        assert_ne!(encode_plan(&executor).0,changed);
+        // Decoding did not publish a plan, grant budget, or execute work.
+        assert!(guard.verifier_evidence_page("original_verifier_plan",0).unwrap().is_empty());
+        assert!(retained_original_plan_budget_contexts(root.path(),control.path(),&guard).unwrap().is_empty());
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_plan_codec_preserves_v1_body_and_rejects_version_downgrades_and_inconsistent_recipes() {
+        let (_root,_control,prepared,guard)=fixture().await;
+        let (key,body)=plan_input(&guard,&prepared.proposal,"a baseline","an environment","an executor").unwrap();
+        assert!(!body.contains("\"approved\""));
+        assert_eq!(key,amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body)).unwrap()));
+        assert_eq!(serde_json::to_string(&Plan::checked(guard.id(),&key,&body).unwrap()).unwrap(),body);
+        let plan=approved_plan_dto(&prepared,&guard);let (key,body)=encode_plan(&plan);
+        for fault in ["version","proposal","base","environment","candidate","old_contract","intent","unknown"] {
+            let mut value:serde_json::Value=serde_json::from_str(&body).unwrap();
+            match fault {
+                "version"=>value["version"]=1.into(),
+                "proposal"=>value["proposal"]["contract"]["revision"]=99.into(),
+                "base"=>value["base"]="f".repeat(40).into(),
+                "environment"=>value["environment"]="other-original-environment".into(),
+                "candidate"=>value["approved"]["authority"]["candidate_environment"]="other-candidate".into(),
+                "old_contract"=>value["binding"]["contract"]="f".repeat(64).into(),
+                "intent"=>value["approved"]["authority"]["intent_sha256"]="f".repeat(64).into(),
+                "unknown"=>value["approved"]["unrecognized_permission"]=true.into(),
+                _=>unreachable!(),
+            }
+            assert!(Plan::checked(guard.id(),&key,&value.to_string()).is_err(),"{fault} was silently accepted");
+        }
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_plan_scope_union_refuses_orphan_v2_and_malformed_legacy_owner_without_mutation() {
+        for version in [1,2] {
+            let (root,control,prepared,guard)=fixture().await;
+            let (key,body)=if version==2 {
+                encode_plan(&approved_plan_dto(&prepared,&guard))
+            }else {
+                let (_,body)=plan_input(&guard,&prepared.proposal,"baseline","environment","executor").unwrap();
+                let mut plan:Plan=serde_json::from_str(&body).unwrap();plan.workflow="foreign/repo#42".into();
+                let body=serde_json::to_string(&plan).unwrap();
+                (amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body)).unwrap()),body)
+            };
+            // Existing protected data receipt without its controller-role index.
+            // This is a temporary fixture database, never production mutation.
+            guard.record_scope_stage_response(&key,&body).unwrap();
+            let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+            let before=store.snapshot(guard.id()).unwrap();let events=store.events(guard.id()).unwrap();
+            assert!(retained_original_plan_budget_contexts(root.path(),control.path(),&guard).is_err(),
+                "version {version} orphan/malformed plan disappeared from the accounting union");
+            assert_eq!(store.snapshot(guard.id()).unwrap(),before);
+            assert_eq!(store.events(guard.id()).unwrap(),events);
+            assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty());
+            drop(store);guard.finish().unwrap();
+        }
     }
 
     // Script only historical admission metadata. The kernel checker is real,

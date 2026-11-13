@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(in crate::self_improve::acceptance::amendment) struct Reference {
+pub(in crate::self_improve::acceptance) struct Reference {
     version:u32,kind:String,attempt:Attempt,intent_sha256:String,response_sha256:String,
     completion_sha256:String,session:String,proposal_sha256:String,old_contract:String,
     original_plan:String,original_result:String,base:String,original_environment:String,
@@ -13,10 +13,30 @@ pub(in crate::self_improve::acceptance::amendment) struct Reference {
 impl Reference {
     /// Excludes routing binding and staging/publication references. Those are
     /// still authenticated separately; they cannot manufacture another phase.
-    pub(in crate::self_improve::acceptance::amendment) fn semantic_identity(&self)->Result<String> {
+    pub(in crate::self_improve::acceptance) fn semantic_identity(&self)->Result<String> {
         Ok(digest(&serde_json::to_vec(&("approved-original-authorization-v1",&self.attempt,
             &self.intent_sha256,&self.response_sha256,&self.proposal_sha256,&self.old_contract,
             &self.base,&self.original_environment,&self.candidate_environment,self.transition))?))
+    }
+    /// Structural plan consistency only. Even a successfully decoded reference
+    /// remains data; native provenance and constructor ownership are separate.
+    pub(in crate::self_improve::acceptance) fn validate_plan_data(&self,workflow:&str,
+        binding:&crate::autoship_workflow::Binding,proposal:&ContractProposal,registration:&RegisteredContract)->Result<()> {
+        self.attempt.validate(workflow)?;
+        let sha=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        ensure!(self.version==1 && self.kind=="approved_original_authority" && self.attempt.version==2
+            && [&self.intent_sha256,&self.response_sha256,&self.completion_sha256,&self.proposal_sha256,
+                &self.old_contract,&self.original_plan,&self.original_result].into_iter().all(|v|sha(v))
+            && !self.session.is_empty() && self.old_contract==binding.contract
+            && digest(serde_json::to_string(&self.attempt)?.as_bytes())==self.intent_sha256
+            && digest(&serde_json::to_vec(proposal)?)==self.proposal_sha256
+            && self.base==registration.baseline_head()
+            && self.original_environment==registration.binding(&self.base)?.environment_id
+            && self.candidate_environment==registration.candidate_environment_id()
+            && self.transition==registration.has_environment_transition(),initial_repair::Hold::EvidenceUnknown);
+        registration.verify_pinned_data(&proposal.files)?;
+        ensure!(registration.contract()==&proposal.contract,initial_repair::Hold::EvidenceUnknown);
+        Ok(())
     }
     /// Retained review provenance only. Original-plan/result and measurement
     /// ownership references still need their own validation. This never creates

@@ -9,6 +9,7 @@ mod source_evidence;
 mod construction;
 #[path="self_improve_amendment_adjudication.rs"]
 mod adjudication;
+pub(super) use adjudication::ApprovedOriginalReference;
 pub(super) fn require_retained_authority_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
     adjudication::require_retained(root,repository,workflow,observations)
 }

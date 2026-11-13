@@ -844,3 +844,46 @@ These results still leave `execute_registered` without distinct approved
 OriginalExecution custody. The complete versioned plan/capture/ownership/recovery
 implementation must replace that call to turn the actual custody RED green. No activation,
 engineering PR, new full-suite result or full #2058 completion is claimed.
+
+
+## Approved original plan decoding — implementation in progress
+
+The original-plan reader now has an explicit v2 data representation retaining
+both the exact registration and native authority reference. Its semantic key
+binds workflow, original base/environment, executor, full proposal, registration
+(including transition presence) and review authorization. Routing binding and
+transient publication references remain in the immutable body but do not create
+a second command phase. V1 writers still omit the new optional field and retain
+their original body/hash format. Unknown modes and inconsistent recipes reject.
+A structurally valid reference is data only; native provenance, constructor
+ownership and current execution authority are separate requirements.
+
+Exact-result loading, retained-outcome validation, command discovery and bounded
+scope-union accounting share the version-aware parser. An approved plan without
+constructor ownership cannot become an initial-scoping grant. The union must
+retain legacy raw-key discovery even for malformed v1 owner metadata; parsing
+success alone is insufficient evidence that an older charged plan is absent.
+
+This checkpoint deliberately adds no v2 writer or command grant. The storage
+writer, mutation-boundary hold/recovery routing, OriginalExecution creation,
+constructor-owner records and Pending activation still need their coordinated
+v2 implementation before the approved command can retain its own capture. Freeze
+the first body atomically with its existing construction-owner record, or provide
+an equally crash-safe retained-body recovery. Never publish an owner that cannot
+recover its exact body, adopt an orphan as owned, or allow a metadata-only change
+to create another original execution. The existing real custody regression
+remains the end-to-end RED until those joins are implemented and tested.
+
+
+Validation for this reader checkpoint: the new scope-union regression first failed
+on a malformed legacy-owner record disappearing from accounting (5.26 seconds,
+after a successful 1 minute 41 second compile). Keeping legacy raw-key discovery
+alongside v2 identity fixed it. The complete acceptance-component selection then
+passed **236 tests / 0 failures / 11 explicit isolation ignores**, in 272.38
+seconds after a 1 minute 36 second managed compile. Coverage includes exact-mode
+identity, metadata-only deduplication, v1 serialization, inconsistent/downgraded
+recipes, orphan-plan discovery, amendment/native provenance and existing original
+capture/recovery. This is not the full CLI suite. In particular, the actual
+approved-transition custody regression remains explicitly ignored in this run
+and intentionally RED at its last delegated execution; no new approved command
+or successful restart was proved by decoding tests.
