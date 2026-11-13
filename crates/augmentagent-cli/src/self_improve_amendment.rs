@@ -5,6 +5,8 @@ use super::*;
 use sha2::{Digest, Sha256};
 #[path = "self_improve_amendment_source.rs"]
 mod source_evidence;
+#[path = "self_improve_construction.rs"]
+mod construction;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Decision {
