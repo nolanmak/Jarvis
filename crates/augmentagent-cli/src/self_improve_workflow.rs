@@ -1695,6 +1695,11 @@ impl WorkflowGuard {
         let custody=store.baseline_native_custody(&self.lease,&self.binding,millis())?;
         acceptance::initial_correction_evidence(root,&control,source,base,proposal_sha256,&self.binding,&custody,&store.inspect_verifier_evidence(self.id()))
     }
+    pub(super) fn exact_original_result_data(&self,plan:&str,result:&str)->Result<acceptance::OriginalResultData> {
+        self.validate_before_side_effect()?;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?;
+        acceptance::exact_original_result_data(plan,result,&store.inspect_verifier_evidence(self.id()))
+    }
 
     pub(super) fn baseline_native_custody(&self)->Result<Vec<durable::NativeScopeCustody>> {
         self.validate_before_side_effect()?;

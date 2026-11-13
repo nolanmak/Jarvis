@@ -63,19 +63,44 @@ pub(super) struct CapturedCommandData {
     pub(super) interrupted:bool,pub(super) output_complete:bool,
 }
 #[derive(Serialize)]
-pub(super) struct OriginalResultData {
+pub(in crate::self_improve) struct OriginalResultData {
     pub(super) identity:String,
     pub(super) binding:crate::autoship_workflow::Binding,
     pub(super) prepared:PreparedAcceptance,
     pub(super) commands:BTreeMap<String,CapturedCommandData>,
 }
 pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
+    require_correction_commands(evidence)?;
     let body=evidence.record(plan_key,"original_verifier_plan")?.context("original plan missing")?;
     let plan=Plan::checked(evidence.workflow(),plan_key,&body)?;
     let raw=evidence.record(result,"original_verifier_result")?.context("original result missing")?;
     let record:RecordedResult=serde_json::from_str(&raw)?;
-    Ok(OriginalResultData {identity:amendment::digest(raw.as_bytes()),binding:plan.binding,
-        prepared:PreparedAcceptance {proposal:plan.proposal,baseline:record.baseline},commands:BTreeMap::new()})
+    ensure!(record.version==1 && record.kind=="original_verifier_result" && record.workflow==evidence.workflow()
+        && record.plan==plan_key && result_key(&record.plan,&record.attempt)==result,"exact original result reference changed");
+    validate_retained_outcome(&plan,&record,evidence)?;
+    record.baseline.registration.verify_pinned_data(&plan.proposal.files)?;
+    ensure!(!record.baseline.receipts.iter().any(|r|r.result==crate::autoship_contract::CheckResult::InfrastructureFailure),"exact original result is infrastructure-only");
+    let mut commands=BTreeMap::new();let mut captures=BTreeMap::new();
+    for receipt in &record.baseline.receipts {
+        let attempt=record.command_sources.get(&receipt.verifier_id).unwrap_or(&record.attempt);
+        let key=command_key(plan_key,attempt,&receipt.verifier_id);
+        let admission=evidence.record(&key,"original_verifier_command_admission")?.context("exact original command missing")?;
+        let admitted:Admission=serde_json::from_str(&admission)?;
+        ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==evidence.workflow()
+            && admitted.plan==plan_key && admitted.attempt==*attempt && admitted.verifier==receipt.verifier_id,"exact original command reference changed");
+        let quiet=evidence.record(&quiet_key(&key),"original_verifier_command_quiescent")?.context("exact original command is not quiescent")?;
+        require_stored_quiescence(evidence.workflow(),&admission,&admitted,&quiet)?;
+        let captured=admitted.capture.context("exact original command lacks durable capture")?.read(&key,&admitted.identity)?.context("exact original output missing")?;
+        let observation=captured.observation;
+        ensure!(!observation.interrupted && observation.output_complete && observation.exit_code.is_some()
+            && amendment::digest(format!("{}\n{}",observation.stdout,observation.stderr).as_bytes())==receipt.output_digest,"exact original output differs from complete receipt");
+        captures.insert(receipt.verifier_id.clone(),(key,amendment::digest(admission.as_bytes()),amendment::digest(quiet.as_bytes()),captured.manifest_sha256));
+        commands.insert(receipt.verifier_id.clone(),CapturedCommandData {exit_code:observation.exit_code,stdout:observation.stdout,stderr:observation.stderr,
+            interrupted:observation.interrupted,output_complete:observation.output_complete});
+    }
+    let identity=amendment::digest(&serde_json::to_vec(&("exact-original-result-data-v1",evidence.workflow(),plan_key,result,
+        amendment::digest(body.as_bytes()),amendment::digest(raw.as_bytes()),captures,&commands))?);
+    Ok(OriginalResultData {identity,binding:plan.binding,prepared:PreparedAcceptance {proposal:plan.proposal,baseline:record.baseline},commands})
 }
 
 pub(super) fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
@@ -121,6 +146,7 @@ pub(super) struct OriginalExecution<'a> {
 }
 
 impl<'a> OriginalExecution<'a> {
+    pub(super) fn result_reference(&self)->String {result_key(&self.plan,&self.attempt)}
     pub(super) fn begin(workflow:&'a workflow::WorkflowGuard,control:&Path,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Self> {
         let (key,body)=plan_input(workflow,proposal,base,environment,executor)?;
         workflow.record_verifier_evidence(&key,"original_verifier_plan",&body)?;

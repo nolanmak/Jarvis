@@ -187,6 +187,13 @@ pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&
     selected.map(|(identity,judgment)|Ok((identity,serde_json::to_string(&judgment)?))).transpose()
 }
 
+/// Proposed-adapter diagnosis data; this never qualifies installed candidate
+/// files or imports an old positive judgment as current approval.
+pub(super) fn retained_proposal_diagnosis_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],_expected:Option<&str>)->Result<Option<(String,String)>> {
+    retained_semantic_diagnosis_in(root,control,prepared,custody)
+}
+
 /// Source data may use a positive original witness without importing approval.
 pub(super) fn retained_source_context_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
@@ -316,6 +323,26 @@ pub(super) fn prepared_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedA
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proposed_negative_diagnosis_does_not_require_installing_unapproved_adapter_in_candidate() {
+        let (root,control,old)=fixture();let mut next=old.clone();
+        next.proposal.contract.revision+=1;
+        next.proposal.files.values_mut().next().unwrap().push_str("\n# proposed replacement, not candidate code\n");
+        for (path,body) in &next.proposal.files {std::fs::write(root.path().join(path),body).unwrap();}
+        next.baseline.registration=RegisteredContract::register(root.path(),next.proposal.contract.clone(),old.baseline.registration.baseline_head().into(),environment_id(root.path()).unwrap()).unwrap();
+        next.baseline.receipts=vec![next.baseline.registration.observe(root.path(),"observe",next.baseline.registration.binding(next.baseline.registration.baseline_head()).unwrap(),
+            &Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true}).unwrap()];
+        persist_scripted(root.path(),control.path(),&next,false).unwrap();
+        let custody=vec![scripted_native_custody(control.path(),&next).unwrap()];
+        for (path,body) in &old.proposal.files {std::fs::write(root.path().join(path),body).unwrap();}
+        let path=root.path().join(old.proposal.files.keys().next().unwrap());let before=std::fs::read(&path).unwrap();
+        let diagnosis=retained_proposal_diagnosis_in(root.path(),control.path(),&next,&custody,None).unwrap().expect("complete negative proposal diagnosis lost");
+        assert!(diagnosis.1.contains("Original fixture is absent"));
+        assert_eq!(std::fs::read(path).unwrap(),before,"reading diagnosis installed an unapproved harness");
+        assert!(assert_current(root.path(),control.path(),&next).is_err(),"data reader granted candidate qualification");
+        let mut changed=next;changed.proposal.files.values_mut().next().unwrap().push_str("forged adapter bytes");
+        assert!(retained_proposal_diagnosis_in(root.path(),control.path(),&changed,&custody,None).is_err());
+    }
     pub(super) fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {
         let root=tempfile::tempdir_in("/tmp").unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(root.path().join("behavior.py"),"READY = False\n").unwrap();

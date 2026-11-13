@@ -588,13 +588,9 @@ impl RegisteredContract {
     /// Authenticate original source data without installing missing adapters.
     /// This is not candidate integrity or a positive qualification receipt.
     pub(crate) fn verify_source_files(&self,root:&Path,files:&BTreeMap<String,String>)->Result<()> {
-        self.verify_metadata()?;
-        let pinned=self.contract.verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<BTreeSet<_>>();
-        ensure!(pinned.len()==self.file_hashes.len() && pinned.iter().all(|path|self.file_hashes.contains_key(*path)),"registered source file set changed");
+        self.verify_pinned_data(files)?;
         let root=root.canonicalize()?;
         for (file,expected) in &self.file_hashes {
-            let body=files.get(file).context("original pinned source is absent")?;
-            ensure!(body.len() as u64<=MAX_FILE_BYTES && digest(body.as_bytes())==*expected,"original pinned source changed");
             let mut path=root.clone();let mut present=true;
             for component in Path::new(file).components() {
                 path.push(component);
@@ -605,6 +601,18 @@ impl RegisteredContract {
                 }
             }
             if present {ensure!(hash_file(&root,file)?==*expected,"existing original adapter changed");}
+        }
+        Ok(())
+    }
+    /// Stored proposal bytes only, never installed candidate integrity or a
+    /// qualification grant. Callers separately authenticate their provenance.
+    pub(crate) fn verify_pinned_data(&self,files:&BTreeMap<String,String>)->Result<()> {
+        self.verify_metadata()?;
+        let pinned=self.contract.verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<BTreeSet<_>>();
+        ensure!(pinned.len()==self.file_hashes.len() && pinned.iter().all(|path|self.file_hashes.contains_key(*path)),"registered source file set changed");
+        for (file,expected) in &self.file_hashes {
+            let body=files.get(file).context("original pinned source is absent")?;
+            ensure!(body.len() as u64<=MAX_FILE_BYTES && digest(body.as_bytes())==*expected,"original pinned source changed");
         }
         Ok(())
     }

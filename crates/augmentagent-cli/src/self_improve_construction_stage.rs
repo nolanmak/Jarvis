@@ -37,6 +37,9 @@ pub(in crate::self_improve::acceptance::amendment) struct StagedCorrection {
     old_contract:String,
     candidate_environment:String,
     measurement:Measurement,
+    original_plan:String,
+    original_result:String,
+    original_data_identity:String,
     prepared:PreparedAcceptance,
 }
 impl StagedCorrection {
@@ -53,6 +56,11 @@ impl StagedCorrection {
             && self.prepared.baseline.registration.baseline_head()==episode.original_base()
             && self.prepared.baseline.registration.baseline_result(&self.prepared.baseline.receipts)?==BaselineResult::Reproduced,
             initial_repair::Hold::EvidenceUnknown);
+        let data=workflow.exact_original_result_data(&self.original_plan,&self.original_result)?;
+        ensure!(data.identity==self.original_data_identity && data.binding==self.binding
+            && serde_json::to_vec(&data.prepared)?==serde_json::to_vec(&self.prepared)?,initial_repair::Hold::EvidenceUnknown);
+        let (plan,body)=verifier_execution::plan_input(workflow,self.measurement.proposal(),episode.original_base(),episode.original_environment(),&verifier_executor_id()?)?;
+        ensure!(plan==self.original_plan && accounting::owned(root,episode.control(),workflow,&plan,&body)?,initial_repair::Hold::EvidenceUnknown);
         baseline_witness::assert_current(&self.original,episode.control(),&self.prepared)
     }
     pub(in crate::self_improve::acceptance::amendment) fn validate_decision(&self,decision:&Decision)->Result<()> {
@@ -96,19 +104,23 @@ where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::Wo
     accounting::reserve(root,workflow,episode,measurement,&plan,&body)?;
     // OriginalExecution retains every conclusive result, including already
     // green and unexpected failures. Reuse those exact observations too.
-    let baseline=if let Some((_,baseline))=verifier_execution::OriginalExecution::retained_result(&original,workflow,proposal,episode.original_base(),&environment,&executor)? {
-        reproduce_observation(baseline)?
+    let (original_result,baseline)=if let Some((result,baseline))=verifier_execution::OriginalExecution::retained_result(&original,workflow,proposal,episode.original_base(),&environment,&executor)? {
+        (result,reproduce_observation(baseline)?)
     }else{
         let execution=verifier_execution::OriginalExecution::begin(workflow,episode.control(),proposal,episode.original_base(),&environment,&executor)?;
-        register_and_reproduce_original(&original,proposal.clone(),workflow.audit_logger(),execution.clone()).await.map_err(|error|execution.failed(error))?
+        let baseline=register_and_reproduce_original(&original,proposal.clone(),workflow.audit_logger(),execution.clone()).await.map_err(|error|execution.failed(error))?;
+        (execution.result_reference(),baseline)
     };
     let prepared=PreparedAcceptance {proposal:proposal.clone(),baseline};
+    let original_data=workflow.exact_original_result_data(&plan,&original_result)?;
+    ensure!(serde_json::to_vec(&original_data.prepared)?==serde_json::to_vec(&prepared)?,initial_repair::Hold::EvidenceUnknown);
     qualify(&original,episode.control(),&prepared,workflow).await?;
     // A callback's success, including an eventual cached qualifier, is not
     // enough: independently re-read the protected current-policy witness.
     baseline_witness::assert_current(&original,episode.control(),&prepared)?;
     let staged=StagedCorrection {_directory:directory,original,workflow:workflow.id().into(),binding,
-        old_contract:episode.registered_contract.clone(),candidate_environment,measurement:measurement.clone(),prepared};
+        old_contract:episode.registered_contract.clone(),candidate_environment,measurement:measurement.clone(),
+        original_plan:plan,original_result,original_data_identity:original_data.identity,prepared};
     staged.require_current(root,workflow,episode).await?;
     Ok(staged)
 }

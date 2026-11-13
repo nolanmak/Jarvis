@@ -32,6 +32,10 @@ mod initial_repair;
 #[path = "self_improve_verifier_execution.rs"]
 mod verifier_execution;
 pub(super) use verifier_execution::recover_original_verifier;
+pub(super) use verifier_execution::OriginalResultData;
+pub(super) fn exact_original_result_data(plan:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
+    verifier_execution::exact_original_result(plan,result,evidence).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))
+}
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
