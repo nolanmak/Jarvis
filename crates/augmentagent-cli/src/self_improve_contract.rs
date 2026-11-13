@@ -22,6 +22,9 @@ mod constructor_native;
 pub(super) fn require_retained_constructor_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
     constructor_native::require_retained(root,repository,workflow,observations)
 }
+pub(super) fn require_retained_authority_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    amendment::require_retained_authority_custody(root,repository,workflow,observations)
+}
 pub(super) fn require_original_correction_custody(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
     verifier_execution::require_correction_commands(evidence).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))
 }
@@ -1582,6 +1585,8 @@ pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGua
 fn native_custody_failure(error:&anyhow::Error)->bool {
     error.downcast_ref::<scope_authority::NativeCustodyUnavailable>().is_some()
         || error.downcast_ref::<crate::autoship_workflow::NativeScopeOutcomeUnresolved>().is_some()
+        || error.downcast_ref::<crate::autoship_workflow::ConstructionNativeOutcomeUnresolved>().is_some()
+        || error.downcast_ref::<crate::autoship_workflow::authority_native::OutcomeUnresolved>().is_some()
 }
 
 // Keep the actual initial producer available to crash/reopen regression fixtures.
@@ -1688,6 +1693,14 @@ async fn initial_correction_proposal(root:&Path,source:AcceptanceSource,base:&st
 #[cfg(all(test,target_os="linux"))]
 mod initial_correction_tests {
     use super::*;
+
+    #[test]
+    fn authority_native_unknown_retains_physical_custody_hold_classification() {
+        let error=initial_scope_replay_error(crate::autoship_workflow::authority_native::OutcomeUnresolved.into());
+        assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+        assert!(native_custody_failure(&error));
+        assert!(!native_custody_failure(&anyhow::anyhow!("unrelated setup failure")));
+    }
 
     #[test]
     fn initial_correction_private_section_counts_serialized_utf8_without_truncation() {

@@ -46,7 +46,7 @@ impl<'a> VerifierEvidenceInspection<'a> {
     /// existing inspection transaction without starting another transaction.
     pub(crate) fn native_response_keys(&self)->Result<std::collections::BTreeSet<String>> {
         let mut keys=std::collections::BTreeSet::new();
-        for domain in [NativeCustodyDomain::Baseline,NativeCustodyDomain::Construction] {
+        for domain in [NativeCustodyDomain::Baseline,NativeCustodyDomain::Construction,NativeCustodyDomain::Adjudication] {
             for reply in native_custody(self.conn,self.workflow,domain)? {
                 let controller:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2)",params![self.workflow,reply.input],|row|row.get(0))?;
                 ensure!(!controller && keys.insert(reply.input),"native output conflicts with controller evidence ownership");

@@ -9,6 +9,9 @@ mod source_evidence;
 mod construction;
 #[path="self_improve_amendment_adjudication.rs"]
 mod adjudication;
+pub(super) fn require_retained_authority_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    adjudication::require_retained(root,repository,workflow,observations)
+}
 pub(super) fn construction_plan_owned(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,plan:&str,body:&str)->Result<bool> {
     construction::original_plan_owned(root,control,workflow,plan,body)
 }
@@ -392,24 +395,21 @@ async fn authority(
     let provider=if origin.is_imported() {adoption::imported_reviewer()}
         else {select_session_isolated_reviewer(&reviewer_pool(),authors,reviewer_status)}
         .map_err(|why|format!("{why:?}"));
-    adjudication::review_with(root,workflow,episode,Some(staged),provider,context,input_context,epoch,|request,sink| {
+    let result=adjudication::review_with(root,workflow,episode,Some(staged),|pinned| {
+        if let Some(original)=pinned {
+            if matches!(reviewer_status(original),ReviewerStatus::Ready) {Ok(original)}else{Err("original reserved provider is not ready".into())}
+        }else{provider.clone()}
+    },context,input_context,epoch,|provider,opts,request| {
         let origin=&origin;
         async move {
-            let provider=sink.provider()?;
             let reasoner=augmentagent_channel_core::build_workflow_pinned(provider).context("native verifier authority unavailable")?;
-            let mut opts=codex_review_opts(root.to_path_buf(),sink.system());
-            opts.allowed_tools.clear();opts.settings_json=None;opts.handoff_path=None;opts.audit_logger=Some(workflow.audit_logger());
-            if provider==augmentagent_channel_core::ProviderKind::Claude {opts.model=Some(build_model());}
             origin.validate(&actual_head(root).await?)?;workflow.require_fresh_issue(root).await?;
-            augmentagent_channel_core::native_session::fresh_review_scope(provider,
-                augmentagent_channel_core::model_router::native_reviewer_scope(provider,async move {
-                    let raw=reasoner.call(&opts,&request).await?;
-                    origin.validate(&actual_head(root).await?)?;
-                    let session=augmentagent_channel_core::native_session::current_for(provider)?.context("authority native session missing")?.id().context("authority native session unobserved")?;
-                    sink.complete(&raw,&session)?;Ok(raw)
-                })).await
+            reasoner.call(&opts,&request).await
         }
-    }).await
+    }).await?;
+    // A completed response is already durable before later head/origin checks.
+    origin.validate(&actual_head(root).await?)?;
+    Ok(result)
 }
 
 fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
@@ -575,6 +575,11 @@ pub(super) async fn try_amend(
     {
         return Ok(None);
     }
+    // Original result readers require settled native custody. Restore an
+    // unpublished original authority result before reconstructing the stage.
+    let authority_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    adjudication::recover_unpublished(root,workflow,&authority_control)
+        .map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
     old.baseline.registration.verify_integrity(root)?;
     let initial_environment=environment_id(root)?;
     let epoch=digest(&serde_json::to_vec(&(source,old.baseline.registration.baseline_head(),&initial_environment))?);
@@ -582,7 +587,7 @@ pub(super) async fn try_amend(
     // data, original measurements and qualification; no new producer/command.
     // This allows a completed fourth decision to resume without a fifth call.
     let authority_exhausted=workflow.epoch_attempts("verifier-amend-total",&epoch)? >= 4;
-    if authority_exhausted && !adjudication::retained_output_hint(control)? {
+    if authority_exhausted && !adjudication::retained_output_hint(control,workflow)? {
         ensure!(adjudication.is_none(),"adjudicated amendment epoch budget exhausted; changed trusted inputs required");
         return Err(initial_repair::Hold::Exhausted.into());
     }

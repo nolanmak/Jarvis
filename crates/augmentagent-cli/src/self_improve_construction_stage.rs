@@ -295,6 +295,47 @@ pub(super) mod tests {
 
     #[cfg(target_os="linux")]
     #[tokio::test]
+    #[ignore="delegated original execution plus native admission accounting; run built binary outside cargo-managed lease; model replies scripted"]
+    async fn qualified_authority_setup_refusal_retries_reserved_intent_after_restart_without_extra_attempt()->Result<()> {
+        let (root,control,old,mut guard,episode,_namespace)=super::super::tests::native_namespace_fixture().await;
+        let measurement=owned_measurement(root.path(),&guard,&episode,&old,super::super::tests::proposal(&old)).await?;
+        let staged=stage_with(root.path(),&guard,&episode,&measurement,|original,control,prepared,_|Box::pin(async move {
+            baseline_witness::persist_scripted(original,control,prepared,true)
+        })).await?;
+        let calls=std::sync::atomic::AtomicUsize::new(0);let calls=&calls;
+        let first=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),|_|Ok(augmentagent_channel_core::ProviderKind::Codex),
+            "complete owner requirements and immutable original source","setup-input","setup-epoch",|_,_,_| {
+                calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                async {anyhow::bail!("scripted runtime capacity refusal before any native admission")}
+            }).await;
+        ensure!(first.is_err() && calls.load(std::sync::atomic::Ordering::SeqCst)==1,"setup refusal fixture did not run once");
+        ensure!(guard.epoch_attempts("verifier-amend-total","setup-epoch")?==1,"fixture lost its original strategy reservation");
+        let repository=guard.repository().to_string();guard.finish()?;
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&control.path().join("workflow.db"),workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:&repository,source_issue:None,pr:Some(840),branch:"fixture",
+            contract:"Complete original owner request",environment:"fixture"}).await?.context("fixture workflow did not reacquire")?;
+        guard.bind_acceptance_for_recovery(&old)?;
+        let raw=serde_json::to_string(&Decision {approved:false,previous_contract_hash:old.baseline.registration.contract_hash().into(),
+            approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent scripted reviewer legitimately declines this correction".into(),proposal:None})?;
+        let raw=&raw;let workflow=&guard;
+        let second=adjudication::review_with(root.path(),workflow,&episode,Some(&staged),|_|Ok(augmentagent_channel_core::ProviderKind::Codex),
+            "complete owner requirements and immutable original source","setup-input","setup-epoch",|provider,_,_|async move {
+                calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                let session=augmentagent_channel_core::native_session::current_for(provider)?.context("fixture native scope absent")?;
+                let mut native=session.begin(provider)?;workflow.audit_logger().model_call_admitted(provider.name())?;
+                native.observe(&format!("scripted-setup-recovery-{}",uuid::Uuid::new_v4()))?;native.finish()?;
+                Ok(raw.clone())
+            }).await;
+        ensure!(calls.load(std::sync::atomic::Ordering::SeqCst)==2,"known zero-admission setup refusal became a permanent unknown-outcome hold: {second:?}");
+        ensure!(!second?.0.approved,"fixture changed a legitimate refusal into approval");
+        ensure!(guard.epoch_attempts("verifier-amend-total","setup-epoch")?==1,"setup recovery spent a second total attempt");
+        let state=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db"))?.snapshot(guard.id())?.context("fixture workflow missing")?;
+        ensure!(state.model_calls==2,"setup refusal/recovery charged anything beyond constructor plus one native reviewer");
+        guard.finish()?;Ok(())
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
     #[ignore="actual isolated original execution owns managed storage; run built test outside cargo-managed lease; constructor and witness replies are scripted"]
     async fn isolated_constructed_stage_requires_real_red_current_witness_and_reuses_original_result()->Result<()> {
         // The native transport/accounting is exercised with a scripted provider
@@ -360,38 +401,36 @@ pub(super) mod tests {
                         approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent scripted authority approves only this exact measured correction".into(),proposal:Some(measurement.proposal().clone())};
                     let raw=serde_json::to_string(&exact)?;let raw=&raw;let workflow=&guard;
                     let context=authority_request_context("fixture",guard.original_owner_request()?,None)?;let context=&context;
-                    let first=adjudication::review_with(root.path(),workflow,&episode,Some(&staged),Ok(augmentagent_channel_core::ProviderKind::Codex),
-                        context,"fixture-input","fixture-authority",|request,sink|async move {
+                    // Fail the index publication after physical native bytes
+                    // are durable. Only this disposable fixture DB is touched.
+                    let fault=rusqlite::Connection::open(control.path().join("workflow.db"))?;
+                    fault.execute_batch("CREATE TRIGGER refuse_authority_index BEFORE INSERT ON scope_stage_response WHEN json_valid(NEW.response) AND json_extract(NEW.response,'$.version')=2 AND json_extract(NEW.response,'$.response_sha256') IS NOT NULL BEGIN SELECT RAISE(ABORT,'scripted authority index publication failure'); END;")?;
+                    let first=adjudication::review_with(root.path(),workflow,&episode,Some(&staged),|_|Ok(augmentagent_channel_core::ProviderKind::Codex),
+                        context,"fixture-input","fixture-authority",|provider,_,request|async move {
                             ensure!(request.contains("qualified_original_witness") && request.contains("original_plan") && request.contains("READY = False"),"authority lost staged original evidence");
                             ensure!(request.contains(workflow.original_owner_request()?),"authority lost the complete original owner request");
                             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
-                            let provider=sink.provider()?;
-                            augmentagent_channel_core::native_session::fresh_review_scope(provider,
-                                augmentagent_channel_core::model_router::native_reviewer_scope(provider,async move {
-                                    let session=augmentagent_channel_core::native_session::current_for(provider)?.context("scripted authority scope absent")?;
-                                    let mut native=session.begin(provider)?;workflow.audit_logger().model_call_admitted(provider.name())?;
-                                    native.observe(&format!("scripted-independent-authority-{}",uuid::Uuid::new_v4()))?;native.finish()?;
-                                    let id=session.id().context("scripted authority identity absent")?;sink.complete(raw,&id)?;
-                                    // Simulate caller failure after the completed native
-                                    // response is durable but before amendment staging.
-                                    Err::<String,_>(anyhow::anyhow!("scripted exit after durable authority output"))
-                                })).await
+                            let session=augmentagent_channel_core::native_session::current_for(provider)?.context("scripted authority scope absent")?;
+                            let mut native=session.begin(provider)?;workflow.audit_logger().model_call_admitted(provider.name())?;
+                            native.observe(&format!("scripted-independent-authority-{}",uuid::Uuid::new_v4()))?;native.finish()?;
+                            Ok(raw.clone())
                         }).await;
+                    fault.execute_batch("DROP TRIGGER refuse_authority_index;")?;
                     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst)==1,"fixture did not make one fourth-attempt callback");
                     let first_error=first.err().context("fixture did not simulate post-completion caller failure")?;
-                    ensure!(first_error.to_string()=="scripted exit after durable authority output","authority fixture failed before durable output: {first_error:#}");
+                    ensure!(format!("{first_error:#}").contains("scripted authority index publication failure"),"authority fixture failed before durable output: {first_error:#}");
                     eprintln!("Staged authority fixture: fourth native output completed before simulated caller failure");
                     ensure!(guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"qualified review did not use existing total allowance");
-                    let replay=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),Err("scripted provider unavailable today".into()),
-                        "changed transient defaults must not replace the frozen request","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("completed fourth review dispatched another native call")}).await.map_err(|error|error.context("replay completed fourth authority output"))?;
+                    let replay=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),|_|Err("scripted provider unavailable today".into()),
+                        "changed transient defaults must not replace the frozen request","fixture-input","fixture-authority",|_,_,_|async {anyhow::bail!("completed fourth review dispatched another native call")}).await.map_err(|error|error.context("replay completed fourth authority output"))?;
                     eprintln!("Staged authority fixture: cached fourth decision replayed while provider unavailable");
                     ensure!(serde_json::to_vec(&replay.0)?==serde_json::to_vec(&exact)? && replay.1=="codex","replay changed the completed decision or observed provider");
                     ensure!(guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"replay spent a fifth authority attempt");
                     let outputs=std::fs::read_dir(control.path())?.map(|e|e.map(|e|e.path())).collect::<std::io::Result<Vec<_>>>()?;
                     let output=outputs.into_iter().find(|p|p.file_name().is_some_and(|name|name.to_string_lossy().starts_with("authority-") && name.to_string_lossy().ends_with(".response"))).context("retained authority output absent")?;
                     let bytes=std::fs::read(&output)?;std::fs::remove_file(&output)?;
-                    let missing=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),Ok(augmentagent_channel_core::ProviderKind::Codex),
-                        "Complete unchanged owner requirements and authenticated source data","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("missing authority output dispatched another native call")}).await;
+                    let missing=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),|_|Ok(augmentagent_channel_core::ProviderKind::Codex),
+                        "Complete unchanged owner requirements and authenticated source data","fixture-input","fixture-authority",|_,_,_|async {anyhow::bail!("missing authority output dispatched another native call")}).await;
                     ensure!(missing.is_err() && guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"lost authority output replenished review allowance");
                     {
                         use std::io::Write;use std::os::unix::fs::OpenOptionsExt;
@@ -425,8 +464,8 @@ pub(super) mod tests {
                         baseline_witness::assert_current(original,control,prepared)
                     })).await.map_err(|error|error.context("reconstruct qualified stage after routing binding rotation"))?;
                     ensure!(replay.adjudication_identity(root.path(),&guard,&episode).await?==previous_identity,"binding metadata replenished the same semantic review input");
-                    let cached=adjudication::review_with(root.path(),&guard,&episode,Some(&replay),Err("scripted unavailable provider".into()),
-                        "new routing metadata remains context only","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("binding metadata retried the completed fourth authority call")}).await.map_err(|error|error.context("replay same completed verdict across binding metadata rotation"))?;
+                    let cached=adjudication::review_with(root.path(),&guard,&episode,Some(&replay),|_|Err("scripted unavailable provider".into()),
+                        "new routing metadata remains context only","fixture-input","fixture-authority",|_,_,_|async {anyhow::bail!("binding metadata retried the completed fourth authority call")}).await.map_err(|error|error.context("replay same completed verdict across binding metadata rotation"))?;
                     ensure!(cached.0.approved && guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"metadata rotation changed the completed verdict or allowance");
                     let file=std::fs::read_dir(control.path())?.map(|e|e.map(|e|e.path())).collect::<std::io::Result<Vec<_>>>()?
                         .into_iter().find(|p|p.file_name().is_some_and(|n|n.to_string_lossy().starts_with("baseline-witness-") && n.to_string_lossy().ends_with(".json")))

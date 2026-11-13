@@ -998,6 +998,8 @@ impl WorkflowGuard {
             acceptance::require_retained_native_custody(&worktree,&custody)?;
             let construction=store.construction_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_constructor_custody(&worktree,&repository,&lease.workflow,&construction)?;
+            let authority=store.authority_native_custody(&lease,&current.checkpoint.binding,millis()).map_err(acceptance::initial_scope_replay_error)?;
+            acceptance::require_retained_authority_custody(&worktree,&repository,&lease.workflow,&authority)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
                 let state=store.snapshot(&lease.workflow)?.context("workflow missing")?;
                 let authority=acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?;
@@ -1019,7 +1021,7 @@ impl WorkflowGuard {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
             }
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
-            if bounded.as_ref().is_some_and(|call|call.purpose.starts_with(durable::CONSTRUCTION_NATIVE_PURPOSE_PREFIX)) {
+            if bounded.as_ref().is_some_and(|call|call.purpose.starts_with(durable::CONSTRUCTION_NATIVE_PURPOSE_PREFIX) || call.purpose.starts_with(durable::authority_native::PREFIX)) {
                 anyhow::ensure!(augmentagent_channel_core::native_session::literal_text_provider().is_some_and(|sealed|sealed.name()==provider),
                     "constructor native admission requires its literal text grant");
             }
@@ -1721,6 +1723,16 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .construction_native_custody(&self.lease,&self.binding,millis())
+    }
+    pub(super) fn authority_native_admission(&self,purpose:&str)->Result<Option<durable::submission::Provider>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .authority_native_admission(&self.lease,&self.binding,purpose,millis())
+    }
+    pub(super) fn authority_native_custody(&self)->Result<Vec<durable::NativeScopeCustody>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .authority_native_custody(&self.lease,&self.binding,millis())
     }
     pub(super) fn construction_native_admission(&self,purpose:&str)->Result<Option<durable::submission::Provider>> {
         self.validate_before_side_effect()?;

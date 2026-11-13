@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path="autoship_authority_native.rs"]
+pub(crate) mod authority_native;
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
 #[path = "autoship_resource_refusal.rs"]
@@ -348,11 +350,11 @@ pub(crate) struct NativeScopeCustody {
 }
 
 #[derive(Clone,Copy)]
-enum NativeCustodyDomain {Baseline,Construction}
+enum NativeCustodyDomain {Baseline,Construction,Adjudication}
 impl NativeCustodyDomain {
-    fn prefix(self)->&'static str {match self {Self::Baseline=>BASELINE_NATIVE_PURPOSE_PREFIX,Self::Construction=>CONSTRUCTION_NATIVE_PURPOSE_PREFIX}}
-    fn keys(self,purpose:&str)->Result<(String,String)> {match self {Self::Baseline=>baseline_native_response_keys(purpose),Self::Construction=>construction_native_response_keys(purpose)}}
-    fn unresolved(self)->anyhow::Error {match self {Self::Baseline=>NativeScopeOutcomeUnresolved.into(),Self::Construction=>ConstructionNativeOutcomeUnresolved.into()}}
+    fn prefix(self)->&'static str {match self {Self::Baseline=>BASELINE_NATIVE_PURPOSE_PREFIX,Self::Construction=>CONSTRUCTION_NATIVE_PURPOSE_PREFIX,Self::Adjudication=>authority_native::PREFIX}}
+    fn keys(self,purpose:&str)->Result<(String,String)> {match self {Self::Baseline=>baseline_native_response_keys(purpose),Self::Construction=>construction_native_response_keys(purpose),Self::Adjudication=>authority_native::response_keys(purpose)}}
+    fn unresolved(self)->anyhow::Error {match self {Self::Baseline=>NativeScopeOutcomeUnresolved.into(),Self::Construction=>ConstructionNativeOutcomeUnresolved.into(),Self::Adjudication=>authority_native::OutcomeUnresolved.into()}}
 }
 
 fn baseline_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<NativeScopeCustody>> {
@@ -375,7 +377,7 @@ fn native_custody(tx:&Connection,workflow:&str,domain:NativeCustodyDomain)->Resu
         let (raw,proof)=domain.keys(purpose)?;
         ensure!(seen.insert(purpose.to_owned()),"native input has multiple actual admissions");
         ensure!(admission["bounded"]["limit"]==1,"native admission lacks exact-input attribution");
-        if matches!(domain,NativeCustodyDomain::Baseline) {ensure!(admission["reviewer"]==true,"baseline admission lacks fresh-review attribution");}
+        if !matches!(domain,NativeCustodyDomain::Construction) {ensure!(admission["reviewer"]==true,"baseline admission lacks fresh-review attribution");}
         let provider:submission::Provider=serde_json::from_value(admission["provider"].clone())?;
         let binding:Binding=serde_json::from_value(admission["bounded"]["binding"].clone())?;
         let receipt=admission["receipt"].as_str().context("baseline admission lost its accounting receipt")?;
@@ -394,6 +396,28 @@ fn native_custody(tx:&Connection,workflow:&str,domain:NativeCustodyDomain)->Resu
     // This returns original custody, not semantic qualification. The consumer
     // must validate every private native provenance file before new dispatch.
     Ok(custody)
+}
+
+/// Exact admission inspection reuses charge/count attribution but deliberately
+/// does not require output yet: the original publisher may still be recovering.
+fn native_admission(conn:&Connection,workflow:&str,purpose:&str,domain:NativeCustodyDomain)->Result<Option<submission::Provider>> {
+    domain.keys(purpose)?;let mut found=None;
+    let mut statement=conn.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
+    for raw in statement.query_map([workflow],|r|r.get::<_,String>(0))? {
+        let value:serde_json::Value=serde_json::from_str(&raw?)?;
+        if value["bounded"]["purpose"].as_str()!=Some(purpose) {continue;}
+        ensure!(found.is_none() && value["bounded"]["limit"]==1,"native admission attribution conflicts");
+        if !matches!(domain,NativeCustodyDomain::Construction) {ensure!(value["reviewer"]==true,"native admission lacks fresh reviewer ownership");}
+        let original:Binding=serde_json::from_value(value["bounded"]["binding"].clone())?;
+        let receipt=value["receipt"].as_str().context("native admission receipt missing")?;
+        let charged:Option<u32>=conn.query_row("SELECT model_calls FROM resource_charge WHERE workflow=?1 AND id=?2",params![workflow,receipt],|r|r.get(0)).optional()?;
+        let counted:Option<u32>=conn.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![workflow,purpose,serde_json::to_string(&original)?],|r|r.get(0)).optional()?;
+        if charged!=Some(1) || counted!=Some(1) {return Err(domain.unresolved());}
+        found=Some(serde_json::from_value(value["provider"].clone())?);
+    }
+    let counted:u64=conn.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![workflow,purpose],|r|r.get(0))?;
+    if counted!=u64::from(found.is_some()) {return Err(domain.unresolved());}
+    Ok(found)
 }
 
 pub struct WorkflowStore {
@@ -450,28 +474,20 @@ impl WorkflowStore {
     /// Inspect the original exact dispatch for response recovery. This grants
     /// no admission and does not treat an unanswered request as a fresh slot.
     pub(crate) fn construction_native_admission(&mut self,lease:&Lease,binding:&Binding,purpose:&str,now:i64)->Result<Option<submission::Provider>> {
-        construction_native_response_keys(purpose)?;
-        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,binding,now)?;
-        let mut found=None;
-        {
-            let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
-            let admissions=statement.query_map([&lease.workflow],|r|r.get::<_,String>(0))?;
-            for raw in admissions {
-                let value:serde_json::Value=serde_json::from_str(&raw?)?;
-                if value["bounded"]["purpose"].as_str()!=Some(purpose) {continue;}
-                ensure!(found.is_none() && value["bounded"]["limit"]==1,"constructor admission attribution conflicts");
-                let original:Binding=serde_json::from_value(value["bounded"]["binding"].clone())?;
-                let receipt=value["receipt"].as_str().context("constructor admission receipt missing")?;
-                let charged:Option<u32>=tx.query_row("SELECT model_calls FROM resource_charge WHERE workflow=?1 AND id=?2",params![lease.workflow,receipt],|r|r.get(0)).optional()?;
-                let counted:Option<u32>=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![lease.workflow,purpose,serde_json::to_string(&original)?],|r|r.get(0)).optional()?;
-                ensure!(charged==Some(1) && counted==Some(1),ConstructionNativeOutcomeUnresolved);
-                found=Some(serde_json::from_value(value["provider"].clone())?);
-            }
-        }
-        let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
-        ensure!(counted==u64::from(found.is_some()),ConstructionNativeOutcomeUnresolved);
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let found=native_admission(&tx,&lease.workflow,purpose,NativeCustodyDomain::Construction)?;
         tx.commit()?;Ok(found)
+    }
+    pub(crate) fn authority_native_admission(&mut self,lease:&Lease,binding:&Binding,purpose:&str,now:i64)->Result<Option<submission::Provider>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let found=native_admission(&tx,&lease.workflow,purpose,NativeCustodyDomain::Adjudication)?;
+        tx.commit()?;Ok(found)
+    }
+    pub(crate) fn authority_native_custody(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<Vec<NativeScopeCustody>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let mut data=native_custody(&tx,&lease.workflow,NativeCustodyDomain::Adjudication)?;
+        data.extend(authority_native::legacy_custody(&tx,&lease.workflow)?);
+        tx.commit()?;Ok(data)
     }
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
@@ -1674,6 +1690,7 @@ impl WorkflowStore {
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
+        let admitted_provider=admission.and_then(|(provider,_)|provider);
         let actual_native=admission.is_some_and(|(provider,_)|provider.is_some());
         let actual_native_reviewer=admission.is_some_and(|(provider,reviewer)|provider.is_some() && reviewer);
         let admission=admission.map(|(provider,reviewer)| {
@@ -1716,6 +1733,8 @@ impl WorkflowStore {
             if admission.is_some() {
                 baseline_native_custody(&tx,&lease.workflow)?;
                 construction_native_custody(&tx,&lease.workflow)?;
+                native_custody(&tx,&lease.workflow,NativeCustodyDomain::Adjudication)?;
+                authority_native::legacy_custody(&tx,&lease.workflow)?;
             }
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
@@ -1734,6 +1753,13 @@ impl WorkflowStore {
                     ensure!(input_admitted==0,"construction native request already admitted; recover its original response");
                     let episode_admitted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![lease.workflow,episode],|r|r.get(0))?;
                     ensure!(episode_admitted<CONSTRUCTION_NATIVE_EPISODE_LIMIT,"construction episode actual native-call budget exhausted");
+                }
+                if purpose.starts_with(authority_native::PREFIX) {
+                    authority_native::response_keys(purpose)?;
+                    ensure!(limit==1 && actual_native_reviewer,"authority requests require one attributed fresh native reviewer admission");
+                    authority_native::require_prepared(&tx,&lease.workflow,purpose,admitted_provider.context("authority native provider missing")?)?;
+                    let count:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
+                    ensure!(count==0,"authority native request already admitted; recover its original output");
                 }
                 // Calibration uses one observation identity per UTC day. An
                 // admitted lost response still counts after audit recovery
@@ -3895,6 +3921,48 @@ mod observation_accounting_tests {
         store.charge_admitted_model(&lease,"next",9,None,Some((&second,&cp.binding,1)),Some(submission::Provider::Claude),false).unwrap();
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
     }
+    #[test]
+    fn authority_native_setup_and_actual_admission_have_distinct_recovery_semantics() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
+        let mut store=WorkflowStore::open(&path).unwrap();let id="owner/repo#authority-recovery";
+        store.register(id,"probe",binding(),1).unwrap();let lease=store.claim(id,"first",2,1000).unwrap().unwrap();
+        let intent=authority_native::DispatchIntent {version:2,workflow:id.into(),episode:"a".repeat(64),input:"b".repeat(64),
+            epoch:"same-epoch".into(),stage_sha256:"c".repeat(64),provider:"codex".into(),round:0,request_sha256:"d".repeat(64),model:Some("frozen-model".into())};
+        let purpose=intent.native_purpose().unwrap();let native=Some((&purpose[..],&binding(),1));
+        assert!(store.charge_admitted_model(&lease,"no-intent",3,None,native,Some(submission::Provider::Codex),true).is_err());
+        assert!(store.admit_staged_authority_attempt(&lease,&binding(),&intent.input,&intent.epoch,&intent.dispatch_key(),&serde_json::to_string(&intent).unwrap(),4).unwrap());
+        assert!(store.authority_native_admission(&lease,&binding(),&purpose,5).unwrap().is_none());
+        assert!(store.authority_native_custody(&lease,&binding(),6).unwrap().is_empty());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        assert!(store.charge_admitted_model(&lease,"wrong-provider",7,None,native,Some(submission::Provider::Claude),true).is_err());
+        assert!(store.charge_admitted_model(&lease,"not-reviewer",8,None,native,Some(submission::Provider::Codex),false).is_err());
+        store.charge_admitted_model(&lease,"actual",9,None,native,Some(submission::Provider::Codex),true).unwrap();
+        assert_eq!(store.authority_native_admission(&lease,&binding(),&purpose,10).unwrap(),Some(submission::Provider::Codex));
+        store.release(&lease,11).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let lease=store.claim(id,"restart",12,1000).unwrap().unwrap();
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.binding.head="new-routing-head".into();store.checkpoint(&lease,&cp,13).unwrap();
+        let error=store.charge_admitted_model(&lease,"other-role",14,None,None,Some(submission::Provider::Claude),true).unwrap_err();
+        assert!(error.is::<authority_native::OutcomeUnresolved>(),"unknown actual authority output did not fence another role: {error:#}");
+        let (raw,proof)=authority_native::response_keys(&purpose).unwrap();
+        store.record_scope_stage_response_pair(&lease,&cp.binding,&raw,"original native output",&proof,"original native provenance",15).unwrap();
+        assert!(store.charge_admitted_model(&lease,"duplicate",16,None,Some((&purpose,&cp.binding,1)),Some(submission::Provider::Codex),true).is_err());
+        store.charge_admitted_model(&lease,"other-role",17,None,None,Some(submission::Provider::Claude),true).unwrap();
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
+    }
+
+    #[test]
+    fn legacy_authority_intent_without_outcome_never_becomes_free_setup() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("ledger.db")).unwrap();
+        let id="owner/repo#legacy-authority";store.register(id,"probe",binding(),1).unwrap();let lease=store.claim(id,"first",2,1000).unwrap().unwrap();
+        let intent=authority_native::DispatchIntent {version:1,workflow:id.into(),episode:"a".repeat(64),input:"b".repeat(64),epoch:"legacy".into(),
+            stage_sha256:"c".repeat(64),provider:"claude".into(),round:0,request_sha256:"d".repeat(64),model:None};
+        let body=serde_json::to_string(&intent).unwrap();
+        assert!(store.admit_staged_authority_attempt(&lease,&binding(),&intent.input,&intent.epoch,&intent.dispatch_key(),&body,3).unwrap());
+        let error=store.charge_admitted_model(&lease,"fresh",4,None,None,Some(submission::Provider::Codex),true).unwrap_err();
+        assert!(error.is::<authority_native::OutcomeUnresolved>());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+    }
+
     #[test]
     fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");

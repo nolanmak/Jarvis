@@ -86,7 +86,7 @@ fn response_path(control:&Path,response:&str)->PathBuf {control.join(format!("co
 
 /// Same effective owner boundary as native witness evidence, with an expected
 /// controller namespace supplied independently of the persisted reference.
-fn private_control(root:&Path,control:&Path)->Result<()> {
+pub(super) fn private_control(root:&Path,control:&Path)->Result<()> {
     ensure!(control.is_absolute() && control.canonicalize()?==control,"constructor control namespace changed");
     let owner=unsafe{libc::geteuid()};
     ensure!(control.metadata()?.uid()==owner,"constructor control has a foreign owner");

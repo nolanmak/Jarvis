@@ -302,7 +302,7 @@ pub(super) mod tests {
     /// The real cross-model custody guard derives this namespace itself.
     /// Own a unique canonical fixture namespace rather than overriding that
     /// guard or writing into any production workflow's control directory.
-    pub(super) async fn native_namespace_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode,tempfile::TempDir) {
+    pub(in crate::self_improve::acceptance::amendment) async fn native_namespace_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode,tempfile::TempDir) {
         use std::os::unix::fs::PermissionsExt;
         let (root,unused,old)=qualification_fixture();drop(unused);
         let repository=format!("fixture-owner/constructor-{}",uuid::Uuid::new_v4().simple());

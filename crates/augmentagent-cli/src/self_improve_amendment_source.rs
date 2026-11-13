@@ -675,12 +675,12 @@ mod tests {
         let (candidate,control,_old,guard,episode)=construction::tests::fixture().await;
         let expected=guard.binding().contract.clone();let calls=std::sync::atomic::AtomicUsize::new(0);
         let result=super::adjudication::review_with(candidate.path(),&guard,&episode,None,
-            Ok(augmentagent_channel_core::ProviderKind::Codex),&request,"unstaged-input","same-epoch",|prompt,_sink| {
+            |_|Ok(augmentagent_channel_core::ProviderKind::Codex),&request,"unstaged-input","same-epoch",|_,_,prompt| {
             assert!(prompt.contains("pub fn behavior() -> bool { false }"),"fixture lost authenticated original source");
             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
             let raw=serde_json::json!({"approved":false,"previous_contract_hash":expected,
                 "approve_environment_transition":false,"reason":"No complete measured replacement was supplied for independent adjudication","proposal":null}).to_string();
-            async move {Ok((raw,"scripted-independent-authority".into()))}
+            async move {Ok(raw)}
         }).await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0,
             "source-only dispute spent independent authority before a concrete staged correction existed");

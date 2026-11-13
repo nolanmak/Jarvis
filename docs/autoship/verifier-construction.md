@@ -556,8 +556,63 @@ a completed fourth attempt; unavailable providers do not justify re-review. Miss
 reply bytes hold. A crash after physical completion but before paired publication
 can republish only that same authenticated private completion.
 
-At an already exhausted authority epoch, no possible retained native output
-means the existing immediate exhausted hold. A possible private completion pair
+A prepared authority intent reserves the existing strategy allowance, but is
+separate from actual native admission. New version-two intents freeze the
+provider and model and use one exact input/round native admission domain. The
+service owns the fresh-review, native-reviewer and literal-text scopes; callers
+supply only transport. Before dispatch, the actual model observer requires that
+exact prepared intent and its original strategy reservation. Restart recovery
+may retry a provably unadmitted setup refusal using the same reservation,
+provider, model and frozen request. It neither refunds nor spends another
+strategy attempt. Once actual admission exists, missing output fences every new
+model role until the original evidence is recovered. Legacy version-one intents
+lack this exact attribution: complete historical data can replay, but missing
+legacy output remains unknown, never free setup.
+
+The protected native scope retains the exact private intent, response and
+provenance before atomically publishing their paired index. The cross-model
+observer authenticates these private bytes before another model role starts.
+Actual native admissions remain distinct from controller intent records and
+model JSON cannot claim controller ownership.
+
+The setup-refusal restart regression first failed against the old boundary,
+then passed in a delegated isolated run (134.39 seconds). It executes the
+original behavior for real while scripting constructor, witness and reviewer
+replies. The reserved strategy count stays one after restart, and actual model
+accounting includes only the constructor plus one reviewer. A separate selected
+suite including final hold classification passes 24 tests with one opt-in ignore
+(40.96 seconds). The unpublished-output recovery fixture is still being
+verified; these results
+do not establish a live provider conversation, deployment or autonomous merge.
+
+The expanded crash fixture then reproduced a second ordering failure in 134.70
+seconds: physical fourth-attempt output survived, but original-result inspection
+required its paired index before the authority reader could restore that index.
+The repair authenticates each exact protected version-two dispatch intent,
+actual admission and private intent/result/provenance before restoring an absent
+original pair ahead of staged-data reconstruction. A missing private result or
+conflicting index remains a hold. This data-only recovery neither grants review
+approval nor changes counters, provider, model or payload. Both the authority
+boundary and amendment ingress use it; restricted held-work scheduling remains a
+separate open obligation. The new focused fault/restart check passed in the
+delegated service in 62.03 seconds, covering setup-only, failed index publication,
+lost outcome and lost private output. It requires the real run-resource policy
+and is explicitly opt-in in the ordinary suite. The final managed CLI suite
+passes 2,092 tests, with zero failures and 45 explicit opt-in ignores (393.47
+seconds). The read-only historical source compatibility probe passes in 25.38
+seconds, preserving the retired workflow's generation 12 and 27 calls, all eight
+source files (343,299 serialized bytes) and the 414,111-byte historical authority
+preflight. It makes no native call or workflow write. Both expanded isolated
+staging/restart fixtures passed together in 604.25 seconds: original red and
+current-witness gates, cached fourth-result restoration/replay, missing native
+and original capture refusal, same semantic verdict across binding movement,
+and zero-admission setup retry without another strategy charge. Constructor,
+qualifier and reviewer replies remain scripted; original isolated commands and
+protected accounting are real. This is neither a live provider conversation nor
+an autonomous merge or deployment.
+
+At an already exhausted authority epoch, no possible retained native output or
+prepared intent means the existing immediate exhausted hold. A possible private completion pair
 is only a routing hint, not approval. The amendment path then permits only
 retained constructor output, retained original measurements and existing qualification.
 It cannot launch new construction conversations, original commands or a new
@@ -620,13 +675,13 @@ a downstream implementer:
   implemented, but approved environment-transition registration must obtain a
   distinct correct `OriginalExecution` identity/capture rather than relabeling
   provisional receipts. Preserve existing `Pending` v1 compatibility.
-- Resolve authority setup/capacity refusals before handoff. The current strategy
-  attempt and dispatch intent are reserved before backend runtime preparation;
-  a refusal with zero actual native admission can leave an intent without output.
-  Bind this to existing actual-native admission/custody and allow supported
-  known-not-admitted setup recovery. Never reset/refund historical counters or
-  retry an actually admitted/uncertain native call. Owner: implementation agent;
-  trigger: before an engineering PR or activation.
+- Connect the validated exact-native authority setup/output recovery to the
+  complete restricted held-work recovery route before handoff. Component and
+  isolated restart checks now pass, including zero admission and unpublished
+  original-output restoration. They do not prove that a production held workflow
+  can reach that data recovery and genuine cue through free selection. Preserve
+  every historical strategy charge and never retry an admitted unknown outcome.
+  Owner: implementation agent; trigger: before engineering PR or activation.
 - Finish setup-only producer-policy migration for frozen unadmitted inputs. Prove
   absence of actual admission using the existing native ownership domain before
   allowing setup repair; missing output after actual admission stays unknown.
