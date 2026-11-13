@@ -162,6 +162,12 @@ shapes keep the existing exact-identity handling. Recovery evidence, owner pause
 charges and prior results are preserved. This does not rewind an already reclaimed
 episode or silently restart an administratively paused workflow.
 
+[Initial verifier budget references](initial-verifier-budget-reference.md) also
+preserve a spent episode across the crash before its stable hold is saved and a
+controller rollout. The primary issue frontend replays the original scoped
+decision and checks exhaustion before paid readiness/scoping. Missing custody
+remains an evidence-recovery hold; an older accounting reference is not approval.
+
 Private progress retains the typed review blocker when a worker wrapper finishes.
 A resume acknowledgement is still intent, and can wait for native retirement or
 another admission guard. If a format correction remains incomplete, inspect the
