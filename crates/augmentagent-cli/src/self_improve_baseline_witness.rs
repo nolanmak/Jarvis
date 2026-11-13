@@ -225,6 +225,13 @@ fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authorit
 }
 
 pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    disposition(&current_judgment(root,control,prepared)?)
+}
+pub(super) fn current_data(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<serde_json::Value> {
+    let judgment=current_judgment(root,control,prepared)?;disposition(&judgment)?;
+    Ok(serde_json::to_value(judgment)?)
+}
+fn current_judgment(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<Judgment> {
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     prepared.baseline.registration.verify_integrity(root)?;
     let control=control.canonicalize()?;
@@ -243,7 +250,7 @@ pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptan
         scope_authority::verify_witness_reply(&artifact.native_control,prepared.baseline.registration.baseline_head(),&expected,&reply)?;
         validate(root,&prepared.proposal,&prepared.baseline,&expected,&reply.text)
     })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    disposition(&checked)
+    Ok(checked)
 }
 
 fn qualification_prompt(expected:&str,prepared:&PreparedAcceptance)->Result<String> {

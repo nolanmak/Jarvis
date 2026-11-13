@@ -10,11 +10,19 @@ approve the remaining producer, admission, staging or fixture integrations.
 
 ## Evidence and scope
 
-The amendment path currently asks an independent authority to construct and
+The deployed amendment path asks an independent authority to construct and
 approve a replacement in one response. It records a complete refusal before
 constructing or measuring any replacement. Complete original source supplied to
 ordinary #2014 did not produce a replacement. Its completed decline, original
 request, candidate and 27 recorded calls remain preserved.
+
+On 2026-11-13, normal engineering PR #2072 landed on main as `971943d8` and
+closed #2014; the older bot PR #2027 was closed as superseded. Supported
+`autopr status` reports #2014 retired at generation 12 with all 27 model calls
+preserved and no autonomous merge credit. Never reopen or resubmit that workflow
+for this repair. Its saved source/requests/decisions are historical compatibility
+data, not active-target eligibility. Ordinary autonomous acceptance must use
+naturally selected open work, and never repair PR #2072.
 
 An opt-in probe compiled an observer against original commit `1d390c41`, through
 the existing storage admission, immutable exporter and isolated executor. Public
@@ -166,12 +174,13 @@ requested needle rather than treating all read failures as model mistakes.
 Exact failed proposals and private diagnoses are included in subsequent requests
 without silent truncation. An oversized complete context holds before dispatch.
 
-This driver returns an **unqualified measurement intent**. It is not connected
-to production selection, original measurement, witness qualification or
-authority admission yet. Those integrations, the restricted component lease and
-cross-episode data-only recovery remain required before rollout. The existing
-source-only authority-boundary regression remains red. No production constructor
-conversation or autonomous merge is established by these component tests.
+This driver returns an **unqualified measurement intent**. Its first component
+checkpoint did not connect original measurement, qualification or authority
+admission; the source-only authority regression was then red. The later qualified
+authority checkpoint below records the current code wiring and its remaining
+rollout blockers. Production selection, the restricted component lease and
+cross-episode data-only recovery still need completion. Component tests establish
+no production constructor conversation or autonomous merge.
 
 The next checkpoint reproduced and fixed a pending-intent replay bug: changed
 validation inputs could turn the saved proposal into a formatting retry and
@@ -193,8 +202,9 @@ non-deserializable `StagedCorrection` retains that checkout and rechecks complet
 workflow binding, environments, original commit, constructor ownership and the
 protected current witness. A successful qualifier callback alone cannot create
 it. Its decision validator rejects unmeasured proposal or environment-mode
-rewrites and preserves legitimate refusals. This is still an unactivated service;
-the existing production authority has not been converted to require this type.
+rewrites and preserves legitimate refusals. This remains unactivated. The first
+staging checkpoint did not convert authority admission; the qualified authority
+checkpoint below records that later code integration.
 
 A second admission regression reached actual constructor model accounting with
 an unsettled original command. The constructor-purpose observer now invokes the
@@ -230,7 +240,8 @@ rejections cannot enter the production constructor. The bounded
 `construct_and_stage` service retains semantic failure evidence before rejection
 and retries within the same three measurement slots; infrastructure and unknown
 effects leave the same intent pending. This service still needs the restricted
-lease/selector and typed authority integration before production activation.
+lease/selector and the remaining authority/registration integration before
+production activation.
 
 The feedback checkpoint passes 20 construction tests and 65 capture, witness
 and contract tests, with four explicit isolation ignores across those component
@@ -241,7 +252,8 @@ fixture remain scripted. The read-only retained-production compatibility probe
 also passes: eight original files, 343,299 serialized source bytes, the unchanged
 414,111-byte historical request including system text, and zero native calls or
 workflow writes. These are component and compatibility results; the unresolved
-source-only authority regression remains outside the passing selections.
+source-only authority regression was outside those passing selections; its later
+connected fix is described below.
 
 The ownership checkpoint has 56 selected accounting, initial-repair, recovery,
 constructor and transport tests passing (one explicit isolation ignore). The
@@ -265,7 +277,8 @@ of the role it names. A native-output key with a controller evidence index is a
 conflict, not an exemption. Missing real controller indexes continue to hold.
 The final expanded selection passes 170 tests with zero failures and four
 explicit isolation ignores; the connected staging-before-authority regression
-remains outside this passing component selection and is still unresolved.
+was outside that passing component selection and remained unresolved at that
+checkpoint.
 
 The authority integration must re-read the exact retained original result and
 its captures immediately before spending review authority. The live stage now retains the exact original plan/result and
@@ -273,8 +286,8 @@ captured-data identity and re-reads them on each `require_current`, alongside
 constructor/witness/binding/environment checks. Its isolation regression removes
 an actual captured stream after staging and requires refusal despite a cached
 positive witness, then restores the fixture bytes and checks witness loss
-separately. These stage checks are not yet connected to authority admission; the
-all-command guard alone is not a substitute for that typed input gate. Also preserve an
+separately. The later authority checkpoint connects these checks before both
+attempt counters; the all-command guard alone is not that typed input gate. Also preserve an
 unadmitted saved request across producer-policy rollouts without spending or
 refilling its episode: the current transport conservatively refuses a fresh call
 under an old producer hash. Any supported migration must authenticate absence of
@@ -452,9 +465,10 @@ payloads, plus guard tests rejecting option/payload changes before dispatch.
 The broader provider suite passes (747, with 16 opt-in tests ignored); constructor,
 source and episode tests pass (14), and workflow regressions pass (266, with one existing ignored
 test). These counts do not claim the full CLI suite passes: the separate
-source-only-before-authority regression remains RED until staging integration.
+source-only-before-authority regression was RED at that checkpoint. The later
+qualified authority checkpoint records its connected fix.
 The legacy source slice also passes (14). The read-only production probe
-authenticates the actual #2014 active enrollment and retained original source,
+authenticated the then-active #2014 enrollment and retained original source,
 reconstructs the same eight files and bounded complete request, and proves
 unchanged workflow state with zero model calls. Fresh read-only review rechecked
 the recovery-metadata finding after the protected-enrollment fix and found that
@@ -489,13 +503,100 @@ an explicit data-only path for an old admitted request; it cannot relax the
 new-dispatch episode check. Scripted native conversations in disposable tests
 are not a production model run, behavioral red or independent approval.
 
+## Qualified authority boundary — unactivated implementation checkpoint
+
+The working implementation now connects `construct_and_stage` to `try_amend`.
+The constructor receives the complete owner request, exact old proposal, failure,
+canonical-main/contribution facts, environment evidence and any bound final
+ruling. It uses the existing source table and bounded original-source reads. An
+independent authority can be reached only with the live, non-deserializable
+`StagedCorrection`. That object re-authenticates native constructor ownership,
+original plan/result and complete capture, exact workflow binding/environment,
+intended original red and the protected current witness before an attempt is
+reserved. The connected source-only regression passes with zero backend calls,
+zero per-input attempts, zero total attempts and zero recorded model calls.
+The earlier red ran in a delegated context and reached one backend callback;
+the ordinary shell's resource refusal was not counted as behavioral red.
+
+Adjudication receives the exact staged draft, complete original output and
+qualified witness, plus bounded immutable source selected for that qualified
+original measurement through the existing source service. Its text-only system
+asks for approval of that exact draft or a legitimate refusal. Approved adapter
+bytes, scope additions and proposed environment mode must match exactly; neither
+approval nor a request for schema consistency can author another correction.
+Provider diversity includes constructor authorship, and the existing protected
+fresh-review session service remains mandatory. The output sink checks the
+observed native session against constructor and retained historical/current
+builder sessions before retaining it.
+
+The authority input key binds workflow, episode, exact draft, registered original
+baseline, complete observed commands and sorted immutable production citations,
+plus the complete-owner/final-scope authorization context and candidate execution
+environment. It excludes routing heads, current binding metadata, publication
+references, excerpt serialization, witness reason wording, prompt wording,
+producer-policy hashes and transient checkout paths. A live stage still requires
+its exact full current binding; an old live value fails after binding rotation.
+A newly reconstructed stage with the same semantic proof can replay the completed
+verdict. Such replay grants no candidate-green or final code-review evidence. The complete prompt
+and system are frozen in protected scope data before dispatch. Defaults or
+wording changes do not create a new review key; completed replies replay the
+frozen input. An unadmitted frozen request under a changed producer policy holds
+until the explicit setup-only migration is implemented, rather than dispatching
+under an unknown policy or replenishing an episode.
+
+The existing two-response consistency loop checks this stage before every fresh
+attempt. Both existing counters (`verifier-amend-input`, limit two, and
+`verifier-amend-total`, limit four) and the exact dispatch intent commit in one
+store transaction. Exhausting either counter or failing intent publication cannot
+partially spend the other counter. A duplicate admitted intent without completed
+output remains unknown. The raw native reply and completion proof are retained
+privately inside the fresh-review scope before it is released. A completed reply
+replays without requiring provider availability or attempt admission, including
+a completed fourth attempt; unavailable providers do not justify re-review. Missing or changed
+reply bytes hold. A crash after physical completion but before paired publication
+can republish only that same authenticated private completion.
+
+At an already exhausted authority epoch, no possible retained native output
+means the existing immediate exhausted hold. A possible private completion pair
+is only a routing hint, not approval. The amendment path then permits only
+retained constructor output, retained original measurements and existing qualification.
+It cannot launch new construction conversations, original commands or a new
+qualifier while reconstructing the completed decision. Existing `Pending` v1
+transactions and historical completed decisions/charges remain preserved.
+
+The complete CLI suite passes: 2,089 tests, zero failures and 43 opt-in ignores
+in 398.12 seconds. After the canonical-namespace fixture correction, 22 selected
+component checks pass with one explicit isolation ignore. The delegated isolated
+check passes separately in 480.02 seconds: completed fourth output survives a
+simulated caller exit, replays with an unavailable provider, refuses missing
+native/original output and preserves the same verdict across binding metadata
+rotation while fencing the old live stage. It measures real isolated original
+execution with scripted constructor, qualifier and reviewer replies; it proves
+no live provider conversation or natural autonomous merge.
+
+The retained-production probe also passes after #2014's closure. It reads eight
+original files (343,299 serialized bytes), verifies the protected owner request
+and unchanged retired workflow snapshot (generation 12, 27 model calls), and
+asserts the active resolver still refuses the closed issue/PR. It makes no native
+calls or workflow writes. The legacy request-format preflight totals 414,111
+bytes including system text; its digest can change with current canonical-main
+metadata. This is source/format compatibility, not a claim to reproduce the
+exact historical authority conversation or to grant a new admission. Before any engineering PR or activation, finish the authorized
+registration/execution identity (including approved environment mode), retain its
+original execution/capture through `OriginalExecution`, prove the current
+source/staged-proposal handoff, add the restricted held-work component lease and
+genuine qualified cue, and implement setup-only producer migration. The complete
+#2014 original fixture and all #1703 natural shipping, CLI/private Discord,
+capacity/custody and fault/soak acceptance remain open. This checkpoint has made no production authority attempt or ordinary-candidate
+edit.
+
 ## Open decisions — owner: implementation agent
 
 These must be resolved against source and audited before handoff, not guessed by
 a downstream implementer:
 
-- Integrate the selected native/source interfaces in the persistent constructor
-  loop. Keep current episode grants separate from data-only recovery of an old
+- Complete replay/selection integration around the implemented persistent native
+  constructor loop. Keep current episode grants separate from data-only recovery of an old
   admitted input after an environment/registration transition. Generic scope
   calls cache native custody only with qualification context; do not relabel a
   constructor as a witness to borrow that cache.
@@ -509,16 +610,29 @@ a downstream implementer:
   same transaction as actual native attribution and the workflow charge. It
   counts at most one dispatch per exact input and six per episode across all
   bindings; a refused transaction spends neither. General `BoundedNativeCall`
-  counters remain keyed by full binding. Producer integration must install this
-  purpose for every construction source/format/proposal conversation, including
-  nested calls; an outer task-local wrapper alone does not do so. The purpose
-  parser does not establish that the producer computed the episode correctly,
-  grant a lease, recover missing replies or prove physical response custody.
-  Those remain explicit producer/admission integration requirements.
-- Choose the staging-value representation and replay boundary so it cannot be
-  supplied by untrusted JSON or mistaken for approval. Preserve existing pending
-  amendment compatibility, including environment-transition registration changes.
-- Complete the actual fixture-interface investigation for the remaining card
-  routes and approval/send seams before treating a #2014 replacement as ready
-  for its remaining authority admission. The generic construction service must
-  validate all supplied original criteria, not special-case that issue.
+  counters remain keyed by full binding. The implemented producer installs this
+  purpose for every construction source/format/proposal conversation and retains
+  its native completion through the same transport. Complete the restricted
+  scheduling grant and full source/staging/authority integration proof; purpose
+  parsing alone establishes neither those permissions nor live acceptance.
+- Finish the authorized registration/execution boundary. The live,
+  non-deserializable staging type and qualified authority admission are now
+  implemented, but approved environment-transition registration must obtain a
+  distinct correct `OriginalExecution` identity/capture rather than relabeling
+  provisional receipts. Preserve existing `Pending` v1 compatibility.
+- Resolve authority setup/capacity refusals before handoff. The current strategy
+  attempt and dispatch intent are reserved before backend runtime preparation;
+  a refusal with zero actual native admission can leave an intent without output.
+  Bind this to existing actual-native admission/custody and allow supported
+  known-not-admitted setup recovery. Never reset/refund historical counters or
+  retry an actually admitted/uncertain native call. Owner: implementation agent;
+  trigger: before an engineering PR or activation.
+- Finish setup-only producer-policy migration for frozen unadmitted inputs. Prove
+  absence of actual admission using the existing native ownership domain before
+  allowing setup repair; missing output after actual admission stays unknown.
+  Preserve frozen payloads, charges, refusals and episodes. This blocks rollout.
+- Complete the actual original fixture-interface investigation for the remaining
+  card routes and approval/send seams as historical engineering coverage. #2014
+  is now closed/retired after #2072 and must never receive another admission for
+  this work. The generic construction service must validate all supplied
+  original criteria on eligible ordinary work, without special-casing #2014.

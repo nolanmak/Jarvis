@@ -1859,6 +1859,30 @@ impl WorkflowStore {
         tx.commit()?;Ok(count)
     }
 
+    /// Existing amendment counters and the exact dispatch intent are one fact.
+    /// An incomplete admitted attempt is unknown, never permission to re-admit.
+    pub(crate) fn admit_staged_authority_attempt(&mut self,lease:&Lease,binding:&Binding,input:&str,epoch:&str,key:&str,intent:&str,now:i64)->Result<bool> {
+        ensure!(!input.is_empty() && input.len()<=1024 && !epoch.is_empty() && epoch.len()<=1024
+            && key.len()==64 && intent.len()<=64*1024,"bounded staged authority intent required");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let previous:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM scope_stage_response WHERE workflow=?1 AND key=?2)",params![lease.workflow,key],|r|r.get(0))?;
+        ensure!(!previous,"staged authority attempt already admitted; reconcile retained output");
+        let counters=[("verifier-amend-input",input,2u32),("verifier-amend-total",epoch,4u32)];
+        let mut counts=Vec::new();
+        for (purpose,epoch,limit) in counters {
+            let count:u32=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![lease.workflow,purpose,format!("epoch:{epoch}")],|r|r.get(0)).optional()?.unwrap_or(0);
+            if count>=limit {return Ok(false);}
+            counts.push(count);
+        }
+        for ((purpose,epoch,_),count) in counters.into_iter().zip(counts) {
+            tx.execute("INSERT INTO bounded_attempt VALUES(?1,?2,?3,1) ON CONFLICT(workflow,purpose,binding) DO UPDATE SET attempts=attempts+1",params![lease.workflow,purpose,format!("epoch:{epoch}")])?;
+            event(&tx,&lease.workflow,lease.generation,"epoch_attempt_admitted",&serde_json::json!({"purpose":purpose,"epoch":epoch,"attempt":count+1}).to_string(),now)?;
+        }
+        tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,intent])?;
+        event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
+        tx.commit()?;Ok(true)
+    }
+
     pub fn admit_epoch_attempt(
         &mut self,
         lease: &Lease,
@@ -3135,6 +3159,29 @@ mod tests {
         assert!(store.attach_pr(&lease, 42, 37).is_ok());
         assert!(store.attach_pr(&lease, 43, 38).is_err());
     }
+    #[test]
+    fn staged_authority_counters_and_intent_commit_together_and_never_refill() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let binding=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.binding;
+        for now in 30..34 {assert!(store.admit_epoch_attempt(&lease,"verifier-amend-total","full",4,now).unwrap());}
+        assert!(!store.admit_staged_authority_attempt(&lease,&binding,"new-input","full",&"a".repeat(64),"exact intent",34).unwrap());
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-input","new-input",35).unwrap(),0,"total exhaustion partially spent per-input allowance");
+        assert!(store.recorded_scope_stage_response(&lease,&binding,&"a".repeat(64),35).unwrap().is_none());
+        assert!(store.admit_staged_authority_attempt(&lease,&binding,"new-input","available",&"a".repeat(64),"exact intent",36).unwrap());
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(store.admit_staged_authority_attempt(&lease,&binding,"new-input","available",&"a".repeat(64),"exact intent",37).is_err(),"unknown admitted attempt was dispatched twice");
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-input","new-input",38).unwrap(),1);
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-total","available",38).unwrap(),1);
+        store.conn.execute_batch("CREATE TRIGGER deny_staged_intent BEFORE INSERT ON scope_stage_response BEGIN SELECT RAISE(ABORT,'intent storage unavailable'); END;").unwrap();
+        assert!(store.admit_staged_authority_attempt(&lease,&binding,"other-input","available",&"b".repeat(64),"other exact intent",39).is_err());
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-input","other-input",40).unwrap(),0,"failed intent publication spent input allowance");
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-total","available",40).unwrap(),1,"failed intent publication spent total allowance");
+        store.conn.execute_batch("DROP TRIGGER deny_staged_intent").unwrap();
+        assert!(store.admit_staged_authority_attempt(&lease,&binding,"new-input","available",&"c".repeat(64),"second exact intent",41).unwrap());
+        assert!(!store.admit_staged_authority_attempt(&lease,&binding,"new-input","available",&"d".repeat(64),"third exact intent",42).unwrap());
+        assert_eq!(store.epoch_attempts(&lease,"verifier-amend-total","available",43).unwrap(),2,"per-input exhaustion partially spent total allowance");
+    }
+
     #[test]
     fn epoch_budget_survives_candidate_commits_restart_and_fences_stale_worker() {
         let dir = tempfile::tempdir().unwrap();

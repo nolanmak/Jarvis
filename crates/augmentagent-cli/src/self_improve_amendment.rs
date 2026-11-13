@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 mod source_evidence;
 #[path = "self_improve_construction.rs"]
 mod construction;
+#[path="self_improve_amendment_adjudication.rs"]
+mod adjudication;
 pub(super) fn construction_plan_owned(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,plan:&str,body:&str)->Result<bool> {
     construction::original_plan_owned(root,control,workflow,plan,body)
 }
@@ -339,24 +341,29 @@ fn decode_authority_response(raw:&str,expected_contract:&str)->Result<Decision> 
     Ok(decision)
 }
 
+// Historical text-consistency fixtures are not a production admission path.
+#[cfg(test)]
 async fn authority_response<F,T,G>(root:&Path,head:&str,expected_contract:&str,prompt:&str,mut call:F,mut admit_correction:G)->Result<(Decision,String)>
 where F:FnMut(String)->T,T:std::future::Future<Output=Result<(String,String)>>,G:FnMut()->Result<bool> {
-    let original=initial_authority_request(prompt)?;
+    response_with_admission(root,head,expected_contract,prompt,AUTHORITY_SYSTEM,
+        |_,request|call(request),|attempt,_|std::future::ready(if attempt==0 {Ok(true)}else{admit_correction()})).await
+}
+async fn response_with_admission<F,T,G,A>(root:&Path,head:&str,expected_contract:&str,prompt:&str,system:&str,mut call:F,mut admit:G)->Result<(Decision,String)>
+where F:FnMut(u32,String)->T,T:std::future::Future<Output=Result<(String,String)>>,
+    G:FnMut(u32,String)->A,A:std::future::Future<Output=Result<bool>> {
+    let original=format!("{prompt}\n{DECISION_CONSISTENCY}");
     let mut request=original.clone();
     for attempt in 0..2 {
-        ensure!(request.len().saturating_add(AUTHORITY_SYSTEM.len())<=REQUEST_LIMIT,"amendment authority request exceeds bound");
+        ensure!(request.len().saturating_add(system.len())<=REQUEST_LIMIT,"amendment authority request exceeds bound");
         ensure!(actual_head(root).await?==head,"amendment candidate changed before authority call");
-        let (raw,session)=call(request).await?;
+        ensure!(admit(attempt,request.clone()).await?,"amendment authority call budget exhausted");
+        let (raw,session)=call(attempt,request).await?;
         ensure!(actual_head(root).await?==head,"amendment candidate changed during authority call");
         match decode_authority_response(&raw,expected_contract) {
             Ok(decision)=>return Ok((decision,session)),
             Err(error)=> {
                 ensure!(attempt==0,"authority response invalid after bounded correction: {error}");
-                // Only controller-defined error codes enter the correction;
-                // provider prose never supplies new instructions or authority.
                 request=format!("{original}\nYour previous completed response failed controller validation: {error}. Return the complete requested JSON. This is a consistency repair, not permission to approve; a justified denial remains valid.");
-                ensure!(request.len().saturating_add(AUTHORITY_SYSTEM.len())<=REQUEST_LIMIT,"amendment authority correction request exceeds bound");
-                ensure!(admit_correction()?,"amendment authority correction budget exhausted");
             }
         }
     }
@@ -370,46 +377,39 @@ fn initial_authority_request(prompt:&str)->Result<String> {
 }
 
 async fn authority(
-    builder: &FallbackReasoner,
-    workflow: &workflow::WorkflowGuard,
-    root: &Path,
-    prompt: &str,
-    expected_contract:&str,input_hash:&str,epoch:&str,
-) -> Result<(Decision, String, String)> {
-    let head = actual_head(root).await?;
-    let origin = adoption::origin_for_candidate(root, Some(workflow)).await?;
-    origin.validate(&head)?;
-    let provider = if origin.is_imported() {
-        adoption::imported_reviewer()
-    } else {
-        select_session_isolated_reviewer(
-            &reviewer_pool(),
-            builder.review_authors().map_err(|e| format!("{e:#}")),
-            reviewer_status,
-        )
-    }
-    .map_err(|why| anyhow::anyhow!("verifier authority unavailable: {why:?}"))?;
-    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
-        .context("native verifier authority unavailable")?;
-    let mut opts=codex_review_opts(root.to_path_buf(),AUTHORITY_SYSTEM);
-    opts.allowed_tools.clear();
-    opts.settings_json = None;
-    opts.handoff_path = None;
-    opts.audit_logger = Some(workflow.audit_logger());
-    if provider == augmentagent_channel_core::ProviderKind::Claude {
-        opts.model = Some(build_model());
-    }
-    let reasoner=&reasoner;let opts=&opts;let origin=&origin;
-    let (decision,session)=authority_response(root,&head,expected_contract,prompt,|request|async move {
-        origin.validate(&actual_head(root).await?)?;
-        workflow.require_fresh_issue(root).await?;
-        let answer=augmentagent_channel_core::native_session::fresh_review_scope(provider,
-            augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(opts,&request))).await?;
-        origin.validate(&actual_head(root).await?)?;
-        Ok(answer)
-    },||Ok(workflow.admit_epoch_attempt("verifier-amend-input",input_hash,2)?
-        && workflow.admit_epoch_attempt("verifier-amend-total",epoch,4)?)).await?;
-    Ok((decision, provider.name().into(), session))
+    builder:&FallbackReasoner,workflow:&workflow::WorkflowGuard,root:&Path,context:&str,input_context:&str,epoch:&str,
+    staged:&construction::StagedCorrection,episode:&ConstructionEpisode,
+)->Result<(Decision,String,String,String)> {
+    workflow.require_fresh_issue(root).await?;
+    let head=actual_head(root).await?;
+    let origin=adoption::origin_for_candidate(root,Some(workflow)).await?;origin.validate(&head)?;
+    let authors=builder.review_authors().map_err(|e|format!("{e:#}")).map(|authors|authors.map(|mut authors| {
+        let constructor=match staged.constructor_session().0 {"codex"=>augmentagent_channel_core::ProviderKind::Codex,_=>augmentagent_channel_core::ProviderKind::Claude};
+        if !authors.contains(&constructor) {authors.push(constructor);}authors
+    }));
+    // Capacity is read now but only required for an actual fresh dispatch.
+    // Completed output can replay while its provider is unavailable today.
+    let provider=if origin.is_imported() {adoption::imported_reviewer()}
+        else {select_session_isolated_reviewer(&reviewer_pool(),authors,reviewer_status)}
+        .map_err(|why|format!("{why:?}"));
+    adjudication::review_with(root,workflow,episode,Some(staged),provider,context,input_context,epoch,|request,sink| {
+        let origin=&origin;
+        async move {
+            let provider=sink.provider()?;
+            let reasoner=augmentagent_channel_core::build_workflow_pinned(provider).context("native verifier authority unavailable")?;
+            let mut opts=codex_review_opts(root.to_path_buf(),sink.system());
+            opts.allowed_tools.clear();opts.settings_json=None;opts.handoff_path=None;opts.audit_logger=Some(workflow.audit_logger());
+            if provider==augmentagent_channel_core::ProviderKind::Claude {opts.model=Some(build_model());}
+            origin.validate(&actual_head(root).await?)?;workflow.require_fresh_issue(root).await?;
+            augmentagent_channel_core::native_session::fresh_review_scope(provider,
+                augmentagent_channel_core::model_router::native_reviewer_scope(provider,async move {
+                    let raw=reasoner.call(&opts,&request).await?;
+                    origin.validate(&actual_head(root).await?)?;
+                    let session=augmentagent_channel_core::native_session::current_for(provider)?.context("authority native session missing")?.id().context("authority native session unobserved")?;
+                    sink.complete(&raw,&session)?;Ok(raw)
+                })).await
+        }
+    }).await
 }
 
 fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
@@ -578,14 +578,15 @@ pub(super) async fn try_amend(
     old.baseline.registration.verify_integrity(root)?;
     let initial_environment=environment_id(root)?;
     let epoch=digest(&serde_json::to_vec(&(source,old.baseline.registration.baseline_head(),&initial_environment))?);
-    // A spent total budget remains spent even when source evidence is missing.
-    // This reads the existing counter only; final admission stays atomic below.
-    if workflow.epoch_attempts("verifier-amend-total",&epoch)? >= 4 {
+    // At the limit, permit only reconstruction from existing completed native
+    // data, original measurements and qualification; no new producer/command.
+    // This allows a completed fourth decision to resume without a fifth call.
+    let authority_exhausted=workflow.epoch_attempts("verifier-amend-total",&epoch)? >= 4;
+    if authority_exhausted && !adjudication::retained_output_hint(control)? {
         ensure!(adjudication.is_none(),"adjudicated amendment epoch budget exhausted; changed trusted inputs required");
         return Err(initial_repair::Hold::Exhausted.into());
     }
     let head = actual_head(root).await?;
-    let tree = trusted_git(root, &["--no-replace-objects", "rev-parse", &format!("{head}^{{tree}}")]).await?;
     // GitHub supplies the canonical main identity; a candidate can mutate its
     // local tracking refs, so they cannot establish this scope boundary.
     let scope = async {
@@ -618,60 +619,54 @@ pub(super) async fn try_amend(
     let candidate_environment = environments.current_candidate.clone();
     ensure!(candidate_environment==initial_environment,"amendment candidate environment changed before request preparation");
     let original_base=old.baseline.registration.baseline_head();
-    let prompt=authority_base_request(old,AuthorityFacts {source,request_context:&request_context,failure,
-        canonical_main:&canonical_main,scope_base:&scope_base,head:&head,diff:&diff,upstream_paths:&upstream_paths,
-        environments:&environments,adjudication}).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let (prompt,source_sha256)=sourced_authority_request(root,&native_control,old,&custody,negative.as_ref(),&prompt,|key|workflow.scope_stage_response(key))
-        .await.map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    ensure!(actual_head(root).await? == head, "candidate changed during amendment scope preparation");
-    ensure!(environment_id(root)?==candidate_environment,"amendment candidate environment changed during request preparation");
-    let context_identity=digest(&serde_json::to_vec(&(OWNER_EVIDENCE_VERSION,digest(owner_request.as_bytes()),
-        negative.as_ref().map(|(identity,_)|identity),CONSTRUCTION_VERSION,&source_sha256))?);
-    let input_hash = digest(&serde_json::to_vec(&(
-        &context_identity,
-        old.baseline.registration.contract_hash(),
-        &tree,
-        &canonical_main,
-        &scope_base,
-        candidate_environment.clone(),
-        adjudication.map(|text| digest(text.as_bytes())),
-    ))?);
-    immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
-        &serde_json::to_vec(&serde_json::json!({"version":2,"context_sha256":context_identity,"source_evidence_sha256":source_sha256}))?)?;
-    if !workflow.admit_epoch_attempt("verifier-amend-input", &input_hash, 2)?
-        || !workflow.admit_epoch_attempt("verifier-amend-total", &epoch, 4)?
-    {
-        ensure!(
-            adjudication.is_none(),
-            "adjudicated amendment epoch budget exhausted; changed trusted inputs required"
-        );
-        return Err(initial_repair::Hold::Exhausted.into());
-    }
     workflow.bind_acceptance_for_recovery(old)?;
-    workflow
-        .checkpoint(
-            crate::autoship_workflow::Stage::Scope,
-            "verifier_definition_disputed",
-            "independent_verifier_authority",
-            0,
-            &[format!("amendment-input:{input_hash}")],
-        )
-        .await?;
-    workflow.audit_logger().record_controller(serde_json::json!({
-        "kind": "amendment_scope_basis", "workflow": workflow.id(),
-        "original_base": original_base, "canonical_main": canonical_main,
-        "contribution_base": scope_base, "candidate_head": head,
-        "contribution_diff_sha256": digest(diff.as_bytes()), "shipping_authority": false,
-        "source_evidence_sha256":source_sha256,"request_bytes":prompt.len(),"construction_protocol":CONSTRUCTION_VERSION,
-    }))?;
-    let (decision, native_provider, native_session) =
-        authority(builder, workflow, root, &prompt,old.baseline.registration.contract_hash(),&input_hash,&epoch).await?;
+    workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"verifier_definition_disputed","construct_verifier",0,&[]).await?;
+    let episode=construction_episode(root,workflow,old,&environments)?;
+    let context=serde_json::to_string(&serde_json::json!({"version":1,"source":source,
+        "complete_owner_evidence":request_context,"original_proposal":old.proposal,"failure":failure,
+        "original_base":original_base,"canonical_main":canonical_main,"contribution_base":scope_base,
+        "candidate_head":head,"contribution_diff":diff,"integrated_upstream_paths":upstream_paths,
+        "controller_environment_evidence":environments,"environment_interpretation":environments.prompt()?,
+        "bound_final_adjudication":adjudication}))?;
+    let provider=builder.builder_provider_pin().or_else(||builder.provider_names().into_iter().find_map(|name|match name {
+        "codex"=>Some(augmentagent_channel_core::ProviderKind::Codex),"claude"=>Some(augmentagent_channel_core::ProviderKind::Claude),_=>None
+    })).context("native constructor provider unavailable")?;
+    let model=if provider==augmentagent_channel_core::ProviderKind::Codex {codex_model()}else{build_model()};
+    let staged=construction::construct_and_stage(root,workflow,construction::Request {episode:&episode,old,
+        candidate_environment:&candidate_environment,adjudication,context:&context,provider,model:&model},authority_exhausted).await?;
+    let source_budget=adjudication::source_budget(root,workflow,&episode,&staged,&context).await?;
+    let original_source=staged.original_source(root,workflow,&episode,source_budget).await?;
+    let source_sha256=digest(&serde_json::to_vec(&original_source)?);
+    let prompt=format!("{context}\n{SOURCE_LABEL}{}",serde_json::to_string(&original_source)?);
+    ensure!(actual_head(root).await?==head && environment_id(root)?==candidate_environment,"candidate changed during staged correction preparation");
+    // Routing heads, excerpt serialization and diagnosis wording do not create
+    // another review of the same qualified correction. The stage supplies its
+    // exact semantic proposal, original observation and attribution identity.
+    let context_identity=digest(&serde_json::to_vec(&("staged-verifier-adjudication-context-v1",digest(owner_request.as_bytes()),
+        source,old.baseline.registration.contract_hash(),adjudication.map(|text|digest(text.as_bytes()))))?);
+    let input_hash=context_identity.clone();
+    let context_artifact=digest(&serde_json::to_vec(&(&input_hash,&source_sha256))?);
+    immutable(control,&format!("{}-amendment-context-{context_artifact}.json",source.key()),
+        &serde_json::to_vec(&serde_json::json!({"version":3,"context_sha256":context_identity,"source_evidence_sha256":source_sha256}))?)?;
+    // The evidence set is unchanged from staging. Do not rotate the binding
+    // merely to add this informational action or an input-hash activity note.
+    workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"verifier_definition_disputed","independent_verifier_authority",0,&[]).await?;
+    staged.require_current(root,workflow,&episode).await?;
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"amendment_scope_basis","workflow":workflow.id(),
+        "original_base":original_base,"canonical_main":canonical_main,"contribution_base":scope_base,"candidate_head":head,
+        "contribution_diff_sha256":digest(diff.as_bytes()),"shipping_authority":false,"source_evidence_sha256":source_sha256,
+        "request_bytes":prompt.len(),"construction_protocol":"staged-verifier-adjudication-v1"}))?;
+    let (decision,native_provider,native_session,review_input)=authority(builder,workflow,root,&prompt,&input_hash,&epoch,&staged,&episode).await?;
+    staged.validate_decision(&decision)?;
+    let input_hash=review_input;
+    immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
+        &serde_json::to_vec(&serde_json::json!({"version":3,"context_sha256":context_identity,"staged_review_input":input_hash}))?)?;
     immutable(
         control,
         &format!(
             "{}-amendment-decision-{input_hash}-{}.json",
             source.key(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::from_u128(u128::from_str_radix(&input_hash[..32],16)?)
         ),
         &serde_json::to_vec(&decision)?,
     )?;

@@ -672,23 +672,28 @@ mod tests {
         let (root,control,base,custody)=fixture().await;
         let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
         let request=super::construction_request("Original proposal is disputed; no replacement has been constructed or measured.",&evidence).unwrap();
-        let expected="c".repeat(64);let calls=std::sync::atomic::AtomicUsize::new(0);
-        let result=super::authority_response(root.path(),&base,&expected,&request,|prompt| {
+        let (candidate,control,_old,guard,episode)=construction::tests::fixture().await;
+        let expected=guard.binding().contract.clone();let calls=std::sync::atomic::AtomicUsize::new(0);
+        let result=super::adjudication::review_with(candidate.path(),&guard,&episode,None,
+            Ok(augmentagent_channel_core::ProviderKind::Codex),&request,"unstaged-input","same-epoch",|prompt,_sink| {
             assert!(prompt.contains("pub fn behavior() -> bool { false }"),"fixture lost authenticated original source");
             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
-            // A valid complete refusal is not malformed output and must remain
-            // authoritative. The missing work is construction before this call.
             let raw=serde_json::json!({"approved":false,"previous_contract_hash":expected,
                 "approve_environment_transition":false,"reason":"No complete measured replacement was supplied for independent adjudication","proposal":null}).to_string();
             async move {Ok((raw,"scripted-independent-authority".into()))}
-        },||panic!("a valid completed refusal cannot justify a formatting retry")).await;
+        }).await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0,
             "source-only dispute spent independent authority before a concrete staged correction existed");
+        assert_eq!(guard.epoch_attempts("verifier-amend-input","unstaged-input").unwrap(),0,"unstaged source spent per-input allowance");
+        assert_eq!(guard.epoch_attempts("verifier-amend-total","same-epoch").unwrap(),0,"unstaged source spent total authority allowance");
         assert!(result.is_err(),"unstaged source-only dispute reached an authority decision");
+        let snapshot=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(snapshot.model_calls,0);
+        guard.finish().unwrap();
     }
 
     #[tokio::test]
-    async fn amendment_source_and_construction_task_reach_actual_authority_call() {
+    async fn historical_source_authoring_request_remains_byte_preservable() {
         let (root,control,base,custody)=fixture().await;
         let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
         let request=super::construction_request("Original proposal is disputed; retain criteria.",&evidence).unwrap();
@@ -816,13 +821,33 @@ mod tests {
         assert_eq!(id,"nolanmak/jarvis#2014","historical rollout proof is explicitly scoped to the retained ordinary issue");
         assert_eq!(evidence.sources.len(),8);assert!(evidence.coverage.starts_with("complete selected original files"));
         let request=crate::autoship_workflow::submission::Request {repository:recovery.repository.clone(),target:crate::autoship_workflow::submission::Target::Issue(number),provider:None,until:crate::autoship_workflow::submission::Milestone::Merged};
-        let targeted::Resolved::Issue(issue)=targeted::resolve_for_recovery(&recovery.worktree,&request).await.unwrap() else {panic!("original issue unavailable")};
+        // Historical data inspection is distinct from active-target admission.
+        // Never reopen a closed source or turn its old evidence into a grant.
+        let issue=gh_json(&recovery.worktree,&format!("repos/{}/issues/{number}",recovery.repository)).await;
+        assert_eq!(issue["number"].as_u64(),Some(number));
+        assert!(issue["html_url"].as_str().is_some_and(|url|url.eq_ignore_ascii_case(&format!("https://github.com/{}/issues/{number}",recovery.repository))));
+        assert!(issue.get("pull_request").is_none_or(serde_json::Value::is_null));
+        let title=issue["title"].as_str().expect("historical issue title unavailable");
+        let body=issue["body"].as_str().unwrap_or("");
+        let issue_state=issue["state"].as_str().expect("historical issue lifecycle unavailable");
+        assert!(matches!(issue_state,"open"|"closed"));
+        if issue_state=="closed" {
+            let error=targeted::resolve_for_recovery(&recovery.worktree,&request).await.err().expect("closed historical issue became active recovery authority");
+            assert!(error.to_string().contains("closed"),"closed target did not reach its explicit admission refusal: {error:#}");
+        }
         let current_request=if let Some(pr)=recovery.source_pr {
-            let request=crate::autoship_workflow::submission::Request {target:crate::autoship_workflow::submission::Target::Pr(pr),..request};
-            let targeted::Resolved::Pr(pr)=targeted::resolve_for_recovery(&recovery.worktree,&request).await.unwrap() else {panic!("original source PR unavailable")};
-            format!("{}\n{}\n{}",issue.title,issue.body,pr.body)
-        }else{serde_json::to_string(&(issue.number,&issue.title,&issue.body)).unwrap()};
+            let value=gh_json(&recovery.worktree,&format!("repos/{}/pulls/{pr}",recovery.repository)).await;
+            assert_eq!(value["number"].as_u64(),Some(pr));
+            assert!(value["html_url"].as_str().is_some_and(|url|url.eq_ignore_ascii_case(&format!("https://github.com/{}/pull/{pr}",recovery.repository))));
+            if value["state"]=="closed" {
+                let request=crate::autoship_workflow::submission::Request {target:crate::autoship_workflow::submission::Target::Pr(pr),..request};
+                let error=targeted::resolve_for_recovery(&recovery.worktree,&request).await.err().expect("closed historical PR became active recovery authority");
+                assert!(error.to_string().contains("closed"),"closed PR did not reach explicit admission refusal: {error:#}");
+            }
+            format!("{}\n{}\n{}",title,body,value["body"].as_str().unwrap_or(""))
+        }else{serde_json::to_string(&(number,title,body)).unwrap()};
         assert_eq!(current_request,recovery.source_request,"protected original owner request changed");
+        println!("Historical source lifecycle: {issue_state}; data inspection only, no active-target grant or reopening; workflow stage={:?}, generation={}, model_calls={}",before.checkpoint.stage,before.generation,before.model_calls);
         let main=workflow::remote_main_head(&recovery.worktree,&recovery.repository).await.unwrap();
         let head=actual_head(&recovery.worktree).await.unwrap();
         let (basis,diff)=super::super::contribution_diff(&recovery.worktree,base,&main,&head).await.unwrap();
@@ -842,7 +867,7 @@ mod tests {
         let failure=if prepared.proposal.contract.verifiers.iter().any(|verifier|!verifier.command.controller_asserted()) {
             "legacy in-process verifier requires independent behavioral-oracle migration".to_owned()
         }else{BaselineNotRed {kind:Some(initial_repair::FailureKind::NotReproduced),detail:"baseline_witness_invalid: authenticated retained measurement is unknown; exact independent diagnosis retained privately".into()}.to_string()};
-        let owner=super::super::authority_request_context(&issue.title,&recovery.source_request,Some((&negative_identity,&diagnosis_raw))).unwrap();
+        let owner=super::super::authority_request_context(title,&recovery.source_request,Some((&negative_identity,&diagnosis_raw))).unwrap();
         let prompt=super::super::authority_base_request(&prepared,super::super::AuthorityFacts {source,request_context:&owner,failure:&failure,canonical_main:&main,
             scope_base:&basis,head:&head,diff:&diff,upstream_paths:&upstream,environments:&environments,adjudication:None}).unwrap();
         let evidence=read_bounded(&recovery.worktree,&control,base,&custody,context,replay.as_deref(),super::super::source_budget(&prompt).unwrap()).await.unwrap();

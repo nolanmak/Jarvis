@@ -1624,6 +1624,17 @@ impl WorkflowGuard {
             .epoch_attempts(&self.lease,purpose,epoch,millis())
     }
 
+    pub(super) fn admit_staged_authority_attempt(&self,input:&str,epoch:&str,key:&str,intent:&str)->Result<bool> {
+        self.check_resource_policy()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_staged_authority_attempt(&self.lease,&self.binding,input,epoch,key,intent,millis())
+    }
+    pub(super) fn require_distinct_reviewer_session(&self,session:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .require_distinct_reviewer_session(&self.lease,session,millis())
+    }
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,

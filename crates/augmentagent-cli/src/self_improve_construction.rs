@@ -125,12 +125,14 @@ pub(super) struct Request<'a> {
 /// Bounded producer/measurement handoff. Semantic failures feed the next
 /// constructor input only after their exact original evidence is retained.
 /// Unknown effects and infrastructure errors preserve the pending intent.
-pub(super) async fn construct_and_stage(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>)->Result<StagedCorrection> {
+pub(super) async fn construct_and_stage(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>,replay_only:bool)->Result<StagedCorrection> {
     for _ in 0..SLOTS {
-        let measurement=next(root,workflow,Request {episode:request.episode,old:request.old,
+        let measurement=next_transport(root,workflow,Request {episode:request.episode,old:request.old,
             candidate_environment:request.candidate_environment,adjudication:request.adjudication,
-            context:request.context,provider:request.provider,model:request.model}).await?;
-        match stage(root,workflow,request.episode,&measurement).await {
+            context:request.context,provider:request.provider,model:request.model},replay_only).await?;
+        let result=if replay_only {staging::stage_replay(root,workflow,request.episode,&measurement).await}
+            else {stage(root,workflow,request.episode,&measurement).await};
+        match result {
             Ok(staged)=>return Ok(staged),
             Err(error)=>{
                 let Some(failure)=error.downcast_ref::<BaselineNotRed>().filter(|failure|failure.kind.is_some()) else {return Err(error)};
@@ -147,6 +149,9 @@ pub(super) async fn construct_and_stage(root:&Path,workflow:&workflow::WorkflowG
 /// clear the canonical hold or call the authority. The native adapter replays
 /// original admitted completions before considering a fresh dispatch.
 pub(super) async fn next(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>)->Result<Measurement> {
+    next_transport(root,workflow,request,false).await
+}
+async fn next_transport(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>,replay_only:bool)->Result<Measurement> {
     let episode=request.episode;
     for slot in 0..SLOTS {
         if let Some(rejected)=read::<Rejection>(workflow,&rejection_key(episode.key(),slot))? {
@@ -154,7 +159,8 @@ pub(super) async fn next(root:&Path,workflow:&workflow::WorkflowGuard,request:Re
         }
     }
     next_with(root,workflow,request,|input|async move {
-        constructor_native::call(root,workflow,episode,&input).await
+        if replay_only {constructor_native::retained(root,workflow,episode,&input)}
+        else {constructor_native::call(root,workflow,episode,&input).await}
     }).await
 }
 
@@ -275,11 +281,11 @@ where F:FnMut(constructor_native::Input)->Fut,Fut:std::future::Future<Output=Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    pub(super) async fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode) {
+    pub(in crate::self_improve::acceptance::amendment) async fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode) {
         let (root,control,old)=qualification_fixture();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -292,6 +298,29 @@ mod tests {
         let environments=environment_evidence(root.path(),control.path(),&old).await.unwrap();
         let episode=construction_episode_at(root.path(),control.path(),&guard,&old,&environments).unwrap();
         (root,control,old,guard,episode)
+    }
+    /// The real cross-model custody guard derives this namespace itself.
+    /// Own a unique canonical fixture namespace rather than overriding that
+    /// guard or writing into any production workflow's control directory.
+    pub(super) async fn native_namespace_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode,tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let (root,unused,old)=qualification_fixture();drop(unused);
+        let repository=format!("fixture-owner/constructor-{}",uuid::Uuid::new_v4().simple());
+        let id=crate::autoship_workflow::pr_workflow_id(&repository,840).unwrap();
+        let paths=control_directories(&repository,&id).unwrap();
+        let policy_parent=paths.repository_policy.parent().unwrap();std::fs::create_dir_all(policy_parent).unwrap();
+        let namespace=tempfile::Builder::new().prefix(paths.repository_policy.file_name().unwrap()).rand_bytes(0).tempdir_in(policy_parent).unwrap();
+        let parent=paths.workflow_acceptance.parent().unwrap();std::fs::create_dir_all(parent).unwrap();
+        let control=tempfile::Builder::new().prefix(paths.workflow_acceptance.file_name().unwrap()).rand_bytes(0).tempdir_in(parent).unwrap();
+        assert_eq!(control.path(),paths.workflow_acceptance);
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&control.path().join("workflow.db"),workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:&repository,source_issue:None,pr:Some(840),branch:"fixture",
+            contract:"Complete original owner request",environment:"fixture"}).await.unwrap().unwrap();
+        guard.checkpoint_qualification_source(&old).await.unwrap();persist_fixture_registration(control.path(),&old).unwrap();
+        let environments=environment_evidence(root.path(),control.path(),&old).await.unwrap();
+        let episode=construction_episode(root.path(),&guard,&old,&environments).unwrap();
+        (root,control,old,guard,episode,namespace)
     }
     pub(super) fn proposal(old:&PreparedAcceptance)->String {
         let mut proposal=old.proposal.clone();proposal.contract.revision+=1;

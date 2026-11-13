@@ -21,6 +21,13 @@ impl WorkflowStore {
         }
         tx.commit()?;Ok(())
     }
+    pub(crate) fn require_distinct_reviewer_session(&self,lease:&Lease,session:&str,now:i64)->Result<()> {
+        ensure!(!session.is_empty() && session.len()<=512,"native reviewer identity missing");
+        let tx=self.conn.unchecked_transaction()?;require_lease(&tx,lease,now)?;
+        let reused:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_session_owner WHERE workflow=?1 AND native_session=?2)",params![lease.workflow,session],|r|r.get(0))?;
+        ensure!(!reused,"independent authority reused a recorded builder session");
+        tx.commit()?;Ok(())
+    }
     /// Reading an ID does not admit model dispatch. The owner turn, requested
     /// provider, workspace and native runtime must still pass their own gates.
     pub fn owner_turn_conversations(&mut self,turn:&owner_turn::OwnerTurn,provider:ProviderKind,now:i64)->Result<Vec<ObservedConversation>> {
@@ -50,6 +57,9 @@ mod tests {
         store.record_builder_conversations(&lease,&binding,&[observed.clone()],4).unwrap();
         let rotated=ObservedConversation {provider:ProviderKind::Codex,id:"rotated-provider-session".into(),uncertain:false};
         store.record_builder_conversations(&lease,&binding,&[rotated],4).unwrap();
+        assert!(store.require_distinct_reviewer_session(&lease,"actual-provider-session",4).is_err(),"review reused a historical builder conversation");
+        assert!(store.require_distinct_reviewer_session(&lease,"rotated-provider-session",4).is_err(),"review reused the current builder conversation");
+        store.require_distinct_reviewer_session(&lease,"new-independent-reviewer",4).unwrap();
         store.conn.execute_batch("CREATE TRIGGER deny_conversation BEFORE INSERT ON workflow_event WHEN NEW.kind='builder_conversation_observed' BEGIN SELECT RAISE(ABORT,'unavailable'); END;").unwrap();
         let failed=ObservedConversation {provider:ProviderKind::Codex,id:"uncommitted-session".into(),uncertain:false};
         assert!(store.record_builder_conversations(&lease,&binding,&[failed],4).is_err());

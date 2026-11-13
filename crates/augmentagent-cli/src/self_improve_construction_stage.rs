@@ -63,7 +63,46 @@ impl StagedCorrection {
         ensure!(plan==self.original_plan && accounting::owned(root,episode.control(),workflow,&plan,&body)?,initial_repair::Hold::EvidenceUnknown);
         baseline_witness::assert_current(&self.original,episode.control(),&self.prepared)
     }
+    pub(in crate::self_improve::acceptance::amendment) async fn adjudication_data(&self,root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode)->Result<serde_json::Value> {
+        self.require_current(root,workflow,episode).await?;
+        Ok(serde_json::json!({"version":1,"workflow":self.workflow,"episode":episode.key(),
+            "binding":self.binding,"old_contract":self.old_contract,"candidate_environment":self.candidate_environment,
+            "measurement_intent":self.measurement.identity()?,"draft":self.measurement.draft,
+            "original_plan":self.original_plan,"original_result":self.original_result,
+            "original":workflow.exact_original_result_data(&self.original_plan,&self.original_result)?,
+            "qualified_original_witness":baseline_witness::current_data(&self.original,episode.control(),&self.prepared)?}))
+    }
+    pub(in crate::self_improve::acceptance::amendment) async fn adjudication_identity(&self,root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode)->Result<String> {
+        self.require_current(root,workflow,episode).await?;
+        let witness=baseline_witness::current_data(&self.original,episode.control(),&self.prepared)?;
+        // A routing binding, publication reference, qualification-policy hash
+        // or rephrased reason is not new behavioral evidence. Keep the live
+        // full-binding/custody checks above, but deduplicate the verdict using
+        // the actual proposal, observation and immutable production attribution.
+        let mut attribution=std::collections::BTreeMap::new();
+        for verifier in witness["verifiers"].as_array().context(initial_repair::Hold::EvidenceUnknown)? {
+            let id=verifier["verifier_id"].as_str().context(initial_repair::Hold::EvidenceUnknown)?;
+            let mut citations=std::collections::BTreeSet::new();
+            for citation in verifier["production_citations"].as_array().context(initial_repair::Hold::EvidenceUnknown)? {
+                citations.insert(serde_json::to_string(citation)?);
+            }
+            ensure!(attribution.insert(id.to_string(),citations).is_none(),initial_repair::Hold::EvidenceUnknown);
+        }
+        let original=workflow.exact_original_result_data(&self.original_plan,&self.original_result)?;
+        Ok(digest(&serde_json::to_vec(&("qualified-staged-correction-v1",&self.workflow,episode.key(),
+            &self.old_contract,&self.candidate_environment,&self.measurement.draft,&self.prepared.baseline,&original.commands,attribution))?))
+    }
+    pub(in crate::self_improve::acceptance::amendment) async fn original_source(&self,root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,budget:usize)->Result<source_evidence::Evidence> {
+        self.require_current(root,workflow,episode).await?;
+        let witness=baseline_witness::current_data(&self.original,episode.control(),&self.prepared)?;
+        let context=witness["context"].as_str().context(initial_repair::Hold::EvidenceUnknown)?;
+        let custody=workflow.baseline_native_custody()?;
+        let key=source_evidence::replay_key(&self.original,episode.control(),episode.original_base(),&custody,Some(context))?;
+        let replay=key.map(|key|workflow.scope_stage_response(&key)).transpose()?.flatten();
+        source_evidence::read_bounded(&self.original,episode.control(),episode.original_base(),&custody,Some(context),replay.as_deref(),budget).await
+    }
     pub(in crate::self_improve::acceptance::amendment) fn validate_decision(&self,decision:&Decision)->Result<()> {
+        ensure!(decision.previous_contract_hash==self.old_contract && !decision.reason.trim().is_empty(),"authority decision is not bound to the staged correction");
         if !decision.approved {return Ok(());}
         ensure!(decision.previous_contract_hash==self.old_contract
             && decision.proposal.as_ref().map(serde_json::to_vec).transpose()?==Some(serde_json::to_vec(self.measurement.proposal())?)
@@ -94,8 +133,17 @@ pub(in crate::self_improve::acceptance::amendment) async fn stage(root:&Path,wor
     }).await
 }
 
+pub(super) async fn stage_replay(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement)->Result<StagedCorrection> {
+    stage_with_mode(root,workflow,episode,measurement,true,|original,control,prepared,_|Box::pin(async move {
+        baseline_witness::assert_current(original,control,prepared)
+    })).await
+}
 async fn stage_with<Q>(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement,qualify:Q)->Result<StagedCorrection>
-where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::WorkflowGuard)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+'a>> {
+where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::WorkflowGuard)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>> {
+    stage_with_mode(root,workflow,episode,measurement,false,qualify).await
+}
+async fn stage_with_mode<Q>(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement,replay_only:bool,qualify:Q)->Result<StagedCorrection>
+where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::WorkflowGuard)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>> {
     authenticate(root,workflow,episode,measurement)?;
     let binding=workflow.binding().clone();
     ensure!(actual_head(root).await?==binding.head,initial_repair::Hold::EvidenceUnknown);
@@ -121,6 +169,7 @@ where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::Wo
     let (original_result,baseline)=if let Some((result,baseline))=verifier_execution::OriginalExecution::retained_result(&original,workflow,proposal,episode.original_base(),&environment,&executor)? {
         (result,baseline)
     }else{
+        ensure!(!replay_only,initial_repair::Hold::EvidenceUnknown);
         let execution=verifier_execution::OriginalExecution::begin(workflow,episode.control(),proposal,episode.original_base(),&environment,&executor)?;
         let baseline=register_and_observe_with_custody(&original,proposal.clone(),&workflow.audit_logger(),Some(&execution)).await.map_err(|error|execution.failed(error))?;
         execution.retain_result(&original,&baseline).map_err(|error|execution.failed(error))?;
@@ -252,7 +301,7 @@ pub(super) mod tests {
         // reply. Original behavior executes for real in the pinned sandbox;
         // qualification data is explicitly test-only, never live acceptance.
         for qualification in ["positive","absent","negative","already-green"] {
-            let (root,control,old,guard,episode)=super::super::tests::fixture().await;
+            let (root,control,old,mut guard,episode,_namespace)=super::super::tests::native_namespace_fixture().await;
             let mut text=super::super::tests::proposal(&old);
             if qualification=="already-green" {
                 let mut raw:serde_json::Value=serde_json::from_str(&text)?;
@@ -260,6 +309,8 @@ pub(super) mod tests {
                 text=serde_json::to_string(&raw)?;
             }
             let measurement=owned_measurement(root.path(),&guard,&episode,&old,text).await?;
+            require_retained_constructor_custody(root.path(),guard.repository(),guard.id(),&guard.construction_native_custody()?)
+                .map_err(|error|error.context("fixture constructor must satisfy the real cross-model namespace guard"))?;
             let head=actual_head(root.path()).await?;
             let result=stage_with(root.path(),&guard,&episode,&measurement,move |original,control,prepared,_| {
                 Box::pin(async move {
@@ -300,10 +351,60 @@ pub(super) mod tests {
                     decision.proposal.as_mut().unwrap().files.values_mut().next().unwrap().push_str("\n# authority rewrite\n");
                     ensure!(staged.validate_decision(&decision).is_err(),"unmeasured authority rewrite accepted");
                     decision.approved=false;staged.validate_decision(&decision)?;
+                    // Exercise the real qualified authority boundary at its
+                    // fourth and last attempt. The native reply is scripted;
+                    // original execution and protected accounting are real.
+                    for _ in 0..3 {ensure!(guard.admit_epoch_attempt("verifier-amend-total","fixture-authority",4)?,"fixture setup admission failed");}
+                    let calls=std::sync::atomic::AtomicUsize::new(0);let calls=&calls;
+                    let exact=Decision {approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),
+                        approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent scripted authority approves only this exact measured correction".into(),proposal:Some(measurement.proposal().clone())};
+                    let raw=serde_json::to_string(&exact)?;let raw=&raw;let workflow=&guard;
+                    let context=authority_request_context("fixture",guard.original_owner_request()?,None)?;let context=&context;
+                    let first=adjudication::review_with(root.path(),workflow,&episode,Some(&staged),Ok(augmentagent_channel_core::ProviderKind::Codex),
+                        context,"fixture-input","fixture-authority",|request,sink|async move {
+                            ensure!(request.contains("qualified_original_witness") && request.contains("original_plan") && request.contains("READY = False"),"authority lost staged original evidence");
+                            ensure!(request.contains(workflow.original_owner_request()?),"authority lost the complete original owner request");
+                            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                            let provider=sink.provider()?;
+                            augmentagent_channel_core::native_session::fresh_review_scope(provider,
+                                augmentagent_channel_core::model_router::native_reviewer_scope(provider,async move {
+                                    let session=augmentagent_channel_core::native_session::current_for(provider)?.context("scripted authority scope absent")?;
+                                    let mut native=session.begin(provider)?;workflow.audit_logger().model_call_admitted(provider.name())?;
+                                    native.observe(&format!("scripted-independent-authority-{}",uuid::Uuid::new_v4()))?;native.finish()?;
+                                    let id=session.id().context("scripted authority identity absent")?;sink.complete(raw,&id)?;
+                                    // Simulate caller failure after the completed native
+                                    // response is durable but before amendment staging.
+                                    Err::<String,_>(anyhow::anyhow!("scripted exit after durable authority output"))
+                                })).await
+                        }).await;
+                    ensure!(calls.load(std::sync::atomic::Ordering::SeqCst)==1,"fixture did not make one fourth-attempt callback");
+                    let first_error=first.err().context("fixture did not simulate post-completion caller failure")?;
+                    ensure!(first_error.to_string()=="scripted exit after durable authority output","authority fixture failed before durable output: {first_error:#}");
+                    eprintln!("Staged authority fixture: fourth native output completed before simulated caller failure");
+                    ensure!(guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"qualified review did not use existing total allowance");
+                    let replay=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),Err("scripted provider unavailable today".into()),
+                        "changed transient defaults must not replace the frozen request","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("completed fourth review dispatched another native call")}).await.map_err(|error|error.context("replay completed fourth authority output"))?;
+                    eprintln!("Staged authority fixture: cached fourth decision replayed while provider unavailable");
+                    ensure!(serde_json::to_vec(&replay.0)?==serde_json::to_vec(&exact)? && replay.1=="codex","replay changed the completed decision or observed provider");
+                    ensure!(guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"replay spent a fifth authority attempt");
+                    let outputs=std::fs::read_dir(control.path())?.map(|e|e.map(|e|e.path())).collect::<std::io::Result<Vec<_>>>()?;
+                    let output=outputs.into_iter().find(|p|p.file_name().is_some_and(|name|name.to_string_lossy().starts_with("authority-") && name.to_string_lossy().ends_with(".response"))).context("retained authority output absent")?;
+                    let bytes=std::fs::read(&output)?;std::fs::remove_file(&output)?;
+                    let missing=adjudication::review_with(root.path(),&guard,&episode,Some(&staged),Ok(augmentagent_channel_core::ProviderKind::Codex),
+                        "Complete unchanged owner requirements and authenticated source data","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("missing authority output dispatched another native call")}).await;
+                    ensure!(missing.is_err() && guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"lost authority output replenished review allowance");
+                    {
+                        use std::io::Write;use std::os::unix::fs::OpenOptionsExt;
+                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output)?;file.write_all(&bytes)?;file.sync_all()?;
+                    }
+                    ensure!(calls.load(std::sync::atomic::Ordering::SeqCst)==1,"retained authority result was re-queried");
+                    let counted=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db"))?.snapshot(guard.id())?.context("fixture workflow disappeared")?;
+                    ensure!(counted.model_calls==2,"authority replay changed actual model accounting");
+                    eprintln!("Staged authority fixture: missing native output held without new calls; restored original bytes");
                     drop(staged);
                     let replay=stage_with(root.path(),&guard,&episode,&measurement,|original,control,prepared,_| {
                         Box::pin(async move {baseline_witness::assert_current(original,control,prepared)})
-                    }).await?;
+                    }).await.map_err(|error|error.context("reconstruct original stage from retained result after authority"))?;
                     ensure!(guard.verifier_evidence_page("original_verifier_command_admission",0)?.len()==1,"restart reran unchanged original command");
                     ensure!(guard.verifier_evidence_page("original_verifier_result",0)?.len()==1,"restart manufactured another original measurement");
                     let admitted:serde_json::Value=serde_json::from_str(&commands[0].body)?;
@@ -315,7 +416,18 @@ pub(super) mod tests {
                         let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(stdout)?;
                         file.write_all(&actual)?;file.sync_all()?;
                     }
-                    replay.require_current(root.path(),&guard,&episode).await?;
+                    replay.require_current(root.path(),&guard,&episode).await.map_err(|error|error.context("restore original capture after staged refusal"))?;
+                    eprintln!("Staged authority fixture: original capture loss refused; original bytes restored");
+                    let previous_identity=replay.adjudication_identity(root.path(),&guard,&episode).await?;
+                    guard.checkpoint(crate::autoship_workflow::Stage::Scope,"fixture_binding_metadata_changed","reconstruct_staged_correction",0,&["new-routing-evidence".into()]).await?;
+                    ensure!(replay.require_current(root.path(),&guard,&episode).await.is_err(),"old stage ignored its full binding fence");
+                    let replay=stage_with(root.path(),&guard,&episode,&measurement,|original,control,prepared,_|Box::pin(async move {
+                        baseline_witness::assert_current(original,control,prepared)
+                    })).await.map_err(|error|error.context("reconstruct qualified stage after routing binding rotation"))?;
+                    ensure!(replay.adjudication_identity(root.path(),&guard,&episode).await?==previous_identity,"binding metadata replenished the same semantic review input");
+                    let cached=adjudication::review_with(root.path(),&guard,&episode,Some(&replay),Err("scripted unavailable provider".into()),
+                        "new routing metadata remains context only","fixture-input","fixture-authority",|_,_|async {anyhow::bail!("binding metadata retried the completed fourth authority call")}).await.map_err(|error|error.context("replay same completed verdict across binding metadata rotation"))?;
+                    ensure!(cached.0.approved && guard.epoch_attempts("verifier-amend-total","fixture-authority")?==4,"metadata rotation changed the completed verdict or allowance");
                     let file=std::fs::read_dir(control.path())?.map(|e|e.map(|e|e.path())).collect::<std::io::Result<Vec<_>>>()?
                         .into_iter().find(|p|p.file_name().is_some_and(|n|n.to_string_lossy().starts_with("baseline-witness-") && n.to_string_lossy().ends_with(".json")))
                         .context("current witness file missing")?;
