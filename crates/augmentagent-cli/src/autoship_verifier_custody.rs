@@ -41,6 +41,19 @@ impl<'a> VerifierEvidenceInspection<'a> {
     pub(crate) fn scope_keys(&self,after:&str)->Result<Vec<String>> {
         read_scope_response_keys(self.conn,self.workflow,after)
     }
+    /// Authenticated raw-output keys, not roles claimed by the model's JSON.
+    /// This shares admission/charge/count/pair validation and can run inside an
+    /// existing inspection transaction without starting another transaction.
+    pub(crate) fn native_response_keys(&self)->Result<std::collections::BTreeSet<String>> {
+        let mut keys=std::collections::BTreeSet::new();
+        for domain in [NativeCustodyDomain::Baseline,NativeCustodyDomain::Construction] {
+            for reply in native_custody(self.conn,self.workflow,domain)? {
+                let controller:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2)",params![self.workflow,reply.input],|row|row.get(0))?;
+                ensure!(!controller && keys.insert(reply.input),"native output conflicts with controller evidence ownership");
+            }
+        }
+        Ok(keys)
+    }
     pub(crate) fn record(&self,key:&str,kind:&str)->Result<Option<String>> {
         let hash:Option<String>=self.conn.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![self.workflow,key,kind],|r|r.get(0)).optional()?;
         let body:Option<String>=self.conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![self.workflow,key],|r|r.get(0)).optional()?;

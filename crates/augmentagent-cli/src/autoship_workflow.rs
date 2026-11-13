@@ -365,7 +365,7 @@ fn construction_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<Na
 
 /// Shared accounting/custody checks, with disjoint keys and role requirements.
 /// Construction data is never returned from the baseline witness accessor.
-fn native_custody(tx:&Transaction<'_>,workflow:&str,domain:NativeCustodyDomain)->Result<Vec<NativeScopeCustody>> {
+fn native_custody(tx:&Connection,workflow:&str,domain:NativeCustodyDomain)->Result<Vec<NativeScopeCustody>> {
     let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
     let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
     let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();

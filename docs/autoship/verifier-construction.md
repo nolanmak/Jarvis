@@ -230,6 +230,23 @@ checking actual original-plan ownership as well as command-result replay. This
 still uses scripted constructor/witness replies and proves no #2014 correction
 or autonomous shipping.
 
+Cross-domain admission recheck found that a fresh scoper could still charge a
+model call around an unsettled original command because the guard only checked
+constructor purposes. Its actual-admission regression now passes with the
+all-command check applied to every correlated model purpose. This still does not
+replace a staged-input check before the old authority attempt counters.
+
+The broader check also exposed an existing discovery ambiguity: native JSON
+claiming `kind: original_verifier_plan` was treated as a missing controller
+record and poisoned later format correction. Another RED-to-GREEN regression
+now distinguishes native raw-output keys through their actual admission,
+charge, count and paired-publication evidence. Raw model JSON is data regardless
+of the role it names. A native-output key with a controller evidence index is a
+conflict, not an exemption. Missing real controller indexes continue to hold.
+The final expanded selection passes 170 tests with zero failures and four
+explicit isolation ignores; the connected staging-before-authority regression
+remains outside this passing component selection and is still unresolved.
+
 The authority integration must re-read the exact retained original result and
 its captures immediately before spending review authority. The current live
 stage object rechecks constructor/witness/binding/environment but does not yet

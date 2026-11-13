@@ -458,6 +458,7 @@ fn require_stored_quiescence(workflow:&str,admission:&str,admitted:&Admission,ra
 pub(super) fn require_correction_commands(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
     // The typed index alone cannot prove absence: a retained command body can
     // outlive its index. Cross-check the same bounded scope union as accounting.
+    let native_outputs=evidence.native_response_keys()?;
     let mut after=String::new();let mut count=0usize;
     loop {
         let keys=evidence.scope_keys(&after)?;
@@ -466,7 +467,7 @@ pub(super) fn require_correction_commands(evidence:&crate::autoship_workflow::Ve
             count+=1;ensure!(count<=8192 && key>after,"correction evidence discovery exceeds bound");
             let body=evidence.scope_response(&key)?.context("correction evidence body missing")?;
             ensure!(body.len()<=2*1024*1024,"correction evidence body exceeds bound");
-            if let Ok(value)=serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(value)=serde_json::from_str::<serde_json::Value>(&body).ok().filter(|_|!native_outputs.contains(&key)) {
                 if let Some(kind)=value["kind"].as_str().filter(|kind|kind.starts_with("original_verifier_")) {
                     ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|
                         "original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"),"unknown original evidence role");
