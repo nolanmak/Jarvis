@@ -58,6 +58,7 @@ impl Input {
             && self.episode==episode.key(),"constructor request differs from its controller-owned episode");
         Ok(())
     }
+    pub(super) fn request_text(&self)->&str {&self.prompt}
 }
 
 #[derive(Clone,Debug,Serialize,Deserialize)]

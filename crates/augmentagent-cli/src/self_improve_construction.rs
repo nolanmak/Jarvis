@@ -3,6 +3,7 @@
 use super::*;
 #[path="self_improve_construction_stage.rs"]
 mod staging;
+pub(super) use staging::{stage,StagedCorrection};
 
 const TURNS:u32=6;
 const SLOTS:u32=3;
@@ -242,6 +243,8 @@ mod tests {
 
     pub(super) async fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance,workflow::WorkflowGuard,ConstructionEpisode) {
         let (root,control,old)=qualification_fixture();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
         let path=control.path().join("workflow.db");
         let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
             repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",
