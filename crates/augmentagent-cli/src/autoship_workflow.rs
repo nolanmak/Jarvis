@@ -163,6 +163,17 @@ pub struct Snapshot {
     pub generation: i64,
 }
 
+/// Shared wait shape for acquisition and dispatch. Recovery evidence still
+/// requires separate authentication and grants no builder or merge approval.
+pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
+    checkpoint.stage==Stage::Scope && matches!(
+        (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
+        ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("readiness_assessment_invalid","await_readiness_input_change")|
+        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
+        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
+}
+
 /// Shape only; the unpaid consumer separately authenticates the exact private
 /// decline and original source before a transaction can queue reconsideration.
 pub(crate) fn legacy_amendment_input(checkpoint:&Checkpoint)->Option<&str> {
@@ -977,12 +988,7 @@ impl WorkflowStore {
             && (qualification_recovery::infrastructure_hold(&cp) || verifier_custody::original_hold_matches(&tx,workflow,&cp)?);
         if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
             && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
-        let awaiting_input=cp.stage==Stage::Scope && matches!(
-            (cp.next.reason.as_str(),cp.next.action.as_str()),
-            ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
-            ("readiness_assessment_invalid","await_readiness_input_change")|
-            ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
-            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"));
+        let awaiting_input=awaits_initial_input(&cp);
         let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input
             && binding.is_none_or(|binding|binding==&cp.binding);
         // Pending owner cleanup owns this generation until checked retirement

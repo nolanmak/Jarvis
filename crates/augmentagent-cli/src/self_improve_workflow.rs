@@ -795,9 +795,11 @@ impl WorkflowGuard {
                 || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
             if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
+        let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
         let context=context.filter(|context|context.source_request==start.contract
             && context.worktree.canonicalize().ok()==start.worktree.canonicalize().ok()
-            && (context.contract.starts_with("registered:") || context.environment==start.environment));
+            && (context.contract.starts_with("registered:") || context.environment==start.environment
+                || initial_wait && recovery::same_initial_verifier_environment(&context.environment,start.environment)));
         let contract=context.as_ref().map_or(start.contract,|c|c.contract.as_str());
         let environment=context.as_ref().map_or(start.environment,|c|c.environment.as_str());
         let receipts = existing
@@ -3769,6 +3771,64 @@ mod tests {
 #[cfg(test)]
 mod initial_acceptance_hold_tests {
     use super::*;
+    #[tokio::test]
+    async fn upstream_only_change_cannot_reclaim_an_exhausted_initial_verifier() {
+        upstream_wait_fixture(true).await;
+    }
+    #[tokio::test]
+    async fn upstream_movement_still_wakes_other_readiness_dependencies() {
+        upstream_wait_fixture(false).await;
+    }
+    async fn upstream_wait_fixture(input_wait:bool) {
+        async fn git(root:&Path,args:&[&str])->String {
+            let out=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(root)
+                .env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        }
+        let root=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        let upstream=root.path().join("upstream");let candidate=root.path().join("candidate");
+        std::fs::create_dir(&upstream).unwrap();
+        std::fs::write(upstream.join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+        std::fs::write(upstream.join("Cargo.lock"),"unchanged compiler inputs\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {git(&upstream,&args).await;}
+        let initial=git(&upstream,&["rev-parse","HEAD"]).await;
+        git(&upstream,&["worktree","add","--detach",candidate.to_str().unwrap(),&initial]).await;
+        let environment=recovery::environment_identity(&candidate,&initial).await.unwrap();
+        let path=control.path().join("workflow.db");let now=millis();
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:&upstream,worktree:&candidate,repository:"owner/repo",
+            source_issue:Some(7),pr:None,branch:"fixture",contract:"unchanged owner criteria",environment:&environment},now).await.unwrap().unwrap();
+        guard.store.lock().unwrap().charge(&guard.lease,"past-scope-work",crate::autoship_workflow::ResourceCharge {model_calls:3,tokens:1234,wall_ms:700},millis()).unwrap();
+        if input_wait {
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+        }else {
+            guard.checkpoint(Stage::Scope,"scope_deferred","resolve_scope_dependencies",0,&[]).await.unwrap();
+        }
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();drop(store);
+        std::fs::write(upstream.join("unrelated.md"),"manual intake routing changed elsewhere\n").unwrap();
+        git(&upstream,&["add","unrelated.md"]).await;
+        git(&upstream,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","unrelated main advance"]).await;
+        let advanced=git(&upstream,&["rev-parse","HEAD"]).await;
+        git(&upstream,&["update-ref","refs/remotes/origin/main",&advanced]).await;
+        let current=recovery::environment_identity(&candidate,&advanced).await.unwrap();
+        assert_ne!(environment,current,"fixture did not exercise real upstream-dependent environment");
+        assert_eq!(git(&candidate,&["rev-parse","HEAD"]).await,initial);
+        assert!(git(&candidate,&["status","--porcelain"]).await.is_empty());
+        let next=WorkflowGuard::acquire_at(&path,Start {repo_root:&upstream,worktree:&candidate,repository:"owner/repo",
+            source_issue:Some(7),pr:None,branch:"fixture",contract:"unchanged owner criteria",environment:&current},now+1000).await.unwrap();
+        if !input_wait {
+            let resumed=next.expect("ordinary readiness dependency lost its upstream wake");
+            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
+            resumed.finish().unwrap();return;
+        }
+        assert!(next.is_none(),"upstream-only environment change revived the exhausted original verifier");
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);
+        assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);assert_eq!(store.events(&id).unwrap(),events);
+    }
     #[tokio::test]
     async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
         for (reason,action) in [

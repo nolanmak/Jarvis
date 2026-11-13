@@ -178,9 +178,39 @@ pub(super) async fn environment_identity(worktree: &Path, upstream_main:&str) ->
     ))
 }
 
+/// Preserve an existing initial input wait across upstream-only movement.
+/// This does not erase main from readiness scheduling or authorize execution.
+/// Only the known producer shape is normalized; all other environment changes
+/// retain the existing exact-identity behavior.
+pub(super) fn same_initial_verifier_environment(left:&str,right:&str)->bool {
+    fn inputs(value:&str)->Option<(&str,&str,&str)> {
+        let (compiler,rest)=value.split_once(";cargo-lock:")?;
+        let (lock,rest)=rest.split_once(";upstream-main:")?;
+        let (main,policy)=rest.split_once(";readiness-policy:")?;
+        if !compiler.starts_with("rustc ") || compiler.len()<=6 || lock.len()!=64
+            || !lock.bytes().all(|b|b.is_ascii_hexdigit())
+            || !matches!(main.len(),40|64) || !main.bytes().all(|b|b.is_ascii_hexdigit()) || policy.is_empty() {return None;}
+        Some((compiler,lock,policy))
+    }
+    left==right || inputs(left).zip(inputs(right)).is_some_and(|(a,b)|a==b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initial_verifier_environment_only_normalizes_known_upstream_movement() {
+        let old=format!("rustc 1.94.1;cargo-lock:{};upstream-main:{};readiness-policy:policy-a","a".repeat(64),"1".repeat(40));
+        let advanced=old.replace(&"1".repeat(40),&"2".repeat(40));
+        assert!(same_initial_verifier_environment(&old,&advanced));
+        for changed in [advanced.replace("1.94.1","1.95.0"),advanced.replace(&"a".repeat(64),&"b".repeat(64)),
+            advanced.replace("policy-a","policy-b"),advanced.replace("rustc ","unknown "),
+            advanced.replace(&"a".repeat(64),"not-a-hash"),advanced.replace(&"2".repeat(40),"not-a-commit")] {
+            assert!(!same_initial_verifier_environment(&old,&changed));
+        }
+        assert!(same_initial_verifier_environment("fixture","fixture"));
+        assert!(!same_initial_verifier_environment("fixture","different fixture"));
+    }
     fn git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)

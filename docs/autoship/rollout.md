@@ -153,6 +153,15 @@ augmentagent autopr status --workflow WORKFLOW --json
 | `review-recovery-required` | A selected review failed to complete. Inspect the protected controller error and repair its recorded cause before retrying. |
 | `review-main-advanced` | Main advanced outside the captured candidate. The original workflow queues integration and fresh verification with a five-minute backoff. Automatic selection recognizes this dependency wake within the same day, and the short queue poll notices eligible work without requiring a CLI job. Existing owner holds and unresolved operations still prevent dispatch. |
 
+Initial acceptance-input waits retain their recorded execution context when only
+the known environment's `upstream-main` value changes. An unrelated main merge
+does not repair the original verifier. Compiler, Cargo.lock, readiness-policy,
+owner-request and candidate changes still pass through their existing admission
+checks; other readiness dependencies retain their upstream wake. Unknown producer
+shapes keep the existing exact-identity handling. Recovery evidence, owner pauses,
+charges and prior results are preserved. This does not rewind an already reclaimed
+episode or silently restart an administratively paused workflow.
+
 Private progress retains the typed review blocker when a worker wrapper finishes.
 A resume acknowledgement is still intent, and can wait for native retirement or
 another admission guard. If a format correction remains incomplete, inspect the
