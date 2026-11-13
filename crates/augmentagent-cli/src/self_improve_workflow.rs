@@ -2242,6 +2242,30 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn constructor_response_pair_without_private_proof_cannot_authorize_native_admission() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:Some(2058),pr:None,branch:"fixture",contract:"C1",environment:"test",
+        },millis()).await.unwrap().unwrap();
+        let purpose=format!("verifier-construction-native-v1:{}:{}","a".repeat(64),"b".repeat(64));
+        let (raw,proof)=durable::construction_native_response_keys(&purpose).unwrap();
+        {
+            let mut store=guard.store.lock().unwrap();
+            store.charge_admitted_model(&guard.lease,"original-constructor",millis(),None,
+                Some((&purpose,guard.binding(),1)),Some(durable::submission::Provider::Codex),false).unwrap();
+            let reference=serde_json::json!({"artifact":control.path().join("constructor-native-missing.json"),"artifact_sha256":"c".repeat(64)}).to_string();
+            store.record_scope_stage_response_pair(&guard.lease,guard.binding(),&raw,"complete original reply",&proof,&reference,millis()).unwrap();
+        }
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert!(guard.audit_logger().model_call_admitted("claude").is_err(),
+            "paired database strings bypassed missing physical constructor provenance");
+        let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint,before.checkpoint);
+        guard.finish().unwrap();
+    }
+    #[tokio::test]
     async fn semantic_recovery_reuses_registered_context_without_builder_authority() {
         let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
         let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"frontend environment"};
