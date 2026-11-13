@@ -525,6 +525,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn amendment_authority_does_not_spend_a_call_on_unstaged_source_only_dispute() {
+        let (root,control,base,custody)=fixture().await;
+        let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
+        let request=super::construction_request("Original proposal is disputed; no replacement has been constructed or measured.",&evidence).unwrap();
+        let expected="c".repeat(64);let calls=std::sync::atomic::AtomicUsize::new(0);
+        let result=super::authority_response(root.path(),&base,&expected,&request,|prompt| {
+            assert!(prompt.contains("pub fn behavior() -> bool { false }"),"fixture lost authenticated original source");
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            // A valid complete refusal is not malformed output and must remain
+            // authoritative. The missing work is construction before this call.
+            let raw=serde_json::json!({"approved":false,"previous_contract_hash":expected,
+                "approve_environment_transition":false,"reason":"No complete measured replacement was supplied for independent adjudication","proposal":null}).to_string();
+            async move {Ok((raw,"scripted-independent-authority".into()))}
+        },||panic!("a valid completed refusal cannot justify a formatting retry")).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0,
+            "source-only dispute spent independent authority before a concrete staged correction existed");
+        assert!(result.is_err(),"unstaged source-only dispute reached an authority decision");
+    }
+
+    #[tokio::test]
     async fn amendment_source_and_construction_task_reach_actual_authority_call() {
         let (root,control,base,custody)=fixture().await;
         let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
