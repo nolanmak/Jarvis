@@ -742,3 +742,68 @@ ignores (139.68 seconds). This source has not had a new full CLI run or the fina
 fresh audits/engineering review. It remains unactivated. A proper authorized
 transition must be implemented through the complete distinct identity/capture/
 ownership path above; callers must not bypass this guard to reuse v1 receipts.
+
+
+## Approved-command custody — actual-boundary regression in progress
+
+The post-authority observation block is now extracted as
+`observe_approved_original`, and the real `try_amend` caller uses that helper.
+The extraction preserves the existing registration and command behavior. It does
+not implement approved-mode custody: the helper still calls `execute_registered`.
+A new explicitly opt-in delegated fixture stages a constructor-owned proposal,
+measures real original RED, retains scripted positive witness data, and obtains a
+scripted reply through the actual independent authority/native-admission service.
+It then invokes this same production helper with the explicitly approved
+transition mode. Its intended failure is the absence of a distinct original
+plan/result/capture, after successful real isolated execution. Build or resource
+refusal is not behavioral RED. The fixture does not claim full ingress, actual
+provider adjudication or autonomous shipping.
+
+Implementation decisions for the remaining complete boundary:
+1. The authority service must return a non-deserializable approved-execution
+   capability tied to its exact retained native intent/completion and qualified
+   staged proposal. Decision JSON, a filename, or a registration alone grants no
+   command. A historical reference is inspectable data, never that live capability.
+2. The approved registration must bind presence of the transition mode (including
+   equal environment strings), original/candidate environments, unchanged original
+   base, exact proposal/adapter bytes and executor. Preserve v1 plan bytes and
+   Pending v1 metadata recovery. Never relabel provisional RED receipts.
+3. The approved phase must use the existing constructor measurement ownership and
+   exact authority proof. It cannot fall through to an initial-scoping budget,
+   allocate another constructor slot, reset an epoch or refund an old charge.
+   Native qualifiers retain their existing actual-admission accounting.
+4. Original execution recovery must cover the actual driver, read-only outcome
+   and ownership consumers, scope-union discovery and `recover_original_verifier`.
+   That recovery currently assumes v1 and initial-measurement execution. Data-only
+   capture settlement must remain possible without a fresh model or active source;
+   fresh/resumed commands still require the supported live source/owner/lease
+   authority and exact frozen approved recipe. Unknown admitted effects fence
+   every new model role until recovered.
+
+Load-bearing implementation questions remain owned by the implementation agent,
+with resolution required before completing this boundary or opening its engineering
+PR: freeze a stable approved-phase identity so routing/binding metadata changes
+cannot manufacture another original execution; authenticate historical ownership
+without treating it as a live dispatch grant; and reconstruct a restricted frozen-
+recipe recovery capability without requiring a newly constructed stage that is
+itself fenced by the unfinished approved command. Existing completed v2 approved
+measurements should be reused only for identical semantic authorization,
+registration and executor; candidate GREEN remains tied to its current head.
+The Pending v2 activation path must likewise carry and authenticate exact original
+plan/result references under a supported owned caller, while retaining Pending v1
+compatibility. No new coordinator, approval ledger, budget or production SQL
+mutation is authorized by these notes. These open joins block activation and the
+full #1703 outcome; they are not waived by the validator guard or a custody RED.
+
+
+The new actual-boundary regression reproduced that intended custody failure in
+114.23 seconds under the delegated test service. The helper returned a real
+intended-RED receipt for the explicit transition registration; the assertion then
+reported that no separate approved original plan/capture ownership existed. The
+service exited 101 with one failing test, after its commands completed; parent
+memory peak was 254.5 MiB. This is behavioral RED, not a build/setup failure.
+The source compiled successfully first (2 minutes 28 seconds). No custody fix,
+new full-suite pass, deployment, real-provider adjudication or autonomous shipment
+is claimed by this test-first checkpoint. Production code still follows the same
+legacy observation path through the extracted helper until the complete approved
+capability/identity/ownership/recovery implementation above replaces it.

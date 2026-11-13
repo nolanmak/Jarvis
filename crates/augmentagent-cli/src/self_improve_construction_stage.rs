@@ -295,6 +295,56 @@ pub(super) mod tests {
 
     #[cfg(target_os="linux")]
     #[tokio::test]
+    #[ignore="real isolated original commands plus native admission; requires delegated service outside enclosing managed build lease; model replies scripted"]
+    async fn approved_transition_original_execution_retains_distinct_owned_plan_and_capture()->Result<()> {
+        let (root,control,old,guard,episode,_namespace)=super::super::tests::native_namespace_fixture().await;
+        let mut text:serde_json::Value=serde_json::from_str(&super::super::tests::proposal(&old))?;
+        text["propose_environment_transition"]=true.into();
+        let measurement=owned_measurement(root.path(),&guard,&episode,&old,serde_json::to_string(&text)?).await?;
+        let staged=stage_with(root.path(),&guard,&episode,&measurement,|original,control,prepared,_|Box::pin(async move {
+            baseline_witness::persist_scripted(original,control,prepared,true)
+        })).await?;
+        let original=guard.exact_original_result_data(&staged.original_plan,&staged.original_result)?;
+        let original_identity=original.identity.clone();
+        let decision=Decision {approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),
+            approve_environment_transition:true,approve_additional_files:vec![],
+            reason:"Independent scripted reviewer approves only the exact measured proposal and its explicit environment mode".into(),
+            proposal:Some(measurement.proposal().clone())};
+        let raw=serde_json::to_string(&decision)?;let raw=&raw;let workflow=&guard;
+        let reviewed=adjudication::review_with(root.path(),workflow,&episode,Some(&staged),|_|Ok(augmentagent_channel_core::ProviderKind::Codex),
+            "Complete original request and exact qualified proposal","approved-mode-input","approved-mode-epoch",|provider,_,_|async move {
+                let session=augmentagent_channel_core::native_session::current_for(provider)?.context("scripted authority scope absent")?;
+                let mut native=session.begin(provider)?;workflow.audit_logger().model_call_admitted(provider.name())?;
+                native.observe(&format!("scripted-approved-mode-review-{}",uuid::Uuid::new_v4()))?;native.finish()?;
+                Ok(raw.clone())
+            }).await?;
+        staged.validate_decision(&reviewed.0)?;
+        ensure!(reviewed.0.approved && reviewed.0.approve_environment_transition,"fixture lacks the exact approved mode");
+        let candidate_environment=environment_id(root.path())?;
+        let baseline=super::super::super::observe_approved_original(&staged.original,measurement.proposal(),
+            episode.original_base(),episode.original_environment(),&candidate_environment,
+            reviewed.0.approve_environment_transition,&guard).await?;
+        ensure!(baseline.registration.has_environment_transition(),"approved registration lost the transition mode");
+        ensure!(baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"actual approved original did not reproduce intended red");
+        let plans=guard.verifier_evidence_page("original_verifier_plan",0)?;
+        ensure!(plans.len()==2,"approved environment registration executed without its own original plan/capture ownership");
+        let plan=plans.iter().find(|p|p.key!=staged.original_plan).context("approved execution relabeled its provisional plan")?;
+        let results=guard.verifier_evidence_page("original_verifier_result",0)?;
+        let result=results.iter().find(|r|serde_json::from_str::<serde_json::Value>(&r.body).ok().is_some_and(|v|v["plan"]==plan.key)).context("approved original result not retained")?;
+        let retained=guard.exact_original_result_data(&plan.key,&result.key)?;
+        ensure!(serde_json::to_vec(&retained.prepared.baseline)?==serde_json::to_vec(&baseline)?,"approved mode/capture/result binding differs");
+        ensure!(guard.verifier_evidence_page("original_verifier_command_admission",0)?.len()==2
+            && guard.verifier_evidence_page("original_verifier_command_quiescent",0)?.len()==2,"approved command did not retain separate actual custody");
+        ensure!(guard.exact_original_result_data(&staged.original_plan,&staged.original_result)?.identity==original_identity,
+            "approved execution changed its provisional original evidence");
+        ensure!(verifier_execution::retained_original_plan_budget_contexts(root.path(),control.path(),&guard)?.is_empty(),
+            "approved correction leaked into an initial-scoping grant");
+        ensure!(guard.epoch_attempts("verifier-amend-total","approved-mode-epoch")?==1,"approved execution spent another authority strategy attempt");
+        guard.finish()?;Ok(())
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
     #[ignore="delegated original execution plus native admission accounting; run built binary outside cargo-managed lease; model replies scripted"]
     async fn qualified_authority_setup_refusal_retries_reserved_intent_after_restart_without_extra_attempt()->Result<()> {
         let (root,control,old,mut guard,episode,_namespace)=super::super::tests::native_namespace_fixture().await;

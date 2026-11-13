@@ -729,38 +729,15 @@ pub(super) async fn try_amend(
     let base = old.baseline.registration.baseline_head();
     trusted_git(root, &["worktree", "add", "--detach", checkout, base]).await?;
     let reproduce = async {
-        install_harness(&baseline_root, &proposal)?;
-        let baseline_environment = environment_id(&baseline_root)?;
-        ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
-        let registration = if decision.approve_environment_transition {
-            RegisteredContract::register_transition(
-                &baseline_root,
-                proposal.contract.clone(),
-                base.into(),
-                baseline_environment,
-                candidate_environment,
-            )?
-        } else {
-            RegisteredContract::register(
-                &baseline_root,
-                proposal.contract.clone(),
-                base.into(),
-                baseline_environment,
-            )?
-        };
-        let receipts = execute_registered(&baseline_root, &registration, &workflow.audit_logger()).await?;
+        let baseline=observe_approved_original(&baseline_root,&proposal,base,
+            &environments.current_original_baseline,&candidate_environment,
+            decision.approve_environment_transition,workflow).await?;
         ensure!(
-            registration.baseline_result(&receipts)? == BaselineResult::Reproduced,
+            baseline.registration.baseline_result(&baseline.receipts)? == BaselineResult::Reproduced,
             "amended verifier failed intended-red baseline: {}",
-            serde_json::to_string(&receipts)?
+            serde_json::to_string(&baseline.receipts)?
         );
-        let prepared=PreparedAcceptance {
-            proposal,
-            baseline: BaselineEvidence {
-                registration,
-                receipts,
-            },
-        };
+        let prepared=PreparedAcceptance {proposal,baseline};
         baseline_witness::qualify(&baseline_root,control,&prepared,workflow).await?;
         Ok::<_, anyhow::Error>(prepared)
     }
@@ -818,6 +795,24 @@ pub(super) async fn try_amend(
         &bytes,
     )?;
     resume_pending(root, control, source).await
+}
+
+/// Actual post-authority observation boundary. This extraction preserves the
+/// existing behavior while its missing authorized OriginalExecution custody is
+/// reproduced by the isolated regression. Authority validation stays upstream.
+async fn observe_approved_original(root:&Path,proposal:&ContractProposal,base:&str,
+    expected_original_environment:&str,candidate_environment:&str,transition:bool,
+    workflow:&workflow::WorkflowGuard)->Result<BaselineEvidence> {
+    install_harness(root,proposal)?;
+    let environment=environment_id(root)?;
+    ensure!(environment==expected_original_environment,"runner environment changed during independent amendment");
+    let registration=if transition {
+        RegisteredContract::register_transition(root,proposal.contract.clone(),base.into(),environment,candidate_environment.into())?
+    }else {
+        RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment)?
+    };
+    let receipts=execute_registered(root,&registration,&workflow.audit_logger()).await?;
+    Ok(BaselineEvidence {registration,receipts})
 }
 
 fn staging_path(relative: &str, contract: &str) -> Result<PathBuf> {
