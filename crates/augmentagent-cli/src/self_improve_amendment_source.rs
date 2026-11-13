@@ -799,6 +799,9 @@ mod tests {
         let number=id.strip_prefix(&format!("{}#",recovery.repository)).unwrap().parse::<u64>().unwrap();
         let source=AcceptanceSource::Issue(number);
         let (prepared,_)=super::super::retained_semantic_source(&recovery.worktree,&control,source,&before.checkpoint.binding,&custody,&store.inspect_verifier_evidence(&id)).unwrap().unwrap();
+        let enrolled=super::constructor_enrollment(&recovery.worktree,&control,source).unwrap();
+        assert_eq!(enrolled.baseline.registration.contract_hash(),prepared.baseline.registration.contract_hash(),"constructor enrollment differs from retained ordinary source");
+        assert_eq!(enrolled.baseline.registration.baseline_head(),prepared.baseline.registration.baseline_head());
         let (negative_identity,diagnosis_raw)=baseline_witness::retained_semantic_diagnosis_in(&recovery.worktree,&control,&prepared,&custody).unwrap().unwrap();
         let diagnosis:serde_json::Value=serde_json::from_str(&diagnosis_raw).unwrap();
         let base=prepared.baseline.registration.baseline_head();let context=diagnosis["context"].as_str();

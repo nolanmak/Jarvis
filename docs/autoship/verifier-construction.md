@@ -238,6 +238,41 @@ conflicting custody holds across role, provider and binding changes. Recovery
 may restore the exact original output; it must not generate a replacement by
 calling a different model.
 
+The source interface now uses a controller-created `ConstructorTable` for the
+episode's original commit. Its distinct table digest binds the literal commit
+and ordered regular-blob metadata/paths; normalize Git column padding rather
+than hashing display whitespace. Pages contain at most 128 entries and 32 KiB
+of serialized data. Requests name that table digest and 1–16 ordinal selections,
+with validated line/literal bounds. Model-provided paths, foreign table IDs,
+symlinks and credential paths are rejected. The shared streaming source buffer
+returns complete selected files when they fit, otherwise explicitly labeled
+excerpts; required windows that do not fit fail without truncation. Final
+serialized evidence must fit its controller-supplied residual budget. These are
+data reads, never witness custody or evidence of behavioral red. The historical
+witness-source ordinal protocol is unchanged.
+
+`ConstructionEpisode` is a controller-only type with no model deserializer.
+Its factory validates the original proposal against its registered contract,
+the workflow's protected registered source/hash, and independently measured
+original environment. Production derives the expected workflow acceptance
+namespace independently. The private active workflow manifest must point to the
+exact enrolled prepared artifact; its source, revision, registration hash,
+original commit and pinned file data must agree. Recovery metadata alone is
+not enrollment and cannot mint a replacement episode. The connected regression
+rebinds/checkpoints a newly constructed replacement through the recovery API
+and proves that it still cannot create a fresh budget without protected
+enrollment. New dispatch rereads that enrollment as well as the workflow
+binding. These checks authenticate enrollment data, not positive qualification
+of an invalid old verifier. The existing engine emits
+`sandbox-protected-cache-v2:<digest>`; unknown or malformed identities hold
+rather than becoming a new budget. The factory ignores current candidate/main,
+feedback and display-policy fields. A newly constructed but unactivated
+registration cannot create another episode. Native requests and constructor
+source tables expose typed episode factories; the raw base/episode constructors
+are private. Native dispatch rechecks that the retained episode still matches
+the workflow's active registered context. Candidate/evidence binding changes
+preserve its budget; a different registered context invalidates that grant.
+
 The indexed-custody regression first reproduced a dispatch past a lost response
 after restart. The implementation now checks the actual admission, charge,
 counter and paired response entries before any fresh native admission, across
@@ -265,10 +300,16 @@ paired-index publication followed by original-output recovery, an admitted lost
 output that remains held, and free setup refusals with zero admitted attempts.
 The production adapters have CLI-capture tests for the exact sealed model and
 payloads, plus guard tests rejecting option/payload changes before dispatch.
-The broader provider suite passes (747, with 16 opt-in tests ignored); constructor
-tests pass (9), and workflow regressions pass (266, with one existing ignored
+The broader provider suite passes (747, with 16 opt-in tests ignored); constructor,
+source and episode tests pass (14), and workflow regressions pass (266, with one existing ignored
 test). These counts do not claim the full CLI suite passes: the separate
 source-only-before-authority regression remains RED until staging integration.
+The legacy source slice also passes (14). The read-only production probe
+authenticates the actual #2014 active enrollment and retained original source,
+reconstructs the same eight files and bounded complete request, and proves
+unchanged workflow state with zero model calls. Fresh read-only review rechecked
+the recovery-metadata finding after the protected-enrollment fix and found that
+specific boundary resolved; full handoff readiness remains unproven.
 
 The constructor transport saves `constructor-input-<exact-input>.json` before
 admission. After a completed native response it privately retains the raw text
@@ -291,10 +332,12 @@ original error, spends no call/attempt and may retry once prerequisites recover.
 Completed-cache replay precedes any new native runtime/capacity admission;
 ordinary owner/source/lease checks still apply.
 
-The native transport is still an unused component. Controller-derived canonical
-episode construction, bounded additional-source collection, restricted held-work
-admission and staged-proposal integration are required before enabling a
-production constructor call. Scripted native conversations in disposable tests
+The native transport, canonical episode factory and bounded source interface are
+still unused components. The persistent proposal/source/measurement loop,
+restricted held-work admission and staged-proposal integration are required
+before enabling a production constructor call. Cross-episode recovery must use
+an explicit data-only path for an old admitted request; it cannot relax the
+new-dispatch episode check. Scripted native conversations in disposable tests
 are not a production model run, behavioral red or independent approval.
 
 ## Open decisions — owner: implementation agent
@@ -302,10 +345,11 @@ are not a production model run, behavioral red or independent approval.
 These must be resolved against source and audited before handoff, not guessed by
 a downstream implementer:
 
-- Implement and verify the selected producer interface above, including bounded
-  additional source collection, physical provenance and recovery before scope
-  release. Generic scope calls cache native custody only with qualification
-  context; do not relabel a constructor as a witness to borrow that cache.
+- Integrate the selected native/source interfaces in the persistent constructor
+  loop. Keep current episode grants separate from data-only recovery of an old
+  admitted input after an environment/registration transition. Generic scope
+  calls cache native custody only with qualification context; do not relabel a
+  constructor as a witness to borrow that cache.
 - Select the restricted construction lease/admission integration. Inspection
   leases forbid models. Normal claims cannot merely clear an unchanged completed
   decline to run a constructor. Specify eligibility, fairness, termination and

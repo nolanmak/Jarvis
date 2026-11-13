@@ -178,7 +178,7 @@ fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::aut
 /// lease and a controller-computed episode; no proposal is approved here.
 pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {
     use std::os::unix::fs::DirBuilderExt;
-    episode.require_current(workflow)?;
+    episode.require_current(root,workflow)?;
     ensure!(episode.workflow()==workflow.id() && input.workflow==episode.workflow()
         && input.original_base==episode.original_base() && input.episode==episode.key(),"constructor request differs from its controller-owned episode");
     workflow.require_fresh_issue(root).await?;

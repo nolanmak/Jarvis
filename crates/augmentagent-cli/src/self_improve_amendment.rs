@@ -210,19 +210,44 @@ struct EnvironmentEvidence {
 /// Controller-owned budget identity. Proposed registrations, current candidate
 /// bindings and serialized model output cannot manufacture a new episode.
 #[derive(Debug)]
-pub(super) struct ConstructionEpisode {key:String,workflow:String,original_base:String,registered_contract:String}
+pub(super) struct ConstructionEpisode {key:String,workflow:String,original_base:String,registered_contract:String,control:PathBuf,source:AcceptanceSource}
 impl ConstructionEpisode {
     pub(super) fn key(&self)->&str {&self.key}
     pub(super) fn workflow(&self)->&str {&self.workflow}
     pub(super) fn original_base(&self)->&str {&self.original_base}
-    pub(super) fn require_current(&self,workflow:&workflow::WorkflowGuard)->Result<()> {
+    pub(super) fn require_current(&self,root:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
         workflow.validate_before_side_effect()?;
         ensure!(self.workflow==workflow.id() && workflow.has_registered_acceptance_context()?
             && workflow.binding().contract==self.registered_contract,"constructor episode no longer matches the registered workflow context");
+        let enrolled=constructor_enrollment(root,&self.control,self.source)?;
+        ensure!(enrolled.baseline.registration.contract_hash()==self.registered_contract
+            && enrolled.baseline.registration.baseline_head()==self.original_base,"constructor enrollment changed after episode creation");
         Ok(())
     }
 }
+/// Enrollment is the controller's protected active manifest and its exact
+/// prepared artifact, not mutable recovery metadata or positive qualification.
+fn constructor_enrollment(root:&Path,control:&Path,source:AcceptanceSource)->Result<PreparedAcceptance> {
+    let control=control.canonicalize()?;
+    for writable in worker_roots(root) {
+        if writable.exists() {ensure!(!control.starts_with(writable.canonicalize()?),"constructor enrollment overlaps worker storage");}
+    }
+    let manifest:WorkflowManifest=private_json(&control.join(format!("{}-workflow.json",source.key())))?;
+    validate_retained_manifest(&control,&manifest,source)?;
+    let path=if let Some(name)=&manifest.evidence_file {control.join(name)}else{evidence_path(&control,source,&manifest.original_base)?};
+    let enrolled:PreparedAcceptance=private_json(&path)?;
+    let registered=&enrolled.baseline.registration;
+    ensure!(registered.contract().source()?==source && enrolled.proposal.contract==*registered.contract()
+        && registered.contract_hash()==manifest.contract_hash && registered.baseline_head()==manifest.original_base
+        && registered.contract().revision==manifest.contract_revision,"constructor manifest differs from its enrolled registration");
+    registered.verify_source_files(root,&enrolled.proposal.files)?;
+    Ok(enrolled)
+}
 fn construction_episode(root:&Path,workflow:&workflow::WorkflowGuard,old:&PreparedAcceptance,environments:&EnvironmentEvidence)->Result<ConstructionEpisode> {
+    let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    construction_episode_at(root,&control,workflow,old,environments)
+}
+fn construction_episode_at(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,old:&PreparedAcceptance,environments:&EnvironmentEvidence)->Result<ConstructionEpisode> {
     workflow.validate_before_side_effect()?;
     workflow.validate_acceptance_source(old)?;
     let registered=&old.baseline.registration;
@@ -230,13 +255,16 @@ fn construction_episode(root:&Path,workflow:&workflow::WorkflowGuard,old:&Prepar
     ensure!(old.proposal.contract==*registered.contract(),"constructor source proposal differs from registered contract");
     ensure!(workflow.has_registered_acceptance_context()? && workflow.binding().contract==registered.contract_hash(),
         "constructor episode requires the workflow's registered old contract");
+    let enrolled=constructor_enrollment(root,control,registered.contract().source()?)?;
+    ensure!(enrolled.baseline.registration.contract_hash()==registered.contract_hash()
+        && enrolled.baseline.registration.baseline_head()==registered.baseline_head(),"constructor registration is not the protected active enrollment");
     ensure!(environments.original_base==registered.baseline_head(),"constructor environment belongs to another original commit");
     let measured=environments.current_original_baseline.strip_prefix("sandbox-protected-cache-v2:")
         .context("constructor original environment has an unsupported engine identity")?;
     ensure!(measured.len()==64 && measured.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"constructor original environment is not measured");
     let key=digest(&serde_json::to_vec(&("verifier-construction-episode-v1",workflow.id(),registered.contract().source()?,
         registered.baseline_head(),registered.contract_hash(),&environments.current_original_baseline))?);
-    Ok(ConstructionEpisode {key,workflow:workflow.id().into(),original_base:registered.baseline_head().into(),registered_contract:registered.contract_hash().into()})
+    Ok(ConstructionEpisode {key,workflow:workflow.id().into(),original_base:registered.baseline_head().into(),registered_contract:registered.contract_hash().into(),control:control.canonicalize()?,source:registered.contract().source()?})
 }
 impl EnvironmentEvidence {
     fn transition_required(&self) -> bool {
@@ -1110,10 +1138,12 @@ mod tests {
         let (source_issue,pr)=match old.proposal.contract.source().unwrap() {AcceptanceSource::Issue(n)=>(Some(n),None),AcceptanceSource::PullRequest(n)=>(None,Some(n))};
         let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue,pr,branch:"fixture",contract:"complete owner request",environment:"fixture"}).await.unwrap().unwrap();
         let environments=environment_evidence(root.path(),control.path(),&old).await.unwrap();
-        assert!(construction_episode(root.path(),&guard,&old,&environments).unwrap_err().to_string().contains("workflow's registered old contract"),"unbound proposal created a fresh constructor budget");
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&old,&environments).unwrap_err().to_string().contains("workflow's registered old contract"),"unbound proposal created a fresh constructor budget");
         guard.checkpoint_qualification_source(&old).await.unwrap();
-        let first=construction_episode(root.path(),&guard,&old,&environments).unwrap();
-        first.require_current(&guard).unwrap();
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&old,&environments).is_err(),"recovery metadata without enrollment seeded a budget");
+        persist_fixture_registration(control.path(),&old).unwrap();
+        let first=construction_episode_at(root.path(),control.path(),&guard,&old,&environments).unwrap();
+        first.require_current(root.path(),&guard).unwrap();
         let table=source_evidence::ConstructorTable::for_episode(root.path(),&first).await.unwrap();
         let page:serde_json::Value=serde_json::from_str(&table.page(0,128).unwrap()).unwrap();
         assert_eq!(page["original_base"],old.baseline.registration.baseline_head());
@@ -1122,28 +1152,28 @@ mod tests {
         let mut changed=environments.clone();changed.canonical_main=Some("b".repeat(40));changed.current_canonical_main=Some("c".repeat(64));
         changed.current_candidate="d".repeat(64);changed.current_sandbox_sha256="e".repeat(64);changed.legacy_proof_migration=!changed.legacy_proof_migration;
         guard.checkpoint(crate::autoship_workflow::Stage::Scope,"constructor_feedback","construct",0,&["changed selected source and feedback".into()]).await.unwrap();
-        assert_eq!(construction_episode(root.path(),&guard,&old,&changed).unwrap().key(),first.key(),"candidate/main/policy/feedback binding refilled the episode");
+        assert_eq!(construction_episode_at(root.path(),control.path(),&guard,&old,&changed).unwrap().key(),first.key(),"candidate/main/policy/feedback binding refilled the episode");
         changed.current_original_baseline=format!("sandbox-protected-cache-v2:{}","f".repeat(64));
-        assert_ne!(construction_episode(root.path(),&guard,&old,&changed).unwrap().key(),first.key());
+        assert_ne!(construction_episode_at(root.path(),control.path(),&guard,&old,&changed).unwrap().key(),first.key());
         let mut malformed=environments.clone();malformed.current_original_baseline="f".repeat(64);
-        assert!(construction_episode(root.path(),&guard,&old,&malformed).is_err());
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&old,&malformed).is_err());
         malformed.current_original_baseline=format!("serialization-only-v99:{}","f".repeat(64));
-        assert!(construction_episode(root.path(),&guard,&old,&malformed).is_err(),"unknown serialized identity minted a fresh budget");
-        changed.original_base="b".repeat(40);assert!(construction_episode(root.path(),&guard,&old,&changed).is_err());
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&old,&malformed).is_err(),"unknown serialized identity minted a fresh budget");
+        changed.original_base="b".repeat(40);assert!(construction_episode_at(root.path(),control.path(),&guard,&old,&changed).is_err());
         let mut proposal=old.clone();proposal.proposal.contract.revision+=1;
         proposal.baseline.registration=RegisteredContract::register(root.path(),proposal.proposal.contract.clone(),old.baseline.registration.baseline_head().into(),environments.current_original_baseline.clone()).unwrap();
-        assert!(construction_episode(root.path(),&guard,&proposal,&environments).is_err(),"unactivated replacement registration refilled the budget");
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&proposal,&environments).is_err(),"unactivated replacement registration refilled the budget");
         let input=constructor_native::Input::for_episode(&first,augmentagent_channel_core::ProviderKind::Codex,"fixture-model","Untrusted constructor","Original requirements and source data").unwrap();
         let mut changed=serde_json::to_value(&input).unwrap();changed["episode"]="a".repeat(64).into();
         let changed:constructor_native::Input=serde_json::from_value(changed).unwrap();
         let error=constructor_native::call(root.path(),&guard,&first,&changed).await.err().unwrap();
         assert!(error.to_string().contains("controller-owned episode"));
         let mut foreign=old.clone();foreign.proposal.contract.issue=Some(841);foreign.proposal.contract.pull_request=None;
-        assert!(construction_episode(root.path(),&guard,&foreign,&environments).is_err());
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&foreign,&environments).is_err());
         guard.bind_acceptance_for_recovery(&proposal).unwrap();
         guard.checkpoint(crate::autoship_workflow::Stage::Scope,"new_registered_context","qualify_original",0,&[]).await.unwrap();
-        assert!(first.require_current(&guard).is_err(),"retained episode authorized a different active registration");
-        assert!(construction_episode(root.path(),&guard,&proposal,&environments).is_err(),
+        assert!(first.require_current(root.path(),&guard).is_err(),"retained episode authorized a different active registration");
+        assert!(construction_episode_at(root.path(),control.path(),&guard,&proposal,&environments).is_err(),
             "recovery metadata alone created a fresh constructor budget for an unactivated proposal");
         assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
         guard.finish().unwrap();
