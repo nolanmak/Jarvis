@@ -10,6 +10,16 @@ struct Plan {
     base:String,environment:String,executor:String,proposal:ContractProposal,
 }
 
+impl Plan {
+    fn checked(workflow:&str,key:&str,body:&str)->Result<Self> {
+        ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
+        let plan:Self=serde_json::from_str(body)?;
+        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
+            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
+        Ok(plan)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct OriginalExecutionFailed {pub(super) plan:String}
 impl std::fmt::Display for OriginalExecutionFailed {
@@ -43,6 +53,54 @@ struct RecordedResult {
 
 fn result_key(plan:&str,attempt:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",plan,attempt)).unwrap())
+}
+
+/// Private captured facts only; no execution, qualification or budget grant.
+#[derive(Debug,Serialize)]
+pub(super) struct CapturedCommandData {
+    pub(super) exit_code:Option<i32>,pub(super) stdout:String,pub(super) stderr:String,
+    pub(super) interrupted:bool,pub(super) output_complete:bool,
+}
+#[derive(Serialize)]
+pub(in crate::self_improve) struct OriginalResultData {
+    pub(super) identity:String,
+    pub(super) binding:crate::autoship_workflow::Binding,
+    pub(super) prepared:PreparedAcceptance,
+    pub(super) commands:BTreeMap<String,CapturedCommandData>,
+}
+pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
+    require_correction_commands(evidence)?;
+    let body=evidence.record(plan_key,"original_verifier_plan")?.context("original plan missing")?;
+    let plan=Plan::checked(evidence.workflow(),plan_key,&body)?;
+    let raw=evidence.record(result,"original_verifier_result")?.context("original result missing")?;
+    let record:RecordedResult=serde_json::from_str(&raw)?;
+    ensure!(record.version==1 && record.kind=="original_verifier_result" && record.workflow==evidence.workflow()
+        && record.plan==plan_key && result_key(&record.plan,&record.attempt)==result,"exact original result reference changed");
+    ensure!(!record.baseline.registration.has_environment_transition(),"baseline-only original plan cannot bind transition data");
+    validate_retained_outcome(&plan,&record,evidence)?;
+    record.baseline.registration.verify_pinned_data(&plan.proposal.files)?;
+    ensure!(!record.baseline.receipts.iter().any(|r|r.result==crate::autoship_contract::CheckResult::InfrastructureFailure),"exact original result is infrastructure-only");
+    let mut commands=BTreeMap::new();let mut captures=BTreeMap::new();
+    for receipt in &record.baseline.receipts {
+        let attempt=record.command_sources.get(&receipt.verifier_id).unwrap_or(&record.attempt);
+        let key=command_key(plan_key,attempt,&receipt.verifier_id);
+        let admission=evidence.record(&key,"original_verifier_command_admission")?.context("exact original command missing")?;
+        let admitted:Admission=serde_json::from_str(&admission)?;
+        ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==evidence.workflow()
+            && admitted.plan==plan_key && admitted.attempt==*attempt && admitted.verifier==receipt.verifier_id,"exact original command reference changed");
+        let quiet=evidence.record(&quiet_key(&key),"original_verifier_command_quiescent")?.context("exact original command is not quiescent")?;
+        require_stored_quiescence(evidence.workflow(),&admission,&admitted,&quiet)?;
+        let captured=admitted.capture.context("exact original command lacks durable capture")?.read(&key,&admitted.identity)?.context("exact original output missing")?;
+        let observation=captured.observation;
+        ensure!(!observation.interrupted && observation.output_complete && observation.exit_code.is_some()
+            && amendment::digest(format!("{}\n{}",observation.stdout,observation.stderr).as_bytes())==receipt.output_digest,"exact original output differs from complete receipt");
+        captures.insert(receipt.verifier_id.clone(),(key,amendment::digest(admission.as_bytes()),amendment::digest(quiet.as_bytes()),captured.manifest_sha256));
+        commands.insert(receipt.verifier_id.clone(),CapturedCommandData {exit_code:observation.exit_code,stdout:observation.stdout,stderr:observation.stderr,
+            interrupted:observation.interrupted,output_complete:observation.output_complete});
+    }
+    let identity=amendment::digest(&serde_json::to_vec(&("exact-original-result-data-v1",evidence.workflow(),plan_key,result,
+        amendment::digest(body.as_bytes()),amendment::digest(raw.as_bytes()),captures,&commands))?);
+    Ok(OriginalResultData {identity,binding:plan.binding,prepared:PreparedAcceptance {proposal:plan.proposal,baseline:record.baseline},commands})
 }
 
 fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
@@ -802,6 +860,64 @@ mod tests {
             "terminal_cause":if interrupted {"controller_stopped"}else{"completed"},
             "stdout_bytes":6,"stderr_bytes":0,"stdout_sha256":amendment::digest(b"false\n"),"stderr_sha256":amendment::digest(b"")}).to_string().as_bytes());
         capture.path().to_owned()
+    }
+
+    #[tokio::test]
+    async fn exact_original_result_data_reads_complete_capture_without_execution_or_mutation() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();let env=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&env,"captured-data fixture executor").unwrap();
+        captured_fixture(&original,&gone_scope(),false);
+        OriginalExecution::quiesce_previous(&guard).unwrap();original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+        let data=exact_original_result(&original.plan,&result_key(&original.plan,&original.attempt),&store.inspect_verifier_evidence(guard.id())).unwrap();
+        assert_eq!(serde_json::to_vec(&data.prepared).unwrap(),serde_json::to_vec(&prepared).unwrap());
+        assert_eq!(data.binding,*guard.binding());let command=&data.commands["observe"];
+        assert_eq!(command.stdout,"false\n");assert_eq!(command.stderr,"");assert_eq!(command.exit_code,Some(0));
+        assert!(command.output_complete && !command.interrupted);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+        drop(store);drop(original);guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_original_result_data_refuses_missing_changed_cross_plan_and_unbound_transition_facts() {
+        for fault in ["metadata-only","missing-stream","changed-stream","other-plan","transition"] {
+            let (root,control,mut prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head().to_owned();let env=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,&base,&env,"exact-data executor").unwrap();
+            let capture=if fault=="metadata-only" {original.retain_admission("observe",&gone_scope()).unwrap();None}
+                else {Some(captured_fixture(&original,&gone_scope(),false))};
+            if fault=="transition" {
+                let registration=RegisteredContract::register_transition(root.path(),prepared.proposal.contract.clone(),base.clone(),env.clone(),env.clone()).unwrap();
+                let observation=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+                let receipt=registration.observe(root.path(),"observe",registration.binding(&base).unwrap(),&observation).unwrap();
+                prepared.baseline=BaselineEvidence {registration,receipts:vec![receipt]};
+            }
+            OriginalExecution::quiesce_previous(&guard).unwrap();
+            if fault=="transition" {
+                // Historical malformed evidence fixture, independent of whether
+                // a newer live producer already refuses the unbound mode.
+                let record=RecordedResult {version:1,kind:"original_verifier_result".into(),workflow:guard.id().into(),
+                    plan:original.plan.clone(),attempt:original.attempt.clone(),baseline:prepared.baseline.clone(),command_sources:BTreeMap::new()};
+                guard.record_verifier_evidence(&result_key(&original.plan,&original.attempt),"original_verifier_result",&serde_json::to_string(&record).unwrap()).unwrap();
+            }else {original.retain_result(root.path(),&prepared.baseline).unwrap();}
+            let reference=result_key(&original.plan,&original.attempt);let mut plan=original.plan.clone();
+            match fault {
+                "missing-stream"=>std::fs::remove_file(capture.unwrap().join("stdout")).unwrap(),
+                "changed-stream"=>std::fs::write(capture.unwrap().join("stdout"),b"true!\n").unwrap(),
+                "other-plan"=> {
+                    let (key,body)=plan_input(&guard,&prepared.proposal,&base,&env,"different executor").unwrap();
+                    guard.record_verifier_evidence(&key,"original_verifier_plan",&body).unwrap();plan=key;
+                },
+                _=>{},
+            }
+            let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+            let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+            assert!(exact_original_result(&plan,&reference,&store.inspect_verifier_evidence(guard.id())).is_err(),"{fault} became exact captured evidence");
+            assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+            drop(store);drop(original);guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]
