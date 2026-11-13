@@ -182,12 +182,24 @@ fn retained_question_matches(root:&Path,prepared:&PreparedAcceptance,control:&Pa
 /// class while legacy reconsideration retains its original Unknown predicate.
 fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody],select:impl Fn(&Judgment)->bool)->Result<Option<(String,Judgment)>> {
+    let mut selected:Option<(String,Judgment)>=None;
+    for (identity,judgment) in retained_judgments_matching(root,prepared,custody,select)? {
+        ensure!(selected.as_ref().is_none_or(|(previous,_)|previous==&identity),"retained semantic judgment is ambiguous");
+        selected=Some((identity,judgment));
+    }
+    Ok(selected)
+}
+
+// Authentication is shared; uniqueness belongs to the consumer. A source
+// projection identifies a context, while a decision identifies one reply.
+fn retained_judgments_matching(root:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],select:impl Fn(&Judgment)->bool)->Result<Vec<(String,Judgment)>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
     prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
         "retained semantic judgment lacks its original measured baseline");
     scope_authority::require_retained_native_custody(root,custody)?;
-    let mut selected:Option<(String,Judgment)>=None;
+    let mut selected=Vec::new();
     for observation in custody {
         let Ok(judgment)=serde_json::from_str::<Judgment>(&observation.response) else {continue};
         if !select(&judgment) {continue;}
@@ -204,8 +216,7 @@ fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
         let judgment=validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
         let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
             &observation.input,observed_request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
-        ensure!(selected.as_ref().is_none_or(|(previous,_)|previous==&identity),"retained semantic judgment is ambiguous");
-        selected=Some((identity,judgment));
+        selected.push((identity,judgment));
     }
     Ok(selected)
 }
@@ -244,10 +255,13 @@ pub(super) fn retained_source_context_in(root:&Path,control:&Path,prepared:&Prep
     if custody.is_empty() {return Ok(None);}
     retained_namespace(control,custody)?;
     let expected=context(&prepared.proposal,&prepared.baseline)?;
-    if let Some((_,judgment))=retained_judgment_matching(root,prepared,custody,|judgment|judgment.context==expected)? {
-        return Ok(Some(judgment.context));
+    if !retained_judgments_matching(root,prepared,custody,|judgment|judgment.context==expected)?.is_empty() {
+        return Ok(Some(expected));
     }
-    Ok(retained_judgment_matching(root,prepared,custody,|_|true)?.map(|(_,judgment)|judgment.context))
+    let contexts=retained_judgments_matching(root,prepared,custody,|_|true)?.into_iter()
+        .map(|(_,judgment)|judgment.context).collect::<BTreeSet<_>>();
+    ensure!(contexts.len()<=1,"retained semantic source context is ambiguous");
+    Ok(contexts.into_iter().next())
 }
 
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
@@ -672,6 +686,49 @@ mod tests {
     }
 
     #[test]
+    fn source_context_deduplicates_replies_without_selecting_a_semantic_decision() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root,control,prepared)=fixture();
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        let historical=context_with_policy(&prepared.proposal,&prepared.baseline,&"a".repeat(64)).unwrap();
+        let mut judgment=saved_judgment(control.path(),&prepared);
+        judgment["context"]=historical.clone().into();
+        let mut custody=Vec::new();
+        for reason in ["First independent source observation","Second independent source observation"] {
+            judgment["verifiers"][0]["reason"]=reason.into();
+            let raw=judgment.to_string();
+            let mut reply=scope_authority::scripted_witness_reply(control.path(),prepared.baseline.registration.baseline_head(),&historical,&raw).unwrap();
+            let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+            proof["scope_request_hash"]=amendment::digest(qualification_prompt(&historical,&prepared).unwrap().as_bytes()).into();
+            let bytes=serde_json::to_vec(&proof).unwrap();
+            std::fs::write(&reply.provenance.artifact,&bytes).unwrap();reply.provenance.artifact_sha256=amendment::digest(&bytes);
+            custody.push(crate::autoship_workflow::NativeScopeCustody {input:proof["native_input_hash"].as_str().unwrap().into(),response:raw,
+                provenance:serde_json::to_string(&reply.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex});
+        }
+        assert_eq!(retained_source_context_in(root.path(),control.path(),&prepared,&custody).unwrap().as_deref(),Some(historical.as_str()),
+            "two authenticated observations of the same original source are not two source contexts");
+        assert!(retained_judgment_matching(root.path(),&prepared,&custody,|_|true).is_err(),
+            "source-only deduplication must not silently select a positive semantic decision");
+        assert!(retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&custody).unwrap().is_none());
+        assert_current(root.path(),control.path(),&prepared).unwrap();
+        let different=context_with_policy(&prepared.proposal,&prepared.baseline,&"b".repeat(64)).unwrap();
+        judgment["context"]=different.clone().into();let raw=judgment.to_string();
+        let mut reply=scope_authority::scripted_witness_reply(control.path(),prepared.baseline.registration.baseline_head(),&different,&raw).unwrap();
+        let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+        proof["scope_request_hash"]=amendment::digest(qualification_prompt(&different,&prepared).unwrap().as_bytes()).into();
+        let bytes=serde_json::to_vec(&proof).unwrap();
+        std::fs::write(&reply.provenance.artifact,&bytes).unwrap();reply.provenance.artifact_sha256=amendment::digest(&bytes);
+        custody.push(crate::autoship_workflow::NativeScopeCustody {input:proof["native_input_hash"].as_str().unwrap().into(),response:raw,
+            provenance:serde_json::to_string(&reply.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex});
+        assert!(retained_source_context_in(root.path(),control.path(),&prepared,&custody).is_err(),
+            "different historical source contexts must remain ambiguous");
+        custody.pop();custody[0].response.push(' ');
+        assert!(retained_source_context_in(root.path(),control.path(),&prepared,&custody).is_err(),
+            "context deduplication bypassed immutable native response custody");
+    }
+
+    #[test]
     fn negative_diagnosis_covers_all_measurements_without_widening_legacy_recovery() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
         use std::os::unix::fs::PermissionsExt;
@@ -936,6 +993,11 @@ mod tests {
             assert_eq!(matched,1,"retained corrective request is absent or ambiguous");correction_questions+=1;
         }
         assert!(exact_metadata_errors>0,"retained evidence did not reproduce the observed endpoint error");
+        let original_context=context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY).unwrap();
+        assert_eq!(retained_source_context_in(&recovery.worktree,&control,prepared,&custody).unwrap().as_deref(),Some(original_context.as_str()),
+            "actual original and corrective replies cannot identify their shared source context");
+        assert!(retained_judgment_matching(&recovery.worktree,prepared,&custody,|_|true).is_err(),
+            "read-only source recovery selected a positive native decision");
         assert_eq!(store.snapshot(id).unwrap().unwrap(),before,"read-only inventory changed the workflow");
         assert_eq!(store.events(id).unwrap(),events,"read-only inventory emitted workflow events");
         eprintln!("actual #1830 inventory: {} native observations; {} complete captured original result; {} exact original witness questions; {} other questions / {} exact correction chains; {} exact-source endpoint errors; unchanged {} model calls; no qualification or dispatch",custody.len(),captured_originals,original_questions,other_questions,correction_questions,exact_metadata_errors,before.model_calls);

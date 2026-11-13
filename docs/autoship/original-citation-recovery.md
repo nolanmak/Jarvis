@@ -340,12 +340,13 @@ both endpoint errors authenticate, with all twelve recorded calls and workflow
 events unchanged. No qualification, cue or dispatch was created.
 
 Recognizing both questions also means two compatible positive replies can exist
-under one original native context. Distinguish source-context deduplication from
-selection of a particular semantic decision. Existing conservative ambiguous-
-identity behavior is not a completed positive-replay selection rule. Resolve that
-consumer seam with negative precedence and the explicit current/native context
-contract before activating the bridge. The versioned receipt, valid-positive
-cutover, typed wake-up and actual preparation/binding integration remain open.
+under one original native context. Source-context deduplication now uses the set
+of fully authenticated contexts, while semantic decision consumers preserve
+unique-reply identity (section 13). This resolves the source-only consumer seam;
+it does not supply positive-replay selection. Resolve that remaining decision
+seam with negative precedence and the explicit current/native context contract
+before activating the bridge. The versioned receipt, valid-positive cutover,
+typed wake-up and actual preparation/binding integration remain open.
 
 
 ## 12. Controller-slot evidence for the next integration step
@@ -372,3 +373,33 @@ slots, and keep it distinct from the live binding that authorizes current work.
 Do not guess that a current head/contract is the original indexing authority.
 No controller slot, native record, model charge or workflow was edited to obtain
 this evidence. The receipt/wake-up and compatibility work remains open.
+
+
+## 13. Source-context identity regression and saved-case proof
+
+The source reader previously required a unique reply identity even when every
+fully authenticated reply described the same original source context. Its new
+regression failed for exactly `retained semantic judgment is ambiguous` after
+successful compilation (5.12 seconds). Authentication is now shared separately
+from consumer uniqueness. Source-only projection deduplicates contexts and keeps
+the existing preference for the current authenticated context; decision and
+negative-diagnosis consumers still require a unique applicable reply identity.
+Different historical contexts remain ambiguous, and changed native bytes fail
+custody validation. Source lookup does not persist or import qualification.
+
+Final witness components: 20 passed, zero failures, two explicit ignored probes
+(54.76 seconds). The expanded actual-#1830 read-only probe also passed (0.24
+seconds): both actual replies resolve to their original shared context, while
+unqualified positive decision selection remains ambiguous. One complete captured
+original result, both exact native question roles, both endpoint errors and all
+12 recorded model calls remain present; snapshots and events are unchanged.
+These are saved-evidence/source-projection checks, not an autonomous recovery or
+merge. The live workflow remains generation 1 at `acceptance_contract_invalid` /
+`await_acceptance_input_change`, and live health reports no confirmed autonomous
+merge since November 6. No model dispatch or workflow mutation was requested.
+
+This change still affects the qualification policy hash because its source is
+hashed. Do not deploy this branch before completing the versioned receipt,
+valid-positive compatibility, typed cue, real preparation/binding integration
+and the audits required by sections 5, 6 and 10. The controller-slot evidence in
+section 12 is the next integration input, not an implemented grant.
