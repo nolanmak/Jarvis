@@ -231,13 +231,37 @@ and separation from worker storage. Focused constructor tests pass (5), as do
 read-only source probe still authenticates all eight retained #2014 files,
 reconstructs the bounded complete request, and verifies unchanged workflow
 state with no model calls. The existing witness producer remains unchanged.
-These are transport-custody results, not native constructor execution or
-behavioral acceptance. The native dispatch caller, pre-release persistence
-integration and source/staging/held-work integrations remain unfinished.
+These are transport-custody results, not behavioral acceptance. Native transport
+and its pre-release persistence now have an implementation and connected
+scripted-native tests; the production pipeline remains disabled pending the
+source/staging/held-work integrations.
 
-This selects the transport and custody shape. Its implementation, source-read
-interface, physical-provenance tests and restricted held-work lease are still
-required before enabling a production constructor call.
+The constructor transport saves `constructor-input-<exact-input>.json` before
+admission. After a completed native response it privately retains the raw text
+at `constructor-response-<response-digest>.txt`, the content-addressed native
+provenance artifact, and an immutable
+`constructor-completed-<exact-input>.json` reference. It then writes the existing
+paired response index before leaving the fresh native scope. Every file remains
+within the protected workflow namespace and is checked before further dispatch.
+
+On restart the controller first authenticates the exact original admission
+against its charge, bounded counter, provider and original binding. If the
+private completed output exists but the paired-index transaction never
+committed, restore that same original pair through the existing immutable
+response-store API. Do not charge another call or reconstruct text with another
+model. A recorded-but-missing/corrupt index remains a hold under the existing
+store's checks; this is recovery of an unpublished original response, not
+permission to overwrite conflicting history. An admitted call without its
+original completed output holds. An unadmitted setup refusal preserves its
+original error, spends no call/attempt and may retry once prerequisites recover.
+Completed-cache replay precedes any new native runtime/capacity admission;
+ordinary owner/source/lease checks still apply.
+
+The native transport is still an unused component. Controller-derived canonical
+episode construction, bounded additional-source collection, restricted held-work
+admission and staged-proposal integration are required before enabling a
+production constructor call. Scripted native conversations in disposable tests
+are not a production model run, behavioral red or independent approval.
 
 ## Open decisions — owner: implementation agent
 

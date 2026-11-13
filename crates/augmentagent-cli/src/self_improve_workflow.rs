@@ -1694,6 +1694,16 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .baseline_native_custody(&self.lease,&self.binding,millis())
     }
+    pub(super) fn construction_native_custody(&self)->Result<Vec<durable::NativeScopeCustody>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .construction_native_custody(&self.lease,&self.binding,millis())
+    }
+    pub(super) fn construction_native_admission(&self,purpose:&str)->Result<Option<durable::submission::Provider>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .construction_native_admission(&self.lease,&self.binding,purpose,millis())
+    }
 
     pub(super) fn record_scope_stage_response_pair(&self,key:&str,response:&str,provenance_key:&str,provenance:&str)->Result<()> {
         self.validate_before_side_effect()?;

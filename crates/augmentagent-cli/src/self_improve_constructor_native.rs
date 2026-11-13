@@ -5,6 +5,10 @@ use std::os::unix::fs::MetadataExt;
 const ROLE:&str="verifier_construction";
 const LIMIT:usize=2*1024*1024;
 
+fn policy_hash()->String {
+    hash(&serde_json::to_vec(&("verifier-construction-producer-v1",hash(include_bytes!("self_improve_constructor_native.rs")),hash(include_bytes!("self_improve_amendment_source.rs")))).unwrap())
+}
+
 fn hash(bytes:&[u8])->String {amendment::digest(bytes)}
 fn sha(value:&str)->bool {value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))}
 
@@ -21,6 +25,10 @@ pub(super) struct Input {
     prompt:String,
 }
 impl Input {
+    pub(super) fn new(workflow:&str,original_base:&str,episode:&str,provider:augmentagent_channel_core::ProviderKind,model:&str,system:&str,prompt:&str)->Result<Self> {
+        let input=Self {workflow:workflow.into(),original_base:original_base.into(),episode:episode.into(),provider:provider.name().into(),policy:policy_hash(),model:model.into(),system:system.into(),prompt:prompt.into()};
+        input.validate()?;Ok(input)
+    }
     fn validate(&self)->Result<()> {
         ensure!(!self.workflow.is_empty() && self.workflow.len()<=1024,"invalid constructor workflow");
         ensure!(matches!(self.original_base.len(),40|64) && self.original_base.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid constructor original commit");
@@ -58,6 +66,8 @@ struct Completed {
 }
 
 fn input_path(control:&Path,input:&str)->PathBuf {control.join(format!("constructor-input-{input}.json"))}
+fn completion_path(control:&Path,input:&str)->PathBuf {control.join(format!("constructor-completed-{input}.json"))}
+fn response_path(control:&Path,response:&str)->PathBuf {control.join(format!("constructor-response-{response}.txt"))}
 
 /// Same effective owner boundary as native witness evidence, with an expected
 /// controller namespace supplied independently of the persisted reference.
@@ -103,11 +113,14 @@ fn persist_reply(root:&Path,control:&Path,input:&Input,session:&str,response:&st
     let input_sha256=input.identity()?;
     let bytes=baseline_witness::private_bytes(&input_path(control,&input_sha256),LIMIT)?;
     ensure!(bytes==serde_json::to_vec(input)?,"constructor completion differs from dispatch intent");
-    let completed=Completed {version:1,role:ROLE.into(),input_sha256,input_file_sha256:hash(&bytes),provider:input.provider.clone(),native_session:session.into(),response_sha256:hash(response.as_bytes())};
+    let completed=Completed {version:1,role:ROLE.into(),input_sha256:input_sha256.clone(),input_file_sha256:hash(&bytes),provider:input.provider.clone(),native_session:session.into(),response_sha256:hash(response.as_bytes())};
+    write_private(control,&response_path(control,&completed.response_sha256),response.as_bytes())?;
     let bytes=serde_json::to_vec(&completed)?;let artifact_sha256=hash(&bytes);
     let artifact=control.join(format!("constructor-native-{artifact_sha256}.json"));
     write_private(control,&artifact,&bytes)?;
-    Ok(Reference {artifact,artifact_sha256})
+    let reference=Reference {artifact,artifact_sha256};
+    write_private(control,&completion_path(control,&input_sha256),&serde_json::to_vec(&reference)?)?;
+    Ok(reference)
 }
 
 fn validate_observation(root:&Path,control:&Path,workflow:&str,observation:&crate::autoship_workflow::NativeScopeCustody)->Result<()> {
@@ -119,6 +132,8 @@ fn validate_observation(root:&Path,control:&Path,workflow:&str,observation:&crat
     let completed:Completed=serde_json::from_slice(&bytes)?;
     ensure!(completed.version==1 && completed.role==ROLE && sha(&completed.input_sha256)
         && !completed.native_session.trim().is_empty() && completed.native_session.len()<=4096,"constructor provenance lacks native ownership");
+    let pointer=baseline_witness::private_bytes(&completion_path(control,&completed.input_sha256),LIMIT)?;
+    ensure!(pointer==serde_json::to_vec(&reference)?,"constructor completion reference changed");
     let bytes=baseline_witness::private_bytes(&input_path(control,&completed.input_sha256),LIMIT)?;
     ensure!(hash(&bytes)==completed.input_file_sha256,"constructor dispatch intent changed");
     let input:Input=serde_json::from_slice(&bytes)?;
@@ -127,7 +142,100 @@ fn validate_observation(root:&Path,control:&Path,workflow:&str,observation:&crat
         && input.provider==provider && completed.provider==provider,"constructor input/provider/workflow changed");
     let (raw,_)=crate::autoship_workflow::construction_native_response_keys(&input.purpose()?)?;
     ensure!(raw==observation.input && hash(observation.response.as_bytes())==completed.response_sha256,"constructor response differs from admitted input");
+    let response=baseline_witness::private_bytes(&response_path(control,&completed.response_sha256),LIMIT)?;
+    ensure!(response==observation.response.as_bytes(),"private constructor response differs from indexed observation");
     Ok(())
+}
+
+pub(super) struct Reply {pub text:String,pub provider:String,pub native_session:String}
+
+fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::autoship_workflow::submission::Provider)->Result<(Reply,String)> {
+    private_control(root,control)?;
+    let encoded=baseline_witness::private_bytes(&completion_path(control,&input.identity()?),LIMIT)?;
+    let reference:Reference=serde_json::from_slice(&encoded)?;
+    // Validate the reference location before dereferencing it, including on a
+    // crash path where the response has not yet reached the database index.
+    ensure!(sha(&reference.artifact_sha256) && reference.artifact==control.join(format!("constructor-native-{}.json",reference.artifact_sha256)),"constructor recovery reference escaped authority");
+    let bytes=baseline_witness::private_bytes(&reference.artifact,LIMIT)?;
+    ensure!(hash(&bytes)==reference.artifact_sha256,"constructor recovery proof changed");
+    let completed:Completed=serde_json::from_slice(&bytes)?;
+    ensure!(sha(&completed.response_sha256),"invalid recovered constructor response identity");
+    let text=String::from_utf8(baseline_witness::private_bytes(&response_path(control,&completed.response_sha256),LIMIT)?)?;
+    let (raw,_)=crate::autoship_workflow::construction_native_response_keys(&input.purpose()?)?;
+    let encoded=String::from_utf8(encoded)?;
+    let observation=crate::autoship_workflow::NativeScopeCustody {input:raw,response:text.clone(),provenance:encoded.clone(),provider};
+    validate_observation(root,control,&input.workflow,&observation)?;
+    let saved=baseline_witness::private_bytes(&input_path(control,&input.identity()?),LIMIT)?;
+    ensure!(saved==serde_json::to_vec(input)?,"recovered constructor input differs from saved request");
+    Ok((Reply {text,provider:completed.provider,native_session:completed.native_session},encoded))
+}
+
+/// Actual native transport. Callers still need the restricted construction
+/// lease and a controller-computed episode; no proposal is approved here.
+pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,input:&Input)->Result<Reply> {
+    use std::os::unix::fs::DirBuilderExt;
+    workflow.require_fresh_issue(root).await?;
+    let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&control)?;
+    exchange(root,&control,workflow,input,|provider,opts,prompt|async move {
+        workflow.check_resource_policy()?;
+        let reasoner=augmentagent_channel_core::build_workflow_pinned(provider).context("native constructor provider unavailable")?;
+        reasoner.call(&opts,&prompt).await
+    }).await
+}
+
+async fn exchange<F,Fut>(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,input:&Input,dispatch:F)->Result<Reply>
+where F:FnOnce(augmentagent_channel_core::ProviderKind,augmentagent_channel_core::ReasonerOpts,String)->Fut,
+    Fut:std::future::Future<Output=Result<String>> {
+    use augmentagent_channel_core::{native_session,model_router,ProviderKind};
+    workflow.validate_before_side_effect()?;
+    input.validate()?;ensure!(input.workflow==workflow.id(),"constructor request belongs to another workflow");
+    let purpose=input.purpose()?;
+    let (raw,proof)=crate::autoship_workflow::construction_native_response_keys(&purpose)?;
+    let indexed=workflow.scope_stage_response_pair(&raw,&proof).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    if let Some(provider)=workflow.construction_native_admission(&purpose)? {
+        // Restore only the original admitted conversation's retained output.
+        // No new call, synthetic result, admission or budget credit is created.
+        let (reply,encoded)=original_completion(root,control,input,provider).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+        if let Some((text,reference))=indexed {
+            ensure!(text==reply.text && reference==encoded,"indexed constructor completion conflicts with original output");
+        } else {workflow.record_scope_stage_response_pair(&raw,&reply.text,&proof,&encoded)?;}
+        for observation in workflow.construction_native_custody()? {validate_observation(root,control,workflow.id(),&observation)?;}
+        return Ok(reply);
+    }
+    ensure!(indexed.is_none(),"constructor response index lacks an actual admission");
+    for observation in workflow.construction_native_custody()? {validate_observation(root,control,workflow.id(),&observation)?;}
+    ensure!(input.policy==policy_hash(),"historical constructor input cannot authorize a new native call");
+    ensure!(!completion_path(control,&input.identity()?).try_exists()?,"constructor completion lacks its original actual admission");
+    let head=actual_head(root).await?;
+    persist_input(root,control,input)?;
+    let provider=match input.provider.as_str() {"codex"=>ProviderKind::Codex,"claude"=>ProviderKind::Claude,_=>unreachable!("validated constructor provider")};
+    let mut opts=codex_review_opts(root.to_path_buf(),&input.system);
+    opts.model=Some(input.model.clone());opts.allowed_tools.clear();opts.add_dirs.clear();opts.env.clear();
+    opts.permission_mode="default".into();opts.restrict_env=false;opts.settings_json=None;
+    opts.handoff_path=None;opts.session_id=None;opts.audit_logger=Some(workflow.audit_logger());
+    let outcome=workflow.bounded_native_calls(purpose.clone(),1,native_session::fresh_review_scope(provider,
+        model_router::native_reviewer_scope(provider,async {
+            let text=dispatch(provider,opts,input.prompt.clone()).await?;
+            ensure!(text.len()<=LIMIT && actual_head(root).await?==head,"constructor output exceeds bound or source moved");
+            let session=native_session::current_for(provider)?.context("constructor has no protected native session")?;
+            ensure!(!session.is_uncertain(),"constructor native outcome is uncertain");
+            let native_session=session.id().context("constructor did not observe its native conversation")?;
+            let reference=persist_reply(root,control,input,&native_session,&text)?;
+            workflow.audit_health().await?;
+            // All raw/provenance bytes and the paired index are durable before
+            // fresh_review_scope releases its native conversation/runtime.
+            workflow.record_scope_stage_response_pair(&raw,&text,&proof,&serde_json::to_string(&reference)?)?;
+            Ok(Reply {text,provider:input.provider.clone(),native_session})
+        }))).await;
+    match outcome {
+        Ok((reply,_))=>Ok(reply),
+        Err(error) if matches!(workflow.construction_native_admission(&purpose),Ok(Some(_)))=>
+            Err(error.context(initial_repair::Hold::EvidenceUnknown)),
+        // Setup/capacity/quota refusals without an actual admission retain
+        // their original classification and consume no conversation slot.
+        Err(error)=>Err(error),
+    }
 }
 
 pub(super) fn require_retained(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
@@ -178,12 +286,15 @@ mod tests {
     }
     #[test]
     fn constructor_physical_custody_rejects_missing_changed_exposed_or_linked_evidence() {
-        for mutation in ["missing-proof","missing-input","changed-input","changed-proof","exposed","symlink","worker-control"] {
+        for mutation in ["missing-proof","missing-input","missing-response","changed-response","missing-completion","changed-input","changed-proof","exposed","symlink","worker-control"] {
             let (root,control,input,observation)=fixture();
             let reference:Reference=serde_json::from_str(&observation.provenance).unwrap();
             match mutation {
                 "missing-proof"=>std::fs::remove_file(&reference.artifact).unwrap(),
                 "missing-input"=>std::fs::remove_file(input_path(control.path(),&input.identity().unwrap())).unwrap(),
+                "missing-response"=>std::fs::remove_file(response_path(control.path(),&hash(observation.response.as_bytes()))).unwrap(),
+                "changed-response"=>std::fs::write(response_path(control.path(),&hash(observation.response.as_bytes())),b"substituted").unwrap(),
+                "missing-completion"=>std::fs::remove_file(completion_path(control.path(),&input.identity().unwrap())).unwrap(),
                 "changed-input"=>std::fs::write(input_path(control.path(),&input.identity().unwrap()),b"{}").unwrap(),
                 "changed-proof"=>std::fs::write(&reference.artifact,b"{}").unwrap(),
                 "exposed"=>std::fs::set_permissions(&reference.artifact,std::fs::Permissions::from_mode(0o644)).unwrap(),
@@ -205,5 +316,74 @@ mod tests {
         let mut changed=input.clone();changed.workflow="owner/repo#foreign".into();
         assert!(persist_input(root.path(),control.path(),&changed).is_err(),"same exact identity reassigned its protected workflow");
         assert!(persist_reply(root.path(),control.path(),&input,"", "data").is_err());
+    }
+    #[tokio::test]
+    async fn constructor_native_exchange_replays_after_restart_and_recovers_failed_index_publication() {
+        use augmentagent_channel_core::{native_session,ProviderKind};
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        for mode in ["completed","index-fault","lost-output"] {
+            let (root,state,_)=qualification_fixture();
+            let control=state.path().join("constructor");std::fs::create_dir(&control).unwrap();
+            std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path=state.path().join("workflow.db");
+            let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(2058),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+            let guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();
+            let input=Input::new(guard.id(),&actual_head(root.path()).await.unwrap(),&"a".repeat(64),ProviderKind::Codex,"explicit-fixture-model","Untrusted constructor; no tools","Preserve every original requirement; source data only").unwrap();
+            if mode=="index-fault" {
+                rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER refuse_constructor_index BEFORE INSERT ON scope_stage_response BEGIN SELECT RAISE(ABORT,'injected index failure'); END;").unwrap();
+            }
+            let audit=guard.audit_logger();
+            let first=exchange(root.path(),&control,&guard,&input,move |provider,opts,prompt|async move {
+                assert_eq!(provider,ProviderKind::Codex);assert_eq!(opts.model.as_deref(),Some("explicit-fixture-model"));
+                assert!(opts.allowed_tools.is_empty() && opts.add_dirs.is_empty() && opts.env.is_empty());
+                assert!(opts.settings_json.is_none() && opts.handoff_path.is_none() && opts.session_id.is_none());
+                assert_eq!(opts.permission_mode,"default");assert!(!opts.restrict_env);
+                assert_eq!(prompt,"Preserve every original requirement; source data only");
+                let session=native_session::current_for(provider)?.unwrap();let mut observed=session.begin(provider)?;
+                audit.model_call_admitted(provider.name())?;
+                observed.observe(&format!("scripted-constructor-{}",uuid::Uuid::new_v4()))?;observed.finish()?;
+                if mode=="lost-output" {anyhow::bail!("original transport outcome unavailable");}
+                Ok("complete original untrusted reply".into())
+            }).await;
+            let why=first.as_ref().err().map(|e|format!("{e:#}")).unwrap_or_default();
+            assert_eq!(first.is_ok(),mode=="completed","unexpected {mode} outcome: {why}");
+            if mode!="completed" {assert!(first.as_ref().err().unwrap().is::<initial_repair::Hold>());}
+            let id=guard.id().to_owned();
+            assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap().model_calls,1);
+            if mode=="index-fault" {rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TRIGGER refuse_constructor_index;").unwrap();}
+            guard.finish().unwrap();
+            let guard=workflow::WorkflowGuard::acquire_fixture(&path,start()).await.unwrap().unwrap();
+            let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+            let replay=exchange(root.path(),&control,&guard,&input,move |_,_,_|async move {
+                observed.fetch_add(1,Ordering::SeqCst);anyhow::bail!("completed or unknown conversation must not redispatch")
+            }).await;
+            assert_eq!(calls.load(Ordering::SeqCst),0,"replayed {mode} spent another native call");
+            if mode=="lost-output" {assert!(replay.is_err());}else {
+                let replay=replay.unwrap();assert_eq!(replay.text,"complete original untrusted reply");assert_eq!(replay.provider,"codex");assert!(!replay.native_session.is_empty());
+                let (raw,proof)=crate::autoship_workflow::construction_native_response_keys(&input.purpose().unwrap()).unwrap();
+                assert_eq!(guard.scope_stage_response_pair(&raw,&proof).unwrap().unwrap().0,replay.text);
+            }
+            let store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);
+            assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),1);
+            drop(store);guard.finish().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn constructor_setup_refusal_preserves_free_retry_and_spends_no_native_attempt() {
+        let (root,state,_)=qualification_fixture();let control=state.path().join("constructor");
+        std::fs::create_dir(&control).unwrap();std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path=state.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(2058),pr:None,branch:"fixture",contract:"C1",environment:"test"}).await.unwrap().unwrap();
+        let input=Input::new(guard.id(),&actual_head(root.path()).await.unwrap(),&"a".repeat(64),augmentagent_channel_core::ProviderKind::Codex,"fixture-model","No tools","Untrusted constructor request").unwrap();
+        for _ in 0..2 {
+            let error=exchange(root.path(),&control,&guard,&input,|_,_,_|async {anyhow::bail!("provider setup prerequisite unavailable")}).await.err().unwrap();
+            assert!(error.to_string().contains("provider setup prerequisite unavailable"));
+            assert!(!error.is::<initial_repair::Hold>(),"unadmitted setup refusal became an unknown paid conversation");
+        }
+        let store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),0);
+        drop(store);guard.finish().unwrap();
     }
 }

@@ -447,6 +447,32 @@ impl WorkflowStore {
         let custody=construction_native_custody(&tx,&lease.workflow)?;
         tx.commit()?;Ok(custody)
     }
+    /// Inspect the original exact dispatch for response recovery. This grants
+    /// no admission and does not treat an unanswered request as a fresh slot.
+    pub(crate) fn construction_native_admission(&mut self,lease:&Lease,binding:&Binding,purpose:&str,now:i64)->Result<Option<submission::Provider>> {
+        construction_native_response_keys(purpose)?;
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let mut found=None;
+        {
+            let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
+            let admissions=statement.query_map([&lease.workflow],|r|r.get::<_,String>(0))?;
+            for raw in admissions {
+                let value:serde_json::Value=serde_json::from_str(&raw?)?;
+                if value["bounded"]["purpose"].as_str()!=Some(purpose) {continue;}
+                ensure!(found.is_none() && value["bounded"]["limit"]==1,"constructor admission attribution conflicts");
+                let original:Binding=serde_json::from_value(value["bounded"]["binding"].clone())?;
+                let receipt=value["receipt"].as_str().context("constructor admission receipt missing")?;
+                let charged:Option<u32>=tx.query_row("SELECT model_calls FROM resource_charge WHERE workflow=?1 AND id=?2",params![lease.workflow,receipt],|r|r.get(0)).optional()?;
+                let counted:Option<u32>=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![lease.workflow,purpose,serde_json::to_string(&original)?],|r|r.get(0)).optional()?;
+                ensure!(charged==Some(1) && counted==Some(1),ConstructionNativeOutcomeUnresolved);
+                found=Some(serde_json::from_value(value["provider"].clone())?);
+            }
+        }
+        let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND purpose=?2",params![lease.workflow,purpose],|r|r.get(0))?;
+        ensure!(counted==u64::from(found.is_some()),ConstructionNativeOutcomeUnresolved);
+        tx.commit()?;Ok(found)
+    }
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
         use std::os::unix::fs::MetadataExt;
