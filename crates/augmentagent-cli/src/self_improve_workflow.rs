@@ -65,8 +65,16 @@ impl std::error::Error for OwnerControlUnavailable {}
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {
-        WorkflowStore::open_read_only(&path()).map(|store|Self {store})
-            .map_err(|error|error.context(OwnerControlUnavailable))
+        WorkflowStore::open_read_only(&path()).and_then(|store| {
+            if let Some(store)=store.as_ref() {
+                // Empty is not a canonical workflow. Reuse the real reader
+                // queries to check structural capabilities even with no issues,
+                // without loading candidate data, registering or migrating.
+                store.snapshot("")?;
+                store.owner_control("")?;
+            }
+            Ok(Self {store})
+        }).map_err(|error|error.context(OwnerControlUnavailable))
     }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {

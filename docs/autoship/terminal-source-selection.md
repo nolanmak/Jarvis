@@ -1,7 +1,9 @@
 # Completed-work selection (#2076)
 
-Status: local implementation, regression validation and spec audit complete;
-exact-head hosted CI/review and rollout pending. Not deployed.
+Status: engineering-review amendment validated locally: 2,060 CLI tests pass,
+with zero failures and 41 existing opt-in ignores. The 72-seam spec/source audit
+passes. Exact-head hosted CI/review and rollout remain pending. PR #2077 is not
+deployed.
 Part of #1703/#1706. Normal engineering repair, excluded from ordinary autoship.
 
 ## Problem and evidence
@@ -37,13 +39,28 @@ and preventing the no-candidate retriage path from running on those turns.
    no-candidate handoff and the independent periodic sweep. Unavailable or malformed
    protected history must never become permission to mutate a source.
 3. An absent workflow row or absent state file does not make a new issue
-   terminal. Selection must not create either. A corrupt/unreadable/incompatible
-   protected store or malformed checkpoint is unknown and follows the existing
-   typed `OwnerControlUnavailable` free hold. The type is retained for caller
-   compatibility; it signals unavailable selection controls, not a new pause.
-   The primary caller projects this as `RunReport::held`; the legacy configured
-   caller retains its existing error report. Both stop before paid work. This
-   repair does not introduce a uniform legacy workflow/reporting service.
+   terminal. Selection must not create either. The selection-control reader
+   opens the existing store read-only and probes its existing snapshot and
+   owner-control lookup queries with an empty, non-workflow identity. This
+   checks the required query capabilities without reading a candidate, creating
+   tables/rows or migrating state; it retains the owner reader's existing
+   absent-owner-table compatibility. This is not full schema-version or row-data
+   certification. An incompatible required query fails when opening selection
+   controls even for an empty inventory. Store opening/query-capability failures
+   retain the typed `OwnerControlUnavailable` hold; existing pause-check failures
+   retain their behavior. A terminal-history read failure for one candidate instead
+   holds only that candidate: report a public-safe unavailability reason, preserve its record/labels/charges, and continue to healthy peers.
+   Never infer nonterminal state from that failure. If no eligible candidate
+   remains after such failures, return the retained typed error, not healthy
+   idle. Both selectors use this rule. The shared readmission sweep likewise
+   excludes unreadable candidates from reservation, processes eligible peers,
+   then returns the retained error as a degraded result; successful peer
+   receipts remain committed when reporting that degradation.
+   The error type is retained for caller compatibility, not a new owner pause.
+   On no-candidate failure the primary caller projects `RunReport::held`; the
+   legacy configured caller retains its existing error report. This repair
+   introduces neither a uniform legacy workflow/reporting service nor a second
+   durable hold ledger. The per-call retained error is only reporting state.
 4. This read is a fairness filter, not admission. In the primary guarded lane,
    a terminal transition after selection remains blocked by the existing
    productive claim. The configured legacy execution lane has no such durable
@@ -67,8 +84,15 @@ rereads plus the final local protected-history check narrow, but do not eliminat
 the race immediately before a remote label request. This accepted external race
 grants no workflow lease, model call or new shipment credit. Primary claims still
 reject terminal/paused work; configured claim-time protection remains #2056.
-Existing provenance and pending/complete receipts remain the recovery authority;
-this repair adds no distributed transaction or parallel ledger.
+Existing provenance and receipt states are retained recovery evidence only.
+`pending` means an uncertain remote outcome; `readmitted` records completion
+publication, not a guarantee that the label cannot later change. No production
+reader/reconciler for pending receipts currently exists. #2078 owns that existing
+recovery gap: implementation agent, after urgent #2077 rollout and before full
+#1703 uncertain-effects/fault-soak acceptance. Until then retain the exact
+receipts and evidence, inspect GitHub state read-only when needed, and never
+claim automatic settlement or erase/replay pending work to make health green.
+This repair adds no reconciler, distributed transaction or parallel ledger.
 
 Here, a *terminal workflow* is exactly an existing canonical issue checkpoint in
 `Merged` or `Retired`. An *open issue* is GitHub's remote lifecycle state and can
@@ -79,9 +103,10 @@ separate guarded execution ownership. None is a new shipment receipt.
 
 Production state changes use supported commands; SQL corruption/concurrency
 injection occurs only in disposable test databases. No production SQL edits.
-No automatic issue closure, issue re-enrollment, author allowlist change, bot
-approval, owner-pause clearing, label removal, new ledger, new schema or budget
-reset. Explicit owner commands retain their current authorities. Manual repair
+No automatic issue closure, workflow re-enrollment, author allowlist change,
+bot approval, owner-pause clearing, new ledger, new schema or budget reset.
+There is no new label-removal authority: preserve existing authorized nonterminal
+readmission, while preserving labels on blocked sources. Explicit owner commands retain their current authorities. Manual repair
 merges count zero autonomous shipments. No repair PR is an autoship test case.
 This fix does not complete #2058, host sizing/C0-C5, review custody, Discord
 coding/progress or the full ordinary end-to-end/fault/soak acceptance in #1703.
@@ -105,7 +130,11 @@ changing history. Configured selector fixtures establish filtering only; #2056
 owns its actual continuation/admission test. Valid automatic-label-proof fixtures
 must cover terminal history, late terminal arrival, malformed protected history
 and owner pause through the real shared sweep, with no label or pending-receipt
-write. Existing valid nonterminal readmission must still work.
+write for the blocked source. Mixed corrupt-history/healthy-peer cases exercise
+both real selectors and the shared sweep: the healthy peer advances while the
+bad record and its receipts remain untouched. Exhausted unknown-only inventories
+retain the typed degraded outcome. Existing valid nonterminal readmission must
+still work.
 
 Run the selection group and shared-readmission fixtures, then the full managed
 CLI suite. Before rollout obtain exact-head hosted CI and independent engineering
@@ -115,8 +144,13 @@ relative to that process's working directory; workflow DB from
 `AUGMENTAGENT_AUTOPR_WORKFLOW_DB` or its normal state-directory default. If these
 resolve to distinct databases, take two supported snapshots with explicit global
 `--db` arguments and distinct labels. Verify each manifest's `source_db` equals
-the declared canonical database path; preserve the release-binary rollback
-artifact. Snapshot allocation/refusal and retention follow `AGENTS.md` and
+the declared canonical database path. Run snapshot commands from the canonical
+deployment checkout that owns the live daemon/worker release, never the task
+worktree: binary capture uses that cwd's `target/release/augmentagent`. First
+observe both live executable hashes and the deployed release hash; wait for a
+coherent pre-rollout build if they differ. Require `has_binary: true` and the
+saved binary's hash to match that observed pre-rollout executable identity.
+A database-only snapshot or wrong binary leaves rollout pending. Snapshot allocation/refusal and retention follow `AGENTS.md` and
 `docs/disk-storage.md`; no raw copy or limit/pin override is a substitute.
 
 Update the branch with a normal merge from main if needed (never rebase or
@@ -132,7 +166,7 @@ deployed or #1703 restored. Full #1703 ordinary issue-to-merge acceptance remain
 separate even after this free selection behavior is demonstrated.
 
 
-## Local checkpoint
+## Local checkpoint before engineering review
 
 The final managed CLI run passes 2,056 tests, zero failures and 41 existing
 opt-in ignores (318.02 seconds). The selected selector group passed 19 checks;
@@ -141,3 +175,25 @@ regressions that failed before its mutation-boundary fix. All 49 mapped spec
 seams were checked read-only, with resolved/rechecked findings for sweep
 eligibility, primary-only claim coverage, snapshot scope and live proof. This
 spec/source audit is not independent engineering approval or deployed evidence.
+
+
+## Engineering-review amendment
+
+CodeRabbit's exact-head review of `8e09b2bc` identified that propagating a single
+candidate's terminal-history error stops later eligible issues. The same
+pattern affected the primary selector and shared readmission sweep. Two mixed
+corrupt/healthy regressions failed before the source-local failure fix. The
+contract above now distinguishes candidate-local unknown state from shared-store
+and existing pause-authority failures, and keeps exhausted unknown inventories
+explicitly degraded. Further test-first boundary checks reproduce late protected-
+history corruption and an incompatible store with an empty inventory. The final
+mutation check now retains degradation, and reader opening probes its actual
+query capabilities without migration or registration.
+
+The focused `terminal_` group passes 22 checks (2.87 seconds). A fresh spec/source
+audit checked 72 mapped seams, then rechecked all eight affected seams after
+corrections; all hold within that audit scope. This is not engineering approval.
+The final amended-source managed CLI run passes 2,060 tests, zero failures and
+41 existing opt-in ignores (321.24 seconds). Exact-head hosted CI and independent
+engineering review remain pending. Neither local validation nor the historical
+checkpoint proves deployment or autonomous issue-to-merge acceptance.

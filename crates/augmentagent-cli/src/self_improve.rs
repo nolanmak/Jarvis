@@ -987,6 +987,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
         .into_iter()
         .partition(|i| !i.research_filed);
+    let mut unavailable_history=None;
     for iss in human.into_iter().chain(research) {
         if owner_controls.paused(&repository,iss.number)? {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
@@ -994,9 +995,17 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         }
         // An open GitHub issue can outlive its completed workflow. Do not
         // spend another selection turn on work the claim gate cannot restart.
-        if owner_controls.terminal(&repository,iss.number)? {
-            info!(issue=iss.number,"skip: workflow already merged or retired; preserve completed history");
-            continue;
+        match owner_controls.terminal(&repository,iss.number) {
+            Ok(true)=> {
+                info!(issue=iss.number,"skip: workflow already merged or retired; preserve completed history");
+                continue;
+            }
+            Ok(false)=>{},
+            Err(error)=> {
+                warn!(issue=iss.number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
+                if unavailable_history.is_none() {unavailable_history=Some(error);}
+                continue;
+            }
         }
         // #851 — an issue already attempted today lost a build to a refusal;
         // retrying it now would almost certainly lose another to the same
@@ -1067,6 +1076,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     if !dry_run {
         retriage_gave_up(repo_root, &issues).await;
     }
+    if let Some(error)=unavailable_history {return Err(error);}
     Ok(None)
 }
 
@@ -10729,6 +10739,7 @@ async fn pick_issue_for_repo(
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
     let owner_controls=workflow::FreshIssueControls::open()?;
+    let mut unavailable_history=None;
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
@@ -10742,9 +10753,17 @@ async fn pick_issue_for_repo(
             info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
-        if owner_controls.terminal(&repo.full_name,number)? {
-            info!(repo=%repo.full_name,issue=number,"skip: workflow already merged or retired; preserve completed history");
-            continue;
+        match owner_controls.terminal(&repo.full_name,number) {
+            Ok(true)=> {
+                info!(repo=%repo.full_name,issue=number,"skip: workflow already merged or retired; preserve completed history");
+                continue;
+            }
+            Ok(false)=>{},
+            Err(error)=> {
+                warn!(repo=%repo.full_name,issue=number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
+                if unavailable_history.is_none() {unavailable_history=Some(error);}
+                continue;
+            }
         }
         let title = iss
             .get("title")
@@ -10804,6 +10823,7 @@ async fn pick_issue_for_repo(
             author_trusted: false,
         }));
     }
+    if let Some(error)=unavailable_history {return Err(error);}
     Ok(None)
 }
 
