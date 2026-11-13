@@ -112,7 +112,7 @@ impl Stream<'_> {
             let valid=match std::str::from_utf8(&active.remaining) {
                 Ok(value)=>value.len(),
                 Err(error) if error.error_len().is_none() && size>0=>error.valid_up_to(),
-                Err(_)=>anyhow::bail!("caller evidence is not strict UTF-8"),
+                Err(error)=>return Err(anyhow::Error::new(error).context("caller evidence is not strict UTF-8")),
             };
             if valid>0 || (size==0 && active.blob.bytes==0) {
                 let body=String::from_utf8(active.remaining[..valid].to_vec())?;

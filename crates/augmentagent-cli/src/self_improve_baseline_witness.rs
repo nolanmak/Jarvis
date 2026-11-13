@@ -130,7 +130,7 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
 /// Share authentication, not selection: diagnostics accept every negative
 /// class while legacy reconsideration retains its original Unknown predicate.
 fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
-    custody:&[crate::autoship_workflow::NativeScopeCustody],select:fn(&Judgment)->bool)->Result<Option<(String,Judgment)>> {
+    custody:&[crate::autoship_workflow::NativeScopeCustody],select:impl Fn(&Judgment)->bool)->Result<Option<(String,Judgment)>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
     prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
@@ -192,6 +192,10 @@ pub(super) fn retained_source_context_in(root:&Path,control:&Path,prepared:&Prep
     custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
     if custody.is_empty() {return Ok(None);}
     retained_namespace(control,custody)?;
+    let expected=context(&prepared.proposal,&prepared.baseline)?;
+    if let Some((_,judgment))=retained_judgment_matching(root,prepared,custody,|judgment|judgment.context==expected)? {
+        return Ok(Some(judgment.context));
+    }
     Ok(retained_judgment_matching(root,prepared,custody,|_|true)?.map(|(_,judgment)|judgment.context))
 }
 

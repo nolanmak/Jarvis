@@ -62,10 +62,10 @@ pub(super) fn replay_key(root:&Path,control:&Path,base:&str,custody:&[crate::aut
 
 /// Frozen indexed-source protocol: this only reuses selections produced under
 /// the unchanged current scope producer. It imports data, never an old ruling.
-fn selection(
+fn selections(
     root: &Path, control: &Path, base: &str,
     custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, replay:Option<&str>,
-) -> Result<(String, Selection)> {
+) -> Result<Vec<(String, Selection)>> {
     ensure!(matches!(base.len(), 40 | 64) && base.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid original source commit");
     scope_authority::require_retained_native_custody(root, custody)?;
     let control = control.canonicalize()?;
@@ -79,7 +79,8 @@ fn selection(
         ensure!(replay.current_request==request,"source replay current request changed");
         Ok(replay)
     }).transpose()?;
-    let mut selected = None;
+    let mut selected = Vec::new();
+    let mut inputs=std::collections::BTreeSet::new();
     for observation in custody {
         let (reference,proof)=proof(&control,observation)?;
         if proof["head"] != base || proof["purpose"] != "source_selection" {continue;}
@@ -93,24 +94,120 @@ fn selection(
             ensure!(!context.is_none_or(|expected|proof["scope_context_hash"]==expected),"original source selection uses an unsupported producer protocol");
             continue;
         }
-        ensure!(selected.is_none(), "ambiguous original source selection");
+        ensure!(inputs.insert(observation.input.as_str()), "ambiguous original source selection");
         let raw = observation.response.trim();
         let raw = raw.strip_prefix("```json\n").and_then(|s| s.strip_suffix("```")).unwrap_or(raw);
-        let selection: Selection = serde_json::from_str(raw)?;
-        ensure!(!selection.requests.is_empty() && selection.requests.len() <= 16, "invalid original source selection size");
-        for request in &selection.requests {
-            ensure!(request.start_line > 0 && request.end_line >= request.start_line && request.end_line - request.start_line < 600, "invalid original source range");
-            ensure!(request.needle.as_ref().is_none_or(|needle| !needle.is_empty() && needle.len() <= 256), "invalid original source search");
-        }
+        // Completed rejected attempts remain authenticated custody. Syntax or
+        // range failures are not competing accepted source selections.
+        let Ok(selection)=serde_json::from_str::<Selection>(raw) else {continue;};
+        if selection.requests.is_empty() || selection.requests.len()>16 || selection.requests.iter().any(|request|
+            request.start_line==0 || request.end_line<request.start_line || request.end_line-request.start_line>=600
+                || request.needle.as_ref().is_some_and(|needle|needle.is_empty() || needle.len()>256)) {continue;}
         let identity = digest(&serde_json::to_vec(&("amendment-original-source-selection-v1", base, &observation.input, &observation.response, &reference,
             if projected {replay.as_ref()}else{None}))?);
-        selected = Some((identity, selection));
+        selected.push((identity,selection));
+        ensure!(selected.len()<=16,"original source attempts exceed bounded inspection");
     }
-    selected.context("original source selection unavailable")
+    ensure!(!selected.is_empty(),"original source selection unavailable");
+    Ok(selected)
 }
 
 pub(super) fn authenticate(root:&Path,control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],context:Option<&str>,replay:Option<&str>)->Result<String> {
-    selection(root,control,base,custody,context,replay).map(|(identity,_)|identity)
+    // Free migration inspection authenticates candidate custody without Git.
+    // Materialization below resolves producer acceptance before paid admission.
+    let candidates=selections(root,control,base,custody,context,replay)?;
+    Ok(digest(&serde_json::to_vec(&candidates.iter().map(|(identity,_)|identity).collect::<Vec<_>>())?))
+}
+
+/// Replay the original producer's acceptance of numbered excerpts without
+/// retaining whole blobs. Overlapping needle windows count separately, as in
+/// the original producer; amendment rendering may subsequently merge them.
+#[derive(Clone)]
+struct SelectionCheck<'a> {
+    request:&'a ReadRequest,pending:String,line:usize,bytes:usize,
+    previous:std::collections::VecDeque<usize>,ends:Vec<usize>,matches:usize,
+}
+impl<'a> SelectionCheck<'a> {
+    fn new(request:&'a ReadRequest)->Self {
+        Self {request,pending:String::new(),line:0,bytes:0,previous:Default::default(),ends:Vec::new(),matches:0}
+    }
+    fn line(&mut self,raw:&str) {
+        self.line+=1;
+        let text=raw.lines().next().unwrap_or("");
+        let size=self.line.to_string().len()+2+text.len()+1;
+        if let Some(needle)=&self.request.needle {
+            self.ends.retain(|end|*end>=self.line);
+            self.bytes=self.bytes.saturating_add(size.saturating_mul(self.ends.len()));
+            if self.matches<5 && text.contains(needle) {
+                self.matches+=1;
+                self.bytes=self.bytes.saturating_add(self.previous.iter().sum::<usize>()).saturating_add(size);
+                self.ends.push(self.line.saturating_add(99));
+            }
+            self.previous.push_back(size);
+            if self.previous.len()>50 {self.previous.pop_front();}
+        }else if (self.request.start_line..=self.request.end_line).contains(&self.line) {
+            self.bytes=self.bytes.saturating_add(size);
+        }
+    }
+    fn push(&mut self,chunk:&str)->Result<()> {
+        for part in chunk.split_inclusive('\n') {
+            ensure!(self.pending.len().saturating_add(part.len())<=512*1024,"original source line exceeds bounded selection inspection");
+            self.pending.push_str(part);
+            if self.pending.ends_with('\n') {let line=std::mem::take(&mut self.pending);self.line(&line);}
+        }
+        Ok(())
+    }
+    fn finish(mut self)->usize {
+        if !self.pending.is_empty() {let line=std::mem::take(&mut self.pending);self.line(&line);}
+        self.bytes
+    }
+}
+
+/// Keep a bounded speculative counter for trailing whitespace. EOF discards it;
+/// a later non-whitespace byte commits it. Even millions of trailing blank
+/// lines need only two bounded counter states, not a retained whitespace string.
+struct TrimmedSelectionCheck<'a> {
+    core:SelectionCheck<'a>,tail:Option<SelectionCheck<'a>>,deferred:Option<anyhow::Error>,started:bool,
+}
+impl<'a> TrimmedSelectionCheck<'a> {
+    fn new(request:&'a ReadRequest)->Self {Self {core:SelectionCheck::new(request),tail:None,deferred:None,started:false}}
+    fn whitespace(&mut self,text:&str) {
+        if text.is_empty() || self.deferred.is_some() {return;}
+        let tail=self.tail.get_or_insert_with(||self.core.clone());
+        if let Err(error)=tail.push(text) {self.deferred=Some(error);}
+    }
+    fn push(&mut self,chunk:&str)->Result<()> {
+        // Only acceptance reproduces trusted_git's whole-file String::trim.
+        // The delivered original source continues to retain exact bytes.
+        let chunk=if self.started {chunk}else{chunk.trim_start()};
+        if chunk.is_empty() {return Ok(());}
+        self.started=true;
+        let body=chunk.trim_end();
+        if body.is_empty() {self.whitespace(chunk);return Ok(());}
+        if let Some(error)=self.deferred.take() {return Err(error);}
+        if let Some(tail)=self.tail.take() {self.core=tail;}
+        self.core.push(body)?;
+        self.whitespace(&chunk[body.len()..]);
+        Ok(())
+    }
+    fn finish(self)->usize {self.core.finish()}
+}
+
+async fn accepted_selection(root:&Path,base:&str,entries:&[(&str,&str)],selection:&Selection)->Result<bool> {
+    let mut bytes=0usize;
+    for request in &selection.requests {
+        let Some((_,path))=entries.get(request.file_index) else {return Ok(false);};
+        let mut check=TrimmedSelectionCheck::new(request);
+        match aligned_review::visit_immutable_source(root,base,path,|chunk|check.push(chunk)).await {
+            Ok(())=>{},
+            Err(error) if error.downcast_ref::<std::string::FromUtf8Error>().is_some()
+                || error.downcast_ref::<std::str::Utf8Error>().is_some()=>return Ok(false),
+            Err(error)=>return Err(error),
+        }
+        bytes=bytes.saturating_add(check.finish());
+        if bytes>512*1024 {return Ok(false);}
+    }
+    Ok(bytes>0)
 }
 
 struct SourceBuffer<'a> {
@@ -204,7 +301,7 @@ pub(super) async fn read_bounded(
     custody: &[crate::autoship_workflow::NativeScopeCustody], context: Option<&str>, replay:Option<&str>,budget: usize,
 ) -> Result<Evidence> {
     ensure!((1024..=512 * 1024).contains(&budget), "invalid amendment source budget");
-    let (identity, selected) = selection(root, control, base, custody, context,replay)?;
+    let candidates=selections(root, control, base, custody, context,replay)?;
     let tree = trusted_git(root, &["--no-replace-objects", "ls-tree", "-r", "--long", "-z", base]).await?;
     ensure!(tree.len() <= 1024 * 1024, "original source table exceeds bound");
     // Preserve the original producer's ordinals, including literal Git paths.
@@ -213,6 +310,13 @@ pub(super) async fn read_bounded(
     }).collect::<Result<Vec<_>>>()?;
     let entries = entries.into_iter().filter(|(metadata, path)| metadata.split_whitespace().nth(1) == Some("blob")
         && scope_authority::witness_source_allowed(path)).collect::<Vec<_>>();
+    let mut accepted=None;
+    for (identity,selection) in candidates {
+        if !accepted_selection(root,base,&entries,&selection).await? {continue;}
+        ensure!(accepted.is_none(),"ambiguous original source selection");
+        accepted=Some((identity,selection));
+    }
+    let (identity,selected)=accepted.context("accepted original source selection unavailable")?;
     let mut full = BTreeMap::new();
     let mut partial = BTreeMap::new();
     let mut complete = true;
@@ -250,6 +354,7 @@ mod tests {
         let control = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(root.path().join("behavior.rs"), "pub fn behavior() -> bool { false }\n").unwrap();
+        std::fs::write(root.path().join("zzz-invalid.bin"),[0xff]).unwrap();
         for args in [&["init", "-q"][..], &["add", "."], &["commit", "-qm", "original"]] {
             let out = Command::new("/usr/bin/git").args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
                 .args(args).current_dir(root.path()).env_clear().env("PATH", "/usr/bin:/bin").output().await.unwrap();
@@ -275,11 +380,55 @@ mod tests {
         (root, control, head, vec![observation])
     }
 
+    #[test]
+    fn amendment_source_selection_check_matches_original_numbered_windows() {
+        for (source,start,end,needle) in [
+            ("first\r\nneedle\r\nlast  ".to_owned(),1,3,None),
+            ((0..250).map(|n|if n==55 || n==60 {"needle\n"}else{"ordinary\n"}).collect::<String>(),1,200,Some("needle")),
+            ("first\nlast\r".to_owned(),999,1000,None),
+            ("  \n\nfirst\n\n  \n".to_owned(),2,3,None),
+            ("\n\n".to_owned(),1,2,None),
+        ] {
+            let request=ReadRequest {file_index:0,start_line:start,end_line:end,needle:needle.map(str::to_owned)};
+            let lines=source.trim().lines().collect::<Vec<_>>();
+            let ranges=if let Some(needle)=needle {
+                lines.iter().enumerate().filter(|(_,line)|line.contains(needle)).take(5)
+                    .map(|(index,_)|(index.saturating_sub(50),(index+100).min(lines.len()))).collect::<Vec<_>>()
+            }else {vec![(start-1,end.min(lines.len()))]};
+            let expected=ranges.into_iter().map(|(start,end)|lines.iter().enumerate().take(end).skip(start)
+                .map(|(index,line)|format!("{}: {line}\n",index+1).len()).sum::<usize>()).sum::<usize>();
+            let mut check=TrimmedSelectionCheck::new(&request);
+            for byte in source.as_bytes().chunks(3) {check.push(std::str::from_utf8(byte).unwrap()).unwrap();}
+            assert_eq!(check.finish(),expected,"producer acceptance changed at CRLF, EOF, empty range or overlapping windows");
+        }
+    }
+
+    #[test]
+    fn amendment_source_selection_discards_unbounded_trailing_whitespace_metadata() {
+        let request=ReadRequest {file_index:0,start_line:2,end_line:2,needle:None};
+        let mut check=TrimmedSelectionCheck::new(&request);
+        check.push("first").unwrap();
+        for _ in 0..1024 {check.push(&"\n".repeat(1024)).unwrap();}
+        assert_eq!(check.finish(),0,"trim-discarded EOF whitespace became accepted original evidence");
+        let request=ReadRequest {file_index:0,start_line:1,end_line:1,needle:None};
+        let mut check=TrimmedSelectionCheck::new(&request);
+        check.push("first").unwrap();
+        for _ in 0..1024 {check.push(&"\n".repeat(1024)).unwrap();}
+        check.push("later").unwrap();
+        assert_eq!(check.finish(),"1: first\n".len(),"interior short blank lines exceeded bounded counters");
+    }
+
     #[tokio::test]
-    async fn amendment_source_uses_correction_after_rejected_empty_range() {
+    async fn amendment_source_uses_correction_after_rejected_selection() {
+        for rejected_response in [
+            r#"{"requests":[{"file_index":0,"start_line":999,"end_line":1000,"needle":null}]}"#,
+            r#"{"requests":[{"file_index":1,"start_line":1,"end_line":1,"needle":null}]}"#,
+            r#"{"requests":[{"file_index":99,"start_line":1,"end_line":1,"needle":null}]}"#,
+            "not valid JSON",
+        ] {
         let (root,control,base,mut custody)=fixture().await;
         let mut rejected=crate::autoship_workflow::NativeScopeCustody {
-            input:digest(b"rejected first source selection"),response:r#"{"requests":[{"file_index":0,"start_line":999,"end_line":1000,"needle":null}]}"#.into(),
+            input:digest(b"rejected first source selection"),response:rejected_response.into(),
             provenance:custody[0].provenance.clone(),provider:custody[0].provider,
         };
         let (_,mut original)=proof(control.path(),&custody[0]).unwrap();
@@ -294,6 +443,7 @@ mod tests {
         let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await
             .expect("rejected empty-range response must not compete with accepted correction");
         assert_eq!(evidence.sources["behavior.rs"],"pub fn behavior() -> bool { false }\n");
+        }
     }
 
     #[tokio::test]

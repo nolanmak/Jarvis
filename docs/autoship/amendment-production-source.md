@@ -28,6 +28,9 @@ original commit, matching the authenticated negative judgment's context when
 one is supplied. Without a negative diagnosis, the shared original-judgment
 reader may supply a positive witness's authenticated context bound to the complete
 same prepared proposal and baseline, solely to locate its source projection.
+Authenticate and prefer the current context first. Only when no current witness
+exists, require a unique historical witness; two applicable current or historical
+witnesses remain ambiguous.
 This does not qualify an old measurement, reopen a legacy Unknown hold, approve
 a correction or grant budget. Keep the negative-diagnosis and Unknown-recovery
 selectors unchanged. If no original judgment exists, an amendment may still use
@@ -43,7 +46,19 @@ context, request, policy and supplied-request hash. The reader must reuse the
 existing protected scope-response lookup semantics and reject missing recorded
 mappings. This is a frozen data projection, never acceptance of an old judgment.
 Do not accept a different context merely because its source files look useful.
-Missing, ambiguous, foreign, malformed or
+Rejected source-selection responses remain in custody. Authenticate the bounded
+candidate set in the free inspector; resolve the accepted selection against the
+original immutable table and the producer's nonempty, 512 KiB numbered-excerpt
+limit during productive preparation, before paid admission. Replay the producer's
+whole-file whitespace trim only for selection acceptance; delivered original
+evidence retains its exact whitespace. Stream speculative trailing-whitespace
+counters so discardable EOF whitespace cannot exhaust the working set. Preserve
+typed UTF-8 content failures to reject those attempts while propagating actual
+transport failures. Rejected schema,
+range, ordinal or empty-window attempts do not compete with their successful
+correction. Multiple accepted selections remain ambiguous. Overlapping literal
+search windows count separately for the producer's limit even when amendment
+rendering later merges them. Missing, ambiguous, foreign, malformed or
 changed custody holds before paid admission. Do not edit the scope producer file
 or accept arbitrary historical producer policies to make recovery pass.
 
