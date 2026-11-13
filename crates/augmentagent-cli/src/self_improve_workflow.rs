@@ -1624,6 +1624,14 @@ impl WorkflowGuard {
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
     }
+    pub(super) fn recorded_scope_stage_response(&self,key:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .recorded_scope_stage_response(&self.lease,&self.binding,key,millis())
+    }
+    pub(super) fn scope_stage_response_keys(&self,after:&str)->Result<Vec<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
+    }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
     }

@@ -406,6 +406,28 @@ impl WorkflowStore {
         let value=read_scope_response(&tx,&lease.workflow,key)?;
         tx.commit()?;Ok(value)
     }
+    /// Budget recovery needs both the immutable body and its committed receipt.
+    pub(crate) fn recorded_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let value=read_scope_response(&tx,&lease.workflow,key)?;
+        if value.is_some() {
+            let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.key')=?2 ELSE 0 END)",params![lease.workflow,key],|row|row.get(0))?;
+            if !recorded {return Err(MissingScopeResponse.into());}
+        }
+        tx.commit()?;Ok(value)
+    }
+    /// Bounded union includes receipts whose bodies were lost, never treating
+    /// their absence as permission to create a fresh verifier budget.
+    pub(crate) fn scope_stage_response_keys(&mut self,lease:&Lease,binding:&Binding,after:&str,now:i64)->Result<Vec<String>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let invalid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[&lease.workflow],|row|row.get(0))?;
+        if invalid {return Err(MissingScopeResponse.into());}
+        let keys={let mut statement=tx.prepare("SELECT key FROM (SELECT key FROM scope_stage_response WHERE workflow=?1 UNION SELECT json_extract(payload,'$.key') AS key FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded') WHERE key>?2 ORDER BY key LIMIT 16")?;
+            let rows=statement.query_map(params![lease.workflow,after],|row|row.get::<_,String>(0))?;rows.collect::<rusqlite::Result<Vec<_>>>()?};
+        if keys.iter().any(|key|key.len()!=64 || !key.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {return Err(MissingScopeResponse.into());}
+        tx.commit()?;Ok(keys)
+    }
+
     pub fn record_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,now:i64)->Result<()> {
         ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
