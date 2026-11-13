@@ -74,6 +74,20 @@ impl StagedCorrection {
     }
 }
 
+/// Controller-only references to a completed semantic failure. Private raw
+/// output is loaded separately; its contents never become an error message.
+#[derive(Debug)]
+pub(super) struct MeasuredFailure {pub(super) plan:String,pub(super) result:String,pub(super) identity:String}
+impl std::fmt::Display for MeasuredFailure {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("constructed original measurement rejected; exact feedback retained privately")}
+}
+impl std::error::Error for MeasuredFailure {}
+fn measured_failure(error:anyhow::Error,plan:&str,result:&str,identity:&str)->anyhow::Error {
+    if error.downcast_ref::<BaselineNotRed>().is_some_and(|failure|failure.kind.is_some()) {
+        error.context(MeasuredFailure {plan:plan.into(),result:result.into(),identity:identity.into()})
+    }else {error}
+}
+
 pub(in crate::self_improve::acceptance::amendment) async fn stage(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement)->Result<StagedCorrection> {
     stage_with(root,workflow,episode,measurement,|original,control,prepared,workflow| {
         Box::pin(async move {baseline_witness::qualify(original,control,prepared,workflow).await})
@@ -105,16 +119,19 @@ where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::Wo
     // OriginalExecution retains every conclusive result, including already
     // green and unexpected failures. Reuse those exact observations too.
     let (original_result,baseline)=if let Some((result,baseline))=verifier_execution::OriginalExecution::retained_result(&original,workflow,proposal,episode.original_base(),&environment,&executor)? {
-        (result,reproduce_observation(baseline)?)
+        (result,baseline)
     }else{
         let execution=verifier_execution::OriginalExecution::begin(workflow,episode.control(),proposal,episode.original_base(),&environment,&executor)?;
-        let baseline=register_and_reproduce_original(&original,proposal.clone(),workflow.audit_logger(),execution.clone()).await.map_err(|error|execution.failed(error))?;
+        let baseline=register_and_observe_with_custody(&original,proposal.clone(),&workflow.audit_logger(),Some(&execution)).await.map_err(|error|execution.failed(error))?;
+        execution.retain_result(&original,&baseline).map_err(|error|execution.failed(error))?;
         (execution.result_reference(),baseline)
     };
     let prepared=PreparedAcceptance {proposal:proposal.clone(),baseline};
     let original_data=workflow.exact_original_result_data(&plan,&original_result)?;
     ensure!(serde_json::to_vec(&original_data.prepared)?==serde_json::to_vec(&prepared)?,initial_repair::Hold::EvidenceUnknown);
-    qualify(&original,episode.control(),&prepared,workflow).await?;
+    reproduce_observation(prepared.baseline.clone()).map_err(|error|measured_failure(error,&plan,&original_result,&original_data.identity))?;
+    qualify(&original,episode.control(),&prepared,workflow).await
+        .map_err(|error|measured_failure(error,&plan,&original_result,&original_data.identity))?;
     // A callback's success, including an eventual cached qualifier, is not
     // enough: independently re-read the protected current-policy witness.
     baseline_witness::assert_current(&original,episode.control(),&prepared)?;
@@ -289,6 +306,16 @@ pub(super) mod tests {
                     }).await?;
                     ensure!(guard.verifier_evidence_page("original_verifier_command_admission",0)?.len()==1,"restart reran unchanged original command");
                     ensure!(guard.verifier_evidence_page("original_verifier_result",0)?.len()==1,"restart manufactured another original measurement");
+                    let admitted:serde_json::Value=serde_json::from_str(&commands[0].body)?;
+                    let stdout=PathBuf::from(admitted["capture"]["path"].as_str().context("actual original capture absent")?).join("stdout");
+                    let actual=std::fs::read(&stdout)?;std::fs::remove_file(&stdout)?;
+                    ensure!(replay.require_current(root.path(),&guard,&episode).await.is_err(),"lost original capture still admitted review with a cached positive witness");
+                    {
+                        use std::io::Write;use std::os::unix::fs::OpenOptionsExt;
+                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(stdout)?;
+                        file.write_all(&actual)?;file.sync_all()?;
+                    }
+                    replay.require_current(root.path(),&guard,&episode).await?;
                     let file=std::fs::read_dir(control.path())?.map(|e|e.map(|e|e.path())).collect::<std::io::Result<Vec<_>>>()?
                         .into_iter().find(|p|p.file_name().is_some_and(|n|n.to_string_lossy().starts_with("baseline-witness-") && n.to_string_lossy().ends_with(".json")))
                         .context("current witness file missing")?;
@@ -303,6 +330,10 @@ pub(super) mod tests {
                 _=>{
                     let error=result.err().context("already-green original produced a staged correction")?;
                     ensure!(matches!(error.downcast_ref::<BaselineNotRed>().and_then(|f|f.kind),Some(initial_repair::FailureKind::AlreadyPasses)),"already-green result lost classification: {error:#}");
+                    let measured=error.downcast_ref::<MeasuredFailure>().context("already-green result lost exact feedback references")?;
+                    guard.exact_original_result_data(&measured.plan,&measured.result)?;
+                    let feedback=feedback::retain(root.path(),&guard,&episode,&measurement,&measured.plan,&measured.result,&measured.identity)?;
+                    ensure!(feedback::load(root.path(),&guard,&episode,&measurement,&feedback)?["original"]["commands"]["observe"]["stdout"].is_string(),"actual original output absent from feedback");
                     let replay=stage_with(root.path(),&guard,&episode,&measurement,|_,_,_,_|Box::pin(async {anyhow::bail!("already-green replay reached qualifier")})).await;
                     ensure!(replay.is_err() && guard.verifier_evidence_page("original_verifier_command_admission",0)?.len()==1,"already-green original was executed again");
                 }

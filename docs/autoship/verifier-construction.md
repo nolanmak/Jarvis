@@ -217,11 +217,31 @@ charges. Forged markers, lost role indexes or missing native proof hold instead
 of allowing a new initial budget. The existing plan serialization and initial
 budget references remain unchanged; this adds no model admission or approval.
 
-Before activation, connect complete authenticated compiler/setup output and negative witness prose
-to the next constructor request through the existing capture/diagnosis services;
-a generic `BaselineNotRed` detail alone is insufficient. These are production
-integration requirements along with the restricted lease/selector, typed
-authority admission and full original fixture coverage.
+The construction service now carries exact private original feedback into the
+next constructor request. A protected immutable reference binds the episode,
+slot, proposal intent, exact original plan/result, captured-output identity and
+negative diagnosis identity. Reading it authenticates the actual native proposal,
+plan ownership, complete uninterrupted supervised streams, command quiescence
+and any required negative witness. The supplied original data remains usable
+across candidate-binding movement within the same episode; it grants no current
+execution or approval. Missing, changed, ambiguous or oversized evidence holds
+without truncation, another proposal slot or a fresh model charge. Summary-only
+rejections cannot enter the production constructor. The bounded
+`construct_and_stage` service retains semantic failure evidence before rejection
+and retries within the same three measurement slots; infrastructure and unknown
+effects leave the same intent pending. This service still needs the restricted
+lease/selector and typed authority integration before production activation.
+
+The feedback checkpoint passes 20 construction tests and 65 capture, witness
+and contract tests, with four explicit isolation ignores across those component
+selections. The delegated isolated staging test passes separately in 311.04
+seconds, including actual captured-output loss after staging and exact feedback
+from a conclusive non-red original. Constructor and qualifier replies in that
+fixture remain scripted. The read-only retained-production compatibility probe
+also passes: eight original files, 343,299 serialized source bytes, the unchanged
+414,111-byte historical request including system text, and zero native calls or
+workflow writes. These are component and compatibility results; the unresolved
+source-only authority regression remains outside the passing selections.
 
 The ownership checkpoint has 56 selected accounting, initial-repair, recovery,
 constructor and transport tests passing (one explicit isolation ignore). The
@@ -248,11 +268,13 @@ explicit isolation ignores; the connected staging-before-authority regression
 remains outside this passing component selection and is still unresolved.
 
 The authority integration must re-read the exact retained original result and
-its captures immediately before spending review authority. The current live
-stage object rechecks constructor/witness/binding/environment but does not yet
-carry an exact original-result reference for that later boundary. Include a
-capture-loss-after-staging regression; the constructor-purpose all-command guard
-alone is not a substitute for the authority's typed input gate. Also preserve an
+its captures immediately before spending review authority. The live stage now retains the exact original plan/result and
+captured-data identity and re-reads them on each `require_current`, alongside
+constructor/witness/binding/environment checks. Its isolation regression removes
+an actual captured stream after staging and requires refusal despite a cached
+positive witness, then restores the fixture bytes and checks witness loss
+separately. These stage checks are not yet connected to authority admission; the
+all-command guard alone is not a substitute for that typed input gate. Also preserve an
 unadmitted saved request across producer-policy rollouts without spending or
 refilling its episode: the current transport conservatively refuses a fresh call
 under an old producer hash. Any supported migration must authenticate absence of

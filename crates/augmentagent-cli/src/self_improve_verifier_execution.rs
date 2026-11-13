@@ -659,6 +659,21 @@ pub(super) fn retain_scripted_original_data(root:&Path,control:&Path,prepared:&P
 }
 
 #[cfg(all(test,target_os="linux"))]
+pub(super) fn retain_captured_feedback_fixture(root:&Path,control:&Path,proposal:&ContractProposal,base:&str,workflow:&workflow::WorkflowGuard,observation:&Observation)->Result<(String,String)> {
+    let environment=environment_id(root)?;
+    let original=OriginalExecution::begin(workflow,control,proposal,base,&environment,&verifier_executor_id()?)?;
+    for verifier in &proposal.contract.verifiers {
+        tests::captured_output_fixture(&original,&verifier.id,&tests::gone_scope(),observation.interrupted,
+            observation.stdout.as_bytes(),observation.stderr.as_bytes(),observation.exit_code.unwrap_or(0));
+    }
+    OriginalExecution::quiesce_previous(workflow)?;
+    let registration=RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment)?;
+    let receipts=proposal.contract.verifiers.iter().map(|v|registration.observe(root,&v.id,registration.binding(base)?,observation)).collect::<Result<Vec<_>>>()?;
+    original.retain_result(root,&BaselineEvidence {registration,receipts})?;
+    Ok((original.plan.clone(),original.result_reference()))
+}
+
+#[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
     use std::cell::Cell;
@@ -848,7 +863,7 @@ mod tests {
     fn captured_verifier_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool)->PathBuf {
         captured_output_fixture(original,verifier,identity,interrupted,b"false\n",b"",0)
     }
-    fn captured_output_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool,stdout:&[u8],stderr:&[u8],exit:i32)->PathBuf {
+    pub(super) fn captured_output_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool,stdout:&[u8],stderr:&[u8],exit:i32)->PathBuf {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let capture=original.prepare_capture(verifier).unwrap();
@@ -885,6 +900,33 @@ mod tests {
         assert!(command.output_complete && !command.interrupted);
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
         drop(store);drop(original);guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_original_data_rejects_metadata_only_capture_loss_and_other_result_references() {
+        for fault in ["metadata-only","missing-stream","changed-stream","other-plan"] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();let env=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&env,"exact executor").unwrap();
+            let capture=if fault=="metadata-only" {original.retain_admission("observe",&gone_scope()).unwrap();None}
+                else {Some(captured_fixture(&original,&gone_scope(),false))};
+            OriginalExecution::quiesce_previous(&guard).unwrap();original.retain_result(root.path(),&prepared.baseline).unwrap();
+            let reference=original.result_reference();let mut plan=original.plan.clone();
+            match fault {
+                "missing-stream"=>std::fs::remove_file(capture.unwrap().join("stdout")).unwrap(),
+                "changed-stream"=>std::fs::write(capture.unwrap().join("stdout"),b"true!\n").unwrap(),
+                "other-plan"=>{
+                    let (key,body)=plan_input(&guard,&prepared.proposal,base,&env,"different executor").unwrap();
+                    guard.record_verifier_evidence(&key,"original_verifier_plan",&body).unwrap();plan=key;
+                }
+                _=>{}
+            }
+            let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+            let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+            assert!(exact_original_result(&plan,&reference,&store.inspect_verifier_evidence(guard.id())).is_err(),"{fault} became exact executable evidence");
+            assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+            drop(store);drop(original);guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]

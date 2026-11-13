@@ -131,8 +131,14 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
 /// class while legacy reconsideration retains its original Unknown predicate.
 fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
     custody:&[crate::autoship_workflow::NativeScopeCustody],select:impl Fn(&Judgment)->bool)->Result<Option<(String,Judgment)>> {
+    retained_judgment_data(root,prepared,custody,select,false,None)
+}
+fn retained_judgment_data(root:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],select:impl Fn(&Judgment)->bool,stored_proposal:bool,
+    expected_identity:Option<&str>)->Result<Option<(String,Judgment)>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
-    prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
+    if stored_proposal {prepared.baseline.registration.verify_pinned_data(&prepared.proposal.files)?;}
+    else {prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;}
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
         "retained semantic judgment lacks its original measured baseline");
     scope_authority::require_retained_native_custody(root,custody)?;
@@ -153,6 +159,7 @@ fn retained_judgment_matching(root:&Path,prepared:&PreparedAcceptance,
         let judgment=validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
         let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
             &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
+        if expected_identity.is_some_and(|expected|expected!=identity) {continue;}
         ensure!(selected.as_ref().is_none_or(|(previous,_)|previous==&identity),"retained semantic judgment is ambiguous");
         selected=Some((identity,judgment));
     }
@@ -190,8 +197,12 @@ pub(super) fn retained_semantic_diagnosis_in(root:&Path,control:&Path,prepared:&
 /// Proposed-adapter diagnosis data; this never qualifies installed candidate
 /// files or imports an old positive judgment as current approval.
 pub(super) fn retained_proposal_diagnosis_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
-    custody:&[crate::autoship_workflow::NativeScopeCustody],_expected:Option<&str>)->Result<Option<(String,String)>> {
-    retained_semantic_diagnosis_in(root,control,prepared,custody)
+    custody:&[crate::autoship_workflow::NativeScopeCustody],expected:Option<&str>)->Result<Option<(String,String)>> {
+    if custody.is_empty() {return Ok(None);}
+    retained_namespace(control,custody)?;
+    let selected=retained_judgment_data(root,prepared,custody,|judgment|judgment.verifiers.iter()
+        .any(|witness|witness.measurement!=Measurement::DirectProduction || !witness.original_fixture_available),true,expected)?;
+    selected.map(|(identity,judgment)|Ok((identity,serde_json::to_string(&judgment)?))).transpose()
 }
 
 /// Source data may use a positive original witness without importing approval.
@@ -326,6 +337,8 @@ mod tests {
     #[test]
     fn proposed_negative_diagnosis_does_not_require_installing_unapproved_adapter_in_candidate() {
         let (root,control,old)=fixture();let mut next=old.clone();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
         next.proposal.contract.revision+=1;
         next.proposal.files.values_mut().next().unwrap().push_str("\n# proposed replacement, not candidate code\n");
         for (path,body) in &next.proposal.files {std::fs::write(root.path().join(path),body).unwrap();}
@@ -338,6 +351,8 @@ mod tests {
         let path=root.path().join(old.proposal.files.keys().next().unwrap());let before=std::fs::read(&path).unwrap();
         let diagnosis=retained_proposal_diagnosis_in(root.path(),control.path(),&next,&custody,None).unwrap().expect("complete negative proposal diagnosis lost");
         assert!(diagnosis.1.contains("Original fixture is absent"));
+        assert_eq!(retained_proposal_diagnosis_in(root.path(),control.path(),&next,&custody,Some(&diagnosis.0)).unwrap().unwrap(),diagnosis);
+        assert!(retained_proposal_diagnosis_in(root.path(),control.path(),&next,&custody,Some(&"f".repeat(64))).unwrap().is_none());
         assert_eq!(std::fs::read(path).unwrap(),before,"reading diagnosis installed an unapproved harness");
         assert!(assert_current(root.path(),control.path(),&next).is_err(),"data reader granted candidate qualification");
         let mut changed=next;changed.proposal.files.values_mut().next().unwrap().push_str("forged adapter bytes");

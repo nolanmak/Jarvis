@@ -5,6 +5,8 @@ use super::*;
 mod staging;
 #[path="self_improve_construction_accounting.rs"]
 mod accounting;
+#[path="self_improve_construction_feedback.rs"]
+mod feedback;
 pub(super) fn original_plan_owned(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,plan:&str,body:&str)->Result<bool> {
     accounting::owned(root,control,workflow,plan,body)
 }
@@ -75,7 +77,8 @@ impl Measurement {
 }
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Rejection {version:u32,episode:String,slot:u32,intent_sha256:String,detail:String}
+struct Rejection {version:u32,episode:String,slot:u32,intent_sha256:String,detail:String,
+    #[serde(default,skip_serializing_if="Option::is_none")] feedback:Option<feedback::Reference>}
 
 fn key(domain:&str,episode:&str,index:u32)->String {digest(&serde_json::to_vec(&(domain,episode,index)).unwrap())}
 fn turn_key(episode:&str,index:u32)->String {key("verifier-construction-turn-v1",episode,index)}
@@ -97,12 +100,15 @@ fn read<T:serde::de::DeserializeOwned>(workflow:&workflow::WorkflowGuard,key:&st
 /// this. Infrastructure, missing custody and unknown execution keep the same
 /// intent pending. The caller must retain that underlying evidence separately.
 pub(super) fn reject(workflow:&workflow::WorkflowGuard,measurement:&Measurement,failure:&BaselineNotRed)->Result<()> {
+    reject_with_reference(workflow,measurement,failure,None)
+}
+fn reject_with_reference(workflow:&workflow::WorkflowGuard,measurement:&Measurement,failure:&BaselineNotRed,feedback:Option<feedback::Reference>)->Result<()> {
     ensure!(failure.kind.is_some(),initial_repair::Hold::InfrastructureUnavailable);
     let detail=&failure.detail;
     ensure!(!detail.trim().is_empty() && detail.len()<=128*1024,"construction rejection exceeds bound");
     let saved:Measurement=read(workflow,&intent_key(&measurement.episode,measurement.slot))?.context(initial_repair::Hold::EvidenceUnknown)?;
     ensure!(saved.identity()?==measurement.identity()?,initial_repair::Hold::EvidenceUnknown);
-    write(workflow,&rejection_key(&measurement.episode,measurement.slot),&Rejection {version:1,episode:measurement.episode.clone(),slot:measurement.slot,intent_sha256:measurement.identity()?,detail:detail.into()})
+    write(workflow,&rejection_key(&measurement.episode,measurement.slot),&Rejection {version:1,episode:measurement.episode.clone(),slot:measurement.slot,intent_sha256:measurement.identity()?,detail:detail.into(),feedback})
 }
 
 pub(super) struct Request<'a> {
@@ -116,11 +122,37 @@ pub(super) struct Request<'a> {
     pub model:&'a str,
 }
 
+/// Bounded producer/measurement handoff. Semantic failures feed the next
+/// constructor input only after their exact original evidence is retained.
+/// Unknown effects and infrastructure errors preserve the pending intent.
+pub(super) async fn construct_and_stage(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>)->Result<StagedCorrection> {
+    for _ in 0..SLOTS {
+        let measurement=next(root,workflow,Request {episode:request.episode,old:request.old,
+            candidate_environment:request.candidate_environment,adjudication:request.adjudication,
+            context:request.context,provider:request.provider,model:request.model}).await?;
+        match stage(root,workflow,request.episode,&measurement).await {
+            Ok(staged)=>return Ok(staged),
+            Err(error)=>{
+                let Some(failure)=error.downcast_ref::<BaselineNotRed>().filter(|failure|failure.kind.is_some()) else {return Err(error)};
+                let measured=error.downcast_ref::<staging::MeasuredFailure>().context(initial_repair::Hold::EvidenceUnknown)?;
+                let reference=feedback::retain(root,workflow,request.episode,&measurement,&measured.plan,&measured.result,&measured.identity)?;
+                reject_with_reference(workflow,&measurement,failure,Some(reference))?;
+            }
+        }
+    }
+    Err(initial_repair::Hold::Exhausted.into())
+}
+
 /// Called only by the restricted, leased construction component. This does not
 /// clear the canonical hold or call the authority. The native adapter replays
 /// original admitted completions before considering a fresh dispatch.
 pub(super) async fn next(root:&Path,workflow:&workflow::WorkflowGuard,request:Request<'_>)->Result<Measurement> {
     let episode=request.episode;
+    for slot in 0..SLOTS {
+        if let Some(rejected)=read::<Rejection>(workflow,&rejection_key(episode.key(),slot))? {
+            ensure!(rejected.feedback.is_some(),initial_repair::Hold::EvidenceUnknown);
+        }
+    }
     next_with(root,workflow,request,|input|async move {
         constructor_native::call(root,workflow,episode,&input).await
     }).await
@@ -209,9 +241,10 @@ where F:FnMut(constructor_native::Input)->Fut,Fut:std::future::Future<Output=Res
                     ensure!(saved.identity()?==measurement.identity()?,initial_repair::Hold::EvidenceUnknown);
                 }else{write(workflow,&intent_key(episode.key(),slot as u32),&measurement)?;intents[slot]=Some(measurement.clone());}
                 let Some(rejection)=&rejections[slot] else{return Ok(measurement)};
+                let raw_feedback=rejection.feedback.as_ref().map(|reference|feedback::load(root,workflow,episode,&measurement,reference)).transpose()?;
                 slot+=1;
                 serde_json::json!({"kind":"measurement_rejected","intent_sha256":rejection.intent_sha256,
-                    "failed_proposal":measurement.draft,"detail":rejection.detail})
+                    "failed_proposal":measurement.draft,"detail":rejection.detail,"raw_original_feedback":raw_feedback})
             }
             Ok(Output::SourcePage {offset,limit})=>match table.page(offset,limit) {
                 Ok(page)=>serde_json::json!({"kind":"source_page","data":serde_json::from_str::<serde_json::Value>(&page)?}),
