@@ -3747,6 +3747,27 @@ mod observation_accounting_tests {
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
     }
     #[test]
+    fn unfinished_constructor_response_blocks_all_fresh_native_admissions_after_restart() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
+        let id="owner/repo#constructor-custody";
+        let first=format!("verifier-construction-native-v1:{}:{}","a".repeat(64),"b".repeat(64));
+        let second=format!("verifier-construction-native-v1:{}:{}","a".repeat(64),"c".repeat(64));
+        let mut store=WorkflowStore::open(&path).unwrap();
+        store.register(id,"probe",binding(),1).unwrap();
+        let lease=store.claim(id,"constructor",2,1000).unwrap().unwrap();
+        store.charge_admitted_model(&lease,"lost",3,None,Some((&first,&binding(),1)),Some(submission::Provider::Codex),false).unwrap();
+        store.release(&lease,4).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let lease=store.claim(id,"restarted",5,1000).unwrap().unwrap();
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.binding.head="new-candidate".into();store.checkpoint(&lease,&cp,6).unwrap();
+        for purpose in [Some((&second[..],&cp.binding,1)),None] {
+            assert!(store.charge_admitted_model(&lease,"must-not-dispatch",7,None,purpose,Some(submission::Provider::Claude),true).is_err(),
+                "missing constructor response was bypassed by a new input, role, provider or binding");
+        }
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,1);
+    }
+    #[test]
     fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
         let mut store=WorkflowStore::open(&path).unwrap();let id="autoship-observation/bounded";
