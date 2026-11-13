@@ -50,7 +50,7 @@ raise AssertionError('Unexpected or mutating GitHub call: ' + repr(args))
             .env("XDG_STATE_HOME",root.path().join("state"))
             .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
             .env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","fixture-owner")
-            .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner")
+            .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner,explicit-author")
             .env("AUTOSHIP_PAUSED_CASE",case).env("AUTOSHIP_PAUSED_ROUTE",route).env("AUTOSHIP_PAUSED_CALLS",root.path().join("calls"))
             .env("AUTOSHIP_PAUSED_INVENTORY",root.path().join("inventory.json"))
             .env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
@@ -181,7 +181,7 @@ async fn trust_child(repo:&Path,path:&Path,case:&str) {
         (store.snapshot(&id).unwrap(),store.owner_control(&id).unwrap(),store.events(&id).unwrap())
     });
     drop(store);
-    for (login,association) in [("another-owner","owner"),("member-login","MEMBER"),("collaborator-login","collaborator"),("FiXtUrE-OwNeR","NONE")] {
+    for (login,association) in [("another-owner","owner"),("member-login","MEMBER"),("collaborator-login","collaborator"),("FiXtUrE-OwNeR","NONE"),("ExPlIcIt-AuThOr","NONE")] {
         let mut a=if case=="trust-paused" {row(42,"fixture-owner","OWNER")}else{row(42,"github-actions[bot]","NONE")};
         if case=="trust-peers" {a["body"]="Background mentions .env but has no owner authorization".into();}
         let mut rows=vec![a,row(41,"outside-author","NONE")];
