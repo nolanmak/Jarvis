@@ -934,11 +934,9 @@ where
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
 /// PR) and isn't blast-radius and isn't `agent-gave-up`.
 ///
-/// #300 trust gate: the returned [`Issue::author_trusted`] flag records
-/// whether the author passed the trust check. Untrusted-authored issues are
-/// still returned (so the loop can route them through owner approval rather
-/// than silently swallowing them) but are NEVER auto-built or auto-pushed by
-/// [`run_once`].
+/// #300 trust gate: automatic selection returns only authors accepted by
+/// the existing trust policy. The execution guard still checks the flag on
+/// other ingress paths; untrusted sources require explicit owner approval.
 async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let allowlist = trusted_authors(repo_root).await;
     let gh = gh_bin();
@@ -1009,6 +1007,15 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             association,
             research_filed,
         } = iss;
+        // Ineligible sources must not consume a selection turn or receive
+        // triage mutations. Explicit owner ingress and the final execution
+        // trust gate remain separate authorities.
+        let author_trusted=author_is_trusted(&author,&association,&allowlist);
+        if !author_trusted {
+            info!(issue=number,author=%author,association=%association,
+                "skip: automatic author not trusted; owner approval required");
+            continue;
+        }
         if let Some((pattern, _)) = issue_blast_radius_hit(&format!("{title} {body}")) {
             // #819 — every other refusal in this pipeline leaves a comment
             // and/or a label. This one used to `continue` silently, so a
@@ -1035,17 +1042,6 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         if has_open_agent_pr(repo_root, number).await? {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
-        }
-        // #300 — trust-gate on the author + its write-access association
-        // before any host-side build/push.
-        let author_trusted = author_is_trusted(&author, &association, &allowlist);
-        if !author_trusted {
-            info!(
-                issue = number,
-                author = %author,
-                association = %association,
-                "untrusted issue author — requires owner approval before any build/push"
-            );
         }
         let candidate=Issue {number,title,body,author,author_trusted,research_filed};
         if acceptance::readiness::blocked(repo_root,&candidate).await? {
