@@ -121,6 +121,23 @@ use owned deployment artifacts and the normal guarded deployment path; retain
 pending workflow/runtime evidence and do not introduce an executable override.
 
 
+## Red-main repair diagnostics
+
+A red-main repair names failed required CI, without assuming that missing Rust
+test names mean compilation failed. Its bounded excerpt uses GitHub's failed
+steps for each verified job, rather than successful setup/tests or post-job
+cleanup. Check names, job identities and links stay with their diagnostic text.
+Missing logs remain explicitly unavailable; they never change a failed verdict.
+The public excerpt is limited to 2,500 bytes, with shared space for up to eight
+failed jobs and an explicit omitted-job count beyond that. Oversized excerpts
+retain both ends and mark truncation; inspect the job link for full evidence.
+
+Changing diagnostic wording does not replace an existing marked repair issue
+for the same full main SHA. Existing requests, owner holds and accounting remain
+attached to that issue. Lines rejected by the public-report privacy check are
+replaced with an explicit withholding marker. Full-report validation still gates
+issue publication; withholding diagnostics never turns a failed check green.
+
 ## Review-held triage
 
 Read the workflow's current state before requesting another attempt:

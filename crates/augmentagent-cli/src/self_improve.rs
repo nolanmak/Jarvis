@@ -5203,7 +5203,7 @@ async fn preexisting_on_main(repo_root: &Path, gate_err: &str, audit: &Arc<augme
 /// A red `main`, as the cache knows it.
 struct RedMain {
     sha: String,
-    /// Test names red on `main`; empty when `main` does not build.
+    /// Test names found in failed CI diagnostics; empty does not classify why.
     failing: Vec<String>,
     /// Packages cargo named in its rerun hints, for `-p` and `git log` paths.
     packages: Vec<String>,
@@ -5273,7 +5273,7 @@ fn is_red_main_issue(body: &str) -> bool {
 fn red_main_title(red: &RedMain) -> String {
     let short = red.sha.get(..7).unwrap_or(&red.sha);
     if red.failing.is_empty() {
-        return format!("main is red at {short}: workspace does not build");
+        return format!("main is red at {short}: required CI checks failed");
     }
     const SHOWN: usize = 3;
     let shown = red
@@ -5300,17 +5300,16 @@ fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
          This issue outranks all other work.\n\n",
         red.sha
     );
-    if red.failing.is_empty() {
-        b.push_str("## `main` does not build\n\n```\n");
-        b.push_str(&truncate(red.gate_err.as_deref().unwrap_or(""), 2500));
-        b.push_str("\n```\n\n");
-    } else {
+    if !red.failing.is_empty() {
         b.push_str("## Failing on `main`\n\n");
         for t in &red.failing {
             b.push_str(&format!("- `{t}`\n"));
         }
         b.push('\n');
     }
+    b.push_str("## Failing required CI\n\n```\n");
+    b.push_str(&truncate(red.gate_err.as_deref().unwrap_or("Diagnostic output unavailable; inspect the failed checks."),2500));
+    b.push_str("\n```\n\n");
     if !red.packages.is_empty() {
         b.push_str("Packages: ");
         b.push_str(
@@ -5325,9 +5324,9 @@ fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
     b.push_str("## Recent commits touching those crates\n\n```\n");
     b.push_str(recent_commits.trim());
     b.push_str(
-        "\n```\n\n## What to do\n\nDecide from those commits whether the TEST or the CODE went \
-                stale and fix the smaller side. Never weaken or delete an assertion to make a \
-                test pass; if the test is right, fix the code. Keep the diff minimal — this PR \
+        "\n```\n\n## What to do\n\nUse the failed check and recent commits to identify the code, test, \
+                dependency, security audit or infrastructure failure. Preserve required checks and \
+                assertions; fix the cause. Keep the diff minimal — this PR \
                 exists only to make `main` green again.\n",
     );
     b
@@ -5354,6 +5353,21 @@ fn red_main_issue_lookup(issues: &serde_json::Value, title: &str) -> Option<(u64
             })
             .unwrap_or(false);
         Some((number, gave_up))
+    })
+}
+
+fn red_main_repair_lookup(issues:&serde_json::Value,red:&RedMain)->Option<(u64,bool)> {
+    if let Some(found)=red_main_issue_lookup(issues,&red_main_title(red)) {return Some(found);}
+    // Diagnostic improvements can change the title without changing the failing
+    // commit. Only a marked repair carrying the full original SHA is an alias.
+    let short=red.sha.get(..7).unwrap_or(&red.sha);
+    let prefix=format!("main is red at {short}: ");
+    let identity=format!("`{}`",red.sha);
+    issues.as_array()?.iter().find_map(|issue| {
+        let title=issue.get("title")?.as_str()?;
+        let body=issue.get("body")?.as_str()?;
+        if !title.starts_with(&prefix) || !is_red_main_issue(body) || !body.contains(&identity) {return None;}
+        red_main_issue_lookup(&serde_json::json!([issue]),title)
     })
 }
 
@@ -5442,7 +5456,7 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
         Ok(json)=>json,
         Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
     };
-    let number = match red_main_issue_lookup(&json, &title) {
+    let number = match red_main_repair_lookup(&json, red) {
         Some((n, true)) => {
             return RedMainPlan::Hold(format!(
                 "issue #{n} carries `{GAVE_UP_LABEL}`; a human has to fix main"
@@ -15741,7 +15755,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         };
         assert_eq!(
             red_main_title(&broken),
-            "main is red at abc1234: workspace does not build"
+            "main is red at abc1234: required CI checks failed"
         );
         // Many failures: the title stays one line, the body has the rest.
         let many = RedMain {
