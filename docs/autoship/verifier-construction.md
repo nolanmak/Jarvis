@@ -173,6 +173,17 @@ cross-episode data-only recovery remain required before rollout. The existing
 source-only authority-boundary regression remains red. No production constructor
 conversation or autonomous merge is established by these component tests.
 
+The next checkpoint reproduced and fixed a pending-intent replay bug: changed
+validation inputs could turn the saved proposal into a formatting retry and
+create another native input. It now holds the existing intent. All ten scripted
+driver tests pass. The combined transport/source/initial-budget run has 56 pass,
+one ignore and the one known staging-before-authority failure; the feature is
+therefore not green. The explicit retained-production source probe also passes:
+eight original files, 343,299 serialized source bytes, a 414,111-byte complete
+historical request including its system text, unchanged workflow snapshot and
+zero native calls or workflow writes. This authenticates historical source data,
+not a new constructor proposal, baseline witness or authority approval.
+
 Use a separate amendment-construction module beneath the existing acceptance
 adapter. It is an untrusted producer, not another workflow coordinator. Reuse
 `build_workflow_pinned`, tool-free `codex_review_opts`, the existing protected

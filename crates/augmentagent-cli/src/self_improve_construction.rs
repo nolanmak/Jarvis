@@ -142,9 +142,18 @@ where F:FnMut(constructor_native::Input)->Fut,Fut:std::future::Future<Output=Res
         if let Some(intent)=&intent {
             ensure!(!gap && intent.version==1 && intent.episode==episode.key() && intent.slot==slot
                 && intent.round<TURNS && turns[intent.round as usize].is_some(),initial_repair::Hold::EvidenceUnknown);
+            let turn=turns[intent.round as usize].as_ref().context(initial_repair::Hold::EvidenceUnknown)?;
+            ensure!(intent.input_sha256==turn.input.identity()?
+                && intent.response_sha256.len()==64 && intent.response_sha256.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && matches!(intent.provider.as_str(),"claude"|"codex")
+                && !intent.native_session.trim().is_empty() && intent.native_session.len()<=4096,initial_repair::Hold::EvidenceUnknown);
             let prior=if slot==0 {None}else{Some(intents.last().and_then(Option::as_ref).context(initial_repair::Hold::EvidenceUnknown)?.identity()?)};
             ensure!(intent.prior==prior,initial_repair::Hold::EvidenceUnknown);
-            if slot>0 {ensure!(rejections.last().is_some_and(Option::is_some),initial_repair::Hold::EvidenceUnknown);}
+            if slot>0 {
+                ensure!(rejections.last().is_some_and(Option::is_some)
+                    && intents[slot as usize-1].as_ref().context(initial_repair::Hold::EvidenceUnknown)?.round<intent.round,
+                    initial_repair::Hold::EvidenceUnknown);
+            }
             if let Some(rejected)=&rejected {
                 ensure!(rejected.version==1 && rejected.episode==episode.key() && rejected.slot==slot
                     && rejected.intent_sha256==intent.identity()? && !rejected.detail.trim().is_empty()
@@ -176,6 +185,12 @@ where F:FnMut(constructor_native::Input)->Fut,Fut:std::future::Future<Output=Res
         let response_sha256=digest(reply.text.as_bytes());
         prior=Some(digest(&serde_json::to_vec(&(&turn,&response_sha256,&reply.provider,&reply.native_session))?));
         let output=decode(&reply.text,old,candidate_environment,adjudication);
+        // A pending measurement is not a failed generation. If today's
+        // validation cannot reproduce it, retain its hold before considering
+        // any further constructor input, rather than spending on format repair.
+        if intents.iter().flatten().any(|intent|intent.round==round) {
+            ensure!(matches!(&output,Ok(Output::Proposal(_))),initial_repair::Hold::EvidenceUnknown);
+        }
         let step=match output {
             Ok(Output::NoProposal {..})=>return Err(initial_repair::Hold::Declined.into()),
             Ok(Output::Proposal(draft))=>{
@@ -245,6 +260,9 @@ mod tests {
             context:"Complete protected request; casing warnings are advisory and owner override suppresses them",
             provider:augmentagent_channel_core::ProviderKind::Codex,model}
     }
+    fn authority_epoch(root:&Path,old:&PreparedAcceptance)->String {
+        digest(&serde_json::to_vec(&(old.proposal.contract.source().unwrap(),old.baseline.registration.baseline_head(),environment_id(root).unwrap())).unwrap())
+    }
     struct Script {outputs:Vec<String>,completed:RefCell<BTreeMap<String,(String,String)>>}
     impl Script {
         fn dispatch(&self,input:constructor_native::Input)->std::future::Ready<Result<constructor_native::Reply>> {
@@ -267,7 +285,7 @@ mod tests {
         assert_eq!(first.identity().unwrap(),replay.identity().unwrap());
         assert_eq!(script.completed.borrow().len(),1,"restart regenerated a native request");
         assert!(read::<Measurement>(&guard,&intent_key(episode.key(),1)).unwrap().is_none());
-        assert_eq!(guard.epoch_attempts("verifier-amend-total","unspent-authority-epoch").unwrap(),0);
+        assert_eq!(guard.epoch_attempts("verifier-amend-total",&authority_epoch(root.path(),&old)).unwrap(),0);
         guard.finish().unwrap();
     }
 
@@ -296,7 +314,7 @@ mod tests {
         assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted));
         assert_eq!(script.completed.borrow().len(),6);
         for slot in 0..SLOTS {assert!(read::<Measurement>(&guard,&intent_key(episode.key(),slot)).unwrap().is_none());}
-        assert_eq!(guard.epoch_attempts("verifier-amend-total","unspent-authority-epoch").unwrap(),0);
+        assert_eq!(guard.epoch_attempts("verifier-amend-total",&authority_epoch(root.path(),&old)).unwrap(),0);
         guard.finish().unwrap();
     }
 
@@ -424,4 +442,3 @@ mod tests {
         assert!(decode(&weakened.to_string(),&old,"different-environment",None).is_err());
     }
 }
-
