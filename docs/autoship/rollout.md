@@ -168,6 +168,11 @@ controller rollout. The primary issue frontend replays the original scoped
 decision and checks exhaustion before paid readiness/scoping. Missing custody
 remains an evidence-recovery hold; an older accounting reference is not approval.
 
+[Initial verifier correction feedback](initial-verifier-correction-feedback.md)
+uses authenticated private predecessor evidence for fresh corrections while
+keeping public errors safe. Completed corrections replay before new inspection;
+missing custody holds without another paid correction.
+
 Private progress retains the typed review blocker when a worker wrapper finishes.
 A resume acknowledgement is still intent, and can wait for native retirement or
 another admission guard. If a format correction remains incomplete, inspect the

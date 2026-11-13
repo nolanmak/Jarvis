@@ -57,6 +57,9 @@ pub(super) struct Failure {
     kind: FailureKind,
     pub(super) detail: String,
 }
+impl Failure {
+    pub(super) fn proposal_sha256(&self)->&str {&self.proposal_sha256}
+}
 fn required_prior<'de, D: serde::Deserializer<'de>>(
     decoder: D,
 ) -> std::result::Result<Option<String>, D::Error> {

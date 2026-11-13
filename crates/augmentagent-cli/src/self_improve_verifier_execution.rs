@@ -212,10 +212,7 @@ impl<'a> OriginalExecution<'a> {
             ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow
                 && admitted.plan==plan && admitted.attempt==source && admitted.verifier==receipt.verifier_id,"result belongs to another command");
             let raw_proof=read(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
-            let proof:Quiescence=serde_json::from_str(&raw_proof)?;
-            ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow
-                && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
-                && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"result lacks matching kernel quiescence");
+            require_stored_quiescence(workflow,&raw,&admitted,&raw_proof)?;
             if source!=attempt {
                 let captured=admitted.capture.context("reused command lacks original capture")?.read(&key,&admitted.identity)?.context("reused command output unavailable")?;
                 ensure!(!captured.observation.interrupted && captured.observation.output_complete
@@ -390,33 +387,175 @@ pub(super) fn retained_original_plan_budget_contexts(workflow:&workflow::Workflo
 
 /// Read original data without claiming, replaying, installing or remeasuring.
 pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
-    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
-    ->Result<Vec<PreparedAcceptance>> {
-    let mut cursor=0;let mut prepared=Vec::new();
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<PreparedAcceptance>> {
+    let mut prepared=Vec::new();
+    visit_original_outcomes(root,source,binding,evidence,None,|_,value|{prepared.push(value);Ok(())})?;
+    Ok(prepared)
+}
+fn validate_retained_outcome(plan:&Plan,result:&RecordedResult,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<BaselineResult> {
+    let registration=&result.baseline.registration;
+    ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
+        && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
+    OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
+        &result.plan,&result.attempt,&result.baseline,&result.command_sources)?;
+    registration.baseline_result(&result.baseline.receipts)
+}
+
+fn visit_original_outcomes(root:&Path,source:AcceptanceSource,binding:&crate::autoship_workflow::Binding,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,selected:Option<(&str,&str)>,
+    mut visit:impl FnMut(&str,PreparedAcceptance)->Result<()>)->Result<()> {
+    let mut cursor=0;let mut count=0usize;
     loop {
         let rows=evidence.page("original_verifier_result",cursor)?;
         if rows.is_empty() {break;}
         for row in rows {
-            cursor=row.sequence;
+            cursor=row.sequence;count+=1;ensure!(count<=8192,"original outcome inspection exceeds bound");
             let result:RecordedResult=serde_json::from_str(&row.body)?;
             ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==evidence.workflow()
                 && result_key(&result.plan,&result.attempt)==row.key,"retained original result identity changed");
             let body=evidence.record(&result.plan,"original_verifier_plan")?.context("retained original result lost its plan")?;
             ensure!(amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan identity changed");
             let plan:Plan=serde_json::from_str(&body)?;
-            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty(),"retained original plan owner or role changed");
+            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
+                && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==result.plan,"retained original plan owner or role changed");
+            let classified=if selected.is_some(){Some(validate_retained_outcome(&plan,&result,evidence)?)}else{None};
             if plan.binding!=*binding || plan.proposal.contract.source()?!=source {continue;}
-            let registration=&result.baseline.registration;
-            ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
-                && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
-            registration.verify_source_files(root,&plan.proposal.files)?;
-            OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
-                &result.plan,&result.attempt,&result.baseline,&result.command_sources)?;
-            if registration.baseline_result(&result.baseline.receipts)?!=BaselineResult::Reproduced {continue;}
-            prepared.push(PreparedAcceptance {proposal:plan.proposal,baseline:result.baseline});
+            if let Some((base,proposal_sha256))=selected {
+                if plan.base!=base || amendment::digest(&serde_json::to_vec(&plan.proposal)?)!=proposal_sha256 {continue;}
+            }
+            let classification=match classified {Some(value)=>value,None=>validate_retained_outcome(&plan,&result,evidence)?};
+            result.baseline.registration.verify_source_files(root,&plan.proposal.files)?;
+            if selected.is_none() && classification!=BaselineResult::Reproduced {continue;}
+            visit(&row.key,PreparedAcceptance {proposal:plan.proposal,baseline:result.baseline})?;
         }
     }
-    Ok(prepared)
+    Ok(())
+}
+
+/// Reuse stored kernel proof only; inspection must never quiesce a command.
+fn require_stored_quiescence(workflow:&str,admission:&str,admitted:&Admission,raw:&str)->Result<()> {
+    let proof:Quiescence=serde_json::from_str(raw)?;
+    ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow
+        && proof.admission_sha256==amendment::digest(admission.as_bytes()) && proof.evidence["identity"]==admitted.identity
+        && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),
+        "original command lacks matching stored kernel quiescence");
+    Ok(())
+}
+
+fn require_correction_commands(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    // The typed index alone cannot prove absence: a retained command body can
+    // outlive its index. Cross-check the same bounded scope union as accounting.
+    let mut after=String::new();let mut count=0usize;
+    loop {
+        let keys=evidence.scope_keys(&after)?;
+        if keys.is_empty(){break;}
+        for key in keys {
+            count+=1;ensure!(count<=8192 && key>after,"correction evidence discovery exceeds bound");
+            let body=evidence.scope_response(&key)?.context("correction evidence body missing")?;
+            ensure!(body.len()<=2*1024*1024,"correction evidence body exceeds bound");
+            if let Ok(value)=serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(kind)=value["kind"].as_str().filter(|kind|kind.starts_with("original_verifier_")) {
+                    ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|
+                        "original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"),"unknown original evidence role");
+                    ensure!(evidence.record(&key,kind)?.as_deref()==Some(body.as_str()),"original evidence lost its role index");
+                    if kind=="original_verifier_plan" {
+                        let plan:Plan=serde_json::from_str(&body)?;
+                        ensure!(plan.version==1 && plan.kind==kind && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
+                            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key,"original plan discovery identity changed");
+                        plan.proposal.contract.source()?;
+                    }
+                }
+            }
+            after=key;
+        }
+    }
+    let mut cursor=0;let mut count=0usize;let mut interrupted=std::collections::BTreeSet::new();
+    loop {
+        let rows=evidence.page("original_verifier_command_admission",cursor)?;
+        if rows.is_empty(){break;}
+        for row in rows {
+            cursor=row.sequence;count+=1;
+            ensure!(count<=8192 && row.body.len()<=65536,"original admission inspection exceeds bound");
+            let admitted:Admission=serde_json::from_str(&row.body)?;
+            ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==evidence.workflow()
+                && command_key(&admitted.plan,&admitted.attempt,&admitted.verifier)==row.key,"original admission identity changed");
+            let body=evidence.record(&admitted.plan,"original_verifier_plan")?.context("admitted original plan missing")?;
+            let plan:Plan=serde_json::from_str(&body)?;
+            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==evidence.workflow() && !plan.executor.is_empty()
+                && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==admitted.plan
+                && plan.proposal.contract.verifiers.iter().any(|verifier|verifier.id==admitted.verifier),"admitted original plan changed");
+            let proof=evidence.record(&quiet_key(&row.key),"original_verifier_command_quiescent")?.context("admitted original command is not quiescent")?;
+            require_stored_quiescence(evidence.workflow(),&row.body,&admitted,&proof)?;
+            if let Some(raw)=evidence.record(&result_key(&admitted.plan,&admitted.attempt),"original_verifier_result")? {
+                let result:RecordedResult=serde_json::from_str(&raw)?;
+                ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==evidence.workflow()
+                    && result.plan==admitted.plan && result.attempt==admitted.attempt,"original result identity changed");
+                validate_retained_outcome(&plan,&result,evidence)?;
+                if !result.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {
+                    let receipt=result.baseline.receipts.iter().find(|receipt|receipt.verifier_id==admitted.verifier)
+                        .context("original result omitted admitted command")?;
+                    ensure!(result.command_sources.get(&admitted.verifier).map_or(result.attempt.as_str(),String::as_str)==admitted.attempt,
+                        "original result replaced an admitted command");
+                    if let Some(capture)=&admitted.capture {
+                        let captured=capture.read(&row.key,&admitted.identity)?.context("original output missing")?;
+                        ensure!(!captured.observation.interrupted && captured.observation.output_complete
+                            && amendment::digest(format!("{}\n{}",captured.observation.stdout,captured.observation.stderr).as_bytes())==receipt.output_digest,
+                            "original output differs from complete receipt");
+                    }
+                    continue;
+                }
+            }
+            // Only an existing authenticated interrupted-attempt disposition
+            // settles an unrelated incomplete attempt. It is never selected as
+            // the immediate predecessor's conclusive correction result.
+            let disposition_key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-interrupted-v1",&admitted.plan,&admitted.attempt))?);
+            let raw=evidence.record(&disposition_key,"original_verifier_attempt_interrupted")?.context("original command outcome is unsettled")?;
+            let disposition:serde_json::Value=serde_json::from_str(&raw)?;
+            ensure!(disposition["version"]==1 && disposition["kind"]=="original_verifier_attempt_interrupted"
+                && disposition["workflow"]==evidence.workflow() && disposition["plan"]==admitted.plan && disposition["attempt"]==admitted.attempt,
+                "original interruption disposition changed");
+            let commands=disposition["commands"].as_array().context("original interruption command references missing")?;
+            ensure!(!commands.is_empty() && commands.len()<=8192,"original interruption reference bound exceeded");
+            let captured=admitted.capture.as_ref().context("unsettled original command has no capture")?
+                .read(&row.key,&admitted.identity)?.context("unsettled original output missing")?;
+            ensure!(commands.iter().any(|command|command["command"]==row.key && command["manifest_sha256"]==captured.manifest_sha256),
+                "original interruption omitted captured command");
+            if interrupted.insert(disposition_key) {
+                let mut seen=std::collections::BTreeSet::new();let mut has_interruption=false;
+                for reference in commands {
+                    let key=reference["command"].as_str().context("interrupted command identity missing")?;
+                    ensure!(seen.insert(key),"duplicate interrupted command");
+                    let body=evidence.record(key,"original_verifier_command_admission")?.context("interrupted admission missing")?;
+                    let command:Admission=serde_json::from_str(&body)?;
+                    ensure!(command.version==1 && command.kind=="original_verifier_command_admission" && command.workflow==evidence.workflow()
+                        && command.plan==admitted.plan && command.attempt==admitted.attempt
+                        && command_key(&command.plan,&command.attempt,&command.verifier)==key,"interrupted command changed");
+                    let captured=command.capture.as_ref().context("interrupted capture missing")?.read(key,&command.identity)?.context("interrupted output missing")?;
+                    ensure!(reference["manifest_sha256"]==captured.manifest_sha256,"interrupted manifest changed");
+                    has_interruption|=captured.observation.interrupted || !captured.observation.output_complete;
+                }
+                ensure!(has_interruption,"interrupted disposition contains no interrupted command");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Immediate predecessor data only. No installation, execution or settlement.
+pub(super) fn initial_correction_outcome(root:&Path,source:AcceptanceSource,base:&str,proposal_sha256:&str,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<(String,PreparedAcceptance)> {
+    require_correction_commands(evidence)?;
+    let mut selected:Option<(String,PreparedAcceptance)>=None;let mut keys=std::collections::BTreeSet::new();
+    visit_original_outcomes(root,source,binding,evidence,Some((base,proposal_sha256)),|key,prepared| {
+        ensure!(!prepared.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure),"predecessor result is infrastructure, not correction evidence");
+        let hash=amendment::digest(&serde_json::to_vec(&prepared)?);
+        if let Some((previous,_))=&selected {ensure!(previous==&hash,"predecessor has conflicting original outcomes");}
+        else {selected=Some((hash,prepared));}
+        keys.insert(key.to_owned());Ok(())
+    })?;
+    let (hash,prepared)=selected.context("immediate predecessor original outcome unavailable")?;
+    let identity=amendment::digest(&serde_json::to_vec(&("initial-correction-outcome-v1",evidence.workflow(),source,base,proposal_sha256,keys,hash))?);
+    Ok((identity,prepared))
 }
 
 /// Execute only the protected original recipe. Qualification and correction
@@ -480,6 +619,108 @@ mod tests {
         serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
             "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{"memory.max":67108864}})
+    }
+
+    #[tokio::test]
+    async fn initial_correction_refuses_another_unsettled_original_command() {
+        for fault in ["quiescence","result","index"] {
+        let (root,control,prepared,guard)=fixture().await;
+        retain_scripted_original_data(root.path(),control.path(),&prepared,&guard).unwrap();
+        let base=prepared.baseline.registration.baseline_head();
+        let digest=amendment::digest(&serde_json::to_vec(&prepared.proposal).unwrap());
+        let next=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,
+            &environment_id(root.path()).unwrap(),"another executor").unwrap();
+        next.retain_admission("observe",&gone_scope()).unwrap();
+        if fault=="result" {OriginalExecution::quiesce_previous(&guard).unwrap();}
+        if fault=="index" {
+            let command=command_key(&next.plan,&next.attempt,"observe");
+            let conn=rusqlite::Connection::open(control.path().join("workflow.db")).unwrap();
+            conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2",rusqlite::params![guard.id(),command]).unwrap();
+        }
+        let state=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let before=state.snapshot(guard.id()).unwrap().unwrap();
+        let events=state.events(guard.id()).unwrap();
+        let result=initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,
+            guard.binding(),&state.inspect_verifier_evidence(guard.id()));
+        assert!(result.is_err(),"paid correction could bypass another admitted original command: {fault}");
+        assert_eq!(state.snapshot(guard.id()).unwrap().unwrap(),before);
+        assert_eq!(state.events(guard.id()).unwrap(),events);
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_correction_refuses_orphan_plan_and_unrelated_result_with_missing_custody() {
+        for fault in ["orphan_plan","unrelated_result"] {
+            let (root,control,prepared,guard)=fixture().await;
+            retain_scripted_original_data(root.path(),control.path(),&prepared,&guard).unwrap();
+            let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+            let (_,body)=plan_input(&guard,&prepared.proposal,base,&environment,"orphan executor").unwrap();
+            let mut plan:Plan=serde_json::from_str(&body).unwrap();plan.binding.head="f".repeat(40);
+            let body=serde_json::to_string(&plan).unwrap();
+            let key=if fault=="orphan_plan" {"f".repeat(64)}else {amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body)).unwrap())};
+            guard.record_verifier_evidence(&key,"original_verifier_plan",&body).unwrap();
+            if fault=="unrelated_result" {
+                let result=RecordedResult {version:1,kind:"original_verifier_result".into(),workflow:guard.id().into(),
+                    plan:key.clone(),attempt:"d".repeat(64),baseline:prepared.baseline.clone(),command_sources:BTreeMap::new()};
+                guard.record_verifier_evidence(&result_key(&key,&result.attempt),"original_verifier_result",&serde_json::to_string(&result).unwrap()).unwrap();
+            }
+            let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+            let digest=amendment::digest(&serde_json::to_vec(&prepared.proposal).unwrap());
+            assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,guard.binding(),&store.inspect_verifier_evidence(guard.id())).is_err(),
+                "paid correction ignored malformed/unaccounted unrelated evidence: {fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_correction_selects_exact_predecessor_before_checking_adapter_paths() {
+        let (root,control,prepared,guard)=fixture().await;
+        retain_scripted_original_data(root.path(),control.path(),&prepared,&guard).unwrap();
+        let base=prepared.baseline.registration.baseline_head();
+        let mut other=prepared.proposal.clone();other.files.values_mut().next().unwrap().push_str("# other proposal\n");
+        std::fs::remove_file(root.path().join(prepared.proposal.files.keys().next().unwrap())).unwrap();
+        install_harness(root.path(),&other).unwrap();
+        let registration=RegisteredContract::register(root.path(),other.contract.clone(),base.into(),environment_id(root.path()).unwrap()).unwrap();
+        let receipt=registration.observe(root.path(),"observe",registration.binding(base).unwrap(),
+            &Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true}).unwrap();
+        let other=PreparedAcceptance {proposal:other,baseline:BaselineEvidence {registration,receipts:vec![receipt]}};
+        retain_scripted_original_data(root.path(),control.path(),&other,&guard).unwrap();
+        std::fs::remove_file(root.path().join(prepared.proposal.files.keys().next().unwrap())).unwrap();
+        install_harness(root.path(),&prepared.proposal).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let evidence=store.inspect_verifier_evidence(guard.id());let binding=guard.binding();
+        let digest=amendment::digest(&serde_json::to_vec(&prepared.proposal).unwrap());
+        let (_,loaded)=initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,binding,&evidence).unwrap();
+        assert!(initial_correction_evidence(root.path(),control.path(),AcceptanceSource::PullRequest(840),base,&digest,binding,&[],&evidence).is_err(),
+            "raw reproduced predecessor without a negative witness became setup feedback");
+        assert_eq!(serde_json::to_value(loaded).unwrap(),serde_json::to_value(&prepared).unwrap());
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(841),base,&digest,binding,&evidence).is_err());
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),&"f".repeat(40),&digest,binding,&evidence).is_err());
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&"f".repeat(64),binding,&evidence).is_err());
+        let mut foreign=binding.clone();foreign.head="f".repeat(40);
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,&foreign,&evidence).is_err());
+        let adapter=root.path().join(prepared.proposal.files.keys().next().unwrap());
+        std::fs::remove_file(&adapter).unwrap();
+        initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,binding,&evidence).unwrap();
+        assert!(!adapter.exists(),"read-only predecessor selection installed an adapter");
+        std::fs::write(adapter,"changed source").unwrap();
+        assert!(initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,binding,&evidence).is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_correction_accepts_complete_setup_failure_without_semantic_diagnosis() {
+        let (root,control,mut prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head().to_owned();
+        prepared.baseline.receipts=vec![prepared.baseline.registration.observe(root.path(),"observe",prepared.baseline.registration.binding(&base).unwrap(),
+            &Observation {exit_code:Some(1),stdout:String::new(),stderr:"fixture syntax error".into(),interrupted:false,output_complete:true}).unwrap()];
+        assert!(matches!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts).unwrap(),BaselineResult::NotReproduced(_)));
+        retain_scripted_original_data(root.path(),control.path(),&prepared,&guard).unwrap();
+        let digest=amendment::digest(&serde_json::to_vec(&prepared.proposal).unwrap());
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let data=initial_correction_evidence(root.path(),control.path(),AcceptanceSource::PullRequest(840),&base,&digest,
+            guard.binding(),&[],&store.inspect_verifier_evidence(guard.id())).unwrap();
+        assert!(data["negative_witness"].is_null());
+        assert_eq!(data["previous_proposal"],serde_json::to_value(prepared.proposal).unwrap());
+        assert_eq!(data["previous_baseline"],serde_json::to_value(prepared.baseline).unwrap());
     }
 
     #[tokio::test]

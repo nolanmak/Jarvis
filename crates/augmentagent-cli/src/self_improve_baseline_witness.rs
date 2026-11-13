@@ -436,7 +436,7 @@ mod tests {
             let result=initial_repair::run(&"7".repeat(64),|key|guard.scope_stage_response(key),|key,raw|guard.record_scope_stage_response(key,raw),
                 |slot,_,previous|async move {
                     if slot==0 {return Ok(p.proposal.clone());}
-                    let request=initial_correction_request(r,source,base,"original owner request",&["Readiness becomes true".into()],g,&previous.unwrap())?;
+                    let request=initial_correction_request(r,source,base,"original owner request",&["Readiness becomes true".into()],g,&previous.unwrap()).await?;
                     assert!(request.contains(reason),"actual initial correction request omitted its authenticated private diagnosis");
                     Err(anyhow::anyhow!("fixture correction request captured"))
                 },
