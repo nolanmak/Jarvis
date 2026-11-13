@@ -57,6 +57,27 @@ fn result_key(plan:&str,attempt:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",plan,attempt)).unwrap())
 }
 
+#[derive(Debug,Serialize)]
+pub(super) struct CapturedCommandData {
+    pub(super) exit_code:Option<i32>,pub(super) stdout:String,pub(super) stderr:String,
+    pub(super) interrupted:bool,pub(super) output_complete:bool,
+}
+#[derive(Serialize)]
+pub(super) struct OriginalResultData {
+    pub(super) identity:String,
+    pub(super) binding:crate::autoship_workflow::Binding,
+    pub(super) prepared:PreparedAcceptance,
+    pub(super) commands:BTreeMap<String,CapturedCommandData>,
+}
+pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
+    let body=evidence.record(plan_key,"original_verifier_plan")?.context("original plan missing")?;
+    let plan=Plan::checked(evidence.workflow(),plan_key,&body)?;
+    let raw=evidence.record(result,"original_verifier_result")?.context("original result missing")?;
+    let record:RecordedResult=serde_json::from_str(&raw)?;
+    Ok(OriginalResultData {identity:amendment::digest(raw.as_bytes()),binding:plan.binding,
+        prepared:PreparedAcceptance {proposal:plan.proposal,baseline:record.baseline},commands:BTreeMap::new()})
+}
+
 pub(super) fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
     let plan=Plan {version:1,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding:workflow.binding().clone(),
         base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone()};
@@ -799,6 +820,9 @@ mod tests {
     }
 
     fn captured_verifier_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool)->PathBuf {
+        captured_output_fixture(original,verifier,identity,interrupted,b"false\n",b"",0)
+    }
+    fn captured_output_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool,stdout:&[u8],stderr:&[u8],exit:i32)->PathBuf {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let capture=original.prepare_capture(verifier).unwrap();
@@ -807,12 +831,34 @@ mod tests {
             let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(capture.path().join(name)).unwrap();
             file.write_all(bytes).unwrap();file.sync_all().unwrap();
         };
-        write("stdout",b"false\n");write("stderr",b"");
+        write("stdout",stdout);write("stderr",stderr);
         write("result.json",serde_json::json!({"version":1,"command":command_key(&original.plan,&original.attempt,verifier),
-            "identity":identity,"exit_code":if interrupted {None}else{Some(0)},"interrupted":interrupted,"output_complete":true,
+            "identity":identity,"exit_code":if interrupted {None}else{Some(exit)},"interrupted":interrupted,"output_complete":true,
             "terminal_cause":if interrupted {"controller_stopped"}else{"completed"},
-            "stdout_bytes":6,"stderr_bytes":0,"stdout_sha256":amendment::digest(b"false\n"),"stderr_sha256":amendment::digest(b"")}).to_string().as_bytes());
+            "stdout_bytes":stdout.len(),"stderr_bytes":stderr.len(),"stdout_sha256":amendment::digest(stdout),"stderr_sha256":amendment::digest(stderr)}).to_string().as_bytes());
         capture.path().to_owned()
+    }
+
+    #[tokio::test]
+    async fn exact_original_feedback_retains_complete_supervised_output_without_reexecution() {
+        let (root,control,mut prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment_id(root.path()).unwrap(),"feedback executor").unwrap();
+        let stdout="setup stdout\n";
+        let stderr=format!("{}END OF EXACT DIAGNOSIS 🦀\n","error[E0599]: missing original API; quoted \\\"untrusted\\\" detail\n".repeat(1200));
+        captured_output_fixture(&original,"observe",&gone_scope(),false,stdout.as_bytes(),stderr.as_bytes(),1);
+        OriginalExecution::quiesce_previous(&guard).unwrap();
+        prepared.baseline.receipts=vec![prepared.baseline.registration.observe(root.path(),"observe",prepared.baseline.registration.binding(base).unwrap(),
+            &Observation {exit_code:Some(1),stdout:stdout.into(),stderr:stderr.clone(),interrupted:false,output_complete:true}).unwrap()];
+        original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+        let data=exact_original_result(&original.plan,&result_key(&original.plan,&original.attempt),&store.inspect_verifier_evidence(guard.id())).unwrap();
+        let command=data.commands.get("observe").expect("metadata-only feedback omitted supervised stdout/stderr");
+        assert_eq!(command.stdout,stdout);assert_eq!(command.stderr,stderr);assert_eq!(command.exit_code,Some(1));
+        assert!(command.output_complete && !command.interrupted);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+        drop(store);drop(original);guard.finish().unwrap();
     }
 
     #[tokio::test]
