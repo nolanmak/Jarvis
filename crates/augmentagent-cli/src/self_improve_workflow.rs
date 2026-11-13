@@ -2255,6 +2255,23 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn constructor_native_admission_requires_literal_text_grant_not_only_fresh_review() {
+        use augmentagent_channel_core::{native_session,ProviderKind};
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(2058),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
+        let purpose=format!("verifier-construction-native-v1:{}:{}","a".repeat(64),"b".repeat(64));
+        let outcome=guard.bounded_native_calls(purpose,1,native_session::fresh_review_scope(ProviderKind::Codex,async {
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),
+                "fresh-review marker admitted constructor work without a literal text grant");
+            anyhow::bail!("no native conversation should be started")
+        })).await;
+        let _:Result<((),String)>=outcome;
+        let store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),0);
+        drop(store);drop(guard);
+    }
+    #[tokio::test]
     async fn constructor_response_pair_without_private_proof_cannot_authorize_native_admission() {
         let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
         let guard=WorkflowGuard::acquire_at(&path,Start {
