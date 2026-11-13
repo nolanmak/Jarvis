@@ -143,6 +143,16 @@ pub(super) fn require_retained(root:&Path,repository:&str,workflow:&str,observat
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn constructor_completed_output_is_durable_before_response_index_publication() {
+        let (root,control,input,observation)=fixture();
+        // The fixture deliberately has no response-index database. Completion
+        // must retain the original raw bytes independently before publication.
+        let path=control.path().join(format!("constructor-response-{}.txt",hash(observation.response.as_bytes())));
+        assert_eq!(std::fs::read(path).ok().as_deref(),Some(observation.response.as_bytes()),
+            "completed native output disappears if response-index publication fails");
+        validate_observation(root.path(),control.path(),&input.workflow,&observation).unwrap();
+    }
     fn fixture()->(tempfile::TempDir,tempfile::TempDir,Input,crate::autoship_workflow::NativeScopeCustody) {
         let root=tempfile::tempdir().unwrap();
         let control=tempfile::Builder::new().prefix("constructor-private-").tempdir_in("/tmp").unwrap();
