@@ -213,10 +213,10 @@ initial eligibility therefore preserved the label but could report `Ok(())`.
 Retain that late typed error just like final terminal/open failures, continue
 healthy peers and return the retained degradation. This changes final-boundary
 reporting, not owner intent or the initial pause-query failure policy. The
-regression must corrupt only a disposable owner-control row during the actual
-GitHub proof reread, assert the typed result and healthy peer completion, and
-preserve the blocked workflow's snapshot, events, charges, corrupt row, label and
-absence of a pending receipt. The new regression failed on the intended false-
+regression corrupts only a disposable owner-control row during the current-issue
+read, after both timeline proof reads, and asserts the typed result and healthy
+peer completion. It also asserts preservation of the blocked workflow's snapshot,
+events, charges, corrupt row, label and absence of a pending receipt. The new regression failed on the intended false-
 success assertion before the fix (0.30 seconds). After the fix, the focused group
 passes 23 tests (2.85 seconds), and the complete managed CLI passes 2,061
 tests, zero failures and 41 existing opt-in ignores (320.63 seconds). All
