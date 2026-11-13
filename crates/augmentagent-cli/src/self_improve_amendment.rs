@@ -379,10 +379,10 @@ fn initial_authority_request(prompt:&str)->Result<String> {
     Ok(request)
 }
 
-async fn authority(
-    builder:&FallbackReasoner,workflow:&workflow::WorkflowGuard,root:&Path,context:&str,input_context:&str,epoch:&str,
-    staged:&construction::StagedCorrection,episode:&ConstructionEpisode,
-)->Result<(Decision,String,String,String)> {
+async fn authority<'a>(
+    builder:&FallbackReasoner,workflow:&workflow::WorkflowGuard,root:&'a Path,context:&str,input_context:&str,epoch:&str,
+    staged:&'a construction::StagedCorrection,episode:&'a ConstructionEpisode,
+)->Result<(Decision,String,String,String,Option<adjudication::ApprovedOriginal<'a>>)> {
     workflow.require_fresh_issue(root).await?;
     let head=actual_head(root).await?;
     let origin=adoption::origin_for_candidate(root,Some(workflow)).await?;origin.validate(&head)?;
@@ -661,7 +661,7 @@ pub(super) async fn try_amend(
         "original_base":original_base,"canonical_main":canonical_main,"contribution_base":scope_base,"candidate_head":head,
         "contribution_diff_sha256":digest(diff.as_bytes()),"shipping_authority":false,"source_evidence_sha256":source_sha256,
         "request_bytes":prompt.len(),"construction_protocol":"staged-verifier-adjudication-v1"}))?;
-    let (decision,native_provider,native_session,review_input)=authority(builder,workflow,root,&prompt,&input_hash,&epoch,&staged,&episode).await?;
+    let (decision,native_provider,native_session,review_input,approved_original)=authority(builder,workflow,root,&prompt,&input_hash,&epoch,&staged,&episode).await?;
     staged.validate_decision(&decision)?;
     let input_hash=review_input;
     immutable(control,&format!("{}-amendment-context-{input_hash}.json",source.key()),
@@ -731,7 +731,7 @@ pub(super) async fn try_amend(
     let reproduce = async {
         let baseline=observe_approved_original(&baseline_root,&proposal,base,
             &environments.current_original_baseline,&candidate_environment,
-            decision.approve_environment_transition,workflow).await?;
+            approved_original.as_ref().context(initial_repair::Hold::EvidenceUnknown)?,workflow).await?;
         ensure!(
             baseline.registration.baseline_result(&baseline.receipts)? == BaselineResult::Reproduced,
             "amended verifier failed intended-red baseline: {}",
@@ -801,16 +801,9 @@ pub(super) async fn try_amend(
 /// existing behavior while its missing authorized OriginalExecution custody is
 /// reproduced by the isolated regression. Authority validation stays upstream.
 async fn observe_approved_original(root:&Path,proposal:&ContractProposal,base:&str,
-    expected_original_environment:&str,candidate_environment:&str,transition:bool,
+    expected_original_environment:&str,candidate_environment:&str,approved:&adjudication::ApprovedOriginal<'_>,
     workflow:&workflow::WorkflowGuard)->Result<BaselineEvidence> {
-    install_harness(root,proposal)?;
-    let environment=environment_id(root)?;
-    ensure!(environment==expected_original_environment,"runner environment changed during independent amendment");
-    let registration=if transition {
-        RegisteredContract::register_transition(root,proposal.contract.clone(),base.into(),environment,candidate_environment.into())?
-    }else {
-        RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment)?
-    };
+    let registration=approved.registration(root,proposal,base,expected_original_environment,candidate_environment,workflow).await?;
     let receipts=execute_registered(root,&registration,&workflow.audit_logger()).await?;
     Ok(BaselineEvidence {registration,receipts})
 }

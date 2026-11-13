@@ -807,3 +807,40 @@ new full-suite pass, deployment, real-provider adjudication or autonomous shipme
 is claimed by this test-first checkpoint. Production code still follows the same
 legacy observation path through the extracted helper until the complete approved
 capability/identity/ownership/recovery implementation above replaces it.
+
+
+## Live approved-registration capability — implementation in progress
+
+The authority service now records which exact native dispatch returned the final
+validated decision and can return an opaque `ApprovedOriginal` borrowing the live
+qualified stage. Completed legacy v1 data may still replay but cannot fabricate
+this v2-native capability. The actual post-authority observation helper now takes
+this capability rather than a caller-supplied transition boolean. Before installing
+an adapter or registering a command, it rechecks the current binding, live stage,
+retained native intent/result/provenance, literal original commit, exact proposal
+and both measured environments. This is only the review-authority leg; it never
+overrides source, owner, lease, budget or candidate-GREEN admission.
+
+Its serializable reference authenticates retained review provenance only. Original
+plan/result and constructor-measurement ownership still require their existing
+separate validators. Deserializing that reference does not construct the live
+capability. The reference exposes a semantic authorization identity excluding
+routing binding and transient original-plan/publication references. The future
+approved-phase writer must freeze its first metadata body and reuse only an
+identical authorized registration/executor phase, rather than letting metadata
+movement manufacture another original command. Historical ownership must not be
+mistaken for a fresh dispatch grant.
+
+The producer-policy hash includes this new service source. It changes no semantic
+review key or counter; completed decisions replay, while unadmitted old-policy
+requests retain their existing hold until the required setup-only migration exists.
+The isolated custody regression also rejects an unreviewed proposal/environment
+before the valid approved command. The capability source compiled successfully (1 minute 37 seconds). Focused
+amendment checks pass 61 tests, zero failures and five existing explicit isolation
+ignores (91.49 seconds). The updated delegated regression then verified the valid
+native-backed capability and rejection of an unreviewed proposal/environment
+before reaching the same intended missing-custody assertion (176.28 seconds).
+These results still leave `execute_registered` without distinct approved
+OriginalExecution custody. The complete versioned plan/capture/ownership/recovery
+implementation must replace that call to turn the actual custody RED green. No activation,
+engineering PR, new full-suite result or full #2058 completion is claimed.

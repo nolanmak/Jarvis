@@ -43,6 +43,8 @@ pub(in crate::self_improve::acceptance::amendment) struct StagedCorrection {
     prepared:PreparedAcceptance,
 }
 impl StagedCorrection {
+    pub(in crate::self_improve::acceptance::amendment) fn original_references(&self)->(&str,&str) {(&self.original_plan,&self.original_result)}
+    pub(in crate::self_improve::acceptance::amendment) fn candidate_environment(&self)->&str {&self.candidate_environment}
     pub(in crate::self_improve::acceptance::amendment) fn prepared(&self)->&PreparedAcceptance {&self.prepared}
     pub(in crate::self_improve::acceptance::amendment) fn constructor_session(&self)->(&str,&str) {(&self.measurement.provider,&self.measurement.native_session)}
     pub(in crate::self_improve::acceptance::amendment) async fn require_current(&self,root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode)->Result<()> {
@@ -321,9 +323,19 @@ pub(super) mod tests {
         staged.validate_decision(&reviewed.0)?;
         ensure!(reviewed.0.approved && reviewed.0.approve_environment_transition,"fixture lacks the exact approved mode");
         let candidate_environment=environment_id(root.path())?;
+        let capability=reviewed.4.as_ref().context("native authority did not return a live approved capability")?;
+        let mut rewritten=measurement.proposal().clone();rewritten.contract.revision+=1;
+        ensure!(super::super::super::observe_approved_original(&staged.original,&rewritten,
+            episode.original_base(),episode.original_environment(),&candidate_environment,capability,&guard).await.is_err(),
+            "approved capability accepted a proposal the authority did not review");
+        ensure!(super::super::super::observe_approved_original(&staged.original,measurement.proposal(),
+            episode.original_base(),episode.original_environment(),"unreviewed candidate environment",capability,&guard).await.is_err(),
+            "approved capability accepted another candidate environment");
+        ensure!(guard.verifier_evidence_page("original_verifier_command_admission",0)?.len()==1,
+            "rejected approved-registration inputs dispatched a command");
         let baseline=super::super::super::observe_approved_original(&staged.original,measurement.proposal(),
             episode.original_base(),episode.original_environment(),&candidate_environment,
-            reviewed.0.approve_environment_transition,&guard).await?;
+            capability,&guard).await?;
         ensure!(baseline.registration.has_environment_transition(),"approved registration lost the transition mode");
         ensure!(baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"actual approved original did not reproduce intended red");
         let plans=guard.verifier_evidence_page("original_verifier_plan",0)?;
