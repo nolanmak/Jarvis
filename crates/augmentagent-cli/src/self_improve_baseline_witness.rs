@@ -394,6 +394,66 @@ mod tests {
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
     }
 
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn initial_correction_receives_authenticated_private_witness_diagnosis() {
+        const CHILD:&str="AUTOSHIP_INITIAL_PRIVATE_FEEDBACK_FIXTURE";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            let (root,control,prepared)=fixture();let state=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&state,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
+            let native_control=control_directories(guard.repository(),guard.id()).unwrap().workflow_acceptance;
+            std::fs::create_dir_all(&native_control).unwrap();std::fs::set_permissions(&native_control,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
+            let reason="PRIVATE_FIXTURE_DIAGNOSIS: selected excerpts stop before original production READY implementation";
+            let raw=serde_json::json!({"version":1,"context":expected,"verifiers":[{"verifier_id":"observe","criterion_ids":["READY"],
+                "measurement":"unknown","original_fixture_available":true,"concrete_input":"fixed readiness fixture","reason":reason,"production_citations":[]}]}).to_string();
+            let input="a".repeat(64);let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),
+                "provider":"codex","native_session":"scripted-private-feedback","supplied_request_hash":amendment::digest(b"scripted selected original source"),
+                "response_hash":amendment::digest(raw.as_bytes()),"purpose":"baseline_witness","scope_context_hash":expected,"native_input_hash":input,
+                "scope_request_hash":amendment::digest(qualification_prompt(&expected,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let artifact=native_control.join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact,artifact_sha256:amendment::digest(&bytes)}).unwrap();
+            let purpose=format!("{}{}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,input);
+            guard.bounded_native_calls(purpose.clone(),1,augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    let session=augmentagent_channel_core::native_session::current_for(augmentagent_channel_core::ProviderKind::Codex)?.unwrap();
+                    let mut native=session.begin(augmentagent_channel_core::ProviderKind::Codex)?;let receipt=guard.audit_logger().model_call_admitted("codex")?;
+                    native.observe("scripted-private-feedback")?;native.finish()?;Ok::<_,anyhow::Error>(receipt)
+                })).await.unwrap();
+            let (reply,proof)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();guard.record_scope_stage_response_pair(&reply,&raw,&proof,&provenance).unwrap();
+            verifier_execution::retain_scripted_original_data(root.path(),&native_control,&prepared,&guard).unwrap();
+            let custody=guard.baseline_native_custody().unwrap();
+            assert!(retained_semantic_diagnosis_in(root.path(),&native_control,&prepared,&custody).unwrap().unwrap().1.contains(reason),"fixture did not establish authenticated diagnosis");
+            let original=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
+            assert!(!format!("{original:#}").contains(reason),"private diagnosis leaked through public failure");
+            let before=crate::autoship_workflow::WorkflowStore::open(&state).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let source=AcceptanceSource::PullRequest(840);let base=prepared.baseline.registration.baseline_head();
+            let (r,c,p,g)=(root.path(),control.path(),&prepared,&guard);
+            let result=initial_repair::run(&"7".repeat(64),|key|guard.scope_stage_response(key),|key,raw|guard.record_scope_stage_response(key,raw),
+                |slot,_,previous|async move {
+                    if slot==0 {return Ok(p.proposal.clone());}
+                    let request=initial_correction_request(r,source,base,"original owner request",&["Readiness becomes true".into()],g,&previous.unwrap()).await?;
+                    assert!(request.contains(reason),"actual initial correction request omitted its authenticated private diagnosis");
+                    Err(anyhow::anyhow!("fixture correction request captured"))
+                },
+                |_|async move {qualify(r,c,p,g).await?;Ok(p.baseline.clone())}).await;
+            assert!(result.unwrap_err().to_string().contains("fixture correction request captured"));
+            let after=crate::autoship_workflow::WorkflowStore::open(&state).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);
+            assert!(guard.bind_acceptance(&prepared,control.path()).is_err(),"negative diagnosis granted implementation authority");
+            guard.finish().unwrap();return;
+        }
+        let scripts=tempfile::tempdir_in("/tmp").unwrap();
+        let output=tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::initial_correction_receives_authenticated_private_witness_diagnosis","--nocapture"])
+            .env(CHILD,"1").env("XDG_STATE_HOME",scripts.path().join("state")).env("AUGMENTAGENT_RUN_RESOURCES","1").output().await.unwrap();
+        assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+
     #[tokio::test]
     async fn retained_unknown_reenters_existing_repair_without_requerying_witness() {
         const CHILD:&str="AUTOSHIP_RETAINED_UNKNOWN_CALLER_FIXTURE";

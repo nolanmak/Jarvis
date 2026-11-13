@@ -363,6 +363,15 @@ fn read_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<S
     Ok(value)
 }
 
+fn read_scope_response_keys(conn:&Connection,workflow:&str,after:&str)->Result<Vec<String>> {
+    let invalid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[workflow],|row|row.get(0))?;
+    if invalid {return Err(MissingScopeResponse.into());}
+    let keys={let mut statement=conn.prepare("SELECT key FROM (SELECT key FROM scope_stage_response WHERE workflow=?1 UNION SELECT json_extract(payload,'$.key') AS key FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded') WHERE key>?2 ORDER BY key LIMIT 16")?;
+        let rows=statement.query_map(params![workflow,after],|row|row.get::<_,String>(0))?;rows.collect::<rusqlite::Result<Vec<_>>>()?};
+    if keys.iter().any(|key|key.len()!=64 || !key.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {return Err(MissingScopeResponse.into());}
+    Ok(keys)
+}
+
 struct CustodyHold<'a> {physical:bool,plan:Option<&'a str>,semantic_source:Option<&'a str>}
 
 impl WorkflowStore {
@@ -420,11 +429,7 @@ impl WorkflowStore {
     /// their absence as permission to create a fresh verifier budget.
     pub(crate) fn scope_stage_response_keys(&mut self,lease:&Lease,binding:&Binding,after:&str,now:i64)->Result<Vec<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
-        let invalid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[&lease.workflow],|row|row.get(0))?;
-        if invalid {return Err(MissingScopeResponse.into());}
-        let keys={let mut statement=tx.prepare("SELECT key FROM (SELECT key FROM scope_stage_response WHERE workflow=?1 UNION SELECT json_extract(payload,'$.key') AS key FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded') WHERE key>?2 ORDER BY key LIMIT 16")?;
-            let rows=statement.query_map(params![lease.workflow,after],|row|row.get::<_,String>(0))?;rows.collect::<rusqlite::Result<Vec<_>>>()?};
-        if keys.iter().any(|key|key.len()!=64 || !key.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {return Err(MissingScopeResponse.into());}
+        let keys=read_scope_response_keys(&tx,&lease.workflow,after)?;
         tx.commit()?;Ok(keys)
     }
 
