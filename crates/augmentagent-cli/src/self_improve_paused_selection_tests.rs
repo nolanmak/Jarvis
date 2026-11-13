@@ -8,7 +8,8 @@ const REPOSITORY:&str="fixture-owner/repo";
 
 async fn exercise(case:&str,test:&str) {
     if std::env::var_os(CHILD).is_some() {child(case).await;return;}
-    for route in ["primary","configured"] {
+    let routes:&[&str]=if case=="race" {&["primary"]}else{&["primary","configured"]};
+    for &route in routes {
         let root=tempfile::tempdir_in("/tmp").unwrap();
         let gh=root.path().join("github.py");
         std::fs::write(&gh,r#"#!/usr/bin/python3
@@ -150,7 +151,7 @@ async fn all_paused_issues_are_idle_without_mutating_their_history() {exercise("
 #[tokio::test]
 async fn supported_owner_resume_restores_fresh_eligibility() {exercise("resume","supported_owner_resume_restores_fresh_eligibility").await;}
 #[tokio::test]
-async fn pause_after_selection_still_fences_actual_workflow_claim() {exercise("race","pause_after_selection_still_fences_actual_workflow_claim").await;}
+async fn primary_pause_after_selection_still_fences_actual_workflow_claim() {exercise("race","primary_pause_after_selection_still_fences_actual_workflow_claim").await;}
 #[tokio::test]
 async fn absent_control_state_allows_new_issue_without_initializing_state() {exercise("missing","absent_control_state_allows_new_issue_without_initializing_state").await;}
 #[tokio::test]

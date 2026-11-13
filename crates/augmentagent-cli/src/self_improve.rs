@@ -14896,9 +14896,10 @@ CODEX-REVIEW: lgtm").0);
         let resume_first = body
             .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
             .expect("the resume-first block yields a reserved slot");
-        let pick = body.find("match pick_issue(repo_root, dry_run).await?").expect("the picker");
+        let pick = body.find("match pick_issue(repo_root, dry_run).await {").expect("the picker");
         assert!(resume_first < pick, "resume-first still precedes the picker");
         let none_arm = &body[pick..];
+        let none_arm = &none_arm[none_arm.find("Ok(None) => {").expect("the empty selector result")..];
         let fallback = none_arm.find("if prefer_build {").expect("the reserved-slot fallback");
         let resume = none_arm.find("find_resumable_draft(repo_root, None, dry_run)").expect("fallback resume");
         let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");

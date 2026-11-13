@@ -168,8 +168,11 @@ Both fresh-issue selectors consult that same owner control using the canonical
 repository/issue identity before triage. They skip paused issues and consider
 eligible peers without changing pauses, candidates, history or resource charges.
 An all-paused inventory is idle; a supported owner resume restores selection
-eligibility. This free read does not admit execution: the productive claim still
-checks owner controls atomically, including a pause arriving after selection.
+eligibility. This free read does not admit execution: on the primary route, the productive
+claim still checks owner controls atomically, including a pause arriving after
+selection. The legacy configured multi-repository route currently has only the
+selection filter; #2056 owns its missing durable claim/model-admission integration.
+Primary-route claim tests do not prove that configured execution is fenced.
 
 A fresh-selection `owner-control-unavailable` hold means the existing protected
 control state or canonical identity could not be read reliably. It is unpaid;
