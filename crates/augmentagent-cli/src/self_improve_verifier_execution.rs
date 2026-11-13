@@ -347,20 +347,45 @@ impl<'a> OriginalExecution<'a> {
 /// Every retained original plan must have a matching accounting context before
 /// a missing-scope frontend may start fresh work for a different trusted input.
 pub(super) fn retained_original_plan_budget_contexts(workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
-    let mut cursor=0;let mut contexts=std::collections::BTreeSet::new();let mut count=0usize;
+    fn checked(workflow:&str,key:&str,body:&str)->Result<String> {
+        ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
+        let plan:Plan=serde_json::from_str(body)?;
+        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
+            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
+        initial_plan_budget_context(workflow,&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)
+    }
+    let mut cursor=0;let mut contexts=std::collections::BTreeSet::new();let mut indexed=std::collections::BTreeSet::new();let mut count=0usize;
     loop {
         let rows=workflow.verifier_evidence_page("original_verifier_plan",cursor)?;
-        if rows.is_empty() {return Ok(contexts);}
+        if rows.is_empty() {break;}
         for row in rows {
             count+=1;ensure!(count<=8192,"original plan accounting exceeds inspection bound");cursor=row.sequence;
-            ensure!(row.body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
-            let plan:Plan=serde_json::from_str(&row.body)?;
-            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow.id()
-                && !plan.executor.is_empty() && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&row.body))?)==row.key,
-                "original plan accounting identity changed");
-            contexts.insert(initial_plan_budget_context(workflow.id(),&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)?);
+            contexts.insert(checked(workflow.id(),&row.key,&row.body)?);indexed.insert(row.key);
         }
     }
+    // Enumerating only the verifier index would lose a plan when that index
+    // is absent but its original body/scope receipt remain. Cross-check the
+    // bounded ordinary scope-record union before allowing fresh scoping.
+    let mut after=String::new();let mut count=0usize;
+    loop {
+        let keys=workflow.scope_stage_response_keys(&after)?;
+        if keys.is_empty() {break;}
+        ensure!(keys.len()<=16,"scope accounting page exceeds bound");
+        for key in keys {
+            count+=1;ensure!(count<=8192 && key>after,"scope accounting exceeds inspection bound");
+            let body=workflow.recorded_scope_stage_response(&key)?.context("recorded scope body missing")?;
+            ensure!(body.len()<=2*1024*1024,"scope accounting body exceeds bound");
+            if let Ok(value)=serde_json::from_str::<serde_json::Value>(&body) {
+                if value["kind"]=="original_verifier_plan"
+                    && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key {
+                    ensure!(indexed.contains(&key),"original plan lost its verifier index");
+                    contexts.insert(checked(workflow.id(),&key,&body)?);
+                }
+            }
+            after=key;
+        }
+    }
+    Ok(contexts)
 }
 
 /// Read original data without claiming, replaying, installing or remeasuring.
