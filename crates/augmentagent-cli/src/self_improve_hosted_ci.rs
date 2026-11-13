@@ -223,6 +223,20 @@ fn job_diagnostics(log: &str) -> String {
         .collect()
 }
 
+async fn failed_main_diagnostics(root:&Path,gh:&str,repository:&str,head:&str,failures:&[Value])->RedMain {
+    let mut diagnostics=String::from("GitHub Actions on main failed:\n");
+    for failure in failures {
+        diagnostics.push_str(&format!("{} {}\n",failure["name"],failure["url"]));
+        if let Some(job)=failure["job"].as_u64() {
+            if let Ok((true,logs,_))=run(gh,&["api",&format!("repos/{repository}/actions/jobs/{job}/logs")],root).await {
+                diagnostics.push_str(&truncate_tail(&job_diagnostics(&logs),8000));
+            }
+        }
+    }
+    let text=truncate(&diagnostics,24000);
+    RedMain {failing:failing_tests(&text),packages:failing_packages(&text),gate_err:Some(text),sha:head.to_owned()}
+}
+
 /// How auto-ship reads `main` from GitHub's evidence, newest commit first.
 #[derive(Debug, PartialEq)]
 enum MainVerdict {
@@ -316,31 +330,7 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
     }
     match evidence.state.as_str() {
         "failed" if evidence.head == head => {
-            let mut diagnostics = String::from("GitHub Actions on main failed:\n");
-            for failure in &evidence.failures {
-                diagnostics.push_str(&format!("{} {}\n", failure["name"], failure["url"]));
-                if let Some(job) = failure["job"].as_u64() {
-                    if let Ok((true, logs, _)) = run(
-                        &gh_bin(),
-                        &[
-                            "api",
-                            &format!("repos/{repository}/actions/jobs/{job}/logs"),
-                        ],
-                        root,
-                    )
-                    .await
-                    {
-                        diagnostics.push_str(&truncate_tail(&job_diagnostics(&logs), 8000));
-                    }
-                }
-            }
-            let text = truncate(&diagnostics, 24000);
-            Ok(Some(RedMain {
-                failing: failing_tests(&text),
-                packages: failing_packages(&text),
-                gate_err: Some(text),
-                sha: head.to_owned(),
-            }))
+            Ok(Some(failed_main_diagnostics(root,&gh_bin(),&repository,head,&evidence.failures).await))
         }
         _ => bail!("GitHub main CI pending or unavailable: {} {}", evidence.state, evidence.reason),
     }
@@ -349,6 +339,25 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn red_main_publication_retains_failed_step_instead_of_success_or_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();
+        let gh=root.path().join("gh");
+        let audit="node-release\tnpm audit\t2026-11-13T00:53:58Z # npm audit report\nnode-release\tnpm audit\t2026-11-13T00:53:58Z hono <=4.13.15\nnode-release\tnpm audit\t2026-11-13T00:53:58Z Severity: moderate\nnode-release\tnpm audit\t2026-11-13T00:53:58Z https://github.com/advisories/GHSA-4m76-xfj5-7975\nnode-release\tnpm audit\t2026-11-13T00:53:58Z ##[error]Process completed with exit code 1.\n";
+        std::fs::write(root.path().join("failed"),audit).unwrap();
+        std::fs::write(root.path().join("whole"),format!("{}{}{}","2026-11-13T00:53:50Z ok successful node test\n".repeat(200),audit,"2026-11-13T00:54:00Z post cleanup cache saved\n".repeat(200))).unwrap();
+        std::fs::write(&gh,"#!/bin/sh\ncase \"$*\" in\n *--log-failed*) cat failed;;\n *) cat whole;;\nesac\n").unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failures=vec![serde_json::json!({"name":"node-release","job":123,"url":"https://github.com/o/r/actions/runs/1/job/123"})];
+        let red=failed_main_diagnostics(root.path(),gh.to_str().unwrap(),"o/r","abc1234def5678",&failures).await;
+        let body=red_main_body(&red,"");
+        assert!(body.contains("GHSA-4m76-xfj5-7975"),"actual failed audit was lost: {body}");
+        assert!(body.contains("exit code 1") && body.contains("node-release") && body.contains("job/123") && body.contains("abc1234def5678"));
+        assert!(!body.contains("successful node test") && !body.contains("post cleanup"));
+        assert!(!red_main_title(&red).contains("does not build"));
+        assert!(red.gate_err.unwrap().len()<=2500);
+    }
     #[test]
     fn hosted_policy_covers_linux_missing_checks_reruns_and_exact_identity() {
         let result = std::process::Command::new("/usr/bin/python3")
