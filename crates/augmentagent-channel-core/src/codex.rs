@@ -222,6 +222,7 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
+        let literal=crate::native_session::literal_text_request(self.kind,opts,user_message)?;
         if crate::native_session::is_fresh_review() {
             anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
                 "fresh review must use supplied evidence without tools, settings or handoff history");
@@ -230,11 +231,11 @@ impl CodexCliReasoner {
             .map(|session| session.begin(self.kind))
             .transpose()?;
         let native_launch = native_lease.as_ref().map(|lease| lease.launch());
-        let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
+        let router = if literal.is_some() {None} else {crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex)};
         if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
             return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
         }
-        let model = if self.kind == ProviderKind::Codex {
+        let model = if let Some(request)=&literal {request.model.clone()} else if self.kind == ProviderKind::Codex {
             router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
                 .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)))
         } else { model_for(self.kind, tier_of(opts)) };
@@ -244,18 +245,18 @@ impl CodexCliReasoner {
         // The marker lines are stripped from the stdin prompt; codex embeds
         // the images in the request itself, so an image turn survives a
         // claude→codex failover instead of arriving as a dead file path.
-        let extracted = crate::images::extract_image_markers(user_message);
-        let (user_message, image_paths) = if extracted.images.is_empty() {
-            (user_message.to_string(), Vec::new())
+        let (user_message, image_paths) = if let Some(request)=&literal {
+            (request.prompt.clone(),Vec::new())
         } else {
-            (
+            let extracted = crate::images::extract_image_markers(user_message);
+            if extracted.images.is_empty() {(user_message.to_string(),Vec::new())} else {(
                 format!(
                     "{}\n\n[{} image attachment(s) are embedded in this prompt]",
                     extracted.text,
                     extracted.images.len()
                 ),
                 extracted.images,
-            )
+            )}
         };
         let user_message = user_message.as_str();
 
@@ -277,12 +278,12 @@ impl CodexCliReasoner {
             })
         })?;
         bridge.preflight_builds(provider,opts.audit_logger.as_ref()).await?;
-        let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
+        let effective_system = if let Some(request)=&literal {request.system.clone()} else {format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
             declared file, command and integration operations. The tool workspace is {}. \
             Relative tool paths resolve there. Commands accept one executable and its arguments; \
             split compound shell operations into separate calls. Preserve ATTACH output markers \
             verbatim when delivering original files. Use native web tools for declared web operations.",
-            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default())};
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
@@ -1512,8 +1513,10 @@ print(json.dumps(dict(type="item.completed",item=dict(type="agent_message",text=
         let reasoner=CodexCliReasoner {kind:ProviderKind::Codex,bin,gate:crate::cli_gate::CliGate::global(),usage_log:crate::token_usage::UsageLogger::global()};
         let mut options=opts();options.model=Some("explicit-literal-native-model".into());options.cwd=Some(dir.path().into());
         let prompt=format!("Quoted original data\nIMAGE: {}\n",image.display());
-        let (answer,_)=crate::native_session::fresh_review_scope(ProviderKind::Codex,
-            crate::native_session::literal_text_scope(ProviderKind::Codex,options.model.as_deref().unwrap(),&options.system_prompt,&prompt,reasoner.call(&options,&prompt))).await.unwrap();
+        let mut router=crate::model_router::tests::fixture();router["models"]["codex"]["quality"]="cx/router-selected-other-model".into();
+        let router=crate::model_router::parse(&router.to_string()).unwrap();
+        let (answer,_)=crate::model_router::SNAPSHOT.scope(Some(router),crate::native_session::fresh_review_scope(ProviderKind::Codex,
+            crate::native_session::literal_text_scope(ProviderKind::Codex,options.model.as_deref().unwrap(),&options.system_prompt,&prompt,reasoner.call(&options,&prompt)))).await.unwrap();
         assert_eq!(answer,"ok");
         let args:Vec<String>=serde_json::from_str(&std::fs::read_to_string(argv).unwrap()).unwrap();
         assert!(args.windows(2).any(|p|p[0]=="-m" && p[1]=="explicit-literal-native-model"),"adapter replaced the sealed native model: {args:?}");

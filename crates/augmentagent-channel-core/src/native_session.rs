@@ -313,6 +313,32 @@ impl Drop for Lease {
 #[cfg(test)]
 mod fresh_review_tests {
     use super::*;
+    #[tokio::test]
+    async fn literal_text_seal_rejects_changed_payloads_and_capabilities_before_dispatch() {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let baseline=crate::ReasonerOpts::pinned(crate::providers::ModelTier::Quality,"sealed system");
+        let model=baseline.model.clone().unwrap();let reached=AtomicBool::new(false);
+        let error=literal_text_scope(ProviderKind::Codex,&model,&baseline.system_prompt,"sealed prompt",async {
+            reached.store(true,Ordering::SeqCst);Ok(())
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("fresh isolated"));assert!(!reached.load(Ordering::SeqCst));
+        for mutation in ["model","system","prompt","provider","tools","directories","environment","settings","session","handoff","permission","restrict-env"] {
+            let mut options=baseline.clone();let mut prompt="sealed prompt";let mut provider=ProviderKind::Codex;
+            match mutation {
+                "model"=>options.model=Some("other-model".into()),"system"=>options.system_prompt="changed".into(),
+                "prompt"=>prompt="changed","provider"=>provider=ProviderKind::Claude,
+                "tools"=>options.allowed_tools.push("Read".into()),"directories"=>options.add_dirs.push("/tmp".into()),
+                "environment"=>options.env.push(("FIXTURE".into(),"value".into())),"settings"=>options.settings_json=Some("{}".into()),
+                "session"=>options.session_id=Some("old-session".into()),"handoff"=>options.handoff_path=Some("/tmp/old-handoff".into()),
+                "permission"=>options.permission_mode="bypassPermissions".into(),"restrict-env"=>options.restrict_env=true,_=>unreachable!(),
+            }
+            let error=fresh_review_scope(ProviderKind::Codex,literal_text_scope(ProviderKind::Codex,&model,&baseline.system_prompt,"sealed prompt",async {
+                literal_text_request(provider,&options,prompt)?;reached.store(true,Ordering::SeqCst);Ok(())
+            })).await.unwrap_err();
+            assert!(error.to_string().contains("literal native"),"wrong {mutation} refusal: {error:#}");
+            assert!(!reached.load(Ordering::SeqCst),"changed {mutation} reached native dispatch");
+        }
+    }
 
     #[tokio::test]
     async fn fresh_review_overrides_builder_and_cannot_resume_even_on_retry() {

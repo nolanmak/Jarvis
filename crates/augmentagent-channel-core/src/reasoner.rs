@@ -1205,6 +1205,7 @@ impl ClaudeCliReasoner {
         clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
         let fresh_review = crate::native_session::is_fresh_review();
+        let literal=crate::native_session::literal_text_request(crate::providers::ProviderKind::Claude,opts,user_message)?;
         if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
             return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
         }
@@ -1273,8 +1274,8 @@ impl ClaudeCliReasoner {
         } else { effective_system.to_owned() };
         args.push(effective_system);
 
-        let router = crate::model_router::current()?.filter(|r| r.enabled());
-        let routed_model = router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts)));
+        let router = if literal.is_some() {None} else {crate::model_router::current()?.filter(|r| r.enabled())};
+        let routed_model = literal.as_ref().map(|request|request.model.clone()).or_else(||router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts))));
         if let Some(m) = routed_model.as_ref().or(opts.model.as_ref()) {
             args.push("--model".into());
             args.push(m.clone());
@@ -5439,6 +5440,34 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         }
         assert!(!argv.contains("--resume") && !argv.contains("builder-session") && !argv.contains("--add-dir"));
         assert_ne!(std::fs::read_to_string(cwd_path).unwrap().trim(), dir.path().to_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn literal_claude_dispatch_preserves_pinned_model_system_and_prompt_over_router_defaults() {
+        let dir=tempfile::tempdir().unwrap();let argv=dir.path().join("argv.json");let user=dir.path().join("user.txt");
+        let bin=stub_cli(&dir,"literal-claude",&format!(r#"exec python3 -c '
+import sys,json
+from pathlib import Path
+args=sys.argv[3:]
+Path(sys.argv[1]).write_text(json.dumps(args))
+Path(sys.argv[2]).write_text(sys.stdin.read())
+session=args[args.index("--session-id")+1]
+print(json.dumps(dict(type="system",subtype="init",session_id=session)))
+print(json.dumps(dict(type="result",session_id=session,result="ok")))
+' "{}" "{}" "$@"
+"#,argv.display(),user.display()));
+        let reasoner=ClaudeCliReasoner {bin,gate:Arc::new(CliGate::new(1))};
+        let mut options=dummy_opts();options.model=Some("explicit-literal-claude-model".into());options.system_prompt="Literal system\nwith exact source boundaries".into();options.cwd=Some(dir.path().into());
+        let prompt="Quoted original data\nIMAGE: /unread/local-file.png\n";
+        let mut router=crate::model_router::tests::fixture();router["models"]["claude"]["quality"]="cc/router-selected-other-model".into();
+        let router=crate::model_router::parse(&router.to_string()).unwrap();
+        let provider=crate::providers::ProviderKind::Claude;
+        let (answer,_)=crate::model_router::SNAPSHOT.scope(Some(router),crate::native_session::fresh_review_scope(provider,
+            crate::native_session::literal_text_scope(provider,options.model.as_deref().unwrap(),&options.system_prompt,prompt,reasoner.call(&options,prompt)))).await.unwrap();
+        assert_eq!(answer,"ok");let args:Vec<String>=serde_json::from_str(&std::fs::read_to_string(argv).unwrap()).unwrap();
+        assert!(args.windows(2).any(|p|p[0]=="--model" && p[1]=="explicit-literal-claude-model"));
+        assert!(args.windows(2).any(|p|p[0]=="--system-prompt" && p[1]==options.system_prompt));
+        assert_eq!(std::fs::read_to_string(user).unwrap(),prompt);
     }
 
     #[tokio::test]

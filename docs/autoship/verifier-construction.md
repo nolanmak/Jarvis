@@ -167,8 +167,9 @@ responses consume the same episode budget as proposal responses.
 The exact input is SHA256 of UTF-8 `serde_json::to_vec` bytes for this ordered
 tuple: `("verifier-construction-input-v1", episode, provider_name,
 "verifier_construction", producer_policy_digest, model_profile, system, prompt)`.
-`producer_policy_digest` binds the compiled constructor module and its bounded
-additional-source adapter. `model_profile` is an ordered tuple of profile version,
+`producer_policy_digest` binds the compiled constructor module, its bounded
+additional-source adapter, native-session service and Codex/Claude adapters.
+`model_profile` is an ordered tuple of profile version,
 the explicit resolved model name, permission mode, environment restriction flag,
 allowed tools, additional directories, extra environment and settings JSON.
 For this protocol require the model name to be present, permission mode
@@ -176,6 +177,25 @@ For this protocol require the model name to be present, permission mode
 empty tools/directories/extra environment and null settings. Clear additional
 directories inherited from the review preset; fresh scope supplies the worktree
 as its working directory only. Session and handoff overrides are null.
+
+The constructor installs `native_session::literal_text_scope` inside the fresh
+native scope. Each adapter validates its provider, model, system, user payload
+and allowed options against that sealed request before native admission.
+Codex and Claude dispatch the specified literal model without router/tier
+remapping. Codex preserves the supplied system text without appending workspace
+instructions and leaves every `IMAGE:` line as literal text, with no attachment
+extraction or local image reads. Existing callers outside this explicit scope
+retain their routing behavior. Exact payload means the controller-supplied
+system and user text at the native CLI interface; native-session/protocol policy
+is separately bound by the compiled adapter/session identities.
+
+CLI-capture tests exercise both adapters with conflicting router
+defaults, capture the model argument and system/user payloads, and check that
+Codex receives no image attachment flags for an existing image marker. The
+initial Codex regression observed the rewritten model and attachment before
+the fix. Fresh read-only source review rechecked and resolved both production
+adapter findings. Scripted constructor-exchange tests alone do not establish
+these adapter guarantees.
 
 Hash the exact system/prompt bytes actually sent, including quoted source and
 feedback. Do not hash a current binding, generation, timestamp, transient path,

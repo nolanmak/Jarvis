@@ -6,7 +6,8 @@ const ROLE:&str="verifier_construction";
 const LIMIT:usize=2*1024*1024;
 
 fn policy_hash()->String {
-    hash(&serde_json::to_vec(&("verifier-construction-producer-v1",hash(include_bytes!("self_improve_constructor_native.rs")),hash(include_bytes!("self_improve_amendment_source.rs")))).unwrap())
+    hash(&serde_json::to_vec(&("verifier-construction-producer-v1",hash(include_bytes!("self_improve_constructor_native.rs")),hash(include_bytes!("self_improve_amendment_source.rs")),
+        hash(include_bytes!("../../augmentagent-channel-core/src/native_session.rs")),hash(include_bytes!("../../augmentagent-channel-core/src/codex.rs")),hash(include_bytes!("../../augmentagent-channel-core/src/reasoner.rs")))).unwrap())
 }
 
 fn hash(bytes:&[u8])->String {amendment::digest(bytes)}
@@ -215,7 +216,7 @@ where F:FnOnce(augmentagent_channel_core::ProviderKind,augmentagent_channel_core
     opts.permission_mode="default".into();opts.restrict_env=false;opts.settings_json=None;
     opts.handoff_path=None;opts.session_id=None;opts.audit_logger=Some(workflow.audit_logger());
     let outcome=workflow.bounded_native_calls(purpose.clone(),1,native_session::fresh_review_scope(provider,
-        model_router::native_reviewer_scope(provider,async {
+        model_router::native_reviewer_scope(provider,native_session::literal_text_scope(provider,&input.model,&input.system,&input.prompt,async {
             let text=dispatch(provider,opts,input.prompt.clone()).await?;
             ensure!(text.len()<=LIMIT && actual_head(root).await?==head,"constructor output exceeds bound or source moved");
             let session=native_session::current_for(provider)?.context("constructor has no protected native session")?;
@@ -227,7 +228,7 @@ where F:FnOnce(augmentagent_channel_core::ProviderKind,augmentagent_channel_core
             // fresh_review_scope releases its native conversation/runtime.
             workflow.record_scope_stage_response_pair(&raw,&text,&proof,&serde_json::to_string(&reference)?)?;
             Ok(Reply {text,provider:input.provider.clone(),native_session})
-        }))).await;
+        })))).await;
     match outcome {
         Ok((reply,_))=>Ok(reply),
         Err(error) if matches!(workflow.construction_native_admission(&purpose),Ok(Some(_)))=>
