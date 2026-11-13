@@ -1508,6 +1508,14 @@ fn initial_repair_epoch(workflow:&str,contract:&str,source:AcceptanceSource,base
         contract,source,base,environment,scope,required_criteria,policy))?))
 }
 
+pub(super) fn initial_scope_replay_error(error:anyhow::Error)->anyhow::Error {
+    error.context(initial_repair::Hold::EvidenceUnknown)
+}
+pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard,base:&str,owner:&str)->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow.id(),
+        workflow.original_owner_request()?,base,environment_id(root)?,owner,readiness::POLICY))?))
+}
+
 fn initial_budget_inputs(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str,
     scope:&str,required_criteria:&[String])->Result<String> {
     Ok(amendment::digest(&serde_json::to_vec(&("initial-baseline-budget-inputs-v1",workflow,
