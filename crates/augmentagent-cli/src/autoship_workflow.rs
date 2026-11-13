@@ -316,7 +316,17 @@ pub(crate) struct NativeScopeCustody {
     pub provider:submission::Provider,
 }
 
-fn baseline_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+/// Original charged admission and completed data. The historical binding is
+/// evidence identity; it never authorizes work on the current candidate.
+pub(crate) struct NativeScopeAdmissionData {
+    pub custody:NativeScopeCustody,
+    pub binding:Binding,
+}
+
+fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+    Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
+}
+fn baseline_native_admissions(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeAdmissionData>> {
     let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
     let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
     let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();
@@ -335,7 +345,7 @@ fn baseline_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<Native
         let response:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,raw],|r|r.get(0)).optional()?;
         let provenance:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,proof],|r|r.get(0)).optional()?;
         match (response,provenance) {
-            (Some(response),Some(provenance))=>custody.push(NativeScopeCustody {input:raw,response,provenance,provider}),
+            (Some(response),Some(provenance))=>custody.push(NativeScopeAdmissionData {custody:NativeScopeCustody {input:raw,response,provenance,provider},binding}),
             _=>return Err(NativeScopeOutcomeUnresolved.into()),
         }
     }
@@ -3168,6 +3178,36 @@ mod tests {
         assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
         assert!(store.require_baseline_native_custody(&lease,&cp.binding,39).is_err());
         assert!(store.require_baseline_native_custody(&lease,&binding(),39).is_err(),"stale binding queried private custody");
+    }
+
+    #[test]
+    fn read_only_native_evidence_retains_its_admitted_binding_after_rotation() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let original=binding();
+        let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+        let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+        store.charge_admitted_model(&lease,"original",30,None,Some((&purpose,&original,1)),Some(submission::Provider::Codex),true).unwrap();
+        store.record_scope_stage_response_pair(&lease,&original,&raw,"retained reply",&proof,"retained proof",31).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding.head="new-main-head".into();checkpoint.binding.contract="registered:new-contract".into();
+        store.checkpoint(&lease,&checkpoint,32).unwrap();store.release(&lease,33).unwrap();drop(store);
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap();let events=store.events(&lease.workflow).unwrap();
+        let evidence=store.inspect_verifier_evidence(&lease.workflow);
+        let admitted=evidence.native_admissions().unwrap();
+        assert_eq!(admitted.len(),1);
+        assert_eq!(admitted[0].binding,original,"native evidence was relabeled with the current binding");
+        assert_eq!(admitted[0].custody.input,raw);
+        assert_eq!(admitted[0].custody.response,"retained reply");
+        assert_eq!(admitted[0].custody.provenance,"retained proof");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap(),before);
+        assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        drop(store);
+        let store=WorkflowStore::open(&path).unwrap();
+        store.conn.execute("DELETE FROM resource_charge WHERE workflow=?1 AND id='original'",[&lease.workflow]).unwrap();
+        assert!(store.inspect_verifier_evidence(&lease.workflow).native_admissions().is_err(),
+            "read-only binding lookup bypassed the original admission's paid-custody checks");
     }
 
     #[test]

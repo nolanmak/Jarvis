@@ -366,13 +366,17 @@ still match. Every later slot must be considered; an applicable completed
 negative/Unknown cannot be ignored. Missing, changed, unclassified or ambiguous
 associations remain unavailable for positive replay.
 
-The actual case's controller binding matches the saved original plan binding.
-For other enrollment/main-reconciliation paths that is an unverified assumption:
-map and authenticate the historical controller binding actually used for the
-slots, and keep it distinct from the live binding that authorizes current work.
-Do not guess that a current head/contract is the original indexing authority.
-No controller slot, native record, model charge or workflow was edited to obtain
-this evidence. The receipt/wake-up and compatibility work remains open.
+The actual case's controller binding matches the saved original plan binding,
+but neither that equality nor the live binding is now used to identify slots.
+Each original paid native admission already records its exact bounded binding.
+Section 14's reader returns that binding with the original completed native data
+through the existing custody validator. Both actual #1830 witness admissions
+match their controller slots through those original admission bindings. That
+resolves the historical indexing input without assuming that enrollment or main
+reconciliation preserved the original plan binding. The historical binding is
+data identity, never current execution authority. No production controller slot,
+native record, model charge or workflow was edited to obtain this evidence.
+The receipt/wake-up and compatibility work remains open.
 
 
 ## 13. Source-context identity regression and saved-case proof
@@ -403,3 +407,59 @@ hashed. Do not deploy this branch before completing the versioned receipt,
 valid-positive compatibility, typed cue, real preparation/binding integration
 and the audits required by sections 5, 6 and 10. The controller-slot evidence in
 section 12 is the next integration input, not an implemented grant.
+
+
+## 14. Charged-admission binding and composed controller-data checkpoint
+
+`VerifierEvidenceInspection::native_admissions` now exposes each completed native
+observation together with its original charged binding. It shares the existing
+paid-custody validator with leased execution: provider/reviewer attribution,
+single admission, charge, bounded counter and completed raw/proof custody remain
+mandatory. The binding is not recovered from today's checkpoint or guessed from
+a verifier plan. A read-only restart/rotation test passes and rejects loss of the
+original charge. Existing native-custody regressions also pass (four tests,
+0.28 seconds), including unanswered outcomes, binding changes and lost custody.
+The native producer source/policy is unchanged.
+
+`retained_controller_slots` uses the recorded admission contract to derive the
+unchanged two controller keys, then matches each raw/proof pair to its actual
+native admission. Both slots remain in order with their original raw bytes,
+proof references and admitted bindings. Half-pairs, absent admitted responses,
+foreign proof, duplicate ownership, changed native proof and a different
+corrective request remain errors. The complete original semantic question must
+match the provided prepared measurement. Corrective question authentication
+still supports only the explicit current/pre-citation checker protocols from
+section 11; unsupported historical protocols remain unavailable. Controller keys
+alone do not replace native question/provenance authentication.
+
+`retained_original_witness_data` composes that reader with
+`exact_original_result`: every call rechecks protected plan/result records,
+admissions, quiescence, capture manifests/streams and receipt digests before
+returning the original measured data and ordered native/controller observations.
+Its stable data identity binds the actual original-result identity and all
+controller-run identities, excluding current build, generation and live head.
+It returns no execution capability, qualification artifact, scheduling cue or
+model admission. The production authority/cue integration must use this composed
+path within its supported inspection/lease transaction; a bare source-only or
+controller-only result cannot qualify the measurement. Publication/restart
+readers still need the explicit authoritative store/control reference and
+current/native context contract from section 10.
+
+Final witness components: 21 passed, zero failures, two explicit ignored probes
+(57.86 seconds). New disposable fixtures preserve a corrective Unknown and its
+negative disposition across a live binding change; they reject missing controller
+output, a foreign controller proof, lost native proof and a changed corrective
+question, leaving fixture events/charges unchanged. Their native replies and
+command claims are scripted fixtures, not autonomous production acceptance.
+The first run rejected an invalid fixture proof filename before the intended
+assertions; the fixture was corrected, and that failure is not claimed as a
+behavioral RED for this feature.
+
+The actual #1830 composed reader passes read-only (0.36 seconds): one complete
+captured original result and both exact-question controller slots authenticate
+together via their original paid admission bindings. Four native observations,
+two exact endpoint errors, all twelve recorded model calls, snapshot and events
+remain unchanged. No qualification, wake-up or dispatch was produced. The
+versioned receipt, valid-positive cutover, decision/negative precedence, typed
+cue, actual preparation/binding integration and full audits remain required
+before this branch can be deployed. These data checks do not restore autoship.

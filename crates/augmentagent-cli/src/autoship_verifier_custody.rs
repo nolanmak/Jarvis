@@ -35,6 +35,11 @@ pub(crate) struct VerifierEvidenceInspection<'a> {
 impl<'a> VerifierEvidenceInspection<'a> {
     pub(super) fn new(conn:&'a Connection,workflow:&'a str)->Self {Self {conn,workflow}}
     pub(crate) fn workflow(&self)->&str {self.workflow}
+    /// Paid-custody validation is identical to leased execution. Returning a
+    /// historical binding grants neither a lease nor semantic qualification.
+    pub(crate) fn native_admissions(&self)->Result<Vec<NativeScopeAdmissionData>> {
+        baseline_native_admissions(self.conn,self.workflow)
+    }
     pub(crate) fn scope_response(&self,key:&str)->Result<Option<String>> {
         read_scope_response(self.conn,self.workflow,key)
     }
