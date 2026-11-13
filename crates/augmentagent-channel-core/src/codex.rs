@@ -1492,6 +1492,36 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         }
     }
 
+    #[tokio::test]
+    async fn literal_constructor_dispatch_pins_model_and_preserves_text_without_attachments() {
+        let dir=tempfile::tempdir().unwrap();
+        let argv=dir.path().join("argv.json");let user=dir.path().join("user.txt");let system=dir.path().join("system.txt");
+        let image=dir.path().join("synthetic.png");std::fs::write(&image,b"synthetic image fixture").unwrap();
+        let bin=stub(&dir,"literal-codex",&format!(r#"exec python3 -c '
+import sys,json
+from pathlib import Path
+args=sys.argv[4:]
+Path(sys.argv[1]).write_text(json.dumps(args))
+Path(sys.argv[2]).write_text(sys.stdin.read())
+instructions=next(a.split("=",1)[1] for a in args if a.startswith("model_instructions_file="))
+Path(sys.argv[3]).write_text(Path(json.loads(instructions)).read_text())
+print(json.dumps(dict(type="thread.started",thread_id="literal-constructor-fixture")))
+print(json.dumps(dict(type="item.completed",item=dict(type="agent_message",text="ok"))))
+' "{}" "{}" "{}" "$@"
+"#,argv.display(),user.display(),system.display()));
+        let reasoner=CodexCliReasoner {kind:ProviderKind::Codex,bin,gate:crate::cli_gate::CliGate::global(),usage_log:crate::token_usage::UsageLogger::global()};
+        let mut options=opts();options.model=Some("explicit-literal-native-model".into());options.cwd=Some(dir.path().into());
+        let prompt=format!("Quoted original data\nIMAGE: {}\n",image.display());
+        let (answer,_)=crate::native_session::fresh_review_scope(ProviderKind::Codex,
+            crate::native_session::literal_text_scope(ProviderKind::Codex,options.model.as_deref().unwrap(),&options.system_prompt,&prompt,reasoner.call(&options,&prompt))).await.unwrap();
+        assert_eq!(answer,"ok");
+        let args:Vec<String>=serde_json::from_str(&std::fs::read_to_string(argv).unwrap()).unwrap();
+        assert!(args.windows(2).any(|p|p[0]=="-m" && p[1]=="explicit-literal-native-model"),"adapter replaced the sealed native model: {args:?}");
+        assert!(!args.iter().any(|p|p=="-i"),"literal source text became local image attachments");
+        assert_eq!(std::fs::read_to_string(user).unwrap(),prompt);
+        assert_eq!(std::fs::read_to_string(system).unwrap(),options.system_prompt);
+    }
+
     // The supervised CLI lifecycle is exercised on the daemon's Linux host;
     // macOS cannot certify its descendant-reaping receipt.
     #[cfg(target_os = "linux")]

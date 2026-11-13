@@ -41,6 +41,35 @@ pub struct Lease {
 tokio::task_local! { pub static CURRENT: Arc<NativeSession>; }
 tokio::task_local! { pub static FRESH_REVIEW: bool; }
 
+#[derive(Clone)]
+pub(crate) struct LiteralTextRequest {
+    pub provider:ProviderKind,
+    pub model:String,
+    pub system:String,
+    pub prompt:String,
+}
+tokio::task_local! { static LITERAL_TEXT: LiteralTextRequest; }
+
+/// Seal a controller-owned, tool-free native request. Adapters must use this
+/// literal model and these payloads, without routing or local attachments.
+pub async fn literal_text_scope<T>(provider:ProviderKind,model:&str,system:&str,prompt:&str,
+    call:impl std::future::Future<Output=anyhow::Result<T>>)->anyhow::Result<T> {
+    anyhow::ensure!(is_fresh_review() && matches!(provider,ProviderKind::Claude|ProviderKind::Codex),"literal native text requires a fresh isolated conversation");
+    anyhow::ensure!(!model.trim().is_empty() && model.len()<=1024 && !system.trim().is_empty()
+        && system.len().saturating_add(prompt.len())<=512*1024,"literal native text exceeds its request bounds");
+    LITERAL_TEXT.scope(LiteralTextRequest {provider,model:model.into(),system:system.into(),prompt:prompt.into()},call).await
+}
+
+pub(crate) fn literal_text_request(provider:ProviderKind,opts:&crate::ReasonerOpts,prompt:&str)->anyhow::Result<Option<LiteralTextRequest>> {
+    let Ok(request)=LITERAL_TEXT.try_with(Clone::clone) else {return Ok(None)};
+    anyhow::ensure!(is_fresh_review() && request.provider==provider && opts.model.as_deref()==Some(request.model.as_str())
+        && opts.system_prompt==request.system && prompt==request.prompt,"literal native request changed before dispatch");
+    anyhow::ensure!(opts.allowed_tools.is_empty() && opts.add_dirs.is_empty() && opts.env.is_empty()
+        && opts.permission_mode=="default" && !opts.restrict_env && opts.settings_json.is_none()
+        && opts.handoff_path.is_none() && opts.session_id.is_none(),"literal native request has unsupported options");
+    Ok(Some(request))
+}
+
 /// A controller-owned set of actual native conversations for one restarted
 /// builder episode. Audit UUIDs are deliberately not used as CLI identities.
 #[derive(Default)]
