@@ -290,7 +290,7 @@ impl std::fmt::Display for MissingScopeResponse {
 impl std::error::Error for MissingScopeResponse {}
 
 pub(crate) const BASELINE_NATIVE_PURPOSE_PREFIX:&str="baseline-witness-native-v1:";
-const CONSTRUCTION_NATIVE_PURPOSE_PREFIX:&str="verifier-construction-native-v1:";
+pub(crate) const CONSTRUCTION_NATIVE_PURPOSE_PREFIX:&str="verifier-construction-native-v1:";
 const CONSTRUCTION_NATIVE_EPISODE_LIMIT:u64=6;
 
 /// Controller-computed episode and exact input identities. This accounting

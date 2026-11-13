@@ -50,6 +50,13 @@ pub(crate) struct LiteralTextRequest {
 }
 tokio::task_local! { static LITERAL_TEXT: LiteralTextRequest; }
 
+/// Actual admission observers use this opt-in role grant independently of the
+/// generic fresh-session marker. Payload/options are checked by the adapter.
+pub fn literal_text_provider()->Option<ProviderKind> {
+    if !is_fresh_review() {return None;}
+    LITERAL_TEXT.try_with(|request|request.provider).ok()
+}
+
 /// Seal a controller-owned, tool-free native request. Adapters must use this
 /// literal model and these payloads, without routing or local attachments.
 pub async fn literal_text_scope<T>(provider:ProviderKind,model:&str,system:&str,prompt:&str,

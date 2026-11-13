@@ -181,6 +181,10 @@ as its working directory only. Session and handoff overrides are null.
 The constructor installs `native_session::literal_text_scope` inside the fresh
 native scope. Each adapter validates its provider, model, system, user payload
 and allowed options against that sealed request before native admission.
+The workflow's actual admission observer separately requires the matching
+literal-text provider grant for every construction-purpose dispatch. The
+general fresh-session marker alone cannot admit a constructor conversation;
+the connected regression first reproduced that missing grant check.
 Codex and Claude dispatch the specified literal model without router/tier
 remapping. Codex preserves the supplied system text without appending workspace
 instructions and leaves every `IMAGE:` line as literal text, with no attachment
@@ -255,6 +259,16 @@ These are transport-custody results, not behavioral acceptance. Native transport
 and its pre-release persistence now have an implementation and connected
 scripted-native tests; the production pipeline remains disabled pending the
 source/staging/held-work integrations.
+
+The constructor tests cover completed replay across restart, failed initial
+paired-index publication followed by original-output recovery, an admitted lost
+output that remains held, and free setup refusals with zero admitted attempts.
+The production adapters have CLI-capture tests for the exact sealed model and
+payloads, plus guard tests rejecting option/payload changes before dispatch.
+The broader provider suite passes (747, with 16 opt-in tests ignored); constructor
+tests pass (9), and workflow regressions pass (266, with one existing ignored
+test). These counts do not claim the full CLI suite passes: the separate
+source-only-before-authority regression remains RED until staging integration.
 
 The constructor transport saves `constructor-input-<exact-input>.json` before
 admission. After a completed native response it privately retains the raw text

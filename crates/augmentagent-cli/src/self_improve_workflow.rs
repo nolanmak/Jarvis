@@ -1019,6 +1019,10 @@ impl WorkflowGuard {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
             }
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
+            if bounded.as_ref().is_some_and(|call|call.purpose.starts_with(durable::CONSTRUCTION_NATIVE_PURPOSE_PREFIX)) {
+                anyhow::ensure!(augmentagent_channel_core::native_session::literal_text_provider().is_some_and(|sealed|sealed.name()==provider),
+                    "constructor native admission requires its literal text grant");
+            }
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
                 augmentagent_channel_core::native_session::is_fresh_review())?;
