@@ -184,6 +184,52 @@ historical request including its system text, unchanged workflow snapshot and
 zero native calls or workflow writes. This authenticates historical source data,
 not a new constructor proposal, baseline witness or authority approval.
 
+The staging component now authenticates a measurement intent against its actual
+native admission, private completion and paired publication before creating a
+checkout. It uses a disposable original-commit clone, the existing pinned
+isolated executor and `OriginalExecution` result/capture/quiescence records.
+Both red and conclusive non-red results are reusable. A private,
+non-deserializable `StagedCorrection` retains that checkout and rechecks complete
+workflow binding, environments, original commit, constructor ownership and the
+protected current witness. A successful qualifier callback alone cannot create
+it. Its decision validator rejects unmeasured proposal or environment-mode
+rewrites and preserves legitimate refusals. This is still an unactivated service;
+the existing production authority has not been converted to require this type.
+
+A second admission regression reached actual constructor model accounting with
+an unsettled original command. The constructor-purpose observer now invokes the
+existing all-command correction-custody check before charging. A retained
+constructor completion also has a synchronous data-only reader which does not
+require a still-current execution grant or dispatch anything. Reconstructing old
+episode references after a restart and repairing missing paired publication
+across episode changes remain separate work; the current reader holds on missing
+publication.
+
+Before activating staging, connect construction ownership of its original plans
+to budget-history inspection: `retained_original_plan_budget_contexts` currently
+derives initial-repair contexts for all plans. Do not misclassify a construction
+plan as an unowned initial plan or create a new initial budget to mask it. Also
+connect complete authenticated compiler/setup output and negative witness prose
+to the next constructor request through the existing capture/diagnosis services;
+a generic `BaselineNotRed` detail alone is insufficient. These are production
+integration requirements along with the restricted lease/selector, typed
+authority admission and full original fixture coverage.
+
+Staging verification checkpoint: 51 selected construction/transport/execution
+tests pass, with three explicit isolation ignores. The new isolated staging test
+also passes separately (237.49 seconds) under a delegated transient service:
+`Delegate=cpu memory pids`, `DelegateSubgroup=daemon`, MemoryMax 6 GiB, TasksMax
+1024, CPUQuota 400%, and `AUGMENTAGENT_RUN_RESOURCES=1` with the standard child
+ceilings. Invoke the already-built test executable after the managed Cargo lease
+exits. This fixture executes actual pinned original Python behavior and verifies
+red, already-green, missing/negative witness rejection, exact proposal binding
+and result replay without another command. Constructor and witness replies are
+scripted test data; it proves no #2014 behavioral correction, live provider
+review, or autonomous merge. No storage floor or budget override is needed.
+The retained #2014 read-only source compatibility probe passes again after the
+admission-wrapper change: the same eight files authenticate and the workflow
+snapshot remains unchanged, with zero native calls or workflow writes.
+
 Use a separate amendment-construction module beneath the existing acceptance
 adapter. It is an untrusted producer, not another workflow coordinator. Reuse
 `build_workflow_pinned`, tool-free `codex_review_opts`, the existing protected

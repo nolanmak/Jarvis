@@ -445,7 +445,7 @@ fn require_stored_quiescence(workflow:&str,admission:&str,admitted:&Admission,ra
     Ok(())
 }
 
-fn require_correction_commands(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+pub(super) fn require_correction_commands(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
     // The typed index alone cannot prove absence: a retained command body can
     // outlive its index. Cross-check the same bounded scope union as accounting.
     let mut after=String::new();let mut count=0usize;

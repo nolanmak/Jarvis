@@ -202,6 +202,13 @@ mod tests {
                     }
                 })
             }).await;
+            if guard.audit_logger().resource_capacity_seen() {
+                // Report the original refusal before fenced guard inspection
+                // replaces it with the generic await-capacity checkpoint.
+                let audit=std::fs::read_to_string(guard.audit_logger().path())?;
+                eprintln!("Isolated constructed-stage capacity evidence ({qualification}):\n{audit}");
+                return match result {Err(error)=>Err(error.context("isolated stage resource admission")),Ok(_)=>Err(anyhow::anyhow!("isolated stage retained resource capacity refusal"))};
+            }
             ensure!(actual_head(root.path()).await?==head,"staging edited the ordinary candidate");
             for (path,body) in &old.proposal.files {ensure!(std::fs::read_to_string(root.path().join(path))?==*body,"staging installed unapproved adapters in candidate");}
             let commands=guard.verifier_evidence_page("original_verifier_command_admission",0)?;

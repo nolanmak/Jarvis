@@ -22,6 +22,9 @@ mod constructor_native;
 pub(super) fn require_retained_constructor_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
     constructor_native::require_retained(root,repository,workflow,observations)
 }
+pub(super) fn require_original_correction_custody(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    verifier_execution::require_correction_commands(evidence).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))
+}
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
