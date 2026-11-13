@@ -61,7 +61,7 @@ impl ConstructorTable {
         ensure!(encoded.len()<=32*1024,"constructor source page exceeds bound; request fewer entries");
         Ok(encoded)
     }
-    pub(super) async fn read(&self,root:&Path,raw:&str,budget:usize)->Result<Evidence> {
+    fn selection(&self,raw:&str,budget:usize)->Result<ConstructorSelection> {
         ensure!((1024..=512*1024).contains(&budget) && raw.len()<=32*1024,"invalid constructor source request budget");
         let selected:ConstructorSelection=serde_json::from_str(raw)?;
         ensure!(selected.table_sha256==self.identity,"constructor source table identity differs");
@@ -71,6 +71,11 @@ impl ConstructorTable {
                 && request.end_line-request.start_line<600
                 && request.needle.as_ref().is_none_or(|needle|!needle.is_empty() && needle.len()<=256),"invalid constructor source selection");
         }
+        Ok(selected)
+    }
+    pub(super) fn validate_read(&self,raw:&str,budget:usize)->Result<()> {self.selection(raw,budget).map(|_|())}
+    pub(super) async fn read(&self,root:&Path,raw:&str,budget:usize)->Result<Evidence> {
+        let selected=self.selection(raw,budget)?;
         let identity=digest(&serde_json::to_vec(&("constructor-original-source-data-v1",&self.base,&self.identity,&selected.requests))?);
         let entries=self.entries.iter().map(|(metadata,path)|(metadata.as_str(),path.as_str())).collect::<Vec<_>>();
         render_selection(root,&self.base,&entries,identity,Selection {requests:selected.requests},budget).await

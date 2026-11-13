@@ -6,7 +6,7 @@ const ROLE:&str="verifier_construction";
 const LIMIT:usize=2*1024*1024;
 
 fn policy_hash()->String {
-    hash(&serde_json::to_vec(&("verifier-construction-producer-v1",hash(include_bytes!("self_improve_constructor_native.rs")),hash(include_bytes!("self_improve_amendment_source.rs")),
+    hash(&serde_json::to_vec(&("verifier-construction-producer-v1",hash(include_bytes!("self_improve_constructor_native.rs")),hash(include_bytes!("self_improve_amendment_source.rs")),hash(include_bytes!("self_improve_construction.rs")),
         hash(include_bytes!("../../augmentagent-channel-core/src/native_session.rs")),hash(include_bytes!("../../augmentagent-channel-core/src/codex.rs")),hash(include_bytes!("../../augmentagent-channel-core/src/reasoner.rs")))).unwrap())
 }
 
@@ -43,7 +43,7 @@ impl Input {
         ensure!(serde_json::to_vec(self)?.len()<=LIMIT-16*1024,"serialized constructor input exceeds bound");
         Ok(())
     }
-    fn identity(&self)->Result<String> {
+    pub(super) fn identity(&self)->Result<String> {
         self.validate()?;
         // JSON arrays implement the ordered tuple specified by this protocol.
         let profile=serde_json::json!(["constructor-model-profile-v1",self.model,"default",false,[],[],[],null]);
@@ -51,6 +51,12 @@ impl Input {
     }
     fn purpose(&self)->Result<String> {
         Ok(format!("verifier-construction-native-v1:{}:{}",self.episode,self.identity()?))
+    }
+    pub(super) fn require_episode(&self,episode:&amendment::ConstructionEpisode)->Result<()> {
+        self.validate()?;
+        ensure!(self.workflow==episode.workflow() && self.original_base==episode.original_base()
+            && self.episode==episode.key(),"constructor request differs from its controller-owned episode");
+        Ok(())
     }
 }
 
@@ -179,8 +185,8 @@ fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::aut
 pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {
     use std::os::unix::fs::DirBuilderExt;
     episode.require_current(root,workflow)?;
-    ensure!(episode.workflow()==workflow.id() && input.workflow==episode.workflow()
-        && input.original_base==episode.original_base() && input.episode==episode.key(),"constructor request differs from its controller-owned episode");
+    ensure!(episode.workflow()==workflow.id(),"constructor request belongs to another workflow");
+    input.require_episode(episode)?;
     workflow.require_fresh_issue(root).await?;
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&control)?;

@@ -147,6 +147,32 @@ every possible observer is impossible.
 
 ## Selected producer interface and custody boundary
 
+The unactivated `amendment::construction` driver now persists exact constructor
+inputs before dispatch, reuses saved inputs after model-default changes, and
+validates source/revision/requirements/scope before reserving one of three
+measurement slots. Its six-round ledger uses construction-specific keys, not the
+initial-verifier budget namespace. A repeated complete proposal in a later round
+reserves another slot; a pending intent replays unchanged. Completed constructor
+refusals remain refusals. Malformed output consumes a constructor round without
+reserving a measurement slot. The native transport separately enforces actual
+admission and immutable completion custody; driver tests use scripted replies
+and do not themselves establish real provider execution.
+
+Infrastructure failures cannot record semantic rejection or advance a slot.
+Structurally invalid source requests can be corrected within the same bounded
+episode. A structurally valid request whose Git bytes or required excerpt cannot
+be read holds before another conversation; this deliberately includes a missing
+requested needle rather than treating all read failures as model mistakes.
+Exact failed proposals and private diagnoses are included in subsequent requests
+without silent truncation. An oversized complete context holds before dispatch.
+
+This driver returns an **unqualified measurement intent**. It is not connected
+to production selection, original measurement, witness qualification or
+authority admission yet. Those integrations, the restricted component lease and
+cross-episode data-only recovery remain required before rollout. The existing
+source-only authority-boundary regression remains red. No production constructor
+conversation or autonomous merge is established by these component tests.
+
 Use a separate amendment-construction module beneath the existing acceptance
 adapter. It is an untrusted producer, not another workflow coordinator. Reuse
 `build_workflow_pinned`, tool-free `codex_review_opts`, the existing protected
