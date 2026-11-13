@@ -306,6 +306,22 @@ fn construction_native_episode_prefix(purpose:&str)->Result<String> {
     Ok(format!("{CONSTRUCTION_NATIVE_PURPOSE_PREFIX}{episode}:"))
 }
 
+pub(crate) fn construction_native_response_keys(purpose:&str)->Result<(String,String)> {
+    construction_native_episode_prefix(purpose)?;
+    let raw=format!("{:x}",Sha256::digest(serde_json::to_vec(&("verifier-construction-response-v1",purpose))?));
+    let proof=format!("{:x}",Sha256::digest(serde_json::to_vec(&("verifier-construction-provenance-v1",purpose))?));
+    Ok((raw,proof))
+}
+
+#[derive(Debug)]
+pub(crate) struct ConstructionNativeOutcomeUnresolved;
+impl std::fmt::Display for ConstructionNativeOutcomeUnresolved {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str("original constructor native outcome requires evidence recovery")
+    }
+}
+impl std::error::Error for ConstructionNativeOutcomeUnresolved {}
+
 #[derive(Debug)]
 pub(crate) struct NativeScopeOutcomeUnresolved;
 impl std::fmt::Display for NativeScopeOutcomeUnresolved {
@@ -331,31 +347,50 @@ pub(crate) struct NativeScopeCustody {
     pub provider:submission::Provider,
 }
 
+#[derive(Clone,Copy)]
+enum NativeCustodyDomain {Baseline,Construction}
+impl NativeCustodyDomain {
+    fn prefix(self)->&'static str {match self {Self::Baseline=>BASELINE_NATIVE_PURPOSE_PREFIX,Self::Construction=>CONSTRUCTION_NATIVE_PURPOSE_PREFIX}}
+    fn keys(self,purpose:&str)->Result<(String,String)> {match self {Self::Baseline=>baseline_native_response_keys(purpose),Self::Construction=>construction_native_response_keys(purpose)}}
+    fn unresolved(self)->anyhow::Error {match self {Self::Baseline=>NativeScopeOutcomeUnresolved.into(),Self::Construction=>ConstructionNativeOutcomeUnresolved.into()}}
+}
+
 fn baseline_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+    native_custody(tx,workflow,NativeCustodyDomain::Baseline)
+}
+
+fn construction_native_custody(tx:&Transaction<'_>,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+    native_custody(tx,workflow,NativeCustodyDomain::Construction)
+}
+
+/// Shared accounting/custody checks, with disjoint keys and role requirements.
+/// Construction data is never returned from the baseline witness accessor.
+fn native_custody(tx:&Transaction<'_>,workflow:&str,domain:NativeCustodyDomain)->Result<Vec<NativeScopeCustody>> {
     let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
     let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
     let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();
     for admission in admissions {
         let admission:serde_json::Value=serde_json::from_str(&admission?)?;
-        let Some(purpose)=admission["bounded"]["purpose"].as_str().filter(|p|p.starts_with(BASELINE_NATIVE_PURPOSE_PREFIX)) else {continue};
-        let (raw,proof)=baseline_native_response_keys(purpose)?;
-        ensure!(seen.insert(purpose.to_owned()),"baseline native input has multiple actual admissions");
-        ensure!(admission["reviewer"]==true && admission["bounded"]["limit"]==1,"baseline admission lacks fresh-review attribution");
+        let Some(purpose)=admission["bounded"]["purpose"].as_str().filter(|p|p.starts_with(domain.prefix())) else {continue};
+        let (raw,proof)=domain.keys(purpose)?;
+        ensure!(seen.insert(purpose.to_owned()),"native input has multiple actual admissions");
+        ensure!(admission["bounded"]["limit"]==1,"native admission lacks exact-input attribution");
+        if matches!(domain,NativeCustodyDomain::Baseline) {ensure!(admission["reviewer"]==true,"baseline admission lacks fresh-review attribution");}
         let provider:submission::Provider=serde_json::from_value(admission["provider"].clone())?;
         let binding:Binding=serde_json::from_value(admission["bounded"]["binding"].clone())?;
         let receipt=admission["receipt"].as_str().context("baseline admission lost its accounting receipt")?;
         let charged:Option<u32>=tx.query_row("SELECT model_calls FROM resource_charge WHERE workflow=?1 AND id=?2",params![workflow,receipt],|r|r.get(0)).optional()?;
         let counted:Option<u32>=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![workflow,purpose,serde_json::to_string(&binding)?],|r|r.get(0)).optional()?;
-        if charged!=Some(1) || counted!=Some(1) {return Err(NativeScopeOutcomeUnresolved.into());}
+        if charged!=Some(1) || counted!=Some(1) {return Err(domain.unresolved());}
         let response:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,raw],|r|r.get(0)).optional()?;
         let provenance:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,proof],|r|r.get(0)).optional()?;
         match (response,provenance) {
             (Some(response),Some(provenance))=>custody.push(NativeScopeCustody {input:raw,response,provenance,provider}),
-            _=>return Err(NativeScopeOutcomeUnresolved.into()),
+            _=>return Err(domain.unresolved()),
         }
     }
-    let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get(0))?;
-    if counted!=custody.len() as u64 {return Err(NativeScopeOutcomeUnresolved.into());}
+    let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,domain.prefix()],|r|r.get(0))?;
+    if counted!=custody.len() as u64 {return Err(domain.unresolved());}
     // This returns original custody, not semantic qualification. The consumer
     // must validate every private native provenance file before new dispatch.
     Ok(custody)
@@ -1646,7 +1681,10 @@ impl WorkflowStore {
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
             // late usage/accounting for the original call remains recordable.
-            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
+            if admission.is_some() {
+                baseline_native_custody(&tx,&lease.workflow)?;
+                construction_native_custody(&tx,&lease.workflow)?;
+            }
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -3708,6 +3746,10 @@ mod observation_accounting_tests {
             store.charge_admitted_model(&lease,&receipt,now+1,None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
             // Reobserving a dispatch is accounting replay, never a fresh call.
             store.charge_admitted_model(&lease,&receipt,now+2,None,Some((&purpose(input),&cp.binding,1)),Some(submission::Provider::Codex),false).unwrap();
+            // Only response-index custody is scripted here. Physical native
+            // provenance and semantic qualification are separate producer gates.
+            let (raw,proof)=construction_native_response_keys(&purpose(input)).unwrap();
+            store.record_scope_stage_response_pair(&lease,&cp.binding,&raw,"retained reply",&proof,"private provenance reference",now+2).unwrap();
             if input==2 {
                 store.release(&lease,now+3).unwrap();drop(store);
                 store=WorkflowStore::open(&path).unwrap();
@@ -3742,6 +3784,8 @@ mod observation_accounting_tests {
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
         assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),0);
         store.charge_admitted_model(&lease,"first",7,None,Some((&valid,&binding(),1)),Some(submission::Provider::Codex),false).unwrap();
+        let (raw,proof)=construction_native_response_keys(&valid).unwrap();
+        store.record_scope_stage_response_pair(&lease,&binding(),&raw,"retained reply",&proof,"private provenance reference",7).unwrap();
         // Existing ordinary authority accounting remains a separate domain.
         store.charge_bounded_call(&lease,"authority",8,None,"verifier-amend-input:old",&binding(),2).unwrap();
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
@@ -3762,10 +3806,15 @@ mod observation_accounting_tests {
         let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
         cp.binding.head="new-candidate".into();store.checkpoint(&lease,&cp,6).unwrap();
         for purpose in [Some((&second[..],&cp.binding,1)),None] {
-            assert!(store.charge_admitted_model(&lease,"must-not-dispatch",7,None,purpose,Some(submission::Provider::Claude),true).is_err(),
-                "missing constructor response was bypassed by a new input, role, provider or binding");
+            let error=store.charge_admitted_model(&lease,"must-not-dispatch",7,None,purpose,Some(submission::Provider::Claude),true).unwrap_err();
+            assert!(error.is::<ConstructionNativeOutcomeUnresolved>(),"unexpected admission refusal: {error:#}");
         }
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,1);
+        let (raw,proof)=construction_native_response_keys(&first).unwrap();
+        store.record_scope_stage_response_pair(&lease,&cp.binding,&raw,"original reply",&proof,"original provenance reference",8).unwrap();
+        assert!(store.inspect_baseline_native_custody(id).unwrap().is_empty(),"construction data entered baseline witness custody");
+        store.charge_admitted_model(&lease,"next",9,None,Some((&second,&cp.binding,1)),Some(submission::Provider::Claude),false).unwrap();
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
     }
     #[test]
     fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
