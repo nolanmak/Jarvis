@@ -82,6 +82,7 @@ fn ordered_numbers()->[u64;3] {
 async fn child(case:&str) {
     let repo=PathBuf::from(std::env::var_os(CHILD).unwrap());
     let path=workflow::path();
+    if case.starts_with("manual-") {manual_child(&repo,&path,case).await;return;}
     if case.starts_with("trust-") {trust_child(&repo,&path,case).await;return;}
     let [first,second,peer_number]=ordered_numbers();
     if case=="all-paused" {inventory(&[first,second]);}else{inventory(&[42,41,40]);}
@@ -229,3 +230,57 @@ async fn automatic_selector_retains_owner_pauses_while_filtering_trust() {exerci
 async fn automatic_selector_completes_inventory_before_trusted_selection() {exercise("trust-pages","automatic_selector_completes_inventory_before_trusted_selection").await;}
 #[tokio::test]
 async fn automatic_selector_requires_canonical_identity_for_trusted_selection() {exercise("trust-identity","automatic_selector_requires_canonical_identity_for_trusted_selection").await;}
+
+async fn manual_child(repo:&Path,path:&Path,case:&str) {
+    let [first,second,peer]=ordered_numbers();
+    inventory(&[42,41,40]);
+    let file=PathBuf::from(std::env::var_os("AUTOSHIP_PAUSED_INVENTORY").unwrap());
+    let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    for row in rows.as_array_mut().unwrap() {
+        if case=="manual-all" || row["number"]!=peer {
+            row["labels"].as_array_mut().unwrap().push(serde_json::json!({"name":"autoship-manual"}));
+            row["body"]=if case=="manual-risk" {"Engineering work mentions .env; automatic intake must not triage it"}else{"Engineering repair work."}.into();
+        }
+    }
+    std::fs::write(&file,serde_json::to_vec(&rows).unwrap()).unwrap();
+    let binding=workflow::git_binding(repo,"original request","fixture-environment",&[]).await.unwrap();
+    let mut store=WorkflowStore::open(path).unwrap();
+    for number in [first,second] {
+        let id=workflow_id(REPOSITORY,number).unwrap();store.register(&id,"fixture",binding.clone(),1).unwrap();
+        let lease=store.claim(&id,"past-owner",2,100).unwrap().unwrap();
+        store.charge(&lease,"past-work",ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},3).unwrap();
+        store.release(&lease,4).unwrap();
+    }
+    let before=[first,second].map(|n| {let id=workflow_id(REPOSITORY,n).unwrap();
+        (store.snapshot(&id).unwrap(),store.owner_control(&id).unwrap(),store.events(&id).unwrap())});drop(store);
+    let selected=select(repo).await.unwrap();
+    assert_eq!(selected.as_ref().map(|i|i.number),if case=="manual-all" {None}else{Some(peer)},"manual engineering consumed an ordinary intake turn");
+    let store=WorkflowStore::open(path).unwrap();
+    for (n,prior) in [first,second].into_iter().zip(before) {
+        let id=workflow_id(REPOSITORY,n).unwrap();
+        assert_eq!((store.snapshot(&id).unwrap(),store.owner_control(&id).unwrap(),store.events(&id).unwrap()),prior);
+    }
+    assert!(store.snapshot(&workflow_id(REPOSITORY,peer).unwrap()).unwrap().is_none());drop(store);
+    assert_eq!(gave_up_breakdown_live(repo),Some(vec![]),"manual routing was reported as a failed issue");
+    let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_PAUSED_CALLS").unwrap()).unwrap();
+    for call in calls.lines() {
+        let args:Vec<String>=serde_json::from_str(call).unwrap();
+        if matches!(args.first().map(String::as_str),Some("issue"|"pr")) {
+            assert_eq!(args.get(1).map(String::as_str),Some("list"),"manual routing attempted public triage");
+        }
+    }
+    if case=="manual-remove" {
+        inventory(&[42,41,40]);
+        assert_eq!(select(repo).await.unwrap().unwrap().number,first,"label removal did not restore normal eligibility");
+    }
+    assert!(!repo.join(".self-improve-worktrees").exists());
+}
+
+#[tokio::test]
+async fn manual_engineering_sources_do_not_starve_ordinary_issues() {exercise("manual-peers","manual_engineering_sources_do_not_starve_ordinary_issues").await;}
+#[tokio::test]
+async fn all_manual_engineering_inventory_stays_idle() {exercise("manual-all","all_manual_engineering_inventory_stays_idle").await;}
+#[tokio::test]
+async fn removing_manual_routing_restores_normal_eligibility() {exercise("manual-remove","removing_manual_routing_restores_normal_eligibility").await;}
+#[tokio::test]
+async fn manual_routing_precedes_blast_radius_triage() {exercise("manual-risk","manual_routing_precedes_blast_radius_triage").await;}
