@@ -303,6 +303,21 @@ fn diagnostic_excerpt(text:&str,budget:usize)->String {
     format!("{}{MARKER}{}",&text[..end],&text[start..])
 }
 
+fn public_diagnostics(text:&str)->String {
+    let mut output=String::new();
+    let mut withheld=false;
+    for line in text.split_inclusive('\n') {
+        if augmentagent_channel_core::public_report::validate("",line).is_err() {
+            if !withheld {output.push_str("[diagnostic line withheld by public-report privacy check]\n");}
+            withheld=true;
+        }else {
+            output.push_str(line);
+            withheld=false;
+        }
+    }
+    output
+}
+
 async fn failed_main_diagnostics(root:&Path,gh:&str,repository:&str,head:&str,failures:&[Value])->RedMain {
     const BUDGET:usize=2500;
     const MAX_JOBS:usize=8;
@@ -317,7 +332,7 @@ async fn failed_main_diagnostics(root:&Path,gh:&str,repository:&str,head:&str,fa
             Some(job)=>failed_step_logs(root,gh,repository,job).await.ok(),
             None=>None,
         };
-        let text=logs.map(|s|job_diagnostics(&s)).filter(|s|!s.trim().is_empty())
+        let text=logs.map(|s|public_diagnostics(&job_diagnostics(&s))).filter(|s|!s.trim().is_empty())
             .unwrap_or_else(||"Failed-step diagnostics unavailable; failure remains confirmed.\n".into());
         let header=diagnostic_excerpt(&header,budget/2);
         let excerpt=diagnostic_excerpt(&text,budget-header.len()-1);
@@ -433,6 +448,17 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_privacy_withholds_sensitive_lines_without_losing_failure() {
+        let path=format!("{}{}","/home/","invented-runner/work/project");
+        let address=format!("{}@{}","invented-private-fixture","gmail.com");
+        let raw=format!("Step: npm audit\nRun python3 {path}/scripts/check.py\ncontact: {address}\nSeverity: moderate\nGHSA-example\nProcess completed with exit code 1.\n");
+        assert!(augmentagent_channel_core::public_report::validate("",&raw).is_err());
+        let public=public_diagnostics(&raw);
+        assert!(!public.contains(&path) && !public.contains(&address));
+        assert!(public.contains("withheld") && public.contains("GHSA-example") && public.contains("exit code 1"));
+        augmentagent_channel_core::public_report::validate("",&public).unwrap();
+    }
     #[tokio::test]
     async fn diagnostic_transport_and_public_excerpts_are_bounded_and_unicode_safe() {
         let small=format!("{}é🦀finish","a".repeat(65535));

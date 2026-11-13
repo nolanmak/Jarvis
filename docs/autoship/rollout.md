@@ -134,7 +134,9 @@ retain both ends and mark truncation; inspect the job link for full evidence.
 
 Changing diagnostic wording does not replace an existing marked repair issue
 for the same full main SHA. Existing requests, owner holds and accounting remain
-attached to that issue. Public-report validation still gates issue publication.
+attached to that issue. Lines rejected by the public-report privacy check are
+replaced with an explicit withholding marker. Full-report validation still gates
+issue publication; withholding diagnostics never turns a failed check green.
 
 ## Review-held triage
 
