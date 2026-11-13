@@ -421,6 +421,10 @@ pub fn dm_register_warning<'a>(
         return None;
     }
     let prose = if is_register_receipt(first) { rest } else { lead };
+    // Only what the recipient would read is audited: an `<!--aa:assumes`
+    // block is card metadata, and its `aa` would read as a lowercase start.
+    let prose = crate::layout::strip_assumes_for_send(prose);
+    let prose = prose.as_str();
     let declared = recipient_register(samples)?;
     let (paragraphs, _) = draft_paragraphs(&prose.lines().collect::<Vec<_>>(), None);
     contradiction("the recipient writes in", declared, &paragraphs)
@@ -817,6 +821,13 @@ mod tests {
         for samples in [vec![], vec!["ok", "see you"], vec![standard, lower]] {
             assert_eq!(with_register_guidance("PROMPT".into(), samples.clone()), "PROMPT", "{samples:?}");
         }
+        // Card metadata is not prose: a correctly cased reply carrying an
+        // assumption is not flagged for the marker's lowercase `aa`.
+        let with_assumes = crate::layout::append_assumes_marker(
+            "Got it, I see it. I'll send it back.",
+            &["you're free on Thursday".to_string()],
+        );
+        assert!(dm_register_warning([standard], &with_assumes).is_none(), "{with_assumes}");
         // The card backstop reads the same evidence: an `ok` no longer
         // cancels a capitalizing contact's sentence-shaped message.
         assert!(dm_register_warning([standard, "ok"], "got it, i see it. i'll send it back").is_some());
