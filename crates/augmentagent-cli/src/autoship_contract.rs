@@ -557,6 +557,11 @@ impl RegisteredContract {
     pub fn baseline_head(&self) -> &str {
         &self.baseline_head
     }
+    /// A transition remains a distinct registration mode even if its two
+    /// measured environment identities happen to be equal.
+    pub(crate) fn has_environment_transition(&self)->bool {
+        self.candidate_environment_id.is_some()
+    }
     pub fn candidate_environment_id(&self) -> &str {
         self.candidate_environment_id
             .as_deref()

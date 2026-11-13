@@ -319,6 +319,7 @@ impl<'a> OriginalExecution<'a> {
     }
 
     pub(super) fn require_registration(&self,root:&Path,registration:&RegisteredContract)->Result<()> {
+        ensure!(!registration.has_environment_transition(),"baseline-only original plan cannot authorize transition registration");
         ensure!(registration.baseline_head()==self.base && registration.contract()==&self.contract
             && registration.binding(&self.base)?.environment_id==self.environment,"executor registration differs from the frozen original plan");
         registration.verify_integrity(root)?;
@@ -451,6 +452,7 @@ pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
 }
 fn validate_retained_outcome(plan:&Plan,result:&RecordedResult,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<BaselineResult> {
     let registration=&result.baseline.registration;
+    ensure!(!registration.has_environment_transition(),"baseline-only retained original plan cannot bind a transition result");
     ensure!(registration.contract()==&plan.proposal.contract && registration.baseline_head()==plan.base
         && registration.binding(&plan.base)?.environment_id==plan.environment,"retained original result differs from frozen plan");
     OriginalExecution::require_result_commands_read(evidence.workflow(),|key,kind|evidence.record(key,kind),
@@ -841,6 +843,22 @@ mod tests {
             assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&binding,&store.inspect_verifier_evidence(&workflow)).is_err(),"{fault} was accepted as original source");
             assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before);assert_eq!(store.events(&workflow).unwrap(),events);
         }
+    }
+
+    #[tokio::test]
+    async fn original_plan_cannot_accept_an_unbound_environment_transition() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();
+        let environment=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,
+            base,&environment,"original mode-bound executor").unwrap();
+        let transition=RegisteredContract::register_transition(root.path(),
+            prepared.proposal.contract.clone(),base.into(),environment,
+            "separately-authorized-candidate-environment".into()).unwrap();
+        assert!(original.require_registration(root.path(),&transition).is_err(),
+            "a baseline-only original plan accepted a different transition registration without binding or capturing that mode");
+        assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty(),
+            "registration validation dispatched an original command");
     }
 
     #[tokio::test]

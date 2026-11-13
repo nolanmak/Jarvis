@@ -691,3 +691,54 @@ a downstream implementer:
   is now closed/retired after #2072 and must never receive another admission for
   this work. The generic construction service must validate all supplied
   original criteria on eligible ordinary work, without special-casing #2014.
+
+
+## Approved registration execution — test-first work in progress
+
+The post-authority path currently creates the approved registration and calls
+`execute_registered` without `OriginalExecution` custody. Before this guard, a baseline-only
+plan also validated only baseline environment, contract and adapter bytes, so it
+accepted a transition registration with a different candidate environment.
+Those are separate boundaries: merely tightening that validator does not connect
+the approved execution, capture, qualification or recovery path.
+
+The required contract is to bind the exact controller-authorized registration
+mode and candidate environment to an original plan before dispatch. A baseline-only
+plan must reject any transition registration. An approved transition must get its
+own plan/result/command captures, and must never relabel provisional RED receipts.
+The eventual approved path must retain its complete observed outcome before
+classification and independently qualify the exact registration. Candidate GREEN
+and exact-head review remain later gates. Preserve historical v1 plan bytes,
+accounting, uncertain command ownership and existing Pending v1 recovery.
+
+Implementation agent owns the versioned representation, authorized handoff,
+read-only recovery/accounting consumers and their final source/spec audit before
+any engineering PR or activation. The new regression exercises the existing real
+plan/registration validator with a disposable workflow and no model or command
+admission. It is a test-first checkpoint, not an implemented transition service.
+The validator regression now reproduces the intended assertion failure:
+`original_plan_cannot_accept_an_unbound_environment_transition` fails because the
+baseline-only plan accepts the different transition registration (10.17 seconds).
+An earlier compile attempt reused a stale dependency artifact from another
+worktree; that compile failure is not counted as behavioral RED. The source-
+refreshed managed rebuild compiled successfully before reaching this assertion.
+No production workflow or native/model admission was used.
+
+The full exit still requires the actual amendment caller and interrupted/restart
+capture recovery, along with every remaining obligation above. Versioning the
+plan alone is insufficient: original-plan accounting must authenticate ownership
+by the existing constructor measurement and exact retained review authority,
+without spending an initial-scoping grant or making a new budget. The complete
+read-only plan/result/accounting discovery consumers must understand that exact
+mode while retaining historical v1 compatibility. These are implementation-agent
+obligations before engineering PR or activation, not waived by the validator test.
+
+The baseline-only guard now rejects transition registrations before accepting an
+execution registration or retaining its result. The read-only original-outcome
+validator also rejects a transition result under a v1 plan that never bound that
+mode. This changes no historical bytes or charges. The focused managed original-
+execution group passes 27 tests, zero failures and two existing explicit isolation
+ignores (139.68 seconds). This source has not had a new full CLI run or the final
+fresh audits/engineering review. It remains unactivated. A proper authorized
+transition must be implemented through the complete distinct identity/capture/
+ownership path above; callers must not bypass this guard to reuse v1 receipts.
