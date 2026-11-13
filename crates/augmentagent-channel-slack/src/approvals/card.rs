@@ -13,7 +13,8 @@
 //! ≤ 2000, `private_metadata` ≤ 3000.
 
 use augmentagent_approval_discord::{
-    split_assumes, split_needs_input, NeedsInput, MAX_REDRAFT_ITERATIONS, PRESETS,
+    split_assumes, split_needs_input, split_register, NeedsInput, MAX_REDRAFT_ITERATIONS,
+    PRESETS,
 };
 use augmentagent_store::Email;
 use serde_json::{json, Value};
@@ -188,6 +189,9 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
     let r = short_ref(id);
     let merge = email.kind == "identity_merge";
     let (human, needs) = split_needs_input(input.display_draft);
+    // #2014 — lift the register warning out before `split_assumes`, which
+    // splices it away, so a Slack-routed card shows it like Discord does.
+    let (human, register) = split_register(&human);
     let (human, assumes) = split_assumes(&human);
     let at_cap = input.redraft_count >= MAX_REDRAFT_ITERATIONS;
     let subject = if email.subject.trim().is_empty() {
@@ -274,6 +278,9 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         }
         s.push_str("_Not verified — Revise if any of these is wrong._");
         blocks.push(section(s));
+    }
+    if let Some(warning) = &register {
+        blocks.push(section(format!("*⚠️ Register*\n{}", escape(warning))));
     }
 
     let version = if input.redraft_count == 0 {
@@ -676,6 +683,24 @@ mod tests {
             offer_retry: false,
             scheduled_for: None,
         }
+    }
+
+    /// #2014 review: a Slack-only approval surface dropped the register
+    /// warning, because `split_assumes` splices the marker out.
+    #[test]
+    fn register_warning_is_shown_on_a_slack_card() {
+        let email = email();
+        let marked = augmentagent_approval_discord::append_register_warning(
+            "hey, tuesday works",
+            "register mismatch: the recipient writes in standard",
+        );
+        let mut i = input(&email, None);
+        i.display_draft = &marked;
+        let rendered = card(&i).1.to_string();
+        assert!(rendered.contains("Register") && rendered.contains("register mismatch"), "{rendered}");
+        assert!(!rendered.contains("aa:register"), "no raw marker on the card: {rendered}");
+        let plain = card(&input(&email, None)).1.to_string();
+        assert!(!plain.contains("Register"), "{plain}");
     }
 
     #[test]

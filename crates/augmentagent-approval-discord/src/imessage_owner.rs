@@ -693,6 +693,7 @@ impl OwnerSurface {
                 .map_err(|e| ApprovalError::Discord(e.to_string()))?,
         );
         let (clean, needs) = crate::split_needs_input(draft);
+        let (clean, register) = crate::split_register(&clean);
         let (clean, assumptions) = crate::split_assumes(&clean);
         let mut text = format!(
             "{} · {}\nTo: {}\n{}\n\n{}",
@@ -728,6 +729,9 @@ impl OwnerSurface {
         }
         for assumption in assumptions {
             text.push_str(&format!("\nAssumes: {assumption}"));
+        }
+        if let Some(warning) = register {
+            text.push_str(&format!("\nRegister: {warning}"));
         }
         text.push_str(&format!("\n\nRef {reference}\nReply approve / 👍, revise: changes, or skip. You can also react 👍 to approve this version."));
         if text.chars().count() > 256_000 {

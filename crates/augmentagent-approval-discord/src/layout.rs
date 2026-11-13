@@ -139,6 +139,52 @@ pub fn append_assumes_marker(draft: &str, facts: &[String]) -> String {
     out
 }
 
+/// Sentinel fencing the register (casing) warning the delivery layer attaches
+/// to a drafted DM whose sentence starts contradict the register the recipient
+/// writes in (#2014). Same carrier discipline as [`ASSUMES_OPEN`]: an HTML
+/// comment, card-only, absent by default, and scrubbed by
+/// [`strip_assumes_for_send`] before anything ships. Advisory by construction
+/// — it annotates the card and drives no decision, so a mismatch never
+/// refuses the compose, the card or the send.
+const REGISTER_OPEN: &str = "<!--aa:register\n";
+const REGISTER_CLOSE: &str = "\n-->";
+/// [`REGISTER_OPEN`] without its newline, so an unclosed fence is still
+/// scrubbed from a body bound for a recipient.
+const REGISTER_OPEN_PREFIX: &str = "<!--aa:register";
+
+/// Attach the register warning to a draft body. An empty warning returns the
+/// draft unchanged, keeping the matching-register path byte-identical. Append
+/// this BEFORE any needs-input marker: [`split_needs_input`] truncates at its
+/// own fence, so a register fence behind it would never render.
+pub fn append_register_warning(draft: &str, warning: &str) -> String {
+    let line = warning.replace(['\n', '\r'], " ").trim().to_string();
+    if line.is_empty() {
+        return draft.to_string();
+    }
+    format!("{}\n\n{REGISTER_OPEN}{line}{REGISTER_CLOSE}", draft.trim_end())
+}
+
+/// Split a persisted draft into the human-facing draft and the register
+/// warning carried in its marker. No marker ⇒ `(draft, None)`. Splices the
+/// fence out rather than truncating at it, like [`split_assumes`].
+pub fn split_register(draft: &str) -> (String, Option<String>) {
+    let Some(open_at) = draft.rfind(REGISTER_OPEN) else {
+        return (draft.to_string(), None);
+    };
+    let after_open = open_at + REGISTER_OPEN.len();
+    let Some(rel_close) = draft[after_open..].find(REGISTER_CLOSE) else {
+        return (draft.to_string(), None);
+    };
+    let warning = draft[after_open..after_open + rel_close].trim();
+    if warning.is_empty() {
+        return (draft.to_string(), None);
+    }
+    let before = draft[..open_at].trim_end();
+    let after = draft[after_open + rel_close + REGISTER_CLOSE.len()..].trim_start();
+    let human = if after.is_empty() { before.to_string() } else { format!("{before}\n\n{after}") };
+    (human, Some(warning.to_string()))
+}
+
 /// Split a persisted draft into the human-facing draft and the assumed facts
 /// carried in its marker. No marker ⇒ `(draft, vec![])`. Tolerant: a malformed
 /// marker is treated as absent, so a half-parsed HTML comment is never
@@ -149,6 +195,11 @@ pub fn append_assumes_marker(draft: &str, facts: &[String]) -> String {
 /// `[to:]`/`[cc:]` envelope display markers and the needs-input marker are
 /// both appended later — and truncating would silently drop them from the card.
 pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
+    // #2014 — the register warning is a separate concern, read by
+    // [`split_register`]. Splice it out here too so a surface that renders
+    // only the assumes payload shows a clean draft instead of raw markup.
+    let without_register = split_register(draft).0;
+    let draft: &str = &without_register;
     let Some(open_at) = draft.rfind(ASSUMES_OPEN) else {
         return (draft.to_string(), Vec::new());
     };
@@ -177,7 +228,8 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 
 /// Scrub every trace of the assumes marker from a body bound for a real
 /// recipient. Also strips needs-input metadata now shared by all messaging
-/// adapters (#1690); context warnings belong on the card, never in a text.
+/// adapters (#1690) and the register warning (#2014); context warnings belong
+/// on the card, never in a text.
 /// Stricter than [`split_assumes`], which deliberately leaves a
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
@@ -187,7 +239,7 @@ pub fn strip_assumes_for_send(body: &str) -> String {
     // A complete marker comment anywhere (the model sometimes writes a
     // one-line `<!--aa:assumes …-->` before the reply) is spliced out; only
     // an unclosed one truncates, since everything after it is marker text.
-    while let Some(at) = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
+    while let Some(at) = [ASSUMES_OPEN_PREFIX, REGISTER_OPEN_PREFIX, "<!--aa:needs-input"].iter()
         .filter_map(|marker| clean.find(marker)).min()
     {
         touched = true;
@@ -381,6 +433,10 @@ fn approval_embed_and_rows(
     // sees the raw `<!--aa:needs-input …-->` fence and the draft preview is
     // the real reply text. No marker ⇒ `human == draft`, byte-identical card.
     let (human_draft, needs) = split_needs_input(draft);
+    // #2014 — then the register warning, so a casing mismatch with the
+    // recipient's own messages is visible on the card without touching the
+    // draft the owner approves.
+    let (human_draft, register) = split_register(&human_draft);
     // #785 — then lift out the assumed facts, so the preview is the reply the
     // recipient would get and the assumptions get their own field.
     let (human_draft, assumes) = split_assumes(&human_draft);
@@ -423,6 +479,9 @@ fn approval_embed_and_rows(
     }
     if !assumes.is_empty() {
         embed = embed.field("⚠ Assumes", truncate(&format_assumes(&assumes), 1024), false);
+    }
+    if let Some(warning) = &register {
+        embed = embed.field("⚠️ Register", truncate(warning, 1024), false);
     }
     let embed = embed.footer(CreateEmbedFooter::new(footer));
 

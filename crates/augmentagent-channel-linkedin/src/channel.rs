@@ -205,6 +205,35 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
         self.process_email(email).await
     }
 
+    /// #2014 — hold a drafted DM to the register the other person writes in
+    /// (their own message is the recipient-authored evidence here) and carry
+    /// a mismatch to the approval card as metadata. Advisory: nothing is
+    /// refused, the card is posted and Approve still sends.
+    ///
+    /// `persist_to` names the code-mode rail's action row, written by the
+    /// dispatcher before the card is posted: the annotated body is stored so
+    /// the row and the card stay one revision (Approve re-hashes the stored
+    /// draft before it sends). The classic rail logs its row afterwards and
+    /// passes `None`.
+    fn register_checked_draft(
+        &self,
+        email: &augmentagent_store::Email,
+        draft: &str,
+        persist_to: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let (draft, warning) = augmentagent_approval_discord::register::attach_dm_register_warning(
+            [email.body.as_str()],
+            draft,
+        );
+        if let Some(note) = &warning {
+            warn!(message_id = %email.message_id, "linkedin draft register mismatch: {note}");
+            if let Some(action_id) = persist_to {
+                self.store.update_action_status(action_id, ActionStatus::Pending, Some(&draft), None)?;
+            }
+        }
+        Ok(draft)
+    }
+
     /// Run one already-converted DM `Email` through the full triage → draft →
     /// approve → ingest pipeline. Single shared per-message entry point: the
     /// bespoke `poll_once` loop reaches it via `handle_dm` (after the outbound
@@ -525,6 +554,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                     // code-mode-written action row. LinkedIn has no
                     // server-side draft — approval-on-click triggers
                     // voyager send.
+                    let draft_body = self.register_checked_draft(&email, &draft_body, Some(&action_id))?;
                     if let Err(e) = self
                         .approvals
                         .post_approval(&action_id, &email, &draft_body)
@@ -568,6 +598,11 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
                 let draft_prompt = draft_user_message(&email, "", "", &thread_context, "", "");
                 let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
+                // #2014 — mirror the sender's casing at generation.
+                let draft_prompt = augmentagent_approval_discord::register::with_register_guidance(
+                    draft_prompt,
+                    [email.body.as_str()],
+                );
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -640,6 +675,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 // --- DISPATCH (classic) ---
                 // LinkedIn has no server-side draft — we post the approval
                 // card directly, the approver calls voyager send on Approve.
+                let draft = self.register_checked_draft(&email, &draft, None)?;
                 let action_id = self.store.log_action(
                     &email.message_id,
                     email.thread_id.as_deref(),
@@ -972,7 +1008,11 @@ impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEn
         let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
         let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
-        let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        // #2014 — mirror the sender's casing at generation.
+        let draft_prompt = augmentagent_approval_discord::register::with_register_guidance(
+            draft_user_message(&email, "", "", "", "", ""),
+            [email.body.as_str()],
+        );
         let draft = self
             .reasoner
             .call(&draft_opts, &draft_prompt)
@@ -1118,6 +1158,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<String>>,
+        /// Draft bodies exactly as the cards showed them (#2014).
+        drafts: std::sync::Mutex<Vec<String>>,
         flag_posts: std::sync::Mutex<Vec<(String, String)>>,
     }
     #[async_trait]
@@ -1126,9 +1168,10 @@ mod tests {
             &self,
             action_id: &str,
             _email: &Email,
-            _draft: &str,
+            draft: &str,
         ) -> Result<(), ApprovalError> {
             self.posts.lock().unwrap().push(action_id.to_string());
+            self.drafts.lock().unwrap().push(draft.to_string());
             Ok(())
         }
         async fn post_flag_notice(
@@ -1517,5 +1560,136 @@ mod tests {
         };
         let _ = handler.handle(junk).await;
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
+    }
+
+    // ---- #2014: the register check reaches both LinkedIn draft rails ----
+
+    /// A sender who writes in standard capitalization.
+    const CAPITALIZES: &str = "Hi, I wanted to check in on the proposal. Does Thursday still work?";
+    const LOWERCASE_DRAFT: &str = "hey, sending it tonight. thursday still works";
+
+    /// The register warning the rendered card shows for `draft`, asserting
+    /// the embed itself carries it — the owner-visible surface, not just the
+    /// draft metadata.
+    fn carded_warning(action_id: &str, email: &Email, draft: &str) -> Option<String> {
+        let (_, warning) = augmentagent_approval_discord::split_register(draft);
+        if warning.is_some() {
+            let card = serde_json::to_value(augmentagent_approval_discord::approval_message(
+                action_id, email, draft, 0,
+            )).unwrap().to_string();
+            assert!(card.contains("Register") && card.contains("register mismatch"), "{card}");
+        }
+        warning
+    }
+
+    /// The classic-fallback rail end to end, returning the warning the card
+    /// showed and the text the send path would ship. The code-mode attempt
+    /// and its one self-repair pass each consume a scripted response without
+    /// a fenced program, so the drafted reply is the fourth.
+    async fn classic_carded(id: &str, inbound: &str, draft: &'static str) -> (Option<String>, String) {
+        let (store, _f) = tmp_store();
+        let mut dm = sample_dm(id);
+        dm.text = inbound.into();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"direct question"}"#,
+            "no program",
+            "no program",
+            draft,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
+        let ch = LinkedInChannel::new(
+            store.clone(),
+            Arc::new(StubApi { dms: vec![dm] }),
+            reasoner,
+            broker.clone(),
+            ME_URN.into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.awaiting_approval, 1, "a register mismatch must never cost the card");
+        let card_draft = broker.drafts.lock().unwrap()[0].clone();
+        let action_id = broker.posts.lock().unwrap()[0].clone();
+        let action = store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(action.action.status, "pending");
+        let stored = action.action.draft_body.clone().unwrap();
+        // Approve re-hashes the stored draft and refuses a card that no
+        // longer matches it, so the warning rides on both or on neither.
+        assert_eq!(
+            augmentagent_approval_discord::interaction::draft_revision(&stored),
+            augmentagent_approval_discord::interaction::draft_revision(&card_draft),
+        );
+        let warning = carded_warning(&action_id, &action.email, &card_draft);
+        (warning, augmentagent_approval_discord::strip_assumes_for_send(&stored))
+    }
+
+    /// #2014 verbatim on the classic rail: the sender capitalizes, the reply
+    /// came out all-lowercase, and only the email path was checking.
+    #[tokio::test]
+    async fn register_warning_is_visible_on_a_mismatched_classic_card() {
+        let (warning, sent) = classic_carded("m-reg-classic", CAPITALIZES, LOWERCASE_DRAFT).await;
+        let warning = warning.expect("the card carries the register warning");
+        assert!(warning.contains("the recipient writes in standard"), "{warning}");
+        assert_eq!(sent, LOWERCASE_DRAFT, "advisory only: the drafted text still ships");
+        println!("linkedin_classic_register_mismatch_warning_visible");
+        println!("linkedin_register_mismatch_card_pending");
+        println!("linkedin_register_mismatch_approval_eligible");
+    }
+
+    /// The code-mode rail reaches the card through the action row its
+    /// dispatcher already wrote, so the annotated body is persisted there
+    /// before the card is posted (the sandbox itself is exercised in
+    /// channel-core; this is the rail's register step).
+    #[tokio::test]
+    async fn register_warning_is_visible_on_a_mismatched_code_mode_card() {
+        let (store, _f) = tmp_store();
+        disable_gh_for_tests();
+        let ch = LinkedInChannel::new(
+            store.clone(),
+            Arc::new(StubApi { dms: vec![] }),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(RecordingBroker::default()),
+            ME_URN.into(),
+            LinkedInChannelConfig::default(),
+        );
+        let mut dm = sample_dm("m-reg-code");
+        dm.text = CAPITALIZES.into();
+        let email = dm.into_email(ME_URN);
+        store.upsert_email(&email).unwrap();
+        // What the code-mode dispatcher's `tools.draft` leaves behind.
+        let action_id = store.log_action(
+            &email.message_id, email.thread_id.as_deref(), &email.from, &email.subject,
+            Some(&email.body), Some(LOWERCASE_DRAFT), ActionStatus::Pending,
+        ).unwrap();
+        let card_draft = ch.register_checked_draft(&email, LOWERCASE_DRAFT, Some(&action_id)).unwrap();
+        let action = store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(action.action.status, "pending");
+        let stored = action.action.draft_body.clone().unwrap();
+        assert_eq!(stored, card_draft, "the row and the card show one draft");
+        let warning = carded_warning(&action_id, &email, &card_draft)
+            .expect("the card carries the register warning");
+        assert!(warning.contains("the recipient writes in standard"), "{warning}");
+        assert_eq!(augmentagent_approval_discord::strip_assumes_for_send(&stored), LOWERCASE_DRAFT);
+        println!("linkedin_code_register_mismatch_warning_visible");
+    }
+
+    /// An owner override this turn, a draft that mirrors the sender, and a
+    /// thread with nothing sentence-shaped to classify all warn about nothing.
+    #[tokio::test]
+    async fn register_warning_is_suppressed_by_an_override_or_thin_evidence() {
+        for (id, inbound, draft) in [
+            ("m-reg-asked", CAPITALIZES, "register: lowercase (you asked)\nsending it tonight"),
+            ("m-reg-match", CAPITALIZES, "Sending it tonight. Thursday works."),
+            ("m-reg-thin", "ok", LOWERCASE_DRAFT),
+        ] {
+            let (warning, _) = classic_carded(id, inbound, draft).await;
+            assert!(warning.is_none(), "{id}: {warning:?}");
+        }
+        println!("linkedin_register_owner_override_suppressed");
+        println!("linkedin_register_matching_or_insufficient_suppressed");
     }
 }

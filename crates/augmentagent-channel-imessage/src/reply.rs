@@ -123,6 +123,20 @@ pub fn context_body(entries: &[(usize, crate::bundle::MessageEntry)]) -> String 
         .join("\n\n")
 }
 
+/// The recipient's own recent messages from a bundle-backed card body
+/// ([`context_body`]), for the register check (#2014). Only the person being
+/// answered is evidence: the owner's `me` entries say nothing about the
+/// register this reply has to mirror, and in a group neither do the other
+/// members. A body that is not a context digest (an owner-started compose)
+/// yields nothing, so such a draft is left unclassified rather than guessed.
+fn recipient_samples(email: &Email) -> Vec<String> {
+    crate::bundle::parse_entries(&email.body)
+        .into_iter()
+        .filter(|e| e.sender == email.from)
+        .map(|e| e.body)
+        .collect()
+}
+
 /// What [`draft_card`] did with one card email.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handled {
@@ -379,9 +393,16 @@ impl CardDrafter<'_> {
         if group {
             evidence.push_str(&group_note);
         }
+        // #2014 — tell the drafter how this person writes, so the card is
+        // mirrored at generation, not only flagged afterwards.
+        let samples = recipient_samples(&email);
+        let prompt = augmentagent_approval_discord::register::with_register_guidance(
+            draft_user_message(&email, &evidence, "", "", "", ""),
+            samples.iter().map(|s| s.as_str()),
+        );
         let drafted = self
             .reasoner
-            .call(&draft_opts, &draft_user_message(&email, &evidence, "", "", "", ""))
+            .call(&draft_opts, &prompt)
             .await?
             .trim()
             .to_string();
@@ -389,6 +410,16 @@ impl CardDrafter<'_> {
             anyhow::bail!("draft came back empty");
         }
         let drafted = context.guard_draft(&drafted);
+        // #2014 — hold the draft to the register the recipient writes in and
+        // carry a mismatch to the card. Advisory: the card is still posted
+        // and Approve still sends.
+        let (drafted, register) = augmentagent_approval_discord::register::attach_dm_register_warning(
+            samples.iter().map(|s| s.as_str()),
+            &drafted,
+        );
+        if let Some(note) = &register {
+            info!(message_id = %email.message_id, "imessage draft register mismatch: {note}");
+        }
         // One live reply card per conversation: the newer message replaces
         // it. A pending compose the owner started stays (#1635).
         let thread = email.thread_id.clone().unwrap_or_default();
@@ -1132,5 +1163,107 @@ mod tests {
         let e = reply_email(&one_to_one(&[(PHONE, "hi")])).unwrap();
         assert_eq!(e.subject, "iMessage: Alex");
         assert!(e.to.is_empty());
+    }
+
+    // ---- #2014: the register check reaches the iMessage card ----
+
+    /// A recipient who writes in standard capitalization.
+    const CAPITALIZES: &str = "Hi, I wanted to check in on the proposal. Does Thursday still work?";
+    const LOWERCASE_DRAFT: &str = "hey, sending it tonight. thursday still works";
+
+    /// The register warning the card carried as metadata, plus the text the
+    /// send path would ship. Asserts the rendered embed shows the warning —
+    /// the owner-visible surface, not just the draft metadata.
+    async fn carded(entries: &[(&str, &str)], draft: &str) -> (Option<String>, String) {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let d = one_to_one(entries);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[REPLY, draft])).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1, "a register mismatch must never cost the card");
+        let (action_id, card_draft) = f.broker.cards.lock().unwrap()[0].clone();
+        let action = f.store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(action.action.status, "pending");
+        let stored = action.action.draft_body.clone().unwrap();
+        // Approve re-hashes the stored draft and refuses a card that no
+        // longer matches it, so the warning must ride on both or on neither.
+        assert_eq!(
+            augmentagent_approval_discord::interaction::draft_revision(&stored),
+            augmentagent_approval_discord::interaction::draft_revision(&card_draft),
+            "the card and the stored draft must stay one revision"
+        );
+        let (_, warning) = augmentagent_approval_discord::split_register(&card_draft);
+        if warning.is_some() {
+            let card = serde_json::to_value(augmentagent_approval_discord::approval_message(
+                &action_id, &action.email, &card_draft, 0,
+            )).unwrap().to_string();
+            assert!(card.contains("Register") && card.contains("register mismatch"), "{card}");
+            println!("imessage_register_mismatch_warning_visible");
+            println!("imessage_register_mismatch_card_pending");
+        }
+        (warning, augmentagent_approval_discord::strip_assumes_for_send(&stored))
+    }
+
+    /// #2014 verbatim: the recipient's recent messages use standard
+    /// capitalization and the reply was drafted all-lowercase. Only the email
+    /// path checked that, so the text shipped with nothing catching it.
+    #[tokio::test]
+    async fn register_warning_is_visible_on_a_mismatched_imessage_card() {
+        let (warning, sent) = carded(&[(PHONE, CAPITALIZES)], LOWERCASE_DRAFT).await;
+        let warning = warning.expect("the card carries the register warning");
+        assert!(warning.contains("the recipient writes in standard"), "{warning}");
+        // Advisory: the reply is still approvable and what ships is the
+        // drafted text, warning scrubbed.
+        assert_eq!(sent, LOWERCASE_DRAFT);
+        println!("imessage_register_mismatch_approval_eligible");
+    }
+
+    /// #2014 (Nov 13 repro): the proactive card drafter wrote all-lowercase
+    /// to a contact who writes in sentence case, because its prompt never
+    /// said how the contact writes. The draft prompt now carries their
+    /// register; the owner's own turns are not evidence for it.
+    #[tokio::test]
+    async fn the_card_drafter_is_told_to_mirror_a_capitalizing_contact() {
+        let inbound = "Sounds good. I sent the document yesterday afternoon, check email.";
+        for (entries, told) in [
+            (&[(PHONE, inbound)][..], true),
+            (&[("me", inbound), (PHONE, "ok")][..], false),
+        ] {
+            let f = fx();
+            f.store.allow_imessage_inbound(PHONE).unwrap();
+            let d = one_to_one(entries);
+            ingest(&f.store, &d);
+            let r = Scripted::new(&[REPLY, "Got it, I see it. I'll send it back."]);
+            let stats = replier(&f, Arc::clone(&r)).handle_deltas(&[d]).await;
+            assert_eq!(stats.cards, 1);
+            let prompts = r.prompts();
+            let draft_prompt = prompts.last().unwrap();
+            assert_eq!(
+                draft_prompt.contains("<recipient_register>\nThis person writes in standard capitalization"),
+                told,
+                "{entries:?}: {draft_prompt}"
+            );
+        }
+    }
+
+    /// #1107 semantics carry over: a receipt marked `(you asked)` records an
+    /// owner-dictated register this turn and is not second-guessed. A draft
+    /// that mirrors the recipient and a thread with nothing sentence-shaped
+    /// to classify also warn about nothing — and the owner's own turns are
+    /// not evidence, however they are cased, so a digest whose only prose is
+    /// the owner's decides nothing either.
+    #[tokio::test]
+    async fn register_warning_is_suppressed_by_an_override_or_thin_evidence() {
+        for (entries, draft) in [
+            (&[(PHONE, CAPITALIZES)][..], "register: lowercase (you asked)\nsending it tonight"),
+            (&[(PHONE, CAPITALIZES)][..], "Sending it tonight. Thursday works."),
+            (&[(PHONE, "ok")][..], LOWERCASE_DRAFT),
+            (&[("me", CAPITALIZES), (PHONE, "ok")][..], LOWERCASE_DRAFT),
+        ] {
+            let (warning, _) = carded(entries, draft).await;
+            assert!(warning.is_none(), "{draft}: {warning:?}");
+        }
+        println!("imessage_register_owner_override_suppressed");
+        println!("imessage_register_matching_or_insufficient_suppressed");
     }
 }
