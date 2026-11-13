@@ -174,6 +174,13 @@ selection. The legacy configured multi-repository route currently has only the
 selection filter; #2056 owns its missing durable claim/model-admission integration.
 Primary-route claim tests do not prove that configured execution is fenced.
 
+Primary automatic selection also skips authors who fail the existing owner,
+write-association or explicit-author allowlist policy. It continues through the
+complete inventory to authorized peers without commenting on or labeling those
+untrusted issues. They still need explicit owner authorization; neither a bot
+identity nor a label grants it. The final execution trust guard remains in place,
+and the configured legacy approval policy is unchanged.
+
 A fresh-selection `owner-control-unavailable` hold means the existing protected
 control state or canonical identity could not be read reliably. It is unpaid;
 inspect the configured state and its access rather than treating unknown state

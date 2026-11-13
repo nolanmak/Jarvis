@@ -182,7 +182,8 @@ async fn trust_child(repo:&Path,path:&Path,case:&str) {
     });
     drop(store);
     for (login,association) in [("another-owner","owner"),("member-login","MEMBER"),("collaborator-login","collaborator"),("FiXtUrE-OwNeR","NONE")] {
-        let a=if case=="trust-paused" {row(42,"fixture-owner","OWNER")}else{row(42,"github-actions[bot]","NONE")};
+        let mut a=if case=="trust-paused" {row(42,"fixture-owner","OWNER")}else{row(42,"github-actions[bot]","NONE")};
+        if case=="trust-peers" {a["body"]="Background mentions .env but has no owner authorization".into();}
         let mut rows=vec![a,row(41,"outside-author","NONE")];
         if case!="trust-all" {rows.push(row(40,login,association));}
         let inventory=if case=="trust-pages" {
@@ -206,6 +207,13 @@ async fn trust_child(repo:&Path,path:&Path,case:&str) {
             assert_eq!(&store.events(&id).unwrap(),events,"selection changed refused-source accounting or history");
         }
         assert!(store.snapshot(&workflow_id(REPOSITORY,40).unwrap()).unwrap().is_none());
+    }
+    let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_PAUSED_CALLS").unwrap()).unwrap();
+    for call in calls.lines() {
+        let args:Vec<String>=serde_json::from_str(call).unwrap();
+        if matches!(args.first().map(String::as_str),Some("issue"|"pr")) {
+            assert_eq!(args.get(1).map(String::as_str),Some("list"),"selection attempted a public triage mutation");
+        }
     }
     assert!(!repo.join(".self-improve-worktrees").exists());
     assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(),"original candidate\n");
