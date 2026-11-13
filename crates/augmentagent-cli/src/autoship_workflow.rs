@@ -441,6 +441,12 @@ impl WorkflowStore {
         let custody=baseline_native_custody(&tx,&lease.workflow)?;
         tx.commit()?;Ok(custody)
     }
+    pub(crate) fn construction_native_custody(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<Vec<NativeScopeCustody>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let custody=construction_native_custody(&tx,&lease.workflow)?;
+        tx.commit()?;Ok(custody)
+    }
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
         use std::os::unix::fs::MetadataExt;

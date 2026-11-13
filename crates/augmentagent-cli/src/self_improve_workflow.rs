@@ -988,6 +988,7 @@ impl WorkflowGuard {
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
         let acceptance_authority=self.acceptance_authority.clone();let worktree=self.worktree.clone();
+        let repository=self.repository.clone();
         self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
@@ -995,6 +996,8 @@ impl WorkflowGuard {
             anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
             let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_native_custody(&worktree,&custody)?;
+            let construction=store.construction_native_custody(&lease,&current.checkpoint.binding,millis())?;
+            acceptance::require_retained_constructor_custody(&worktree,&repository,&lease.workflow,&construction)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
                 let state=store.snapshot(&lease.workflow)?.context("workflow missing")?;
                 let authority=acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?;

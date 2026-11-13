@@ -221,6 +221,20 @@ provider/role/binding changes. All 222 durable-workflow tests pass. These tests
 script response-index data only; they do not establish physical provenance,
 original behavioral red, witness qualification or a live constructor.
 
+The next connected regression reproduced a fresh native admission with paired
+database strings but no private proof file. The actual admission observer now
+also validates constructor evidence in its independently derived controller
+namespace: immutable request bytes, request/provenance digests, workflow,
+provider/session ownership metadata, response digest, file ownership/mode/links,
+and separation from worker storage. Focused constructor tests pass (5), as do
+265 workflow tests (one existing ignored test). The explicit production
+read-only source probe still authenticates all eight retained #2014 files,
+reconstructs the bounded complete request, and verifies unchanged workflow
+state with no model calls. The existing witness producer remains unchanged.
+These are transport-custody results, not native constructor execution or
+behavioral acceptance. The native dispatch caller, pre-release persistence
+integration and source/staging/held-work integrations remain unfinished.
+
 This selects the transport and custody shape. Its implementation, source-read
 interface, physical-provenance tests and restricted held-work lease are still
 required before enabling a production constructor call.

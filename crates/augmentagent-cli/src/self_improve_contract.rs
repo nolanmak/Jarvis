@@ -17,6 +17,11 @@ mod fixture_probe;
 
 #[path = "self_improve_amendment.rs"]
 mod amendment;
+#[path = "self_improve_constructor_native.rs"]
+mod constructor_native;
+pub(super) fn require_retained_constructor_custody(root:&Path,repository:&str,workflow:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    constructor_native::require_retained(root,repository,workflow,observations)
+}
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
