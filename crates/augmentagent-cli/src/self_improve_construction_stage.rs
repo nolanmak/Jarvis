@@ -2,7 +2,7 @@
 //! This service is not yet enrolled by the held-work selector or adjudicator.
 use super::*;
 
-fn authenticate(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement)->Result<()> {
+pub(super) fn authenticate(root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode,measurement:&Measurement)->Result<()> {
     episode.require_current(root,workflow)?;
     ensure!(measurement.episode==episode.key(),initial_repair::Hold::EvidenceUnknown);
     let saved:Measurement=read(workflow,&intent_key(episode.key(),measurement.slot))?.context(initial_repair::Hold::EvidenceUnknown)?;
@@ -92,6 +92,8 @@ where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::Wo
     ensure!(actual_head(&original).await?==episode.original_base() && environment==episode.original_environment(),initial_repair::Hold::EvidenceUnknown);
     let executor=verifier_executor_id()?;
     let proposal=measurement.proposal();
+    let (plan,body)=verifier_execution::plan_input(workflow,proposal,episode.original_base(),&environment,&executor)?;
+    accounting::reserve(root,workflow,episode,measurement,&plan,&body)?;
     // OriginalExecution retains every conclusive result, including already
     // green and unexpected failures. Reuse those exact observations too.
     let baseline=if let Some((_,baseline))=verifier_execution::OriginalExecution::retained_result(&original,workflow,proposal,episode.original_base(),&environment,&executor)? {
@@ -172,6 +174,32 @@ pub(super) mod tests {
         drop(store);guard.finish().unwrap();
     }
 
+    #[tokio::test]
+    async fn fresh_scoper_cannot_bypass_unsettled_constructor_execution_with_an_initial_budget() {
+        let (root,control,old,guard,episode)=super::super::tests::fixture().await;
+        let _execution=verifier_execution::OriginalExecution::begin(&guard,episode.control(),&old.proposal,episode.original_base(),episode.original_environment(),&verifier_executor_id().unwrap()).unwrap();
+        let plan=guard.verifier_evidence_page("original_verifier_plan",0).unwrap().pop().unwrap();
+        let attempt="b".repeat(64);let verifier=&old.proposal.contract.verifiers[0].id;
+        let key=digest(&serde_json::to_vec(&("original-verifier-command-v1",&plan.key,&attempt,verifier)).unwrap());
+        guard.record_verifier_evidence(&key,"original_verifier_command_admission",&serde_json::json!({"version":1,
+            "kind":"original_verifier_command_admission","workflow":guard.id(),"plan":plan.key,"attempt":attempt,
+            "verifier":verifier,"identity":{}}).to_string()).unwrap();
+        // A fresh scoper/reviewer has no constructor-purpose prefix. Its
+        // actual model admission must still retain the old command's hold.
+        let provider=augmentagent_channel_core::ProviderKind::Codex;
+        let result=augmentagent_channel_core::native_session::fresh_review_scope(provider,async {
+            let session=augmentagent_channel_core::native_session::current_for(provider)?.unwrap();
+            let mut native=session.begin(provider)?;
+            guard.audit_logger().model_call_admitted(provider.name())?;
+            native.observe("test-fresh-scoper-admission")?;native.finish()?;
+            Ok(())
+        }).await;
+        assert!(result.is_err(),"fresh scoper admitted a model call around unsettled original execution");
+        let snapshot=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(snapshot.model_calls,0,"changing model purpose bypassed the execution hold");
+        guard.finish().unwrap();
+    }
+
     #[cfg(target_os="linux")]
     #[tokio::test]
     #[ignore="actual isolated original execution owns managed storage; run built test outside cargo-managed lease; constructor and witness replies are scripted"]
@@ -215,6 +243,7 @@ pub(super) mod tests {
             ensure!(commands.len()==1,"original measurement was not admitted exactly once");
             ensure!(guard.verifier_evidence_page("original_verifier_command_quiescent",0)?.len()==1,"original command was not quiescent");
             ensure!(guard.verifier_evidence_page("original_verifier_result",0)?.len()==1,"original result was not retained before qualification");
+            ensure!(verifier_execution::retained_original_plan_budget_contexts(root.path(),control.path(),&guard)?.is_empty(),"actual constructed measurement leaked into initial-repair accounting");
             match qualification {
                 "positive"=>{
                     let staged=result.map_err(|e|e.context("actual isolated constructed stage"))?;

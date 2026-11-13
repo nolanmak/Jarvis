@@ -205,15 +205,42 @@ episode references after a restart and repairing missing paired publication
 across episode changes remain separate work; the current reader holds on missing
 publication.
 
-Before activating staging, connect construction ownership of its original plans
-to budget-history inspection: `retained_original_plan_budget_contexts` currently
-derives initial-repair contexts for all plans. Do not misclassify a construction
-plan as an unowned initial plan or create a new initial budget to mask it. Also
-connect complete authenticated compiler/setup output and negative witness prose
+Construction ownership is now connected to original-plan budget inspection.
+Before creating a plan, staging writes an immutable indexed
+`construction_original_plan_owner` record, bound to the exact plan, canonical
+episode and already charged measurement intent. Historical inspection verifies
+that intent, its actual native admission and private paired completion, and the
+exact returned proposal. Only then can it exclude the plan from initial-repair
+contexts. Existing plans without that earlier ownership record cannot be
+retroactively relabeled. Rejected intents and old bindings retain ownership and
+charges. Forged markers, lost role indexes or missing native proof hold instead
+of allowing a new initial budget. The existing plan serialization and initial
+budget references remain unchanged; this adds no model admission or approval.
+
+Before activation, connect complete authenticated compiler/setup output and negative witness prose
 to the next constructor request through the existing capture/diagnosis services;
 a generic `BaselineNotRed` detail alone is insufficient. These are production
 integration requirements along with the restricted lease/selector, typed
 authority admission and full original fixture coverage.
+
+The ownership checkpoint has 56 selected accounting, initial-repair, recovery,
+constructor and transport tests passing (one explicit isolation ignore). The
+separate delegated isolated staging test passes again in 272.96 seconds, now
+checking actual original-plan ownership as well as command-result replay. This
+still uses scripted constructor/witness replies and proves no #2014 correction
+or autonomous shipping.
+
+The authority integration must re-read the exact retained original result and
+its captures immediately before spending review authority. The current live
+stage object rechecks constructor/witness/binding/environment but does not yet
+carry an exact original-result reference for that later boundary. Include a
+capture-loss-after-staging regression; the constructor-purpose all-command guard
+alone is not a substitute for the authority's typed input gate. Also preserve an
+unadmitted saved request across producer-policy rollouts without spending or
+refilling its episode: the current transport conservatively refuses a fresh call
+under an old producer hash. Any supported migration must authenticate absence of
+an earlier actual admission, preserve the frozen payload and all existing charges,
+and avoid treating a completed refusal or unknown outcome as setup failure.
 
 Staging verification checkpoint: 51 selected construction/transport/execution
 tests pass, with three explicit isolation ignores. The new isolated staging test

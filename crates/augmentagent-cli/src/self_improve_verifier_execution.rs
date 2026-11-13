@@ -5,9 +5,21 @@ mod capture;
 
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Plan {
+pub(super) struct Plan {
     version:u32,kind:String,workflow:String,binding:crate::autoship_workflow::Binding,
     base:String,environment:String,executor:String,proposal:ContractProposal,
+}
+impl Plan {
+    pub(super) fn checked(workflow:&str,key:&str,body:&str)->Result<Self> {
+        ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
+        let plan:Self=serde_json::from_str(body)?;
+        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
+            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
+        Ok(plan)
+    }
+    pub(super) fn inputs(&self)->(&crate::autoship_workflow::Binding,&str,&str,&ContractProposal) {
+        (&self.binding,&self.base,&self.environment,&self.proposal)
+    }
 }
 
 #[derive(Debug)]
@@ -343,13 +355,11 @@ impl<'a> OriginalExecution<'a> {
 
 /// Every retained original plan must have a matching accounting context before
 /// a missing-scope frontend may start fresh work for a different trusted input.
-pub(super) fn retained_original_plan_budget_contexts(_root:&Path,_native_control:&Path,workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
-    fn checked(workflow:&str,key:&str,body:&str)->Result<String> {
-        ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
-        let plan:Plan=serde_json::from_str(body)?;
-        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
-            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
-        initial_plan_budget_context(workflow,&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)
+pub(super) fn retained_original_plan_budget_contexts(root:&Path,native_control:&Path,workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
+    fn checked(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,key:&str,body:&str)->Result<Option<String>> {
+        let plan=Plan::checked(workflow.id(),key,body)?;
+        if amendment::construction_plan_owned(root,control,workflow,key,body)? {return Ok(None);}
+        Ok(Some(initial_plan_budget_context(workflow.id(),&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)?))
     }
     let mut cursor=0;let mut contexts=std::collections::BTreeSet::new();let mut indexed=std::collections::BTreeSet::new();let mut count=0usize;
     loop {
@@ -357,7 +367,7 @@ pub(super) fn retained_original_plan_budget_contexts(_root:&Path,_native_control
         if rows.is_empty() {break;}
         for row in rows {
             count+=1;ensure!(count<=8192,"original plan accounting exceeds inspection bound");cursor=row.sequence;
-            contexts.insert(checked(workflow.id(),&row.key,&row.body)?);indexed.insert(row.key);
+            if let Some(context)=checked(root,native_control,workflow,&row.key,&row.body)? {contexts.insert(context);}indexed.insert(row.key);
         }
     }
     // Enumerating only the verifier index would lose a plan when that index
@@ -376,7 +386,7 @@ pub(super) fn retained_original_plan_budget_contexts(_root:&Path,_native_control
                 if value["kind"]=="original_verifier_plan"
                     && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&body))?)==key {
                     ensure!(indexed.contains(&key),"original plan lost its verifier index");
-                    contexts.insert(checked(workflow.id(),&key,&body)?);
+                    if let Some(context)=checked(root,native_control,workflow,&key,&body)? {contexts.insert(context);}
                 }
             }
             after=key;

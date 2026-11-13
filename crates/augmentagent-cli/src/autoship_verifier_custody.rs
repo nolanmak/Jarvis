@@ -142,7 +142,7 @@ impl WorkflowStore {
 
     pub(crate) fn record_verifier_evidence(&mut self,lease:&Lease,binding:&Binding,key:&str,kind:&str,body:&str,now:i64)->Result<()> {
         ensure!(key.len()==64 && key.bytes().all(|c|c.is_ascii_hexdigit()) && body.len()<=2*1024*1024,"invalid bounded verifier evidence");
-        ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|"original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"),"unknown verifier evidence role");
+        ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|"original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"|"construction_original_plan_owner"),"unknown verifier evidence role");
         let parsed:serde_json::Value=serde_json::from_str(body)?;
         ensure!(parsed["version"]==1 && parsed["kind"]==kind && parsed["workflow"]==lease.workflow,"verifier evidence owner or role changed");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

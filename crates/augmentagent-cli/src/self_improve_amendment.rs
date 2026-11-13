@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 mod source_evidence;
 #[path = "self_improve_construction.rs"]
 mod construction;
+pub(super) fn construction_plan_owned(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,plan:&str,body:&str)->Result<bool> {
+    construction::original_plan_owned(root,control,workflow,plan,body)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Decision {

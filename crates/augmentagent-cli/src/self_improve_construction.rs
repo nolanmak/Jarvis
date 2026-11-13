@@ -5,6 +5,9 @@ use super::*;
 mod staging;
 #[path="self_improve_construction_accounting.rs"]
 mod accounting;
+pub(super) fn original_plan_owned(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,plan:&str,body:&str)->Result<bool> {
+    accounting::owned(root,control,workflow,plan,body)
+}
 pub(super) use staging::{stage,StagedCorrection};
 
 const TURNS:u32=6;

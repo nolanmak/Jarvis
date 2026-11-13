@@ -59,6 +59,10 @@ impl Input {
         Ok(())
     }
     pub(super) fn request_text(&self)->&str {&self.prompt}
+    pub(super) fn require_history(&self,workflow:&str,base:&str,episode:&str)->Result<()> {
+        self.validate()?;
+        ensure!(self.workflow==workflow && self.original_base==base && self.episode==episode,"constructor historical input changed");Ok(())
+    }
 }
 
 #[derive(Clone,Debug,Serialize,Deserialize)]
@@ -185,13 +189,21 @@ fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::aut
 /// does not require current episode enrollment and can never dispatch. Missing
 /// paired publication remains a hold; ordinary leased exchange owns repair.
 pub(super) fn retained(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {
+    ensure!(workflow.id()==episode.workflow(),"constructor recovery belongs to another workflow");
+    input.require_episode(episode)?;
+    retained_in(root,episode.control(),workflow,input)
+}
+
+/// Data-only historical reader. The caller supplies the independently derived
+/// workflow control directory, never a path selected by the stored reference.
+pub(super) fn retained_in(root:&Path,control:&Path,workflow:&workflow::WorkflowGuard,input:&Input)->Result<Reply> {
     (||->Result<Reply> {
         workflow.validate_before_side_effect()?;
-        ensure!(workflow.id()==episode.workflow(),"constructor recovery belongs to another workflow");
-        input.require_episode(episode)?;
+        input.validate()?;
+        ensure!(input.workflow==workflow.id(),"constructor recovery belongs to another workflow");
         let purpose=input.purpose()?;
         let provider=workflow.construction_native_admission(&purpose)?.context("constructor lacks original actual admission")?;
-        let (reply,reference)=original_completion(root,episode.control(),input,provider)?;
+        let (reply,reference)=original_completion(root,control,input,provider)?;
         let (raw,proof)=crate::autoship_workflow::construction_native_response_keys(&purpose)?;
         let (text,encoded)=workflow.scope_stage_response_pair(&raw,&proof)?.context("constructor completion lacks paired publication")?;
         ensure!(text==reply.text && encoded==reference,"constructor recovered data differs from paired publication");
