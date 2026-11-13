@@ -26,9 +26,12 @@ pub(super) struct Input {
     prompt:String,
 }
 impl Input {
-    pub(super) fn new(workflow:&str,original_base:&str,episode:&str,provider:augmentagent_channel_core::ProviderKind,model:&str,system:&str,prompt:&str)->Result<Self> {
+    fn new(workflow:&str,original_base:&str,episode:&str,provider:augmentagent_channel_core::ProviderKind,model:&str,system:&str,prompt:&str)->Result<Self> {
         let input=Self {workflow:workflow.into(),original_base:original_base.into(),episode:episode.into(),provider:provider.name().into(),policy:policy_hash(),model:model.into(),system:system.into(),prompt:prompt.into()};
         input.validate()?;Ok(input)
+    }
+    pub(super) fn for_episode(episode:&amendment::ConstructionEpisode,provider:augmentagent_channel_core::ProviderKind,model:&str,system:&str,prompt:&str)->Result<Self> {
+        Self::new(episode.workflow(),episode.original_base(),episode.key(),provider,model,system,prompt)
     }
     fn validate(&self)->Result<()> {
         ensure!(!self.workflow.is_empty() && self.workflow.len()<=1024,"invalid constructor workflow");
@@ -173,8 +176,11 @@ fn original_completion(root:&Path,control:&Path,input:&Input,provider:crate::aut
 
 /// Actual native transport. Callers still need the restricted construction
 /// lease and a controller-computed episode; no proposal is approved here.
-pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,input:&Input)->Result<Reply> {
+pub(super) async fn call(root:&Path,workflow:&workflow::WorkflowGuard,episode:&amendment::ConstructionEpisode,input:&Input)->Result<Reply> {
     use std::os::unix::fs::DirBuilderExt;
+    episode.require_current(workflow)?;
+    ensure!(episode.workflow()==workflow.id() && input.workflow==episode.workflow()
+        && input.original_base==episode.original_base() && input.episode==episode.key(),"constructor request differs from its controller-owned episode");
     workflow.require_fresh_issue(root).await?;
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&control)?;

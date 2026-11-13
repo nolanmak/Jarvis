@@ -9,7 +9,7 @@ pub(super) struct Evidence {
     sources: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadRequest {
     file_index: usize,
@@ -20,6 +20,62 @@ struct ReadRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection { requests: Vec<ReadRequest> }
+
+/// Constructor-only source view. Its private entries are created from Git,
+/// never deserialized from model output or treated as witness provenance.
+pub(super) struct ConstructorTable {
+    base:String,
+    identity:String,
+    entries:Vec<(String,String)>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConstructorSelection {table_sha256:String,requests:Vec<ReadRequest>}
+impl ConstructorTable {
+    pub(super) async fn for_episode(root:&Path,episode:&ConstructionEpisode)->Result<Self> {
+        Self::build(root,episode.original_base()).await
+    }
+    async fn build(root:&Path,base:&str)->Result<Self> {
+        ensure!(matches!(base.len(),40|64) && base.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"constructor source requires literal original commit");
+        let tree=trusted_git(root,&["--no-replace-objects","ls-tree","-r","--long","-z",base]).await?;
+        ensure!(tree.len()<=1024*1024,"constructor source table exceeds bound");
+        let mut entries=Vec::new();
+        for entry in tree.split('\0').filter(|e|!e.is_empty()) {
+            let (metadata,path)=entry.split_once('\t').context("invalid constructor Git table")?;
+            let fields=metadata.split_whitespace().collect::<Vec<_>>();
+            if fields.get(1)!=Some(&"blob") || !matches!(fields.first().copied(),Some("100644"|"100755"))
+                || !scope_authority::witness_source_allowed(path) {continue;}
+            ensure!(fields.len()==4 && matches!(fields[2].len(),40|64) && fields[2].bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid constructor blob identity");
+            let size=fields[3].parse::<u64>().context("invalid constructor blob size")?;
+            // Column padding and Git display formatting are not source input.
+            entries.push((format!("{} blob {} {size}",fields[0],fields[2]),path.to_owned()));
+        }
+        let identity=digest(&serde_json::to_vec(&("constructor-original-source-table-v1",base,&entries))?);
+        Ok(Self {base:base.into(),identity,entries})
+    }
+    pub(super) fn page(&self,offset:usize,limit:usize)->Result<String> {
+        ensure!(offset<=self.entries.len() && (1..=128).contains(&limit),"invalid constructor source page");
+        let entries=self.entries.iter().enumerate().skip(offset).take(limit).map(|(index,(metadata,path))|
+            serde_json::json!({"file_index":index,"path":path,"git_metadata":metadata})).collect::<Vec<_>>();
+        let encoded=serde_json::to_string(&serde_json::json!({"version":1,"original_base":self.base,"table_sha256":self.identity,"offset":offset,"total":self.entries.len(),"entries":entries}))?;
+        ensure!(encoded.len()<=32*1024,"constructor source page exceeds bound; request fewer entries");
+        Ok(encoded)
+    }
+    pub(super) async fn read(&self,root:&Path,raw:&str,budget:usize)->Result<Evidence> {
+        ensure!((1024..=512*1024).contains(&budget) && raw.len()<=32*1024,"invalid constructor source request budget");
+        let selected:ConstructorSelection=serde_json::from_str(raw)?;
+        ensure!(selected.table_sha256==self.identity,"constructor source table identity differs");
+        ensure!(!selected.requests.is_empty() && selected.requests.len()<=16,"constructor requires 1-16 source requests");
+        for request in &selected.requests {
+            ensure!(request.file_index<self.entries.len() && request.start_line>0 && request.end_line>=request.start_line
+                && request.end_line-request.start_line<600
+                && request.needle.as_ref().is_none_or(|needle|!needle.is_empty() && needle.len()<=256),"invalid constructor source selection");
+        }
+        let identity=digest(&serde_json::to_vec(&("constructor-original-source-data-v1",&self.base,&self.identity,&selected.requests))?);
+        let entries=self.entries.iter().map(|(metadata,path)|(metadata.as_str(),path.as_str())).collect::<Vec<_>>();
+        render_selection(root,&self.base,&entries,identity,Selection {requests:selected.requests},budget).await
+    }
+}
 
 // The already-supported frozen data projection in scope_authority. This
 // constant admits only that indexed-source protocol, never an old judgment.
@@ -317,6 +373,10 @@ pub(super) async fn read_bounded(
         accepted=Some((identity,selection));
     }
     let (identity,selected)=accepted.context("accepted original source selection unavailable")?;
+    render_selection(root,base,&entries,identity,selected,budget).await
+}
+
+async fn render_selection(root:&Path,base:&str,entries:&[(&str,&str)],identity:String,selected:Selection,budget:usize)->Result<Evidence> {
     let mut full = BTreeMap::new();
     let mut partial = BTreeMap::new();
     let mut complete = true;
@@ -348,6 +408,84 @@ pub(super) async fn read_bounded(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    async fn commit_constructor_source_fixture(root:&Path) {
+        for args in [vec!["add","-A"],vec!["commit","-qm","constructor source fixture"]] {
+            let out=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"])
+                .args(args).current_dir(root).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(out.status.success());
+        }
+    }
+    fn constructor_query(page:&serde_json::Value,path:&str,start:usize,end:usize)->String {
+        let file=page["entries"].as_array().unwrap().iter().find(|e|e["path"]==path).unwrap();
+        serde_json::json!({"table_sha256":page["table_sha256"],"requests":[{"file_index":file["file_index"],"start_line":start,"end_line":end,"needle":null}]}).to_string()
+    }
+    #[tokio::test]
+    async fn constructor_sources_read_original_git_without_borrowing_witness_custody() {
+        let (root,_control,base,_unused_witness)=fixture().await;
+        let table=ConstructorTable::build(root.path(),&base).await.unwrap();
+        let page:serde_json::Value=serde_json::from_str(&table.page(0,128).unwrap()).unwrap();
+        std::fs::write(root.path().join("behavior.rs"),"candidate replacement must not be read").unwrap();
+        let evidence=table.read(root.path(),&constructor_query(&page,"behavior.rs",1,1),4096).await.unwrap();
+        assert_eq!(evidence.sources["behavior.rs"],"pub fn behavior() -> bool { false }\n");
+        assert!(evidence.coverage.starts_with("complete selected original files"));
+        assert_eq!(evidence.original_base,base);
+        assert!(ConstructorTable::build(root.path(),"HEAD").await.is_err());
+    }
+    #[tokio::test]
+    async fn constructor_sources_reject_foreign_tables_paths_ranges_and_non_text() {
+        let (root,_control,base,_)=fixture().await;
+        let table=ConstructorTable::build(root.path(),&base).await.unwrap();
+        let page:serde_json::Value=serde_json::from_str(&table.page(0,128).unwrap()).unwrap();
+        let valid:serde_json::Value=serde_json::from_str(&constructor_query(&page,"behavior.rs",1,1)).unwrap();
+        for mutation in ["table","ordinal","range","needle","path","extra"] {
+            let mut query=valid.clone();
+            match mutation {
+                "table"=>query["table_sha256"]="f".repeat(64).into(),
+                "ordinal"=>query["requests"][0]["file_index"]=999999.into(),
+                "range"=>query["requests"][0]["start_line"]=0.into(),
+                "needle"=>query["requests"][0]["needle"]="".into(),
+                "path"=>query["requests"][0]["path"]="/etc/passwd".into(),
+                "extra"=>query["untrusted_path"]="behavior.rs".into(),_=>unreachable!(),
+            }
+            assert!(table.read(root.path(),&query.to_string(),4096).await.is_err(),"accepted {mutation}");
+        }
+        assert!(table.read(root.path(),&constructor_query(&page,"zzz-invalid.bin",1,1),4096).await.is_err());
+        assert!(table.page(0,0).is_err());assert!(table.page(0,129).is_err());assert!(table.page(999999,1).is_err());
+    }
+    #[tokio::test]
+    async fn constructor_sources_exclude_credentials_and_symlinks_and_bind_paged_ordinals() {
+        let (root,_control,base,_)=fixture().await;
+        std::fs::write(root.path().join(".env"),"SYNTHETIC_CREDENTIAL=fixture").unwrap();
+        std::fs::write(root.path().join("secret.key"),"synthetic fixture").unwrap();
+        std::os::unix::fs::symlink(".env",root.path().join("alias.rs")).unwrap();
+        commit_constructor_source_fixture(root.path()).await;
+        let next=actual_head(root.path()).await.unwrap();
+        let table=ConstructorTable::build(root.path(),&next).await.unwrap();
+        let page:serde_json::Value=serde_json::from_str(&table.page(0,128).unwrap()).unwrap();
+        for name in [".env","secret.key","alias.rs"] {
+            assert!(!page["entries"].as_array().unwrap().iter().any(|e|e["path"]==name));
+        }
+        let first:serde_json::Value=serde_json::from_str(&table.page(0,1).unwrap()).unwrap();
+        let second:serde_json::Value=serde_json::from_str(&table.page(1,1).unwrap()).unwrap();
+        assert_eq!(first["table_sha256"],second["table_sha256"]);
+        assert_ne!(first["entries"][0]["file_index"],second["entries"][0]["file_index"]);
+        let old=ConstructorTable::build(root.path(),&base).await.unwrap();
+        assert!(old.read(root.path(),&constructor_query(&page,"behavior.rs",1,1),4096).await.is_err());
+    }
+    #[tokio::test]
+    async fn constructor_sources_bound_serialized_evidence_without_claiming_unread_bytes() {
+        let (root,_control,_base,_)=fixture().await;
+        std::fs::write(root.path().join("large.rs"),"abcdefghij".repeat(20)+"\n"+&"unread-tail\n".repeat(1000)).unwrap();
+        commit_constructor_source_fixture(root.path()).await;
+        let table=ConstructorTable::build(root.path(),&actual_head(root.path()).await.unwrap()).await.unwrap();
+        let page:serde_json::Value=serde_json::from_str(&table.page(0,128).unwrap()).unwrap();
+        let evidence=table.read(root.path(),&constructor_query(&page,"large.rs",1,1),1024).await.unwrap();
+        assert!(evidence.coverage.starts_with("partial original source excerpts"));
+        assert!(serde_json::to_vec(&evidence).unwrap().len()<=1024);
+        assert!(!serde_json::to_string(&evidence).unwrap().contains("unread-tail"));
+        assert!(table.read(root.path(),&constructor_query(&page,"large.rs",1,599),1024).await.is_err(),"oversized required windows were silently truncated");
+    }
 
     async fn fixture() -> (tempfile::TempDir, tempfile::TempDir, String, Vec<crate::autoship_workflow::NativeScopeCustody>) {
         let root = tempfile::tempdir_in("/tmp").unwrap();
