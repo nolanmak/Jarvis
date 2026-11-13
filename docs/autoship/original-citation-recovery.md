@@ -310,3 +310,39 @@ These are root-owned load-bearing rollout blockers under section 6. They are
 implementation facts to resolve from the existing services, not requests for a
 new owner product decision. The parser and read-only evidence checkpoint is
 committed on an engineering branch; it is not deployed and has no repair-test PR.
+
+
+## 11. Corrective negative-source authentication checkpoint
+
+A connected regression found that retained diagnosis authenticated only the
+original qualification question and silently missed a valid corrective Unknown.
+The test failed for that intended missing-diagnosis assertion (5.08 seconds after
+successful compilation). The data reader now authenticates the exact bounded
+corrective question against its original complete request, previous response and
+checker rejection. It supports the current checker and the explicit pre-citation
+checker policy at deployed main b9e09d46; unknown historical corrective protocols
+are not guessed. The frozen policy hash was reproduced from immutable Git source
+and verified against both actual #1830 witness contexts.
+
+Original-question identities remain unchanged. A corrective diagnosis instead
+binds its actual authenticated corrective-request hash. The original response,
+proof files, role and native producer policy remain unchanged; no extra model or
+completed-response slot is created. This is negative/source data recovery, not
+current positive qualification or permission to run work.
+
+The witness components pass 19 tests, zero failures and two explicit ignores
+(55.02 seconds). Adversarial coverage rejects a missing predecessor, changed
+predecessor, altered request and ambiguous chains. A fixture compilation error
+while adding those negatives was corrected and is not behavioral RED. The
+production request matcher also passes the read-only actual-#1830 inventory in
+0.15 seconds: one complete captured result, original/corrective questions and
+both endpoint errors authenticate, with all twelve recorded calls and workflow
+events unchanged. No qualification, cue or dispatch was created.
+
+Recognizing both questions also means two compatible positive replies can exist
+under one original native context. Distinguish source-context deduplication from
+selection of a particular semantic decision. Existing conservative ambiguous-
+identity behavior is not a completed positive-replay selection rule. Resolve that
+consumer seam with negative precedence and the explicit current/native context
+contract before activating the bridge. The versioned receipt, valid-positive
+cutover, typed wake-up and actual preparation/binding integration remain open.
