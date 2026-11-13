@@ -358,6 +358,37 @@ mod tests {
         assert!(!red_main_title(&red).contains("does not build"));
         assert!(red.gate_err.unwrap().len()<=2500);
     }
+
+    #[tokio::test]
+    async fn red_main_publication_carries_multiple_failures_and_unavailable_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh");
+        std::fs::write(&gh,"#!/bin/sh\ncase \"$*\" in\n *--job\\ 123*) printf 'node-release\\tnpm audit\\t2026-11-13T00:53:58Z Severity: moderate; GHSA-example\\n';;\n *--job\\ 124*) printf 'cli\\tcargo test\\t2026-11-13T00:53:58Z error[E0308]: mismatched types\\ncli\\tcargo test\\t2026-11-13T00:53:58Z failures:\\ncli\\tcargo test\\t2026-11-13T00:53:58Z     widget::tests::rounding\\ncli\\tcargo test\\t2026-11-13T00:53:58Z error: test failed, to rerun pass `-p augmentagent-cli`\\n';;\n *) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failures=[("node-release",123),("cli",124),("privacy",125)].map(|(name,job)|serde_json::json!({"name":name,"job":job,"url":format!("https://github.com/o/r/actions/runs/1/job/{job}")}));
+        let red=failed_main_diagnostics(root.path(),gh.to_str().unwrap(),"o/r","abc1234def5678",&failures).await;
+        let body=red_main_body(&red,"");
+        for text in ["node-release","job/123","GHSA-example","job/124","error[E0308]","widget::tests::rounding","-p augmentagent-cli","job/125","diagnostics unavailable"] {
+            assert!(body.contains(text),"lost {text}: {body}");
+        }
+        assert_eq!(red.failing,vec!["widget::tests::rounding"]);
+        assert!(red.gate_err.unwrap().len()<=2500);
+        augmentagent_channel_core::public_report::validate(&red_main_title(&red_fixture_for_diagnostics()),&body).unwrap();
+    }
+
+    fn red_fixture_for_diagnostics()->RedMain {
+        RedMain {sha:"abc1234def5678".into(),failing:vec![],packages:vec![],gate_err:None}
+    }
+
+    #[test]
+    fn red_main_diagnostic_wording_reuses_legacy_issue_for_exact_head() {
+        let red=red_fixture_for_diagnostics();
+        let legacy=serde_json::json!([{"number":2054,"title":"main is red at abc1234: workspace does not build","body":format!("{RED_MAIN_MARKER}\n`{}`",red.sha),"labels":[{"name":GAVE_UP_LABEL}]}]);
+        let changed=RedMain {failing:vec!["widget::tests::rounding".into()],..red_fixture_for_diagnostics()};
+        assert_eq!(red_main_repair_lookup(&legacy,&changed),Some((2054,true)),"new diagnostic identity duplicated a same-head repair");
+        let wrong=serde_json::json!([{"number":2054,"title":"main is red at abc1234: workspace does not build","body":format!("{RED_MAIN_MARKER}\n`abc1234different`"),"labels":[]}]);
+        assert_eq!(red_main_repair_lookup(&wrong,&changed),None);
+    }
     #[test]
     fn hosted_policy_covers_linux_missing_checks_reruns_and_exact_identity() {
         let result = std::process::Command::new("/usr/bin/python3")

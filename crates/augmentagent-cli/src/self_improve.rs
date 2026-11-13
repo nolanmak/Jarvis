@@ -5361,6 +5361,10 @@ fn red_main_issue_lookup(issues: &serde_json::Value, title: &str) -> Option<(u64
     })
 }
 
+fn red_main_repair_lookup(issues:&serde_json::Value,red:&RedMain)->Option<(u64,bool)> {
+    red_main_issue_lookup(issues,&red_main_title(red))
+}
+
 /// `git log` for the crates cargo blamed (all of `main` when it named none).
 async fn red_main_recent_commits(repo_root: &Path, packages: &[String]) -> String {
     let mut args: Vec<String> = vec![
@@ -5446,7 +5450,7 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
         Ok(json)=>json,
         Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
     };
-    let number = match red_main_issue_lookup(&json, &title) {
+    let number = match red_main_repair_lookup(&json, red) {
         Some((n, true)) => {
             return RedMainPlan::Hold(format!(
                 "issue #{n} carries `{GAVE_UP_LABEL}`; a human has to fix main"
