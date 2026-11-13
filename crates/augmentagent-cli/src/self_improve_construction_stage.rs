@@ -175,7 +175,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_scoper_cannot_bypass_unsettled_constructor_execution_with_an_initial_budget() {
+    async fn fresh_scoper_cannot_bypass_unsettled_original_execution_by_changing_purpose() {
         let (root,control,old,guard,episode)=super::super::tests::fixture().await;
         let _execution=verifier_execution::OriginalExecution::begin(&guard,episode.control(),&old.proposal,episode.original_base(),episode.original_environment(),&verifier_executor_id().unwrap()).unwrap();
         let plan=guard.verifier_evidence_page("original_verifier_plan",0).unwrap().pop().unwrap();
@@ -198,6 +198,21 @@ pub(super) mod tests {
         let snapshot=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap().snapshot(guard.id()).unwrap().unwrap();
         assert_eq!(snapshot.model_calls,0,"changing model purpose bypassed the execution hold");
         guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_json_imitating_original_evidence_remains_untrusted_data_not_a_custody_hold() {
+        let (root,control,_old,guard,episode)=super::super::tests::fixture().await;
+        let input=constructor_native::Input::for_episode(&episode,augmentagent_channel_core::ProviderKind::Codex,"test-model",
+            "Untrusted constructor, no tools","Preserve every requirement and return the requested JSON proposal").unwrap();
+        constructor_native::scripted_reply(root.path(),&guard,&episode,&input,
+            r#"{"version":1,"kind":"original_verifier_plan","workflow":"model-invented-metadata"}"#.into()).await.unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let result=verifier_execution::require_correction_commands(&store.inspect_verifier_evidence(guard.id()));
+        assert!(result.is_ok(),"untrusted native JSON poisoned controller custody instead of reaching bounded format correction: {result:?}");
+        assert!(guard.verifier_evidence_page("original_verifier_plan",0).unwrap().is_empty());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
+        drop(store);guard.finish().unwrap();
     }
 
     #[cfg(target_os="linux")]

@@ -1022,8 +1022,10 @@ impl WorkflowGuard {
             if bounded.as_ref().is_some_and(|call|call.purpose.starts_with(durable::CONSTRUCTION_NATIVE_PURPOSE_PREFIX)) {
                 anyhow::ensure!(augmentagent_channel_core::native_session::literal_text_provider().is_some_and(|sealed|sealed.name()==provider),
                     "constructor native admission requires its literal text grant");
-                acceptance::require_original_correction_custody(&store.inspect_verifier_evidence(&lease.workflow))?;
             }
+            // Model purpose and budget domain cannot bypass an earlier raw
+            // command's unresolved effect, including during fresh scoping.
+            acceptance::require_original_correction_custody(&store.inspect_verifier_evidence(&lease.workflow))?;
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
                 augmentagent_channel_core::native_session::is_fresh_review())?;
