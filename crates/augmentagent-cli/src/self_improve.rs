@@ -125,6 +125,7 @@ const BRANCH_PREFIX: &str = "agent-fix/issue-";
 const FIXABLE_LABEL: &str = "agent-fixable";
 /// Label stamped on an issue once the loop has given up on it (back-off).
 const GAVE_UP_LABEL: &str = "agent-gave-up";
+const MANUAL_ENGINEERING_LABEL:&str="autoship-manual";
 /// The sentence the not-fixable scoping verdict leaves on the issue, and the
 /// marker #955's re-triage sweep matches on: it tells a scoper label-out apart
 /// from a back-off at [`MAX_ATTEMPTS`] or a blast-radius refusal, both of
@@ -402,7 +403,7 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter(|iss| iss.get("pull_request").is_none())
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
-            if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) {
+            if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
                 return None;
             }
             let s = |k: &str| {
@@ -10606,6 +10607,10 @@ async fn pick_issue_for_repo(
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
+            continue;
+        }
+        if has_label(&iss,MANUAL_ENGINEERING_LABEL) {
+            info!(repo=%repo.full_name,issue=number,"skip: manual engineering routing");
             continue;
         }
         if owner_controls.paused(&repo.full_name,number)? {
