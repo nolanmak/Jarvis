@@ -1248,7 +1248,7 @@ Output ONLY the header and spec/reason, no preamble.";
 
 /// Complexity grade the scoping pass assigns (#653). Anything above
 /// [`Complexity::Medium`] never auto-merges — it lands as a draft PR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Complexity {
     Simple,
     Medium,
@@ -1271,13 +1271,15 @@ impl Complexity {
 }
 
 /// Parsed stage-1 output (#653).
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScopeOutcome {
     pub(crate) fixable: bool,
     pub(crate) complexity: Complexity,
     /// #843 — the scoper's own size estimate. `None` when the header was
     /// missing or unparseable (older prompt, formatting glitch): absence must
     /// not refuse work, only an explicit over-cap estimate may.
+    #[serde(deserialize_with="required_scope_estimate")]
     pub(crate) est_diff_lines: Option<usize>,
     /// #843 — the scoper's answer to "would the diff touch a guarded path?".
     /// Defaults to `false` for the same reason.
@@ -1298,7 +1300,7 @@ pub(crate) struct ScopeOutcome {
 }
 
 /// #1515 — whether main has moved past an issue since it was filed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Relevance {
     /// Still what the code needs.
     Current,
@@ -2642,6 +2644,40 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
     scope.fixable=true;
 }
 
+#[derive(serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitialScopeSnapshot {version:u32,context:String,#[serde(deserialize_with="required_initial_scope")] scope:Option<ScopeOutcome>}
+fn required_scope_estimate<'de,D:serde::Deserializer<'de>>(decoder:D)->std::result::Result<Option<usize>,D::Error> {
+    <Option<usize> as serde::Deserialize>::deserialize(decoder)
+}
+fn required_initial_scope<'de,D:serde::Deserializer<'de>>(decoder:D)->std::result::Result<Option<ScopeOutcome>,D::Error> {
+    <Option<ScopeOutcome> as serde::Deserialize>::deserialize(decoder)
+}
+fn initial_scope_key(context:&str)->String {
+    use sha2::{Digest,Sha256};
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&("initial-scope-snapshot-v1",context)).unwrap()))
+}
+fn read_initial_scope(context:&str,read:impl Fn(&str)->Result<Option<String>>)->Result<Option<InitialScopeSnapshot>> {
+    (||->Result<Option<InitialScopeSnapshot>> {
+        let Some(raw)=read(&initial_scope_key(context))? else{return Ok(None)};
+        anyhow::ensure!(raw.len()<=2*1024*1024,"initial scope exceeds evidence envelope");
+        let snapshot:InitialScopeSnapshot=serde_json::from_str(&raw)?;
+        anyhow::ensure!(snapshot.version==1 && snapshot.context==context,"initial scoped decision belongs to another episode");
+        Ok(Some(snapshot))
+    })().map_err(|error|acceptance::initial_scope_replay_error(error))
+}
+fn retain_initial_scope(context:&str,scope:Option<ScopeOutcome>,write:impl Fn(&str,&str)->Result<()>)->Result<()> {
+    (||->Result<()> {
+        let raw=serde_json::to_string(&InitialScopeSnapshot {version:1,context:context.into(),scope})?;
+        anyhow::ensure!(raw.len()<=2*1024*1024,"initial scope exceeds evidence envelope");
+        write(&initial_scope_key(context),&raw)
+    })().map_err(|error|acceptance::initial_scope_replay_error(error))
+}
+// A completed processed decision belongs to the original authorized episode.
+fn replay_initial_scope(saved:&Option<InitialScopeSnapshot>)->Option<Option<ScopeOutcome>> {
+    saved.as_ref().map(|saved|saved.scope.clone())
+}
+
 fn initial_acceptance_inputs(scope:Option<&ScopeOutcome>,owner_request:&str)->(String,Vec<String>) {
     // A refusal is diagnostic context, never a substitute owner requirement
     // (#955). Keep the first-pass build policy, but enroll acceptance against
@@ -2658,6 +2694,68 @@ fn initial_acceptance_inputs(scope:Option<&ScopeOutcome>,owner_request:&str)->(S
 #[cfg(test)]
 mod acceptance_source_tests {
     use super::*;
+    #[test]
+    fn changed_upstream_guidance_replays_original_scope_without_new_scoper_call() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        use std::cell::RefCell;
+        let root=tempfile::tempdir().unwrap();let binding=Binding {head:"a".repeat(40),contract:"b".repeat(64),evidence_hash:"c".repeat(64)};
+        let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        store.register("owner/repo#1","fixture",binding.clone(),1).unwrap();
+        let lease=store.claim("owner/repo#1","first",2,1000).unwrap().unwrap();let store=RefCell::new(store);
+        let owner="Fix stale warnings; preserve the original owner override.";
+        let original=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Never warn twice for one unchanged context.\n\nUse the original reconciler.");
+        let expected=initial_acceptance_inputs(Some(&original),owner);
+        retain_initial_scope("same-owner-base-environment",Some(original),|key,raw|store.borrow_mut().record_scope_stage_response(&lease,&binding,key,raw,3)).unwrap();
+        store.borrow_mut().release(&lease,4).unwrap();
+        let lease=store.borrow_mut().claim("owner/repo#1","reopened",2002,1000).unwrap().unwrap();
+        let saved=read_initial_scope("same-owner-base-environment",|key|store.borrow_mut().recorded_scope_stage_response(&lease,&binding,key,2003)).unwrap();
+        let mut fresh_scoper_calls=0;
+        let scope=replay_initial_scope(&saved).unwrap_or_else(|| {
+            fresh_scoper_calls+=1;
+            Some(parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\nCRITERIA:\n- New reworded guidance after unrelated main movement.\n\nFresh implementation plan from new upstream context."))
+        });
+        assert_eq!(fresh_scoper_calls,0,"unchanged episode admitted another scoper after completed original decision");
+        assert_eq!(initial_acceptance_inputs(scope.as_ref(),owner),expected,"regenerated guidance changed original acceptance inputs");
+        assert_eq!(scope.unwrap().complexity,Complexity::Medium);
+    }
+
+    #[test]
+    fn saved_scope_requires_explicit_fallback_and_preserves_complete_metadata() {
+        let context="1".repeat(64);
+        let null=serde_json::json!({"version":1,"context":context,"scope":null});
+        let saved=read_initial_scope(&context,|_|Ok(Some(null.to_string()))).unwrap();
+        assert!(matches!(replay_initial_scope(&saved),Some(None)));
+        for raw in [serde_json::json!({"version":1,"context":context}),
+            serde_json::json!({"version":1,"context":"foreign","scope":null}),
+            serde_json::json!({"version":2,"context":context,"scope":null}),
+            serde_json::json!({"version":1,"context":context,"scope":null,"extra":true})] {
+            assert!(read_initial_scope(&context,|_|Ok(Some(raw.to_string()))).is_err(),"corrupt scope became fallback");
+        }
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Preserve every original criterion.\n\nProduction guidance.");
+        let mut snapshot=serde_json::to_value(InitialScopeSnapshot {version:1,context:context.clone(),scope:Some(scope)}).unwrap();
+        snapshot["scope"].as_object_mut().unwrap().remove("est_diff_lines");
+        assert!(read_initial_scope(&context,|_|Ok(Some(snapshot.to_string()))).is_err(),"missing optional metadata silently altered original decision");
+    }
+    #[test]
+    fn scoped_snapshot_custody_loss_holds_before_fresh_scoping() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        use std::cell::RefCell;
+        for missing in ["body","event"] {
+            let root=tempfile::tempdir().unwrap();let binding=Binding {head:"a".repeat(40),contract:"b".repeat(64),evidence_hash:"c".repeat(64)};
+            let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();store.register("owner/repo#1","fixture",binding.clone(),1).unwrap();
+            let lease=store.claim("owner/repo#1","fixture",2,1000).unwrap().unwrap();let store=RefCell::new(store);let context="1".repeat(64);
+            retain_initial_scope(&context,None,|key,raw|store.borrow_mut().record_scope_stage_response(&lease,&binding,key,raw,3)).unwrap();
+            let key=initial_scope_key(&context);
+            store.borrow().query_connection(|conn| {
+                if missing=="body" {conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![lease.workflow,key])?;}
+                else {conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2",rusqlite::params![lease.workflow,key])?;}
+                Ok(())
+            }).unwrap();
+            let result=read_initial_scope(&context,|key|store.borrow_mut().recorded_scope_stage_response(&lease,&binding,key,3));
+            assert!(result.is_err(),"{missing} loss permitted another scoper");
+        }
+    }
+
     #[test]
     fn fixable_guidance_cannot_hide_an_owner_constraint_from_acceptance() {
         let owner="Return the arithmetic sum. Never change the audit journal.";
@@ -8182,6 +8280,22 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
+    let owner_request=acceptance_owner_request(&issue);
+    let scope_context=match acceptance::initial_scope_context(&worktree,&workflow_guard,candidate_base) {
+        Ok(context)=>context,
+        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+    };
+    let saved_scope=match read_initial_scope(&scope_context,|key|workflow_guard.recorded_scope_stage_response(key)) {
+        Ok(saved)=>saved,
+        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+    };
+
+    let saved_inputs=saved_scope.as_ref().map(|saved|initial_acceptance_inputs(saved.scope.as_ref(),&owner_request));
+    if let Err(error)=acceptance::preflight_initial_scope(&worktree,&workflow_guard,
+        crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,
+        saved_inputs.as_ref().map(|(scope,criteria)|(scope.as_str(),criteria.as_slice()))) {
+        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+    }
 
     // Failed stages retain committed and unfinished work. Publication alone is
     // not permission to erase the only local recovery copy.
@@ -8256,8 +8370,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
-    let owner_request=acceptance_owner_request(&issue);
-    let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
+    let mut scope = if let Some(scope)=replay_initial_scope(&saved_scope) {scope}else{match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
         Ok(p) => Some(parse_scope_output(&p)),
@@ -8274,9 +8387,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             );
             None
         }
-    };
+    }};
     workflow_guard.require_fresh_issue(repo_root).await?;
-    if let Some(s) = &mut scope {
+    if saved_scope.is_none() {if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
             if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
                 return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
@@ -8293,6 +8406,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // cannot replace that authority with a routine human-only label.
             continue_after_scope_refusal(s,&owner_request);
         }
+    }
     }
     // #843/#1516 — plan only unguarded parent issues. The post-scope caller
     // owns both child publication and the ordinary refusal fallback.
@@ -8317,6 +8431,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
     let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
+    if saved_scope.is_none() {
+        if let Err(error)=retain_initial_scope(&scope_context,scope.clone(),|key,raw|workflow_guard.record_scope_stage_response(key,raw)) {
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+        }
+    }
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,

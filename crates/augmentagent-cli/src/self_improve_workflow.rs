@@ -1303,6 +1303,12 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Metadata identifying enrolled recovery, never positive qualification.
+    pub(super) fn has_registered_acceptance_context(&self)->Result<bool> {
+        self.healthy_lease()?;
+        Ok(self.contract.strip_prefix("registered:").is_some_and(|hash|hash.len()==64 && hash.bytes().all(|b|b.is_ascii_hexdigit())))
+    }
+
     /// Original protected frontend request, never a replacement inferred from a title.
     pub(super) fn original_owner_request(&self)->Result<&str> {
         self.healthy_lease()?;
@@ -1623,6 +1629,14 @@ impl WorkflowGuard {
 
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
+    }
+    pub(super) fn recorded_scope_stage_response(&self,key:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .recorded_scope_stage_response(&self.lease,&self.binding,key,millis())
+    }
+    pub(super) fn scope_stage_response_keys(&self,after:&str)->Result<Vec<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
     }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
