@@ -30,6 +30,15 @@ and a current guarded edit plus independent review. Never dump credential values
 or complete process environments for that check. Existing runtime generations
 remain available while their leases drain.
 
+Native boot archives have a 128 MiB uncompressed newc ceiling, including every
+header, name, alignment byte and trailer. Busybox, modules and launcher scripts
+are read through bounded regular-file descriptors against remaining capacity.
+The compressed image has a separate 129 MiB cap checked before exclusive 0600
+output creation. Oversized or observed-changing input refuses preparation;
+this does not resize guest RAM or establish a whole-launch physical disk or
+host memory bound. The shared build-VM codec retains its existing behavior when
+no optional archive cap is supplied.
+
 The daemon reads `AUGMENTAGENT_NATIVE_VM_POLICY` itself, never from model options.
 The file must be owner-private, regular and single-link. Its version 1 shape is:
 
@@ -251,6 +260,16 @@ logger once with `set_native_runtime_owner` after its fenced workflow claim. Age
 not retirement authority. Capacity refusal persists the existing workflow
 capacity dependency without admitting a model call; a subsequent retry prunes
 newly retired state before evaluating that dependency again.
+
+Native receipt/credential publication uses one serialized publisher per helper
+process. Each atomic payload is at most 2 MiB; exclusive 0600 temporary writes
+stay under an original held private parent. A failed unpublished write removes
+only its exact original single-link temporary inode. Unknown cleanup, lost
+rename acknowledgment or failed parent sync stops all later publications in
+that process. It never undoes a possibly published target or clears a native
+reservation. Diagnostic failure does not replace the original launch error.
+This generic limit does not replace the stricter credential round-trip bounds
+or establish the full launch's physical storage allowance.
 
 Refresh-enabled credentials have one held use lock across initial seed, native
 execution, token refresh and descendant cleanup, not merely at file writeback.

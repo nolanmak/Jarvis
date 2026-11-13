@@ -54,15 +54,23 @@ pub fn credentials_at(path:Option<&Path>, provider:&str, now:i64,
     };
     let Some(profile)=policy.providers.get(provider) else{report.status=RouteUndeclared;return report};
     let key=match provider {"codex"=>"CODEX_API_KEY","claude"=>"ANTHROPIC_API_KEY",_=>{report.status=RouteUndeclared;return report}};
+    // Launch seeds every declared file, including environment-key routes.
+    // Validate it before the environment shortcut using launch's 1 MiB bound.
+    let declared=if let Some(auth)=&profile.auth_file {
+        let bytes=match private(auth) {
+            Ok(bytes) if bytes.len()<=1024*1024=>bytes,
+            Ok(_)=>{report.status=CredentialInvalid;return report},
+            Err(error)=>{report.status=if error.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::NotFound) {CredentialMissing} else {CredentialInvalid};return report}
+        };
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value)=>Some(value),Err(_)=>{report.status=CredentialInvalid;return report}
+        }
+    } else {None};
     if profile.environment.iter().any(|name|name==key) && environment(key).is_some_and(|value|!value.trim().is_empty()) {
         report.status=DeclaredUsable;return report;
     }
     let Some(auth)=&profile.auth_file else{report.status=CredentialMissing;return report};
-    let bytes=match private(auth) {
-        Ok(bytes)=>bytes,
-        Err(error)=>{report.status=if error.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::NotFound) {CredentialMissing} else {CredentialInvalid};return report}
-    };
-    let value:serde_json::Value=match serde_json::from_slice(&bytes) {Ok(value)=>value,Err(_)=>{report.status=CredentialInvalid;return report}};
+    let value=declared.expect("declared credential was validated");
     let nonempty=|pointer:&str|value.pointer(pointer).and_then(|v|v.as_str()).is_some_and(|value|!value.trim().is_empty());
     if provider=="codex" && nonempty("/OPENAI_API_KEY") {report.status=DeclaredUsable;return report;}
     let complete=if provider=="codex" {nonempty("/tokens/access_token") && nonempty("/tokens/refresh_token") && nonempty("/tokens/id_token")}
@@ -136,6 +144,46 @@ mod tests {
         assert_eq!(credentials_at(Some(&path),"claude",1000,|_|None).status,CredentialStatus::CredentialInvalid);
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(credentials_at(Some(&path),"claude",1000,|_|None).status,CredentialStatus::PolicyInvalid);
+    }
+}
+
+#[cfg(test)]
+mod credential_byte_budget_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn declaration_matches_native_credential_byte_boundary_even_with_environment_key() {
+        let root=tempfile::tempdir().unwrap();
+        let auth=root.path().join("credential.json");
+        let policy_path=root.path().join("policy.json");
+        let mut policy=serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json",
+            "guest_runtime":"/declared/guest","state_root":root.path(),"memory_mb":1024,
+            "max_state_bytes":8589934592u64,"max_sessions":16,
+            "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json",
+                "environment":["CODEX_API_KEY"]}}});
+        let base=serde_json::json!({"OPENAI_API_KEY":"synthetic","padding":""});
+        for (size,expected) in [(1024*1024,CredentialStatus::DeclaredUsable),
+            (1024*1024+1,CredentialStatus::CredentialInvalid)] {
+            let mut value=base.clone();
+            value["padding"]="p".repeat(size-serde_json::to_vec(&base).unwrap().len()).into();
+            let bytes=serde_json::to_vec(&value).unwrap();assert_eq!(bytes.len(),size);
+            std::fs::write(&auth,&bytes).unwrap();
+            std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&policy_path,serde_json::to_vec(&policy).unwrap()).unwrap();
+            std::fs::set_permissions(&policy_path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            for environment_key in [false,true] {
+                let report=credentials_at(Some(&policy_path),"codex",1000,|_|environment_key.then(||"synthetic-env".into()));
+                assert_eq!(report.status,expected,"size={size}, environment_key={environment_key}");
+                assert!(!report.live_verified);
+                assert!(!serde_json::to_string(&report).unwrap().contains("synthetic"));
+                assert_eq!(std::fs::read(&auth).unwrap(),bytes,"readiness mutated credential");
+            }
+        }
+        policy["providers"]["codex"]["auth_file"]=serde_json::Value::Null;
+        std::fs::write(&policy_path,serde_json::to_vec(&policy).unwrap()).unwrap();
+        assert_eq!(credentials_at(Some(&policy_path),"codex",1000,|_|Some("synthetic-env".into())).status,
+            CredentialStatus::DeclaredUsable,"fileless environment routes remain supported");
     }
 }
 

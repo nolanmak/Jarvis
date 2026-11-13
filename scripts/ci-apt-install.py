@@ -65,7 +65,10 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
     if not packages:
         print('All required CI APT packages are already installed', flush=True)
         return 0
-    common = ['sudo', 'apt-get', '-o', 'Acquire::Retries=0',
+    # Hosted runners have IPv4 egress; avoid an unavailable IPv6 route turning
+    # a DNS-only mirror outage into a mixed error that must fail closed.
+    common = ['sudo', 'apt-get', '-o', 'Acquire::ForceIPv4=true',
+              '-o', 'Acquire::Retries=0',
               '-o', 'Acquire::http::Timeout=20', '-o', 'Acquire::https::Timeout=20',
               '-o', 'APT::Update::Error-Mode=any',
               '-o', 'Acquire::AllowInsecureRepositories=false',

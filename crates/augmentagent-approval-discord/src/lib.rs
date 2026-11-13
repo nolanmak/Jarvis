@@ -132,6 +132,16 @@ pub enum ApprovalActionOutcome {
         response: String,
         summary: String,
     },
+    /// #2039 — a `calendar reschedule` card was approved: the event is at
+    /// its new time (`already_there` when it already was; nothing written).
+    CalendarRescheduled {
+        account: String,
+        summary: String,
+        /// Human local time of the new slot, e.g. "Tue Nov 18 15:00–15:30 EST".
+        when: String,
+        notified: bool,
+        already_there: bool,
+    },
     /// A signed PDF was published, or its immutable receipt recovered.
     DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
     /// #1765 — approved on a platform with no sender (WhatsApp archive cards):

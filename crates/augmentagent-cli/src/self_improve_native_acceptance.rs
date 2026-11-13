@@ -129,7 +129,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
             .baseline_result(&prepared.baseline.receipts)?,
         crate::autoship_contract::BaselineResult::Reproduced
     );
-    guard.bind_acceptance(&prepared)?;
+    guard.bind_acceptance(&prepared,&control)?;
     let mut opts = fix_opts(root.clone());
     opts.audit_logger = Some(guard.audit_logger());
     let session = augmentagent_channel_core::native_session::FreshBuilderSessions::new();

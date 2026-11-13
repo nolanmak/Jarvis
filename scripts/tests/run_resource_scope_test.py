@@ -5,6 +5,7 @@ systemd-run --user --wait --pipe --collect -p Delegate='cpu memory pids' \
  /usr/bin/python3 /absolute/path/to/run_resource_scope_test.py
 """
 import importlib.util
+import io
 import json
 import tempfile
 import time
@@ -18,6 +19,116 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location('resources', Path(__file__).parents[1]/'run-resource-scope.py')
 resources = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(resources)
+
+
+class HostMemoryFactsTests(unittest.TestCase):
+    """The real admission decoder must not turn malformed facts into capacity."""
+
+    def available_from(self, data):
+        with tempfile.TemporaryDirectory() as name:
+            fixture = Path(name) / 'meminfo'
+            fixture.write_bytes(data)
+            with patch.object(resources, 'Path', return_value=fixture):
+                return resources.available_memory()
+
+    def test_available_memory_reads_kibibytes_and_accepts_known_zero(self):
+        self.assertEqual(self.available_from(b'MemTotal: 128 kB\nMemAvailable: 32 kB\n'), 32768)
+        self.assertEqual(self.available_from(b'MemTotal: 128 kB\nMemAvailable: 0 kB\n'), 0)
+
+    def test_available_memory_rejects_invalid_observations(self):
+        samples = {
+            'missing-total': b'MemAvailable: 32 kB\n',
+            'zero-total': b'MemTotal: 0 kB\nMemAvailable: 0 kB\n',
+            'duplicate-available': b'MemTotal: 128 kB\nMemAvailable: 32 kB\nMemAvailable: 64 kB\n',
+            'duplicate-total': b'MemTotal: 128 kB\nMemTotal: 256 kB\nMemAvailable: 32 kB\n',
+            'wrong-unit': b'MemTotal: 128 kB\nMemAvailable: 32 MB\n',
+            'extra-token': b'MemTotal: 128 kB\nMemAvailable: 32 kB extra\n',
+            'negative': b'MemTotal: 128 kB\nMemAvailable: -1 kB\n',
+            'signed-plus': b'MemTotal: 128 kB\nMemAvailable: +1 kB\n',
+            'greater-than-total': b'MemTotal: 128 kB\nMemAvailable: 256 kB\n',
+            'overflow': b'MemTotal: 18446744073709551616 kB\nMemAvailable: 18446744073709551616 kB\n',
+            'oversized': b'Other: 1 kB\n' * 7000 + b'MemTotal: 128 kB\nMemAvailable: 32 kB\n',
+        }
+        for label, data in samples.items():
+            with self.subTest(label=label), self.assertRaises(RuntimeError):
+                self.available_from(data)
+
+    def test_missing_available_remains_an_error(self):
+        with self.assertRaises(RuntimeError):
+            self.available_from(b'MemTotal: 128 kB\n')
+
+    def test_host_read_is_bounded_even_when_the_input_is_oversized(self):
+        class ReadBudget(io.BytesIO):
+            consumed = 0
+
+            def read(stream, count=-1):
+                self.assertGreaterEqual(count, 0, 'unbounded host observation read')
+                self.assertLessEqual(stream.consumed + count, 65537)
+                value = super(ReadBudget, stream).read(count)
+                stream.consumed += len(value)
+                return value
+
+        source = ReadBudget(b'Other: 1 kB\n' * 7000)
+        with patch.object(Path, 'open', return_value=source), self.assertRaises(RuntimeError):
+            resources.read_host_memory()
+        self.assertEqual(source.consumed, 65537)
+
+    def test_parser_ignores_swap_and_accepts_largest_representable_kib_count(self):
+        self.assertEqual(resources.parse_host_memory(
+            b'MemTotal: 18014398509481983 kB\nMemAvailable: 0 kB\nSwapTotal: 18446744073709551616 kB\n'),
+            {'total_bytes': 18446744073709550592, 'available_bytes': 0})
+
+    def test_parser_rejects_invalid_counts_encoding_and_input_type(self):
+        samples = [b'MemTotal: 128 kB\nMemAvailable: nan kB\n',
+                   b'MemTotal: 128 kB\nMemAvailable: \xff kB\n',
+                   b'MemTotal: 128 kB\nMemAvailable: 18446744073709552 kB\n',
+                   'MemTotal: 128 kB\nMemAvailable: 32 kB\n']
+        for data in samples:
+            with self.subTest(data_type=type(data).__name__), self.assertRaises(RuntimeError):
+                resources.parse_host_memory(data)
+
+    def test_planning_table_and_external_ancestor_limits(self):
+        gib = 1024**3
+        cases = [
+            (2, (), 2*gib, gib, gib, 966367641),
+            (8, (), 8*gib, 2*gib, 6*gib, 5798205849),
+            (16, (), 16*gib, 4*gib, 12*gib, 11596411699),
+            (64, (), 64*gib, 16*gib, 48*gib, 46385646796),
+            (64, (None, 2*gib, None), 2*gib, gib, gib, 966367641),
+            (16, (0,), 0, gib, 0, 0),
+        ]
+        for physical, ancestors, effective, protected, budget, high in cases:
+            with self.subTest(physical=physical, ancestors=ancestors):
+                self.assertEqual(resources.memory_defaults(physical*gib, ancestors), {
+                    'effective_bytes': effective, 'protected_bytes': protected,
+                    'memory_max_bytes': budget, 'memory_high_bytes': high})
+
+    def test_planning_rounding_and_u64_boundaries(self):
+        gib = 1024**3
+        self.assertEqual(resources.memory_defaults(4*gib+1), {
+            'effective_bytes': 4294967297, 'protected_bytes': 1073741825,
+            'memory_max_bytes': 3221225472, 'memory_high_bytes': 2899102924})
+        self.assertEqual(resources.memory_defaults(2**64-1), {
+            'effective_bytes': 18446744073709551615, 'protected_bytes': 4611686018427387904,
+            'memory_max_bytes': 13835058055282163711, 'memory_high_bytes': 12451552249753947339})
+
+    def test_explicit_reserve_increases_protection_without_shrinking_run_demand(self):
+        gib = 1024**3
+        self.assertEqual(resources.memory_defaults(16*gib, reserve_bytes=5*gib), {
+            'effective_bytes': 16*gib, 'protected_bytes': 5*gib,
+            'memory_max_bytes': 11*gib, 'memory_high_bytes': 10630044057})
+        self.assertEqual(resources.memory_defaults(2*gib, reserve_bytes=3*gib)['memory_max_bytes'], 0)
+        with self.assertRaises(RuntimeError):
+            resources.memory_defaults(16*gib, reserve_bytes=gib)
+
+    def test_invalid_planner_values_never_become_defaults_or_unlimited(self):
+        cases = [(0, (), None), (True, (), None), (-1, (), None), (2**64, (), None),
+                 (1024**3, (True,), None), (1024**3, (-1,), None),
+                 (1024**3, (2**64,), None), (1024**3, ('max',), None),
+                 (1024**3, {}, None), (1024**3, (), False), (1024**3, (), 2**64)]
+        for physical, caps, reserve in cases:
+            with self.subTest(physical=physical, caps=caps, reserve=reserve), self.assertRaises(RuntimeError):
+                resources.memory_defaults(physical, caps, reserve)
 
 
 class AdmissionPublicationTests(unittest.TestCase):

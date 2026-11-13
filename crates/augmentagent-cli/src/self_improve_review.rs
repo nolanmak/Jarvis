@@ -176,6 +176,30 @@ mod source_ranges;
 mod group_execution;
 #[path = "self_improve_review_callers.rs"]
 mod caller_stream;
+
+/// Share the existing bounded immutable-blob transport with other controller
+/// evidence readers. The visitor gets exact UTF-8 bytes, never a working tree.
+pub(super) async fn visit_immutable_source<F>(root:&Path,head:&str,path:&str,mut visit:F)->Result<()>
+where F:FnMut(&str)->Result<()> {
+    anyhow::ensure!(requested_evidence::admitted_path(path),"immutable source path is not admitted");
+    let plan=caller_stream::Plan::named(root,head,path).await?;
+    let (_,_,size)=plan.single_source_identity()?;
+    let mut stream=plan.stream(root);let mut consumed=0usize;
+    while let Some(batch)=stream.next_batch().await? {
+        let mut ordered=batch.into_iter().map(|(key,body)| {
+            let range=key.rsplit_once("#bytes-").context("source stream lacks byte provenance")?.1;
+            let (start,end)=range.split_once('-').context("source stream range missing")?;
+            Ok((start.parse::<usize>()?,end.parse::<usize>()?,body))
+        }).collect::<Result<Vec<_>>>()?;
+        ordered.sort_by_key(|(start,_,_)|*start);
+        for (start,end,body) in ordered {
+            anyhow::ensure!(start==consumed && end>=start && end-start==body.len(),"immutable source stream has a gap or duplicate");
+            visit(&body)?;consumed=end;
+        }
+    }
+    anyhow::ensure!(consumed==size,"immutable source stream is incomplete");
+    Ok(())
+}
 #[path = "self_improve_review_adjudication.rs"]
 mod final_authority;
 #[path = "self_improve_adjudication_windows.rs"]

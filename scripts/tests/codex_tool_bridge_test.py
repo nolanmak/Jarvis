@@ -26,6 +26,76 @@ requires_sandbox = capabilities.requirement(SANDBOX_UNAVAILABLE)
 requires_poppler = capabilities.requirement(POPPLER_UNAVAILABLE)
 
 
+class FilteredEnvInputTests(unittest.TestCase):
+    def test_real_embedded_schema_compiles_after_source_filtering(self):
+        import os
+        import shutil
+        import uuid
+        wrapper = os.environ.get('AUGMENTAGENT_TEST_CARGO_WRAPPER')
+        if not wrapper and os.environ.get('GITHUB_ACTIONS') != 'true':
+            self.skipTest('local Rust fixture requires AUGMENTAGENT_TEST_CARGO_WRAPPER')
+        runner = [wrapper] if wrapper else [shutil.which('cargo') or 'cargo']
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory(prefix='autoship-env-input-') as temporary:
+            base = Path(temporary)
+            work = base / 'work'
+            crate = work / 'crates/augmentagent-cli'
+            source = crate / 'src'
+            source.mkdir(parents=True)
+            nonce = uuid.uuid4().hex
+            package = 'autoship-env-input-probe-' + nonce
+            (crate / 'Cargo.toml').write_text(
+                '[package]\nname="' + package + '"\nversion="0.0.0"\nedition="2021"\n[workspace]\n')
+            module = repo / 'crates/augmentagent-cli/src/env_key_snapshot.rs'
+            (source / module.name).write_bytes(module.read_bytes())
+            asset = repo / 'crates/augmentagent-cli/src/env_keys.txt'
+            if asset.exists():
+                (source / asset.name).write_bytes(asset.read_bytes())
+            (source / 'lib.rs').write_text("""
+mod env_key_snapshot;
+pub fn fallback_schema() -> &'static str { env_key_snapshot::EMBEDDED_DOTENV_EXAMPLE }
+#[test]
+fn real_fallback_has_canonical_keys() {
+    let keys = fallback_schema();
+    assert!(keys.contains("GROQ_API_KEY="));
+    assert!(keys.contains("DISCORD_BOT_TOKEN="));
+    assert!(keys.contains("DASHBOARD_PORT="));
+}
+""")
+            (work / '.env.example').write_text(
+                'GROQ_API_KEY=\nDISCORD_BOT_TOKEN=\nDASHBOARD_PORT=\n')
+            (work / '.env').write_text('SYNTHETIC_PRIVATE=not-for-the-source-view\n')
+            (work / '.env.local').write_text('SYNTHETIC_LOCAL=not-for-the-source-view\n')
+            environment = dict(os.environ, CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0')
+            def compile_fixture(directory):
+                return subprocess.run(
+                    [*runner, 'test', '--lib', '--offline', '--manifest-path',
+                     str(directory / 'crates/augmentagent-cli/Cargo.toml')],
+                    cwd=repo, env=environment, capture_output=True, text=True)
+            # Different package identities force both real Rust compilations;
+            # the registered local target stays shared and owned by this worktree.
+            control = base / 'control'
+            shutil.copytree(work, control)
+            manifest = control / 'crates/augmentagent-cli/Cargo.toml'
+            manifest.write_text(manifest.read_text().replace(package, 'autoship-env-control-' + nonce))
+            complete = compile_fixture(control)
+            self.assertEqual(complete.returncode, 0,
+                             'full-source control must compile before diagnosing filtering:\n' + complete.stderr)
+            policy = bridge.Policy({'cwd': str(work), 'read_roots': [str(work)],
+                                    'write_roots': [], 'allowed_tools': ['Read']})
+            try:
+                snapshot = bridge.BuildSnapshot(policy, base / 'snapshot')
+                self.assertFalse((snapshot.root / '.env').exists())
+                self.assertFalse((snapshot.root / '.env.local').exists())
+                self.assertFalse((snapshot.root / '.env.example').exists())
+                filtered = compile_fixture(snapshot.root)
+                self.assertEqual(filtered.returncode, 0,
+                                 'real embedded schema cannot compile in the filtered source view:\n'
+                                 + filtered.stderr)
+            finally:
+                policy.close()
+
+
 class ToolPolicyTests(unittest.TestCase):
     def setUp(self):
         # Every policy owns session resources, including when an assertion or
@@ -2905,6 +2975,57 @@ class BuildScratchTests(unittest.TestCase):
         policy._scratch.cache_bytes = 64 * 1024**2
         policy.run_command('cargo build')
         self.assertEqual(len(self.calls), 1)
+
+    def test_preflight_accounts_for_shared_reserve_after_cache_without_allocating(self):
+        gib = 1024**3
+        policy = self.policy(command_storage={
+            'lock': str(Path(self.temp.name) / 'disk-build.lock'),
+            'floor_bytes': 15*gib, 'admission_bytes': 25*gib})
+        policy._scratch.cache_bytes = 12*gib
+        policy._scratch.headroom_bytes = 20*gib
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=36*gib)
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.preflight_builds()
+        self.assertEqual(raised.exception.category, 'build_storage_reserve')
+        with self.assertRaises(bridge.Readiness) as actual:
+            policy.run_command('cargo build')
+        self.assertEqual(actual.exception.category, raised.exception.category)
+        reply = bridge.Server(policy).dispatch({'method': 'tools/call',
+            'params': {'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        self.assertTrue(reply['isError'])
+        evidence = json.loads(reply['content'][1]['text'].split(':', 1)[1])
+        self.assertEqual(evidence, {'category': 'build_storage_reserve',
+            'available_bytes': 36*gib, 'required_bytes': 37*gib})
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertEqual(self.calls, [])
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=37*gib)
+        report = policy.preflight_builds()
+        self.assertTrue(report['ready'])
+        self.assertEqual(report['required_bytes'], 37*gib)
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertEqual(self.calls, [])
+
+    def test_preflight_observes_busy_shared_lease_without_creating_lock_files(self):
+        config = {'lock': str(Path(self.temp.name) / 'disk-build.lock'),
+                  'floor_bytes': 0, 'admission_bytes': 0}
+        policy = self.policy(command_storage=config)
+        before = set(Path(self.temp.name).iterdir())
+        policy.preflight_builds()
+        self.assertEqual(set(Path(self.temp.name).iterdir()), before)
+        with bridge.CommandStorage(config, self.scratch):
+            with self.assertRaises(bridge.Readiness) as raised:
+                policy.preflight_builds()
+            self.assertEqual(raised.exception.category, 'build_storage_busy')
+        self.assertTrue(policy.preflight_builds()['ready'])
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(self.calls, [])
+
+    def test_preflight_preserves_read_only_profiles_with_no_build_requirements(self):
+        policy = self.policy(allowed_tools=['Read'], build_scratch_dir=None)
+        self.assertEqual(policy.preflight_builds(), {'ready': True, 'builds_required': False})
+        self.assertEqual(self.calls, [])
 
     def test_admission_holds_an_exclusive_lock_on_the_scratch_root(self):
         import fcntl, os

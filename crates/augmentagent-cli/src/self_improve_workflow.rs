@@ -52,6 +52,31 @@ pub(super) fn path() -> PathBuf {
     durable::default_path()
 }
 
+#[derive(Debug)]
+pub(super) struct OwnerControlUnavailable;
+impl std::fmt::Display for OwnerControlUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("owner-control-unavailable")}
+}
+impl std::error::Error for OwnerControlUnavailable {}
+
+/// Free selection reads the existing owner authority without registering a
+/// workflow or initializing storage. The productive claim still rechecks pause
+/// atomically; this reader is only a fairness filter, never execution admission.
+pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
+impl FreshIssueControls {
+    pub(super) fn open()->Result<Self> {
+        WorkflowStore::open_read_only(&path()).map(|store|Self {store})
+            .map_err(|error|error.context(OwnerControlUnavailable))
+    }
+    pub(super) fn paused(&self,repository:&str,issue:u64)->Result<bool> {
+        (||->Result<bool> {
+            let id=durable::workflow_id(repository,issue)?;
+            let control=self.store.as_ref().map(|store|store.owner_control(&id)).transpose()?.flatten();
+            Ok(control.is_some_and(|control|control.paused))
+        })().map_err(|error|error.context(OwnerControlUnavailable))
+    }
+}
+
 /// Read GitHub's current base, never a possibly stale local tracking ref.
 pub(super) async fn remote_main_head(repo: &Path, repository: &str) -> Result<String> {
     let (ok, out, error) = run(
@@ -88,6 +113,7 @@ pub(super) struct WorkflowGuard {
     worktree: PathBuf,
     contract: String,
     environment: String,
+    source_request:Option<(String,Option<u64>)>,
     binding: Binding,
     heartbeat: tokio_util::sync::CancellationToken,
     lease_failure: Arc<Mutex<Option<String>>>,
@@ -96,6 +122,63 @@ pub(super) struct WorkflowGuard {
     capacity_exhausted: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
+    acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
+    acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
+}
+
+#[derive(Debug)]
+struct SemanticSourceUnavailable;
+impl std::fmt::Display for SemanticSourceUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Original verification evidence is unavailable; waiting for its restoration")}
+}
+impl std::error::Error for SemanticSourceUnavailable {}
+
+/// Source data is rechecked at preparation and both launch gates. This has
+/// no subprocess/model API and never substitutes an old positive approval.
+fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,repository:&str)->Result<Option<acceptance::PreparedAcceptance>> {
+    let snapshot=store.snapshot(&lease.workflow)?.context("semantic workflow missing")?;
+    let binding=&snapshot.checkpoint.binding;
+    let cue:Option<durable::SemanticReconsideration>=store.semantic_reconsideration(&lease.workflow,binding)?;
+    let Some(cue)=cue else{return Ok(None)};
+    store.validate_dispatch(lease,binding,millis())?;
+    if store.semantic_source_waiting(&lease.workflow,binding)? {return Err(SemanticSourceUnavailable.into());}
+    let source=(||->Result<acceptance::PreparedAcceptance> {
+        let source=source_from_workflow(&lease.workflow).context("semantic source identity missing")?;
+        let control=acceptance::control_directories(repository,&lease.workflow)?.workflow_acceptance;
+        let custody=store.baseline_native_custody(lease,binding,millis())?;
+        let (prepared,identity)=acceptance::retained_semantic_source(root,&control,source,binding,&custody,&store.inspect_verifier_evidence(&lease.workflow))?
+            .context("original semantic prepared source is unavailable")?;
+        anyhow::ensure!(identity==cue.judgment,"semantic source differs from its queued judgment");
+        Ok(prepared)
+    })();
+    match source {
+        Ok(prepared)=>Ok(Some(prepared)),
+        Err(error)=> {
+            store.hold_semantic_source_unavailable(lease,binding,&cue.key,millis())?;
+            let detail=format!("{error:#}");
+            let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,&cue.key,&detail))?));
+            let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
+            store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+            Err(SemanticSourceUnavailable.into())
+        }
+    }
+}
+
+enum AcceptanceAuthority {
+    Unbound,
+    RecoveryOnly,
+    Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
+}
+
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum AcquireMode {Productive,OwnerTurn,VerifierRecovery}
+
+fn source_from_workflow(id:&str)->Option<crate::autoship_contract::AcceptanceSource> {
+    use crate::autoship_contract::AcceptanceSource;
+    if let Some((_,number))=id.rsplit_once('#') {
+        return number.parse::<u64>().ok().filter(|n|*n>0).map(AcceptanceSource::Issue);
+    }
+    id.rsplit_once("/pr/").and_then(|(_,number)|number.parse::<u64>().ok()).filter(|n|*n>0).map(AcceptanceSource::PullRequest)
 }
 
 /// A run-local view of durable admissions. It survives guard consumption on
@@ -109,6 +192,12 @@ pub(super) struct CapacityAccounting {
 }
 impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
+        let source_waiting={
+            let store=self.store.lock().map_err(|_|anyhow::anyhow!("source accounting store poisoned"))?;
+            let snapshot=store.snapshot(&self.workflow)?.context("source accounting workflow missing")?;
+            store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?
+        };
+        if source_waiting {return self.report()?.context("source hold has no status report");}
         let Err(error) = &outcome else { return outcome; };
         let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
@@ -132,14 +221,17 @@ impl CapacityAccounting {
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
-        if !paused && !self.audit.resource_capacity_seen() { return Ok(None); }
-        let calls_after = store.snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let snapshot=store.snapshot(&self.workflow)?.context("capacity workflow missing")?;
+        let source_waiting=store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?;
+        if !paused && !source_waiting && !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = snapshot.model_calls;
         let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
         Ok(Some(RunReport {
             message: if paused {format!("Autoship owner pause requested; candidate and evidence preserved ({paid} model admissions this run)")}
+                else if source_waiting {format!("Autoship waiting for original verification evidence; candidate and prior charges preserved ({paid} model admissions this run)")}
                 else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
-            held: paid == 0,
+            held: source_waiting || paid == 0,
             resumed: self.resumed,
         }))
     }
@@ -463,12 +555,15 @@ impl SweepGuard {
             worktree: PathBuf::new(),
             contract: String::new(),
             environment: String::new(),
+            source_request:None,
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_source:source_from_workflow(&id),
             released: false,
         };
         inner.install_model_accounting()?;
@@ -657,12 +752,19 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
-        Self::acquire_mode_at(&path(),start,millis(),true).await
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::OwnerTurn).await
+    }
+    pub(super) async fn acquire_verifier_recovery(start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::VerifierRecovery).await
+    }
+    #[cfg(test)]
+    pub(super) async fn acquire_verifier_recovery_fixture(state:&Path,start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(state,start,millis(),AcquireMode::VerifierRecovery).await
     }
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
-        Self::acquire_mode_at(state,start,now,false).await
+        Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
-    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
+    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -685,26 +787,56 @@ impl WorkflowGuard {
             )?
         };
         let existing = store.snapshot(&id)?;
+        let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
+        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered") || semantic.is_some(),"semantic recovery source reference is missing");
+        let context=if let Some(snapshot)=&existing {
+            let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
+                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
+            if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
+        }else{None};
+        let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
+        let context=context.filter(|context|context.source_request==start.contract
+            && context.worktree.canonicalize().ok()==start.worktree.canonicalize().ok()
+            && (context.contract.starts_with("registered:") || context.environment==start.environment
+                || initial_wait && recovery::same_initial_verifier_environment(&context.environment,start.environment)));
+        let contract=context.as_ref().map_or(start.contract,|c|c.contract.as_str());
+        let environment=context.as_ref().map_or(start.environment,|c|c.environment.as_str());
         let receipts = existing
             .as_ref()
             .map(|s| s.checkpoint.evidence.clone())
             .unwrap_or_default();
         let mut binding =
-            git_binding(start.worktree, start.contract, start.environment, &receipts).await?;
+            git_binding(start.worktree, contract, environment, &receipts).await?;
         if existing
             .as_ref()
             .is_some_and(|s| s.checkpoint.binding != binding)
         {
-            binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
+            binding = git_binding(start.worktree, contract, environment, &[]).await?;
         }
-        if owner_turn {
+        if mode==AcquireMode::OwnerTurn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
+        } else if mode==AcquireMode::VerifierRecovery {
+            if !existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding && s.branch==start.branch
+                && s.checkpoint.stage==Stage::Scope && matches!((s.checkpoint.next.reason.as_str(),s.checkpoint.next.action.as_str()),
+                    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")|
+                    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"))) {return Ok(None);}
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
-        refresh_native_capacity(&mut store,&id,now)?;
+        if mode!=AcquireMode::VerifierRecovery {refresh_native_capacity(&mut store,&id,now)?;}
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
-        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
-            else {store.claim_productive_for_binding(&id,&owner,now,LEASE_MS,&binding)?};
+        let lease=match mode {
+            AcquireMode::OwnerTurn=>store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease),
+            AcquireMode::VerifierRecovery=>store.claim_reconciliation(&id,&owner,now,LEASE_MS)?,
+            AcquireMode::Productive=>store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?,
+        };
         let Some(lease)=lease else {return Ok(None);};
+        if mode==AcquireMode::VerifierRecovery {
+            match store.original_verifier_recovery_plan(&lease,&binding,now) {
+                Ok(Some(_))=>{},
+                Ok(None)=>{store.release(&lease,now)?;return Ok(None);},
+                Err(error)=>{store.release(&lease,now)?;return Err(error);},
+            }
+        }
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -732,18 +864,25 @@ impl WorkflowGuard {
         }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
-        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
-            workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
-        })?;
-        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        if mode!=AcquireMode::VerifierRecovery {
+            audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
+            })?;
+            store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        }
+        let semantic=store.semantic_reconsideration(&id,&binding)?;
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() {
+            AcceptanceAuthority::RecoveryOnly
+        }else {AcceptanceAuthority::Unbound};
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
             repository: start.repository.into(),
             worktree: start.worktree.into(),
-            contract: start.contract.into(),
-            environment: start.environment.into(),
+            contract: contract.into(),
+            environment: environment.into(),
+            source_request:Some((start.contract.into(),context.as_ref().map_or(start.pr,|context|context.source_pr))),
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
@@ -751,8 +890,15 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
+            acceptance_authority:Arc::new(Mutex::new(acceptance_authority)),
+            acceptance_source:source_from_workflow(&id),
         };
         guard.install_model_accounting()?;
+        if let Some(context)=guard.execution_context(&guard.binding)? {
+            let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+                .record_recovery_context(&guard.lease,&guard.binding,&context,now);
+            if let Err(error)=result {guard.finish()?;return Err(error);}
+        }
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
@@ -813,10 +959,13 @@ impl WorkflowGuard {
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
-            store.validate_dispatch(&dispatch_lease,&binding,millis())
+            store.validate_dispatch(&dispatch_lease,&binding,millis())?;
+            semantic_preparation_source(&mut store,&dispatch_lease,&dispatch_root,&dispatch_repository)?;
+            Ok(())
         }))?;
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
@@ -830,17 +979,37 @@ impl WorkflowGuard {
                 && observation["native_state"]["status"]=="capacity-exhausted" {
                 observation["native_state"]["capacity_fingerprint"].as_str()
             }else{None};
-            store.defer_run_capacity(&capacity_lease,fingerprint,millis())?;
+            let tool_refusal=durable::tool_capacity::ToolCapacityRefusal::capture(observation);
+            store.defer_run_capacity_observation(&capacity_lease,fingerprint,tool_refusal.as_ref(),millis())?;
             Ok(())
         }))?;
         let capacity_flag = self.capacity_exhausted.clone();
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
+        let acceptance_authority=self.acceptance_authority.clone();let worktree=self.worktree.clone();
         self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
-            anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
+            anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
+            acceptance::require_retained_native_custody(&worktree,&custody)?;
+            if !augmentagent_channel_core::native_session::is_fresh_review() {
+                let state=store.snapshot(&lease.workflow)?.context("workflow missing")?;
+                let authority=acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?;
+                match &*authority {
+                    AcceptanceAuthority::Qualified {prepared,control}=> {
+                        acceptance::require_qualified_baseline(&worktree,control,prepared)?;
+                        if state.checkpoint.binding.contract.starts_with("registered:") {
+                            anyhow::ensure!(state.checkpoint.binding.contract==format!("registered:{}",prepared.baseline.registration.contract_hash()),"builder qualification belongs to another registered contract");
+                        }
+                    },
+                    AcceptanceAuthority::RecoveryOnly=>anyhow::bail!("baseline_witness_unqualified: recovery metadata cannot authorize a builder"),
+                    AcceptanceAuthority::Unbound if state.checkpoint.binding.contract.starts_with("registered:") || matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review)=>anyhow::bail!("baseline_witness_unqualified: builder admission requires protected original-production qualification"),
+                    AcceptanceAuthority::Unbound=>{},
+                }
+            }
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let bounded=BOUNDED_NATIVE_CALL.try_with(Clone::clone).ok();
             if let Some(bounded)=&bounded {
@@ -894,7 +1063,9 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_source:None,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
@@ -1033,8 +1204,26 @@ impl WorkflowGuard {
     pub(super) fn bind_acceptance(
         &mut self,
         prepared: &acceptance::PreparedAcceptance,
+        control:&Path,
     ) -> Result<()> {
+        self.validate_acceptance_source(prepared)?;
+        acceptance::require_qualified_baseline(&self.worktree,control,prepared)?;
+        self.bind_acceptance_identity(prepared)?;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Qualified {prepared:prepared.clone(),control:control.canonicalize()?};
+        Ok(())
+    }
+
+    /// This metadata is needed by independent repair of an invalid legacy
+    /// verifier. It deliberately grants no builder/verification/merge proof.
+    pub(super) fn bind_acceptance_for_recovery(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        self.bind_acceptance_identity(prepared)?;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        Ok(())
+    }
+
+    fn bind_acceptance_identity(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
         self.healthy_lease()?;
+        self.validate_acceptance_source(prepared)?;
         self.contract = format!(
             "registered:{}",
             prepared.baseline.registration.contract_hash()
@@ -1044,6 +1233,11 @@ impl WorkflowGuard {
             .registration
             .binding(prepared.baseline.registration.baseline_head())?
             .environment_id;
+        Ok(())
+    }
+
+    pub(super) fn validate_acceptance_source(&self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        anyhow::ensure!(self.acceptance_source==Some(prepared.proposal.contract.source()?),"baseline qualification belongs to a different issue or PR");
         Ok(())
     }
 
@@ -1075,14 +1269,14 @@ impl WorkflowGuard {
         self.audit_health().await?;
         let binding =
             git_binding(&self.worktree, &self.contract, &self.environment, evidence).await?;
+        let context=self.execution_context(&binding)?;
         let now = millis();
         let mut store = self
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
-        store.checkpoint(
-            &self.lease,
-            &Checkpoint {
+        let checkpoint=
+            Checkpoint {
                 stage,
                 binding: binding.clone(),
                 evidence: evidence.to_vec(),
@@ -1091,9 +1285,9 @@ impl WorkflowGuard {
                     action: action.into(),
                     eligible_at_ms,
                 },
-            },
-            now,
-        )?;
+            };
+        if let Some(context)=&context {store.checkpoint_with_execution_context(&self.lease,&checkpoint,context,now)?;}
+        else {store.checkpoint(&self.lease,&checkpoint,now)?;}
         charge_elapsed(
             &mut store,
             &self.lease,
@@ -1107,6 +1301,27 @@ impl WorkflowGuard {
             serde_json::json!({"stage":stage,"reason":reason,"next_action":action}),
         )?;
         Ok(())
+    }
+
+    /// Metadata identifying enrolled recovery, never positive qualification.
+    pub(super) fn has_registered_acceptance_context(&self)->Result<bool> {
+        self.healthy_lease()?;
+        Ok(self.contract.strip_prefix("registered:").is_some_and(|hash|hash.len()==64 && hash.bytes().all(|b|b.is_ascii_hexdigit())))
+    }
+
+    /// Original protected frontend request, never a replacement inferred from a title.
+    pub(super) fn original_owner_request(&self)->Result<&str> {
+        self.healthy_lease()?;
+        self.source_request.as_ref().map(|(request,_)|request.as_str())
+            .filter(|request|!request.trim().is_empty())
+            .context("original owner request unavailable")
+    }
+
+    fn execution_context(&self,binding:&Binding)->Result<Option<durable::RecoveryContext>> {
+        let Some((request,pr))=&self.source_request else{return Ok(None)};
+        Ok(Some(durable::RecoveryContext {version:1,workflow:self.id().into(),repository:self.repository.clone(),
+            worktree:self.worktree.canonicalize()?,source_request:request.clone(),source_pr:*pr,
+            contract:self.contract.clone(),environment:self.environment.clone(),binding:binding.clone()}))
     }
 
     /// Check immediately before gh/git side effects. Also pass GitHub the
@@ -1296,16 +1511,76 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
+        self.hold_initial_acceptance_custody(reason,action,false).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_custody(&mut self,reason:&str,action:&str,physical:bool)->Result<()> {
+        self.hold_initial_acceptance_verifier(reason,action,physical,None).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_verifier(&mut self,reason:&str,action:&str,physical:bool,plan:Option<&str>)->Result<()> {
         self.healthy_lease()?;
         self.audit_health().await?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let mut checkpoint=store.snapshot(self.id())?.context("initial acceptance workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,Stage::Intake|Stage::Scope),
+        let readiness_reassessment=reason=="readiness_assessment_invalid" && action=="await_readiness_input_change"
+            && checkpoint.stage==Stage::Reconcile && checkpoint.next.reason=="inputs_changed";
+        anyhow::ensure!(checkpoint.binding==self.binding && (matches!(checkpoint.stage,Stage::Intake|Stage::Scope) || readiness_reassessment),
             "initial acceptance hold requires unchanged unenrolled scope");
-        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
-            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint_verifier_recovery_hold(&self.lease,&checkpoint,millis(),physical,plan)?;
+        Ok(())
+    }
+
+    /// Qualification recovery holds already-enrolled work without turning its
+    /// candidate binding into an unenrolled initial scope or granting a builder.
+    pub(super) async fn hold_enrolled_acceptance(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str)->Result<()> {
+        self.hold_enrolled_acceptance_custody(prepared,reason,action,false).await
+    }
+
+    pub(super) async fn hold_enrolled_acceptance_custody(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str,physical:bool)->Result<()> {
+        self.healthy_lease()?;
+        self.validate_acceptance_source(prepared)?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("enrolled acceptance workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,
+            Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"enrolled acceptance hold binding/stage changed");
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
+        Ok(())
+    }
+
+    /// A fresh issue must not keep spending once an authorized linked PR exists.
+    /// PR-bound recovery uses its original independent execution authority.
+    pub(super) async fn require_fresh_issue(&self,repo:&Path)->Result<()> {
+        self.validate_before_side_effect()?;
+        if self.pr()?.is_some() {return Ok(());}
+        let Some((_,number))=self.id().rsplit_once('#') else {return Ok(())};
+        let issue=number.parse::<u64>()?;
+        if let Err(error)=linked_claims::require_absence(repo,self.repository(),issue).await {
+            if let Some(hold)=error.downcast_ref::<linked_claims::Hold>() {
+                self.hold_linked_claim(*hold).await?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn hold_linked_claim(&self,hold:linked_claims::Hold)->Result<()> {
+        self.healthy_lease()?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("fresh issue workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding
+            && !matches!(checkpoint.stage,Stage::Merged|Stage::Retired),"fresh claim hold binding/stage changed");
+        if checkpoint.next.reason==hold.reason() && checkpoint.next.action==hold.action() {return Ok(());}
+        checkpoint.next=crate::autoship_workflow::NextAction {
+            reason:hold.reason().into(),action:hold.action().into(),eligible_at_ms:millis()+300_000,
+        };
         store.checkpoint(&self.lease,&checkpoint,millis())?;
         Ok(())
     }
@@ -1313,6 +1588,30 @@ impl WorkflowGuard {
     pub(super) fn check_resource_policy(&self) -> Result<()> {
         self.validate_before_side_effect()?;
         augmentagent_channel_core::run_resources::check_requirement("workflow_action", Some(&self.audit))
+    }
+
+    pub(super) fn semantic_preparation_source(&self)->Result<Option<acceptance::PreparedAcceptance>> {
+        self.validate_before_side_effect()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?;
+        semantic_preparation_source(&mut store,&self.lease,&self.worktree,&self.repository)
+    }
+
+    pub(super) fn semantic_source_waiting(&self)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?
+            .semantic_source_waiting(self.id(),&self.binding)
+    }
+
+    pub(super) async fn checkpoint_qualification_source(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
+        let evidence=self.store.lock().map_err(|_|anyhow::anyhow!("qualification store poisoned"))?
+            .snapshot(self.id())?.context("qualification workflow missing")?.checkpoint.evidence;
+        self.bind_acceptance_for_recovery(prepared)?;
+        self.checkpoint(Stage::Scope,"baseline_qualification_started","qualify_original_baseline",0,&evidence).await
+    }
+
+    pub(super) fn epoch_attempts(&self,purpose:&str,epoch:&str)->Result<u32> {
+        self.healthy_lease()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .epoch_attempts(&self.lease,purpose,epoch,millis())
     }
 
     pub(super) fn admit_epoch_attempt(
@@ -1331,8 +1630,72 @@ impl WorkflowGuard {
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
     }
+    pub(super) fn recorded_scope_stage_response(&self,key:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .recorded_scope_stage_response(&self.lease,&self.binding,key,millis())
+    }
+    pub(super) fn scope_stage_response_keys(&self,after:&str)->Result<Vec<String>> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
+    }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
+    }
+
+    pub(super) fn record_verifier_evidence(&self,key:&str,kind:&str,body:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_verifier_evidence(&self.lease,&self.binding,key,kind,body,millis())
+    }
+
+    pub(super) fn original_verifier_recovery_plan(&self)->Result<Option<(String,String)>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .original_verifier_recovery_plan(&self.lease,&self.binding,millis())
+    }
+
+    pub(super) async fn complete_original_verifier_recovery(&self,plan:&str,result:&str)->Result<()> {
+        self.validate_before_side_effect()?;self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .complete_original_verifier_recovery(&self.lease,&self.binding,plan,result,millis())
+    }
+
+    pub(super) fn verifier_evidence_page(&self,kind:&str,after:i64)->Result<Vec<durable::VerifierEvidence>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence_page(&self.lease,&self.binding,kind,after,millis())
+    }
+
+    pub(super) fn verifier_evidence(&self,key:&str,kind:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence(&self.lease,&self.binding,key,kind,millis())
+    }
+
+    pub(super) fn scope_stage_response_pair(&self,key:&str,provenance_key:&str)->Result<Option<(String,String)>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .scope_stage_response_pair(&self.lease,&self.binding,key,provenance_key,millis())
+    }
+
+    pub(super) fn initial_correction_evidence(&self,root:&Path,source:crate::autoship_contract::AcceptanceSource,base:&str,proposal_sha256:&str)->Result<serde_json::Value> {
+        self.validate_before_side_effect()?;
+        let control=acceptance::control_directories(self.repository(),self.id())?.workflow_acceptance;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?;
+        let custody=store.baseline_native_custody(&self.lease,&self.binding,millis())?;
+        acceptance::initial_correction_evidence(root,&control,source,base,proposal_sha256,&self.binding,&custody,&store.inspect_verifier_evidence(self.id()))
+    }
+
+    pub(super) fn baseline_native_custody(&self)->Result<Vec<durable::NativeScopeCustody>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .baseline_native_custody(&self.lease,&self.binding,millis())
+    }
+
+    pub(super) fn record_scope_stage_response_pair(&self,key:&str,response:&str,provenance_key:&str,provenance:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_scope_stage_response_pair(&self.lease,&self.binding,key,response,provenance_key,provenance,millis())
     }
 
     pub(super) fn set_pr_readiness_dependency(&self,pr:u64,record:Option<(&str,&str,&str)>)->Result<()> {
@@ -1421,6 +1784,33 @@ impl WorkflowGuard {
             .record_verification_gate_passed(&self.lease,&self.binding,domain,millis())?;
         self.audit_event("verification_gate_passed",serde_json::json!({"domain":domain}))?;
         Ok(())
+    }
+
+    pub(super) async fn defer_main_policy_reconciliation(&mut self, main: &str) -> Result<i64> {
+        anyhow::ensure!(
+            matches!(main.len(), 40 | 64) && main.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid main policy dependency"
+        );
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        anyhow::ensure!(
+            self.pending_operations()?.is_empty(),
+            "pending publication must reconcile before main integration"
+        );
+        let eligible = millis().saturating_add(300_000);
+        self.audit_event(
+            "hosted_ci_main_dependency",
+            serde_json::json!({"observed_main":main,"shipping_authority":false}),
+        )?;
+        self.checkpoint(
+            Stage::Reconcile,
+            "review_main_changed",
+            "reconcile_main",
+            eligible,
+            &[],
+        )
+        .await?;
+        Ok(eligible)
     }
 
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
@@ -1554,8 +1944,9 @@ impl WorkflowGuard {
     pub(super) fn finish_ci_deferral(&mut self) -> Result<()> {
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
-            && checkpoint.next.action == "retry_verification", "no durable CI deferral to release");
+        anyhow::ensure!(matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
+            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")),
+            "no durable CI deferral to release");
         self.release_after_teardown()
     }
 
@@ -1756,13 +2147,19 @@ pub(super) async fn prepare_resume_worktree(
     prepare_resume_worktree_at_head(repo_root,pr,branch,None).await
 }
 
+/// Read-only identity shared by the resume producer and recovery inspector.
+pub(super) async fn resume_worktree_path(repo_root:&Path,pr:u64)->Result<PathBuf> {
+    anyhow::ensure!(pr>0,"PR identity required");
+    let primary=workspace::primary_root(repo_root).await?;
+    let path=primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
+    recovery::checkout_path(&primary,&path)?;
+    Ok(path)
+}
+
 pub(super) async fn prepare_resume_worktree_at_head(
     repo_root:&Path, pr:u64, branch:&str, expected_head:Option<&str>,
 )->Result<PathBuf> {
-    anyhow::ensure!(pr > 0, "PR identity required");
-    let primary = workspace::primary_root(repo_root).await?;
-    let path = primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
-    recovery::checkout_path(&primary, &path)?;
+    let path=resume_worktree_path(repo_root,pr).await?;
     let exists = path.try_exists()?;
     if exists {
         recovery::existing_checkout(repo_root, &path).await?;
@@ -1844,6 +2241,50 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn semantic_recovery_reuses_registered_context_without_builder_authority() {
+        let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+        let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        original.bind_acceptance_for_recovery(&prepared).unwrap();
+        original.checkpoint(Stage::Scope,"acceptance_verifier_evidence_unknown","await_original_evidence_recovery",0,&[]).await.unwrap();
+        let binding=original.binding().clone();let workflow=original.id().to_owned();original.finish().unwrap();
+        {
+            let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&workflow).unwrap().unwrap();
+            assert!(store.recover_semantic_qualification(&held,None,&"b".repeat(64),millis(),|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        }
+        let mut resumed=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(resumed.binding(),&binding,"semantic recovery lost its original registered binding");
+        assert!(matches!(*resumed.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"reconsideration entered with ordinary builder authority");
+        assert!(resumed.audit_logger().model_call_admitted("codex").is_err(),"negative qualification metadata admitted a builder");
+        let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        drop(store);
+        resumed.checkpoint(Stage::Reconcile,"resume_started","inspect_candidate",0,&[]).await.unwrap();
+        resumed.finish().unwrap();
+        let restarted=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(restarted.binding(),&binding,"crash after resume_started discarded the queued source binding");
+        assert!(matches!(*restarted.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"restart discarded semantic recovery-only authority");
+        assert!(restarted.audit_logger().model_call_admitted("codex").is_err(),"restart admitted a builder from negative source data");
+        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        restarted.finish().unwrap();
+    }
+
+    #[test]
+    fn baseline_source_uses_the_resolved_workflow_not_a_pr_alias() {
+        use crate::autoship_contract::AcceptanceSource;
+        assert_eq!(source_from_workflow("owner/repo#2014"),Some(AcceptanceSource::Issue(2014)));
+        assert_eq!(source_from_workflow("owner/repo/pr/2027"),Some(AcceptanceSource::PullRequest(2027)));
+        assert_eq!(source_from_workflow("autoship-observation/probe"),None);
+        assert_eq!(source_from_workflow("owner/repo#0"),None);
+    }
+    async fn scripted_independent_admission(guard:&WorkflowGuard) {
+        use augmentagent_channel_core::{native_session,ProviderKind};
+        native_session::fresh_review_scope(ProviderKind::Codex,async {
+            let session=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut native=session.begin(ProviderKind::Codex)?;
+            guard.audit_logger().model_call_admitted("codex")?;native.observe("scripted-independent-accounting-fixture")?;native.finish()?;
+            Ok::<_,anyhow::Error>(())
+        }).await.unwrap();
+    }
     fn control_dir() -> tempfile::TempDir {
         // Managed Cargo puts TMPDIR inside the writable build cache. Control
         // evidence must live outside every worker write root even in fixtures.
@@ -1948,7 +2389,7 @@ mod tests {
         let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap().admission.workflow;
         let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
         store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
-        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),AcquireMode::OwnerTurn).await.unwrap().unwrap();
         guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
         assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
         let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
@@ -2898,6 +3339,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_restart_cannot_spend_a_second_witness_call_for_changed_inputs() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=||Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
+        let original=format!("{}{}",durable::BASELINE_NATIVE_PURPOSE_PREFIX,"a".repeat(64));
+        let result=guard.bounded_native_calls(original,1,
+            augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    guard.audit_logger().model_call_admitted("codex")?;
+                    Err::<(),_>(anyhow::anyhow!("scripted original response loss after admission"))
+                })).await;
+        assert!(result.is_err());
+        assert!(guard.baseline_native_custody().is_err());
+        let workflow=guard.id().to_owned();guard.finish().unwrap();
+        let next=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
+        let changed=format!("{}{}",durable::BASELINE_NATIVE_PURPOSE_PREFIX,"b".repeat(64));
+        let refused=next.bounded_native_calls(changed,1,
+            augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    next.audit_logger().model_call_admitted("codex")
+                })).await.unwrap_err();
+        assert!(refused.is::<durable::NativeScopeOutcomeUnresolved>(),"native admission lost its durable custody refusal: {refused:#}");
+        let store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,1);
+        assert_eq!(store.events(&workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),1);
+        next.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn model_admission_audit_names_the_committed_accounting_receipt() {
         let dir = repo();
         let control = control_dir();
@@ -2909,13 +3379,18 @@ mod tests {
         }, millis()).await.unwrap().unwrap();
         let audit = guard.audit_logger();
         // Script the existing admission boundary; no provider is launched.
-        audit.model_call_admitted("codex").unwrap();
+        guard.bounded_native_calls("original-witness-input".into(),1,async {
+            audit.model_call_admitted("codex")
+        }).await.unwrap();
         let store = WorkflowStore::open(&path).unwrap();
         let admissions: Vec<serde_json::Value> = store.events(guard.id()).unwrap()
             .into_iter().filter(|(_, kind, _, _)| kind == "native_model_admitted")
             .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap()).collect();
         assert_eq!(admissions.len(), 1);
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        assert_eq!(admissions[0]["bounded"],serde_json::json!({
+            "purpose":"original-witness-input","binding":guard.binding(),"limit":1
+        }),"the existing admission observer must bind the charged receipt to its native input");
         let receipt = admissions[0]["receipt"].as_str().unwrap();
         assert!(receipt.starts_with("model-call:"));
         let records: Vec<serde_json::Value> = std::fs::read_to_string(audit.path()).unwrap()
@@ -2970,18 +3445,19 @@ mod tests {
     async fn ci_gate_consumption_defers_revisions_before_repair_and_preserves_paid_accounting() {
         for stage in [Stage::Build, Stage::Review, Stage::Reconcile] {
             for (infrastructure, already_paid) in [(true, false), (true, true), (false, false)] {
-                let dir = repo();
-                let state = control_dir();
+                let (dir,state,prepared)=acceptance::qualification_fixture();
+                acceptance::qualify_fixture(dir.path(),state.path(),&prepared).unwrap();
                 let path = state.path().join("workflow.db");
                 let mut guard = WorkflowGuard::acquire_at(&path, Start {
                     repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
-                    source_issue: Some(77), pr: Some(88), branch: "fixture", contract: "C1",
+                    source_issue: None, pr: Some(840), branch: "fixture", contract: "C1",
                     environment: "rust-a",
                 }, millis()).await.unwrap().unwrap();
+                guard.bind_acceptance(&prepared,state.path()).unwrap();
                 guard.checkpoint(stage, "candidate_ready", "run_verifier", 0,
                     &["protected-receipt".into()]).await.unwrap();
                 let accounting = guard.capacity_accounting(true).unwrap();
-                if already_paid { guard.audit_logger().model_call_admitted("codex").unwrap(); }
+                if already_paid { scripted_independent_admission(&guard).await; }
                 let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
                 let allowance = WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap();
                 let mut repairs = 0;
@@ -3067,7 +3543,7 @@ mod tests {
         let paid_run = guard.capacity_accounting(false).unwrap();
         // Deterministic observer fixture: one protected admission in this run,
         // then a resumed run sees that admission only as historical spend.
-        guard.audit_logger().model_call_admitted("codex").unwrap();
+        scripted_independent_admission(&guard).await;
         let subsequent_run = guard.capacity_accounting(true).unwrap();
         let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         guard.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"completed","exhausted":true,"memory_events":{"oom_kill":1}})).unwrap();
@@ -3184,6 +3660,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_policy_dependency_defers_before_the_model_repair_boundary() {
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let mut guard = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(713),
+                pr: Some(42),
+                branch: "fixture",
+                contract: "C1",
+                environment: "test",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        guard.audit_logger().model_call_admitted("claude").unwrap();
+        let id = guard.id().to_owned();
+        let before = WorkflowStore::open(&path)
+            .unwrap()
+            .snapshot(&id)
+            .unwrap()
+            .unwrap();
+        let error = CiGateResult(Err(hosted_ci::MainPolicyReconciliation {
+            main: "b".repeat(40),
+        }
+        .into()))
+        .for_workflow(&mut guard)
+        .await
+        .unwrap_err();
+        assert!(
+            error.is::<CiInfrastructureDeferred>(),
+            "policy drift leaked into the repairable inner result: {error:#}"
+        );
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let after = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage, Stage::Reconcile);
+        assert_eq!(after.checkpoint.next.reason, "review_main_changed");
+        assert_eq!(after.checkpoint.next.action, "reconcile_main");
+        assert!(after.checkpoint.next.eligible_at_ms > millis());
+        assert_eq!(after.model_calls, before.model_calls);
+        assert_eq!(after.tokens, before.tokens);
+        assert!(store
+            .claim_productive(
+                &id,
+                "too-early",
+                after.checkpoint.next.eligible_at_ms - 1,
+                60_000
+            )
+            .unwrap()
+            .is_none());
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_tool_capacity_observer_keeps_precise_blocker_after_restart() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(712),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start,millis()).await.unwrap().unwrap();
+        guard.audit_logger().model_call_admitted("claude").unwrap();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let observation=serde_json::json!({"phase":"native_tool_build_storage_reserve","exhausted":true,
+            "tool_readiness":{"category":"build_storage_reserve","execution_started":false},
+            "available_bytes":25,"required_bytes":37,"private":"MUST_NOT_ESCAPE"});
+        guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        let id=guard.id().to_owned();assert!(guard.finish().is_err());
+        let mut store=WorkflowStore::open(&path).unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.reason,"resource_capacity");assert_eq!(after.checkpoint.next.action,"await_capacity");
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert!(store.claim_productive(&id,"early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
+        let events=store.progress_events(&id).unwrap();let progress=serde_json::to_value(events.last().unwrap()).unwrap();
+        assert_eq!(progress["tool_capacity_refusal"],serde_json::json!({"category":"build_storage_reserve","execution_started":false,"available_bytes":25,"required_bytes":37}));
+        assert!(!progress.to_string().contains("MUST_NOT_ESCAPE"));
+        let (code,status)=crate::autoship_commands::status(&path,&id,millis(),5);
+        assert_eq!(code,3);assert_eq!(status["tool_capacity_refusal"],progress["tool_capacity_refusal"]);
+    }
+
+    #[tokio::test]
     async fn acquired_guard_accounts_direct_reviewers_without_builder_binding() {
         let dir=repo(); let control=control_dir(); let path=control.path().join("workflow.db");
         let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
@@ -3199,6 +3759,34 @@ mod tests {
         assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
     }
 
+    #[tokio::test]
+    async fn linked_claim_hold_preserves_current_stage_evidence_progress_and_first_eligibility() {
+        for stage in [Stage::Scope,Stage::Build,Stage::Publish] {
+            for hold in [linked_claims::Hold::Claimed,linked_claims::Hold::Unknown] {
+                let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+                let mut guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),
+                    repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+                guard.checkpoint(stage,"fixture_dispatch","fixture",0,&["original-evidence".into()]).await.unwrap();
+                let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                let first=millis();guard.hold_linked_claim(hold).await.unwrap();
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+                assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+                assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+                assert_eq!(after.progress_at_ms,before.progress_at_ms);
+                assert_eq!(after.model_calls,before.model_calls);
+                assert_eq!(after.checkpoint.next.reason,hold.reason());
+                assert_eq!(after.checkpoint.next.action,hold.action());
+                assert!(after.checkpoint.next.eligible_at_ms>=first+300_000);
+                guard.hold_linked_claim(hold).await.unwrap();
+                let repeated=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(repeated.checkpoint,after.checkpoint);
+                assert_eq!(repeated.progress_at_ms,after.progress_at_ms);
+                guard.finish().unwrap();
+            }
+        }
+    }
+
 }
 
 
@@ -3206,55 +3794,125 @@ mod tests {
 mod initial_acceptance_hold_tests {
     use super::*;
     #[tokio::test]
-    async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
-        for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
-            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
-            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
-            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
-                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
-                assert!(output.status.success());
-            }
-            let path=control.path().join("workflow.db");
-            let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
-                source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
-            let now=millis();
-            let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
+    async fn upstream_only_change_cannot_reclaim_an_exhausted_initial_verifier() {
+        upstream_wait_fixture(true).await;
+    }
+    #[tokio::test]
+    async fn upstream_movement_still_wakes_other_readiness_dependencies() {
+        upstream_wait_fixture(false).await;
+    }
+    async fn upstream_wait_fixture(input_wait:bool) {
+        async fn git(root:&Path,args:&[&str])->String {
+            let out=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(root)
+                .env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        }
+        let root=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        let upstream=root.path().join("upstream");let candidate=root.path().join("candidate");
+        std::fs::create_dir(&upstream).unwrap();
+        std::fs::write(upstream.join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+        std::fs::write(upstream.join("Cargo.lock"),"unchanged compiler inputs\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {git(&upstream,&args).await;}
+        let initial=git(&upstream,&["rev-parse","HEAD"]).await;
+        git(&upstream,&["worktree","add","--detach",candidate.to_str().unwrap(),&initial]).await;
+        let environment=recovery::environment_identity(&candidate,&initial).await.unwrap();
+        let path=control.path().join("workflow.db");let now=millis();
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:&upstream,worktree:&candidate,repository:"owner/repo",
+            source_issue:Some(7),pr:None,branch:"fixture",contract:"unchanged owner criteria",environment:&environment},now).await.unwrap().unwrap();
+        guard.store.lock().unwrap().charge(&guard.lease,"past-scope-work",crate::autoship_workflow::ResourceCharge {model_calls:3,tokens:1234,wall_ms:700},millis()).unwrap();
+        if input_wait {
             guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
-            let id=guard.id().to_owned();guard.finish().unwrap();
-            let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-            let original=before.snapshot(&id).unwrap().unwrap();
-            let events=before.events(&id).unwrap();drop(before);
-            for offset in [1000,86_400_000,2*86_400_000] {
-                let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
-                assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
+        }else {
+            guard.checkpoint(Stage::Scope,"scope_deferred","resolve_scope_dependencies",0,&[]).await.unwrap();
+        }
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();drop(store);
+        std::fs::write(upstream.join("unrelated.md"),"manual intake routing changed elsewhere\n").unwrap();
+        git(&upstream,&["add","unrelated.md"]).await;
+        git(&upstream,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","unrelated main advance"]).await;
+        let advanced=git(&upstream,&["rev-parse","HEAD"]).await;
+        git(&upstream,&["update-ref","refs/remotes/origin/main",&advanced]).await;
+        let current=recovery::environment_identity(&candidate,&advanced).await.unwrap();
+        assert_ne!(environment,current,"fixture did not exercise real upstream-dependent environment");
+        assert_eq!(git(&candidate,&["rev-parse","HEAD"]).await,initial);
+        assert!(git(&candidate,&["status","--porcelain"]).await.is_empty());
+        let next=WorkflowGuard::acquire_at(&path,Start {repo_root:&upstream,worktree:&candidate,repository:"owner/repo",
+            source_issue:Some(7),pr:None,branch:"fixture",contract:"unchanged owner criteria",environment:&current},now+1000).await.unwrap();
+        if !input_wait {
+            let resumed=next.expect("ordinary readiness dependency lost its upstream wake");
+            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
+            resumed.finish().unwrap();return;
+        }
+        assert!(next.is_none(),"upstream-only environment change revived the exhausted original verifier");
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);
+        assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);assert_eq!(store.events(&id).unwrap(),events);
+    }
+    #[tokio::test]
+    async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
+        for (reason,action) in [
+            ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
+            ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+            ("readiness_assessment_invalid","await_readiness_input_change"),
+            ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+        ] {
+            for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
+                let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+                std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+                for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                    let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                    assert!(output.status.success());
+                }
+                let path=control.path().join("workflow.db");
+                let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
+                    source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
+                let now=millis();
+                let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
+                guard.hold_initial_acceptance(reason,action).await.unwrap();
+                let id=guard.id().to_owned();guard.finish().unwrap();
+                let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+                let original=before.snapshot(&id).unwrap().unwrap();
+                let events=before.events(&id).unwrap();drop(before);
+                for offset in [1000,86_400_000,2*86_400_000] {
+                    let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
+                    assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
+                    let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+                    let after=store.snapshot(&id).unwrap().unwrap();
+                    assert_eq!(after.attempts,original.attempts);
+                    assert_eq!(after.model_calls,original.model_calls);
+                    assert_eq!(after.tokens,original.tokens);
+                    assert_eq!(after.checkpoint,original.checkpoint);
+                    assert_eq!(store.events(&id).unwrap(),events);
+                }
+                // A real contract revision can re-enter ordinary admission, but
+                // it cannot override the owner's pause or reuse old approval.
+                let mut store=WorkflowStore::open(&path).unwrap();
+                store.set_owner_pause(&id,"github:owner",0,true,now+3*86_400_000).unwrap();
+                let mut revised=start();revised.contract="changed owner criteria";
+                assert!(WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000).await.unwrap().is_none());
+                store.set_owner_pause(&id,"github:owner",1,false,now+3*86_400_000+1).unwrap();
+                drop(store);
+                let mut revised=start();revised.contract="changed owner criteria";
+                let mut changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
                 let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                 let after=store.snapshot(&id).unwrap().unwrap();
-                assert_eq!(after.attempts,original.attempts);
+                assert_eq!(after.attempts,original.attempts+1);
+                assert_eq!(after.checkpoint.stage,Stage::Reconcile);
+                assert_eq!(after.checkpoint.next.reason,"inputs_changed");
+                assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
                 assert_eq!(after.model_calls,original.model_calls);
                 assert_eq!(after.tokens,original.tokens);
-                assert_eq!(after.checkpoint,original.checkpoint);
-                assert_eq!(store.events(&id).unwrap(),events);
+                assert!(store.current_review_history(&id).unwrap().is_empty());
+                drop(store);
+                if reason=="readiness_assessment_invalid" {
+                    changed.hold_initial_acceptance(reason,action).await.unwrap();
+                }
+                changed.finish().unwrap();
             }
-            // A real contract revision can re-enter ordinary admission, but
-            // it cannot override the owner's pause or reuse old approval.
-            let mut store=WorkflowStore::open(&path).unwrap();
-            store.set_owner_pause(&id,"github:owner",0,true,now+3*86_400_000).unwrap();
-            let mut revised=start();revised.contract="changed owner criteria";
-            assert!(WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000).await.unwrap().is_none());
-            store.set_owner_pause(&id,"github:owner",1,false,now+3*86_400_000+1).unwrap();
-            drop(store);
-            let mut revised=start();revised.contract="changed owner criteria";
-            let changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
-            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-            let after=store.snapshot(&id).unwrap().unwrap();
-            assert_eq!(after.attempts,original.attempts+1);
-            assert_eq!(after.checkpoint.stage,Stage::Reconcile);
-            assert_eq!(after.checkpoint.next.reason,"inputs_changed");
-            assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
-            assert_eq!(after.model_calls,original.model_calls);
-            assert_eq!(after.tokens,original.tokens);
-            assert!(store.current_review_history(&id).unwrap().is_empty());
-            drop(store);changed.finish().unwrap();
         }
     }
 

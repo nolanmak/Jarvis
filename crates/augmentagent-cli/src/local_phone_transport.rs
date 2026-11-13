@@ -230,7 +230,8 @@ mod tests {
         }
     }
     fn directory() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // Unix socket paths must fit even when managed build TMPDIR is long.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }

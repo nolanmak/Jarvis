@@ -34,8 +34,13 @@ milestones and blockers; do not restart the canceled benchmark campaign.
   and hosted dependency setup. The normal updater deployed commit `227d27f1`
   on November 11; both running service executable hashes matched the release
   artifact in the 16:14 UTC readback. This is a dated rollout observation.
-- #2016 tracks unchanged acceptance-input waits being reclaimed without useful
-  progress. Waiting for changed input must not become repeated paid attempts.
+- #2020 merged the #2019 fix for #2016: productive claims hold unchanged initial
+  acceptance-input waits. It also added authenticated `autopr reconcile-target`
+  for targets merged or closed outside autoship, preserving owner controls,
+  accounting and unresolved operations. Terminal state queues native retirement;
+  it does not certify teardown. Verify the deployed build before using it.
+- The proposed [automatic retained-session count semantics](auto-session-count-contract.md)
+  settle one #1918 decision; they do not enable host sizing or close C0.
 - #1917 remains the automatic host-capacity epic. Native retained-state storage
   reservations and host memory are different limits. Neither free disk nor the
   old fixed retained-state budget is evidence of automatic RAM sizing.
@@ -53,6 +58,20 @@ and node-release are the merge signal; macOS is informational unless explicitly
 required by branch protection. Keep owner pauses and uncertain operations intact.
 Use the supported workflow/controller paths for terminal reconciliation and native
 retirement; never edit production SQLite rows to manufacture completion.
+
+Readiness evidence must quote literal immutable source bytes, including comment
+markers and line breaks when they occur inside a quote. Correction feedback
+preserves bounded previous output and verbatim source excerpts privately; it
+does not relax validation or increase the three completed-assessment limit.
+`readiness_assessment_invalid / await_readiness_input_change` means those
+corrections were exhausted, not that an owner decision is missing. The same
+binding cannot make another productive claim, including after a restart or day
+change. Changed request, source or environment bindings can retry through normal
+admission; owner pauses still apply. Admission also binds GitHub’s freshly read
+main SHA and the readiness-policy version, so a retained checkout does not hide
+a real upstream change or policy rollout. Bump the shared readiness policy when
+changing its correction protocol. General reconciliation remains available.
+See #2023 for the observed wrapped-comment failure and regression coverage.
 
 The superseded #1916 documentation branch retains historical design and proof
 artifacts at commit `799ba04dcfcd51b65f9585f82aa995a2c0bd4dfa`. Each describes

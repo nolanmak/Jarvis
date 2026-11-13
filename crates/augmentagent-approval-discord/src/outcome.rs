@@ -51,6 +51,14 @@ pub fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::CalendarResponded { account, response, summary } => {
             format!("RSVP sent: {response} for \"{summary}\" on {account}.")
         }
+        ApprovalActionOutcome::CalendarRescheduled { account, summary, when, notified, already_there } => {
+            if *already_there {
+                format!("Meeting \"{summary}\" was already at {when} on {account}; nothing changed.")
+            } else {
+                let guests = if *notified { "guests notified" } else { "guests not notified" };
+                format!("Meeting moved: \"{summary}\" now {when} on {account}; {guests}.")
+            }
+        }
         ApprovalActionOutcome::DocumentSigned { receipt, .. } => format!("Document signed. {receipt}"),
         ApprovalActionOutcome::ManualSendReady { text, link } => {
             let open = link.as_deref().map(|l| format!("\nOpen the chat: {l}")).unwrap_or_default();
@@ -182,6 +190,33 @@ mod tests {
         assert!(line.contains("Schedule cancelled"), "{line}");
         let skipped = card_status_line("rejected", Some("skipped by approver")).unwrap();
         assert!(skipped.contains("Skipped"), "{skipped}");
+    }
+
+    /// #2039 AC8 — the reschedule receipt names the meeting, new time,
+    /// account, and whether guests were told.
+    #[test]
+    fn a_reschedule_receipt_says_where_the_meeting_went() {
+        let moved = ApprovalActionOutcome::CalendarRescheduled {
+            account: "owner@example.test".into(),
+            summary: "Sync".into(),
+            when: "Tue Nov 18 15:00–15:30 EST".into(),
+            notified: true,
+            already_there: false,
+        };
+        assert_eq!(
+            describe(&moved),
+            "Meeting moved: \"Sync\" now Tue Nov 18 15:00–15:30 EST on owner@example.test; guests notified."
+        );
+        let quiet = ApprovalActionOutcome::CalendarRescheduled {
+            account: "a@example.test".into(), summary: "S".into(), when: "w".into(),
+            notified: false, already_there: false,
+        };
+        assert!(describe(&quiet).ends_with("guests not notified."));
+        let same = ApprovalActionOutcome::CalendarRescheduled {
+            account: "a@example.test".into(), summary: "S".into(), when: "w".into(),
+            notified: true, already_there: true,
+        };
+        assert!(describe(&same).contains("nothing changed"));
     }
 
     #[test]

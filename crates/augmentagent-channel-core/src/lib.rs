@@ -17,6 +17,7 @@ pub mod cli_gate;
 pub mod code_mode;
 pub mod codex;
 pub mod codex_tools;
+mod native_tool_readiness;
 pub mod cooldown;
 pub mod decision;
 pub mod draft_context;
@@ -44,6 +45,21 @@ pub mod run_resources;
 pub mod secret_loader;
 pub mod skills;
 pub mod state_dir;
+// #1930 — one storage authority for every writer: the CLI build gate and the
+// Autoship capacity paths outside it admit against the same lock namespace,
+// the same growth ledger, the same directory leases and the same CI cleanup
+// fence instead of each starting its own.
+#[path = "storage_ci_holds.rs"]
+pub mod build_storage_ci_holds;
+pub mod storage_checkout;
+pub mod storage_coordination;
+pub mod storage_reservations;
+/// Physical-directory leases. They are lock files in the coordination
+/// namespace, so they are implemented beside it and published here under the
+/// name every writer reaches them by.
+pub mod storage_leases {
+    pub use crate::storage_coordination::{ProfileDirs, TargetLeases};
+}
 pub mod timeparse;
 pub mod log_retention;
 pub mod token_usage;

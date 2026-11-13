@@ -432,9 +432,13 @@ mod tests {
     #[test]
     fn pressure_preserves_held_leases_and_unavailable_or_live_process_evidence() {
         let f = Fixture::new();
-        let lease = TargetLeases::try_cache_roots(std::slice::from_ref(&f.root.path), None)
-            .unwrap()
-            .unwrap();
+        let lease = TargetLeases::try_cache_roots(
+            std::slice::from_ref(&f.root.path),
+            None,
+            &crate::disk::profile_dirs,
+        )
+        .unwrap()
+        .unwrap();
         assert!(f
             .run(false, None, Some(&[]), &f.refs)
             .iter()

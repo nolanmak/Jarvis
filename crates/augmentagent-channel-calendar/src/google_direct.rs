@@ -264,6 +264,27 @@ impl GoogleCalendar {
             "end": {"dateTime": end.to_rfc3339()},
             "attendees": draft.attendees.iter().map(|a| serde_json::json!({"email": a})).collect::<Vec<_>>(),
         });
+        // #2042 — a series needs an IANA zone on both ends (Google rejects a
+        // recurring event without one, and it keeps the local time across DST).
+        if !draft.recurrence.is_empty() {
+            let tz = draft
+                .time_zone
+                .as_deref()
+                .map(str::trim)
+                .filter(|z| !z.is_empty())
+                .ok_or_else(|| {
+                    CalendarError::Invalid("a recurring event needs a time zone (IANA name)".into())
+                })?;
+            if draft.recurrence.iter().any(|r| !r.starts_with("RRULE:") || r.contains(['\n', '\r'])) {
+                return Err(CalendarError::Invalid(format!(
+                    "recurrence must be RRULE lines, got {:?}",
+                    draft.recurrence
+                )));
+            }
+            body["start"]["timeZone"] = serde_json::Value::String(tz.to_string());
+            body["end"]["timeZone"] = serde_json::Value::String(tz.to_string());
+            body["recurrence"] = serde_json::json!(draft.recurrence);
+        }
         if let Some(desc) = &draft.description {
             body["description"] = serde_json::Value::String(desc.clone());
         }
@@ -372,12 +393,84 @@ mod tests {
             duration_minutes: 30,
             attendees: vec!["a@example.com".into(), "b@example.com".into()],
             description: None,
-            create_meeting_room: true,
+            create_meeting_room: true, recurrence: vec![], time_zone: None,
         };
         let created = client(&server).create_event("owner@example.com", "primary", &draft).await.unwrap();
         assert_eq!(created.id.as_deref(), Some("new1"));
         assert!(created.attendees.is_some());
         insert.assert_async().await;
+    }
+
+    /// #2042 AC3/AC6 — a recurring draft sends the RRULE and an IANA
+    /// timeZone on both ends; nothing else changes.
+    #[tokio::test]
+    async fn a_recurring_create_sends_recurrence_and_time_zone() {
+        let mut server = Server::new_async().await;
+        let insert = server
+            .mock("POST", "/calendars/primary/events")
+            .match_query(Matcher::Any)
+            .match_body(Matcher::Json(serde_json::json!({
+                "summary": "1:1",
+                "start": {"dateTime": "2026-11-17T10:00:00-05:00", "timeZone": "America/New_York"},
+                "end": {"dateTime": "2026-11-17T10:30:00-05:00", "timeZone": "America/New_York"},
+                "attendees": [{"email": "sam@example.com"}],
+                "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=10"],
+            })))
+            .with_body(r#"{"id":"series1","htmlLink":"https://calendar.google.com/event?eid=s"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let draft = EventDraft {
+            summary: "1:1".into(),
+            start_datetime: "2026-11-17T10:00:00-05:00".into(),
+            duration_minutes: 30,
+            attendees: vec!["sam@example.com".into()],
+            description: None,
+            create_meeting_room: false,
+            recurrence: vec!["RRULE:FREQ=WEEKLY;COUNT=10".into()],
+            time_zone: Some("America/New_York".into()),
+        };
+        let created = client(&server).create_event("owner@example.com", "primary", &draft).await.unwrap();
+        assert_eq!(created.id.as_deref(), Some("series1"));
+        insert.assert_async().await;
+    }
+
+    /// #2042 — a one-off draft's body is unchanged: no recurrence, no zone.
+    #[tokio::test]
+    async fn a_one_off_create_has_no_recurrence_fields() {
+        let mut server = Server::new_async().await;
+        let insert = server
+            .mock("POST", "/calendars/primary/events")
+            .match_query(Matcher::Any)
+            .match_body(Matcher::Json(serde_json::json!({
+                "summary": "x",
+                "start": {"dateTime": "2026-10-30T10:00:00-07:00"},
+                "end": {"dateTime": "2026-10-30T10:30:00-07:00"},
+                "attendees": [],
+            })))
+            .with_body(r#"{"id":"one1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let draft = EventDraft {
+            summary: "x".into(), start_datetime: "2026-10-30T10:00:00-07:00".into(), duration_minutes: 30,
+            attendees: vec![], description: None, create_meeting_room: false, recurrence: vec![], time_zone: None,
+        };
+        client(&server).create_event("owner@example.com", "primary", &draft).await.unwrap();
+        insert.assert_async().await;
+    }
+
+    /// A recurring draft without a zone is refused before any request.
+    #[tokio::test]
+    async fn a_recurring_create_without_a_zone_is_refused() {
+        let server = Server::new_async().await;
+        let draft = EventDraft {
+            summary: "x".into(), start_datetime: "2026-10-30T10:00:00-07:00".into(), duration_minutes: 30,
+            attendees: vec![], description: None, create_meeting_room: false,
+            recurrence: vec!["RRULE:FREQ=DAILY".into()], time_zone: None,
+        };
+        let err = client(&server).create_event("owner@example.com", "primary", &draft).await.unwrap_err();
+        assert!(matches!(&err, CalendarError::Invalid(m) if m.contains("time zone")), "{err}");
     }
 
     #[tokio::test]
@@ -392,7 +485,7 @@ mod tests {
             .await;
         let draft = EventDraft {
             summary: "x".into(), start_datetime: "2026-10-30T10:00:00-07:00".into(), duration_minutes: 30,
-            attendees: vec![], description: None, create_meeting_room: false,
+            attendees: vec![], description: None, create_meeting_room: false, recurrence: vec![], time_zone: None,
         };
         let err = client(&server).create_event("owner@example.com", "primary", &draft).await.unwrap_err();
         assert!(matches!(err, CalendarError::Unconfirmed(_)), "{err}");
@@ -468,7 +561,7 @@ mod tests {
         let marker = format!("[TEST direct-gcal] {}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let draft = EventDraft {
             summary: marker.clone(), start_datetime: start, duration_minutes: 5,
-            attendees: vec![], description: Some("automated QA; deleted immediately".into()), create_meeting_room: true,
+            attendees: vec![], description: Some("automated QA; deleted immediately".into()), create_meeting_room: true, recurrence: vec![], time_zone: None,
         };
         let created = cal.create_event(&email, "primary", &draft).await.expect("create");
         let id = created.id.clone().unwrap();

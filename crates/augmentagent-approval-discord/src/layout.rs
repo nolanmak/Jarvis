@@ -488,13 +488,20 @@ fn approval_embed_and_rows(
     // #927 — a merge card carries evidence, not a draft: nothing to redraft,
     // so Approve (which runs the merge) and Skip are the only verbs offered.
     // #1224 — an RSVP card carries a provider write, not a draft.
-    if email.kind == "identity_merge" || email.platform == "document-signing" || email.kind == "rsvp" {
+    // #2039 — so does a reschedule card (its body is the JSON move request).
+    if email.kind == "identity_merge"
+        || email.platform == "document-signing"
+        || email.kind == "rsvp"
+        || email.kind == "reschedule"
+    {
         let row = CreateActionRow::Buttons(vec![
             CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
                 .label(if email.platform == "document-signing" {
                     "Approve & Sign"
                 } else if email.kind == "rsvp" {
                     "Send RSVP"
+                } else if email.kind == "reschedule" {
+                    "Move meeting"
                 } else {
                     "Approve & Merge"
                 })
@@ -1443,6 +1450,18 @@ mod tests {
         assert!(v.contains("aa:act-m1:approve") && v.contains("Approve & Merge"));
         assert!(v.contains("aa:act-m1:skip") && !v.contains(":revise"), "nothing to redraft");
         assert_eq!(row_count(&approval_message("a", &email(), "d", 0)), 3, "other kinds unchanged");
+    }
+
+    /// #2039 — a reschedule card is a provider write with nothing to
+    /// redraft: Move meeting and Skip only.
+    #[test]
+    fn reschedule_card_offers_only_move_and_skip() {
+        let mut e = email();
+        e.platform = "gcal".into();
+        e.kind = "reschedule".into();
+        let v = json(&approval_message("act-r1", &e, "Move calendar event", 0));
+        assert!(v.contains("aa:act-r1:approve") && v.contains("Move meeting"), "{v}");
+        assert!(v.contains("aa:act-r1:skip") && !v.contains(":revise"), "nothing to redraft");
     }
 
     #[test]

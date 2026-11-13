@@ -31,6 +31,17 @@ impl AdoptedPr {
     }
 }
 
+/// Existing permissive canonical source mapping, shared with fresh-work suppression.
+/// Callers requiring completeness must validate metadata before invoking it.
+pub(super) fn source_references(row:&serde_json::Value,repository:&str)->Vec<u64> {
+    row.get("closingIssuesReferences").and_then(|v|v.as_array()).into_iter().flatten()
+        .filter_map(|issue| {
+            let number=issue.get("number")?.as_u64().filter(|n|*n>0)?;
+            let url=issue.get("url")?.as_str()?;
+            url.eq_ignore_ascii_case(&format!("https://github.com/{repository}/issues/{number}")).then_some(number)
+        }).collect()
+}
+
 /// Only GitHub's explicit same-repository flag and a trusted PR author authorize
 /// adoption. Branch names and model-written approval prose supply no authority.
 pub(super) fn authorized(
@@ -61,20 +72,7 @@ pub(super) fn authorized(
             if branch.is_empty() || head.is_empty() || base.is_empty() {
                 return None;
             }
-            let references: Vec<u64> = row
-                .get("closingIssuesReferences")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|issue| {
-                    let number = issue.get("number")?.as_u64().filter(|n| *n > 0)?;
-                    let url = issue.get("url")?.as_str()?;
-                    (url.eq_ignore_ascii_case(&format!(
-                        "https://github.com/{repository}/issues/{number}"
-                    )))
-                    .then_some(number)
-                })
-                .collect();
+            let references = source_references(row, repository);
             // Multiple sources require an explicit contract decision; never guess
             // which issue to retire. Legacy harness branches retain their mapping.
             let source_issue = match references.as_slice() {
@@ -167,6 +165,7 @@ pub(super) fn episode_retries(
     now: i64,
 ) -> Result<std::collections::BTreeSet<u64>> {
     let store = WorkflowStore::open(path)?;
+    let recovered=store.due_qualification_recovery(None,now)?;
     let mut result = std::collections::BTreeSet::new();
     for candidate in candidates {
         let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
@@ -175,13 +174,22 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
+        if owner_resume_matches(&store,&id,candidate)? && store.owner_resume_due(&id,now)? {
+            result.insert(candidate.pr);
+            continue;
+        }
+        let qualification_recovered=recovered.contains(&id) && snapshot.pr==Some(candidate.pr)
+            && snapshot.branch==candidate.branch && candidate.ready_for_review()
+            && (snapshot.checkpoint.binding.head==candidate.head
+                || store.retained_candidate_head(&candidate.repository,candidate.pr,&candidate.branch,&candidate.head,
+                    &snapshot.checkpoint.binding.head,now)?.as_deref()==Some(snapshot.checkpoint.binding.head.as_str()));
         let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
             && snapshot.checkpoint.next.reason == "review_main_changed"
             && snapshot.checkpoint.next.action == "reconcile_main";
         if snapshot.lease_until_ms <= now
             && snapshot.checkpoint.next.eligible_at_ms <= now
             && !store.owner_control(&id)?.is_some_and(|control| control.paused)
-            && (main_changed || matches!(
+            && (main_changed || qualification_recovered || matches!(
                 snapshot.checkpoint.next.action.as_str(),
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
@@ -193,6 +201,83 @@ pub(super) fn episode_retries(
         }
     }
     Ok(result)
+}
+
+fn owner_resume_matches(store:&WorkflowStore,id:&str,candidate:&AdoptedPr)->Result<bool> {
+    let identity=candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|source|source==id))
+        || crate::autoship_workflow::pr_workflow_id(&candidate.repository,candidate.pr).is_ok_and(|source|source==id);
+    Ok(identity && candidate.ready_for_review()
+        && store.snapshot(id)?.is_some_and(|snapshot|snapshot.pr==Some(candidate.pr))
+        && store.resolve_pr(&candidate.repository,candidate.pr)?.as_deref()==Some(id))
+}
+
+/// Re-read authorized PR inventory before handing an owner resume into the
+/// existing protected PR execution path. The durable hint grants no authority.
+pub(super) async fn current_owner_resume(repo:&Path,path:&Path,id:&str)->Result<Option<AdoptedPr>> {
+    let repository=workflow::canonical_repository(repo).await?;
+    targeted::authorize_repository(repo,&repository).await?;
+    let raw=complete_repository_inventory(repo,"pr",None,
+        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences").await?;
+    let mut allowed=trusted_authors(repo).await;
+    if let Some(owner)=repository.split('/').next() {allowed.push(owner.into());}
+    let mut candidates=authorized(&serde_json::from_str(&raw)?,&repository,&allowed);
+    policy_hold::filter(repo,&mut candidates,false).await;
+    let Some(store)=WorkflowStore::open_read_only(path)? else{return Ok(None)};
+    if !store.owner_resume_ready_for_dispatch(id,chrono::Utc::now().timestamp_millis())? {return Ok(None);}
+    for candidate in candidates {
+        if owner_resume_matches(&store,id,&candidate)? {return Ok(Some(candidate));}
+    }
+    Ok(None)
+}
+
+pub(super) async fn policy_reconciliation_retries(
+    repo: &Path,
+    path: &Path,
+    candidates: &[AdoptedPr],
+    now: i64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let mut retries = std::collections::BTreeSet::new();
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(retries);
+    };
+    for candidate in candidates {
+        if !candidate.ready_for_review()
+            || candidate.source_issue.is_none()
+            || !matches!(candidate.head.len(), 40 | 64)
+            || !candidate.head.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
+            continue;
+        };
+        let Some(snapshot) = store.snapshot(&id)? else {
+            continue;
+        };
+        if snapshot.lease_until_ms > now
+            || snapshot.checkpoint.next.eligible_at_ms > now
+            || snapshot.pr != Some(candidate.pr)
+            || snapshot.checkpoint.binding.head != candidate.head
+            || snapshot.checkpoint.stage != crate::autoship_workflow::Stage::Reconcile
+            || snapshot.checkpoint.next.reason != "draft_parked"
+            || snapshot.checkpoint.next.action != "resume"
+            || store
+                .owner_control(&id)?
+                .is_some_and(|control| control.paused)
+            || store.pending_owner_messages(&id)? > 0
+        {
+            continue;
+        }
+        // Only the unmodified inherited policy can reopen this legacy state.
+        // Missing objects/policy evidence never create a scheduling grant.
+        if matches!(
+            hosted_ci::inherited_policy_drift(repo, &candidate.head, &candidate.head).await,
+            Ok(Some(_))
+        ) {
+            retries.insert(candidate.pr);
+        }
+    }
+    Ok(retries)
 }
 
 pub(super) fn select_linked_with_retries(
@@ -343,6 +428,7 @@ pub(super) async fn revise(
     prompt: &str,
 ) -> Result<String> {
     let worktree = opts.cwd.as_deref().context("revision worktree missing")?;
+    workflow.require_fresh_issue(worktree).await?;
     let origin = origin_for_candidate(worktree, Some(workflow)).await?;
     if origin.is_imported() {
         // Normal dispatch records actual mutation providers. Imported unknown
@@ -356,6 +442,33 @@ pub(super) async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_recovered_retry_requires_the_same_available_owned_candidate() {
+        for obstruction in ["none","pause","head","branch","dependency","message","mutation"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let mut store=WorkflowStore::open(&path).unwrap();
+            let mut candidates=authorized(&serde_json::json!([row(9,"fix/issue-7")]),"owner/repo",&["owner".into()]);
+            let candidate=&mut candidates[0];let id="owner/repo#7";
+            let binding=crate::autoship_workflow::Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(id,&candidate.branch,binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,1000).unwrap().unwrap();
+            store.attach_pr_in_repo(&lease,"owner/repo",9,3).unwrap();
+            let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;checkpoint.stage=crate::autoship_workflow::Stage::Reconcile;
+            checkpoint.next=crate::autoship_workflow::NextAction {reason:"original_verifier_measurement_recovered".into(),action:"qualify_original_measurement".into(),eligible_at_ms:0};
+            store.checkpoint(&lease,&checkpoint,4).unwrap();
+            if obstruction=="mutation" {store.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,5).unwrap();}
+            store.release(&lease,6).unwrap();
+            if obstruction=="pause" {store.set_owner_pause(id,"github:owner",0,true,7).unwrap();}
+            if obstruction=="head" {candidate.head="different-head".into();}
+            if obstruction=="branch" {candidate.branch="different-branch".into();}
+            if obstruction=="dependency" {candidate.dependency=Dependency::AwaitParent {pr:8};}
+            // Inbox insertion is exercised by the owner-inbox suite; this
+            // matrix models a due handoff whose action needs that owner input.
+            if obstruction=="message" {
+                let lease=store.claim(id,"owner-input",7,1000).unwrap().unwrap();
+                checkpoint.next.action="await_owner_reply".into();store.checkpoint(&lease,&checkpoint,8).unwrap();store.release(&lease,9).unwrap();
+            }
+            assert_eq!(episode_retries(&path,&candidates,10).unwrap().contains(&9),obstruction=="none","{obstruction}");
+        }
+    }
     fn row(pr: u64, branch: &str) -> serde_json::Value {
         serde_json::json!({"number":pr,"headRefName":branch,"headRefOid":"head-one","baseRefName":"main",
             "isCrossRepository":false,"author":{"login":"owner"},"title":"Fix", "body":"LGTM does not grant approval",

@@ -267,6 +267,7 @@ mod tests {
             class: String::new(),
             usage: Default::default(),
             duration_ms: 0,
+            outcome: None,
         });
 
         assert!(state.join("reasoner-cooldowns.json").is_file());

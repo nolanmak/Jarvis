@@ -994,9 +994,39 @@ impl ComposioClient {
         max_pages: u32,
         sleep_between_pages: Option<Duration>,
     ) -> Result<Vec<Email>, GmailError> {
+        let hits = self
+            .fetch_paged_hits(entity_id, query, max_total, max_pages, sleep_between_pages)
+            .await?;
+        Ok(hits.into_iter().map(|h| h.email).collect())
+    }
+
+    /// [`GmailApi::fetch_with_query`] that keeps each message's Gmail labels
+    /// (#2040), so `gmail search` can tell an unsent draft from a sent reply.
+    pub async fn search_hits(
+        &self,
+        entity_id: &str,
+        query: &str,
+        max_total: u32,
+    ) -> Result<Vec<SearchHit>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.search_hits(&email, query, max_total).await;
+        }
+        self.fetch_paged_hits(entity_id, query, max_total, 10, None)
+            .await
+    }
+
+    async fn fetch_paged_hits(
+        &self,
+        entity_id: &str,
+        query: &str,
+        max_total: u32,
+        max_pages: u32,
+        sleep_between_pages: Option<Duration>,
+    ) -> Result<Vec<SearchHit>, GmailError> {
         const PAGE_SIZE: u32 = 20;
 
-        let mut collected: Vec<Email> = Vec::new();
+        let mut collected: Vec<SearchHit> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut page_token: Option<String> = None;
 
@@ -1024,12 +1054,13 @@ impl ComposioClient {
             let returned = msgs.len();
 
             let mut new_this_page = 0usize;
-            for m in msgs {
+            for mut m in msgs {
+                let labels = std::mem::take(&mut m.label_ids);
                 if let Some(email) = m.into_email(entity_id) {
                     // Dedup by message id: a repeated message never gets added
                     // twice, no matter how many times Composio re-serves it.
                     if seen.insert(email.message_id.clone()) {
-                        collected.push(email);
+                        collected.push(SearchHit { email, labels });
                         new_this_page += 1;
                         if collected.len() >= max_total as usize {
                             break;
@@ -2147,6 +2178,33 @@ mod tests {
     // terminates (token-advance guard, not the page cap), and (3) the
     // `messageTimestamp` field populates Email.date.
     #[tokio::test]
+    async fn search_hits_keep_gmail_labels_so_a_draft_is_not_a_sent_reply() {
+        // #2040: a saved reply draft and a sent reply looked identical in
+        // `gmail search`; Composio returns `labelIds`, which must survive.
+        let body = r#"{"data":{"messages":[
+            {"id":"D1","from":"me@example.com","subject":"Re: invite","messageText":"draft","labelIds":["DRAFT"]},
+            {"id":"S1","from":"me@example.com","subject":"Re: invite","messageText":"sent","labelIds":["SENT","IMPORTANT"]},
+            {"id":"X1","from":"a@example.com","subject":"invite","messageText":"odd","labelIds":"INBOX"}
+        ]}}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+        let hits = client.search_hits("entity-x", "subject:invite", 3).await.unwrap();
+        let got: Vec<(&str, bool, Vec<&str>)> = hits
+            .iter()
+            .map(|h| (h.email.message_id.as_str(), h.is_draft(), h.labels.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("D1", true, vec!["DRAFT"]),
+                ("S1", false, vec!["SENT", "IMPORTANT"]),
+                ("X1", false, vec![]),
+            ],
+            "labels kept per hit; a malformed labelIds is empty, not a failed decode"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_with_query_dedups_repeated_message_and_parses_timestamp() {
         let body = r#"{"data":{"messages":[{"id":"MSG1","from":"me@example.com","subject":"Invoice #35","messageTimestamp":"2026-01-17T21:11:09Z","messageText":"hi"}],"nextPageToken":"STUCK_CURSOR"}}"#;
         let addr = spawn_repeating_http(200, body, "").await;
@@ -3012,6 +3070,36 @@ struct FetchMessage {
         deserialize_with = "de_lenient_attachments"
     )]
     attachment_list: Vec<AttachmentMeta>,
+    /// Gmail label ids (`DRAFT`, `SENT`, `INBOX`, ...) (#2040). Lenient for
+    /// the #331 reason: an odd shape yields no labels, never a failed decode.
+    #[serde(default, alias = "label_ids", deserialize_with = "de_lenient_labels")]
+    label_ids: Vec<String>,
+}
+
+/// A search result with the Gmail labels attached to it (#2040). `Email` has
+/// no label field, so search keeps them alongside: without them a saved draft
+/// reply in a thread reads exactly like a sent one.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub email: Email,
+    pub labels: Vec<String>,
+}
+
+impl SearchHit {
+    /// Saved in Drafts and never sent.
+    pub fn is_draft(&self) -> bool {
+        self.labels.iter().any(|l| l == "DRAFT")
+    }
+}
+
+fn de_lenient_labels<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_array()
+        .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+        .unwrap_or_default())
 }
 
 /// One entry of Composio's `attachmentList` (#811 labels, #937 download).

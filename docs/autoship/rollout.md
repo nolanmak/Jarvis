@@ -121,6 +121,23 @@ use owned deployment artifacts and the normal guarded deployment path; retain
 pending workflow/runtime evidence and do not introduce an executable override.
 
 
+## Red-main repair diagnostics
+
+A red-main repair names failed required CI, without assuming that missing Rust
+test names mean compilation failed. Its bounded excerpt uses GitHub's failed
+steps for each verified job, rather than successful setup/tests or post-job
+cleanup. Check names, job identities and links stay with their diagnostic text.
+Missing logs remain explicitly unavailable; they never change a failed verdict.
+The public excerpt is limited to 2,500 bytes, with shared space for up to eight
+failed jobs and an explicit omitted-job count beyond that. Oversized excerpts
+retain both ends and mark truncation; inspect the job link for full evidence.
+
+Changing diagnostic wording does not replace an existing marked repair issue
+for the same full main SHA. Existing requests, owner holds and accounting remain
+attached to that issue. Lines rejected by the public-report privacy check are
+replaced with an explicit withholding marker. Full-report validation still gates
+issue publication; withholding diagnostics never turns a failed check green.
+
 ## Review-held triage
 
 Read the workflow's current state before requesting another attempt:
@@ -136,6 +153,26 @@ augmentagent autopr status --workflow WORKFLOW --json
 | `review-recovery-required` | A selected review failed to complete. Inspect the protected controller error and repair its recorded cause before retrying. |
 | `review-main-advanced` | Main advanced outside the captured candidate. The original workflow queues integration and fresh verification with a five-minute backoff. Automatic selection recognizes this dependency wake within the same day, and the short queue poll notices eligible work without requiring a CLI job. Existing owner holds and unresolved operations still prevent dispatch. |
 
+Initial acceptance-input waits retain their recorded execution context when only
+the known environment's `upstream-main` value changes. An unrelated main merge
+does not repair the original verifier. Compiler, Cargo.lock, readiness-policy,
+owner-request and candidate changes still pass through their existing admission
+checks; other readiness dependencies retain their upstream wake. Unknown producer
+shapes keep the existing exact-identity handling. Recovery evidence, owner pauses,
+charges and prior results are preserved. This does not rewind an already reclaimed
+episode or silently restart an administratively paused workflow.
+
+[Initial verifier budget references](initial-verifier-budget-reference.md) also
+preserve a spent episode across the crash before its stable hold is saved and a
+controller rollout. The primary issue frontend replays the original scoped
+decision and checks exhaustion before paid readiness/scoping. Missing custody
+remains an evidence-recovery hold; an older accounting reference is not approval.
+
+[Initial verifier correction feedback](initial-verifier-correction-feedback.md)
+uses authenticated private predecessor evidence for fresh corrections while
+keeping public errors safe. Completed corrections replay before new inspection;
+missing custody holds without another paid correction.
+
 Private progress retains the typed review blocker when a worker wrapper finishes.
 A resume acknowledgement is still intent, and can wait for native retirement or
 another admission guard. If a format correction remains incomplete, inspect the
@@ -148,7 +185,8 @@ A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
 hold reasons remain historical records; a new deployment does not rewrite them.
 
-Hosted APT setup retries a confirmed Ubuntu mirror DNS failure once against
+Hosted APT setup requests IPv4 on hosted runners and retries a confirmed Ubuntu
+mirror DNS failure once against
 `https://mirrors.edge.kernel.org/ubuntu/`, using the runner's Ubuntu suite and
 archive signature keyring. Temporary source options apply only to that retry;
 host DNS and source files stay unchanged. Signature, lock, package and subsequent
@@ -162,6 +200,68 @@ report `policy-missing` while the services have a valid selection. An accepted
 resume can still require runtime retirement reconciliation before execution.
 Acceptance, cleanup, model progress, and a confirmed merge are separate results.
 Preserve unrelated owner pauses and inspect the resulting status.
+
+Both fresh-issue selectors consult that same owner control using the canonical
+repository/issue identity before triage. They skip paused issues and consider
+eligible peers without changing pauses, candidates, history or resource charges.
+An all-paused inventory is idle; a supported owner resume restores selection
+eligibility. This free read does not admit execution: on the primary route, the productive
+claim still checks owner controls atomically, including a pause arriving after
+selection. The legacy configured multi-repository route currently has only the
+selection filter; #2056 owns its missing durable claim/model-admission integration.
+Primary-route claim tests do not prove that configured execution is fenced.
+
+Primary automatic selection also skips authors who fail the existing owner,
+write-association or explicit-author allowlist policy. It continues through the
+complete inventory to authorized peers without commenting on or labeling those
+untrusted issues. They still need explicit owner authorization; neither a bot
+identity nor a label grants it. The final execution trust guard remains in place,
+and the configured legacy approval policy is unchanged.
+
+The `autoship-manual` issue label routes engineering recovery work outside both
+automatic fresh selectors. They skip it before triage and continue to ordinary
+peers. This is a routing choice, not a failure, permission, workflow registration
+or teardown receipt. Remove the label to restore normal selection eligibility;
+all existing authorization, owner controls and execution gates still apply.
+Pause already-active repair workflows through `autopr pause`; labeling alone
+does not stop them. Keep remaining engineering/acceptance work open and tracked.
+Do not use `agent-gave-up` for this routing choice: that label reports failures.
+
+A fresh-selection `owner-control-unavailable` hold means the existing protected
+control state or canonical identity could not be read reliably. It is unpaid;
+inspect the configured state and its access rather than treating unknown state
+as permission or clearing owner controls. A missing database for a new
+installation is different: free selection may consider new issues without
+initializing a database or registering workflows.
+
+## Capacity waits in health readback
+
+After verifying the deployed build and worker, run:
+
+```sh
+augmentagent autopr-health --json
+```
+
+`resource-capacity-waiting` or `native-capacity-unobserved` is an ALERT for active durable
+`resource_capacity` / `await_capacity` checkpoints. A running worker, recent
+manual merge or provider-hold warning does not clear it. Owner-paused, held,
+terminal and diagnostic-only workflows are excluded. The count describes the
+persisted wait; available capacity still needs normal worker reconciliation.
+
+`capacity-state-unavailable` is an ALERT when the running worker's effective
+configuration or selected workflow store cannot be verified. Health reads the
+worker's private process-bound post-bootstrap receipt and opens that workflow
+store read-only, using the same selected database and daily cap for capacity and
+merge accounting. Missing or stale evidence does not select or create another
+workflow database. Capacity ALERTs make the command exit 1. Native retained-state measurements are descriptive storage observations, not host-memory sizing or execution authority.
+
+Health observation does not claim, wake or prune workflows or spend shipping
+allowance. Inspect the worker's selected capacity and ownership evidence through
+its configured delegated resource context. A readiness probe from an ordinary
+shell may lack delegation without proving the worker lacks it. Restore supported
+capacity or complete verified ownership recovery; preserve owner holds, retained
+sessions and budgets while the underlying cause is unresolved.
+
 
 ## Observed deployment, 2026-10-26
 

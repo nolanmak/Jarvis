@@ -39,6 +39,14 @@ pub struct EventDraft {
     /// Attach a Google Meet room.
     #[serde(default)]
     pub create_meeting_room: bool,
+    /// #2042 — RRULE lines (`RRULE:FREQ=WEEKLY;COUNT=10`); empty = one-off.
+    /// Older stored drafts have no such field and stay one-off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recurrence: Vec<String>,
+    /// #2042 — IANA zone sent as start/end `timeZone`. Required for a
+    /// recurring event so occurrences keep their local time across DST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
 }
 
 /// Handle returned by a successful create.
@@ -163,6 +171,21 @@ pub trait CalendarApi: Send + Sync {
         let _ = (entity_id, calendar_id, event_id, response, notify);
         Err(CalendarError::Invalid(
             "RSVP is not supported by this calendar client".into(),
+        ))
+    }
+
+    /// #2039 — move an event the account organizes to the request's new
+    /// time. Re-reads the event first: refuses if it moved since the card
+    /// was posted, writes nothing if it is already there, and otherwise
+    /// PATCHes only `start`/`end`. Only ever called from the daemon's
+    /// Approve handler.
+    async fn reschedule(
+        &self,
+        req: &crate::reschedule::RescheduleRequest,
+    ) -> Result<crate::reschedule::RescheduleOutcome, CalendarError> {
+        let _ = req;
+        Err(CalendarError::Invalid(
+            "reschedule is not supported by this calendar client".into(),
         ))
     }
 }
@@ -642,6 +665,13 @@ impl CalendarApi for ComposioCalendarClient {
             let (g, email) = route?;
             return g.create_event(&email, calendar_id, draft).await;
         }
+        if !draft.recurrence.is_empty() {
+            // The Composio tool takes a naive time in UTC, so a series would
+            // drift across DST. Refuse instead of creating a one-off.
+            return Err(CalendarError::Invalid(format!(
+                "recurring events need a Google-direct calendar account; {entity_id} is Composio-routed"
+            )));
+        }
         // Param names per Composio's GOOGLECALENDAR_CREATE_EVENT schema
         // (snake_case, unlike EVENTS_LIST's Google-native camelCase).
         // The Composio tool expects a naive datetime plus an IANA zone.
@@ -701,6 +731,44 @@ impl CalendarApi for ComposioCalendarClient {
         Err(CalendarError::Unconfirmed(format!(
             "GOOGLECALENDAR_CREATE_EVENT returned no nonempty event ID (composio log_id {log_id})"
         )))
+    }
+
+    async fn reschedule(
+        &self,
+        req: &crate::reschedule::RescheduleRequest,
+    ) -> Result<crate::reschedule::RescheduleOutcome, CalendarError> {
+        use crate::reschedule::{check_current, confirm, patch_body};
+        if req.event_id.trim().is_empty() || req.calendar_id.trim().is_empty() {
+            return Err(CalendarError::Invalid(
+                "calendar id and event id are required".into(),
+            ));
+        }
+        let path = format!(
+            "calendars/{}/events/{}",
+            path_segment(&req.calendar_id),
+            path_segment(&req.event_id)
+        );
+        let read = self.proxy(&req.entity_id, "GET", &path, &[], None).await?;
+        let current: CalendarEvent = serde_json::from_value(read.clone()).map_err(|e| {
+            CalendarError::Decode(format!(
+                "events.get: {e}: {}",
+                bounded(&read.to_string(), 300)
+            ))
+        })?;
+        if let Some(done) = check_current(req, &current)? {
+            return Ok(done);
+        }
+        let send_updates = if req.notify { "all" } else { "none" };
+        let updated = self
+            .proxy(
+                &req.entity_id,
+                "PATCH",
+                &path,
+                &[("sendUpdates", send_updates)],
+                Some(patch_body(req, &current)),
+            )
+            .await?;
+        confirm(req, &updated)
     }
 
     async fn respond(
@@ -1026,7 +1094,7 @@ mod tests {
             duration_minutes: 30,
             attendees: vec!["sarah@acme.example.com".into()],
             description: None,
-            create_meeting_room: false,
+            create_meeting_room: false, recurrence: vec![], time_zone: None,
         };
         let created = client.create_event("ent", "primary", &draft).await.unwrap();
         assert!(ensure_organizer_accepted(&client, "ent", "primary", &created).await.unwrap());
@@ -1092,7 +1160,7 @@ mod tests {
             duration_minutes: 30,
             attendees: vec!["sarah@acme.example.com".into()],
             description: None,
-            create_meeting_room: false,
+            create_meeting_room: false, recurrence: vec![], time_zone: None,
         };
         let created = client.create_event("ent", "primary", &draft).await.unwrap();
         assert_eq!(created.id.as_deref(), Some("new-evt-1"));
@@ -1119,13 +1187,50 @@ mod tests {
             duration_minutes: 90,
             attendees: vec![],
             description: None,
-            create_meeting_room: false,
+            create_meeting_room: false, recurrence: vec![], time_zone: None,
         };
         let err = client
             .create_event("ent", "primary", &draft)
             .await
             .unwrap_err();
         assert!(matches!(err, CalendarError::Forbidden { .. }));
+    }
+
+    /// #2042 AC6 — the Composio tool path cannot carry a zone-correct
+    /// series, so a recurring draft is refused, never made one-off.
+    #[tokio::test]
+    async fn composio_path_refuses_a_recurring_draft() {
+        let mut server = Server::new_async().await;
+        let never = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let draft = EventDraft {
+            summary: "x".into(),
+            start_datetime: "2026-07-10T15:00:00-04:00".into(),
+            duration_minutes: 30,
+            attendees: vec![],
+            description: None,
+            create_meeting_room: false,
+            recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+            time_zone: Some("America/New_York".into()),
+        };
+        let err = client.create_event("ent", "primary", &draft).await.unwrap_err();
+        assert!(matches!(&err, CalendarError::Invalid(m) if m.contains("recurring")), "{err}");
+        never.assert_async().await;
+    }
+
+    /// #2042 AC5 — drafts stored before recurrence existed still parse as
+    /// one-off events, and a one-off draft serializes without the new keys.
+    #[test]
+    fn old_drafts_parse_as_one_off() {
+        let old = r#"{"summary":"s","start_datetime":"2026-07-10T15:00:00-04:00","duration_minutes":30,"attendees":[],"description":null,"create_meeting_room":false}"#;
+        let d: EventDraft = serde_json::from_str(old).unwrap();
+        assert!(d.recurrence.is_empty() && d.time_zone.is_none());
+        let back = serde_json::to_string(&d).unwrap();
+        assert!(!back.contains("recurrence") && !back.contains("time_zone"), "{back}");
     }
 
     #[tokio::test]

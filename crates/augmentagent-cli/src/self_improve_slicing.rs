@@ -12,6 +12,7 @@ struct Transport<'a>(&'a Path, &'a workflow::WorkflowGuard);
 impl Github for Transport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<String> {
         if args.starts_with(&["issue", "create"]) || args.starts_with(&["issue", "edit"]) {
+            self.1.require_fresh_issue(self.0).await?;
             self.1.validate_before_side_effect()?;
         }
         let (ok, out, error) = run(&gh_bin(), args, self.0).await?;
@@ -149,6 +150,10 @@ async fn reconcile(
                 labels,
             ])
             .await;
+        let result=match result {
+            Err(error) if linked_claims::report(&error).is_some()=>return Err(error),
+            other=>other,
+        };
         // Query even after a lost response: a transport error is not proof that
         // GitHub did not create the child. Closed children remain discoverable.
         rows = inventory(github).await?;
@@ -186,6 +191,7 @@ pub(super) async fn file(
     plan: &[Slice],
     guard: &workflow::WorkflowGuard,
 ) -> Result<Vec<u64>> {
+    guard.require_fresh_issue(repo).await?;
     guard.validate_before_side_effect()?;
     let repository = workflow::canonical_repository(repo).await?;
     let plan = admitted_plan(&workflow::path(), &repository, issue, plan)?;

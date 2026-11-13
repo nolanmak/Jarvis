@@ -320,7 +320,8 @@ mod tests {
             );
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        // Keep the IPC fixture within Unix socket path limits under managed TMPDIR.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
         let account = SurfaceAccountRef::new(
             SurfacePlatform::new("whatsapp").unwrap(),

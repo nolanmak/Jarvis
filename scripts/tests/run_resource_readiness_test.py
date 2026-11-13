@@ -11,6 +11,34 @@ m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 MIB=1024**2
 
 class ReadinessTests(unittest.TestCase):
+    def test_invalid_host_facts_are_unavailable_without_claims_or_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / 'fixture.service'
+            parent.mkdir()
+            leaf = parent / 'daemon'
+            leaf.mkdir()
+            values = {'cgroup.procs': '', 'cgroup.controllers': 'cpu memory pids',
+                'cgroup.subtree_control': 'cpu memory pids', 'memory.max': str(512*MIB),
+                'memory.current': str(32*MIB), 'pids.max': '64', 'cpu.max': '100000 100000'}
+            for name, value in values.items():
+                (parent / name).write_text(value)
+            (leaf / 'memory.current').write_text(str(32*MIB))
+            meminfo = root / 'meminfo'
+            meminfo.write_bytes(b'MemTotal: 8388608 kB\nMemAvailable: 4194304 MB\n')
+            before = {p: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
+                      for p in parent.rglob('*') if p.is_file()}
+            with patch.object(m, 'current_group', return_value=leaf), patch.object(m, 'Path',
+                    side_effect=lambda value: meminfo if str(value) == '/proc/meminfo' else Path(value)):
+                report = m.inspect({'memory_bytes': 128*MIB, 'pids': 8, 'cpu_percent': 20})
+            self.assertEqual(report['status'], 'inspection-unavailable', report)
+            self.assertFalse(report['permits_attempt'])
+            self.assertNotIn('capacity', report)
+            after = {p: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
+                     for p in parent.rglob('*') if p.is_file()}
+            self.assertEqual(before, after)
+            self.assertEqual(set(parent.iterdir()), {parent / name for name in values} | {leaf})
+
     def test_limits_capacity_and_uninitialized_accounting_are_distinct_without_writes(self):
         for case in ('available','reservations','host','ceiling','invalid','delegation','uninitialized','busy'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:

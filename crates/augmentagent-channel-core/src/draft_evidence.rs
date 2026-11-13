@@ -11,6 +11,8 @@ use std::path::Path;
 
 const MAX_STEPS: usize = 8;
 const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// The initial-draft evidence budget, for callers that run the full check.
+pub const BUDGET_DEFAULT: std::time::Duration = BUDGET;
 const MAX_CHARS: usize = 64_000;
 const PAGE_CHARS: usize = 8_000;
 
@@ -79,6 +81,9 @@ pub struct EvidenceRead {
 pub enum StepKind {
     ModelDecision,
     Retrieval,
+    /// Queued for a CLI permit before the decision could start (#2012).
+    /// Only measured inside `cli_gate::run_interactive`.
+    GateWait,
 }
 
 /// The step kind that consumed most of the budget; `None` when nothing ran.
@@ -87,6 +92,7 @@ pub enum StepKind {
 pub enum BudgetConsumer {
     ModelDecision,
     Retrieval,
+    GateWait,
     None,
 }
 
@@ -123,9 +129,12 @@ impl EvidenceOutcome {
                 .map(|step| step.elapsed_ms)
                 .sum::<u64>()
         };
+        let model = total(StepKind::ModelDecision);
         if self.step_timings.is_empty() {
             BudgetConsumer::None
-        } else if total(StepKind::Retrieval) > total(StepKind::ModelDecision) {
+        } else if total(StepKind::GateWait) > model.max(total(StepKind::Retrieval)) {
+            BudgetConsumer::GateWait
+        } else if total(StepKind::Retrieval) > model {
             BudgetConsumer::Retrieval
         } else {
             BudgetConsumer::ModelDecision
@@ -175,6 +184,20 @@ pub async fn gather(
     owner_request: &str,
     wiki_root: Option<&Path>,
 ) -> EvidenceOutcome {
+    gather_within(store, reasoner, seed, owner_request, wiki_root, BUDGET).await
+}
+
+/// [`gather`] under a caller-chosen budget. A revision lookup (#2012) is a
+/// targeted question the owner is waiting on, so it gets far less than the
+/// initial draft's 90 s.
+pub async fn gather_within(
+    store: &Store,
+    reasoner: &dyn Reasoner,
+    seed: &ContextSeed,
+    owner_request: &str,
+    wiki_root: Option<&Path>,
+    budget: std::time::Duration,
+) -> EvidenceOutcome {
     let mut out = EvidenceOutcome {
         facts: Vec::new(),
         gaps: Vec::new(),
@@ -208,7 +231,7 @@ pub async fn gather(
     // must conclude from what has been read.
     let mut slowest_decision = std::time::Duration::ZERO;
     for step in 0..MAX_STEPS {
-        let remaining = BUDGET.saturating_sub(started.elapsed());
+        let remaining = budget.saturating_sub(started.elapsed());
         let out_of_time = !slowest_decision.is_zero() && remaining < slowest_decision * 2;
         let final_decision = out_of_time || step + 1 == MAX_STEPS;
         let prompt =
@@ -220,8 +243,17 @@ pub async fn gather(
         }
         out.model_decisions += 1;
         let decided = tokio::time::Instant::now();
+        let waited_before = crate::cli_gate::scope_gate_wait_ms();
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
-        let decision_ms = measured_ms(decided);
+        let mut decision_ms = measured_ms(decided);
+        // Queueing is not model latency: report it as its own step.
+        if let (Some(before), Some(after)) = (waited_before, crate::cli_gate::scope_gate_wait_ms()) {
+            let waited = after.saturating_sub(before);
+            if waited > 0 {
+                out.record(StepKind::GateWait, "cli_permit", waited, "ok");
+                decision_ms = decision_ms.saturating_sub(waited);
+            }
+        }
         slowest_decision = slowest_decision.max(decided.elapsed());
         let raw = match response {
             Ok(Ok(raw)) => raw,
@@ -396,7 +428,7 @@ pub async fn gather(
     out
 }
 
-fn read_message(store: &Store, id: &str, offset: usize) -> anyhow::Result<Value> {
+pub(crate) fn read_message(store: &Store, id: &str, offset: usize) -> anyhow::Result<Value> {
     anyhow::ensure!(offset < i64::MAX as usize, "invalid offset");
     Ok(store.with_conn(|c| {
         c.query_row("SELECT platform,accountEntityId,threadId,fromEmail,receivedAt,
@@ -413,7 +445,7 @@ fn read_message(store: &Store, id: &str, offset: usize) -> anyhow::Result<Value>
     })?)
 }
 
-fn read_wiki(root: Option<&Path>, relative: &str, offset: usize) -> Value {
+pub(crate) fn read_wiki(root: Option<&Path>, relative: &str, offset: usize) -> Value {
     let Some(root) = root else {
         return json!({"error":"Wiki unavailable"});
     };

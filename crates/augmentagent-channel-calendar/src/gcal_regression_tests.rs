@@ -12,7 +12,7 @@ fn draft() -> EventDraft {
             "owner-two@example.test".into(),
         ],
         description: Some("Self-invite QA".into()),
-        create_meeting_room: true,
+        create_meeting_room: true, recurrence: vec![], time_zone: None,
     }
 }
 

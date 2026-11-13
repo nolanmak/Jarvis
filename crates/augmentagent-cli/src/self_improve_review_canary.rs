@@ -314,7 +314,9 @@ async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::Pre
 }
 #[cfg(test)]
 pub(super) async fn shipping_fixture(root: &Path, control: &Path, issue: u64) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
-    prepare_fixture_kind(root, control, issue, false, &test_resource_audit(control)).await
+    let (prepared,reference)=prepare_fixture_kind(root,control,issue,false,&test_resource_audit(control)).await?;
+    acceptance::qualify_fixture(root,control,&prepared)?;
+    Ok((prepared,reference))
 }
 
 async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
@@ -345,7 +347,7 @@ async fn probe_with_priority(id: &str,allow_shipping:bool) -> Result<crate::auto
     })
     .await?
     .context("canary workflow lease unavailable")?;
-    guard.bind_acceptance(&prepared)?;
+    guard.bind_acceptance_for_recovery(&prepared)?;
     guard
         .checkpoint(
             crate::autoship_workflow::Stage::Review,
@@ -569,6 +571,9 @@ mod tests {
         assert!(call_bound<=12,"complete native probe, including adjudicator correction, must fit the default observation budget: {call_bound}");
         assert!(reference.alignment.is_none());
         acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.unwrap();
+        let shipping=acceptance::assert_receipt_current(&root,&prepared,&reference).await.unwrap_err();
+        assert!(shipping.to_string().contains("baseline_witness_unqualified"),"{shipping:#}");
+        acceptance::qualify_fixture(&root,&control,&prepared).unwrap();
         let shipping=acceptance::assert_receipt_current(&root,&prepared,&reference).await.unwrap_err();
         assert!(shipping.to_string().contains("alignment"),"{shipping:#}");
         std::fs::write(&reference.artifact,b"changed evidence").unwrap();

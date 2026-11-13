@@ -16,6 +16,8 @@ pub mod gcal;
 pub mod google_direct;
 pub mod guest;
 pub mod recurrence;
+pub mod repeat;
+pub mod reschedule;
 pub mod rsvp;
 pub mod trigger;
 pub mod types;
@@ -40,6 +42,7 @@ pub use gcal::{
 };
 pub use google_direct::{CallOptions, CallResponse, GoogleCalendar, GoogleTokens};
 pub use guest::GuestOutcome;
+pub use reschedule::{RescheduleOutcome, RescheduleRequest, RESCHEDULE_CARD_KIND};
 pub use rsvp::{InviteDecision, RsvpRequest};
 pub use trigger::{CalendarTrigger, HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
 pub use types::{

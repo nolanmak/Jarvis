@@ -207,7 +207,8 @@ pub(super) async fn resume(
     };
     let worktree = workflow::prepare_resume_candidate(repo, &pr.repository, pr.pr, &pr.branch, Some(&pr.head)).await?;
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
-    let environment = recovery::environment_identity(&worktree).await?;
+    let upstream_main = workflow::remote_main_head(&worktree,&pr.repository).await?;
+    let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: repo,
         worktree: &worktree,
@@ -238,6 +239,7 @@ pub(super) async fn resume(
         &request,
         &environment,
         &mut guard,
+        &capacity_accounting,
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
@@ -261,7 +263,8 @@ pub(super) async fn resume(
                         || checkpoint.next.action.starts_with("retry_")
                         || matches!(
                             checkpoint.next.action.as_str(),
-                            "verify_new_revision"
+                            "await_readiness_input_change"
+                                | "verify_new_revision"
                                 | "rescope_acceptance"
                                 | "repair_verifier_definition"
                                 | "complete_review_or_adjudication"
@@ -291,6 +294,7 @@ async fn execute(
     request: &str,
     environment: &str,
     guard: &mut workflow::WorkflowGuard,
+    capacity_accounting:&workflow::CapacityAccounting,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
     let grounding=match acceptance::readiness::assess_pr(worktree,pr,guard).await? {
@@ -320,7 +324,11 @@ async fn execute(
             return Err(error);
         },
     };
-    guard.bind_acceptance(&prepared)?;
+    if let Err(error)=acceptance::qualify_or_amend(reasoner,source,&pr.title,worktree,&control,&mut prepared,guard).await {
+        if let Some(report)=acceptance::hold_qualification_error(guard,&prepared,&error,capacity_accounting).await? {return Ok(report);}
+        return Err(error);
+    }
+    guard.bind_acceptance(&prepared,&control)?;
     // Preserve interrupted edits before integrating either upstream. The pinned
     // verifier and full gate judge every recovered or conflict-resolution edit.
     recovery::commit_candidate_named(

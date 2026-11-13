@@ -164,21 +164,53 @@ pub(super) async fn commit_candidate_named(worktree: &Path, message: &str) -> Re
     Ok(())
 }
 
-pub(super) async fn environment_identity(worktree: &Path) -> Result<String> {
+pub(super) async fn environment_identity(worktree: &Path, upstream_main:&str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let (ok, compiler, _) = run("rustc", &["--version"], worktree).await?;
     anyhow::ensure!(ok, "verifier compiler identity unavailable");
     let lock = std::fs::read(worktree.join("Cargo.lock"))?;
     Ok(format!(
-        "{};cargo-lock:{:x}",
+        "{};cargo-lock:{:x};upstream-main:{};readiness-policy:{}",
         compiler.trim(),
-        Sha256::digest(lock)
+        Sha256::digest(lock),
+        upstream_main,
+        acceptance::readiness::POLICY
     ))
+}
+
+/// Preserve an existing initial input wait across upstream-only movement.
+/// This does not erase main from readiness scheduling or authorize execution.
+/// Only the known producer shape is normalized; all other environment changes
+/// retain the existing exact-identity behavior.
+pub(super) fn same_initial_verifier_environment(left:&str,right:&str)->bool {
+    fn inputs(value:&str)->Option<(&str,&str,&str)> {
+        let (compiler,rest)=value.split_once(";cargo-lock:")?;
+        let (lock,rest)=rest.split_once(";upstream-main:")?;
+        let (main,policy)=rest.split_once(";readiness-policy:")?;
+        if !compiler.starts_with("rustc ") || compiler.len()<=6 || lock.len()!=64
+            || !lock.bytes().all(|b|b.is_ascii_hexdigit())
+            || !matches!(main.len(),40|64) || !main.bytes().all(|b|b.is_ascii_hexdigit()) || policy.is_empty() {return None;}
+        Some((compiler,lock,policy))
+    }
+    left==right || inputs(left).zip(inputs(right)).is_some_and(|(a,b)|a==b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initial_verifier_environment_only_normalizes_known_upstream_movement() {
+        let old=format!("rustc 1.94.1;cargo-lock:{};upstream-main:{};readiness-policy:policy-a","a".repeat(64),"1".repeat(40));
+        let advanced=old.replace(&"1".repeat(40),&"2".repeat(40));
+        assert!(same_initial_verifier_environment(&old,&advanced));
+        for changed in [advanced.replace("1.94.1","1.95.0"),advanced.replace(&"a".repeat(64),&"b".repeat(64)),
+            advanced.replace("policy-a","policy-b"),advanced.replace("rustc ","unknown "),
+            advanced.replace(&"a".repeat(64),"not-a-hash"),advanced.replace(&"2".repeat(40),"not-a-commit")] {
+            assert!(!same_initial_verifier_environment(&old,&changed));
+        }
+        assert!(same_initial_verifier_environment("fixture","fixture"));
+        assert!(!same_initial_verifier_environment("fixture","different fixture"));
+    }
     fn git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -214,6 +246,21 @@ mod tests {
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
         );
         root
+    }
+    #[tokio::test]
+    async fn retained_candidate_environment_changes_only_when_upstream_input_changes() {
+        let root=repo();
+        std::fs::write(root.path().join("Cargo.lock"),"fixture lock").unwrap();
+        let candidate=git(root.path(),&["rev-parse","HEAD"]);
+        let first=environment_identity(root.path(),&candidate).await.unwrap();
+        assert_eq!(first,environment_identity(root.path(),&candidate).await.unwrap());
+        let upstream=git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit-tree","HEAD^{tree}","-p","HEAD","-m","upstream change"]);
+        assert_eq!(candidate,git(root.path(),&["rev-parse","refs/remotes/origin/main"]),"local tracking ref deliberately stays stale");
+        assert_eq!(candidate,git(root.path(),&["rev-parse","HEAD"]),"retained candidate must remain intact");
+        let changed=environment_identity(root.path(),&upstream).await.unwrap();
+        assert_ne!(first,changed,"upstream input must reopen readiness admission without editing the candidate");
+        assert_eq!(changed,environment_identity(root.path(),&upstream).await.unwrap(),"unchanged input remains stable");
     }
     #[tokio::test]
     async fn interruption_preserves_commits_dirty_edits_and_new_files() {

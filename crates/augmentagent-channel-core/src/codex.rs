@@ -127,6 +127,26 @@ async fn record_tool_item_for(kind: ProviderKind, model: &str, opts: &ReasonerOp
     }
 }
 
+fn tool_readiness(item: &serde_json::Value) -> Option<crate::native_tool_readiness::Refusal> {
+    if item["type"] != "mcp_tool_call" || item["server"] != "jarvis" || item["tool"] != "Bash" {
+        return None;
+    }
+    let result = item.get("result")?;
+    let failed = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let content = result
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::native_tool_readiness::Refusal::tool("mcp__jarvis__Bash", failed, &content)
+}
+
 impl CodexCliReasoner {
     pub fn openai() -> Self {
         Self {
@@ -256,6 +276,7 @@ impl CodexCliReasoner {
                 message: format!("codex tool policy is not ready: {error}"),
             })
         })?;
+        bridge.preflight_builds(provider,opts.audit_logger.as_ref()).await?;
         let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
             declared file, command and integration operations. The tool workspace is {}. \
             Relative tool paths resolve there. Commands accept one executable and its arguments; \
@@ -422,6 +443,9 @@ impl CodexCliReasoner {
         // #1047 — each `turn.completed` restates the thread's running total,
         // so the last one seen is this call's usage. Keep it; never sum.
         let call_started = std::time::Instant::now();
+        let mut unfinished = crate::token_usage::UnfinishedCallGuard::new(
+            self.usage_log.clone(),self.kind,model.as_str(),capability,call_started,
+        );
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
@@ -449,10 +473,20 @@ impl CodexCliReasoner {
             }
             if let Some(usage) = crate::token_usage::codex_turn_usage(&v) {
                 observed_usage = Some(usage);
+                unfinished.observe_usage(usage);
             }
             if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
                     record_tool_item_for(self.kind, &model, opts, item).await;
+                    if opts.audit_logger.as_ref().is_some_and(|logger|logger.is_protected()) {
+                        if let Some(refused)=tool_readiness(item) {
+                            drop(process_group);
+                            let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
+                            if let Some(logger)=&opts.audit_logger {logger.drain_checked().await?;}
+                            refused.fail(provider,opts.audit_logger.as_ref())?;
+                            anyhow::bail!("native tool readiness refused");
+                        }
+                    }
                 }
             }
             match kind {
@@ -490,6 +524,7 @@ impl CodexCliReasoner {
             }
         }
 
+        unfinished.finish();
         // #1047 — record what the call cost before its outcome is judged:
         // tokens spent on a turn that ends without an answer are still spent.
         // Best effort, like the Claude path: the logger swallows IO errors.
@@ -1161,6 +1196,72 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         assert_eq!(rows[3]["runner"], "host", "denied after the process started (timeout)");
         assert_eq!(rows[4]["runner"], "vm", "truncated result keeps its leading runner");
         assert_eq!(rows[5]["runner"], "none");
+    }
+
+    #[tokio::test]
+    async fn protected_codex_yields_on_first_build_readiness_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("repeated");
+        let event = serde_json::json!({"type":"item.completed","item":{"type":"mcp_tool_call",
+            "server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},
+            "result":{"isError":true,"content":[{"type":"text","text":"JARVIS_READINESS:build_storage_reserve PRIVATE_DIAGNOSTIC"}]},"status":"completed"}});
+        let marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let reported = serde_json::json!({"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}});
+        let bin=stub(&dir,"fake-codex-tool-capacity",&format!("cat >/dev/null\nprintf '%s\\n' '{}' '{}'\nsleep 2\nprintf repeated > '{}'\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",reported,event,marker));
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = std::sync::Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                dir.path().join("logs/audit.jsonl"),
+                dir.path().join("anchors/anchor.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = admitted.clone();
+        logger
+            .set_model_call_observer(std::sync::Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
+        let mut options = opts();
+        options.audit_logger = Some(logger.clone());
+        let usage_path = dir.path().join("usage.jsonl");
+        let mut reasoner = CodexCliReasoner::with_bin(bin);
+        reasoner.usage_log =
+            std::sync::Arc::new(crate::token_usage::UsageLogger::new(usage_path.clone()));
+        let error = reasoner
+            .call(&options, "synthetic implementation")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ReasonerError>(),
+                Some(ReasonerError::ResourceCapacity { .. })
+            ),
+            "{error:#}"
+        );
+        assert!(!dir.path().join("repeated").exists());
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "spent admission remains charged; no retry"
+        );
+        assert!(!format!("{error:#}").contains("PRIVATE_DIAGNOSTIC"));
+        logger.drain_checked().await.unwrap();
+        let rows: Vec<crate::token_usage::UsageRecord> = std::fs::read_to_string(usage_path)
+            .expect("observed usage must survive early capacity yield")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one reported usage record, no refund or duplicate"
+        );
+        assert_eq!(rows[0].usage.total(), 10);
+        assert_eq!(rows[0].outcome.as_deref(), Some("unfinished"));
     }
 
     #[tokio::test]

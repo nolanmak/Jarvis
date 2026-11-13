@@ -81,7 +81,9 @@ async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Ac
         else {
             // Only bounded shared status fields, never raw provider or auth errors.
             let field=|key:&str|value[key].as_str().unwrap_or("unknown").chars().take(160).collect::<String>();
-            Some(format!("Autoship {workflow}: stage {}; reason {}; provider {}; PR {}. Merge: {}. Deployment: {}. Completion observed: {}.",
+            let resource = crate::autoship_workflow::resource_refusal::render_status(&value)
+                .map(|text| format!(" {text}.")).unwrap_or_default();
+            Some(format!("Autoship {workflow}: stage {}; reason {}; provider {}; PR {}. Merge: {}. Deployment: {}. Completion observed: {}.{resource}",
                 field("stage"),field("reason"),field("provider"),field("pr_url"),
                 value["merge"]["state"].as_str().unwrap_or("unknown"),value["deployment"]["state"].as_str().unwrap_or("unknown"),value["complete"]==true))
         }
