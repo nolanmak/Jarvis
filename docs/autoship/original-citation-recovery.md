@@ -346,3 +346,29 @@ identity behavior is not a completed positive-replay selection rule. Resolve tha
 consumer seam with negative precedence and the explicit current/native context
 contract before activating the bridge. The versioned receipt, valid-positive
 cutover, typed wake-up and actual preparation/binding integration remain open.
+
+
+## 12. Controller-slot evidence for the next integration step
+
+Read-only production inspection found both existing protected completed-response
+slots for #1830: slot 0 and slot 1 each retain their raw value and native-proof
+reference. Their keys are the existing `response_key("baseline_witness_v1",
+origin_context, controller_binding.contract, false, slot)` and the associated
+native-scope provenance key. One original native context covers both slots.
+
+Prefer verifying these authoritative controller associations, then matching each
+raw/proof pair to authenticated native custody, rather than making positive
+replay depend only on reconstructing every historical validator's error text.
+This is an implementation candidate, not a grant from a key or a JSON row. The
+original slot's complete semantic question and original captured measurement must
+still match. Every later slot must be considered; an applicable completed
+negative/Unknown cannot be ignored. Missing, changed, unclassified or ambiguous
+associations remain unavailable for positive replay.
+
+The actual case's controller binding matches the saved original plan binding.
+For other enrollment/main-reconciliation paths that is an unverified assumption:
+map and authenticate the historical controller binding actually used for the
+slots, and keep it distinct from the live binding that authorizes current work.
+Do not guess that a current head/contract is the original indexing authority.
+No controller slot, native record, model charge or workflow was edited to obtain
+this evidence. The receipt/wake-up and compatibility work remains open.
