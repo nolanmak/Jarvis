@@ -1279,6 +1279,7 @@ pub(crate) struct ScopeOutcome {
     /// #843 — the scoper's own size estimate. `None` when the header was
     /// missing or unparseable (older prompt, formatting glitch): absence must
     /// not refuse work, only an explicit over-cap estimate may.
+    #[serde(deserialize_with="required_scope_estimate")]
     pub(crate) est_diff_lines: Option<usize>,
     /// #843 — the scoper's answer to "would the diff touch a guarded path?".
     /// Defaults to `false` for the same reason.
@@ -2645,7 +2646,13 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
 
 #[derive(serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InitialScopeSnapshot {version:u32,context:String,scope:Option<ScopeOutcome>}
+struct InitialScopeSnapshot {version:u32,context:String,#[serde(deserialize_with="required_initial_scope")] scope:Option<ScopeOutcome>}
+fn required_scope_estimate<'de,D:serde::Deserializer<'de>>(decoder:D)->std::result::Result<Option<usize>,D::Error> {
+    <Option<usize> as serde::Deserialize>::deserialize(decoder)
+}
+fn required_initial_scope<'de,D:serde::Deserializer<'de>>(decoder:D)->std::result::Result<Option<ScopeOutcome>,D::Error> {
+    <Option<ScopeOutcome> as serde::Deserialize>::deserialize(decoder)
+}
 fn initial_scope_key(context:&str)->String {
     use sha2::{Digest,Sha256};
     format!("{:x}",Sha256::digest(serde_json::to_vec(&("initial-scope-snapshot-v1",context)).unwrap()))
@@ -2666,8 +2673,10 @@ fn retain_initial_scope(context:&str,scope:Option<ScopeOutcome>,write:impl Fn(&s
         write(&initial_scope_key(context),&raw)
     })().map_err(|error|acceptance::initial_scope_replay_error(error))
 }
-// The fresh frontend currently regenerates its scoper decision on each pass.
-fn replay_initial_scope(_saved:&Option<InitialScopeSnapshot>)->Option<Option<ScopeOutcome>> {None}
+// A completed processed decision belongs to the original authorized episode.
+fn replay_initial_scope(saved:&Option<InitialScopeSnapshot>)->Option<Option<ScopeOutcome>> {
+    saved.as_ref().map(|saved|saved.scope.clone())
+}
 
 fn initial_acceptance_inputs(scope:Option<&ScopeOutcome>,owner_request:&str)->(String,Vec<String>) {
     // A refusal is diagnostic context, never a substitute owner requirement
@@ -2708,6 +2717,43 @@ mod acceptance_source_tests {
         assert_eq!(fresh_scoper_calls,0,"unchanged episode admitted another scoper after completed original decision");
         assert_eq!(initial_acceptance_inputs(scope.as_ref(),owner),expected,"regenerated guidance changed original acceptance inputs");
         assert_eq!(scope.unwrap().complexity,Complexity::Medium);
+    }
+
+    #[test]
+    fn saved_scope_requires_explicit_fallback_and_preserves_complete_metadata() {
+        let context="1".repeat(64);
+        let null=serde_json::json!({"version":1,"context":context,"scope":null});
+        let saved=read_initial_scope(&context,|_|Ok(Some(null.to_string()))).unwrap();
+        assert!(matches!(replay_initial_scope(&saved),Some(None)));
+        for raw in [serde_json::json!({"version":1,"context":context}),
+            serde_json::json!({"version":1,"context":"foreign","scope":null}),
+            serde_json::json!({"version":2,"context":context,"scope":null}),
+            serde_json::json!({"version":1,"context":context,"scope":null,"extra":true})] {
+            assert!(read_initial_scope(&context,|_|Ok(Some(raw.to_string()))).is_err(),"corrupt scope became fallback");
+        }
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Preserve every original criterion.\n\nProduction guidance.");
+        let mut snapshot=serde_json::to_value(InitialScopeSnapshot {version:1,context:context.clone(),scope:Some(scope)}).unwrap();
+        snapshot["scope"].as_object_mut().unwrap().remove("est_diff_lines");
+        assert!(read_initial_scope(&context,|_|Ok(Some(snapshot.to_string()))).is_err(),"missing optional metadata silently altered original decision");
+    }
+    #[test]
+    fn scoped_snapshot_custody_loss_holds_before_fresh_scoping() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        use std::cell::RefCell;
+        for missing in ["body","event"] {
+            let root=tempfile::tempdir().unwrap();let binding=Binding {head:"a".repeat(40),contract:"b".repeat(64),evidence_hash:"c".repeat(64)};
+            let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();store.register("owner/repo#1","fixture",binding.clone(),1).unwrap();
+            let lease=store.claim("owner/repo#1","fixture",2,1000).unwrap().unwrap();let store=RefCell::new(store);let context="1".repeat(64);
+            retain_initial_scope(&context,None,|key,raw|store.borrow_mut().record_scope_stage_response(&lease,&binding,key,raw,3)).unwrap();
+            let key=initial_scope_key(&context);
+            store.borrow().query_connection(|conn| {
+                if missing=="body" {conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![lease.workflow,key])?;}
+                else {conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2",rusqlite::params![lease.workflow,key])?;}
+                Ok(())
+            }).unwrap();
+            let result=read_initial_scope(&context,|key|store.borrow_mut().recorded_scope_stage_response(&lease,&binding,key,3));
+            assert!(result.is_err(),"{missing} loss permitted another scoper");
+        }
     }
 
     #[test]
@@ -8235,11 +8281,21 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
     let owner_request=acceptance_owner_request(&issue);
-    let scope_context=acceptance::initial_scope_context(&worktree,&workflow_guard,candidate_base,&owner_request)?;
+    let scope_context=match acceptance::initial_scope_context(&worktree,&workflow_guard,candidate_base) {
+        Ok(context)=>context,
+        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+    };
     let saved_scope=match read_initial_scope(&scope_context,|key|workflow_guard.recorded_scope_stage_response(key)) {
         Ok(saved)=>saved,
         Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
     };
+
+    let saved_inputs=saved_scope.as_ref().map(|saved|initial_acceptance_inputs(saved.scope.as_ref(),&owner_request));
+    if let Err(error)=acceptance::preflight_initial_scope(&worktree,&workflow_guard,
+        crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,
+        saved_inputs.as_ref().map(|(scope,criteria)|(scope.as_str(),criteria.as_slice()))) {
+        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+    }
 
     // Failed stages retain committed and unfinished work. Publication alone is
     // not permission to erase the only local recovery copy.

@@ -344,6 +344,25 @@ impl<'a> OriginalExecution<'a> {
     }
 }
 
+/// Every retained original plan must have a matching accounting context before
+/// a missing-scope frontend may start fresh work for a different trusted input.
+pub(super) fn retained_original_plan_budget_contexts(workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
+    let mut cursor=0;let mut contexts=std::collections::BTreeSet::new();let mut count=0usize;
+    loop {
+        let rows=workflow.verifier_evidence_page("original_verifier_plan",cursor)?;
+        if rows.is_empty() {return Ok(contexts);}
+        for row in rows {
+            count+=1;ensure!(count<=8192,"original plan accounting exceeds inspection bound");cursor=row.sequence;
+            ensure!(row.body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
+            let plan:Plan=serde_json::from_str(&row.body)?;
+            ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow.id()
+                && !plan.executor.is_empty() && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",&row.body))?)==row.key,
+                "original plan accounting identity changed");
+            contexts.insert(initial_plan_budget_context(workflow.id(),&plan.binding.contract,plan.proposal.contract.source()?,&plan.base,&plan.environment)?);
+        }
+    }
+}
+
 /// Read original data without claiming, replaying, installing or remeasuring.
 pub(super) fn retained_original_prepared(root:&Path,source:AcceptanceSource,
     binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)

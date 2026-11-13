@@ -167,39 +167,23 @@ fn prefix<R:Fn(&str)->Result<Option<String>>>(epoch:&str,read:R)->Result<(Vec<(F
 
 // Exact producer at main 8d5db4f2. Accounting migration only, never approval.
 pub(super) const LEGACY_BUDGET_POLICY:&str="64507eba1790035881df940099cc1ea640319518572a2a370a310744b883cf40";
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize,Deserialize,PartialEq,Eq)]
 #[serde(deny_unknown_fields)]
-struct BudgetReference {version:u32,kind:String,inputs:String,epoch:String,policy:String}
+struct BudgetReference {version:u32,kind:String,inputs:String,origin:String,plan_context:String,epoch:String,policy:String}
 fn reference_key(inputs:&str)->String {
     amendment::digest(&serde_json::to_vec(&("initial-repair-budget-reference-v1",inputs)).unwrap())
 }
 fn reference(raw:&str,key:&str)->Result<BudgetReference> {
     let value:BudgetReference=serde_json::from_str(raw)?;
     ensure!(value.version==1 && value.kind=="initial_repair_budget_reference" && sha(&value.inputs)
-        && sha(&value.epoch) && sha(&value.policy) && reference_key(&value.inputs)==key,Hold::EvidenceUnknown);
+        && sha(&value.origin) && sha(&value.plan_context) && sha(&value.epoch) && sha(&value.policy) && reference_key(&value.inputs)==key,Hold::EvidenceUnknown);
     Ok(value)
 }
 
-/// Pin accounting before any coordinator callback. Current qualification uses
-/// current policy independently; this reader never installs or executes code.
-pub(super) fn budget_epoch<R,W,K,E>(inputs:&str,policy:&str,epoch_for_policy:E,read:R,write:W,keys:K)->Result<String>
-where R:Fn(&str)->Result<Option<String>>,W:Fn(&str,&str)->Result<()>,K:Fn(&str)->Result<Vec<String>>,
-    E:Fn(&str)->Result<String> {
-    (||->Result<String> {
-        ensure!(sha(inputs) && sha(policy),Hold::EvidenceUnknown);
-        let anchor_key=reference_key(inputs);
-        if let Some(raw)=read(&anchor_key)? {
-            let saved=reference(&raw,&anchor_key)?;
-            ensure!(saved.inputs==inputs && saved.epoch==epoch_for_policy(&saved.policy)?,Hold::EvidenceUnknown);
-            return Ok(saved.epoch);
-        }
-        let legacy=epoch_for_policy(LEGACY_BUDGET_POLICY)?;
-        // Reserve known keys before discovery. Corrupt sole intents cannot
-        // disappear from recognition and become a fresh episode.
-        let (failures,intents)=prefix(&legacy,&read)?;
-        let legacy_present=!failures.is_empty() || intents.iter().any(Option::is_some);
+fn budget_history<R,K>(read:R,keys:K)->Result<(std::collections::BTreeSet<String>,BTreeMap<String,BudgetReference>)>
+where R:Fn(&str)->Result<Option<String>>,K:Fn(&str)->Result<Vec<String>> {
         let mut epochs=std::collections::BTreeSet::new();
-        let mut owned=std::collections::BTreeSet::new();
+        let mut owned=BTreeMap::new();
         let mut after=String::new();let mut count=0usize;
         loop {
             let page=keys(&after)?;
@@ -226,19 +210,57 @@ where R:Fn(&str)->Result<Option<String>>,W:Fn(&str,&str)->Result<()>,K:Fn(&str)-
                     if let Some(other)=value["inputs"].as_str() {
                         if sha(other) && entry==reference_key(other) {
                             let saved=reference(&raw,&entry)?;
-                            ensure!(saved.inputs!=inputs,Hold::EvidenceUnknown);
-                            owned.insert(saved.epoch);
+                            if let Some(prior)=owned.get(&saved.epoch) {ensure!(prior==&saved,Hold::EvidenceUnknown);}
+                            owned.insert(saved.epoch.clone(),saved);
                         }
                     }
                 }
                 after=entry;
             }
         }
-        ensure!(epochs.iter().all(|epoch|owned.contains(epoch) || legacy_present && epoch==&legacy),Hold::EvidenceUnknown);
+    Ok((epochs,owned))
+}
+
+pub(super) fn require_scoped_history<R,K>(origin:&str,read:R,keys:K,plan_contexts:&std::collections::BTreeSet<String>)->Result<()>
+where R:Fn(&str)->Result<Option<String>>,K:Fn(&str)->Result<Vec<String>> {
+    (||->Result<()> {
+        let (epochs,owned)=budget_history(read,keys)?;
+        ensure!(epochs.iter().all(|epoch|owned.contains_key(epoch))
+            && plan_contexts.iter().all(|context|owned.values().any(|reference|&reference.plan_context==context))
+            && owned.values().all(|reference|reference.origin!=origin),Hold::EvidenceUnknown);
+        Ok(())
+    })().map_err(|error|if error.downcast_ref::<Hold>().is_some(){error}else{error.context(Hold::EvidenceUnknown)})
+}
+
+pub(super) fn exhausted(epoch:&str,read:impl Fn(&str)->Result<Option<String>>)->Result<bool> {
+    Ok(prefix(epoch,read)?.0.len()==LIMIT as usize)
+}
+
+/// Pin accounting before any coordinator callback. Current qualification uses
+/// current policy independently; this reader never installs or executes code.
+pub(super) fn budget_epoch<R,W,K,E>(inputs:&str,origin:&str,plan_context:&str,policy:&str,epoch_for_policy:E,read:R,write:W,keys:K)->Result<String>
+where R:Fn(&str)->Result<Option<String>>,W:Fn(&str,&str)->Result<()>,K:Fn(&str)->Result<Vec<String>>,
+    E:Fn(&str)->Result<String> {
+    (||->Result<String> {
+        ensure!(sha(inputs) && sha(origin) && sha(plan_context) && sha(policy),Hold::EvidenceUnknown);
+        let anchor_key=reference_key(inputs);
+        if let Some(raw)=read(&anchor_key)? {
+            let saved=reference(&raw,&anchor_key)?;
+            ensure!(saved.inputs==inputs && saved.origin==origin && saved.plan_context==plan_context && saved.epoch==epoch_for_policy(&saved.policy)?,Hold::EvidenceUnknown);
+            return Ok(saved.epoch);
+        }
+        let legacy=epoch_for_policy(LEGACY_BUDGET_POLICY)?;
+        // Reserve known keys before discovery. Corrupt sole intents cannot
+        // disappear from recognition and become a fresh episode.
+        let (failures,intents)=prefix(&legacy,&read)?;
+        let legacy_present=!failures.is_empty() || intents.iter().any(Option::is_some);
+        let (epochs,owned)=budget_history(&read,&keys)?;
+        ensure!(owned.values().all(|reference|reference.inputs!=inputs),Hold::EvidenceUnknown);
+        ensure!(epochs.iter().all(|epoch|owned.contains_key(epoch) || legacy_present && epoch==&legacy),Hold::EvidenceUnknown);
         let (epoch,original_policy)=if legacy_present {(legacy,LEGACY_BUDGET_POLICY.to_owned())}
             else {(epoch_for_policy(policy)?,policy.to_owned())};
         ensure!(sha(&epoch),Hold::EvidenceUnknown);
-        let saved=BudgetReference {version:1,kind:"initial_repair_budget_reference".into(),inputs:inputs.into(),epoch:epoch.clone(),policy:original_policy};
+        let saved=BudgetReference {version:1,kind:"initial_repair_budget_reference".into(),inputs:inputs.into(),origin:origin.into(),plan_context:plan_context.into(),epoch:epoch.clone(),policy:original_policy};
         write(&anchor_key,&serde_json::to_string(&saved)?)?;
         Ok(epoch)
     })().map_err(|error|if error.downcast_ref::<Hold>().is_some(){error}else{error.context(Hold::EvidenceUnknown)})
@@ -793,7 +815,7 @@ mod tests {
     }
     fn resolve_fixture_budget(store:&Mutex<crate::autoship_workflow::WorkflowStore>,binding:&crate::autoship_workflow::Binding,
         lease:&crate::autoship_workflow::Lease,inputs:&str,policy:&str)->Result<String> {
-        budget_epoch(inputs,policy,|policy|fixture_epoch(inputs,policy),
+        budget_epoch(inputs,inputs,inputs,policy,|policy|fixture_epoch(inputs,policy),
             |key|store.lock().unwrap().recorded_scope_stage_response(lease,binding,key,3),
             |key,raw|store.lock().unwrap().record_scope_stage_response(lease,binding,key,raw,3),
             |after|store.lock().unwrap().scope_stage_response_keys(lease,binding,after,3))
@@ -854,7 +876,7 @@ mod tests {
     }
     #[test]
     fn reference_custody_loss_or_mismatched_fields_never_mints_another_epoch() {
-        for mutation in ["body","event","epoch","inputs","policy","version","extra"] {
+        for mutation in ["body","event","epoch","inputs","origin","plan_context","policy","version","extra"] {
             let root=tempfile::tempdir().unwrap();let (store,binding,lease)=budget_store(root.path());let inputs="1".repeat(64);
             resolve_fixture_budget(&store,&binding,&lease,&inputs,&"2".repeat(64)).unwrap();let key=reference_key(&inputs);
             store.lock().unwrap().query_connection(|conn| {
@@ -868,6 +890,29 @@ mod tests {
             let error=resolve_fixture_budget(&store,&binding,&lease,&inputs,&"3".repeat(64)).unwrap_err();assert_eq!(error.downcast_ref::<Hold>(),Some(&Hold::EvidenceUnknown),"{mutation}");
         }
     }
+    #[tokio::test]
+    async fn missing_scope_holds_same_origin_but_distinct_trusted_origin_can_start() {
+        let root=tempfile::tempdir().unwrap();let (store,binding,lease)=budget_store(root.path());let origin="1".repeat(64);
+        let epoch=resolve_fixture_budget(&store,&binding,&lease,&origin,&"2".repeat(64)).unwrap();exhaust_fixture_budget(&store,&binding,&lease,&epoch).await;
+        let plans=std::collections::BTreeSet::from([origin.clone()]);
+        let check=|origin:&str|require_scoped_history(origin,
+            |key|store.lock().unwrap().recorded_scope_stage_response(&lease,&binding,key,3),
+            |after|store.lock().unwrap().scope_stage_response_keys(&lease,&binding,after,3),&plans);
+        assert_eq!(check(&origin).unwrap_err().downcast_ref::<Hold>(),Some(&Hold::EvidenceUnknown));
+        check(&"3".repeat(64)).unwrap();
+    }
+
+    #[test]
+    fn unrelated_reference_cannot_mask_an_unowned_original_plan() {
+        let root=tempfile::tempdir().unwrap();let (store,binding,lease)=budget_store(root.path());let old="1".repeat(64);
+        resolve_fixture_budget(&store,&binding,&lease,&old,&"2".repeat(64)).unwrap();
+        let contexts=std::collections::BTreeSet::from([old.clone(),"4".repeat(64)]);
+        let result=require_scoped_history(&"3".repeat(64),
+            |key|store.lock().unwrap().recorded_scope_stage_response(&lease,&binding,key,3),
+            |after|store.lock().unwrap().scope_stage_response_keys(&lease,&binding,after,3),&contexts);
+        assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::EvidenceUnknown));
+    }
+
     #[test]
     fn budget_scan_paginates_and_ignores_provider_record_lookalikes() {
         let root=tempfile::tempdir().unwrap();let (store,binding,lease)=budget_store(root.path());let inputs="1".repeat(64);
@@ -915,7 +960,7 @@ mod tests {
         let store = Mutex::new(store);
         let resolved;
         let epoch=if exhaust {
-            resolved=budget_epoch(&rollout_inputs(),epoch,rollout_epoch,
+            resolved=budget_epoch(&rollout_inputs(),&rollout_inputs(),&rollout_inputs(),epoch,rollout_epoch,
                 |key|store.lock().unwrap().recorded_scope_stage_response(&lease,&binding,key,now+1),
                 |key,raw|store.lock().unwrap().record_scope_stage_response(&lease,&binding,key,raw,now+1),
                 |after|store.lock().unwrap().scope_stage_response_keys(&lease,&binding,after,now+1))?;

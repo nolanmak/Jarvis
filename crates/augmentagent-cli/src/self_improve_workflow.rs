@@ -1303,6 +1303,12 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Metadata identifying enrolled recovery, never positive qualification.
+    pub(super) fn has_registered_acceptance_context(&self)->Result<bool> {
+        self.healthy_lease()?;
+        Ok(self.contract.strip_prefix("registered:").is_some_and(|hash|hash.len()==64 && hash.bytes().all(|b|b.is_ascii_hexdigit())))
+    }
+
     /// Original protected frontend request, never a replacement inferred from a title.
     pub(super) fn original_owner_request(&self)->Result<&str> {
         self.healthy_lease()?;

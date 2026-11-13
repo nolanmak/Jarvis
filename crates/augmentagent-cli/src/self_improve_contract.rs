@@ -1275,6 +1275,73 @@ fn initial_scope_error(error:anyhow::Error)->anyhow::Error {
 mod initial_diagnostic_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn missing_original_plan_index_does_not_erase_scoping_custody() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let state=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&state,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixed environment"}).await.unwrap().unwrap();
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+        verifier_execution::OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"scripted executor").unwrap();
+        let key=guard.verifier_evidence_page("original_verifier_plan",0).unwrap().remove(0).key;
+        crate::autoship_workflow::WorkflowStore::open(&state).unwrap().query_connection(|conn| {
+            conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2",rusqlite::params![guard.id(),key])?;Ok(())
+        }).unwrap();
+        assert!(guard.recorded_scope_stage_response(&key).unwrap().is_some(),"fixture lost more than the verifier index");
+        let result=preflight_initial_scope(root.path(),&guard,AcceptanceSource::PullRequest(840),base,None);
+        assert!(result.is_err(),"missing plan index let original scope custody disappear before a fresh scoper");
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_historical_reference_and_orphan_original_plan_hold_before_scoping() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let state=control.path().join("workflow.db");
+        let start=|request|workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:request,environment:"fixed environment"};
+        let old=workflow::WorkflowGuard::acquire_fixture(&state,start("old owner request")).await.unwrap().unwrap();
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();let source=AcceptanceSource::PullRequest(840);
+        initial_budget_epoch(&old,source,base,&environment,"original guidance",&["original criterion".into()]).unwrap();
+        verifier_execution::OriginalExecution::begin(&old,control.path(),&prepared.proposal,base,&environment,"scripted old executor").unwrap();
+        old.finish().unwrap();
+        let new=workflow::WorkflowGuard::acquire_fixture(&state,start("genuine new owner request")).await.unwrap().unwrap();
+        verifier_execution::OriginalExecution::begin(&new,control.path(),&prepared.proposal,base,&environment,"scripted orphan executor").unwrap();
+        let contexts=verifier_execution::retained_original_plan_budget_contexts(&new).unwrap();assert_eq!(contexts.len(),2);
+        let error=preflight_initial_scope(root.path(),&new,source,base,None).unwrap_err();
+        assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+        new.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_initial_budget_preflight_stops_before_frontend_model_callbacks() {
+        use crate::autoship_workflow::WorkflowStore;
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let state=control.path().join("workflow.db");
+        let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixed environment"};
+        let guard=workflow::WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        let source=AcceptanceSource::PullRequest(840);let base=prepared.baseline.registration.baseline_head();
+        let scope="Original owner request with original immutable guidance";let criteria=vec!["Original exact criterion".to_owned()];
+        let epoch=initial_budget_epoch(&guard,source,base,&environment_id(root.path()).unwrap(),scope,&criteria).unwrap();
+        let result=initial_repair::run(&epoch,|key|guard.scope_stage_response(key),|key,raw|guard.record_scope_stage_response(key,raw),
+            |slot,_,_|std::future::ready(Ok(slot)),|_|std::future::ready(Err::<(),_>(BaselineNotRed {detail:"scripted fixture failure".into(),kind:Some(initial_repair::FailureKind::UnexpectedFailure)}.into()))).await;
+        assert_eq!(result.unwrap_err().downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted));
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let reopened=workflow::WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        let mut frontend_calls=0;
+        let result=preflight_initial_scope(root.path(),&reopened,source,base,Some((scope,&criteria))).map(|_|{frontend_calls+=1;});
+        assert_eq!(result.unwrap_err().downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::Exhausted));assert_eq!(frontend_calls,0);
+        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap().model_calls,0);
+        reopened.finish().unwrap();
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn registered_recovery_uses_protected_execution_context_not_bare_binding_hash() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&control.path().join("workflow.db"),workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixed environment"}).await.unwrap().unwrap();
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        guard.checkpoint(crate::autoship_workflow::Stage::Scope,"fixture_recovery","restore_original_evidence",0,&[]).await.unwrap();
+        assert!(!guard.binding().contract.starts_with("registered:"));assert!(guard.has_registered_acceptance_context().unwrap());
+        verifier_execution::retain_scripted_original_data(root.path(),control.path(),&prepared,&guard).unwrap();
+        preflight_initial_scope(root.path(),&guard,AcceptanceSource::PullRequest(840),prepared.baseline.registration.baseline_head(),None).unwrap();
+        guard.finish().unwrap();
+    }
+
     #[test]
     fn initial_scope_classification_retains_typed_private_cause() {
         let error=initial_scope_error(anyhow::Error::new(scope_authority::CompletedInvalid("synthetic private validation detail".into())).context("proposal correction"));
@@ -1511,9 +1578,33 @@ fn initial_repair_epoch(workflow:&str,contract:&str,source:AcceptanceSource,base
 pub(super) fn initial_scope_replay_error(error:anyhow::Error)->anyhow::Error {
     error.context(initial_repair::Hold::EvidenceUnknown)
 }
-pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard,base:&str,owner:&str)->Result<String> {
+fn initial_plan_budget_context(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str)->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&("initial-verifier-budget-context-v1",workflow,contract,source,base,environment))?))
+}
+fn initial_scope_origin(workflow:&workflow::WorkflowGuard,base:&str,environment:&str)->Result<String> {
     Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow.id(),
-        workflow.original_owner_request()?,base,environment_id(root)?,owner,readiness::POLICY))?))
+        workflow.original_owner_request()?,base,environment))?))
+}
+pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard,base:&str)->Result<String> {
+    (||->Result<String> {initial_scope_origin(workflow,base,&environment_id(root)?)})().map_err(initial_scope_replay_error)
+}
+
+pub(super) fn preflight_initial_scope(root:&Path,workflow:&workflow::WorkflowGuard,source:AcceptanceSource,base:&str,
+    saved:Option<(&str,&[String])>)->Result<()> {
+    // Registered acceptance has its own original-source/qualification owner.
+    if workflow.has_registered_acceptance_context()? {return Ok(());}
+    (||->Result<()> {
+        let environment=environment_id(root)?;
+        let origin=initial_scope_origin(workflow,base,&environment)?;
+        let Some((scope,criteria))=saved else {
+            let plans=verifier_execution::retained_original_plan_budget_contexts(workflow)?;
+            return initial_repair::require_scoped_history(&origin,|key|workflow.recorded_scope_stage_response(key),
+                |after|workflow.scope_stage_response_keys(after),&plans);
+        };
+        let epoch=initial_budget_epoch(workflow,source,base,&environment,scope,criteria)?;
+        if initial_repair::exhausted(&epoch,|key|workflow.recorded_scope_stage_response(key))? {return Err(initial_repair::Hold::Exhausted.into());}
+        Ok(())
+    })().map_err(|error|if error.downcast_ref::<initial_repair::Hold>().is_some(){error}else{initial_scope_replay_error(error)})
 }
 
 fn initial_budget_inputs(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str,
@@ -1522,18 +1613,25 @@ fn initial_budget_inputs(workflow:&str,contract:&str,source:AcceptanceSource,bas
         contract,source,base,environment,scope,required_criteria))?))
 }
 
+fn initial_budget_epoch(workflow:&workflow::WorkflowGuard,source:AcceptanceSource,base:&str,environment:&str,
+    scope:&str,required_criteria:&[String])->Result<String> {
+    let inputs=initial_budget_inputs(workflow.id(),&workflow.binding().contract,source,base,environment,scope,required_criteria)?;
+    let origin=initial_scope_origin(workflow,base,environment)?;
+    let plan_context=initial_plan_budget_context(workflow.id(),&workflow.binding().contract,source,base,environment)?;
+    initial_repair::budget_epoch(&inputs,&origin,&plan_context,&baseline_witness::policy_hash(),
+        |policy|initial_repair_epoch(workflow.id(),&workflow.binding().contract,source,base,environment,scope,required_criteria,policy),
+        |key|workflow.recorded_scope_stage_response(key),
+        |key,raw|workflow.record_scope_stage_response(key,raw),
+        |after|workflow.scope_stage_response_keys(after))
+ }
+
 async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
     required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<(ContractProposal,BaselineEvidence)> {
     // This private call owns a newly detached original-baseline checkout.
     trusted_git(root,&["reset","--hard",base]).await?;
     trusted_git(root,&["clean","-fdx"]).await?;
     let environment=environment_id(root)?;
-    let inputs=initial_budget_inputs(workflow.id(),&workflow.binding().contract,source,base,&environment,scope,required_criteria)?;
-    let epoch=initial_repair::budget_epoch(&inputs,&baseline_witness::policy_hash(),
-        |policy|initial_repair_epoch(workflow.id(),&workflow.binding().contract,source,base,&environment,scope,required_criteria,policy),
-        |key|workflow.recorded_scope_stage_response(key),
-        |key,raw|workflow.record_scope_stage_response(key,raw),
-        |after|workflow.scope_stage_response_keys(after))?;
+    let epoch=initial_budget_epoch(workflow,source,base,&environment,scope,required_criteria)?;
     let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,
