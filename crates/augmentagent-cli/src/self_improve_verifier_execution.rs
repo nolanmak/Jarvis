@@ -658,6 +658,18 @@ pub(super) fn retain_scripted_original_data(root:&Path,control:&Path,prepared:&P
     original.retain_result(root,&prepared.baseline)
 }
 
+/// Script captured original command facts only in disposable fixtures.
+#[cfg(all(test,target_os="linux"))]
+pub(super) fn retain_scripted_captured_original_data(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<(String,String)> {
+    let original=OriginalExecution::begin(workflow,control,&prepared.proposal,prepared.baseline.registration.baseline_head(),&environment_id(root)?,"scripted captured executor")?;
+    for verifier in &prepared.proposal.contract.verifiers {
+        tests::captured_verifier_fixture(&original,&verifier.id,&tests::gone_scope(),false);
+    }
+    OriginalExecution::quiesce_previous(workflow)?;
+    original.retain_result(root,&prepared.baseline)?;
+    Ok((original.plan.clone(),result_key(&original.plan,&original.attempt)))
+}
+
 #[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
@@ -845,7 +857,7 @@ mod tests {
         captured_verifier_fixture(original,"observe",identity,interrupted)
     }
 
-    fn captured_verifier_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool)->PathBuf {
+    pub(super) fn captured_verifier_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool)->PathBuf {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let capture=original.prepare_capture(verifier).unwrap();

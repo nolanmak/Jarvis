@@ -982,6 +982,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn qualify_reuses_complete_retained_original_witness_without_native_admission() {
+        const CHILD:&str="AUTOSHIP_RETAINED_QUALIFICATION_FIXTURE";
+        if let Some(script)=std::env::var_os(CHILD).map(PathBuf::from) {
+            use std::os::unix::fs::PermissionsExt;
+            let (root,control,prepared)=fixture();
+            persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+            let mut judgment=saved_judgment(control.path(),&prepared);
+            let current=context(&prepared.proposal,&prepared.baseline).unwrap();
+            std::fs::remove_file(artifact_path(control.path(),&current)).unwrap();
+            let origin=context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY).unwrap();
+            judgment["context"]=origin.clone().into();let raw=judgment.to_string();
+            let base=prepared.baseline.registration.baseline_head();
+            std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+            std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let database=workflow::path();
+            let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().unwrap();
+            let native_control=control_directories("owner/repo",guard.id()).unwrap().workflow_acceptance;
+            std::fs::create_dir_all(&native_control).unwrap();
+            std::fs::set_permissions(&native_control,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let input=amendment::digest(b"scripted retained original qualification admission");
+            let proof=serde_json::json!({"version":1,"head":base,"provider":"codex","native_session":"scripted-retained-qualification",
+                "supplied_request_hash":amendment::digest(b"scripted selected original source"),"response_hash":amendment::digest(raw.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":origin,"native_input_hash":input,
+                "scope_request_hash":amendment::digest(qualification_prompt(&origin,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let path=native_control.join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&path,&bytes).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let reference=scope_authority::NativeReplyReference {artifact:path,artifact_sha256:amendment::digest(&bytes)};
+            let encoded=serde_json::to_string(&reference).unwrap();
+            let purpose=format!("{}{}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,input);
+            guard.bounded_native_calls(purpose.clone(),1,augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    let session=augmentagent_channel_core::native_session::current_for(augmentagent_channel_core::ProviderKind::Codex)?.unwrap();
+                    let mut native=session.begin(augmentagent_channel_core::ProviderKind::Codex)?;
+                    let admitted=guard.audit_logger().model_call_admitted("codex")?;
+                    native.observe("scripted-original-qualification")?;native.finish()?;Ok::<_,anyhow::Error>(admitted)
+                })).await.unwrap();
+            let (native_raw,native_proof)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
+            guard.record_scope_stage_response_pair(&native_raw,&raw,&native_proof,&encoded).unwrap();
+            let (controller_raw,controller_proof)=witness_controller_keys(&origin,&guard.binding().contract,0);
+            guard.record_scope_stage_response_pair(&controller_raw,&raw,&controller_proof,&encoded).unwrap();
+            persist(control.path(),&origin,&native_control,&scope_authority::NativeReply {text:raw.clone(),provenance:reference.clone()}).unwrap();
+            let (plan,result)=verifier_execution::retain_scripted_captured_original_data(root.path(),&native_control,&prepared,&guard).unwrap();
+            // Establish all fixture prerequisites before testing the live caller.
+            prepared.baseline.registration.verify_integrity(root.path()).unwrap();
+            assert_eq!(environment_id(root.path()).unwrap(),prepared.baseline.registration.binding(base).unwrap().environment_id);
+            disposition(&validate(root.path(),&prepared.proposal,&prepared.baseline,&origin,&raw).unwrap()).unwrap();
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&database).unwrap().unwrap();
+            let checked=retained_original_witness_data(root.path(),&native_control,&plan,&result,&store.inspect_verifier_evidence(guard.id())).unwrap().unwrap();
+            assert_eq!(checked.runs.len(),1);assert_eq!(checked.runs[0].replies.len(),1);
+            let before=store.snapshot(guard.id()).unwrap().unwrap();assert_eq!(before.model_calls,1);
+            let native_bytes=private_bytes(&reference.artifact,64*1024).unwrap();
+            let outcome=qualify(root.path(),control.path(),&prepared,&guard).await;
+            assert!(outcome.is_ok(),"complete retained original witness required new native generation instead of current requalification: {outcome:?}");
+            assert_current(root.path(),control.path(),&prepared).unwrap();
+            assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,
+                "metadata-only requalification admitted another model call");
+            assert_eq!(private_bytes(&reference.artifact,64*1024).unwrap(),native_bytes,"qualification rewrote native provenance");
+            assert_eq!(store.inspect_baseline_native_custody(guard.id()).unwrap().len(),1);
+            guard.finish().unwrap();return;
+        }
+        let scripts=tempfile::tempdir_in("/tmp").unwrap();let script=scripts.path().join("gh");
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::qualify_reuses_complete_retained_original_witness_without_native_admission","--nocapture"])
+            .env(CHILD,&script).env("GH_BIN",&script).env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",scripts.path().join("workflow.db"))
+            .env("AUGMENTAGENT_RUN_RESOURCES","1").env("XDG_STATE_HOME",scripts.path().join("state"))
+            .output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+
     #[test]
     fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
