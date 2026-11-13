@@ -45,7 +45,7 @@ fn result_key(plan:&str,attempt:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",plan,attempt)).unwrap())
 }
 
-fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
+pub(super) fn plan_input(workflow:&workflow::WorkflowGuard,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<(String,String)> {
     let plan=Plan {version:1,kind:"original_verifier_plan".into(),workflow:workflow.id().into(),binding:workflow.binding().clone(),
         base:base.into(),environment:environment.into(),executor:executor.into(),proposal:proposal.clone()};
     let body=serde_json::to_string(&plan)?;
@@ -343,7 +343,7 @@ impl<'a> OriginalExecution<'a> {
 
 /// Every retained original plan must have a matching accounting context before
 /// a missing-scope frontend may start fresh work for a different trusted input.
-pub(super) fn retained_original_plan_budget_contexts(workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
+pub(super) fn retained_original_plan_budget_contexts(_root:&Path,_native_control:&Path,workflow:&workflow::WorkflowGuard)->Result<std::collections::BTreeSet<String>> {
     fn checked(workflow:&str,key:&str,body:&str)->Result<String> {
         ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
         let plan:Plan=serde_json::from_str(body)?;

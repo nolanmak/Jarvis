@@ -3,6 +3,8 @@
 use super::*;
 #[path="self_improve_construction_stage.rs"]
 mod staging;
+#[path="self_improve_construction_accounting.rs"]
+mod accounting;
 pub(super) use staging::{stage,StagedCorrection};
 
 const TURNS:u32=6;

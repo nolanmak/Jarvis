@@ -112,7 +112,7 @@ where Q:for<'a> FnOnce(&'a Path,&'a Path,&'a PreparedAcceptance,&'a workflow::Wo
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -129,7 +129,7 @@ mod tests {
         guard.finish().unwrap();
     }
 
-    async fn owned_measurement(root:&Path,guard:&workflow::WorkflowGuard,episode:&ConstructionEpisode,old:&PreparedAcceptance,text:String)->Result<Measurement> {
+    pub(in super::super) async fn owned_measurement(root:&Path,guard:&workflow::WorkflowGuard,episode:&ConstructionEpisode,old:&PreparedAcceptance,text:String)->Result<Measurement> {
         next_with(root,guard,super::super::tests::request(episode,old,"test-model"),|input| {
             let text=text.clone();
             async move {constructor_native::scripted_reply(root,guard,episode,&input,text).await}

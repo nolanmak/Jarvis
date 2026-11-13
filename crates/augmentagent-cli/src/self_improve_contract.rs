@@ -1314,7 +1314,7 @@ mod initial_diagnostic_tests {
         old.finish().unwrap();
         let new=workflow::WorkflowGuard::acquire_fixture(&state,start("genuine new owner request")).await.unwrap().unwrap();
         verifier_execution::OriginalExecution::begin(&new,control.path(),&prepared.proposal,base,&environment,"scripted orphan executor").unwrap();
-        let contexts=verifier_execution::retained_original_plan_budget_contexts(&new).unwrap();assert_eq!(contexts.len(),2);
+        let contexts=verifier_execution::retained_original_plan_budget_contexts(root.path(),control.path(),&new).unwrap();assert_eq!(contexts.len(),2);
         let error=preflight_initial_scope(root.path(),&new,source,base,None).unwrap_err();
         assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
         new.finish().unwrap();
@@ -1609,7 +1609,8 @@ pub(super) fn preflight_initial_scope(root:&Path,workflow:&workflow::WorkflowGua
         let environment=environment_id(root)?;
         let origin=initial_scope_origin(workflow,base,&environment)?;
         let Some((scope,criteria))=saved else {
-            let plans=verifier_execution::retained_original_plan_budget_contexts(workflow)?;
+            let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+            let plans=verifier_execution::retained_original_plan_budget_contexts(root,&native_control,workflow)?;
             return initial_repair::require_scoped_history(&origin,|key|workflow.recorded_scope_stage_response(key),
                 |after|workflow.scope_stage_response_keys(after),&plans);
         };
