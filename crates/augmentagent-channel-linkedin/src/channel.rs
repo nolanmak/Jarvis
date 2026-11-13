@@ -598,6 +598,11 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
                 let draft_prompt = draft_user_message(&email, "", "", &thread_context, "", "");
                 let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
+                // #2014 — mirror the sender's casing at generation.
+                let draft_prompt = augmentagent_approval_discord::register::with_register_guidance(
+                    draft_prompt,
+                    [email.body.as_str()],
+                );
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -1003,7 +1008,11 @@ impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEn
         let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
         let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
-        let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        // #2014 — mirror the sender's casing at generation.
+        let draft_prompt = augmentagent_approval_discord::register::with_register_guidance(
+            draft_user_message(&email, "", "", "", "", ""),
+            [email.body.as_str()],
+        );
         let draft = self
             .reasoner
             .call(&draft_opts, &draft_prompt)

@@ -393,9 +393,16 @@ impl CardDrafter<'_> {
         if group {
             evidence.push_str(&group_note);
         }
+        // #2014 — tell the drafter how this person writes, so the card is
+        // mirrored at generation, not only flagged afterwards.
+        let samples = recipient_samples(&email);
+        let prompt = augmentagent_approval_discord::register::with_register_guidance(
+            draft_user_message(&email, &evidence, "", "", "", ""),
+            samples.iter().map(|s| s.as_str()),
+        );
         let drafted = self
             .reasoner
-            .call(&draft_opts, &draft_user_message(&email, &evidence, "", "", "", ""))
+            .call(&draft_opts, &prompt)
             .await?
             .trim()
             .to_string();
@@ -406,7 +413,6 @@ impl CardDrafter<'_> {
         // #2014 — hold the draft to the register the recipient writes in and
         // carry a mismatch to the card. Advisory: the card is still posted
         // and Approve still sends.
-        let samples = recipient_samples(&email);
         let (drafted, register) = augmentagent_approval_discord::register::attach_dm_register_warning(
             samples.iter().map(|s| s.as_str()),
             &drafted,
@@ -1210,6 +1216,34 @@ mod tests {
         // drafted text, warning scrubbed.
         assert_eq!(sent, LOWERCASE_DRAFT);
         println!("imessage_register_mismatch_approval_eligible");
+    }
+
+    /// #2014 (Nov 13 repro): the proactive card drafter wrote all-lowercase
+    /// to a contact who writes in sentence case, because its prompt never
+    /// said how the contact writes. The draft prompt now carries their
+    /// register; the owner's own turns are not evidence for it.
+    #[tokio::test]
+    async fn the_card_drafter_is_told_to_mirror_a_capitalizing_contact() {
+        let inbound = "Sounds good. I sent the document yesterday afternoon, check email.";
+        for (entries, told) in [
+            (&[(PHONE, inbound)][..], true),
+            (&[("me", inbound), (PHONE, "ok")][..], false),
+        ] {
+            let f = fx();
+            f.store.allow_imessage_inbound(PHONE).unwrap();
+            let d = one_to_one(entries);
+            ingest(&f.store, &d);
+            let r = Scripted::new(&[REPLY, "Got it, I see it. I'll send it back."]);
+            let stats = replier(&f, Arc::clone(&r)).handle_deltas(&[d]).await;
+            assert_eq!(stats.cards, 1);
+            let prompts = r.prompts();
+            let draft_prompt = prompts.last().unwrap();
+            assert_eq!(
+                draft_prompt.contains("<recipient_register>\nThis person writes in standard capitalization"),
+                told,
+                "{entries:?}: {draft_prompt}"
+            );
+        }
     }
 
     /// #1107 semantics carry over: a receipt marked `(you asked)` records an

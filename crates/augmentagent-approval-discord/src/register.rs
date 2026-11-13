@@ -421,13 +421,57 @@ pub fn dm_register_warning<'a>(
         return None;
     }
     let prose = if is_register_receipt(first) { rest } else { lead };
-    let sample = samples
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    audit_draft_against_sample(&sample, prose)
+    let declared = recipient_register(samples)?;
+    let (paragraphs, _) = draft_paragraphs(&prose.lines().collect::<Vec<_>>(), None);
+    contradiction("the recipient writes in", declared, &paragraphs)
+}
+
+/// The register a DM recipient writes in, from their own recent messages.
+/// Each message is classified on its own and the majority wins; a message of
+/// under three words (`ok`, `see you`) is evidence for neither register, so
+/// an acknowledgement does not cancel a person's sentence-shaped messages.
+/// A tie, or nothing to classify, is `None`: nothing is guessed.
+fn recipient_register<'a>(samples: impl IntoIterator<Item = &'a str>) -> Option<Register> {
+    let (mut standard, mut lowercase) = (0, 0);
+    for sample in samples {
+        let words = sample.split_whitespace().filter(|w| w.chars().any(char::is_alphabetic)).count();
+        if words < 3 {
+            continue;
+        }
+        match register_of(sample) {
+            Some(Register::Standard) => standard += 1,
+            Some(Register::Lowercase) => lowercase += 1,
+            None => {}
+        }
+    }
+    match standard.cmp(&lowercase) {
+        std::cmp::Ordering::Greater => Some(Register::Standard),
+        std::cmp::Ordering::Less => Some(Register::Lowercase),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// Append the recipient's register to a DM drafter's prompt (#2014). The
+/// proactive drafters wrote in the owner's lowercase voice even to someone
+/// who capitalizes, because nothing told them how the recipient writes; the
+/// card warning only caught it afterwards. The section goes last so it reads
+/// after the owner's tone. Thin or mixed evidence leaves the prompt unchanged.
+pub fn with_register_guidance<'a>(
+    prompt: String,
+    samples: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let guidance = match recipient_register(samples) {
+        Some(Register::Standard) => {
+            "This person writes in standard capitalization. Mirror them: capitalize the first \
+             word of every sentence and the pronoun \"I\" in your reply, even where the owner's \
+             usual voice is lowercase."
+        }
+        Some(Register::Lowercase) => {
+            "This person writes in lowercase. Mirror them: lowercase sentence starts are fine."
+        }
+        None => return prompt,
+    };
+    format!("{prompt}\n\n<recipient_register>\n{guidance}\n</recipient_register>\n")
 }
 
 /// [`dm_register_warning`], attached to the draft as card-only metadata
@@ -756,6 +800,26 @@ mod tests {
             ));
             assert_eq!(notes.len(), 1, "{draft:?}: {notes:?}");
         }
+    }
+
+    /// #2014: the drafter is told the register the recipient writes in, from
+    /// their own sentence-shaped messages; a short acknowledgement is not
+    /// evidence, and thin or tied evidence adds nothing to the prompt.
+    #[test]
+    fn issue_2014_dm_drafter_is_told_the_recipients_register() {
+        let standard = "Sounds good. I sent the document yesterday afternoon, check email.";
+        let lower = "sounds good, i sent it yesterday. check your email";
+        let told = with_register_guidance("PROMPT".into(), [standard, "ok"]);
+        assert!(told.starts_with("PROMPT\n\n<recipient_register>\n"), "{told}");
+        assert!(told.contains("capitalize the first word of every sentence"), "{told}");
+        let told = with_register_guidance("PROMPT".into(), [lower, lower, standard]);
+        assert!(told.contains("writes in lowercase"), "{told}");
+        for samples in [vec![], vec!["ok", "see you"], vec![standard, lower]] {
+            assert_eq!(with_register_guidance("PROMPT".into(), samples.clone()), "PROMPT", "{samples:?}");
+        }
+        // The card backstop reads the same evidence: an `ok` no longer
+        // cancels a capitalizing contact's sentence-shaped message.
+        assert!(dm_register_warning([standard, "ok"], "got it, i see it. i'll send it back").is_some());
     }
 
     /// #2014: the DM paths hold a draft to the recipient's own casing and

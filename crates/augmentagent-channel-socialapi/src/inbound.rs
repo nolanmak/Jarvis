@@ -806,7 +806,11 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             "Draft a response using relevant conversation and cross-platform evidence.",
             self.config.wiki_root.as_deref(),
         ).await?;
-        let mut draft_prompt = draft_user_message(&email, &shared_draft_context.prompt(), "", "", "", "");
+        // #2014 — mirror the sender's casing at generation.
+        let mut draft_prompt = augmentagent_approval_discord::register::with_register_guidance(
+            draft_user_message(&email, &shared_draft_context.prompt(), "", "", "", ""),
+            [dm.text.as_str()],
+        );
         // #858: let the drafter SEE a shared image. Best-effort — a failed fetch
         // leaves the #573 URL note as the fallback; the guard drops the tempfile.
         let image = match dm.attachment_url.as_deref() {
