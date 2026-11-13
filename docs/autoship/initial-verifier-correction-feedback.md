@@ -21,6 +21,10 @@ work. Conclusive captures, when present, must be complete and match the receipt'
 output digest. The existing legacy result-and-quiescence protocol remains
 supported for admissions without capture data. An interrupted disposition can
 settle an unrelated attempt; it cannot make the selected predecessor conclusive.
+When recovery retains a later conclusive result for the exact same proposal,
+earlier infrastructure results are excluded from selection after their command
+custody and settlement checks pass. Infrastructure-only history still holds, and
+conflicting conclusive results still hold.
 
 Selection precedes checkout-dependent adapter checks. Retained adapters from
 other proposals are not checked against the selected checkout. Record identity,

@@ -426,6 +426,9 @@ fn visit_original_outcomes(root:&Path,source:AcceptanceSource,binding:&crate::au
             let classification=match classified {Some(value)=>value,None=>validate_retained_outcome(&plan,&result,evidence)?};
             result.baseline.registration.verify_source_files(root,&plan.proposal.files)?;
             if selected.is_none() && classification!=BaselineResult::Reproduced {continue;}
+            // Command custody/settlement is checked before selection. An old
+            // interrupted result must not poison its later conclusive recovery.
+            if selected.is_some() && result.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
             visit(&row.key,PreparedAcceptance {proposal:plan.proposal,baseline:result.baseline})?;
         }
     }
@@ -547,7 +550,6 @@ pub(super) fn initial_correction_outcome(root:&Path,source:AcceptanceSource,base
     require_correction_commands(evidence)?;
     let mut selected:Option<(String,PreparedAcceptance)>=None;let mut keys=std::collections::BTreeSet::new();
     visit_original_outcomes(root,source,binding,evidence,Some((base,proposal_sha256)),|key,prepared| {
-        ensure!(!prepared.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure),"predecessor result is infrastructure, not correction evidence");
         let hash=amendment::digest(&serde_json::to_vec(&prepared)?);
         if let Some((previous,_))=&selected {ensure!(previous==&hash,"predecessor has conflicting original outcomes");}
         else {selected=Some((hash,prepared));}
@@ -826,6 +828,12 @@ mod tests {
             .expect("settled earlier infrastructure hid the conclusive original recovery");
         assert_eq!(serde_json::to_value(loaded.baseline).unwrap(),serde_json::to_value(baseline).unwrap());
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+        let mut conflicting=prepared.clone();
+        conflicting.baseline.receipts=vec![prepared.baseline.registration.observe(root.path(),"observe",prepared.baseline.registration.binding(base).unwrap(),
+            &Observation {exit_code:Some(0),stdout:"true\n".into(),stderr:String::new(),interrupted:false,output_complete:true}).unwrap()];
+        retain_scripted_original_data(root.path(),control.path(),&conflicting,&guard).unwrap();
+        let error=initial_correction_outcome(root.path(),AcceptanceSource::PullRequest(840),base,&digest,guard.binding(),&store.inspect_verifier_evidence(guard.id())).unwrap_err();
+        assert!(error.to_string().contains("conflicting original outcomes"),"conclusive conflicts were silently selected: {error:#}");
     }
 
     #[tokio::test]
