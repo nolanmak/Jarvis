@@ -181,6 +181,15 @@ untrusted issues. They still need explicit owner authorization; neither a bot
 identity nor a label grants it. The final execution trust guard remains in place,
 and the configured legacy approval policy is unchanged.
 
+The `autoship-manual` issue label routes engineering recovery work outside both
+automatic fresh selectors. They skip it before triage and continue to ordinary
+peers. This is a routing choice, not a failure, permission, workflow registration
+or teardown receipt. Remove the label to restore normal selection eligibility;
+all existing authorization, owner controls and execution gates still apply.
+Pause already-active repair workflows through `autopr pause`; labeling alone
+does not stop them. Keep remaining engineering/acceptance work open and tracked.
+Do not use `agent-gave-up` for this routing choice: that label reports failures.
+
 A fresh-selection `owner-control-unavailable` hold means the existing protected
 control state or canonical identity could not be read reliably. It is unpaid;
 inspect the configured state and its access rather than treating unknown state
