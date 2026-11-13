@@ -1501,14 +1501,21 @@ fn native_custody_failure(error:&anyhow::Error)->bool {
         || error.downcast_ref::<crate::autoship_workflow::NativeScopeOutcomeUnresolved>().is_some()
 }
 
+// Keep the actual initial producer available to crash/reopen regression fixtures.
+fn initial_repair_epoch(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str,
+    scope:&str,required_criteria:&[String],policy:&str)->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow,
+        contract,source,base,environment,scope,required_criteria,policy))?))
+}
+
 async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
     required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<(ContractProposal,BaselineEvidence)> {
     // This private call owns a newly detached original-baseline checkout.
     trusted_git(root,&["reset","--hard",base]).await?;
     trusted_git(root,&["clean","-fdx"]).await?;
     let environment=environment_id(root)?;
-    let epoch=amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow.id(),
-        &workflow.binding().contract,source,base,&environment,scope,required_criteria,baseline_witness::policy_hash()))?);
+    let epoch=initial_repair_epoch(workflow.id(),&workflow.binding().contract,source,base,&environment,scope,
+        required_criteria,&baseline_witness::policy_hash())?;
     let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,

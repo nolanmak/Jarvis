@@ -697,6 +697,10 @@ mod tests {
     }
 
     async fn crash_fixture(root: &Path, phase: Option<&str>) -> Result<(u32, &'static str)> {
+        crash_fixture_at_epoch(root,phase,&"5".repeat(64),false).await
+    }
+
+    async fn crash_fixture_at_epoch(root:&Path,phase:Option<&str>,epoch:&str,exhaust:bool)->Result<(u32,&'static str)> {
         use crate::autoship_workflow::{Binding, WorkflowStore};
         let path = root.join("workflow.db");
         let binding = Binding {
@@ -716,7 +720,7 @@ mod tests {
             .context("fixture lease unavailable")?;
         let store = Mutex::new(store);
         let result = run(
-            &"5".repeat(64),
+            epoch,
             |key| {
                 store
                     .lock()
@@ -736,7 +740,9 @@ mod tests {
                     raw,
                     now + 1,
                 )?;
-                if (phase==Some("after-failure") && !intent) || (phase==Some("after-intent") && intent) {
+                let last_failure=serde_json::from_str::<Failure>(raw).is_ok_and(|failure|failure.slot==LIMIT-1);
+                if (phase==Some("after-failure") && !intent) || (phase==Some("after-intent") && intent)
+                    || (phase==Some("after-exhausted-failure") && last_failure) {
                     crash_marker(root, phase.unwrap());
                     std::process::exit(73);
                 }
@@ -757,6 +763,10 @@ mod tests {
                         return Err(Hold::EvidenceUnknown.into());
                     }
                     crash_marker(root, &format!("model:{slot}")); // scripted boundary only
+                    if exhaust {
+                        store.lock().unwrap().charge(&lease,&format!("scripted-{epoch}-{slot}"),
+                            crate::autoship_workflow::ResourceCharge {model_calls:1,tokens:7,wall_ms:1},now+1)?;
+                    }
                     store.lock().unwrap().record_scope_stage_response(
                         &lease,
                         &binding,
@@ -774,7 +784,7 @@ mod tests {
             },
             |slot| {
                 crash_marker(root, &format!("observe:{slot}"));
-                std::future::ready(if slot == 0 {
+                std::future::ready(if exhaust || slot == 0 {
                     Err(rejected())
                 } else {
                     Ok("scripted current observation; no production permission")
@@ -787,6 +797,31 @@ mod tests {
             std::process::exit(73);
         }
         Ok(result)
+    }
+
+    #[tokio::test]
+    async fn controller_rollout_after_last_failure_cannot_restart_spent_initial_budget() {
+        const ROOT:&str="AUTOSHIP_INITIAL_BUDGET_ROLLOUT_CRASH_ROOT";
+        let epoch=|policy:&str|super::super::initial_repair_epoch("owner/repo#1",&"b".repeat(64),
+            AcceptanceSource::Issue(1),&"a".repeat(40),"unchanged execution environment",
+            "unchanged original owner request",&["unchanged criterion".into()],policy).unwrap();
+        if let Some(root)=std::env::var_os(ROOT) {
+            crash_fixture_at_epoch(Path::new(&root),Some("after-exhausted-failure"),&epoch("controller-policy-before"),true).await.unwrap();
+            panic!("did not reach committed final failure before hold");
+        }
+        let root=tempfile::tempdir().unwrap();
+        let output=tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::initial_repair::tests::controller_rollout_after_last_failure_cannot_restart_spent_initial_budget"])
+            .env(ROOT,root.path()).output().await.unwrap();
+        assert_eq!(output.status.code(),Some(73),"{}",String::from_utf8_lossy(&output.stderr));
+        let before=std::fs::read_to_string(root.path().join("observations")).unwrap();
+        assert_eq!(before.lines().filter(|line|line.starts_with("observe:")).count(),3);
+        let result=crash_fixture_at_epoch(root.path(),None,&epoch("controller-policy-after"),true).await;
+        assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::Exhausted));
+        let after=std::fs::read_to_string(root.path().join("observations")).unwrap();
+        assert_eq!(after,before,"controller rollout re-executed an exhausted original verifier after the pre-hold crash");
+        let store=crate::autoship_workflow::WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        assert_eq!(store.snapshot("owner/repo#1").unwrap().unwrap().model_calls,3,"historical charges changed");
     }
 
     #[tokio::test]
