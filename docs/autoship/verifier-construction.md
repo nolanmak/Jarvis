@@ -145,16 +145,95 @@ every possible observer is impossible.
   engineering change with normal CI/review/snapshot/merge/updater and both-process
   proof. Use ordinary work for autonomous acceptance, never this repair PR.
 
+## Selected producer interface and custody boundary
+
+Use a separate amendment-construction module beneath the existing acceptance
+adapter. It is an untrusted producer, not another workflow coordinator. Reuse
+`build_workflow_pinned`, tool-free `codex_review_opts`, the existing protected
+fresh-session service, `WorkflowGuard` accounting and the immutable paired
+scope-response store. Do not route construction through `persistent_witness`
+or add construction results to baseline-witness custody. Keeping the existing
+scope producer unchanged also avoids changing its full-file policy identity
+just to add an unrelated producer role.
+
+Each construction conversation carries the controller-computed episode and
+exact-input purpose into the actual admission observer. Its native role is
+`verifier_construction`; the runtime's fresh-session isolation marker is a
+technical custody fact, not witness approval. The producer returns proposal
+data, a bounded request for immutable original source, or an explicit no-proposal
+result. Controller validation decides which variant it is. Source and format
+responses consume the same episode budget as proposal responses.
+
+The exact input is SHA256 of UTF-8 `serde_json::to_vec` bytes for this ordered
+tuple: `("verifier-construction-input-v1", episode, provider_name,
+"verifier_construction", producer_policy_digest, model_profile, system, prompt)`.
+`producer_policy_digest` binds the compiled constructor module and its bounded
+additional-source adapter. `model_profile` is an ordered tuple of profile version,
+the explicit resolved model name, permission mode, environment restriction flag,
+allowed tools, additional directories, extra environment and settings JSON.
+For this protocol require the model name to be present, permission mode
+`default`, `restrict_env=false` as in the existing review transport,
+empty tools/directories/extra environment and null settings. Clear additional
+directories inherited from the review preset; fresh scope supplies the worktree
+as its working directory only. Session and handoff overrides are null.
+
+Hash the exact system/prompt bytes actually sent, including quoted source and
+feedback. Do not hash a current binding, generation, timestamp, transient path,
+session ID or main SHA separately. The episode already pins the canonical
+workflow, source and original commit. Constructor prompts use those immutable
+inputs rather than injecting current-main or candidate-head metadata. A policy
+or model change creates a different exact input but never replenishes the
+episode's six-call allowance or independently wakes a completed hold.
+
+Retain this complete input envelope with its dispatch intent. Restart recovery
+first addresses the saved exact input and its original completed output; it
+does not recompute that historical identity with current defaults. Authenticate
+its original policy/model envelope as untrusted historical construction data,
+then rerun current proposal/source/staging validation before any effect. This
+does not import an old positive witness or adjudication decision. A new native
+conversation uses the current explicit envelope and the same remaining episode
+budget.
+
+The module must retain the raw reply and a private provenance file before the
+fresh native scope returns. Provenance binds the role/version, workflow,
+episode, original commit, exact request, actual provider/session and response
+digest. Paired response-store keys are derived from the complete constructor
+purpose in their own response/provenance domains, so they cannot alias witness
+or ordinary scope entries. Indexed custody checks the actual admission,
+resource charge, bounded counter and both immutable response entries. Physical
+validation separately checks the private provenance file and its exact request
+and reply binding before another paid dispatch. Neither check substitutes for
+the other; a paired string in the database is not proof of a native session.
+
+Existing authenticated source projections seed the first request. Further
+source requests reuse controller-mediated immutable Git reads and the bounded
+source-buffer implementation, with an explicit constructor caller interface;
+they cannot fabricate a baseline source-selection observation. All prompts and
+feedback remain bounded untrusted data. Pending admitted work with missing or
+conflicting custody holds across role, provider and binding changes. Recovery
+may restore the exact original output; it must not generate a replacement by
+calling a different model.
+
+The indexed-custody regression first reproduced a dispatch past a lost response
+after restart. The implementation now checks the actual admission, charge,
+counter and paired response entries before any fresh native admission, across
+provider/role/binding changes. All 222 durable-workflow tests pass. These tests
+script response-index data only; they do not establish physical provenance,
+original behavioral red, witness qualification or a live constructor.
+
+This selects the transport and custody shape. Its implementation, source-read
+interface, physical-provenance tests and restricted held-work lease are still
+required before enabling a production constructor call.
+
 ## Open decisions — owner: implementation agent
 
 These must be resolved against source and audited before handoff, not guessed by
 a downstream implementer:
 
-- Select the existing producer interface that supports bounded source collection,
-  protected per-input response recovery and a distinct untrusted construction
-  role. Generic scope calls currently cache native custody only with qualification
-  context; original custody permits source-selection and baseline-witness roles.
-  Simply relabeling a constructor as a witness is invalid.
+- Implement and verify the selected producer interface above, including bounded
+  additional source collection, physical provenance and recovery before scope
+  release. Generic scope calls cache native custody only with qualification
+  context; do not relabel a constructor as a witness to borrow that cache.
 - Select the restricted construction lease/admission integration. Inspection
   leases forbid models. Normal claims cannot merely clear an unchanged completed
   decline to run a constructor. Specify eligibility, fairness, termination and
