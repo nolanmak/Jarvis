@@ -60,11 +60,14 @@ pub(super) fn reserve(root:&Path,workflow:&workflow::WorkflowGuard,episode:&Cons
     let indexed=workflow.verifier_evidence(key,"original_verifier_plan")?;
     let recorded=workflow.recorded_scope_stage_response(key)?;
     ensure!(indexed==recorded && indexed.as_deref().is_none_or(|old|old==body),initial_repair::Hold::EvidenceUnknown);
-    if existing.is_none() {
+    let ownership=if existing.is_some() {
+        workflow.verifier_evidence(&owner_key(key),KIND)?.context(initial_repair::Hold::EvidenceUnknown)?
+    }else {
         ensure!(indexed.is_none(),"existing original plan cannot be reclassified as construction ownership");
-        let value=Owner {version:1,kind:KIND.into(),workflow:workflow.id().into(),plan:key.into(),episode:episode.key().into(),slot:measurement.slot,intent_sha256:measurement.identity()?};
-        workflow.record_verifier_evidence(&owner_key(key),KIND,&serde_json::to_string(&value)?)?;
-    }
+        serde_json::to_string(&Owner {version:1,kind:KIND.into(),workflow:workflow.id().into(),plan:key.into(),episode:episode.key().into(),slot:measurement.slot,intent_sha256:measurement.identity()?})?
+    };
+    workflow.record_constructed_original_plan(key,body,&owner_key(key),&ownership)
+        .map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
     ensure!(owned(root,episode.control(),workflow,key,body)?,initial_repair::Hold::EvidenceUnknown);
     Ok(())
 }
@@ -72,6 +75,39 @@ pub(super) fn reserve(root:&Path,workflow:&workflow::WorkflowGuard,episode:&Cons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn constructed_plan_publication_failure_does_not_orphan_ownership_or_spend_another_charge() {
+        let (root,control,old,guard,episode)=super::super::tests::fixture().await;
+        let measurement=super::super::staging::tests::owned_measurement(root.path(),&guard,&episode,&old,super::super::tests::proposal(&old)).await.unwrap();
+        let executor=verifier_executor_id().unwrap();
+        let (key,body)=verifier_execution::plan_input(&guard,measurement.proposal(),episode.original_base(),episode.original_environment(),&executor).unwrap();
+        let conn=rusqlite::Connection::open(control.path().join("workflow.db")).unwrap();
+        // Fault injection touches only this temporary fixture database. Fail
+        // the second logical write, after ownership would have been inserted.
+        conn.execute_batch(&format!("CREATE TRIGGER deny_constructed_plan BEFORE INSERT ON scope_stage_response WHEN NEW.key='{key}' BEGIN SELECT RAISE(ABORT,'scripted original-plan publication failure'); END;")).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+        let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+        let outcome=(||->Result<()> {
+            reserve(root.path(),&guard,&episode,&measurement,&key,&body)?;
+            verifier_execution::OriginalExecution::begin(&guard,control.path(),measurement.proposal(),episode.original_base(),episode.original_environment(),&executor)?;
+            Ok(())
+        })();
+        assert!(outcome.is_err(),"publication fault did not reach the actual constructed-plan path");
+        assert!(owner(&guard,&key).unwrap().is_none(),"failed plan publication left an orphan ownership receipt");
+        assert!(guard.verifier_evidence(&key,"original_verifier_plan").unwrap().is_none());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);
+        assert_eq!(store.events(guard.id()).unwrap(),events,"rolled-back publication fabricated durable progress");
+        conn.execute_batch("DROP TRIGGER deny_constructed_plan;").unwrap();
+        reserve(root.path(),&guard,&episode,&measurement,&key,&body).unwrap();
+        verifier_execution::OriginalExecution::begin(&guard,control.path(),measurement.proposal(),episode.original_base(),episode.original_environment(),&executor).unwrap();
+        assert!(owned(root.path(),episode.control(),&guard,&key,&body).unwrap());
+        assert_eq!(guard.verifier_evidence_page(KIND,0).unwrap().len(),1);
+        assert_eq!(guard.verifier_evidence_page("original_verifier_plan",0).unwrap().len(),1);
+        assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,"publication retry added a native charge");
+        drop(store);drop(conn);guard.finish().unwrap();
+    }
 
     #[tokio::test]
     async fn constructed_original_plan_is_not_misclassified_as_unowned_initial_budget() {

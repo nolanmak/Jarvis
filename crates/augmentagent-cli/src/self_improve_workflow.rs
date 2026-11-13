@@ -1671,6 +1671,12 @@ impl WorkflowGuard {
             .record_verifier_evidence(&self.lease,&self.binding,key,kind,body,millis())
     }
 
+    pub(super) fn record_constructed_original_plan(&self,key:&str,body:&str,ownership_key:&str,ownership:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_constructed_original_plan(&self.lease,&self.binding,key,body,ownership_key,ownership,millis())
+    }
+
     pub(super) fn original_verifier_recovery_plan(&self)->Result<Option<(String,String)>> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?

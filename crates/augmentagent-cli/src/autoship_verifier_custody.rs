@@ -154,22 +154,44 @@ impl WorkflowStore {
     }
 
     pub(crate) fn record_verifier_evidence(&mut self,lease:&Lease,binding:&Binding,key:&str,kind:&str,body:&str,now:i64)->Result<()> {
-        ensure!(key.len()==64 && key.bytes().all(|c|c.is_ascii_hexdigit()) && body.len()<=2*1024*1024,"invalid bounded verifier evidence");
-        ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|"original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"|"construction_original_plan_owner"),"unknown verifier evidence role");
-        let parsed:serde_json::Value=serde_json::from_str(body)?;
-        ensure!(parsed["version"]==1 && parsed["kind"]==kind && parsed["workflow"]==lease.workflow,"verifier evidence owner or role changed");
+        self.record_verifier_evidence_records(lease,binding,&[(key,kind,body)],now)
+    }
+
+    /// Existing constructor charge and original recipe publish together. This
+    /// stores immutable evidence; it grants neither a native call nor a command.
+    pub(crate) fn record_constructed_original_plan(&mut self,lease:&Lease,binding:&Binding,key:&str,body:&str,
+        ownership_key:&str,ownership:&str,now:i64)->Result<()> {
+        let owner:serde_json::Value=serde_json::from_str(ownership)?;
+        ensure!(key!=ownership_key && owner["kind"]=="construction_original_plan_owner" && owner["plan"]==key
+            && format!("{:x}",Sha256::digest(serde_json::to_vec(&("construction-original-plan-owner-v1",key))?))==ownership_key,
+            "constructed original ownership does not match plan");
+        self.record_verifier_evidence_records(lease,binding,&[
+            (ownership_key,"construction_original_plan_owner",ownership),(key,"original_verifier_plan",body),
+        ],now)
+    }
+
+    fn record_verifier_evidence_records(&mut self,lease:&Lease,binding:&Binding,records:&[(&str,&str,&str)],now:i64)->Result<()> {
+        ensure!(!records.is_empty() && records.len()<=2,"invalid verifier publication batch");
+        for &(key,kind,body) in records {
+            ensure!(key.len()==64 && key.bytes().all(|c|c.is_ascii_hexdigit()) && body.len()<=2*1024*1024,"invalid bounded verifier evidence");
+            ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|"original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"|"construction_original_plan_owner"),"unknown verifier evidence role");
+            let parsed:serde_json::Value=serde_json::from_str(body)?;
+            ensure!(parsed["version"]==1 && parsed["kind"]==kind && parsed["workflow"]==lease.workflow,"verifier evidence owner or role changed");
+        }
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
-        let old:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if let Some(old)=old {ensure!(old==body,"verifier evidence is immutable");}
-        else {
-            tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,body])?;
-            event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
+        for &(key,kind,body) in records {
+            let old:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
+            if let Some(old)=old {ensure!(old==body,"verifier evidence is immutable");}
+            else {
+                tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,body])?;
+                event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
+            }
+            let hash=format!("{:x}",Sha256::digest(body.as_bytes()));
+            let indexed:Option<String>=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![lease.workflow,key,kind],|r|r.get(0)).optional()?;
+            if let Some(indexed)=indexed {ensure!(indexed==hash,"verifier evidence history changed");}
+            else {event(&tx,&lease.workflow,lease.generation,"verifier_evidence_recorded",&serde_json::json!({"key":key,"kind":kind,"sha256":hash}).to_string(),now)?;}
         }
-        let hash=format!("{:x}",Sha256::digest(body.as_bytes()));
-        let indexed:Option<String>=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![lease.workflow,key,kind],|r|r.get(0)).optional()?;
-        if let Some(indexed)=indexed {ensure!(indexed==hash,"verifier evidence history changed");}
-        else {event(&tx,&lease.workflow,lease.generation,"verifier_evidence_recorded",&serde_json::json!({"key":key,"kind":kind,"sha256":hash}).to_string(),now)?;}
         tx.commit()?;Ok(())
     }
 

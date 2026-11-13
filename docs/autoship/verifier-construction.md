@@ -887,3 +887,27 @@ capture/recovery. This is not the full CLI suite. In particular, the actual
 approved-transition custody regression remains explicitly ignored in this run
 and intentionally RED at its last delegated execution; no new approved command
 or successful restart was proved by decoding tests.
+
+
+## Atomic constructed-plan publication — v1 foundation
+
+Constructor ownership and its original plan now publish together in one existing
+fenced evidence-store transaction, including both immutable bodies and role/hash
+indexes. The constructor reservation authenticates its already charged measurement
+first, refuses to relabel an existing initial/orphan plan, and reuses literal
+existing ownership bytes on replay. Storage failure retains the typed unknown-
+evidence hold. No new ledger, model admission, measurement slot or command grant
+is introduced. This is the v1 publication foundation; the approved v2 owner,
+writer, current capability, recovery and Pending activation joins remain open.
+
+A temporary constructor-owned fixture injects a failure on the plan insertion.
+Before the fix it failed because the previously committed ownership receipt was
+orphaned (21.07 seconds after a successful 1 minute 36 second compile). With the
+transactional writer, neither new body/index nor progress event survives the
+failed insertion. Retrying after removing the fixture fault publishes one owner
+and one plan, admits no command and preserves the original native charge.
+The full managed CLI suite passes **2,098 tests / 0 failures / 46 explicit ignores**
+in 398.69 seconds. Native model replies in this fixture are scripted. These tests
+are not a new actual-provider, approved-v2 execution, restart or autonomous-shipment
+receipt; the distinct approved original custody regression is still intentionally
+RED at its last delegated run. No deployment or full #2058 closure is claimed.
