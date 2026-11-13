@@ -1575,6 +1575,12 @@ impl WorkflowGuard {
         self.checkpoint(Stage::Scope,"baseline_qualification_started","qualify_original_baseline",0,&evidence).await
     }
 
+    pub(super) fn epoch_attempts(&self,purpose:&str,epoch:&str)->Result<u32> {
+        self.healthy_lease()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .epoch_attempts(&self.lease,purpose,epoch,millis())
+    }
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,

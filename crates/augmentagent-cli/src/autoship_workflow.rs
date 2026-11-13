@@ -339,6 +339,19 @@ pub struct WorkflowStore {
     conn: Connection,
 }
 
+/// The same immutable response lookup serves leased execution and free data
+/// inspection; a recorded-but-missing result is never a fresh empty slot.
+fn read_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<String>> {
+    let value=conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,key],|r|r.get(0)).optional()?;
+    if value.is_none() {
+        let malformed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[workflow],|row|row.get(0))?;
+        if malformed {return Err(MissingScopeResponse.into());}
+        let recorded:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2)",params![workflow,key],|row|row.get(0))?;
+        if recorded {return Err(MissingScopeResponse.into());}
+    }
+    Ok(value)
+}
+
 struct CustodyHold<'a> {physical:bool,plan:Option<&'a str>,semantic_source:Option<&'a str>}
 
 impl WorkflowStore {
@@ -379,13 +392,7 @@ impl WorkflowStore {
 
     pub fn scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
-        let value=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if value.is_none() {
-            let malformed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[&lease.workflow],|row|row.get(0))?;
-            if malformed {return Err(MissingScopeResponse.into());}
-            let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2)",params![lease.workflow,key],|row|row.get(0))?;
-            if recorded {return Err(MissingScopeResponse.into());}
-        }
+        let value=read_scope_response(&tx,&lease.workflow,key)?;
         tx.commit()?;Ok(value)
     }
     pub fn record_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,now:i64)->Result<()> {
@@ -1716,6 +1723,14 @@ impl WorkflowStore {
 
     /// Strategy budgets belong to a contract/base/runner epoch, not a mutable
     /// candidate head. Committing an unsuccessful fix cannot reset this budget.
+    pub(crate) fn epoch_attempts(&self,lease:&Lease,purpose:&str,epoch:&str,now:i64)->Result<u32> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len()<=1024,"bounded epoch purpose required");
+        let tx=self.conn.unchecked_transaction()?;require_lease(&tx,lease,now)?;
+        let count=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",
+            params![lease.workflow,purpose,format!("epoch:{epoch}")],|row|row.get(0)).optional()?.unwrap_or(0);
+        tx.commit()?;Ok(count)
+    }
+
     pub fn admit_epoch_attempt(
         &mut self,
         lease: &Lease,
