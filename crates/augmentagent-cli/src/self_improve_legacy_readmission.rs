@@ -228,9 +228,17 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
                     return Ok(());
                 }
             };
-            if current_controls.paused(&repository,number)? {
-                info!(issue=number,"preserve automatic hold: workflow paused before label mutation");
-                return Ok(());
+            match current_controls.paused(&repository,number) {
+                Ok(true)=> {
+                    info!(issue=number,"preserve automatic hold: workflow paused before label mutation");
+                    return Ok(());
+                }
+                Ok(false)=>{},
+                Err(error)=> {
+                    warn!(issue=number,error=%error,"preserve automatic hold: owner controls unavailable before label mutation");
+                    if unavailable_history.is_none() {unavailable_history=Some(error);}
+                    return Ok(());
+                }
             }
             match current_controls.terminal(&repository,number) {
                 Ok(true)=> {
@@ -291,6 +299,10 @@ mod tests {
     async fn terminal_history_corruption_at_mutation_reports_degraded() {
         migration_fixture("terminal-corrupt-late","terminal_history_corruption_at_mutation_reports_degraded").await;
     }
+    #[tokio::test]
+    async fn terminal_late_owner_control_error_reports_degraded_and_advances_peer() {
+        migration_fixture("owner-corrupt-late-peer","terminal_late_owner_control_error_reports_degraded_and_advances_peer").await;
+    }
     async fn migration_fixture(case:&str,test:&str) {
         const CHILD: &str = "AUTOSHIP_LEGACY_READMISSION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
@@ -309,6 +321,11 @@ if a[:2]==['repo','view']: print('controller/repo')
 elif a[:2]==['api','user']: print('controller')
 elif a[:1]==['api'] and '/timeline?' in a[1]:print((r/'timeline.json').read_text())
 elif a[:1]==['api'] and '/issues/' in a[1]:
+ if os.environ.get('AUTOSHIP_LEGACY_READMISSION_CASE')=='owner-corrupt-late-peer' and a[1].endswith('/issues/7'):
+  # Corrupt only the disposable fixture row, after initial eligibility passed.
+  import sqlite3
+  with sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']) as c:
+   c.execute("UPDATE workflow_owner_control SET revision='malformed' WHERE workflow=?",('controller/repo#7',))
  if os.environ.get('AUTOSHIP_LEGACY_READMISSION_CASE') in ['terminal-late','terminal-corrupt-late']:
   # Only this disposable fixture DB: simulate concurrent controller retirement.
   import sqlite3
@@ -320,7 +337,7 @@ elif a[:1]==['api'] and '/issues/' in a[1]:
     cp['stage']='retired'
     c.execute('UPDATE workflow SET checkpoint=? WHERE id=?',(json.dumps(cp),'controller/repo#7'))
  row=json.loads((r/'current-issue.json').read_text())
- if os.environ.get('AUTOSHIP_LEGACY_READMISSION_CASE')=='terminal-corrupt-peer':
+ if os.environ.get('AUTOSHIP_LEGACY_READMISSION_CASE') in ['terminal-corrupt-peer','owner-corrupt-late-peer']:
   row['number']=int(a[1].rsplit('/',1)[-1])
  print(json.dumps(row))
 elif a[:2]==['issue','edit']:
@@ -367,25 +384,36 @@ else:sys.exit(2)
             store.checkpoint(&lease,&Checkpoint {stage,binding,evidence:vec![],next:NextAction {
                 reason:"fixture_archived_state".into(),action:"complete".into(),eligible_at_ms:0}},4).unwrap();
             store.release(&lease,5).unwrap();
-            if case=="paused" {store.set_owner_pause(&id,"github:controller",0,true,6).unwrap();}
+            if matches!(case,"paused"|"owner-corrupt-late-peer") {store.set_owner_pause(&id,"github:controller",0,case=="paused",6).unwrap();}
             let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
             let owner=store.owner_control(&id).unwrap();drop(store);
             if matches!(case,"terminal-corrupt"|"terminal-corrupt-peer") {
                 rusqlite::Connection::open(&path).unwrap().execute("UPDATE workflow SET checkpoint='not-json' WHERE id=?1",[&id]).unwrap();
             }
-            if case=="terminal-corrupt-peer" {
+            if matches!(case,"terminal-corrupt-peer"|"owner-corrupt-late-peer") {
                 let mut peer=inventory[0].clone();peer["number"]=8.into();
                 inventory.as_array_mut().unwrap().push(peer);
             }
             let result=sweep(&root,Some(&inventory),false).await;
-            if case.starts_with("terminal-corrupt") {assert!(result.is_err(),"unknown protected history was not reported");}
+            if case=="owner-corrupt-late-peer" {
+                let error=result.err().expect("late owner-control read failure was reported as successful readmission");
+                assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"late owner-control failure lost its typed hold: {error:#}");
+            } else if case.starts_with("terminal-corrupt") {assert!(result.is_err(),"unknown protected history was not reported");}
             else {result.unwrap();}
-            if case=="terminal-corrupt-peer" {
+            if matches!(case,"terminal-corrupt-peer"|"owner-corrupt-late-peer") {
                 assert_eq!(std::fs::read_to_string(root.join("edits")).unwrap_or_default(),"8\n","unreadable workflow blocked valid legacy readmission peer");
             }else {assert!(!root.join("edits").exists(),"{case}: automatic sweep removed a protected source label");}
             let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
             assert_eq!(store.events(&id).unwrap(),events,"sweep changed execution history");
-            assert_eq!(store.owner_control(&id).unwrap(),owner);
+            if case=="owner-corrupt-late-peer" {
+                assert!(store.owner_control(&id).is_err(),"sweep overwrote corrupt owner intent");
+                store.query_connection(|conn| {
+                    let row:(String,bool,String,i64)=conn.query_row("SELECT revision,paused,principal,updated_at FROM workflow_owner_control WHERE workflow=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+                    let prior=owner.as_ref().unwrap();
+                    assert_eq!(row,("malformed".into(),prior.paused,prior.principal.clone(),prior.updated_at_ms));
+                    Ok(())
+                }).unwrap();
+            } else {assert_eq!(store.owner_control(&id).unwrap(),owner);}
             if !case.starts_with("terminal-corrupt") {
                 let after=store.snapshot(&id).unwrap().unwrap();
                 if case=="terminal-late" {
@@ -399,7 +427,7 @@ else:sys.exit(2)
                 if exists {
                     let blocked:i64=conn.query_row("SELECT COUNT(*) FROM legacy_readmission_receipt WHERE issue=7",[],|r|r.get(0))?;
                     assert_eq!(blocked,0,"blocked work acquired a pending readmission receipt");
-                    if case=="terminal-corrupt-peer" {
+                    if matches!(case,"terminal-corrupt-peer"|"owner-corrupt-late-peer") {
                         let status:String=conn.query_row("SELECT status FROM legacy_readmission_receipt WHERE issue=8",[],|r|r.get(0))?;
                         assert_eq!(status,"readmitted");
                     }
