@@ -59,14 +59,29 @@ impl std::fmt::Display for OwnerControlUnavailable {
 }
 impl std::error::Error for OwnerControlUnavailable {}
 
-/// Free selection reads the existing owner authority without registering a
-/// workflow or initializing storage. The productive claim still rechecks pause
-/// atomically; this reader is only a fairness filter, never execution admission.
+/// Free selection reads existing owner and workflow history without registering
+/// a workflow or initializing storage. The productive claim still rechecks pause
+/// and terminal state atomically; this is a fairness filter, never admission.
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {
-        WorkflowStore::open_read_only(&path()).map(|store|Self {store})
-            .map_err(|error|error.context(OwnerControlUnavailable))
+        WorkflowStore::open_read_only(&path()).and_then(|store| {
+            if let Some(store)=store.as_ref() {
+                // Empty is not a canonical workflow. Reuse the real reader
+                // queries to check structural capabilities even with no issues,
+                // without loading candidate data, registering or migrating.
+                store.snapshot("")?;
+                store.owner_control("")?;
+            }
+            Ok(Self {store})
+        }).map_err(|error|error.context(OwnerControlUnavailable))
+    }
+    pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
+        (||->Result<bool> {
+            let id=durable::workflow_id(repository,issue)?;
+            let snapshot=self.store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
+            Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
+        })().map_err(|error|error.context(OwnerControlUnavailable))
     }
     pub(super) fn paused(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {
