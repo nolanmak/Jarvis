@@ -83,8 +83,8 @@ impl FreshIssueControls {
             Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
         })().map_err(|error|error.context(OwnerControlUnavailable))
     }
-    /// Fairness preview only: an unchanged initial hold cannot be claimed by
-    /// normal execution. Read the same context/environment/binding inputs,
+    /// Fairness preview only: unchanged initial holds are skipped unless exact
+    /// native custody has recovered. Read the same context/environment/binding inputs,
     /// without register, claim, capacity refresh or checkout preparation.
     pub(super) fn unchanged_initial_hold(&self,root:&Path,repository:&str,issue:&Issue)
         ->impl std::future::Future<Output=Result<bool>>+Send+'static {
@@ -122,8 +122,13 @@ impl FreshIssueControls {
                 // A genuine recovery cue arriving during Git inspection must
                 // rejoin selection. Productive claim still checks atomically.
                 let store=WorkflowStore::open_read_only(&state)?.context("held issue history unavailable after inspection")?;
+                // Standalone self-improve has no background inspector: restored
+                // physical custody can be recovered by the ordinary atomic claim
+                // even when the binding and checkpoint have not changed yet.
+                let custody_recovered=store.native_custody_recovery_available(
+                    &snapshot,&context.worktree,acceptance::require_retained_native_custody)?;
                 let current=store.snapshot(&snapshot.workflow)?.context("held issue history disappeared during inspection")?;
-                Ok(binding==snapshot.checkpoint.binding && current==snapshot)
+                Ok(binding==snapshot.checkpoint.binding && current==snapshot && !custody_recovered)
             }.await;
             result.map_err(|error:anyhow::Error|error.context(OwnerControlUnavailable))
         }

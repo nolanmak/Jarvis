@@ -63,6 +63,11 @@ in `reconcile` is not that shape and rejoins ordinary selection. The preview:
   still reach normal guarded acquisition.
 - Compares the complete binding: head, contract and Git/environment/evidence
   identity, including current tracked/untracked candidate bytes and receipts.
+- Checks the exact read-only native-custody recovery predicate also used inside
+  productive claim. A physically held workflow whose original charged evidence
+  has become readable again stays eligible even without a background inspector.
+  Missing custody or a semantic hold remains blocked; this preview cannot grant
+  a lease, replace the original evidence or admit another model call.
 - Reopens protected state after filesystem inspection and requires the original
   snapshot still to match before skipping. A genuine recovery during inspection
   cannot stay hidden behind an older held snapshot. Disappeared or unreadable
@@ -92,6 +97,7 @@ production inspector transition was separately observed at 13:01:19 UTC. Before
 the fix the picker chose held #1833 instead of recovered #1830.
 
 Coverage includes recovered priority, eligible peers without a recovery cue,
+a genuinely eligible newer peer, restored/missing/semantic native-custody holds,
 changed owner/candidate/compiler input, upstream-only movement, paused/untrusted/
 manual/research sources, missing context and a recovery arriving during inspection.
 Snapshots, events, model calls and command-job absence remain unchanged during
