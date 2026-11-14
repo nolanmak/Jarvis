@@ -469,15 +469,23 @@ pub(super) fn retained_qualification_reference(root:&Path,control:&Path,prepared
 }
 fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
+    let retained=workflow.retained_qualification_reference(prepared).map_err(requalification_error)?;
     let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     workflow.with_qualification_evidence(|database,evidence| {
         (||->Result<bool> {
-            if retained_controller_slots(root,&native_control,prepared,evidence)?.is_empty() {return Ok(false);}
+            if retained_controller_slots(root,&native_control,prepared,evidence)?.is_empty() {
+                ensure!(retained.is_none(),"known retained original witness data is unavailable; fresh witness generation is forbidden");
+                return Ok(false);
+            }
             let references=verifier_execution::matching_original_results(prepared,evidence)?;
             ensure!(references.len()==1,"retained witness original measurement is missing or ambiguous");
             let (plan,result)=&references[0];
             let data=retained_original_witness_data(root,&native_control,plan,result,evidence)?.context("retained original witness data missing")?;
             ensure!(serde_json::to_vec(&data.original.prepared)?==serde_json::to_vec(prepared)?,"retained original measurement changed");
+            if let Some(reference)=&retained {
+                ensure!(reference.plan==*plan && reference.result==*result && reference.data==data.identity,
+                    "retained original measurement differs from its recovery reference");
+            }
             let checked=checked_retained_responses(root,&data)?;
             ensure!(workflow::path().canonicalize()?==database,"retained qualification store differs from configured authority");
             let control=control.canonicalize()?;let native_control=native_control.canonicalize()?;
@@ -1195,6 +1203,45 @@ mod tests {
         assert!(retained_controller_slots(root.path(),&absent,&prepared,&store.inspect_verifier_evidence(id)).is_err(),
             "lost witness ledger was treated as never-admitted despite protected historical evidence");
         assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn known_retained_source_never_becomes_a_fresh_witness_when_its_data_is_missing() {
+        for settled in [false,true] {
+            let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
+            let repository=format!("owner/retained-source-{}",uuid::Uuid::new_v4());
+            let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:&repository,source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+            let mut original=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+            original.transition(crate::autoship_workflow::Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0).await.unwrap();
+            let id=original.id().to_owned();original.finish().unwrap();
+            // Isolate the known-history fence using synthetic references to
+            // absent data. No callback in this fixture proves qualification.
+            let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),
+                prepared:amendment::digest(&serde_json::to_vec(&prepared).unwrap()),contract:prepared.baseline.registration.contract_hash().into()};
+            let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+            let held=store.snapshot(&id).unwrap().unwrap();
+            assert!(store.recover_retained_qualification(&held,None,chrono::Utc::now().timestamp_millis(),|_|Ok(Some(reference))).unwrap());
+            if settled {
+                // Store completion is scripted solely to exercise historical
+                // lookup; the guard still has no builder authority.
+                let now=chrono::Utc::now().timestamp_millis();let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+                let lease=store.claim_productive_for_binding(&id,"scripted-preparation",now,60_000,&checkpoint.binding).unwrap().unwrap();
+                checkpoint.stage=crate::autoship_workflow::Stage::Scope;
+                checkpoint.next=crate::autoship_workflow::NextAction {reason:"baseline_qualification_started".into(),action:"qualify_original_baseline".into(),eligible_at_ms:0};
+                store.checkpoint(&lease,&checkpoint,now).unwrap();
+                store.settle_retained_qualification(&lease,&checkpoint.binding,now,|_,_|Ok(())).unwrap();
+                store.release(&lease,now).unwrap();
+            }
+            let guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+            let before=store.snapshot(&id).unwrap();let events=store.events(&id).unwrap();
+            let outcome=requalify_retained(root.path(),control.path(),&prepared,&guard);
+            assert!(outcome.as_ref().is_err_and(|error|error.downcast_ref::<initial_repair::Hold>().is_some()),
+                "known retained data loss was treated as a fresh witness: settled={settled}, outcome={outcome:?}");
+            assert_eq!(store.snapshot(&id).unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+            assert_eq!(before.unwrap().model_calls,0);guard.finish().unwrap();
+        }
     }
 
     #[cfg(target_os="linux")]

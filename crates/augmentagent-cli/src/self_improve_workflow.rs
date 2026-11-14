@@ -807,7 +807,9 @@ impl WorkflowGuard {
         };
         let existing = store.snapshot(&id)?;
         let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
-        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered") || semantic.is_some(),"semantic recovery source reference is missing");
+        let retained=if let Some(snapshot)=&existing {store.retained_qualification_history(&id,&snapshot.checkpoint.binding)?}else{None};
+        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered")
+            || semantic.is_some() || retained.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
@@ -918,7 +920,9 @@ impl WorkflowGuard {
         // and before installing any model admission observer.
         let semantic=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
             .semantic_reconsideration(&id,&guard.binding)?;
-        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() {
+        let retained=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+            .retained_qualification_history(&id,&guard.binding)?;
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() || retained.is_some() {
             AcceptanceAuthority::RecoveryOnly
         }else {AcceptanceAuthority::Unbound};
         *guard.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=acceptance_authority;
@@ -1639,6 +1643,19 @@ impl WorkflowGuard {
         semantic_preparation_source(&mut store,&self.lease,&self.worktree,&self.repository)
     }
 
+    /// A completed handoff stops overriding preparation, but remains proof
+    /// that these exact prepared bytes already had an original witness.
+    pub(super) fn retained_qualification_reference(&self,prepared:&acceptance::PreparedAcceptance)->Result<Option<durable::RetainedWitnessReference>> {
+        self.validate_before_side_effect()?;self.validate_acceptance_source(prepared)?;
+        let expected=format!("{:x}",Sha256::digest(serde_json::to_vec(prepared)?));
+        let reference=self.store.lock().map_err(|_|anyhow::anyhow!("retained qualification store poisoned"))?
+            .retained_qualification_history(self.id(),&self.binding)?.filter(|reference|reference.prepared==expected);
+        if let Some(reference)=&reference {
+            anyhow::ensure!(reference.contract==prepared.baseline.registration.contract_hash(),"retained qualification contract reference changed");
+        }
+        Ok(reference)
+    }
+
     pub(super) fn semantic_source_waiting(&self)->Result<bool> {
         self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?
             .semantic_source_waiting(self.id(),&self.binding)
@@ -2291,6 +2308,37 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn retained_recovery_restart_after_settlement_keeps_qualification_gate() {
+        let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+        let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        original.transition(Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0).await.unwrap();
+        let id=original.id().to_owned();original.finish().unwrap();
+        let reference=durable::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),
+            prepared:format!("{:x}",Sha256::digest(serde_json::to_vec(&prepared).unwrap())),contract:prepared.baseline.registration.contract_hash().into()};
+        {
+            let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&id).unwrap().unwrap();
+            assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference))).unwrap());
+        }
+        let guard=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        {
+            let mut store=guard.store.lock().unwrap();
+            // Script only the store completion boundary, without qualifying
+            // the guard. Model admission must still recheck real evidence.
+            assert!(store.settle_retained_qualification(&guard.lease,&guard.binding,millis(),|_,_|Ok(())).unwrap());
+            assert!(store.semantic_reconsideration(&id,&guard.binding).unwrap().is_none());
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.reason,"original_semantic_witness_recovered");
+        }
+        guard.finish().unwrap();
+        let restarted=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().expect("settled recovery checkpoint was parked after restart");
+        assert!(matches!(*restarted.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"historical completion bypassed current qualification after restart");
+        let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        restarted.finish().unwrap();
+    }
+
     #[tokio::test]
     async fn retained_recovery_keeps_recovery_only_authority_across_a_changed_candidate_head() {
         for (registered,owner_changed) in [(false,false),(true,false),(false,true),(true,true)] {

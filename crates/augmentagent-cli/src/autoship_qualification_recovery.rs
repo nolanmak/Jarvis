@@ -134,17 +134,25 @@ fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)-
 #[serde(deny_unknown_fields)]
 struct SemanticSourceUnavailable {version:u32,cue:String,checkpoint:Checkpoint}
 
+fn retained_preparation_settled(conn:&Connection,workflow:&str,key:&str)->Result<bool> {
+    let (prepared,loss):(Option<i64>,Option<i64>)=conn.query_row(
+        "SELECT (SELECT MAX(seq) FROM workflow_event WHERE workflow=?1 AND kind='retained_qualification_prepared' AND json_extract(payload,'$.key')=?2),
+                (SELECT MAX(seq) FROM workflow_event WHERE workflow=?1 AND kind='semantic_source_unavailable' AND json_extract(payload,'$.cue')=?2)",
+        params![workflow,key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    Ok(prepared.is_some_and(|prepared|prepared>loss.unwrap_or(0)))
+}
+
 /// The restrictive checkpoint and its continuation reference share the lease
 /// transaction. This records source loss, not another judgment or grant.
 pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previous:&Checkpoint,
     checkpoint:&Checkpoint,cue_key:&str,now:i64)->Result<()> {
     ensure!(native_hold(checkpoint) && previous.binding==checkpoint.binding
-        && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile),"semantic source loss changed its owned input");
+        && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"semantic source loss changed its owned input");
     let cue=semantic_cue(tx,&lease.workflow,&checkpoint.binding,lease.generation)?.context("semantic source reference missing")?;
     ensure!(cue.key==cue_key,"semantic source reference changed");
     let body=serde_json::to_string(&SemanticSourceUnavailable {version:1,cue:cue.key,checkpoint:checkpoint.clone()})?;
     let old:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
-    if old.as_deref()!=Some(body.as_str()) {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
+    if old.as_deref()!=Some(body.as_str()) || previous!=checkpoint {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
     Ok(())
 }
 
@@ -170,8 +178,7 @@ impl WorkflowStore {
         let cue=semantic_cue(&self.conn,workflow,binding,snapshot.generation)?;
         if let Some(cue)=&cue {
             if cue.retained_witness().is_some() {
-                let settled:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='retained_qualification_prepared' AND json_extract(payload,'$.key')=?2)",params![workflow,cue.key],|r|r.get(0))?;
-                if settled {return Ok(None);}
+                if retained_preparation_settled(&self.conn,workflow,&cue.key)? {return Ok(None);}
             }
         }
         Ok(cue)
@@ -271,8 +278,7 @@ impl WorkflowStore {
         ensure!(!pending_mutation(&tx,&lease.workflow)?,"retained qualification has unsettled publication");
         let Some(cue)=semantic_cue(&tx,&lease.workflow,binding,lease.generation)? else{return Ok(false)};
         let Some(reference)=cue.retained_witness() else{return Ok(false)};
-        let done:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='retained_qualification_prepared' AND json_extract(payload,'$.key')=?2)",params![lease.workflow,cue.key],|r|r.get(0))?;
-        if done {return Ok(false);}
+        if retained_preparation_settled(&tx,&lease.workflow,&cue.key)? {return Ok(false);}
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"retained qualification workflow is not active");
@@ -437,6 +443,46 @@ mod tests {
         assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
         assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),1);
         assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),1);
+    }
+
+    #[test]
+    fn settled_retained_preparation_reactivates_only_for_a_new_recorded_source_loss() {
+        for stage in [Stage::Scope,Stage::Build,Stage::Verify,Stage::Review] {
+            let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let reference=retained_reference();
+            assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+            let binding=before.checkpoint.binding.clone();
+            let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
+            let mut lease=store.claim_productive_for_binding(&id,"preparation",8,1000,&binding).unwrap().unwrap();
+            assert!(store.settle_retained_qualification(&lease,&binding,9,|_,_|Ok(())).unwrap());
+            assert!(store.semantic_reconsideration(&id,&binding).unwrap().is_none());
+            for episode in 0..2 {
+                let now=10+episode*10;
+                let mut active=store.snapshot(&id).unwrap().unwrap().checkpoint;
+                active.stage=stage;active.next=NextAction {reason:"qualified_work_started".into(),action:"continue_work".into(),eligible_at_ms:0};
+                store.checkpoint(&lease,&active,now).unwrap();
+                store.hold_semantic_source_unavailable(&lease,&binding,&cue.key,now+1).unwrap();
+                assert_eq!(store.semantic_reconsideration(&id,&binding).unwrap(),Some(cue.clone()),"settled source loss never reactivated original cue at {stage:?}");
+                let events=store.events(&id).unwrap();
+                store.hold_semantic_source_unavailable(&lease,&binding,&cue.key,now+2).unwrap();
+                assert_eq!(store.events(&id).unwrap(),events,"unchanged source loss created another episode");
+                store.release(&lease,now+3).unwrap();
+                let lost=store.snapshot(&id).unwrap().unwrap();
+                let events=store.events(&id).unwrap();
+                assert!(store.claim_productive_for_binding(&id,"unchanged-input",now+4,1000,&binding).unwrap().is_none());
+                assert!(!store.recover_retained_qualification(&lost,None,now+4,|_|Ok(None)).unwrap());
+                assert_eq!(store.snapshot(&id).unwrap().unwrap(),lost);assert_eq!(store.events(&id).unwrap(),events);
+                assert!(store.recover_retained_qualification(&lost,None,now+5,|_|Ok(Some(reference.clone()))).unwrap());
+                lease=store.claim_productive_for_binding(&id,"restored-preparation",now+6,1000,&binding).unwrap().unwrap();
+                assert!(store.settle_retained_qualification(&lease,&binding,now+7,|_,_|Ok(())).unwrap());
+                assert!(store.semantic_reconsideration(&id,&binding).unwrap().is_none());
+            }
+            let events=store.events(&id).unwrap();
+            assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+            assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="semantic_source_unavailable").count(),2);
+            assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),2);
+            assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),3);
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
+        }
     }
 
     #[test]
