@@ -160,6 +160,10 @@ fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,
     let source=(||->Result<acceptance::PreparedAcceptance> {
         let source=source_from_workflow(&lease.workflow).context("semantic source identity missing")?;
         let control=acceptance::control_directories(repository,&lease.workflow)?.workflow_acceptance;
+        if let Some(reference)=cue.retained_witness() {
+            return acceptance::retained_qualification_source(root,&control,source,reference,
+                &store.inspect_verifier_evidence(&lease.workflow));
+        }
         let custody=store.baseline_native_custody(lease,binding,millis())?;
         let (prepared,identity)=acceptance::retained_semantic_source(root,&control,source,binding,&custody,&store.inspect_verifier_evidence(&lease.workflow))?
             .context("original semantic prepared source is unavailable")?;

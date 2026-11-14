@@ -1288,6 +1288,33 @@ mod tests {
             assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);
             assert_eq!(store.events(guard.id()).unwrap(),events,"free metadata inspection mutated workflow history");
             assert!(!artifact_path(control.path(),&current).exists(),"free inspection published qualification");
+            // Exercise the normal owned preparation caller, first before
+            // enrollment and then after publication/contract binding changes.
+            std::fs::remove_file(&index).unwrap();std::fs::remove_file(&prepared_path).unwrap();
+            let mut guard=guard;
+            guard.transition(crate::autoship_workflow::Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0).await.unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+            let held=writer.snapshot(&id).unwrap().unwrap();
+            let revision=writer.owner_control(&id).unwrap().map(|owner|owner.revision);
+            assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
+                inspect_retained_qualification(root.path(),&native_control,source,&held.checkpoint.binding,evidence)).unwrap());
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().unwrap();
+            let recovered=guard.semantic_preparation_source().unwrap()
+                .expect("normal initial preparation lost the typed original witness cue");
+            assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            let initial=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
+                &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
+            assert_eq!(serde_json::to_vec(&initial).unwrap(),serde_json::to_vec(&prepared).unwrap(),"initial preparation regenerated the verifier");
+            guard.checkpoint_qualification_source(&prepared).await.unwrap();
+            let enrolled=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
+                &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
+            assert_eq!(serde_json::to_vec(&enrolled).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            assert_eq!(reasoner.calls(),0,"retained metadata preparation made a paid model call");
             let outcome=qualify(root.path(),control.path(),&prepared,&guard).await;
             assert!(outcome.is_ok(),"complete retained original witness required new native generation instead of current requalification: {outcome:?}");
             assert_current(root.path(),control.path(),&prepared).unwrap();
