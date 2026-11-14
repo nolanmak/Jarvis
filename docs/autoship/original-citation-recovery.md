@@ -1303,7 +1303,7 @@ hosted CI result, snapshot, rollout or natural autonomous merge is implied.
 
 D15. A real retained-setup I/O failure must retain a bounded dependency record
 atomically with its same-cue restrictive checkpoint. The record contains protocol
-version 1, the operation (`prepared`, `manifest`, `harness`, `registration` or
+version 1 (quota exhaustion uses the explicit version-2 amendment in §30), the operation (`prepared`, `manifest`, `harness`, `registration` or
 `qualification`), condition class (`permission`, `capacity` or `other`) and an
 optional SHA-256 filesystem fingerprint. A capacity condition also carries
 bounded available-block/inode observations keyed by opaque namespace hashes.
@@ -1541,3 +1541,64 @@ engineering approval or activation evidence.
 The stricter read-only actual #1830 inventory also passed (11.34s): committed
 original scope remains Medium with no fallback; snapshot/events and 12 historical
 model calls are unchanged; no qualification, grant or dispatch occurred.
+
+## 30. Quota repair is a separate setup dependency
+
+Independent review found that §27's filesystem capacity observation cannot prove
+all quota repairs. `EDQUOT` now uses setup-dependency version 2, condition
+`capacity`, with a separate optional `quotas` map; ordinary `ENOSPC` and other
+conditions retain version 1 and omit that field, preserving their encoding.
+Version 2 requires a complete quota map whenever its filesystem fingerprint is
+present; unknown observations have no fingerprint, capacity or quota map.
+A v1 proof cannot restore a v2 quota loss. Existing cue, source-loss and budget
+identity are unchanged; no new model or metadata allowance is introduced.
+
+For each actual setup parent, observe Linux quota enforcement with
+`quotactl_fd(Q_XGETQSTATV)` and the applicable enforced user/group/project limits
+with `Q_XGETQUOTA`. These are quota read commands, never quota setters. The
+ordinary `Q_GETQUOTA` command is deliberately not used: Linux classifies it as
+requiring mount write access. Native UAPI structures are version 1. The namespace
+key is SHA-256 of compact JSON
+`["retained-setup-quota-namespace-v1",literal_parent_path,kind]`, with numeric kind
+0=user, 1=group, 2=project, three entries per observed parent, at most 768 total.
+The charged user is effective UID; group uses the actual setgid or
+`grpid/bsdgroups` inheritance policy, otherwise effective GID. If parent and
+process GIDs differ without setgid, ext4 uses the per-device `/proc/fs/ext4`
+full options view (mountinfo can omit filesystem defaults); XFS uses the exact
+open descriptor's mount ID and its mountinfo superblock options. Reads are
+bounded to 64 KiB per options/fdinfo view and 4 MiB for mountinfo. Missing,
+ambiguous or unsupported ownership policy stays unknown. No scratch inode is
+created to guess its quota owner. `FS_IOC_FSGETXATTR` supplies inherited project ID (otherwise zero) and refuses
+realtime allocation, whose counters are outside this normal-data contract.
+
+Each strict quota record contains `id`, `enabled`, `space_limit_blocks`,
+`space_used_bytes`, `inode_limit`, `inodes_used`, `space_grace`, `inode_grace`, in
+that declaration order. Space limits use 512-byte units, usage uses bytes,
+inode values are counts and grace values are recorded Unix deadlines, not the
+current clock. Limits select the smaller nonzero hard/soft limit; zero means
+unlimited. Disabled entries are explicit `enabled:false` and all-zero fields.
+Unavailable/denied/unsupported quota queries remain unknown, never disabled.
+Linux's no-enabled-quota `ENOSYS` result is disambiguated only when all three
+`Q_GETINFO` reads positively report inactive (`ESRCH`).
+
+Under the existing complete source/readiness/store fences, a same-fingerprint
+quota loss can restore only for increased applicable remaining quota, observed
+removal of enforcement, a changed charged identity, an extension of an already
+recorded grace deadline, or exact read-only operation completion. Filesystem
+free-space and directory-entry changes alone cannot release a quota hold.
+Unchanged/worse quota observations, missing proof and downgraded proof preserve
+checkpoint, history and charges. Actual publication still has its own live
+lease/binding guards and can fail; a new real failure preserves its own observed
+state and the same cue. This does not claim support for unobservable server-side
+quotas, realtime allocation or unavailable kernel APIs; those remain explicit
+infrastructure holds rather than fabricated recovery or unchanged retry loops.
+
+Quota validation checkpoint: test-first EDQUOT/global-capacity and BSD-group
+regressions reproduced the defects before correction; all eight quota-filter
+tests then passed. The managed full CLI run passed 2,115 tests, zero failures,
+42 explicit ignores (378.61s). The separate read-only actual #1830 inventory
+passed (11.27s): all three quota kinds observed, none enforced; complete original
+scope/native/capture evidence, snapshot/events and 12 historical model calls
+unchanged. That host observation does not claim an active-quota integration test
+or a restored autonomous merge. Independent new-head review, hosted CI, supported
+snapshot and protected rollout remain required.

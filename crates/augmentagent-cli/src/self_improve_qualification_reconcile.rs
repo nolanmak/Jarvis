@@ -496,7 +496,7 @@ mod tests {
             std::fs::write(context.worktree.join("autoship_verifiers/case.py"),b"print('original measurement')\n").unwrap();
             let captured=workflow::git_binding(&context.worktree,&context.contract,&context.environment,&before.checkpoint.evidence).await.unwrap();
             assert_ne!(captured,before.checkpoint.binding);
-            let setup=crate::autoship_workflow::RetainedSetupDependency {version:1,operation:"registration".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+            let setup=crate::autoship_workflow::RetainedSetupDependency {version:1,operation:"registration".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
             store.hold_retained_setup_failure(&lease,&before.checkpoint.binding,&cue.key,&setup,(mode!="missing").then_some(&captured),now).unwrap();
             store.release(&lease,now).unwrap();let snapshot=store.snapshot(&before.workflow).unwrap().unwrap();let events=store.events(&before.workflow).unwrap();
             if mode=="later-edit" {std::fs::write(context.worktree.join("code"),b"unrecorded later edits\n").unwrap();}

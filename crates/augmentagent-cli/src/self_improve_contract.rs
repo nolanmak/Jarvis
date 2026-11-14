@@ -2412,7 +2412,7 @@ pub(super) fn inspect_retained_recovery_ready_with_setup(root:&Path,control:&Pat
     let Some(reference)=inspect_retained_recovery_ready(root,control,source,snapshot,context,evidence,reference)? else{return Ok(None)};
     let current=if let Some(failed)=failed {
         let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
-        let mut current=setup_dependency::observe(root,control,&prepared,&failed.operation,&failed.condition)
+        let mut current=setup_dependency::observe(root,control,&prepared,&failed.operation,&failed.condition,failed.version)
             .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
         current.completed=setup_dependency::completed(root,control,&prepared,&failed.operation)?;
         Some(current)

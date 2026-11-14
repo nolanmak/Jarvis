@@ -2,6 +2,8 @@
 use super::*;
 use crate::autoship_workflow::{RetainedSetupDependency,RetainedSetupCapacity};
 use std::os::unix::{ffi::OsStrExt,fs::MetadataExt};
+#[path="self_improve_setup_quota.rs"]
+mod quota;
 
 #[derive(Debug)]
 struct FailedSetup(RetainedSetupDependency);
@@ -40,13 +42,14 @@ pub(super) fn capture(root:&Path,control:&Path,prepared:&PreparedAcceptance,oper
                 Some(libc::EACCES|libc::EPERM|libc::EROFS)=>"permission",
                 _=>"other",
             };
-            let observed=observe(root,control,prepared,operation,condition).unwrap_or_else(|_|RetainedSetupDependency {
-                version:1,operation:operation.into(),condition:condition.into(),fingerprint:None,capacity:None,completed:false,
+            let version=if io.raw_os_error()==Some(libc::EDQUOT) {2}else{1};
+            let observed=observe(root,control,prepared,operation,condition,version).unwrap_or_else(|_|RetainedSetupDependency {
+                version,operation:operation.into(),condition:condition.into(),fingerprint:None,capacity:None,quotas:None,completed:false,
             });
             error.context(FailedSetup(observed))
 }
 
-pub(super) fn observe(root:&Path,control:&Path,prepared:&PreparedAcceptance,operation:&str,condition:&str)->Result<RetainedSetupDependency> {
+pub(super) fn observe(root:&Path,control:&Path,prepared:&PreparedAcceptance,operation:&str,condition:&str,version:u32)->Result<RetainedSetupDependency> {
     let targets=match operation {
         "prepared"=>{
             let source=prepared.proposal.contract.source()?;
@@ -70,7 +73,7 @@ pub(super) fn observe(root:&Path,control:&Path,prepared:&PreparedAcceptance,oper
         _=>bail!("unsupported retained setup operation"),
     };
     let roles=if operation=="qualification" {vec![("@qualification",baseline_witness::qualification_destination(control,prepared)?)]}else{vec![]};
-    snapshot_with_roles(operation,condition,&targets,&roles)
+    snapshot_with_roles(operation,condition,&targets,&roles,version)
 }
 
 pub(super) fn completed(root:&Path,control:&Path,prepared:&PreparedAcceptance,operation:&str)->Result<bool> {
@@ -165,15 +168,16 @@ fn encode(operation:&str,condition:&str,access:Access,targets:&[String],nodes:BT
 
 #[cfg(test)]
 fn snapshot(operation:&str,condition:&str,targets:&[PathBuf])->Result<RetainedSetupDependency> {
-    snapshot_with_roles(operation,condition,targets,&[])
+    snapshot_with_roles(operation,condition,targets,&[],1)
 }
-fn snapshot_with_roles(operation:&str,condition:&str,targets:&[PathBuf],roles:&[(&str,PathBuf)])->Result<RetainedSetupDependency> {
+fn snapshot_with_roles(operation:&str,condition:&str,targets:&[PathBuf],roles:&[(&str,PathBuf)],version:u32)->Result<RetainedSetupDependency> {
+    ensure!(version==1 || version==2 && condition=="capacity","unsupported setup observation version");
     ensure!(["prepared","manifest","harness","registration","qualification"].contains(&operation),"unknown setup operation");
     ensure!(["permission","capacity","other"].contains(&condition) && targets.len()<=256,"invalid setup observation");
     ensure!(!targets.is_empty(),"setup observation has no namespace");
     let mut targets=targets.iter().map(|target|Ok(target.to_str().context("setup path is not UTF8")?.to_owned())).collect::<Result<Vec<String>>>()?;
     targets.sort();targets.dedup();
-    let mut nodes=BTreeMap::<String,Option<Node>>::new();let mut spaces=BTreeMap::<String,u64>::new();let mut capacities=BTreeMap::new();let mut budget=Budget::default();
+    let mut nodes=BTreeMap::<String,Option<Node>>::new();let mut spaces=BTreeMap::<String,u64>::new();let mut capacities=BTreeMap::new();let mut quotas=BTreeMap::new();let mut budget=Budget::default();
     for target in &targets {
         let target=Path::new(target);
         ensure!(target.is_absolute() && target.components().all(|part|matches!(part,std::path::Component::RootDir|std::path::Component::Normal(_))),"setup observation needs a literal absolute path");
@@ -207,6 +211,12 @@ fn snapshot_with_roles(operation:&str,condition:&str,targets:&[PathBuf],roles:&[
                 let id=amendment::digest(&serde_json::to_vec(&("retained-setup-capacity-namespace-v1",&key))?);
                 capacities.insert(id,capacity);
             }
+            if version==2 {
+                for (kind,value) in quota::observe(directory)?.into_iter().enumerate() {
+                    let id=amendment::digest(&serde_json::to_vec(&("retained-setup-quota-namespace-v1",&key,kind))?);
+                    quotas.insert(id,value);
+                }
+            }
             spaces.insert(key,observed.flags);
         }
     }
@@ -225,14 +235,24 @@ fn snapshot_with_roles(operation:&str,condition:&str,targets:&[PathBuf],roles:&[
     groups.sort();groups.dedup();
     let access=Access {uid:unsafe{libc::geteuid()},gid:unsafe{libc::getegid()},groups:groups.into_iter().map(|group|group as u32).collect()};
     let bytes=encode(operation,condition,access,&targets,nodes,spaces)?;
-    Ok(RetainedSetupDependency {version:1,operation:operation.into(),condition:condition.into(),fingerprint:Some(amendment::digest(&bytes)),
-        capacity:(condition=="capacity").then_some(capacities),completed:false})
+    Ok(RetainedSetupDependency {version,operation:operation.into(),condition:condition.into(),fingerprint:Some(amendment::digest(&bytes)),
+        capacity:(condition=="capacity").then_some(capacities),quotas:(version==2).then_some(quotas),completed:false})
 }
 
 #[cfg(all(test,target_os="linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn quota_exhaustion_capture_is_distinct_from_filesystem_exhaustion() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();
+        for (errno,version) in [(libc::EDQUOT,2),(libc::ENOSPC,1)] {
+            let error=capture(root.path(),control.path(),&prepared,"prepared",std::io::Error::from_raw_os_error(errno).into());
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),Some(errno));
+            let setup=failure(&error).unwrap();assert_eq!(setup.version,version,"quota exhaustion was recorded as global disk exhaustion");
+            assert_eq!(setup.condition,"capacity");assert!(!setup.completed);
+        }
+    }
     #[test]
     fn setup_fingerprint_encoding_keeps_a_frozen_data_vector_without_code_or_clock() {
         let access=Access {uid:1000,gid:1000,groups:vec![1000]};
@@ -301,11 +321,11 @@ mod tests {
     #[test]
     fn actual_receipt_repairs_are_observed_without_encoding_a_policy_filename() {
         let (root,control,prepared)=baseline_witness::prepared_fixture();
-        let before=observe(root.path(),control.path(),&prepared,"qualification","permission").unwrap();
+        let before=observe(root.path(),control.path(),&prepared,"qualification","permission",1).unwrap();
         let receipt=baseline_witness::qualification_destination(control.path(),&prepared).unwrap();
         std::fs::write(&receipt,b"receipt requiring repair").unwrap();
-        let present=observe(root.path(),control.path(),&prepared,"qualification","permission").unwrap();assert_ne!(before,present);
+        let present=observe(root.path(),control.path(),&prepared,"qualification","permission",1).unwrap();assert_ne!(before,present);
         std::fs::remove_file(&receipt).unwrap();
-        assert_eq!(observe(root.path(),control.path(),&prepared,"qualification","permission").unwrap(),before);
+        assert_eq!(observe(root.path(),control.path(),&prepared,"qualification","permission",1).unwrap(),before);
     }
 }

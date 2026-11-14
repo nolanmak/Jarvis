@@ -76,17 +76,54 @@ pub(crate) struct RetainedSetupCapacity {
 }
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RetainedSetupQuota {
+    pub id:u32,
+    pub enabled:bool,
+    /// Linux X quota read ABI block limits use 512-byte units; zero is unlimited.
+    pub space_limit_blocks:u64,
+    pub space_used_bytes:u64,
+    pub inode_limit:u64,
+    pub inodes_used:u64,
+    pub space_grace:u64,
+    pub inode_grace:u64,
+}
+impl RetainedSetupQuota {
+    fn valid(&self)->bool {
+        (self.enabled && self.space_used_bytes%512==0) || (!self.enabled && self.id==0 && self.space_limit_blocks==0 && self.space_used_bytes==0
+            && self.inode_limit==0 && self.inodes_used==0 && self.space_grace==0 && self.inode_grace==0)
+    }
+    fn improved_from(&self,old:&Self)->bool {
+        if !old.enabled {return false;}
+        if !self.enabled || self.id!=old.id {return true;}
+        let remaining=|limit:u64,used:u64,unit:u128|if limit==0 {u128::MAX}else{(limit as u128*unit).saturating_sub(used as u128)};
+        remaining(self.space_limit_blocks,self.space_used_bytes,512)>remaining(old.space_limit_blocks,old.space_used_bytes,512)
+            || remaining(self.inode_limit,self.inodes_used,1)>remaining(old.inode_limit,old.inodes_used,1)
+            || old.space_grace>0 && self.space_grace>old.space_grace
+            || old.inode_grace>0 && self.inode_grace>old.inode_grace
+    }
+}
+
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RetainedSetupDependency {
     pub version:u32,
     pub operation:String,
     pub condition:String,
     pub fingerprint:Option<String>,
     pub capacity:Option<std::collections::BTreeMap<String,RetainedSetupCapacity>>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub quotas:Option<std::collections::BTreeMap<String,RetainedSetupQuota>>,
     pub completed:bool,
 }
 impl RetainedSetupDependency {
     fn valid(&self)->bool {
-        self.version==1 && ["prepared","manifest","harness","registration","qualification"].contains(&self.operation.as_str())
+        ((self.version==1 && self.quotas.is_none()) || (self.version==2 && self.condition=="capacity"
+            && match (&self.quotas,self.fingerprint.is_some()) {
+                (None,false)=>true,
+                (Some(values),true)=>!values.is_empty() && values.len()<=768 && values.len()%3==0
+                    && values.iter().all(|(key,value)|semantic_hash(key) && value.valid()),
+                _=>false,
+            })) && ["prepared","manifest","harness","registration","qualification"].contains(&self.operation.as_str())
             && ["permission","capacity","other"].contains(&self.condition.as_str())
             && self.fingerprint.as_ref().is_none_or(|value|semantic_hash(value))
             && match (&self.capacity,self.condition.as_str(),self.fingerprint.is_some()) {
@@ -341,7 +378,7 @@ impl WorkflowStore {
         ensure!(semantic_hash(&identity) && retained==reference.is_some() && reference.as_ref().is_none_or(|reference|reference.valid() && reference.data==identity),"qualification recovery source identity is invalid");
         if let Some(failed)=&failed_setup {
             let Some(current)=current_setup.as_ref() else{return Ok(false)};
-            ensure!(retained && current.valid() && current.operation==failed.operation && current.condition==failed.condition,"setup recovery proof differs from failed operation");
+            ensure!(retained && current.valid() && current.version==failed.version && current.operation==failed.operation && current.condition==failed.condition,"setup recovery proof differs from failed operation");
             let capacity_improved=match (&failed.capacity,&current.capacity) {
                 (Some(before),Some(after)) if before.keys().eq(after.keys())=>before.iter().any(|(key,old)| {
                     let new=&after[key];new.available_blocks as u128*new.block_size as u128>old.available_blocks as u128*old.block_size as u128
@@ -349,7 +386,13 @@ impl WorkflowStore {
                 }),
                 _=>false,
             };
-            if current.fingerprint.is_none() || current.fingerprint==failed.fingerprint && !capacity_improved && !current.completed {return Ok(false);}
+            let dependency_improved=if failed.version==2 {
+                match (&failed.quotas,&current.quotas) {
+                    (Some(before),Some(after)) if before.keys().eq(after.keys())=>before.iter().any(|(key,old)|after[key].improved_from(old)),
+                    _=>false,
+                }
+            }else{capacity_improved};
+            if current.fingerprint.is_none() || current.fingerprint==failed.fingerprint && !dependency_improved && !current.completed {return Ok(false);}
         }else {ensure!(current_setup.is_none(),"unrequested setup proof cannot create a recovery episode");}
         let source=if let Some(reference)=&reference {
             let context=qualification_schedule::context(&tx,&expected.workflow,&checkpoint.binding)?.context("retained qualification execution context missing")?;
@@ -532,7 +575,7 @@ mod tests {
         assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
         let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
         let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
         store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();
         let recorded=store.events(&id).unwrap();store.hold_retained_infrastructure(&lease,&binding,&cue.key,9).unwrap();
         assert_eq!(store.events(&id).unwrap(),recorded,"generic duplicate erased the actual setup dependency");
@@ -567,7 +610,7 @@ mod tests {
         let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
         let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
         let state=|blocks,inodes|std::collections::BTreeMap::from([("f".repeat(64),RetainedSetupCapacity {available_blocks:blocks,available_inodes:inodes,block_size:4096,entries:1,name_bytes:4})]);
-        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),capacity:Some(state(100,100)),completed:false};
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),capacity:Some(state(100,100)),quotas:None,completed:false};
         store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();store.release(&lease,10).unwrap();
         let held=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
         for (blocks,inodes,entries,names) in [(100,100,1,4),(99,100,1,4),(100,99,1,4),(99,99,1,4),(100,100,2,8)] {
@@ -581,11 +624,47 @@ mod tests {
     }
 
     #[test]
+    fn quota_repair_resumes_same_cue_without_filesystem_space_change() {
+        for repair in ["space_limit","inode_limit","space_usage","inode_usage","disabled","grace","identity"] {
+            let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+            assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+            let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+            let quota=RetainedSetupQuota {id:1000,enabled:true,space_limit_blocks:100,space_used_bytes:51200,inode_limit:10,inodes_used:10,space_grace:50,inode_grace:50};
+            let quotas=std::collections::BTreeMap::from([("1".repeat(64),quota.clone()),("2".repeat(64),quota.clone()),("3".repeat(64),quota.clone())]);
+            let failed=RetainedSetupDependency {version:2,operation:"prepared".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),
+                capacity:Some(std::collections::BTreeMap::from([("f".repeat(64),RetainedSetupCapacity {available_blocks:1000,available_inodes:1000,block_size:4096,entries:1,name_bytes:4})])),quotas:Some(quotas),completed:false};
+            store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();store.release(&lease,10).unwrap();
+            let held=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+            for change in ["unchanged","worse","filesystem_only","legacy_proof"] {
+                let mut current=failed.clone();
+                match change {
+                    "worse"=>current.quotas.as_mut().unwrap().values_mut().next().unwrap().space_used_bytes+=512,
+                    "filesystem_only"=>current.capacity.as_mut().unwrap().values_mut().next().unwrap().available_blocks+=1,
+                    "legacy_proof"=>{current.version=1;current.quotas=None;current.fingerprint=Some("b".repeat(64));},
+                    _=>{},
+                }
+                assert!(!store.recover_retained_qualification_with_setup(&held,None,11,|_,_|Ok(Some((reference.clone(),Some(current))))).unwrap_or(false),"{change} bypassed the quota-specific hold");
+                assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);assert_eq!(store.events(&id).unwrap(),events);
+            }
+            let mut current=failed.clone();let value=current.quotas.as_mut().unwrap().values_mut().next().unwrap();
+            match repair {
+                "space_limit"=>value.space_limit_blocks+=1,"inode_limit"=>value.inode_limit+=1,
+                "space_usage"=>value.space_used_bytes-=512,"inode_usage"=>value.inodes_used-=1,
+                "disabled"=>*value=RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_used_bytes:0,inode_limit:0,inodes_used:0,space_grace:0,inode_grace:0},
+                "grace"=>value.space_grace+=1,"identity"=>value.id+=1,_=>unreachable!(),
+            }
+            assert!(store.recover_retained_qualification_with_setup(&held,None,12,|_,_|Ok(Some((reference.clone(),Some(current))))).unwrap(),"{repair} remained invisible despite the repaired quota");
+            let restored=store.snapshot(&id).unwrap().unwrap();assert_eq!(restored.model_calls,held.model_calls);assert_eq!(restored.tokens,held.tokens);
+            assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        }
+    }
+
+    #[test]
     fn completed_setup_recovery_does_not_require_an_artificial_filesystem_change() {
         let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
         assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
         let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
         store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();store.release(&lease,10).unwrap();
         let held=store.snapshot(&id).unwrap().unwrap();let complete=RetainedSetupDependency {completed:true,..failed};
         assert!(store.recover_retained_qualification_with_setup(&held,None,11,|_,_|Ok(Some((reference,Some(complete))))).unwrap(),"an already completed real writer still required a manufactured filesystem change");
@@ -598,7 +677,7 @@ mod tests {
             assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference))).unwrap());
             let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
             let mut lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-            let mut setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+            let mut setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
             let mut supplied=binding.clone();
             if fault=="binding" {supplied.head="another head".into();}
             if fault=="lease" {lease.generation+=1;}
@@ -611,7 +690,7 @@ mod tests {
         let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();
         assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(retained_reference()))).unwrap());
         let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-        let setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        let setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
         store.hold_retained_setup_failure(&lease,&binding,&cue.key,&setup,None,9).unwrap();let events=store.events(&id).unwrap();
         assert!(store.hold_retained_setup_failure(&lease,&binding,&cue.key,&RetainedSetupDependency {fingerprint:Some("b".repeat(64)),..setup},None,10).is_err());
         assert_eq!(store.events(&id).unwrap(),events);

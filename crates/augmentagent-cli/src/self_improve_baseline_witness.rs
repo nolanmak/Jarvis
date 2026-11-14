@@ -1899,6 +1899,12 @@ mod tests {
                 Err(error)=>panic!("retained harness inventory unavailable: {error}"),
             }
         }
+        let quota_dependency=setup_dependency::observe(&recovery.worktree,&control,prepared,"prepared","capacity",2)
+            .expect("actual controller quota namespace remains unobservable");
+        assert!(quota_dependency.fingerprint.is_some());
+        let quotas=quota_dependency.quotas.as_ref().expect("actual quota observation omitted its authority");
+        assert_eq!(quotas.len(),3,"single actual prepared namespace has an incomplete quota map");
+        println!("actual quota inventory: {} kinds observed, {} enforced; read commands only",quotas.len(),quotas.values().filter(|quota|quota.enabled).count());
         println!("actual setup inventory: admission_registered={}, harness_files={}, missing_harness={}; inspection only",
             admission.registered,recovered.proposal.files.len(),missing_harness);
         let mut cursor=0;let mut captured_originals=0;
