@@ -622,6 +622,42 @@ fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authorit
     immutable(control,&artifact_path(control,context),&serde_json::to_vec(&artifact)?)
 }
 
+/// Semantic production attribution for the existing authority replay key.
+/// Every value comes from current_data, which rechecks the complete indexed
+/// native/measurement custody before this projection can return anything.
+pub(super) fn adjudication_attribution(root:&Path,control:&Path,prepared:&PreparedAcceptance)
+    ->Result<std::collections::BTreeMap<String,BTreeSet<String>>> {
+    let data=current_data(root,control,prepared)?;
+    let judgments=if data["version"]==2 {
+        data["original_witnesses"].as_array().context(initial_repair::Hold::EvidenceUnknown)?.iter()
+            .map(|member|serde_json::from_value::<Judgment>(member["judgment"].clone()))
+            .collect::<std::result::Result<Vec<_>,_>>()?
+    }else{vec![serde_json::from_value::<Judgment>(data)?]};
+    judgment_attribution(&judgments)
+}
+
+fn judgment_attribution(judgments:&[Judgment])->Result<std::collections::BTreeMap<String,BTreeSet<String>>> {
+    let first=judgments.first().context(initial_repair::Hold::EvidenceUnknown)?;
+    let wanted=first.verifiers.iter().map(|verifier|verifier.verifier_id.as_str()).collect::<BTreeSet<_>>();
+    ensure!(!wanted.is_empty(),initial_repair::Hold::EvidenceUnknown);
+    let mut attribution=std::collections::BTreeMap::<String,BTreeSet<String>>::new();
+    for judgment in judgments {
+        let found=judgment.verifiers.iter().map(|verifier|verifier.verifier_id.as_str()).collect::<BTreeSet<_>>();
+        ensure!(judgment.version==1 && found==wanted && found.len()==judgment.verifiers.len(),initial_repair::Hold::EvidenceUnknown);
+        disposition(judgment)?;
+        for verifier in &judgment.verifiers {
+            let citations=attribution.entry(verifier.verifier_id.clone()).or_default();
+            for citation in &verifier.production_citations {
+                // Preserve the old Value-based canonical JSON representation;
+                // serializing the typed struct directly would reorder keys and
+                // manufacture a different authority input for identical facts.
+                citations.insert(serde_json::to_string(&serde_json::to_value(citation)?)?);
+            }
+        }
+    }
+    Ok(attribution)
+}
+
 pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
     current_data(root,control,prepared).map(|_|())
 }
@@ -1419,6 +1455,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adjudication_attribution_combines_all_judgments_without_new_wording_identity() {
+        let (root,control,prepared)=fixture();persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        let data=current_data(root.path(),control.path(),&prepared).unwrap();
+        let original:Judgment=serde_json::from_value(data.clone()).unwrap();
+        let expected=data["verifiers"].as_array().unwrap().iter().map(|verifier|(
+            verifier["verifier_id"].as_str().unwrap().to_owned(),
+            verifier["production_citations"].as_array().unwrap().iter().map(|citation|serde_json::to_string(citation).unwrap()).collect::<BTreeSet<_>>()
+        )).collect::<std::collections::BTreeMap<_,_>>();
+        assert_eq!(adjudication_attribution(root.path(),control.path(),&prepared).unwrap(),expected,"v1 authority attribution changed");
+        let mut reworded=original.clone();reworded.context="another retained native context".into();
+        reworded.verifiers[0].reason="Same observation described differently".into();
+        reworded.verifiers[0].concrete_input="Same pinned input described differently".into();
+        reworded.verifiers[0].production_citations.push(original.verifiers[0].production_citations[0].clone());
+        assert_eq!(judgment_attribution(&[original.clone(),reworded.clone()]).unwrap(),expected,"wording, context or duplicate citations changed authority identity");
+        // Pure projection data, not an authenticated source/qualification grant.
+        // The public service above admits only current_data's checked members.
+        let mut distinct=reworded.clone();distinct.verifiers[0].production_citations[0].path="another_original.py".into();
+        let combined=judgment_attribution(&[original.clone(),distinct]).unwrap();
+        assert_ne!(combined,expected,"an additional distinct attribution disappeared");
+        assert_eq!(combined[&original.verifiers[0].verifier_id].len(),2);
+        assert!(judgment_attribution(&[]).is_err());
+        let mut absent=reworded.clone();absent.verifiers.clear();assert!(judgment_attribution(&[original.clone(),absent]).is_err(),"a missing member's verifier was ignored");
+        let mut duplicate=reworded.clone();duplicate.verifiers.push(duplicate.verifiers[0].clone());assert!(judgment_attribution(&[original.clone(),duplicate]).is_err());
+        let mut negative=reworded;negative.verifiers[0].measurement=Measurement::Unknown;
+        assert!(judgment_attribution(&[original.clone(),negative.clone()]).is_err(),"a later negative was hidden by an earlier positive");
+        assert!(judgment_attribution(&[negative,original]).is_err(),"an earlier negative was hidden by a later positive");
+    }
+
     #[cfg(target_os="linux")]
     #[tokio::test]
     async fn qualify_reuses_complete_retained_original_witness_without_native_admission() {
@@ -1428,6 +1493,7 @@ mod tests {
             let source=if std::env::var("AUTOSHIP_RETAINED_QUALIFICATION_SOURCE").as_deref()==Ok("issue") {AcceptanceSource::Issue(840)}else{AcceptanceSource::PullRequest(840)};
             let (root,control,prepared)=fixture_for_source(source);
             persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+            let original_attribution=adjudication_attribution(root.path(),control.path(),&prepared).unwrap();
             let mut judgment=saved_judgment(control.path(),&prepared);
             let current=context(&prepared.proposal,&prepared.baseline).unwrap();
             std::fs::remove_file(artifact_path(control.path(),&current)).unwrap();
@@ -1685,6 +1751,8 @@ mod tests {
             assert_eq!(witnesses[0]["judgment"]["verifiers"],judgment["verifiers"]);
             assert_eq!(witnesses[0]["checked"]["native_context"],origin);
             assert_eq!(projected,current_data(root.path(),&native_control,&enrolled).unwrap(),"witness data projection is not stable");
+            assert_eq!(adjudication_attribution(root.path(),&native_control,&enrolled).unwrap(),original_attribution,
+                "current v2 qualification changed the same original authority attribution");
             assert_eq!(store.snapshot(guard.id()).unwrap(),projection_before);assert_eq!(store.events(guard.id()).unwrap(),projection_events);
             let unpublished=native_control.join("fixture-unpublished-prepared.json");
             std::fs::rename(&prepared_path,&unpublished).unwrap();

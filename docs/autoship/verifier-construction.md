@@ -1020,3 +1020,87 @@ existing explicitly open recovery, scheduling and policy-migration work above;
 this checkpoint does not replace or close them. The spec remains a draft and the
 branch remains unactivated until these decisions, implementation and actual
 custody/end-to-end tests are complete.
+
+
+### Retained-judgment adjudication projection — selected contract, not yet verified
+
+The implementation agent owns decisions 1 and 3 above as follows. This resolves
+what to implement; tests and actual consumers must still establish it before
+those implementation blockers can close.
+
+Every native judgment in the current qualified data object applies to the exact
+retained original measurement. The existing qualification reader authenticates
+all indexed original/corrective responses, their native contexts, checked hashes,
+complete verifier/criterion coverage and original source bytes before returning
+that object. Adjudication consumes all of them. Any applicable negative or
+unknown remains disqualifying; a structurally rejected first reply may be omitted
+only under the existing authenticated correction rule in the qualifier, never
+by a consumer choosing a convenient positive. Missing, swapped or ambiguous
+members fail current-data validation before any new authority reservation.
+
+For the existing authority replay key, aggregate each verifier's immutable
+production citations as a sorted set across every qualified judgment. Require
+the same complete verifier set in every member. Preserve the existing citation
+JSON representation and the existing qualified-staged-correction-v1 identity
+formula. A v1 judgment and a requalified v2 representation with the same citation
+sets therefore yield the same attribution. Duplicate citations or ordering do not
+supply new evidence. An additional distinct production citation changes the
+attribution; removing one changes it too. The complete registered baseline and
+captured commands remain bound independently in the unchanged identity formula.
+
+Every qualifying judgment already requires direct production measurement,
+original fixtures and exact criterion coverage. Native free-form descriptions of
+the input and reason are retained in the full adjudication payload but do not
+replace the pinned adapter, actual captured input/output or owner criteria as
+replay identity. Native context, checked-response identity, qualification header,
+publication references and raw wording remain authenticated live data, not new
+behavioral facts that reset a completed authority episode. This preserves the
+existing v1 replay contract rather than versioning the key to accommodate v2.
+
+This choice does not settle decision 2's original/corrective source-selection
+relationship, or grant frozen execution, held-work eligibility or producer-policy
+migration. Those remain open with the same owner and rollout blockers.
+
+
+The read-only fresh-reader audit of this selected projection checked it against
+the complete spec and found the all-judgment/citation-union choice implementable
+as written. That is specification evidence only, not engineering approval or a
+verified consumer. It retained source-context authentication, frozen recovery,
+held-work scheduling and setup-only migration as blocking decisions. It also
+requires two explicit continuations owned by the implementation agent before
+handoff: the complete Pending v2 activation/replay transaction under the frozen
+recovery/caller contract, and the field-level immutable constructor prompt
+projection. Current-main/contribution/final-ruling facts cannot be copied into
+that prompt indiscriminately; required semantic owner authorization must remain
+while routing-head movement cannot create fresh native input or budget. These
+are active root-owned #2058 blockers, not questions delegated to the owner or
+claims that the complete spec is ready.
+
+
+### Adjudication attribution consumer — unactivated implementation checkpoint
+
+The actual Stage identity consumer now calls the qualification service's
+`adjudication_attribution`. That service first authenticates complete current
+qualification, consumes every returned original/corrective judgment, requires
+equal complete verifier sets and refuses applicable negatives before returning
+the sorted union of production citations. Citation serialization remains the old
+Value-based representation, preserving the qualified-staged-correction-v1 key
+rather than creating new authority input merely by changing the data format.
+The full authenticated judgment data stays in the adjudication payload.
+
+The composed retained-qualification regression first reached valid v2 data and
+failed at the flat attribution consumer (73.68 seconds). After this change it
+passes both initial/enrolled issue and PR children (199.31 seconds), comparing
+the original v1 attribution with the authenticated requalified projection and
+checking unchanged snapshots/events and zero new reasoner calls. A separate
+projection test passes (5.22 seconds), covering all-member citation aggregation,
+context/reason/input wording and duplicate-citation stability, distinct-citation
+changes, missing/duplicate verifier refusal and negative-first/negative-last
+refusal. Its synthetic projection data is not qualification or execution proof.
+
+These tests implement the selected decisions 1 and 3 for the Stage attribution
+consumer; they do not resolve original/corrective source authentication for
+`Stage::original_source`. The frozen recovery/caller, held-work cue, setup-only
+migration, Pending v2 and immutable constructor-prompt decisions remain root-owned
+rollout blockers. No production activation, new approval, native execution grant,
+autonomous merge or full combined CLI pass is established by this checkpoint.

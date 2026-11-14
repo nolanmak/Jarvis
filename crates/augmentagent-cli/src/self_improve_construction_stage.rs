@@ -76,20 +76,9 @@ impl StagedCorrection {
     }
     pub(in crate::self_improve::acceptance::amendment) async fn adjudication_identity(&self,root:&Path,workflow:&workflow::WorkflowGuard,episode:&ConstructionEpisode)->Result<String> {
         self.require_current(root,workflow,episode).await?;
-        let witness=baseline_witness::current_data(&self.original,episode.control(),&self.prepared)?;
-        // A routing binding, publication reference, qualification-policy hash
-        // or rephrased reason is not new behavioral evidence. Keep the live
-        // full-binding/custody checks above, but deduplicate the verdict using
-        // the actual proposal, observation and immutable production attribution.
-        let mut attribution=std::collections::BTreeMap::new();
-        for verifier in witness["verifiers"].as_array().context(initial_repair::Hold::EvidenceUnknown)? {
-            let id=verifier["verifier_id"].as_str().context(initial_repair::Hold::EvidenceUnknown)?;
-            let mut citations=std::collections::BTreeSet::new();
-            for citation in verifier["production_citations"].as_array().context(initial_repair::Hold::EvidenceUnknown)? {
-                citations.insert(serde_json::to_string(citation)?);
-            }
-            ensure!(attribution.insert(id.to_string(),citations).is_none(),initial_repair::Hold::EvidenceUnknown);
-        }
+        // Preserve the existing semantic key across current v1 and requalified
+        // v2 witness representations; consume every authenticated judgment.
+        let attribution=baseline_witness::adjudication_attribution(&self.original,episode.control(),&self.prepared)?;
         let original=workflow.exact_original_result_data(&self.original_plan,&self.original_result)?;
         Ok(digest(&serde_json::to_vec(&("qualified-staged-correction-v1",&self.workflow,episode.key(),
             &self.old_contract,&self.candidate_environment,&self.measurement.draft,&self.prepared.baseline,&original.commands,attribution))?))
