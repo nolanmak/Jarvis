@@ -2880,6 +2880,9 @@ class BuildScratchTests(unittest.TestCase):
             class CommandTimedOut(Unavailable):
                 pass
 
+            class ExecutionFailed(Unavailable):
+                pass
+
             class CleanupUnverified(Unavailable):
                 pass
 
@@ -3212,6 +3215,40 @@ class BuildScratchTests(unittest.TestCase):
         self.assertNotIn('command_timeout', text)
         self.assertNotIn('JARVIS_READINESS:', text)
 
+    def test_verified_supervisor_failure_is_fixed_execution_diagnostic(self):
+        policy = self.policy()
+        def failed(*args, **kwargs):
+            raise self.fake_vm.ExecutionFailed('SYNTHETIC_PRIVATE_SUPERVISOR_DETAIL')
+        self.fake_vm.run = staticmethod(failed)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        text = response['content'][0]['text']
+        self.assertTrue(response['isError'])
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:supervisor_failure '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('JARVIS_READINESS:', text)
+
+    def test_guest_error_text_cannot_impersonate_a_controller_supervisor_failure(self):
+        policy = self.policy()
+        def failed(*args, **kwargs):
+            raise self.fake_vm.Unavailable('VM execution failed')
+        self.fake_vm.run = staticmethod(failed)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        self.assertTrue(response['isError'])
+        self.assertNotIn('JARVIS_EXECUTION:supervisor_failure', response['content'][0]['text'])
+
+    def test_guest_nonzero_exit_codes_remain_command_results(self):
+        for status in (1, 125, 137):
+            with self.subTest(guest_status=status):
+                def failed(*args, **kwargs):
+                    return {'exit_code': status, 'stdout': '', 'stderr': 'synthetic guest failure'}
+                self.fake_vm.run = staticmethod(failed)
+                result = self.policy().run_vm_build(['cargo', 'test'], 1)
+                self.assertEqual(result['exit_code'], status)
+                self.assertEqual(result['stderr'], 'synthetic guest failure')
+
     def test_guest_error_text_cannot_impersonate_a_controller_timeout(self):
         policy = self.policy()
         def guest_error(*args, **kwargs):
@@ -3229,6 +3266,7 @@ class BuildScratchTests(unittest.TestCase):
         self.fake_vm.Unavailable = vm.Unavailable
         self.fake_vm.CommandTimedOut = vm.CommandTimedOut
         self.fake_vm.CleanupUnverified = vm.CleanupUnverified
+        self.fake_vm.ExecutionFailed = vm.ExecutionFailed
         for receipt, status, cleanup_failed in [(None, 125, True), (None, 0, True),
                 ('incomplete\n', 0, True), ('all-descendants-reaped\r\n', 0, True),
                 ('all-descendants-reaped\r', 0, True), ('all-descendants-reaped\n', 125, False)]:
@@ -3243,8 +3281,9 @@ class BuildScratchTests(unittest.TestCase):
                 self.assertTrue(text.startswith('[runner=vm] '), text)
                 self.assertEqual('JARVIS_EXECUTION:cleanup_unverified ' in text, cleanup_failed, text)
                 self.assertNotIn('JARVIS_EXECUTION:command_timeout', text)
-                if cleanup_failed:
-                    self.assertNotIn('Operation denied', text)
+                self.assertNotIn('Operation denied', text)
+                if not cleanup_failed:
+                    self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:supervisor_failure '), text)
 
     def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
         import os

@@ -386,3 +386,9 @@ rebuild, denied direct networking and HTTP mutations, inaccessible signing keys,
 canonical lockfiles and a fresh npm-ci session. A clean worktree of this project
 passed installation, build and all 26 Node tests through the gateway, including
 compilation of its native SQLite addon.
+
+A nonzero supervisor exit after exact descendant-cleanup proof is reported as
+`[runner=vm] JARVIS_EXECUTION:supervisor_failure`, with fixed public text. It is
+separate from a controller deadline, unverified cleanup and a profile/readiness
+refusal. Guest nonzero exit codes remain ordinary command results; guest error
+prose cannot mint the supervisor-failure category.

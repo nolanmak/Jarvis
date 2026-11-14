@@ -174,6 +174,7 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
+        if !candidate_source_matches(&id,candidate) {continue;}
         if owner_resume_matches(&store,&id,candidate)? && store.owner_resume_due(&id,now)? {
             result.insert(candidate.pr);
             continue;
@@ -212,10 +213,13 @@ pub(super) fn episode_retries(
     Ok(result)
 }
 
+fn candidate_source_matches(id:&str,candidate:&AdoptedPr)->bool {
+    candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|source|source==id))
+        || crate::autoship_workflow::pr_workflow_id(&candidate.repository,candidate.pr).is_ok_and(|source|source==id)
+}
+
 fn owner_resume_matches(store:&WorkflowStore,id:&str,candidate:&AdoptedPr)->Result<bool> {
-    let identity=candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|source|source==id))
-        || crate::autoship_workflow::pr_workflow_id(&candidate.repository,candidate.pr).is_ok_and(|source|source==id);
-    Ok(identity && candidate.ready_for_review()
+    Ok(candidate_source_matches(id,candidate) && candidate.ready_for_review()
         && store.snapshot(id)?.is_some_and(|snapshot|snapshot.pr==Some(candidate.pr))
         && store.resolve_pr(&candidate.repository,candidate.pr)?.as_deref()==Some(id))
 }
@@ -456,7 +460,7 @@ mod tests {
         use crate::autoship_workflow::{Binding,NextAction,OperationKind,ResourceCharge,Stage};
         for routing_hold in [false,true] {
             for fault in ["none","retained","future","active","pause","stage","reason","action",
-                "head","branch","dependency","pending-push","pending-merge","retained-without-publication"] {
+                "head","branch","dependency","pending-push","pending-merge","retained-without-publication","changed-source","missing-source"] {
                 let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
                 let mut store=WorkflowStore::open(&path).unwrap();
                 let mut peer=row(10,"fix/issue-8");
@@ -486,6 +490,8 @@ mod tests {
                     "reason"=>cp.next.reason="acceptance_verifier_repair_exhausted".into(),
                     "action"=>cp.next.action="await_acceptance_input_change".into(),
                     "head"=>candidate.head="foreign-head".into(),
+                    "changed-source"=>candidate.source_issue=Some(70),
+                    "missing-source"=>candidate.source_issue=None,
                     "branch"=>candidate.branch="foreign-branch".into(),
                     "dependency"=>candidate.dependency=Dependency::AwaitParent {pr:8},
                     "pending-push"|"pending-merge"=>cp.binding.evidence_hash="pending-evidence".into(),
@@ -500,7 +506,7 @@ mod tests {
                 if fault!="active" {store.release(&lease,9).unwrap();}
                 if fault=="pause" {store.set_owner_pause(id,"github:owner",0,true,9).unwrap();}
                 let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
-                let mut ledger=AttemptLedger::default();ledger.mark(1,7);
+                let mut ledger=AttemptLedger::default();ledger.mark(1,7);ledger.mark(1,70);
                 let retries=episode_retries(&path,&candidates,10).unwrap();
                 let allowed=matches!(fault,"none"|"retained");
                 assert_eq!(retries.contains(&9),allowed,"routing_hold={routing_hold}/{fault}: due retry was lost or an unsafe retry was admitted");
@@ -515,7 +521,7 @@ mod tests {
 
     #[test]
     fn qualification_recovered_retry_requires_the_same_available_owned_candidate() {
-        for obstruction in ["none","pause","head","branch","dependency","message","mutation"] {
+        for obstruction in ["none","pause","head","branch","dependency","message","mutation","source","missing-source"] {
             let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let mut store=WorkflowStore::open(&path).unwrap();
             let mut candidates=authorized(&serde_json::json!([row(9,"fix/issue-7")]),"owner/repo",&["owner".into()]);
             let candidate=&mut candidates[0];let id="owner/repo#7";
@@ -528,6 +534,8 @@ mod tests {
             if obstruction=="mutation" {store.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,5).unwrap();}
             store.release(&lease,6).unwrap();
             if obstruction=="pause" {store.set_owner_pause(id,"github:owner",0,true,7).unwrap();}
+            if obstruction=="source" {candidate.source_issue=Some(70);}
+            if obstruction=="missing-source" {candidate.source_issue=None;}
             if obstruction=="head" {candidate.head="different-head".into();}
             if obstruction=="branch" {candidate.branch="different-branch".into();}
             if obstruction=="dependency" {candidate.dependency=Dependency::AwaitParent {pr:8};}

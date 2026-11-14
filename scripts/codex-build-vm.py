@@ -34,6 +34,10 @@ class CommandTimedOut(Unavailable):
     """Controller deadline, distinct from guest-supplied failure text."""
 
 
+class ExecutionFailed(Unavailable):
+    """Controller observed a failed supervisor after verified cleanup."""
+
+
 class CleanupUnverified(Unavailable):
     """Controller could not prove descendant cleanup after execution."""
 
@@ -457,7 +461,7 @@ poweroff -f
                 if not cleanup_verified(cleanup):
                     raise CleanupUnverified('VM command cleanup could not be verified')
                 if status:
-                    raise Unavailable('VM execution failed')
+                    raise ExecutionFailed('VM execution failed')
                 try:
                     result = private_json(control / 'outcome.json')
                 except (OSError, ValueError) as exc:

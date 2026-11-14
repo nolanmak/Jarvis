@@ -51,15 +51,8 @@ impl Github for Transport<'_> {
             }
             // A routing label is advisory for explicit commands. Existing owner
             // pauses remain authoritative for every newly dispatched close.
-            if let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())
-                .context(ControlHeld("owner-control-unavailable"))? {
-                let mut ids=vec![crate::autoship_workflow::workflow_id(&repository,self.issue)?,
-                    crate::autoship_workflow::pr_workflow_id(&repository,pr)?];
-                if let Some(id)=store.resolve_pr(&repository,pr).context(ControlHeld("owner-control-unavailable"))? {ids.push(id);}
-                for id in ids {
-                    store.require_owner_dispatch(&id).context(ControlHeld("owner-control-held"))?;
-                }
-            }
+            manual_routing::require_terminal_controls(&repository,self.issue,Some(pr))
+                .context(ControlHeld("owner-control-or-reconciliation-held"))?;
         }
         let (ok, out, _) = run(&gh_bin(), args, self.root).await?;
         anyhow::ensure!(ok, "source reconciliation GitHub call failed");

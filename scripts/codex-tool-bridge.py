@@ -35,6 +35,15 @@ class CommandTimeout(RuntimeError):
                          'deciding whether to retry.')
 
 
+class SupervisorFailure(RuntimeError):
+    """The isolated supervisor failed after verified descendant cleanup."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:supervisor_failure The isolated execution supervisor failed. '
+                         'Descendant cleanup was verified. Inspect retained work and execution '
+                         'evidence before deciding whether to retry.')
+
+
 class CleanupUnverified(RuntimeError):
     """An executed command has no verified descendant-cleanup receipt."""
 
@@ -2161,6 +2170,8 @@ class Policy:
                         owner.cleanup()
                         raise
                 return result
+        except vm.ExecutionFailed as exc:
+            raise SupervisorFailure() from exc
         except vm.CleanupUnverified as exc:
             raise CleanupUnverified() from exc
         except vm.CommandTimedOut as exc:
@@ -2804,7 +2815,7 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
-            except (CommandTimeout, CleanupUnverified) as error:
+            except (CommandTimeout, CleanupUnverified, SupervisorFailure) as error:
                 return {'isError': True, 'content': [{'type': 'text',
                         'text': runner_prefix(error) + str(error)}]}
             except Readiness as error:

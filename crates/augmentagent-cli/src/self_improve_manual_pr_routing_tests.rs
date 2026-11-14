@@ -11,6 +11,53 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if matches!(case.as_str(),"late-fresh-claim"|"fresh-uncertain") {
+            let git=|args:&[&str]| {
+                let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
+                assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            let published=git(&["rev-parse","HEAD"]);git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:None,
+                branch:"feat/repair-9",contract:"Original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            guard.require_fresh_issue(&root).await.unwrap();
+            git(&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+                "commit","--quiet","--allow-empty","-m","New local fresh revision"]);
+            guard.transition(crate::autoship_workflow::Stage::Build,"revision_created","publish_revision",0).await.unwrap();
+            let before=initial.snapshot(guard.id()).unwrap().unwrap();
+            std::fs::write(root.join("fresh-claim-appeared"),b"owner opened manual PR after earlier absence observation").unwrap();
+            if case=="fresh-uncertain" {
+                let id=guard.id().to_owned();let binding=guard.binding().clone();guard.finish().unwrap();
+                let now=chrono::Utc::now().timestamp_millis();
+                let lease=initial.claim(&id,"lost-response-controller",now,1000).unwrap().unwrap();
+                let operation=initial.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,now).unwrap();
+                // Simulate a genuinely dispatched push whose response was lost.
+                git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
+                initial.release(&lease,now+1).unwrap();
+                let mut recovered=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                    repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:None,
+                    branch:"feat/repair-9",contract:"Original request",environment:"fixture",
+                }).await.unwrap().unwrap();
+                assert_eq!(recovered.push_fresh(&root,"feat/repair-9",true).await.unwrap(),binding.head,
+                    "a new manual claim prevented read-only reconciliation of an already-dispatched push");
+                assert!(initial.pending_operations(&id).unwrap().is_empty());
+                let conn=rusqlite::Connection::open(&path).unwrap();
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM operation WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),1,"reconciliation manufactured another Push");
+                assert_eq!(conn.query_row("SELECT receipt FROM operation WHERE id=?1",[&operation.id],|r|r.get::<_,String>(0)).unwrap(),format!("git-head:{}",binding.head));
+                assert_eq!(initial.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
+                recovered.finish().unwrap();return;
+            }
+            let result=guard.push_fresh(&root,"feat/repair-9",true).await;
+            assert_eq!(git(&["ls-remote","--heads","origin","refs/heads/feat/repair-9"]).split_whitespace().next(),Some(published.as_str()),
+                "fresh publication updated a newly claimed manual PR before checking routing");
+            assert_eq!(result.unwrap_err().downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
+            let after=initial.snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.model_calls,before.model_calls);
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"late claim created an un-dispatched Push intent");
+            guard.finish().unwrap();return;
+        }
         if case=="late-adopted-retry" {
             let git=|args:&[&str]| {
                 let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
@@ -142,7 +189,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
                 std::fs::create_dir(&root).unwrap();
@@ -150,13 +197,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if matches!(case,"late-mutation"|"late-adopted-retry") {
+                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain") {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                     assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
-                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\n").unwrap();
+                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\n").unwrap();
                     let remote=dir.path().join("remote.git");
                     assert!(std::process::Command::new("/usr/bin/git").args(["init","--bare","--quiet"])
                         .arg(&remote).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
@@ -164,7 +211,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                         .arg(remote).current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
                 let references=|number|serde_json::json!([{"number":number,"url":format!("https://github.com/owner/repo/issues/{number}")}]);
-                let mut manual_refs=if route=="linked" {references(7)}else{serde_json::json!([])};
+                let mut manual_refs=if route=="linked" || matches!(case,"late-fresh-claim"|"fresh-uncertain") {references(7)}else{serde_json::json!([])};
                 if route=="source-less" && matches!(case,"source-label"|"unknown-source"|"malformed-source") {
                     manual_refs=serde_json::json!([{"number":7,"url":"https://github.com/owner/repo/issues/7"},
                         {"number":8,"url":"https://github.com/owner/repo/issues/8"}]);
@@ -176,7 +223,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     "baseRefName":"main","isCrossRepository":false,"headRepositoryOwner":{"login":"owner"},
                     "author":{"login":"owner"},"title":"Repair a widget","body":"Synthetic owner work",
                     "closingIssuesReferences":refs,"labels":labels,"files":[],"mergeable":"MERGEABLE"});
-                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
+                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue"|"late-fresh-claim"|"fresh-uncertain") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
                     row(10,if route=="linked" {references(8)}else{serde_json::json!([])},serde_json::json!([]))]);
                 let issues=serde_json::json!({"7":{"number":7,"state":"open","labels":if case=="source-label" {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}},
                     "8":{"number":8,"state":"open","labels":[]}});
@@ -190,7 +237,7 @@ prs=json.loads((root/'prs.json').read_text());issues=json.loads((root/'issues.js
 case=os.environ['MANUAL_PR_CASE']
 with (root/'calls').open('a') as out:out.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(('READ' if case=='explicit-revoked' else 'ADMIN') if 'viewerPermission' in a else 'owner/repo')
-elif a[:2]==['pr','list']: print(json.dumps(prs))
+elif a[:2]==['pr','list']: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain') and not (root/'fresh-claim-appeared').exists() else prs))
 elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
 elif a[:2]==['pr','view']:
  if case=='unknown-pr' and a[2]=='9':sys.exit(1)

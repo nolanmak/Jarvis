@@ -165,8 +165,8 @@ class BuildScratchPlacementTests(unittest.TestCase):
                 error = self.deadline_fixture(receipt, status, expired=False)
                 self.assertIsInstance(error, vm.CleanupUnverified)
         error = self.deadline_fixture('all-descendants-reaped\n', 125, expired=False)
-        self.assertIs(type(error), vm.Unavailable,
-                      'a verified nonzero supervisor exit is execution failure, not missing cleanup')
+        self.assertEqual(type(error).__name__, 'ExecutionFailed',
+                         'verified supervisor failure must survive bridge dispatch as execution failure')
 
     def test_explicit_ort_cache_is_read_only_and_pinned_in_guest_environment(self):
         with tempfile.TemporaryDirectory() as temporary:

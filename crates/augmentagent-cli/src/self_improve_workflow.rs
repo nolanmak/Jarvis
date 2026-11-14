@@ -2100,7 +2100,39 @@ impl WorkflowGuard {
     /// Publish detached resumed work with a remote-head precondition. A lost
     /// response is reconciled against ls-remote before any retry. No force push
     /// is needed; ancestry and the lease both protect intervening remote edits.
+    /// The actual fresh publication entry, separately callable by its
+    /// disposable-remote regression without invoking a model.
+    pub(super) async fn push_fresh(&mut self,repo:&Path,branch:&str,automatic:bool)->Result<String> {
+        self.push_checked(branch,Some((repo,automatic))).await
+    }
+
+    async fn require_fresh_publication_route(&mut self,repo:&Path,automatic:bool)->Result<()> {
+        self.require_fresh_issue(repo).await?;
+        let source=self.id().rsplit_once('#').map(|(_,number)|number.parse::<u64>()).transpose()?;
+        if let Some(pr)=self.pr()? {
+            if !manual_routing::permit_mutation(repo,pr,source,automatic,self).await? {return Err(manual_routing::Hold.into());}
+        }else {
+            let issue=source.context("fresh publication source unavailable")?;
+            if automatic && !manual_routing::issue_allowed(repo,self.repository(),issue).await {
+                self.transition(Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",millis()+300_000).await?;
+                return Err(manual_routing::Hold.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn push(&mut self, branch: &str) -> Result<String> {
+        self.push_checked(branch,None).await
+    }
+
+    async fn push_checked(&mut self,branch:&str,fresh:Option<(&Path,bool)>)->Result<String> {
+        if let Some((repo,automatic))=fresh {
+            let pending_push=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+                .pending_operations(self.id())?.iter().any(|operation|operation.kind==OperationKind::Push);
+            // Existing uncertain pushes may first observe their remote outcome.
+            // Every newly dispatched push still rechecks below.
+            if !pending_push {self.require_fresh_publication_route(repo,automatic).await?;}
+        }
         self.transition(Stage::Publish, "publishing_revision", "push", millis())
             .await?;
         let operation = self.intent(OperationKind::Push)?;
@@ -2130,6 +2162,7 @@ impl WorkflowGuard {
                 "remote PR changed; reconcile before publishing preserved work"
             );
         }
+        if let Some((repo,automatic))=fresh {self.require_fresh_publication_route(repo,automatic).await?;}
         self.validate_before_side_effect()?;
         self.validate_binding(&operation.binding).await?;
         let expected = format!("--force-with-lease={target}:{remote}");

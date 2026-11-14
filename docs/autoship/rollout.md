@@ -316,3 +316,13 @@ This establishes deployment of PR #1603 and resource-unit configuration only.
 The stable native policy remained staged, not selected by the daemon, and
 shared local/GitHub CI PR #1616 was still under validation. Protected native
 issue-to-PR acceptance and sustained autonomous shipping remain outstanding.
+
+Terminal stand-down checks both issue and PR identities, including their
+protected alias, before bookkeeping and before each write. Owner pauses,
+follow-up input and uncertain remote effects hold automatic and explicitly
+targeted stand-down alike. A reason comment already dispatched does not license
+a later terminal label when routing or those controls change. Fresh issue pushes
+recheck linked claims before a new intent and again before dispatch. An existing
+uncertain push can still observe an already-published matching remote head;
+that observation neither sends another push nor starts model work. Retry hints
+also retain the workflow's source identity when closing references change.

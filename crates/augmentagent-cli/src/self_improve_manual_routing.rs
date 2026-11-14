@@ -61,6 +61,56 @@ pub(super) async fn allowed(root:&Path,repository:&str,pr:u64,source:Option<u64>
     }
 }
 
+/// A denied fresh mutation is a retained routing hold, never a code failure.
+#[derive(Debug)]
+pub(super) struct Hold;
+impl std::fmt::Display for Hold {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("automatic publication routing held")}
+}
+impl std::error::Error for Hold {}
+
+/// Protected observations for terminal mutations even before a productive
+/// workflow is claimed. Existing remote effects must be reconciled separately.
+pub(super) fn require_terminal_controls(repository:&str,issue:u64,pr:Option<u64>)->Result<()> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else {return Ok(())};
+    let mut ids=std::collections::BTreeSet::from([crate::autoship_workflow::workflow_id(repository,issue)?]);
+    if let Some(pr)=pr {
+        ids.insert(crate::autoship_workflow::pr_workflow_id(repository,pr)?);
+        if let Some(id)=store.resolve_pr(repository,pr)? {ids.insert(id);}
+    }
+    for id in ids {
+        store.require_owner_dispatch(&id)?;
+        ensure!(store.pending_operations(&id)?.is_empty() && !store.merge_reconciliation_needed(&id)?,
+            "terminal mutation requires remote-effect reconciliation");
+    }
+    Ok(())
+}
+
+pub(super) async fn issue_allowed(root:&Path,repository:&str,issue:u64)->bool {
+    let check=async {
+        ensure!(issue>0,"automatic issue routing target missing");
+        let (ok,raw,_)=run(&gh_bin(),&["api",&format!("repos/{repository}/issues/{issue}")],root).await?;
+        ensure!(ok && raw.len()<=1024*1024,"automatic issue routing unavailable");
+        let row:serde_json::Value=serde_json::from_str(&raw)?;
+        ensure!(row["number"].as_u64()==Some(issue),"automatic issue routing target changed");
+        Ok::<bool,anyhow::Error>(!manual(&row)?)
+    };
+    check.await.unwrap_or(false)
+}
+
+/// Terminal labeling has two separate writes. Re-observe routing and protected
+/// controls before each. Explicit routing bypasses only the automatic label.
+pub(super) async fn terminal_allowed(root:&Path,issue:u64,pr:Option<u64>,automatic:bool)->bool {
+    let check=async {
+        let repository=workflow::canonical_repository(root).await?;
+        require_terminal_controls(&repository,issue,pr)?;
+        if !automatic {return Ok(true);}
+        if let Some(pr)=pr {return inspect(root,&repository,pr,Some(issue)).await;}
+        Ok::<bool,anyhow::Error>(issue_allowed(root,&repository,issue).await)
+    };
+    check.await.unwrap_or(false)
+}
+
 pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>) {
     let mut eligible=Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
