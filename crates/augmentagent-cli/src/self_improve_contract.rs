@@ -1585,9 +1585,11 @@ pub(super) fn initial_scope_replay_error(error:anyhow::Error)->anyhow::Error {
 fn initial_plan_budget_context(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str)->Result<String> {
     Ok(amendment::digest(&serde_json::to_vec(&("initial-verifier-budget-context-v1",workflow,contract,source,base,environment))?))
 }
+fn initial_scope_origin_inputs(workflow:&str,owner_request:&str,base:&str,environment:&str)->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow,owner_request,base,environment))?))
+}
 fn initial_scope_origin(workflow:&workflow::WorkflowGuard,base:&str,environment:&str)->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow.id(),
-        workflow.original_owner_request()?,base,environment))?))
+    initial_scope_origin_inputs(workflow.id(),&workflow.original_owner_request()?,base,environment)
 }
 pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard,base:&str)->Result<String> {
     (||->Result<String> {initial_scope_origin(workflow,base,&environment_id(root)?)})().map_err(initial_scope_replay_error)
@@ -2331,14 +2333,39 @@ pub(super) fn inspect_retained_qualification(root:&Path,control:&Path,source:Acc
     Ok(selected)
 }
 
-pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&Path,source:AcceptanceSource,
-    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
-    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
-    if let Some(reference)=reference {
-        retained_qualification_source(root,control,source,reference,evidence)?;
-        return Ok(Some(reference.clone()));
+/// Read-only prerequisites for a retained-source wake, before a productive claim.
+fn require_retained_recovery_inputs(root:&Path,source:AcceptanceSource,attached_pr:Option<u64>,workflow:&str,
+    owner_request:&str,prepared:&PreparedAcceptance,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    let base=prepared.baseline.registration.baseline_head();
+    let environment=prepared.baseline.registration.binding(base)?.environment_id;
+    (||->Result<()> {
+        ensure!(recovery_environment::original_environment(root,base,&prepared.proposal.files)?==environment,
+            "original qualification environment remains unavailable");
+        Ok(())
+    })().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    if source.issue().is_some() && attached_pr.is_none() {
+        let context=initial_scope_origin_inputs(workflow,owner_request,base,&environment)?;
+        read_initial_scope(&context,|key|evidence.scope_response(key))?
+            .context("original initial scope decision remains unavailable")
+            .map_err(initial_scope_replay_error)?;
     }
-    inspect_retained_qualification(root,control,source,binding,evidence)
+    Ok(())
+}
+
+pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    ensure!(context.workflow==snapshot.workflow && context.binding==snapshot.checkpoint.binding,
+        "retained readiness context changed");
+    let reference=match reference {
+        Some(reference)=>Some(reference.clone()),
+        None=>inspect_retained_qualification(root,control,source,&snapshot.checkpoint.binding,evidence)?,
+    };
+    let Some(reference)=reference else{return Ok(None)};
+    let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+    require_retained_recovery_inputs(root,source,snapshot.pr,&snapshot.workflow,&context.source_request,&prepared,evidence)?;
+    Ok(Some(reference))
 }
 
 /// Consume immutable plan/result references rather than requiring the original

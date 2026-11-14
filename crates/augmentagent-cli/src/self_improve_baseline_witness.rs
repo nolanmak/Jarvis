@@ -1380,6 +1380,23 @@ mod tests {
             let source=prepared.proposal.contract.source().unwrap();
             let evidence=store.inspect_verifier_evidence(guard.id());
             assert_eq!(inspect_retained_qualification(root.path(),&native_control,source,guard.binding(),&evidence).unwrap(),Some(retained.clone()));
+            require_retained_recovery_inputs(root.path(),source,source.pull_request(),guard.id(),"original scope",&prepared,&evidence).unwrap();
+            let mut incompatible=prepared.clone();
+            incompatible.baseline.registration=RegisteredContract::register(root.path(),prepared.proposal.contract.clone(),base.into(),"unavailable original runtime".into()).unwrap();
+            let error=require_retained_recovery_inputs(root.path(),source,source.pull_request(),guard.id(),"original scope",&incompatible,&evidence)
+                .expect_err("free wake ignored unavailable original environment");
+            assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::InfrastructureUnavailable));
+            if source.issue().is_some() {
+                let scope_context=retained_initial_scope_context(&guard,&prepared).unwrap();let key=initial_scope_key(&scope_context);
+                let original=guard.recorded_scope_stage_response(&key).unwrap().unwrap();
+                assert!(require_retained_recovery_inputs(root.path(),source,None,guard.id(),"different owner request",&prepared,&evidence).is_err());
+                rusqlite::Connection::open(&database).unwrap().execute("UPDATE scope_stage_response SET response='unavailable' WHERE workflow=?1 AND key=?2",rusqlite::params![guard.id(),key]).unwrap();
+                assert!(require_retained_recovery_inputs(root.path(),source,None,guard.id(),"original scope",&prepared,&evidence).is_err(),"free wake ignored corrupt original scope");
+                // An attached PR resumes its enrolled path and must not invent
+                // initial issue scoping that was never part of that path.
+                require_retained_recovery_inputs(root.path(),source,Some(840),guard.id(),"original scope",&prepared,&evidence).unwrap();
+                rusqlite::Connection::open(&database).unwrap().execute("UPDATE scope_stage_response SET response=?3 WHERE workflow=?1 AND key=?2",rusqlite::params![guard.id(),key,original]).unwrap();
+            }
             let recovered=retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).unwrap();
             assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
             assert!(retained_qualification_source(root.path(),&native_control,AcceptanceSource::PullRequest(841),&retained,&evidence).is_err());
@@ -1415,8 +1432,9 @@ mod tests {
             let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
             let held=writer.snapshot(&id).unwrap().unwrap();
             let revision=writer.owner_control(&id).unwrap().map(|owner|owner.revision);
+            let recovery_context=writer.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();
             assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
-                inspect_retained_qualification(root.path(),&native_control,source,&held.checkpoint.binding,evidence)).unwrap());
+                inspect_retained_qualification_with_reference(root.path(),&native_control,source,&held,&recovery_context,evidence,None)).unwrap());
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
                 repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
                 branch:"fixture",contract:"original scope",environment:"test",
@@ -1500,8 +1518,9 @@ mod tests {
                 let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
                 let parked=writer.snapshot(&id).unwrap().unwrap();
                 let original_reference=writer.retained_qualification_history(&id,&parked.checkpoint.binding).unwrap().unwrap();
+                let recovery_context=writer.recovery_context(&id,&parked.checkpoint.binding).unwrap().unwrap();
                 assert!(writer.recover_retained_qualification(&parked,None,chrono::Utc::now().timestamp_millis(),|evidence| {
-                    let found=inspect_retained_qualification_with_reference(root.path(),&native_control,source,&parked.checkpoint.binding,evidence,Some(&original_reference))?;
+                    let found=inspect_retained_qualification_with_reference(root.path(),&native_control,source,&parked,&recovery_context,evidence,Some(&original_reference))?;
                     ensure!(found.as_ref()==Some(&original_reference),"free inspector lost saved original reference after {missing} loss");
                     Ok(found)
                 }).unwrap());
@@ -1710,6 +1729,7 @@ mod tests {
             original_scope.scope.as_ref().map_or("hard",|scope|scope.complexity.as_str()));
         let reference=inspect_retained_qualification(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&before.checkpoint.binding,&evidence).unwrap()
             .expect("actual metadata hold has no typed retained original handoff");
+        assert_eq!(inspect_retained_qualification_with_reference(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&before,&recovery,&evidence,None).unwrap(),Some(reference.clone()));
         let recovered=retained_qualification_source(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&reference,&evidence).unwrap();
         assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(prepared).unwrap());
         let mut cursor=0;let mut captured_originals=0;

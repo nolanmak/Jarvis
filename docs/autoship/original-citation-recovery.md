@@ -738,3 +738,51 @@ original measurement, independent qualification and later merge gates remain
 required. Final joined validation, documentation/seam review, independent
 engineering review, hosted CI, protected merge and normal updater rollout remain
 pending. No autonomous shipment is established by these component fixtures.
+
+
+## 19. Read-only environment and initial-scope readiness checkpoint
+
+The retained-source recovery inspector now takes the expected snapshot and its
+protected execution context. It rejects a different workflow or binding, loads
+and authenticates the complete original prepared evidence, then validates these
+prerequisites before returning the reference to the store's recovery callback:
+
+- Reconstruct the original environment from the immutable original Git base
+  and original proposal overlays, and require equality with the registered
+  environment. The read-only reader runs trusted Git object reads only; it
+  performs no checkout, compiler/verifier invocation, model call or publication.
+  Failure retains the infrastructure-unavailable classification.
+- For an initial issue with no attached PR, load the original committed scope
+  snapshot using the exact workflow, protected original frontend request,
+  original base and registered environment. Missing, malformed or mismatched
+  scope remains an evidence hold. Preserve the original decision, complexity,
+  criteria and fallback status. An attached PR uses its existing enrolled resume
+  path and does not invent an initial issue scope requirement.
+
+The shared initial-scope identity remains byte-compatible with the existing
+`initial-scope-inputs-v1` tuple. The reader's bounds are 100,000 original tree
+entries, 32 MiB of Git command output and 16 MiB per relevant compiler control;
+these are inspection refusal bounds, not permission to execute candidate code.
+Local Git replacement objects remain disabled. Candidate compiler edits do not
+replace the immutable original inputs. Normal qualification still independently
+checks actual original checkout, integrity and environment before granting any
+builder authority.
+
+The test-first regression reproduced an unavailable original environment being
+accepted by the old data-only readiness boundary. Both initial-issue and PR
+fixtures now exercise the shared recovery inspector through the store callback,
+normal claims, preparation and same-reference restoration. Direct negative
+checks cover an incompatible registered environment, a different protected
+request and corrupt original issue scope; the attached-PR case remains valid
+without an invented initial snapshot. Fault injection is limited to the
+explicitly verified disposable fixture database. The actual ordinary-source
+probe invokes this same inspector read-only and verifies unchanged live state
+and accounting; it never queues or claims the source.
+
+Publication/setup readiness is still required before the production poller may
+invoke this positive-source path. The inspector's new prerequisites do not by
+themselves prove that an immutable receipt can be published after an earlier
+filesystem failure. The production positive callback is therefore still
+unactivated. No rollout, autonomous merge, fresh allowance or ordinary end-to-end
+success is claimed here. Final joined checks, seam review, independent review,
+hosted CI and the normal protected rollout remain pending.
