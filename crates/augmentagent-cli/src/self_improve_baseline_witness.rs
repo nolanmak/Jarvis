@@ -467,6 +467,35 @@ pub(super) fn retained_qualification_reference(root:&Path,control:&Path,prepared
     Ok(Some(crate::autoship_workflow::RetainedWitnessReference {plan:plan.clone(),result:result.clone(),data:data.identity,
         prepared:amendment::digest(&serialized),contract:prepared.baseline.registration.contract_hash().into()}))
 }
+fn encode_requalified(prepared:&PreparedAcceptance,repository:&str,workflow:&str,database:&Path,native_control:&Path,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,checked:Vec<CheckedNativeResponse>)->Result<(String,Vec<u8>)> {
+    let expected=context(&prepared.proposal,&prepared.baseline)?;
+    let artifact=RequalifiedArtifact {version:2,context:expected.clone(),rule:REQUALIFICATION_RULE.into(),repository:repository.into(),
+        workflow:workflow.into(),workflow_db:database.into(),native_control:native_control.into(),plan:reference.plan.clone(),
+        result:reference.result.clone(),data:reference.data.clone(),checked};
+    let bytes=serde_json::to_vec(&artifact)?;ensure!(bytes.len()<=64*1024,"retained qualification receipt exceeds envelope");
+    Ok((expected,bytes))
+}
+
+pub(super) fn require_retained_publication(root:&Path,control:&Path,repository:&str,workflow_id:&str,prepared:&PreparedAcceptance,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    let database=workflow::path().canonicalize()?;let control=control.canonicalize()?;
+    let native_control=control_directories(repository,workflow_id)?.workflow_acceptance.canonicalize()?;
+    for writable in worker_roots(root) {
+        if writable.exists() {let writable=writable.canonicalize()?;
+            ensure!(!control.starts_with(&writable) && !native_control.starts_with(&writable) && !database.starts_with(&writable),
+                "retained publication authority is writable by worker");
+        }
+    }
+    let data=retained_original_witness_data(root,&native_control,&reference.plan,&reference.result,evidence)?.context("original publication source unavailable")?;
+    ensure!(data.identity==reference.data,"publication source reference changed");
+    let (expected,bytes)=encode_requalified(prepared,repository,workflow_id,&database,&native_control,reference,checked_retained_responses(root,&data)?)?;
+    let prepared_bytes=serde_json::to_vec(prepared)?;ensure!(prepared_bytes.len()<=4*1024*1024,"prepared publication exceeds envelope");
+    let manifest_bytes=serde_json::to_vec(&WorkflowManifest::from_prepared(prepared.proposal.contract.source()?,prepared))?;
+    ensure!(manifest_bytes.len()<=64*1024,"manifest publication exceeds envelope");
+    recovery_publication::probe(&control,&artifact_path(&control,&expected),&bytes,prepared_bytes.len()+manifest_bytes.len())
+}
+
 fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
     let retained=workflow.retained_qualification_reference(prepared).map_err(requalification_error)?;
@@ -495,11 +524,9 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
                         "retained qualification authority is writable by worker");
                 }
             }
-            let expected=context(&prepared.proposal,&prepared.baseline)?;
-            let artifact=RequalifiedArtifact {version:2,context:expected.clone(),rule:REQUALIFICATION_RULE.into(),
-                repository:workflow.repository().into(),workflow:workflow.id().into(),workflow_db:database.into(),native_control,
-                plan:plan.clone(),result:result.clone(),data:data.identity,checked};
-            let bytes=serde_json::to_vec(&artifact)?;ensure!(bytes.len()<=64*1024,"retained qualification receipt exceeds envelope");
+            let reference=crate::autoship_workflow::RetainedWitnessReference {plan:plan.clone(),result:result.clone(),data:data.identity,
+                prepared:amendment::digest(&serde_json::to_vec(prepared)?),contract:prepared.baseline.registration.contract_hash().into()};
+            let (expected,bytes)=encode_requalified(prepared,workflow.repository(),workflow.id(),database,&native_control,&reference,checked)?;
             immutable(&control,&artifact_path(&control,&expected),&bytes)?;
             Ok(true)
         })().map_err(requalification_error)
@@ -1433,8 +1460,16 @@ mod tests {
             let held=writer.snapshot(&id).unwrap().unwrap();
             let revision=writer.owner_control(&id).unwrap().map(|owner|owner.revision);
             let recovery_context=writer.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();
+            let conflicting=artifact_path(&native_control,&context(&prepared.proposal,&prepared.baseline).unwrap());
+            std::fs::write(&conflicting,b"conflicting immutable receipt").unwrap();
+            std::fs::set_permissions(&conflicting,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let parked_events=writer.events(&id).unwrap();
             assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
-                inspect_retained_qualification_with_reference(root.path(),&native_control,source,&held,&recovery_context,evidence,None)).unwrap());
+                inspect_retained_recovery_ready(root.path(),&native_control,source,&held,&recovery_context,evidence,None)).is_err());
+            assert_eq!(writer.snapshot(&id).unwrap().unwrap(),held);assert_eq!(writer.events(&id).unwrap(),parked_events);
+            std::fs::remove_file(&conflicting).unwrap();
+            assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
+                inspect_retained_recovery_ready(root.path(),&native_control,source,&held,&recovery_context,evidence,None)).unwrap());
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
                 repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
                 branch:"fixture",contract:"original scope",environment:"test",
@@ -1520,7 +1555,7 @@ mod tests {
                 let original_reference=writer.retained_qualification_history(&id,&parked.checkpoint.binding).unwrap().unwrap();
                 let recovery_context=writer.recovery_context(&id,&parked.checkpoint.binding).unwrap().unwrap();
                 assert!(writer.recover_retained_qualification(&parked,None,chrono::Utc::now().timestamp_millis(),|evidence| {
-                    let found=inspect_retained_qualification_with_reference(root.path(),&native_control,source,&parked,&recovery_context,evidence,Some(&original_reference))?;
+                    let found=inspect_retained_recovery_ready(root.path(),&native_control,source,&parked,&recovery_context,evidence,Some(&original_reference))?;
                     ensure!(found.as_ref()==Some(&original_reference),"free inspector lost saved original reference after {missing} loss");
                     Ok(found)
                 }).unwrap());

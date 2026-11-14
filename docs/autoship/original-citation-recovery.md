@@ -1,8 +1,8 @@
 # Original witness citation recovery (#2080)
 
-Status: investigation and test-first draft. No fix, implementation handoff or
-rollout is approved by this document. Root implementation agent owns every open
-thread below; resolve them against actual callers before handoff. This is normal
+Status: implementation branch; final joined validation, independent review and
+rollout remain pending. Root implementation agent owns every open thread below;
+resolve them against actual callers before handoff. This is normal
 engineering, excluded from ordinary autoship selection. #1703 remains the full
 acceptance contract. #2058 is separate unfinished engineering, not superseded.
 
@@ -145,7 +145,7 @@ remain authoritative. Mutation/publication and data-only inspection stay separat
    benchmark. Full #1703 fault/soak, capacity, CLI/private Discord and shipping
    acceptance still apply.
 
-## 6. Open threads — all block implementation handoff and rollout
+## 6. Historical open-thread inventory — current resolution in §21
 
 - Repair envelope resolved in D3: only +/-1 inclusive end, exact full quote at
   declared start, independently bounded declared/derived intervals and unchanged
@@ -282,7 +282,7 @@ These points narrow the remaining investigation; they do not close section 6,
 complete the 54-seam audit or establish a supported deployed recovery path.
 
 
-## 10. Additional rollout seams found during source comparison
+## 10. Historical rollout seam inventory — current resolution in §21
 
 Both changed checker/contract sources contribute to the qualification policy
 hash. Consequently this rollout also changes the context of previously valid
@@ -696,7 +696,8 @@ receipt deletion, snapshot-limit override or native-response rewrite is an
 activation path. Existing protected-state retention owns obsolete evidence;
 this patch adds no second copy or independent retention pool. The typed cue must
 retain its same episode through failed publication and genuine source restoration
-without unchanged productive reclaims; that scheduling work is still open.
+without unchanged productive reclaims; §§18–20 implement that scheduling and
+readiness path on the repair branch. Joined validation and rollout remain open.
 
 
 ## 18. Retained infrastructure continuation implementation checkpoint
@@ -779,10 +780,211 @@ explicitly verified disposable fixture database. The actual ordinary-source
 probe invokes this same inspector read-only and verifies unchanged live state
 and accounting; it never queues or claims the source.
 
-Publication/setup readiness is still required before the production poller may
-invoke this positive-source path. The inspector's new prerequisites do not by
+At this checkpoint publication/setup readiness remained required before the
+production poller could invoke this positive-source path; §20 supplies that
+boundary and connects the caller on the repair branch. The inspector's new prerequisites do not by
 themselves prove that an immutable receipt can be published after an earlier
-filesystem failure. The production positive callback is therefore still
-unactivated. No rollout, autonomous merge, fresh allowance or ordinary end-to-end
+filesystem failure. The callback was still unconnected at this checkpoint; §20 supersedes that
+implementation status. Production deployment remains unverified. No rollout, autonomous merge, fresh allowance or ordinary end-to-end
 success is claimed here. Final joined checks, seam review, independent review,
 hosted CI and the normal protected rollout remain pending.
+
+
+## 20. Publication readiness and poller integration
+
+D10. Separate read-only source validation from filesystem readiness. Source,
+native, environment and original-scope inspection remains read-only (§19),
+including the explicit ordinary-source inventory probe. A separate controller
+readiness operation may allocate bounded anonymous scratch solely to exercise
+actual allocation, quota, write and fsync. This is necessary because mode/free
+space checks cannot prove that the next immutable publication can succeed.
+It publishes no receipt, native response, manifest, qualification or grant and
+runs no worker, verifier, compiler or model. It is normal recovery preparation,
+not a substitute for original-checkout qualification or later merge gates.
+
+The operation uses the same exact encoded v2 receipt bytes as the real writer.
+A present final receipt must be private, bounded, single-linked and byte-identical;
+conflicts, malformed/nonprivate files and symlinks remain held without overwrite.
+The destination and configured authority must remain outside worker-writable
+roots. The controller directory must be private, owned and writable. The probe
+writes zeros equal to the bounded receipt + prepared data + manifest footprint,
+plus 64 KiB of margin, and fsyncs both scratch and directory. Its maximum is
+4 MiB + 192 KiB per operation; the existing four-candidate window bounds aggregate
+scratch below 17 MiB. No budget or free-space-floor override is used.
+
+On this Linux deployment the scratch descriptor is opened with O_TMPFILE and
+O_CLOEXEC. There is no named-file fallback: an unsupported filesystem/platform
+stays held. Thus failure, cancellation or process death leaves no named scratch
+artifact or new retention pool. The descriptor closes on ordinary error/drop;
+no snapshot, native proof or old receipt is deleted or rewritten. This probe
+establishes current filesystem availability, not a reservation: an intervening
+failure can still occur, and must return to the same restrictive hold.
+
+The poller retains its existing fresh remote authorization/request checks,
+RunLock, checkout validation, owner revision, binding, pending effects and inbox
+fences. After existing authenticated negative-source handling, the positive
+path reads any protected retained reference, runs source/input/publication
+readiness, then uses the existing store transaction to queue the same workflow.
+No reference or failed readiness means no productive claim or model admission.
+A restored continuation reuses the same cue; no policy/build/time change refills
+a bounded model or amendment allowance. Existing physical fallback is preserved.
+
+Retained preparation now catches setup/publication errors at the real producer
+boundary and records its existing source continuation before the public error
+escapes. Enrolled evidence and infrastructure errors likewise retain that
+continuation, preserving the actual safe reason and private diagnostics. Fresh
+work without a retained reference keeps its existing error path. The wrapper
+boxes the existing async preparation future to preserve the CLI's layout-depth
+limit; it changes no invocation, timeout, provider or model budget.
+
+Test-first publication checks reproduce a conflicting receipt being incorrectly
+considered ready. Focused tests cover unwritable destinations, conflicting and
+nonprivate receipts, dangling symlinks, bounded allocation and injected ENOSPC,
+with unchanged receipt bytes and no leftover scratch. Both original issue and
+PR lifecycle fixtures run the same readiness callback before queue and after
+source restoration; a conflicting real-context receipt refuses queueing without
+checkpoint/event changes. The explicit live #1830 inventory continues to use
+only the read-only inspector. No live readiness probe or automatic wake is
+performed by that inventory test.
+
+This section supersedes the unconnected-publication status in §§18–19. Poller
+integration is code on the repair branch, not deployed acceptance. Final joined
+validation, fresh spec/seam review, independent engineering review, hosted CI,
+supported snapshot, protected merge and normal updater rollout remain required.
+Natural ordinary execution and the full #1703 outcome are still unproven.
+
+
+## 21. Current recovery contract and unresolved integration blockers
+
+This section is the current status authority. Earlier “UNIMPLEMENTED”, “next”
+and open-thread statements in §§4–19 describe their individual checkpoints;
+they do not override the contracts below. Code and component fixtures remain
+engineering evidence, not deployed or ordinary-work acceptance. Root owns all
+remaining implementation and rollout work; no new owner product decision is
+required to resolve these seams.
+
+### Cue identity and storage
+
+The authoritative positive cue is a `workflow_event` with kind
+`original_semantic_witness_recovered` and a strict `SemanticReconsideration` JSON
+payload: `version:2`, `key`, `judgment`, `policy`, `original_generation`, `binding`,
+`qualification_required:true`, and `source`. The source has tag
+`kind:"retained_original_witness"`, an `evidence` object with fields `plan`, `result`, `data`, `prepared`, `contract`,
+and a sibling `owner_request_sha256`.
+Each evidence field, policy, judgment and key is lowercase 64-digit SHA-256;
+`judgment` must equal `evidence.data`. The owner hash covers the exact protected
+frontend request UTF-8 bytes. No relabeled provider response establishes this
+source: the original plan/result, full raw measurement and paid native question
+chain are independently authenticated before creation and on consumption.
+
+`policy = SHA256(UTF8("retained-original-witness-current-validation-v1"))`.
+The stable key is SHA-256 of the compact `serde_json` UTF-8 encoding of the tuple
+`("retained-qualification-recovery-v1", workflow, evidence, policy)`. Evidence
+object field order for this key input is the declaration order above. Stored
+event JSON object order is not an identity rule: readers deserialize the typed
+reference before reconstructing that key input. Live head/binding, generation,
+owner revision, timestamps and current build hash fence transactions but do not
+enter this key. The event's generation must equal `original_generation` and not
+exceed the consuming generation. Current-policy qualification receipts may have
+new context hashes; this does not mint a second cue or refill allowances.
+
+The store uses an IMMEDIATE transaction and checks for the same workflow/event
+key before inserting the initial cue. This is the deduplication authority;
+there is no parallel queue or grant ledger. A v1 cue without `source` remains a
+negative semantic reconsideration with its existing exact-binding rules. It is
+never upgraded to this positive type or admitted as a retained infrastructure
+continuation. Unsupported versions and mismatched references fail closed.
+
+### Bindings and consumers
+
+The original execution binding remains part of immutable plan/result evidence.
+It is not overwritten with a later candidate head. Queueing compares the complete
+expected snapshot, generation, branch and PR, eligibility and idle lease against
+current store state. Protected owner revision/request, pause, pending mutation
+and owner-inbox checks still fence this transaction. A stale observation queues
+nothing. Remote source authorization, lifecycle/request equality, original
+checkout ownership and RunLock are separately checked by the poller.
+
+A live binding rotation is supported only by a protected current
+`RecoveryContext` for that same workflow and binding. Its exact frontend request
+hash must match the cue, and its contract must be that frontend request or
+`registered:<original evidence.contract>`. Guard acquisition records this context
+after audit/head rotation and before resolving the cue or installing accounting.
+The immutable cue keeps its original binding; the current context supplies the
+live association. A changed owner request or different registered measurement
+cannot borrow this reference. A newer registered verifier manifest takes
+precedence over historical recovery data, including when its evidence is lost.
+
+For an initial issue the normal claim consumes the cue before paid lane,
+readiness or scoping admission. The original committed scope is replayed using
+the protected request, original base and original environment. It preserves
+complexity, estimate, implementation guidance, criteria and fallback status.
+A missing/corrupt scope stays held; it is never defaulted to a new hard grade.
+For PR/enrolled resumption the normal source/PR identity fence remains and the
+original prepared evidence is consumed without manufacturing an initial issue
+scope. Both paths start with RecoveryOnly acceptance authority, use the actual
+preparation/qualification writer, and must prove complete published prepared
+bytes and current original qualification before settlement grants Qualified
+builder authority. Exact-current-head candidate tests, review and hosted CI
+remain later gates. Settlement is lease/binding/native-owner-turn fenced and
+refuses unsettled publication or a waiting source.
+
+### Episode transitions
+
+| Current state | Event/condition | Result and durable authority |
+| --- | --- | --- |
+| Eligible metadata/native hold, no consumed matching key | Authenticated source and all applicable readiness checks pass under current snapshot/owner fences | One initial cue + Reconcile checkpoint commit atomically. No productive lease, model call or allowance is created. |
+| Queued cue | Normal guarded claim | The normal lease/attempt rules apply; RecoveryOnly authority permits preparation, not a model bypass or merge. |
+| Claimed/preparing or settled history | Required source/setup/qualification fails | Scope hold + same-cue `semantic_source_unavailable` version-1 record commit in the existing lease transaction. Its payload contains `cue` and the complete restrictive checkpoint. Evidence and infrastructure reasons remain distinct. |
+| Same waiting checkpoint | Identical failure report | No new loss episode, grant or event. A generic retry cannot overwrite the hold. |
+| Waiting source | Unavailable/mismatched source or readiness | Remains parked. Free inspection cannot create a productive lease. See remaining coverage blockers below. |
+| Waiting source | Same reference passes source and readiness validation | Reconcile checkpoint + `original_semantic_source_restored` referencing the exact loss-event sequence commit atomically; no second initial cue is inserted. |
+| Active cue after restore | Published prepared evidence equals the immutable reference and actual current qualification passes | `retained_qualification_prepared` records the same cue/data/prepared identity under the normal lease; builder authority becomes Qualified only after this succeeds. |
+| Settled history, no later loss | Duplicate inspection/preparation or a later unrelated hold | The consumed stable key grants no second metadata wake or model budget. Historical evidence remains available for audit and provenance. |
+| Settled history | A genuinely new recorded loss after settlement | That loss sequence reactivates the same cue; subsequent restore/settlement refers to this episode. Settlement is current only if its event sequence exceeds the latest same-cue loss. |
+| Any observation | Pause, source close, changed request/binding, active lease, pending effect/inbox, storage/event failure | Existing guards prevent or roll back the handoff. Supported terminal retirement remains authoritative; retained facts do not authorize new work. |
+
+The latest same-generation loss record must match the current complete checkpoint
+and authenticated cue. A restoration consumes that particular loss sequence.
+These event sequences distinguish actual loss/restoration episodes; a wall-clock,
+heartbeat or code hash is not a dependency change. Publication readiness is an
+actual filesystem check, not a claim that source bytes have changed. Its incomplete
+coverage below must be resolved before activation can claim unchanged-failure
+suppression across all setup destinations and publication operations.
+
+### Shared bounded fair selection
+
+Negative, positive, native and verifier-infrastructure holds use the existing
+shared selection window, not separate queues. It admits at most four concurrent
+candidates and excludes active workflow IDs, leased rows, future eligibility and
+owner pauses. The query scans at most 128 rows ordered by least recent persisted
+same-binding `qualification_recovery_selected` event, then workflow ID. Eligible
+rows with no prior reservation sort first. A reservation commits before remote
+lookup and detailed source eligibility checks, so invalid/inaccessible candidates
+also rotate instead of retaining the front of the window. The same binding has
+a persisted 300,000 ms inspection cooldown. Restart reads those same events;
+no in-memory reset, generation or day boundary replenishes model allowance.
+
+The matching selection binding consists of head, contract and evidence hash.
+At most four selected inspections run, while skipped invalid rows may receive
+bounded reservations within the 128-row scan. Positive and negative handling
+share the same candidate execution; negative-source authentication stays first.
+The existing free physical-custody restoration route stays ahead of optional
+positive inspection. If no retained cue exists, inability to inspect optional
+original data cannot replace the existing exact original-plan/hold/owner/lease
+rules for physical fallback. A known retained continuation never grants original
+re-execution merely because its source becomes unavailable.
+
+### Current status and merge blockers
+
+| Earlier thread | Current contract/evidence | Remaining obligation |
+| --- | --- | --- |
+| Citation repair envelope / checked receipt | D1–D3, §§14–17; parser, complete measurement/native reader and actual qualifier fixtures | Final joined validation, engineering review and ordinary acceptance. |
+| Positive cue / legacy separation | Cue schema and transaction rules above; typed v2 store tests, v1 rejection and stable-key restart tests | Fresh seam audit and final production-path verification. |
+| Live rebinding / initial and enrolled consumers | Binding/consumer rules above; actual claim, preparation, qualification, publication and settlement fixtures | Final current-main integration and exact-head review/CI. |
+| Loss, duplicate, interruption and settlement | Episode table above; atomicity, source-loss and restoration store/guard fixtures | Publication/setup coverage below and natural ordinary outcome. |
+| Bounded fair scheduling | Shared window rules above; scheduler rotation and refused-inspection tests | Fresh seam review; do not infer live recovery from selection counts. |
+| Publication destination and metadata operations | Current probe covers the receipt/controller directory's allocation/write/fsync and exact expected receipt collision | **OPEN, blocks merge/activation:** enumerate and validate every actual setup destination, including missing harness parents and literal write-admission storage. Anonymous allocation alone also does not prove named create/persist/link availability. Add an appropriate supported check or failure-condition hold before claiming full setup readiness. Root owns implementation next. |
+| Physical recovery compatibility | Existing free custody restoration is ordered before optional positive inspection; original-plan fallback retains independent authority checks | Verify the connected routing and errors on current code, including incomplete optional positive data; do not broaden re-execution authority. |
+| Documentation and fresh review | This section supersedes historic open-status statements and specifies current cue/binding/episode/fairness rules | Fresh-reader findings require recheck; the mapped 100 seams have **not** all been audited. Spec audit is not independent engineering approval. |
+| Rollout and full #1703 | Protected merge, hosted CI, supported snapshot and normal updater; natural ordinary workflow acceptance | Entire requirement remains open. No forced resubmission, fabricated input/approval, budget reset or repair self-test. |

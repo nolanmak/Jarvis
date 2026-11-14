@@ -8365,7 +8365,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // be served at all. The build preset is the demanding one; when every
     // provider cleared for it is latched on quota, the scoping call buys
     // nothing and the tick used to end as a failure rather than a pause.
-    let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
     if !retained_preparation {
         match reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic) {
             augmentagent_channel_core::LaneAvailability::Available => {}
@@ -8378,10 +8377,8 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 return Ok(RunReport::held(why));
             }
             augmentagent_channel_core::LaneAvailability::NoEligibleProvider => {
-                // NOT a pause. No provider in the chain is cleared for the build
-                // preset at all, so waiting will never fix it — that is a
-                // configuration or deployment fault and must stay loud, or a
-                // misconfigured chain looks exactly like a quiet quota day.
+                // No configured provider can serve this preset. Waiting cannot
+                // fix that configuration fault.
                 workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -8393,6 +8390,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             }
         }
 
+    }
+    let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
             acceptance::readiness::Decision::Ready(evidence)=>evidence,
             acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),

@@ -200,18 +200,23 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
         |custody,evidence|acceptance::inspect_semantic_hold(&context.worktree,&control,source,&snapshot.checkpoint,custody,evidence))? {
         return Ok(());
     }
-    drop(store);
-    // Physical native custody can be checked without a native allocation,
-    // execution claim, model call or any change to the attempt counters.
-    if WorkflowStore::open(&workflow::path())?.recover_native_qualification(
-        &snapshot.workflow,
-        &binding,
-        &context.worktree,
-        acceptance::require_retained_native_custody,
-        chrono::Utc::now().timestamp_millis(),
-    )? {
+    // Preserve the existing free physical-custody route before an optional
+    // retained-measurement inspection can discover incomplete original data.
+    if store.recover_native_qualification(&snapshot.workflow,&binding,&context.worktree,
+        acceptance::require_retained_native_custody,chrono::Utc::now().timestamp_millis())? {
         return Ok(());
     }
+    let retained=store.retained_qualification_history(&snapshot.workflow,&snapshot.checkpoint.binding)?;
+    match store.recover_retained_qualification(&snapshot,owner_revision,chrono::Utc::now().timestamp_millis(),|evidence|
+        acceptance::inspect_retained_recovery_ready(&context.worktree,&control,source,&snapshot,&context,evidence,retained.as_ref())) {
+        Ok(true)=>return Ok(()),
+        Ok(false)=>{},
+        Err(error) if retained.is_some()=>return Err(error),
+        Err(_)=>warn!("retained source unavailable; existing original-verifier recovery authority remains required"),
+    }
+    drop(store);
+    // No retained cue authorizes re-execution. The existing original-plan
+    // descriptor, precise hold, owner and lease checks still decide fallback.
     let Some(mut guard) = workflow::WorkflowGuard::acquire_verifier_recovery(workflow::Start {
         repo_root: root,
         worktree: &context.worktree,

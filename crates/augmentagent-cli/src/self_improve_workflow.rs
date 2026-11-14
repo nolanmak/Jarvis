@@ -1617,6 +1617,12 @@ impl WorkflowGuard {
                 return Ok(());
             }
         }
+        if reason=="acceptance_verifier_evidence_unknown" && action=="await_original_evidence_recovery" {
+            if let Some(cue)=store.retained_qualification_cue(self.id(),&self.binding)? {
+                store.hold_semantic_source_unavailable(&self.lease,&self.binding,&cue.key,millis())?;
+                return Ok(());
+            }
+        }
         store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
     }
@@ -1691,6 +1697,15 @@ impl WorkflowGuard {
             Err(error) if self.semantic_source_waiting()?=>Err(error),
             Err(error)=>Err(self.retained_preparation_failure(error)?),
         }
+    }
+
+    pub(super) fn preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        self.validate_before_side_effect()?;
+        let retained=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?
+            .retained_qualification_cue(self.id(),&self.binding)?.is_some();
+        if !retained {return Ok(error);}
+        if self.semantic_source_waiting()? {return Ok(SemanticSourceUnavailable.into());}
+        self.retained_preparation_failure(error)
     }
 
     pub(super) fn retained_preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {

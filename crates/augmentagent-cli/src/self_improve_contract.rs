@@ -24,6 +24,8 @@ pub(super) use verifier_execution::recover_original_verifier;
 mod baseline_witness;
 #[path = "self_improve_recovery_environment.rs"]
 mod recovery_environment;
+#[path = "self_improve_recovery_publication.rs"]
+mod recovery_publication;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -1863,7 +1865,17 @@ fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptanc
     std::fs::File::open(control)?.sync_all()?;Ok(())
 }
 
-pub(super) async fn prepare_acceptance_for(
+pub(super) async fn prepare_acceptance_for(repo:&Path,candidate:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
+    reasoner:&dyn Reasoner,writable_roots:&[PathBuf],required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<PreparedAcceptance> {
+    let execution:futures::future::BoxFuture<'_,Result<PreparedAcceptance>>=Box::pin(
+        prepare_acceptance_for_inner(repo,candidate,control,source,base,scope,reasoner,writable_roots,required_criteria,workflow));
+    match execution.await {
+        Ok(prepared)=>Ok(prepared),
+        Err(error)=>Err(workflow.preparation_failure(error)?),
+    }
+}
+
+async fn prepare_acceptance_for_inner(
     repo: &Path,
     candidate: &Path,
     control: &Path,
@@ -2365,6 +2377,19 @@ pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&
     let Some(reference)=reference else{return Ok(None)};
     let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
     require_retained_recovery_inputs(root,source,snapshot.pr,&snapshot.workflow,&context.source_request,&prepared,evidence)?;
+    Ok(Some(reference))
+}
+
+/// Source inspection remains read-only; only this separate readiness boundary
+/// performs the bounded anonymous controller-filesystem probe before queueing.
+pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    let Some(reference)=inspect_retained_qualification_with_reference(root,control,source,snapshot,context,evidence,reference)? else{return Ok(None)};
+    let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+    baseline_witness::require_retained_publication(root,control,&context.repository,&snapshot.workflow,&prepared,&reference,evidence)
+        .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     Ok(Some(reference))
 }
 
