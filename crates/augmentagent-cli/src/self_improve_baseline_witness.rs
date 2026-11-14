@@ -1315,22 +1315,32 @@ mod tests {
                 &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
             assert_eq!(serde_json::to_vec(&enrolled).unwrap(),serde_json::to_vec(&prepared).unwrap());
             assert_eq!(reasoner.calls(),0,"retained metadata preparation made a paid model call");
-            let outcome=qualify(root.path(),control.path(),&prepared,&guard).await;
+            let outcome=qualify(root.path(),&native_control,&prepared,&guard).await;
             assert!(outcome.is_ok(),"complete retained original witness required new native generation instead of current requalification: {outcome:?}");
-            assert_current(root.path(),control.path(),&prepared).unwrap();
+            assert_current(root.path(),&native_control,&prepared).unwrap();
+            let unpublished=native_control.join("fixture-unpublished-prepared.json");
+            std::fs::rename(&prepared_path,&unpublished).unwrap();
+            assert!(guard.bind_acceptance(&prepared,&native_control).is_err(),"qualified but unpublished prepared evidence settled the recovery handoff");
+            assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().is_some());
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"failed prepared publication granted builder authority");
+            std::fs::rename(&unpublished,&prepared_path).unwrap();
+            guard.bind_acceptance(&prepared,&native_control).unwrap();
+            assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().is_none(),"qualified published preparation still overrides later verifier revisions");
+            guard.bind_acceptance(&prepared,&native_control).unwrap();
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),1);
             assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,
                 "metadata-only requalification admitted another model call");
             assert_eq!(private_bytes(&reference.artifact,64*1024).unwrap(),native_bytes,"qualification rewrote native provenance");
             assert_eq!(store.inspect_baseline_native_custody(guard.id()).unwrap().len(),1);
-            let receipt_path=artifact_path(control.path(),&current);let receipt_bytes=private_bytes(&receipt_path,64*1024).unwrap();
+            let receipt_path=artifact_path(&native_control,&current);let receipt_bytes=private_bytes(&receipt_path,64*1024).unwrap();
             let receipt:RequalifiedArtifact=serde_json::from_slice(&receipt_bytes).unwrap();
             assert_eq!(receipt.version,2);assert_eq!(receipt.context,current);
             assert!(receipt.checked.iter().all(|reply|reply.native_context==origin && reply.native_context!=current
                 && reply.response_sha256==amendment::digest(raw.as_bytes())),"receipt relabeled original native evidence");
-            qualify(root.path(),control.path(),&prepared,&guard).await.unwrap();
+            qualify(root.path(),&native_control,&prepared,&guard).await.unwrap();
             assert_eq!(private_bytes(&receipt_path,64*1024).unwrap(),receipt_bytes,"repeat qualification rewrote its immutable receipt");
             let id=guard.id().to_owned();guard.finish().unwrap();
-            assert_current(root.path(),control.path(),&prepared).unwrap();
+            assert_current(root.path(),&native_control,&prepared).unwrap();
             for field in ["workflow_db","workflow","rule","checked"] {
                 let mut changed:serde_json::Value=serde_json::from_slice(&receipt_bytes).unwrap();
                 match field {
@@ -1340,19 +1350,19 @@ mod tests {
                     _=>changed["checked"][0]["canonical_judgment_sha256"]="f".repeat(64).into(),
                 }
                 std::fs::write(&receipt_path,changed.to_string()).unwrap();
-                assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted changed receipt {field}");
+                assert!(assert_current(root.path(),&native_control,&prepared).is_err(),"restart trusted changed receipt {field}");
             }
             std::fs::write(&receipt_path,&receipt_bytes).unwrap();
             let admission=store.inspect_verifier_evidence(&id).page("original_verifier_command_admission",0).unwrap();
             let admission:serde_json::Value=serde_json::from_str(&admission[0].body).unwrap();
             let stdout=PathBuf::from(admission["capture"]["path"].as_str().unwrap()).join("stdout");
             std::fs::write(&stdout,b"true\n").unwrap();
-            assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted receipt without rechecking original command output");
+            assert!(assert_current(root.path(),&native_control,&prepared).is_err(),"restart trusted receipt without rechecking original command output");
             std::fs::write(&stdout,b"false\n").unwrap();
             std::fs::write(&reference.artifact,b"changed proof").unwrap();
-            assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted receipt without original native provenance");
+            assert!(assert_current(root.path(),&native_control,&prepared).is_err(),"restart trusted receipt without original native provenance");
             std::fs::write(&reference.artifact,&native_bytes).unwrap();
-            assert_current(root.path(),control.path(),&prepared).unwrap();
+            assert_current(root.path(),&native_control,&prepared).unwrap();
             assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
             return;
         }
