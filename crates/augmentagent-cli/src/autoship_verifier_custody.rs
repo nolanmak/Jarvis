@@ -35,8 +35,16 @@ pub(crate) struct VerifierEvidenceInspection<'a> {
 impl<'a> VerifierEvidenceInspection<'a> {
     pub(super) fn new(conn:&'a Connection,workflow:&'a str)->Self {Self {conn,workflow}}
     pub(crate) fn workflow(&self)->&str {self.workflow}
+    /// Paid-custody validation is identical to leased execution. Returning a
+    /// historical binding grants neither a lease nor semantic qualification.
+    pub(crate) fn native_admissions(&self)->Result<Vec<NativeScopeAdmissionData>> {
+        baseline_native_admissions(self.conn,self.workflow)
+    }
     pub(crate) fn scope_response(&self,key:&str)->Result<Option<String>> {
         read_scope_response(self.conn,self.workflow,key)
+    }
+    pub(crate) fn recorded_scope_response(&self,key:&str)->Result<Option<String>> {
+        read_recorded_scope_response(self.conn,self.workflow,key)
     }
     pub(crate) fn scope_keys(&self,after:&str)->Result<Vec<String>> {
         read_scope_response_keys(self.conn,self.workflow,after)
@@ -193,6 +201,28 @@ impl WorkflowStore {
             else {event(&tx,&lease.workflow,lease.generation,"verifier_evidence_recorded",&serde_json::json!({"key":key,"kind":kind,"sha256":hash}).to_string(),now)?;}
         }
         tx.commit()?;Ok(())
+    }
+
+    /// One SQLite read snapshot for derived-evidence readers, including restart.
+    pub(crate) fn read_verifier_evidence<T>(&self,workflow:&str,read:impl FnOnce(&VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        let tx=self.conn.unchecked_transaction()?;
+        let result=read(&VerifierEvidenceInspection::new(&tx,workflow))?;
+        tx.commit()?;Ok(result)
+    }
+
+    /// Deriving protected qualification metadata is fenced by the same live
+    /// dispatch/owner-turn authority, plus unsettled-publication exclusion.
+    pub(crate) fn with_qualification_evidence<T>(&mut self,lease:&Lease,binding:&Binding,now:i64,
+        read:impl FnOnce(&Path,&VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        let database=Path::new(self.conn.path().context("qualification requires a persistent workflow store")?).canonicalize()?;
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        owner_turn::require_native_dispatch(&tx,lease,now)?;
+        ensure!(!qualification_recovery::pending_mutation(&tx,&lease.workflow)?,"qualification has unsettled publication");
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+        ensure!(!matches!(serde_json::from_str::<Checkpoint>(&raw)?.stage,Stage::Held|Stage::Merged|Stage::Retired),"qualification workflow is not active");
+        let result=read(&database,&VerifierEvidenceInspection::new(&tx,&lease.workflow))?;
+        tx.commit()?;Ok(result)
     }
 
     pub(crate) fn inspect_verifier_evidence<'a>(&'a self,workflow:&'a str)->VerifierEvidenceInspection<'a> {
