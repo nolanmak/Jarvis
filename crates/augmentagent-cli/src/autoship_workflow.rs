@@ -3181,6 +3181,31 @@ mod tests {
     }
 
     #[test]
+    fn qualification_evidence_derivation_preserves_dispatch_and_publication_fences() {
+        for fault in ["none","paused","pending-publication","terminal","held","expired","wrong-binding"] {
+            let dir=tempfile::tempdir_in("/tmp").unwrap();let path=dir.path().join("state.db");
+            let (mut store,lease)=setup(&path);let mut expected=binding();let mut now=40;
+            match fault {
+                "paused"=>{store.set_owner_pause(&lease.workflow,"owner",0,true,30).unwrap();},
+                "pending-publication"=>{store.begin_operation(&lease,OperationKind::Push,&binding(),30).unwrap();},
+                "terminal"|"held"=>{let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+                    checkpoint.stage=if fault=="terminal" {Stage::Retired}else{Stage::Held};store.checkpoint(&lease,&checkpoint,30).unwrap();},
+                "expired"=>now=2000,
+                "wrong-binding"=>expected.contract="different-original-request".into(),
+                _=>{},
+            }
+            let before=store.snapshot(&lease.workflow).unwrap();let events=store.events(&lease.workflow).unwrap();
+            let called=std::cell::Cell::new(false);
+            let result=store.with_qualification_evidence(&lease,&expected,now,|database,evidence| {
+                called.set(true);assert_eq!(database,path.canonicalize().unwrap());assert_eq!(evidence.workflow(),lease.workflow);Ok(42)
+            });
+            assert_eq!(result.is_ok(),fault=="none","{fault} qualification fence changed: {result:?}");
+            assert_eq!(called.get(),fault=="none","{fault} ran derivation before checking authority");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+
+    #[test]
     fn read_only_native_evidence_retains_its_admitted_binding_after_rotation() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
         let (mut store,lease)=setup(&path);

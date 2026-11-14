@@ -52,9 +52,12 @@ leaving contradictory or missing source evidence rejected.
 
 D4. An old-policy reply is data, not current qualification. A parser-only fix is
 insufficient. Preserve normal v1 artifacts and their native/request/policy checks.
-Any explicit narrow requalification of exact retained metadata-error evidence
-must be represented and independently reviewed as such; do not silently feed an
-old context to a current artifact or synthesize new provider provenance.
+Explicit requalification of exact retained metadata-error evidence and previously
+exact positive evidence must be represented and independently reviewed as such.
+Both require the complete unchanged native question, actual original measurement
+and current checks; the latter avoids stranding valid work solely on rollout.
+Do not silently feed an old context to a current artifact or synthesize new
+provider provenance.
 
 D5. Preserve every native charge and existing finite workflow/input/environment
 budget. No policy-only hash, new main commit, routing metadata, UTC rollover or
@@ -73,10 +76,11 @@ SQL write, owner unpause, allowance reset or repair-PR self-test is authorized.
   quote to `source.lines()[start-1..end].join("\n")`. It separately checks all
   criteria and semantic fields. Its source contributes to `policy_hash()` and
   hence the qualification context; changing it changes that current context.
-- `qualify` first checks current artifacts, then authenticated retained Unknown,
-  original checkout/environment and source recovery, then `persistent_witness`.
-  `current_judgment` verifies native provenance under the current context before
-  parsing; data-only retained readers explicitly do not import old approval.
+- `qualify` checks current artifacts, authenticated retained Unknown and the
+  original checkout/environment, then explicit retained requalification (§15)
+  before source recovery/`persistent_witness`. V1 native/current-context checks
+  remain strict. V2 separately rechecks original captured/native/controller data
+  and current validation; source/data readers alone never import old approval.
 - `self_improve_scope.rs::persistent_witness` retains original raw/proof pairs.
   Its completed-response protocol has TWO slots: original question, then exact
   `correction_prompt(original,error,previous_raw)`. Workflow binding contract and
@@ -99,13 +103,14 @@ SQL write, owner unpause, allowance reset or repair-PR self-test is authorized.
 
 ## 4. Proposed data path, not yet approved implementation
 
-One existing witness service should own the checked correction. Candidate shapes
-include a derived citation record and a versioned qualification artifact retaining
-both original native context/provenance and current checked context. A live grant
-must require complete original native-request authentication, raw captured
-measurement/original plan binding, exact source anchor, full judgment validation,
-current caller authority and an explicit narrowly reviewed migration rule. A
-serialized correction reference alone grants nothing. Do not introduce a second
+The existing witness service owns the checked correction. Section 15 chooses a
+version 2 qualification artifact retaining original native context/provenance
+separately from current checked context. Its live writer requires complete
+original native-request authentication, raw captured measurement/original plan
+binding, exact source anchor, full judgment validation, current caller authority
+and the explicit reviewed migration rule. A serialized correction reference alone
+grants nothing. The implementation remains on the engineering branch; held-source
+cue activation and review are unfinished. Do not introduce a second
 approval authority/ledger or change the native producer policy merely to evade a
 saved result's checks. Any producer change must be explicit and budget-safe.
 
@@ -144,16 +149,18 @@ remain authoritative. Mutation/publication and data-only inspection stay separat
 
 - Repair envelope resolved in D3: only +/-1 inclusive end, exact full quote at
   declared start, independently bounded declared/derived intervals and unchanged
-  v1 source-line semantics. Canonical metadata/artifact representation is still
-  open; root must specify original versus derived fields before step 2 completes.
-- Positive old-context handling: determine how the current witness authority can
-  requalify the exact complete original judgment with a metadata correction,
-  while keeping original native provenance/context and the old-data-only
-  invariant. If that cannot be proved, retain the hold and identify the legitimate
-  existing-budget next action rather than synthesizing qualification. Root/step 2.
-- Authenticate original versus correction-slot questions, actual native admission,
-  original measurement and independent-session ownership. Do not infer roles or
-  multiplicity from raw index counts. Root/step 2 and actual saved-data probe.
+  v1 source-line semantics. Section 15 now specifies/implements the version 2
+  representation on the engineering branch. Root still owns its complete reader,
+  cue/consumer integration and audit before step 2/handoff is complete.
+- Positive old-context handling: section 15 adds explicit current validation and
+  a separate version 2 receipt in the existing witness authority. Original native
+  bytes/context remain unchanged. Complete the held-source cue/preparation and
+  all caller/restart audits before activation; unsupported/missing evidence stays
+  held without a fresh metadata-only model call. Root/step 2.
+- Section 14 now authenticates original/correction slots via actual charged
+  bindings, full questions and original captures; the actual saved-data probe
+  passes. Preserve independent native role/ownership and negative precedence
+  through the version 2 receipt and every consuming caller. Root/step 2/audit.
 - Specify stable cue/rule identity, all guards, typed source-loss/unknown failures,
   bounded fair eligibility and both actual initial/enrolled consuming callers.
   Root/step 2; parser-only success cannot close the issue.
@@ -241,11 +248,12 @@ the unresolved reader/caller contracts in section 6:
   using its original context, plus any exact corrective-question chain. A
   self-reported context, provider name or unverified saved JSON is insufficient.
 - Let the existing witness service represent current qualification separately
-  from the original independent native judgment. A possible Artifact v2 carries
-  current checked context/policy, original native context/raw hash/provenance,
-  exact original plan/result/capture identity and explicit declared/canonical
-  source metadata under a fixed endpoint-repair rule. It never serializes a
-  modified value as the original provider response. V1 reads remain strict.
+  from the original independent native judgment. Section 15's Artifact v2
+  carries current checked context, original native context/raw hash and checked
+  canonical judgment digest, plus original plan/result/capture/native identity
+  under its fixed rule. Declared metadata remains in immutable native raw data;
+  canonical metadata is recomputed and digest-checked on every read. It never
+  serializes a modified value as the provider response. V1 reads remain strict.
 - A metadata-positive requalification cannot use the negative-Unknown cue path
   as if those were the same decision. The existing recovery mechanism needs a
   typed distinction consumed by actual preparation before any new scoper call;
@@ -261,10 +269,10 @@ the unresolved reader/caller contracts in section 6:
   Do not arbitrarily pick a raw row when several indexes refer to one call.
 - A reader must reauthenticate original data/provenance and current checks;
   a path, serialized correction reference or previous policy hash alone cannot
-  grant current qualification. Map current `assert_current`/`current_data`,
-  source-context consumers and workflow/store ownership before choosing stored
-  database/control references or an artifact identity. Keep raw-data inspection
-  distinct from live source/owner/lease authority and terminal retirement.
+  grant current qualification. Section 15 chooses the authoritative references
+  for `assert_current`; finish the `current_data`/source-context/consumer and
+  callback audits. Keep raw-data inspection distinct from live source/owner/
+  lease authority and terminal retirement.
 - Resolve publication crash recovery, typed unavailable causes and dependency-
   changed wake-up before activating the cue. Repeated failed writes on identical
   evidence must not create another cue/model attempt or an unchanged reclaim
@@ -296,11 +304,12 @@ rotation must neither lose the cue nor mint another one. Historical binding is
 data identity, not authority over the current candidate. Source/owner/lease and
 all exact-current-head candidate/review/CI checks remain separate.
 
-`assert_current` and `current_data` currently lack a WorkflowGuard argument, while
-the new fact reader requires protected original-store evidence. Define who
-supplies and authenticates the original workflow/store/control references at
-publication and on every reader/restart, without another authority or ad hoc
-copies. Preserve terminal data-only audit versus permission for new work. Check
+`assert_current` and `current_data` lack a WorkflowGuard argument, while the
+fact reader requires protected original-store evidence. Section 15 now defines
+version 2 publication and restart references: actual guarded store, exact
+configured database path, source/workflow identity and existing native control
+namespace, with consistent read snapshots. Finish the caller audit without
+introducing another authority or ad hoc database copies. Preserve terminal data-only audit versus permission for new work. Check
 resource/native callback ordering so revalidation cannot fence its own legitimate
 in-flight operation or bypass an unresolved earlier one. Source-context consumers
 must distinguish original native context from current checked qualification
@@ -463,3 +472,228 @@ remain unchanged. No qualification, wake-up or dispatch was produced. The
 versioned receipt, valid-positive cutover, decision/negative precedence, typed
 cue, actual preparation/binding integration and full audits remain required
 before this branch can be deployed. These data checks do not restore autoship.
+
+
+## 15. Explicit current requalification receipt and caller regression
+
+The actual `qualify` regression first authenticates a complete disposable command
+capture and original native/controller response under the pre-citation context.
+It then requires the real caller to requalify without fresh native generation.
+The intended RED reached `fresh native scoper unavailable` (20.62 seconds after a
+successful managed compile); its test commit is `83467163`. An earlier run stopped
+at an invalid fixture storage location under the worker-writable build cache.
+Moving that disposable state to private `/tmp` fixed the prerequisite; that
+storage rejection is not the qualification RED.
+
+Chosen rule: `retained-original-witness-current-validation-v1`, implemented by
+this same baseline witness service. It rechecks exact protected original facts,
+all applicable ordered controller/native replies and the complete unchanged
+qualification question. Every structurally valid semantic reply must have direct
+production measurement and its original fixture. An applicable negative/Unknown
+blocks qualification, including an earlier one; no convenient positive run is
+selected. A structurally rejected first reply can remain diagnostic input only
+when its exact authenticated corrective response exists and passes current
+checks. A final malformed reply is never skipped. Unsupported correction
+protocols, missing original records/captures, ambiguous originals or changed
+physical evidence produce a hold rather than metadata-only paid regeneration.
+A genuinely fresh original without any saved witness continues the normal native
+path; free lookup does not create a missing control directory.
+
+Version 1 artifacts keep their strict existing native/current-context validator.
+Version 2 is an explicit separate shape under the existing protected witness
+artifact path. Its fields bind current context and fixed rule; repository,
+workflow, authoritative workflow database and native-control directory; exact
+original plan/result references and composed immutable-data identity; and each
+checked reply's ORIGINAL native context, slot/input, raw-response SHA-256 and
+canonical-judgment SHA-256. Current validation canonicalizes only D3's endpoint
+metadata. The native reply/proof and its declared citation remain immutable;
+checked metadata is a derived value whose digest is rechecked. No native context
+is relabeled as current. The existing 64 KiB private artifact envelope applies;
+oversize is a hold, never truncation or another paid reply.
+
+Writer and readers use the existing workflow evidence service, not another
+approval ledger. Publication runs inside the actual guarded store's immediate
+transaction: lease/binding, supported owner/owner-turn dispatch, active stage and
+unsettled-publication guards precede derivation. It authenticates the prepared
+source, verifies original checkout/integrity/environment and requires the actual
+store path to equal configured workflow authority. All artifact, native-control
+and store locations must lie outside worker-writable roots. Publication uses the
+existing immutable private file protocol. If publication/commit fails, the caller
+fails; any complete file left by an interrupted publication can only be used
+after full restart revalidation and the caller's normal live dispatch guards.
+No charge, workflow transition, approval event or new execution authority is
+created by that file alone.
+
+A restart reader requires that same configured private database, canonical
+repository and matching source/workflow identity (including supported PR alias),
+plus the existing repository/workflow-derived native namespace. It opens a
+read-only SQLite snapshot and reauthenticates original plan/result, actual
+capture streams/receipts, every original native/controller association, composed
+data identity and all current checked digests. The caller's current registration
+integrity check remains. This allows terminal data audit but grants no permission
+to claim or dispatch a terminal/paused workflow. Candidate GREEN, independent
+review, exact-head CI and merge remain separate gates.
+
+Current focused caller GREEN passes (20.68 seconds). Expanded witness components
+pass 23 tests, zero failures, two explicit ignored probes (58.87 seconds), including
+repeat receipt idempotence, distinct current/native contexts, fresh/no-native
+behavior, restart rejection of changed store/workflow/rule/checked digest,
+changed original command output and changed native provenance. Restoring the
+same actual evidence restores the same receipt's validity with unchanged charges.
+A separate seven-scenario publication-fence fixture passes (0.24 seconds): normal
+read succeeds, while pause, pending publication, retired/held stage, expired lease
+and wrong binding refuse derivation before its callback and preserve events.
+All replies/command facts in those unit fixtures are scripted, not production
+behavioral or autonomous-shipping acceptance.
+
+The actual #1830 read-only probe also passes (0.37 seconds): both saved replies
+satisfy the proposed current source/semantic validation against the complete
+captured original result. It writes no receipt, grants no live qualification,
+creates no cue and dispatches no work; all twelve calls and workflow events stay
+unchanged. Before the subsequent freshness hardening, full CLI validation passed
+2,071 tests, zero failures and 42 explicit ignores (340.84 seconds). The final
+post-hardening full CLI passes at the section 16 checkpoint. The positive
+held-source typed cue and actual initial/enrolled preparation/binding/main-
+rotation consumption remain UNIMPLEMENTED, with all corresponding source-loss,
+fairness/crash/budget tests and audits still required. Do not deploy this branch
+or claim autoship restored from the caller/component checks.
+
+
+## 16. Fresh audit triage and authoritative freshness
+
+The fresh-reader audit returned seven findings. Root checked each against the
+current source/spec. The positive cue payload/consumers, complete cue lifecycle,
+binding/head-rotation rules and scheduler bound/fairness remain real open work
+(findings 1–3 and 7). Root owns them as the next implementation stage; they block
+activation and handoff, not owner product decisions. The previous 54-seam map is
+outdated and still is not a completed seam audit. Refresh/check all seams after
+the remaining integration is concrete.
+
+Finding 4 exposed a real freshness defect: removing native-admission events AND
+bounded counters while leaving paid charges/controller proofs caused the reader
+to return empty, allowing it to appear fresh. The targeted regression failed for
+that intended assertion (30.86 seconds). Native lookup now reconciles original
+paid custody with the controller's committed provenance-key associations before
+returning any runs. A provenance key is exactly the versioned hash of another
+known raw slot key (§17); a reference-shaped model reply is not a provenance
+record. Such raw text remains data and cannot claim native history. Its separate
+regression failed for that classification error (5.23 seconds) before the
+association check was added. This retains an actual controller boundary rather
+than trusting JSON shape, a filename supplied by a model, or raw row counts.
+
+Existing custody errors distinguish incomplete/unanswered admission, missing
+committed response, invalid native provenance and unsupported corrective history;
+none permits a fresh metadata-only call. A tagged provenance reference absent
+from paid custody raises the existing unresolved-native-outcome error. If native
+custody is empty but the protected native directory retains a native proof or
+witness artifact marker, history is unavailable, not never-admitted. This also
+catches an otherwise unindexed protected history marker. A genuinely absent
+native directory with no admitted/committed history needs no recovery directory
+and is not created by lookup.
+
+Freshness applies to the COMPLETE unchanged witness question: all global known
+native custody must be coherent, and there must be no applicable saved witness
+for that question. A coherent prior source-selection call or witness for a
+DIFFERENT prepared measurement does not qualify the current measurement; its
+normal next question uses the existing finite budget. A saved applicable witness
+without matching captured original records is held, not regenerated. Current
+policy/context hashing alone cannot make an unchanged question fresh: old
+questions are authenticated using their original context and the complete current
+prepared measurement. No paid charge/counter is erased or refilled by inspection.
+
+Finding 5 is resolved by the versioned encodings and fixed controller/run vector
+in section 17; future codec changes require an explicit new version rather than
+silently changing a stable recovery identity. Finding 6 is resolved for receipt
+files by the immutable-publication outcomes below. The remaining scheduling/
+source-restoration transitions remain part of findings 1–3 and 7 and must still
+be implemented/tested before deployment.
+
+The final witness components pass 25 tests, zero failures, two explicit ignored
+probes (59.68 seconds). They include both corruption and raw-data classification
+regressions, the frozen wire vector and the restart/caller checks in section 15.
+The final actual #1830 read-only probe passes (0.40 seconds), with the same twelve
+calls and unchanged snapshot/events; no receipt/cue/workflow mutation is made.
+The final full CLI passes 2,073 tests, zero failures and 42 explicit ignores
+(342.12 seconds). Neither this checkpoint nor the fresh audit is engineering
+approval or evidence of a live autonomous recovery.
+
+## 17. Frozen identities and receipt publication outcomes
+
+All new identity encodings below are compact UTF-8 JSON from
+`serde_json::to_vec`, followed by SHA-256 and lowercase hexadecimal. Tuples encode
+as ordered arrays; there is no added newline. Maps are Rust `BTreeMap` order;
+struct fields use declaration order. Native raw response and recorded plan/result/
+admission/quiescence hashes use their ORIGINAL stored bytes, never reserialized
+replacement bytes. Path references serialize their exact canonical UTF-8 string.
+Do not change a v1 field order/encoding under the same tag.
+
+- Controller raw key: `["baseline_witness_v1", native_context,
+  admitted_binding.contract, slot]`, slots 0 then 1.
+- Controller proof key: `["native-scope-response-provenance-v1", raw_key]`.
+  This tag belongs to the existing native scoping/witness producer; ordinary raw
+  model output has no authority to choose a key in this protocol.
+- Run identity: `["retained-controller-witness-data-v1", workflow,
+  native_context, admitted_contract, replies]`. Replies are ordered tuples
+  `[slot, native_input, admitted_binding, SHA256(original_response_bytes),
+  native_reference]`. Binding fields are `head`, `contract`, `evidence_hash`;
+  reference fields are `artifact`, `artifact_sha256`. ALL slots participate,
+  including a structurally rejected diagnostic first reply.
+- Exact original-data identity: `["exact-original-result-data-v1", workflow,
+  plan_key, result_key, SHA256(original_plan_body), SHA256(original_result_body),
+  captures, commands]`. `captures` maps verifier ID to `[command_key,
+  SHA256(original_admission_body), SHA256(original_quiescence_body),
+  capture_manifest_sha256]`. `commands` maps verifier ID to fields `exit_code`
+  (integer or null), `stdout`, `stderr`, `interrupted`, `output_complete` in that
+  order. Capture reading independently verifies the physical stream/manifest
+  hashes and receipts; this hash is not a substitute for those checks.
+- Composed witness-data identity: `["retained-original-witness-data-v1",
+  exact_original_data_identity, run_identities]`. Run order is the reader's sorted
+  `(native_context, admitted_contract)` grouping. It excludes current policy/
+  build/generation/live head; ORIGINAL admitted head/context remain immutable facts.
+- A checked-response digest is the compact serialization of current `Judgment`
+  data: fields `version`, `context`, `verifiers`; each verifier has
+  `verifier_id`, `criterion_ids`, `measurement`, `original_fixture_available`,
+  `concrete_input`, `reason`, `production_citations`; each citation has `path`,
+  `start_line`, `end_line`, `quote`. `context` remains the original native context;
+  only D3 permits derived end metadata. Enum spellings stay v1 snake_case.
+
+The receipt schema is exactly `RequalifiedArtifact` (§15): fields `version`,
+`context`, `rule`, `repository`, `workflow`, `workflow_db`, `native_control`,
+`plan`, `result`, `data`, `checked`. Checked record fields are `native_context`,
+`slot`, `input`, `response_sha256`, `canonical_judgment_sha256`. It stores every
+validated semantic reply in run/slot order; a rejected diagnostic first reply is
+omitted from `checked` but remains bound by `data`. All unknown/duplicate typed
+fields are rejected by the existing typed decoder. Writer/readers are this one
+service, never independent approval issuers.
+
+`controller_data_identity_matches_the_frozen_v1_wire_vector` supplies an
+independent fixed vector. For context `c` repeated 64 times, admitted contract
+`original-contract`, slot 0, raw key is
+`42d6eb10975672c7b7b43801c64d5aa42f27a1e41c4bc8eeb37bac797495d2fe`
+and proof key is
+`1bfd3c23c19e1d5297d4fdb3df5145066cabf4a101d1b137eceef9f5c03c2796`.
+Its one-reply run vector (literal binding/reference/input/response bytes are in
+the test) yields
+`1c14cf1ff60dbf28289fc7ce7598289e7ddd543941a9b087bdcadfdd07653f7f`.
+These are synthetic wire values, never provider evidence or a qualification.
+
+Receipt publication follows the existing private immutable protocol:
+
+| Interruption/state | Result and ownership |
+| --- | --- |
+| Before final publication | Named private temporary file is not an artifact. Normal error/drop cleanup removes it; unclean-exit leftovers remain under existing protected-state lifecycle/retention ownership (#1799), never build-cache pruning. A receipt temporary file is bounded by 64 KiB. No current grant or model retry follows. |
+| Complete final file, caller/commit interrupted | Restart may use it only after full current/original/native revalidation and normal live dispatch guards; data alone does not create a lease or refill budgets. |
+| Existing byte-identical final file | Idempotent reuse; no rewrite or new publication episode. |
+| Partial, conflicting, malformed or nonprivate final file | Current validation fails and work remains held; never overwrite a native reply/proof or spend a model call to replace it. A conflict is not proof of a negative semantic decision. |
+| Original evidence lost, then same bytes restored | Full restart revalidation restores the same receipt's validity and charges; the unit caller test exercises this. |
+| Changed current policy with complete compatible original facts | A separately checked current-context receipt is derived by §15. Old receipts/raw facts remain immutable; no new model allowance follows solely from the policy hash. |
+| Inapplicable/negative/unsupported native history | Hold or existing independent negative-repair path, as applicable; no current positive receipt is manufactured. |
+
+A final conflict/tamper hold needs restoration of authentic controller state or
+an explicitly supported repair of derived metadata; this change does not add an
+operator overwrite command. No raw database copies, ad hoc rollback directories,
+receipt deletion, snapshot-limit override or native-response rewrite is an
+activation path. Existing protected-state retention owns obsolete evidence;
+this patch adds no second copy or independent retention pool. The typed cue must
+retain its same episode through failed publication and genuine source restoration
+without unchanged productive reclaims; that scheduling work is still open.

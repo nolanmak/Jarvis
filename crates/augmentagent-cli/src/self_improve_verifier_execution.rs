@@ -68,6 +68,25 @@ pub(in crate::self_improve) struct OriginalResultData {
     pub(super) prepared:PreparedAcceptance,
     pub(super) commands:BTreeMap<String,CapturedCommandData>,
 }
+/// Locate exact prepared measurement references before opening command streams.
+/// These references are data only; callers must recheck exact_original_result.
+pub(super) fn matching_original_results(prepared:&PreparedAcceptance,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<(String,String)>> {
+    let wanted=serde_json::to_vec(&(&prepared.proposal,&prepared.baseline))?;
+    let mut cursor=0;let mut matches=std::collections::BTreeSet::new();
+    loop {
+        let rows=evidence.page("original_verifier_result",cursor)?;if rows.is_empty(){break;}
+        for row in rows {
+            cursor=row.sequence;let record:RecordedResult=serde_json::from_str(&row.body)?;
+            ensure!(record.version==1 && record.kind=="original_verifier_result" && record.workflow==evidence.workflow()
+                && result_key(&record.plan,&record.attempt)==row.key,"original result index changed");
+            let body=evidence.record(&record.plan,"original_verifier_plan")?.context("original plan missing")?;
+            let plan=Plan::checked(evidence.workflow(),&record.plan,&body)?;
+            if serde_json::to_vec(&(&plan.proposal,&record.baseline))?==wanted {matches.insert((record.plan,row.key));}
+        }
+    }
+    Ok(matches.into_iter().collect())
+}
+
 pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
     require_correction_commands(evidence)?;
     let body=evidence.record(plan_key,"original_verifier_plan")?.context("original plan missing")?;

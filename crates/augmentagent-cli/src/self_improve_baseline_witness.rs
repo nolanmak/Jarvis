@@ -37,6 +37,20 @@ struct Artifact {
     provenance:scope_authority::NativeReplyReference,
 }
 
+const REQUALIFICATION_RULE:&str="retained-original-witness-current-validation-v1";
+#[derive(Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct CheckedNativeResponse {
+    native_context:String,slot:u32,input:String,response_sha256:String,canonical_judgment_sha256:String,
+}
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequalifiedArtifact {
+    version:u32,context:String,rule:String,repository:String,workflow:String,
+    workflow_db:PathBuf,native_control:PathBuf,plan:String,result:String,data:String,
+    checked:Vec<CheckedNativeResponse>,
+}
+
 pub(super) fn policy_hash()->String {
     amendment::digest(&serde_json::to_vec(&("original-production-witness-v1",amendment::digest(include_bytes!("self_improve_baseline_witness.rs")),
         amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
@@ -295,6 +309,11 @@ pub(super) fn retained_original_witness_data(root:&Path,control:&Path,plan:&str,
     let identity=amendment::digest(&serde_json::to_vec(&("retained-original-witness-data-v1",&original.identity,identities))?);
     Ok(Some(RetainedOriginalWitnessData {identity,original,runs}))
 }
+fn retained_run_identity(workflow:&str,origin:&str,contract:&str,replies:&[RetainedWitnessReplyData])->Result<String> {
+    let identities=replies.iter().map(|reply|(reply.slot,&reply.input,&reply.binding,
+        amendment::digest(reply.response.as_bytes()),&reply.provenance)).collect::<Vec<_>>();
+    Ok(amendment::digest(&serde_json::to_vec(&("retained-controller-witness-data-v1",workflow,origin,contract,identities))?))
+}
 fn witness_controller_keys(origin:&str,contract:&str,slot:u32)->(String,String) {
     let raw=amendment::digest(&serde_json::to_vec(&("baseline_witness_v1",origin,contract,slot)).unwrap());
     let proof=amendment::digest(&serde_json::to_vec(&("native-scope-response-provenance-v1",&raw)).unwrap());
@@ -305,6 +324,46 @@ fn retained_witness_proof(reference:&scope_authority::NativeReplyReference)->Res
     ensure!(amendment::digest(&bytes)==reference.artifact_sha256,"controller witness provenance changed");
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn require_admitted_native_references(evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    let known=custody.iter().map(|observed| {
+        let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observed.provenance)?;
+        Ok(serde_json::to_string(&reference)?)
+    }).collect::<Result<BTreeSet<_>>>()?;
+    let mut after=String::new();let mut keys=Vec::new();
+    loop {
+        let page=evidence.scope_keys(&after)?;if page.is_empty(){break;}
+        after=page.last().unwrap().clone();keys.extend(page);
+    }
+    // Only the controller's versioned provenance-key association supplies a
+    // proof record. Reference-shaped MODEL OUTPUT cannot vouch for history.
+    let proof_keys=keys.iter().map(|raw|amendment::digest(&serde_json::to_vec(&(
+        "native-scope-response-provenance-v1",raw)).unwrap())).collect::<BTreeSet<_>>();
+    for key in keys.iter().filter(|key|proof_keys.contains(*key)) {
+        let raw=evidence.scope_response(key)?.context("scope provenance disappeared during native inspection")?;
+        let reference:scope_authority::NativeReplyReference=serde_json::from_str(&raw)
+            .context("committed native provenance reference is malformed")?;
+        if !known.contains(&serde_json::to_string(&reference)?) {
+            return Err(anyhow::Error::new(crate::autoship_workflow::NativeScopeOutcomeUnresolved)
+                .context("stored native proof has lost its original paid admission"));
+        }
+    }
+    Ok(())
+}
+
+fn require_empty_native_history(control:&Path)->Result<()> {
+    let entries=match std::fs::read_dir(control) {
+        Ok(entries)=>entries,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),Err(error)=>return Err(error.into()),
+    };
+    for entry in entries {
+        let name=entry?.file_name();let Some(name)=name.to_str() else {continue};
+        if name.ends_with(".json") && (name.starts_with("primary-scope-") || name.starts_with("baseline-witness-")) {
+            return Err(anyhow::Error::new(crate::autoship_workflow::NativeScopeOutcomeUnresolved)
+                .context("protected native witness history exists without paid admission custody"));
+        }
+    }
+    Ok(())
+}
 pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<RetainedWitnessRunData>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"controller witness contract changed");
@@ -314,6 +373,8 @@ pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&Prepa
     let admissions=evidence.native_admissions()?;
     let bindings=admissions.iter().map(|data|(data.custody.input.clone(),data.binding.clone())).collect::<BTreeMap<_,_>>();
     let custody=admissions.into_iter().map(|data|data.custody).collect::<Vec<_>>();
+    require_admitted_native_references(evidence,&custody)?;
+    if custody.is_empty() {require_empty_native_history(control)?;return Ok(Vec::new());}
     retained_namespace(control,&custody)?;
     scope_authority::require_retained_native_custody(root,&custody)?;
     let base=prepared.baseline.registration.baseline_head();
@@ -359,12 +420,94 @@ pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&Prepa
             ensure!(request!=original_question && retained_question_matches(root,prepared,control,&origin,request,&custody)?,
                 "corrective controller witness question is unavailable or changed");
         }
-        let identities=replies.iter().map(|reply|(reply.slot,&reply.input,&reply.binding,
-            amendment::digest(reply.response.as_bytes()),&reply.provenance)).collect::<Vec<_>>();
-        let identity=amendment::digest(&serde_json::to_vec(&("retained-controller-witness-data-v1",evidence.workflow(),&origin,&contract,identities))?);
+        let identity=retained_run_identity(evidence.workflow(),&origin,&contract,&replies)?;
         runs.push(RetainedWitnessRunData {identity,context:origin,replies});
     }
     Ok(runs)
+}
+
+fn checked_retained_responses(root:&Path,data:&RetainedOriginalWitnessData)->Result<Vec<CheckedNativeResponse>> {
+    let prepared=&data.original.prepared;let mut checked=Vec::new();
+    for run in &data.runs {
+        ensure!(!run.replies.is_empty(),"retained witness run has no completed decision");
+        for reply in &run.replies {
+            let judgment=match validate(root,&prepared.proposal,&prepared.baseline,&run.context,&reply.response) {
+                Ok(judgment)=>judgment,
+                // A rejected first response is diagnostic input to its exact
+                // authenticated correction. A later response is never skipped.
+                Err(error) if reply.slot==0 && run.replies.len()==2 && error.downcast_ref::<initial_repair::Hold>().is_none()=>continue,
+                Err(error)=>return Err(error),
+            };
+            // Every applicable negative, including an earlier Unknown, blocks
+            // positive qualification. Never pick a convenient positive run.
+            disposition(&judgment)?;
+            checked.push(CheckedNativeResponse {native_context:run.context.clone(),slot:reply.slot,input:reply.input.clone(),
+                response_sha256:amendment::digest(reply.response.as_bytes()),
+                canonical_judgment_sha256:amendment::digest(&serde_json::to_vec(&judgment)?)});
+        }
+        ensure!(checked.last().is_some_and(|last|last.native_context==run.context && last.slot==run.replies.last().unwrap().slot),
+            "final retained witness response was not checked");
+    }
+    ensure!(!checked.is_empty(),"retained witness has no checked decision");
+    Ok(checked)
+}
+fn requalification_error(error:anyhow::Error)->anyhow::Error {
+    if error.downcast_ref::<BaselineNotRed>().is_some() {error}else {error.context(initial_repair::Hold::EvidenceUnknown)}
+}
+fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
+    workflow.validate_acceptance_source(prepared)?;
+    let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    workflow.with_qualification_evidence(|database,evidence| {
+        (||->Result<bool> {
+            if retained_controller_slots(root,&native_control,prepared,evidence)?.is_empty() {return Ok(false);}
+            let references=verifier_execution::matching_original_results(prepared,evidence)?;
+            ensure!(references.len()==1,"retained witness original measurement is missing or ambiguous");
+            let (plan,result)=&references[0];
+            let data=retained_original_witness_data(root,&native_control,plan,result,evidence)?.context("retained original witness data missing")?;
+            ensure!(serde_json::to_vec(&data.original.prepared)?==serde_json::to_vec(prepared)?,"retained original measurement changed");
+            let checked=checked_retained_responses(root,&data)?;
+            ensure!(workflow::path().canonicalize()?==database,"retained qualification store differs from configured authority");
+            let control=control.canonicalize()?;let native_control=native_control.canonicalize()?;
+            for writable in worker_roots(root) {
+                if writable.exists() {let writable=writable.canonicalize()?;
+                    ensure!(!control.starts_with(&writable) && !native_control.starts_with(&writable) && !database.starts_with(&writable),
+                        "retained qualification authority is writable by worker");
+                }
+            }
+            let expected=context(&prepared.proposal,&prepared.baseline)?;
+            let artifact=RequalifiedArtifact {version:2,context:expected.clone(),rule:REQUALIFICATION_RULE.into(),
+                repository:workflow.repository().into(),workflow:workflow.id().into(),workflow_db:database.into(),native_control,
+                plan:plan.clone(),result:result.clone(),data:data.identity,checked};
+            let bytes=serde_json::to_vec(&artifact)?;ensure!(bytes.len()<=64*1024,"retained qualification receipt exceeds envelope");
+            immutable(&control,&artifact_path(&control,&expected),&bytes)?;
+            Ok(true)
+        })().map_err(requalification_error)
+    })
+}
+fn assert_requalified(root:&Path,prepared:&PreparedAcceptance,expected:&str,artifact:RequalifiedArtifact)->Result<()> {
+    ensure!(artifact.version==2 && artifact.context==expected && artifact.rule==REQUALIFICATION_RULE,"retained qualification rule/context changed");
+    let repository=crate::autoship_workflow::submission::normalized_repository(&artifact.repository)?;
+    ensure!(repository==artifact.repository,"retained qualification repository is not canonical");
+    let configured=workflow::path();
+    ensure!(artifact.workflow_db.is_absolute() && artifact.workflow_db==configured.canonicalize()?,"retained qualification store changed");
+    let native_control=control_directories(&repository,&artifact.workflow)?.workflow_acceptance.canonicalize()?;
+    ensure!(artifact.native_control==native_control,"retained qualification native namespace changed");
+    for writable in worker_roots(root) {if writable.exists() {let writable=writable.canonicalize()?;
+        ensure!(!artifact.workflow_db.starts_with(&writable) && !native_control.starts_with(&writable),"retained qualification authority overlaps worker");
+    }}
+    let store=crate::autoship_workflow::WorkflowStore::open_read_only(&configured)?.context("retained qualification store unavailable")?;
+    let owned=match prepared.proposal.contract.source()? {
+        AcceptanceSource::Issue(number)=>artifact.workflow==crate::autoship_workflow::workflow_id(&repository,number)?,
+        AcceptanceSource::PullRequest(number)=>artifact.workflow==crate::autoship_workflow::pr_workflow_id(&repository,number)?
+            || store.resolve_pr(&repository,number)?.as_deref()==Some(artifact.workflow.as_str()),
+    };
+    ensure!(owned,"retained qualification belongs to another source");
+    store.read_verifier_evidence(&artifact.workflow,|evidence| {
+        let data=retained_original_witness_data(root,&native_control,&artifact.plan,&artifact.result,evidence)?.context("retained qualification original data unavailable")?;
+        ensure!(data.identity==artifact.data && serde_json::to_vec(&data.original.prepared)?==serde_json::to_vec(prepared)?,"retained qualification original/native facts changed");
+        ensure!(checked_retained_responses(root,&data)?==artifact.checked,"retained qualification checked data changed");
+        Ok(())
+    })
 }
 
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
@@ -381,8 +524,13 @@ pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptan
     for writable in worker_roots(root) {if writable.exists() {ensure!(!control.starts_with(writable.canonicalize()?),"baseline qualification is writable by worker");}}
     let path=artifact_path(&control,&expected);
     if !path.try_exists()? {bail!("baseline_witness_unqualified: protected original-production qualification is missing");}
+    let bytes=private_bytes(&path,64*1024).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    let header:serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|anyhow::Error::from(e).context(initial_repair::Hold::EvidenceUnknown))?;
+    if header["version"]==2 {
+        return (||->Result<()> {assert_requalified(root,prepared,&expected,serde_json::from_slice(&bytes)?)})().map_err(requalification_error);
+    }
     let checked=(||->Result<Judgment> {
-        let artifact:Artifact=serde_json::from_slice(&private_bytes(&path,64*1024)?)?;
+        let artifact:Artifact=serde_json::from_slice(&bytes)?;
         ensure!(artifact.version==1 && artifact.context==expected,"baseline witness artifact context changed");
         ensure!(artifact.native_control.is_absolute() && artifact.native_control.canonicalize()?==artifact.native_control,"native witness authority directory changed");
         ensure!(artifact.response_sha256.len()==64 && artifact.response_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid witness response identity");
@@ -416,6 +564,7 @@ pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptanc
     prepared.baseline.registration.verify_integrity(root)?;
     ensure!(environment_id(root)?==prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id,
         "baseline_witness_invalid: environment changed before production witness qualification");
+    if requalify_retained(root,control,prepared,workflow)? {return assert_current(root,control,prepared);}
     let prompt=qualification_prompt(&expected,prepared)?;
     // Frozen controller policy from main 7353e9cd. This reconstructs the exact
     // original request; it grants reuse of source data, never old approval.
@@ -917,7 +1066,7 @@ mod tests {
     fn controller_slots_use_paid_historical_bindings_and_preserve_corrective_unknown() {
         use std::os::unix::fs::PermissionsExt;
         use crate::autoship_workflow::{WorkflowStore,Binding,submission::Provider};
-        for fault in ["none","missing-controller","foreign-controller-proof","missing-native-proof","changed-corrective-question"] {
+        for fault in ["none","missing-controller","foreign-controller-proof","missing-native-proof","changed-corrective-question","lost-admission-and-counter"] {
             let (root,control,prepared)=fixture();
             std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
             persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
@@ -965,6 +1114,11 @@ mod tests {
                 if fault=="missing-controller" {conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![id,raw]).unwrap();}
                 else {conn.execute("UPDATE scope_stage_response SET response=?3 WHERE workflow=?1 AND key=?2",rusqlite::params![id,proof,serde_json::to_string(&references[0]).unwrap()]).unwrap();}
             }
+            if fault=="lost-admission-and-counter" {
+                let conn=rusqlite::Connection::open(&database).unwrap();
+                conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted'",[id]).unwrap();
+                conn.execute("DELETE FROM bounded_attempt WHERE workflow=?1",[id]).unwrap();
+            }
             let store=WorkflowStore::open_read_only(&database).unwrap().unwrap();
             let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
             let runs=retained_controller_slots(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id));
@@ -980,6 +1134,54 @@ mod tests {
             assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
             assert_eq!(before.unwrap().model_calls,2,"fixture's recorded admissions changed during inspection");
         }
+    }
+
+    #[test]
+    fn controller_data_identity_matches_the_frozen_v1_wire_vector() {
+        let origin="c".repeat(64);let contract="original-contract";
+        let (raw,proof)=witness_controller_keys(&origin,contract,0);
+        assert_eq!(raw,"42d6eb10975672c7b7b43801c64d5aa42f27a1e41c4bc8eeb37bac797495d2fe");assert_eq!(proof,"1bfd3c23c19e1d5297d4fdb3df5145066cabf4a101d1b137eceef9f5c03c2796");
+        let replies=[RetainedWitnessReplyData {slot:0,input:"a".repeat(64),
+            binding:crate::autoship_workflow::Binding {head:"d".repeat(40),contract:contract.into(),evidence_hash:"e".repeat(64)},
+            response:"raw native response\n".into(),provenance:scope_authority::NativeReplyReference {
+                artifact:"/controller/primary-scope-00000000-0000-0000-0000-000000000000.json".into(),artifact_sha256:"b".repeat(64)}}];
+        assert_eq!(retained_run_identity("owner/repo#7",&origin,contract,&replies).unwrap(),"1c14cf1ff60dbf28289fc7ce7598289e7ddd543941a9b087bdcadfdd07653f7f");
+    }
+
+    #[test]
+    fn reference_shaped_model_output_cannot_claim_native_admission_history() {
+        let (root,control,prepared)=fixture();
+        let database=control.path().join("workflow.db");let id="owner/repo/pr/840";
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let binding=crate::autoship_workflow::Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"environment".into()};
+        store.register(id,"fixture",binding.clone(),1).unwrap();let lease=store.claim(id,"fixture",2,1000).unwrap().unwrap();
+        store.charge(&lease,"ordinary-scoper-fixture",crate::autoship_workflow::ResourceCharge {model_calls:1,tokens:2,wall_ms:3},3).unwrap();
+        let claimed=scope_authority::NativeReplyReference {artifact:control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4())),artifact_sha256:"b".repeat(64)};
+        // An invalid ordinary model reply is raw data, not a controller proof
+        // record. Its key has no native-provenance association to another slot.
+        store.record_scope_stage_response(&lease,&binding,&"a".repeat(64),&serde_json::to_string(&claimed).unwrap(),4).unwrap();
+        store.release(&lease,5).unwrap();
+        let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
+        assert!(retained_controller_slots(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id)).unwrap().is_empty(),
+            "raw model text was treated as native-controller evidence");
+        assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
+    }
+
+    #[test]
+    fn fresh_original_without_native_admissions_does_not_require_a_recovery_directory() {
+        let (root,control,prepared)=fixture();
+        let database=control.path().join("workflow.db");let id="owner/repo/pr/840";
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        store.register(id,"fixture",crate::autoship_workflow::Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"environment".into()},1).unwrap();
+        let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
+        let absent=control.path().join("no-native-directory-yet");
+        assert!(retained_controller_slots(root.path(),&absent,&prepared,&store.inspect_verifier_evidence(id)).unwrap().is_empty());
+        assert!(!absent.exists());assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
+        std::fs::create_dir(&absent).unwrap();
+        std::fs::write(absent.join("baseline-witness-old-context.json"),b"lost historical witness").unwrap();
+        assert!(retained_controller_slots(root.path(),&absent,&prepared,&store.inspect_verifier_evidence(id)).is_err(),
+            "lost witness ledger was treated as never-admitted despite protected historical evidence");
+        assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
     }
 
     #[cfg(target_os="linux")]
@@ -1045,7 +1247,39 @@ mod tests {
                 "metadata-only requalification admitted another model call");
             assert_eq!(private_bytes(&reference.artifact,64*1024).unwrap(),native_bytes,"qualification rewrote native provenance");
             assert_eq!(store.inspect_baseline_native_custody(guard.id()).unwrap().len(),1);
-            guard.finish().unwrap();return;
+            let receipt_path=artifact_path(control.path(),&current);let receipt_bytes=private_bytes(&receipt_path,64*1024).unwrap();
+            let receipt:RequalifiedArtifact=serde_json::from_slice(&receipt_bytes).unwrap();
+            assert_eq!(receipt.version,2);assert_eq!(receipt.context,current);
+            assert!(receipt.checked.iter().all(|reply|reply.native_context==origin && reply.native_context!=current
+                && reply.response_sha256==amendment::digest(raw.as_bytes())),"receipt relabeled original native evidence");
+            qualify(root.path(),control.path(),&prepared,&guard).await.unwrap();
+            assert_eq!(private_bytes(&receipt_path,64*1024).unwrap(),receipt_bytes,"repeat qualification rewrote its immutable receipt");
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            assert_current(root.path(),control.path(),&prepared).unwrap();
+            for field in ["workflow_db","workflow","rule","checked"] {
+                let mut changed:serde_json::Value=serde_json::from_slice(&receipt_bytes).unwrap();
+                match field {
+                    "workflow_db"=>changed[field]="/tmp/untrusted-other-workflow.db".into(),
+                    "workflow"=>changed[field]="owner/repo/pr/841".into(),
+                    "rule"=>changed[field]="unreviewed-import-rule".into(),
+                    _=>changed["checked"][0]["canonical_judgment_sha256"]="f".repeat(64).into(),
+                }
+                std::fs::write(&receipt_path,changed.to_string()).unwrap();
+                assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted changed receipt {field}");
+            }
+            std::fs::write(&receipt_path,&receipt_bytes).unwrap();
+            let admission=store.inspect_verifier_evidence(&id).page("original_verifier_command_admission",0).unwrap();
+            let admission:serde_json::Value=serde_json::from_str(&admission[0].body).unwrap();
+            let stdout=PathBuf::from(admission["capture"]["path"].as_str().unwrap()).join("stdout");
+            std::fs::write(&stdout,b"true\n").unwrap();
+            assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted receipt without rechecking original command output");
+            std::fs::write(&stdout,b"false\n").unwrap();
+            std::fs::write(&reference.artifact,b"changed proof").unwrap();
+            assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"restart trusted receipt without original native provenance");
+            std::fs::write(&reference.artifact,&native_bytes).unwrap();
+            assert_current(root.path(),control.path(),&prepared).unwrap();
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
+            return;
         }
         let scripts=tempfile::tempdir_in("/tmp").unwrap();let script=scripts.path().join("gh");
         let out=std::process::Command::new(std::env::current_exe().unwrap())
@@ -1195,6 +1429,8 @@ mod tests {
                         .expect("actual complete original result and controller slots cannot be authenticated together");
                     assert_eq!(checked.identity.len(),64);assert_eq!(checked.original.identity,data.identity);
                     assert_eq!(checked.runs.len(),1);assert_eq!(checked.runs[0].replies.len(),2);
+                    assert_eq!(checked_retained_responses(&recovery.worktree,&checked).unwrap().len(),2,
+                        "actual saved judgments do not both satisfy current source/semantic checks");
                     captured_originals+=1;
                 }
             }

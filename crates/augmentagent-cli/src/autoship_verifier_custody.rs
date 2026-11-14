@@ -165,6 +165,28 @@ impl WorkflowStore {
         tx.commit()?;Ok(())
     }
 
+    /// One SQLite read snapshot for derived-evidence readers, including restart.
+    pub(crate) fn read_verifier_evidence<T>(&self,workflow:&str,read:impl FnOnce(&VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        let tx=self.conn.unchecked_transaction()?;
+        let result=read(&VerifierEvidenceInspection::new(&tx,workflow))?;
+        tx.commit()?;Ok(result)
+    }
+
+    /// Deriving protected qualification metadata is fenced by the same live
+    /// dispatch/owner-turn authority, plus unsettled-publication exclusion.
+    pub(crate) fn with_qualification_evidence<T>(&mut self,lease:&Lease,binding:&Binding,now:i64,
+        read:impl FnOnce(&Path,&VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        let database=Path::new(self.conn.path().context("qualification requires a persistent workflow store")?).canonicalize()?;
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        owner_turn::require_native_dispatch(&tx,lease,now)?;
+        ensure!(!qualification_recovery::pending_mutation(&tx,&lease.workflow)?,"qualification has unsettled publication");
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+        ensure!(!matches!(serde_json::from_str::<Checkpoint>(&raw)?.stage,Stage::Held|Stage::Merged|Stage::Retired),"qualification workflow is not active");
+        let result=read(&database,&VerifierEvidenceInspection::new(&tx,&lease.workflow))?;
+        tx.commit()?;Ok(result)
+    }
+
     pub(crate) fn inspect_verifier_evidence<'a>(&'a self,workflow:&'a str)->VerifierEvidenceInspection<'a> {
         VerifierEvidenceInspection::new(&self.conn,workflow)
     }

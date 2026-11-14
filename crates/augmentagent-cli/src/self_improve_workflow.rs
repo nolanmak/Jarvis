@@ -1657,6 +1657,13 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
     }
 
+    pub(super) fn with_qualification_evidence<T>(&self,
+        read:impl FnOnce(&Path,&durable::VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        self.healthy_lease()?;self.audit.protected_health()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow evidence lock poisoned"))?
+            .with_qualification_evidence(&self.lease,&self.binding,millis(),read)
+    }
+
     pub(super) fn record_verifier_evidence(&self,key:&str,kind:&str,body:&str)->Result<()> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
