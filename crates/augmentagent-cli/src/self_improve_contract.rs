@@ -1135,6 +1135,7 @@ pub(super) fn require_qualified_baseline(root:&Path,control:&Path,prepared:&Prep
 
 async fn qualify_original_baseline(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
     if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    if baseline_witness::qualify_known_retained(root,control,prepared,workflow)? {return Ok(());}
     let directory=tempfile::Builder::new().prefix("witness-baseline-").tempdir_in(control)?;
     let baseline=directory.path().join("checkout");let path=baseline.to_str().context("original baseline checkout UTF8")?;
     trusted_git(root,&["worktree","add","--detach",path,prepared.baseline.registration.baseline_head()]).await?;

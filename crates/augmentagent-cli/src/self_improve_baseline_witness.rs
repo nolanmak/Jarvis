@@ -496,6 +496,29 @@ pub(super) fn require_retained_publication(root:&Path,control:&Path,repository:&
     recovery_publication::probe(&control,&artifact_path(&control,&expected),&bytes,prepared_bytes.len()+manifest_bytes.len())
 }
 
+/// A saved positive recovery reference admits data validation, never a new
+/// witness or execution. Original facts come from immutable Git/capture/native
+/// custody; a later candidate HEAD need not be checked out a second time.
+pub(super) fn qualify_known_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
+    workflow.validate_acceptance_source(prepared)?;
+    if workflow.retained_qualification_reference(prepared).map_err(requalification_error)?.is_none() {return Ok(false);}
+    prepared.baseline.registration.verify_integrity(root).map_err(requalification_error)?;
+    (||->Result<()> {
+        let base=prepared.baseline.registration.baseline_head();
+        ensure!(recovery_environment::original_environment(root,base,&prepared.proposal.files)?
+            ==prepared.baseline.registration.binding(base)?.environment_id,
+            "original qualification environment remains unavailable");
+        Ok(())
+    })().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    // Known-data recovery must not fall through to native generation or paid
+    // amendment when source facts or the current semantic judgment refuse it.
+    (||->Result<()> {
+        ensure!(requalify_retained(root,control,prepared,workflow)?,"known retained original witness unavailable");
+        assert_current(root,control,prepared)
+    })().map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    Ok(true)
+}
+
 fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
     let retained=workflow.retained_qualification_reference(prepared).map_err(requalification_error)?;
@@ -1515,8 +1538,38 @@ mod tests {
                 &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
             assert_eq!(serde_json::to_vec(&enrolled).unwrap(),serde_json::to_vec(&prepared).unwrap());
             assert_eq!(reasoner.calls(),0,"retained metadata preparation made a paid model call");
-            let outcome=qualify(root.path(),&native_control,&prepared,&guard).await;
+            // Retained-data qualification must survive a later candidate head
+            // without a second checkout. Fresh native qualification still
+            // requires the original head and environment.
+            std::fs::write(root.path().join("Cargo.lock"),b"candidate-only compiler input\n").unwrap();
+            for args in [vec!["add","Cargo.lock"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","candidate compiler change"]] {
+                let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();
+                assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            }
+            assert_ne!(actual_head(root.path()).await.unwrap(),base);
+            assert_ne!(environment_id(root.path()).unwrap(),prepared.baseline.registration.binding(base).unwrap().environment_id);
+            let fresh=qualify(root.path(),&native_control,&prepared,&guard).await.unwrap_err();
+            assert!(format!("{fresh:#}").contains("original baseline checkout"),"fresh native qualification lost its original-head fence");
+            guard.checkpoint_qualification_source(&prepared).await.unwrap();
+            let blocked_worktrees=root.path().join(".git/worktrees");
+            std::fs::write(&blocked_worktrees,b"worktree creation unavailable\n").unwrap();
+            let harness=root.path().join(prepared.proposal.files.keys().next().unwrap());
+            let original_harness=std::fs::read(&harness).unwrap();
+            std::fs::write(&harness,b"changed verifier\n").unwrap();
+            let changed=qualify_original_baseline(root.path(),&native_control,&prepared,&guard).await.unwrap_err();
+            assert_eq!(changed.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"changed harness fell through to a fresh checkout");
+            std::fs::write(&harness,&original_harness).unwrap();
+            let unavailable_proof=native_control.join("fixture-unavailable-qualified-proof");
+            std::fs::rename(&reference.artifact,&unavailable_proof).unwrap();
+            let missing=qualify_original_baseline(root.path(),&native_control,&prepared,&guard).await.unwrap_err();
+            assert_eq!(missing.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"lost native proof fell through to fresh qualification");
+            assert!(!artifact_path(&native_control,&current).exists(),"refused retained facts published qualification");
+            std::fs::rename(&unavailable_proof,&reference.artifact).unwrap();
+            let outcome=qualify_original_baseline(root.path(),&native_control,&prepared,&guard).await;
             assert!(outcome.is_ok(),"complete retained original witness required new native generation instead of current requalification: {outcome:?}");
+            assert_eq!(std::fs::read(&blocked_worktrees).unwrap(),b"worktree creation unavailable\n");
+            assert!(!std::fs::read_dir(&native_control).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().starts_with("witness-baseline-")),"retained data allocated an unnecessary original checkout");
+            assert_eq!(reasoner.calls(),0);
             assert_current(root.path(),&native_control,&prepared).unwrap();
             let unpublished=native_control.join("fixture-unpublished-prepared.json");
             std::fs::rename(&prepared_path,&unpublished).unwrap();

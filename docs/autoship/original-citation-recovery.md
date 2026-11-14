@@ -1194,12 +1194,93 @@ review, exact-head hosted CI, supported snapshot, protected merge and updater
 rollout remain required. Natural ordinary shipping and the complete #1703
 acceptance remain unproven.
 
-The next source-comparison checkpoint is `qualify_original_baseline`: it still
-creates an original temporary worktree when the current receipt is absent,
-including for an authenticated retained measurement. Validate that dependency
-and its resource/failure behavior before declaring the entire connected recovery
-path ready. Do not drop fresh-witness original-head/environment gates, substitute
-candidate code for original facts, or admit new native calls to repair metadata.
-Any data-only optimization must prove the recorded original head, original
-measurement, native question/provenance, original environment and every current
-semantic criterion under the normal live owner/lease/dispatch fences.
+The next source-comparison checkpoint was `qualify_original_baseline`, which
+created an original temporary worktree even for retained-data recovery. The
+decision and implementation status for removing that dependency are in §25.
+
+## 25. Retained-data qualification without a second original checkout
+
+D14. Only an existing authenticated V2 retained-witness reference may take the
+data-only path before original-worktree creation. It must pass the normal live
+source, owner, lease and dispatch checks, candidate harness integrity, immutable
+original environment reconstruction, full captured original result and complete
+native question/provenance revalidation. The actual receipt writer remains
+`requalify_retained`, followed by the normal `assert_current` reader; there is no
+second approval mechanism. Missing, corrupt or incompatible retained data stays
+held under the same cue and never falls through to fresh witness generation.
+
+Why: this path reads and revalidates completed original observations; it neither
+executes the candidate nor asks a new witness. Requiring a second checkout adds
+Git shared-metadata writes and a full-tree allocation without strengthening those
+facts. Original captured head and environment are still mandatory. A later
+candidate head or candidate compiler-file edit cannot replace original facts:
+source and environment come from the immutable original base plus the original
+registered proposal overlays, and current tools must match the original
+environment identity. This is not permission to run an old measurement in the
+candidate environment or certify current candidate behavior.
+
+No-reference, fresh and legacy qualification retain their existing original
+checkout path. In particular, `baseline_witness::qualify` still checks actual
+checkout HEAD, harness integrity and installed environment before generating any
+new native witness. Missing original setup in those paths remains a real failure.
+Current independent review, candidate GREEN, CI and merge requirements are
+unchanged. Data-only recovery cannot itself authorize a builder until actual
+prepared publication and the existing guarded settlement succeed.
+
+Implementation checkpoint: the real `qualify_original_baseline` caller now uses
+`qualify_known_retained` before creating a worktree. A regression for both issue
+and PR sources advances the
+candidate HEAD, changes a candidate compiler input and makes Git worktree
+creation unavailable. It proves successful requalification without a new
+checkout or native admission, while direct fresh qualification still refuses
+the candidate HEAD. The joined witness checkpoint passed **27 tests, zero
+failures, two explicit read-only ignores**. Changed-harness and lost-native-proof
+checks at this production caller also passed in the full joined CLI run:
+**2,097 passed, zero failures, 42 explicit ignores, 374.77 seconds**. This is branch
+implementation evidence, not deployment or ordinary acceptance. §26 remains an
+explicit final-handoff/activation blocker.
+The final explicit read-only #1830 inventory passed in 11.26 seconds with its
+snapshot/events and twelve historical model calls unchanged; it published no
+qualification and queued no work.
+
+## 26. Fresh-audit finding still blocking final handoff
+
+The fresh-reader audit of §§1–25 identified one unresolved liveness contract:
+advisory readiness may pass while a later real writer repeatedly fails the same
+operation. A stable cue prevents another initial grant, but restoration episodes
+alone do not prove changed setup dependencies. The five-minute inspection
+cooldown controls rate; it is not a dependency-change predicate or a complete
+bound on productive claims. The new data-only path in §25 removes the full
+original-checkout dependency, but does not resolve this general writer gap.
+
+The current source comparison identifies these real operations:
+
+| Real writer | Readiness evidence | Remaining distinction |
+| --- | --- | --- |
+| `harness_parent`: validate/create declared directories | The same helper runs during harness readiness | Intervening directory/permission changes still require the normal restrictive failure path. |
+| `install_harness`: named `create_new`, body write and file sync | Anonymous allocation/write/sync in the same parent; exact existing-pin read | The probe does not perform named creation. A partial actual write leaves a differing pin that subsequent source/readiness checks refuse without overwrite. A refusal before creation may leave no differing pin. |
+| `autoship_write_scope::register_at`: private parent creation, temporary file, byte write, sync and no-clobber persistence | Shared destination/bytes plan plus named no-clobber probe in that parent and concurrent final-record validation | The probe uses reserved names; the normal final record and any intervening changes still require actual writer validation. |
+| `persist_initial_prepared` and `write_manifest`: temporary file, exact byte write, sync, no-clobber persistence and controller-directory sync | The controller probe exercises named no-clobber persistence and directory sync with the combined prepared/manifest/receipt allocation | Actual artifact names remain distinct. Existing prepared/manifest state is independently validated by retained-source inspection. |
+| `baseline_witness::immutable`: exact existing receipt or temporary file, write/sync, no-clobber and directory sync | Same controller publication operation plus exact expected-receipt conflict validation | Current live qualification and the actual immutable writer remain mandatory; readiness is not a receipt or approval. |
+
+This inventory narrows the next regression to an unchanged failing real operation
+whose readiness continues to pass. It does not establish a general guarantee
+against concurrent filesystem changes or unsupported per-name security policy.
+
+Root owns the remaining test-first resolution before final handoff/activation:
+enumerate real writer operations against the actual readiness operations;
+reproduce repeated successful readiness with an unchanged failing real writer;
+then define and implement the durable operation-specific change predicate or
+explicit bounded retry policy. Verify claims, attempts, model calls and events
+across restart, with legitimate resource/source restoration still able to recover
+without changing the original owner request, resetting charges or inventing
+new original data. No hidden generic retry or merely relabeled hold is an exit.
+This obligation is not delegated to the owner and is not an approval question.
+
+The latest map identifies **105 seams** across §§1–25. Mapping is not checking.
+Bounded read-only audits and root recheck currently cover **S61–S105: 45 checked,
+45 holding**. S1–S60 remain unchecked against this latest map; the new
+writer/readiness contract and any affected seams must also be checked after its
+resolution. These counts do not close the separate fresh-reader liveness finding.
+No independent engineering approval,
+hosted CI result, snapshot, rollout or natural autonomous merge is implied.
