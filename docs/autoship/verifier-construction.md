@@ -1236,3 +1236,21 @@ acceptance tests / zero failures / 13 explicit isolation ignores (361.16 seconds
 and 239 workflow-store tests / zero failures (6.95 seconds). This is component
 evidence on eff09346; the last full CLI pass predates these publication changes.
 The delegated approved-command custody regression remains known RED.
+
+
+### November 14: recovered-selection main integration
+
+Main `f959e5d052e6def8c01b4dc59f31e21bc726c804` was merged normally into
+this branch at `528c7e8e6f572d2960264d856bb1e5eecb890179`, without rebase or
+force-push. The complete managed CLI command passed: **2,172 unit tests, zero
+failures, 49 explicit ignores** (475.67 seconds), followed by every integration
+and contract group. It used this worktree's registered `f7a2cf7e18c031ed` cache,
+with dev/test debug information and incremental compilation disabled.
+
+This validates the combined current-main source and the preceding publication/
+first-body retention changes. The explicitly delegated approved-v2 command-
+custody regression remains outside that run and remains RED at its last actual
+execution. Source-context authentication, opaque live/frozen grants, recovery
+caller separation, held-work eligibility, setup-only migration, Pending v2 and
+immutable constructor prompts remain open. No #2058 PR, activation, new native
+provider call or autonomous shipment is established by this integration result.
