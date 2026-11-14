@@ -1192,3 +1192,41 @@ acceptance tests / zero failures / 13 explicit isolation ignores (365.53 seconds
 and 239 workflow-store tests / zero failures (6.92 seconds). The actual approved
 execution/capture regression remains one of the explicit isolation cases and
 has not been turned GREEN by this data-publication component.
+
+
+### Approved-phase first-body retention (component implementation)
+
+The existing owned-plan publication API now returns the retained recipe body.
+For a v2 approved phase it validates the proposed semantic key and current
+registered-contract identity, then reads both indexed ownership and plan in one
+immediate fenced transaction. A fresh complete pair publishes atomically; a
+complete existing pair with unchanged constructor ownership returns its first
+body verbatim. Routing, evidence-location and publication-reference metadata
+cannot overwrite that body or add another event. Material recipe changes still
+require their different validated semantic key. V1 retains exact-body behavior.
+
+An indexed record with missing bytes, a missing half of the pair, an unindexed
+raw plan, and an indexed standalone plan without ownership are all refused.
+The writer does not repair those cases using a retry's proposed body or relabel
+an orphan as construction-owned. Shared batch validation/publication helpers
+keep one implementation of existing event/hash and v1 transaction behavior.
+The returned string is data, not an execution capability; future approved
+callers must consume that actual frozen body and separately authenticate its
+historical native/constructor ownership before obtaining any live grant.
+
+The real publication retry test first reproduced metadata-only retry failure
+(5.23 seconds). It now passes in 5.54 seconds, checking returned/stored first
+bytes, unchanged events/resources, ownership immutability, both original and
+routed retry bodies against partial history, raw and indexed orphan refusal,
+and no command/initial-budget grant from synthetic data. One initial test
+assertion used the authenticated reader for deliberately missing indexed bytes;
+that reader correctly returned MissingScopeResponse, so the assertion now
+queries the disposable fixture's raw rows to prove no repair occurred.
+
+Broader current-source acceptance/store verification is pending. This completes
+only the publication-side first-body rule. Approved OriginalExecution/capture,
+frozen recovery and its caller matrix, historical ownership versus live grant,
+source-context aggregation, held-work admission, setup-only policy migration,
+constructor prompt projection and Pending v2 activation still block a #2058
+PR or rollout. The actual delegated approved-command custody regression remains
+known RED; no provider adjudication or autonomous shipment is claimed.

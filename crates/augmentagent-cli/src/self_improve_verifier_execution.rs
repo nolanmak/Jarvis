@@ -861,6 +861,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approved_phase_retries_keep_first_body_and_never_adopt_partial_history() {
+        let (root,control,prepared,guard)=fixture().await;
+        let mut value=serde_json::to_value(approved_plan_dto(&prepared,&guard)).unwrap();
+        value["binding"]=serde_json::to_value(guard.binding()).unwrap();
+        value["approved"]["authority"]["old_contract"]=guard.binding().contract.clone().into();
+        let plan:Plan=serde_json::from_value(value).unwrap();let (key,body)=encode_plan(&plan);
+        let owner_key=amendment::digest(&serde_json::to_vec(&("construction-original-plan-owner-v1",&key)).unwrap());
+        let owner=serde_json::json!({"version":1,"kind":"construction_original_plan_owner","workflow":guard.id(),
+            "plan":key,"episode":"b".repeat(64),"slot":0,"intent_sha256":"c".repeat(64)}).to_string();
+        guard.record_constructed_original_plan(&key,&body,&owner_key,&owner).unwrap();
+        let database=control.path().join("workflow.db");let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let snapshot=store.snapshot(guard.id()).unwrap();let events=store.events(guard.id()).unwrap();
+        let mut metadata=serde_json::to_value(&plan).unwrap();metadata["binding"]["head"]="f".repeat(40).into();
+        metadata["binding"]["evidence_hash"]="routing-only".into();
+        metadata["approved"]["authority"]["original_plan"]="5".repeat(64).into();
+        metadata["approved"]["authority"]["original_result"]="6".repeat(64).into();
+        metadata["approved"]["authority"]["completion_sha256"]="7".repeat(64).into();
+        let routed:Plan=serde_json::from_value(metadata).unwrap();let (routed_key,routed_body)=encode_plan(&routed);
+        assert_eq!(routed_key,key);assert_ne!(routed_body,body);
+        let retained=guard.record_constructed_original_plan(&key,&routed_body,&owner_key,&owner)
+            .expect("same approved phase could not reuse its first frozen body");
+        assert_eq!(retained,body,"caller did not receive the exact frozen recipe");
+        assert_eq!(guard.verifier_evidence(&key,"original_verifier_plan").unwrap().as_deref(),Some(body.as_str()));
+        assert_eq!(guard.verifier_evidence(&owner_key,"construction_original_plan_owner").unwrap().as_deref(),Some(owner.as_str()));
+        assert_eq!(store.events(guard.id()).unwrap(),events,"metadata retry fabricated another publication/charge");
+        let mut changed_owner:serde_json::Value=serde_json::from_str(&owner).unwrap();changed_owner["slot"]=1.into();
+        assert!(guard.record_constructed_original_plan(&key,&body,&owner_key,&changed_owner.to_string()).is_err(),"phase retry replaced constructor ownership");
+        let connection=rusqlite::Connection::open(&database).unwrap();
+        for (lost_key,restored) in [(&key,&body),(&owner_key,&owner)] {
+            connection.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![guard.id(),lost_key]).unwrap();
+            for proposed in [&body,&routed_body] {
+                assert!(guard.record_constructed_original_plan(&key,proposed,&owner_key,&owner).is_err(),"incomplete indexed history was silently adopted");
+                let restored:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM scope_stage_response WHERE workflow=?1 AND key=?2)",rusqlite::params![guard.id(),lost_key],|row|row.get(0)).unwrap();
+                assert!(!restored,"retry repaired lost custody from a proposed body");
+            }
+            assert_eq!(store.events(guard.id()).unwrap(),events);
+            connection.execute("INSERT INTO scope_stage_response(workflow,key,response) VALUES(?1,?2,?3)",rusqlite::params![guard.id(),lost_key,restored]).unwrap();
+        }
+        let mut orphan:Plan=serde_json::from_str(&body).unwrap();orphan.executor="different-executor".into();let (orphan_key,orphan_body)=encode_plan(&orphan);
+        let orphan_owner_key=amendment::digest(&serde_json::to_vec(&("construction-original-plan-owner-v1",&orphan_key)).unwrap());
+        let mut orphan_owner:serde_json::Value=serde_json::from_str(&owner).unwrap();orphan_owner["plan"]=orphan_key.clone().into();
+        connection.execute("INSERT INTO scope_stage_response(workflow,key,response) VALUES(?1,?2,?3)",rusqlite::params![guard.id(),orphan_key,orphan_body]).unwrap();
+        assert!(guard.record_constructed_original_plan(&orphan_key,&orphan_body,&orphan_owner_key,&orphan_owner.to_string()).is_err(),"unindexed original plan was relabeled as owned");
+        assert!(guard.recorded_scope_stage_response(&orphan_owner_key).unwrap().is_none());
+        assert_eq!(store.events(guard.id()).unwrap(),events);
+        let mut standalone:Plan=serde_json::from_str(&body).unwrap();standalone.executor="indexed-without-owner".into();
+        let (standalone_key,standalone_body)=encode_plan(&standalone);
+        guard.record_verifier_evidence(&standalone_key,"original_verifier_plan",&standalone_body).unwrap();
+        let standalone_owner_key=amendment::digest(&serde_json::to_vec(&("construction-original-plan-owner-v1",&standalone_key)).unwrap());
+        let mut standalone_owner:serde_json::Value=serde_json::from_str(&owner).unwrap();standalone_owner["plan"]=standalone_key.clone().into();
+        let indexed_events=store.events(guard.id()).unwrap();
+        assert!(guard.record_constructed_original_plan(&standalone_key,&standalone_body,&standalone_owner_key,&standalone_owner.to_string()).is_err(),"indexed unowned plan was relabeled as constructed");
+        assert!(guard.recorded_scope_stage_response(&standalone_owner_key).unwrap().is_none());
+        assert_eq!(store.events(guard.id()).unwrap(),indexed_events);assert_eq!(store.snapshot(guard.id()).unwrap(),snapshot);
+        assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty());
+        assert!(retained_original_plan_budget_contexts(root.path(),control.path(),&guard).is_err(),"synthetic phase history granted initial/constructor execution");
+        drop(connection);drop(store);guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn approved_plan_dto_identity_does_not_mint_a_phase_from_routing_or_publication_metadata() {
         let (_root,_control,prepared,guard)=fixture().await;
         let mut plan=approved_plan_dto(&prepared,&guard);
