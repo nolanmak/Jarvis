@@ -1230,3 +1230,9 @@ source-context aggregation, held-work admission, setup-only policy migration,
 constructor prompt projection and Pending v2 activation still block a #2058
 PR or rollout. The actual delegated approved-command custody regression remains
 known RED; no provider adjudication or autonomous shipment is claimed.
+
+Current-source validation for the first-body retention component passes: 279
+acceptance tests / zero failures / 13 explicit isolation ignores (361.16 seconds),
+and 239 workflow-store tests / zero failures (6.95 seconds). This is component
+evidence on eff09346; the last full CLI pass predates these publication changes.
+The delegated approved-command custody regression remains known RED.
