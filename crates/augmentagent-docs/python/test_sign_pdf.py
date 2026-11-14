@@ -39,6 +39,49 @@ class SigningTests(unittest.TestCase):
             if n > 1:
                 self.assertNotIn('2026-10-12', result.pages[0].extract_text())
 
+    def test_later_page_signs_when_pages_share_a_type0_font(self):
+        # #2081: Chrome/Skia and Word exports give pages a shared Type0 font
+        # whose /DescendantFonts holds an indirect reference. Text extraction
+        # resolved it in place on the original reader, so signing page 3
+        # reported that page 1 would change and signed nothing.
+        from pypdf import PdfWriter
+        from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
+                                   NameObject, NumberObject, TextStringObject)
+        data = request(3)
+        w = PdfWriter(clone_from=PdfReader(io.BytesIO(base64.b64decode(data['pdf']))))
+        cid = w._add_object(DictionaryObject({
+            NameObject('/Type'): NameObject('/Font'),
+            NameObject('/Subtype'): NameObject('/CIDFontType2'),
+            NameObject('/BaseFont'): NameObject('/AAAAAA+Test'),
+            NameObject('/CIDSystemInfo'): DictionaryObject({
+                NameObject('/Registry'): TextStringObject('Adobe'),
+                NameObject('/Ordering'): TextStringObject('Identity'),
+                NameObject('/Supplement'): NumberObject(0)}),
+            NameObject('/DW'): NumberObject(556),
+        }))
+        font = w._add_object(DictionaryObject({
+            NameObject('/Type'): NameObject('/Font'),
+            NameObject('/Subtype'): NameObject('/Type0'),
+            NameObject('/BaseFont'): NameObject('/AAAAAA+Test'),
+            NameObject('/Encoding'): NameObject('/Identity-H'),
+            NameObject('/DescendantFonts'): ArrayObject([cid]),
+        }))
+        for page in w.pages:
+            fonts = page['/Resources'].get_object()['/Font'].get_object()
+            fonts[NameObject('/T0')] = font
+            text = DecodedStreamObject()
+            text.set_data(b'BT /T0 10 Tf 72 700 Td <0001> Tj ET')
+            page[NameObject('/Contents')] = ArrayObject([page.raw_get('/Contents'), w._add_object(text)])
+        out = io.BytesIO()
+        w.write(out)
+        source = out.getvalue()
+        data['pdf'] = base64.b64encode(source).decode()
+        for width in (144, 60):
+            with self.subTest(width=width):
+                signed = sign_pdf.process(dict(data, width=width), 'sign')
+                self.assertTrue(signed.startswith(source))
+                self.assertIn('2026-10-12', PdfReader(io.BytesIO(signed)).pages[2].extract_text())
+
     def test_invalid_placement_and_documents(self):
         for change in ({'page':0}, {'page':2}, {'x':-1}, {'y':790}, {'width':0}, {'x':float('nan')}, {'pdf':'broken'}, {'png':'broken'}):
             with self.subTest(change=change), self.assertRaises(Exception):
