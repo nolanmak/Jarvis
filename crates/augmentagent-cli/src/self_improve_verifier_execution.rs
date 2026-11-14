@@ -43,6 +43,21 @@ impl Plan {
             _=>anyhow::bail!("original plan version or approved registration mode changed"),
         }
     }
+    /// Historical parent measurement only. This is not an execution grant or
+    /// current qualification; ordinary consumers retain the global hold.
+    fn approved_parent_data(&self,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
+        let approved=self.approved.as_ref().context("original plan has no approved parent")?;
+        self.identity(&serde_json::to_string(self)?)?;
+        ensure!(self.version==2 && self.workflow==evidence.workflow(),"approved parent belongs to another workflow");
+        let (parent,result)=approved.authority.original_references();
+        let data=read_exact_original_data(parent,result,evidence)?;
+        ensure!(data.binding.contract==self.binding.contract
+            && serde_json::to_vec(&data.prepared.proposal)?==serde_json::to_vec(&self.proposal)?
+            && data.prepared.baseline.registration.baseline_head()==self.base
+            && data.prepared.baseline.registration.binding(&self.base)?.environment_id==self.environment,
+            "approved parent measurement differs from its frozen recipe");
+        Ok(data)
+    }
     fn require_registration_data(&self,registration:&RegisteredContract)->Result<()> {
         if let Some(approved)=&self.approved {
             ensure!(registration==&approved.registration,"approved original registration differs from frozen mode recipe");
@@ -107,6 +122,13 @@ pub(in crate::self_improve) struct OriginalResultData {
 }
 pub(super) fn exact_original_result(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
     require_correction_commands(evidence)?;
+    read_exact_original_data(plan_key,result,evidence)
+}
+
+/// Fact reconstruction only: all exact plan/result, admission, terminal capture
+/// and pinned-data checks remain here. Global settlement is a separate gate on
+/// the ordinary reader above; this private path grants no execution or witness.
+fn read_exact_original_data(plan_key:&str,result:&str,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<OriginalResultData> {
     let body=evidence.record(plan_key,"original_verifier_plan")?.context("original plan missing")?;
     let plan=Plan::checked(evidence.workflow(),plan_key,&body)?;
     let raw=evidence.record(result,"original_verifier_result")?.context("original result missing")?;
@@ -1069,6 +1091,40 @@ mod tests {
         assert!(command.output_complete && !command.interrupted);
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
         drop(store);drop(original);guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_parent_data_survives_unsettled_child_without_releasing_global_hold() {
+        let (root,control,prepared,mut guard)=fixture().await;
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"complete parent").unwrap();
+        let capture=captured_fixture(&original,&gone_scope(),false);OriginalExecution::quiesce_previous(&guard).unwrap();
+        original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let parent=original.plan.clone();let result=original.result_reference();
+        let mut value=serde_json::to_value(approved_plan_dto(&prepared,&guard)).unwrap();
+        value["binding"]=serde_json::to_value(guard.binding()).unwrap();
+        value["approved"]["authority"]["old_contract"]=guard.binding().contract.clone().into();
+        value["approved"]["authority"]["original_plan"]=parent.clone().into();
+        value["approved"]["authority"]["original_result"]=result.clone().into();
+        let approved:Plan=serde_json::from_value(value).unwrap();let (key,body)=encode_plan(&approved);
+        let approved=Plan::checked(guard.id(),&key,&body).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&control.path().join("workflow.db")).unwrap().unwrap();
+        let evidence=store.inspect_verifier_evidence(guard.id());
+        let expected=approved.approved_parent_data(&evidence).unwrap().identity;
+        // The v2 DTO is deliberately not an approval. An independently
+        // unsettled original command reproduces the global dependency; no new
+        // approved execution, native call or production database is created.
+        let child=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"unsettled later command").unwrap();
+        child.retain_admission("observe",&gone_scope()).unwrap();
+        let before=store.snapshot(guard.id()).unwrap().unwrap();let events=store.events(guard.id()).unwrap();
+        assert!(exact_original_result(&parent,&result,&evidence).is_err(),"ordinary evidence consumption ignored an unsettled command");
+        let data=approved.approved_parent_data(&evidence).expect("frozen recovery could not read its complete parent while a later command was unsettled");
+        assert_eq!(data.identity,expected);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+        std::fs::write(capture.join("stdout"),b"changed original output").unwrap();
+        assert!(approved.approved_parent_data(&evidence).is_err(),"read-only parent lookup ignored capture tampering");
+        drop(child);drop(original);drop(store);guard.finish().unwrap();
     }
 
     #[tokio::test]

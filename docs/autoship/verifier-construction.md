@@ -911,3 +911,36 @@ in 398.69 seconds. Native model replies in this fixture are scripted. These test
 are not a new actual-provider, approved-v2 execution, restart or autonomous-shipment
 receipt; the distinct approved original custody regression is still intentionally
 RED at its last delegated run. No deployment or full #2058 closure is claimed.
+
+## Approved parent facts without a global-settlement dependency
+
+The frozen approved recipe can name its completed provisional original while a
+later command remains unfinished. Ordinary `exact_original_result` deliberately
+requires all workflow correction commands to be settled; using that entry point
+for historical parent facts creates a dependency cycle for approved recovery.
+The new private `Plan::approved_parent_data` path first checks the v2 recipe and
+exact parent workflow, original contract/proposal/base/environment relationship,
+then reconstructs the parent's complete recorded result using the same pinned
+registration, command/admission, stored quiescence, capture manifest/streams and
+output-digest checks. It does not require unrelated commands to be settled merely
+to read those facts. The ordinary reader still enforces global settlement.
+
+This path returns data only. Structural recipe consistency is not native-review
+provenance, constructor ownership, current source authorization, witness
+qualification or permission to dispatch. The approved execution/recovery service
+must authenticate those separately, including the exact parent references in the
+retained reviewed request, before using these facts. No model admission, command,
+publication, ownership record or recovery grant is produced by this private read.
+The current approved observer still uses the legacy uncaptured executor; v2
+ownership/publication, live/frozen grants, capture, caller/hold/recovery and
+Pending activation remain unfinished. The actual delegated custody regression
+remains RED at its preceding run, not passed by this data-reader work.
+
+The disposable regression first failed because an unsettled later command blocked
+reading the complete parent (10.60s). It now passes while the ordinary public
+reader still refuses that same state; altered parent capture bytes also refuse,
+and workflow snapshot/events remain unchanged. The managed verifier-execution
+selection passed 32 tests, zero failures and two explicit delegated-service
+ignores (147.78s). These synthetic DTO/capture fixtures do not establish a native
+approval or new execution grant. Current main was merged normally into this
+engineering branch before the change; nothing was activated or deployed.

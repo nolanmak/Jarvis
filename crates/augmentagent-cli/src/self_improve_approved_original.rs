@@ -11,6 +11,7 @@ pub(in crate::self_improve::acceptance) struct Reference {
     candidate_environment:String,transition:bool,
 }
 impl Reference {
+    pub(in crate::self_improve::acceptance) fn original_references(&self)->(&str,&str) {(&self.original_plan,&self.original_result)}
     /// Excludes routing binding and staging/publication references. Those are
     /// still authenticated separately; they cannot manufacture another phase.
     pub(in crate::self_improve::acceptance) fn semantic_identity(&self)->Result<String> {
