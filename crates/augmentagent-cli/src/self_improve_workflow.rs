@@ -1611,6 +1611,12 @@ impl WorkflowGuard {
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        if reason=="acceptance_verifier_infrastructure_unavailable" && action=="await_verifier_infrastructure_recovery" {
+            if let Some(cue)=store.retained_qualification_cue(self.id(),&self.binding)? {
+                store.hold_retained_infrastructure(&self.lease,&self.binding,&cue.key,millis())?;
+                return Ok(());
+            }
+        }
         store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
     }

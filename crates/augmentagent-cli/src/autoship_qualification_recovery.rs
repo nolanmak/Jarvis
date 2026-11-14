@@ -146,10 +146,11 @@ fn retained_preparation_settled(conn:&Connection,workflow:&str,key:&str)->Result
 /// transaction. This records source loss, not another judgment or grant.
 pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previous:&Checkpoint,
     checkpoint:&Checkpoint,cue_key:&str,now:i64)->Result<()> {
-    ensure!(native_hold(checkpoint) && previous.binding==checkpoint.binding
+    ensure!((native_hold(checkpoint) || infrastructure_hold(checkpoint)) && previous.binding==checkpoint.binding
         && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"semantic source loss changed its owned input");
     let cue=semantic_cue(tx,&lease.workflow,&checkpoint.binding,lease.generation)?.context("semantic source reference missing")?;
     ensure!(cue.key==cue_key,"semantic source reference changed");
+    ensure!(!infrastructure_hold(checkpoint) || cue.retained_witness().is_some(),"infrastructure continuation requires retained original witness");
     let body=serde_json::to_string(&SemanticSourceUnavailable {version:1,cue:cue.key,checkpoint:checkpoint.clone()})?;
     let old:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
     if old.as_deref()!=Some(body.as_str()) || previous!=checkpoint {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
@@ -157,7 +158,7 @@ pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previou
 }
 
 pub(super) fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<(i64,SemanticReconsideration)>> {
-    if !native_hold(checkpoint) {return Ok(None);}
+    if !native_hold(checkpoint) && !infrastructure_hold(checkpoint) {return Ok(None);}
     let saved:Option<(i64,String)>=conn.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((sequence,raw))=saved else{return Ok(None)};
     let saved:SemanticSourceUnavailable=serde_json::from_str(&raw)?;
@@ -165,6 +166,7 @@ pub(super) fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:
     if saved.checkpoint!=*checkpoint {return Ok(None);}
     let cue=semantic_cue(conn,workflow,&checkpoint.binding,generation)?.context("semantic source continuation missing")?;
     ensure!(saved.cue==cue.key,"semantic source continuation changed");
+    ensure!(!infrastructure_hold(checkpoint) || cue.retained_witness().is_some(),"infrastructure continuation requires retained original witness");
     let consumed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_source_restored' AND json_extract(payload,'$.loss_sequence')=?2)",params![workflow,sequence],|r|r.get(0))?;
     Ok((!consumed).then_some((sequence,cue)))
 }
@@ -209,12 +211,13 @@ impl WorkflowStore {
             Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
     }
 
-    pub(crate) fn hold_retained_infrastructure(&mut self,lease:&Lease,binding:&Binding,_cue_key:&str,now:i64)->Result<()> {
+    pub(crate) fn hold_retained_infrastructure(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {
         let mut checkpoint=self.snapshot(&lease.workflow)?.context("retained workflow missing")?.checkpoint;
         ensure!(checkpoint.binding==*binding,"retained infrastructure binding changed");
         checkpoint.stage=Stage::Scope;
         checkpoint.next=NextAction {reason:"acceptance_verifier_infrastructure_unavailable".into(),action:"await_verifier_infrastructure_recovery".into(),eligible_at_ms:0};
-        self.checkpoint(lease,&checkpoint,now)
+        self.checkpoint_with_custody_cause(lease,&checkpoint,now,
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
     }
 
     /// Queue consideration of authenticated negative source data. This grants
@@ -243,7 +246,8 @@ impl WorkflowStore {
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
         let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-        if !(native_hold(&checkpoint) || if retained {metadata_hold(&checkpoint)}else{legacy_amendment_input(&checkpoint).is_some()}) || checkpoint!=expected.checkpoint || generation!=expected.generation
+        if !(native_hold(&checkpoint) || if retained {metadata_hold(&checkpoint) || (infrastructure_hold(&checkpoint)
+            && waiting_semantic_source(&tx,&expected.workflow,generation,&checkpoint)?.is_some())}else{legacy_amendment_input(&checkpoint).is_some()}) || checkpoint!=expected.checkpoint || generation!=expected.generation
             || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
         let control=owner_control::read(&tx,&expected.workflow)?;
         if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
@@ -444,6 +448,35 @@ mod tests {
         let events=store.events(&id).unwrap();
         assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
         assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),1);
+    }
+
+    #[test]
+    fn retained_infrastructure_rejects_legacy_generic_and_partial_holds() {
+        let (_dir,mut store,lease,hold,cue)=queued_semantic_source();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+        assert!(store.hold_retained_infrastructure(&lease,&hold.binding,&cue.key,10).is_err(),"negative semantic cue gained positive infrastructure continuation");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        for fault in ["key","binding","lease","storage","generic"] {
+            let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let reference=retained_reference();
+            if fault=="generic" {
+                let lease=store.claim(&id,"generic",7,1000).unwrap().unwrap();
+                let mut checkpoint=before.checkpoint.clone();checkpoint.next=NextAction {reason:"acceptance_verifier_infrastructure_unavailable".into(),action:"await_verifier_infrastructure_recovery".into(),eligible_at_ms:0};
+                store.checkpoint(&lease,&checkpoint,8).unwrap();store.release(&lease,9).unwrap();
+                let expected=store.snapshot(&id).unwrap().unwrap();
+                assert!(!store.recover_retained_qualification(&expected,None,10,|_|panic!("generic infrastructure hold reached retained validator")).unwrap());
+                continue;
+            }
+            assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+            let cue=store.semantic_reconsideration(&id,&before.checkpoint.binding).unwrap().unwrap();
+            let lease=store.claim_productive_for_binding(&id,"worker",8,1000,&before.checkpoint.binding).unwrap().unwrap();
+            if fault=="lease" {store.release(&lease,9).unwrap();}
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_infra_loss BEFORE INSERT ON workflow_event WHEN NEW.kind='semantic_source_unavailable' BEGIN SELECT RAISE(ABORT,'hold cause unavailable'); END;").unwrap();}
+            let mut binding=before.checkpoint.binding.clone();if fault=="binding" {binding.head="foreign".into();}
+            let key=if fault=="key" {"f".repeat(64)}else{cue.key};
+            let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+            assert!(store.hold_retained_infrastructure(&lease,&binding,&key,10).is_err(),"{fault} saved a partial infrastructure hold");
+            assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+        }
     }
 
     #[test]

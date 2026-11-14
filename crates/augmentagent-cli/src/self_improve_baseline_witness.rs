@@ -739,6 +739,15 @@ mod tests {
                 let error=qualify_or_amend(&reasoner,AcceptanceSource::PullRequest(840),"original requirement",root.path(),control.path(),&mut prepared,&mut guard).await.unwrap_err();
                 let expected=if known {initial_repair::Hold::InfrastructureUnavailable}else{initial_repair::Hold::Exhausted};
                 assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&expected),"environment failure took the wrong repair route: known={known}, error={error:#}");
+                if known {
+                    let accounting=guard.capacity_accounting(true).unwrap();
+                    assert!(hold_qualification_error(&mut guard,&prepared,&error,&accounting).await.unwrap().unwrap().held);
+                    let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let held=store.snapshot(guard.id()).unwrap().unwrap();
+                    assert_eq!(held.checkpoint.next.reason,"acceptance_verifier_infrastructure_unavailable");
+                    assert_eq!(held.checkpoint.next.action,"await_verifier_infrastructure_recovery");
+                    assert!(store.semantic_source_waiting(guard.id(),guard.binding()).unwrap());
+                    assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().unwrap().retained_witness().is_some());
+                }
                 assert_eq!(guard.epoch_attempts("verifier-amend-total",&epoch).unwrap(),4);
                 assert_eq!(reasoner.calls(),0);
                 assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);

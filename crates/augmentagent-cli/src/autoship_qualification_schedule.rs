@@ -173,6 +173,8 @@ impl WorkflowStore {
             if !verifier_custody::original_hold_matches(&tx, &id, &checkpoint).unwrap_or(false)
                 && !qualification_recovery::physical_hold(&tx, &id, generation, &checkpoint)
                     .unwrap_or(false)
+                && !qualification_recovery::waiting_semantic_source(&tx,&id,generation,&checkpoint)
+                    .is_ok_and(|waiting|waiting.is_some_and(|(_,cue)|cue.retained_witness().is_some()))
                 // Completed negative judgments need read-only source inspection,
                 // too. Selection grants no qualification or model admission.
                 && !((qualification_recovery::native_hold(&checkpoint) || qualification_recovery::metadata_hold(&checkpoint) || legacy_amendment_input(&checkpoint).is_some())

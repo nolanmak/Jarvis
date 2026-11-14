@@ -697,3 +697,44 @@ activation path. Existing protected-state retention owns obsolete evidence;
 this patch adds no second copy or independent retention pool. The typed cue must
 retain its same episode through failed publication and genuine source restoration
 without unchanged productive reclaims; that scheduling work is still open.
+
+
+## 18. Retained infrastructure continuation implementation checkpoint
+
+The repair branch now preserves the precise
+`acceptance_verifier_infrastructure_unavailable /
+await_verifier_infrastructure_recovery` hold together with its authenticated
+retained-original-witness reference. Checkpoint and continuation commit in the
+same lease transaction. Repeated identical reports are idempotent. This does
+not convert an older negative semantic judgment or an arbitrary infrastructure
+hold into retained positive-source recovery.
+
+Free selection can reserve this retained continuation for inspection, including
+when original custody still needs restoration. Selection is not validation:
+normal execution remains parked until the retained source validator succeeds
+with the same reference under the existing owner, binding, effect and lease
+fences. Restoration reuses the original cue and records the particular loss
+episode, without another original-witness recovery grant, model call, token
+charge or amendment allowance. Enrolled qualification errors use this path while
+keeping their actual infrastructure reason and private diagnostic.
+
+The test-first store regression failed because the infrastructure checkpoint
+lost its retained continuation. The corrected path covers settlement followed
+by failure, duplicate reporting, unchanged-input refusal, free reservation,
+validated restoration and resettlement. Negative tests cover legacy semantic
+references, generic infrastructure holds, foreign reference/binding, lost lease
+and failure to persist the continuation. The real qualification-error fixture
+also checks the public infrastructure reason and retained waiting reference.
+
+This is an implementation checkpoint, not activation or ordinary end-to-end
+acceptance. Production positive-source recovery still needs the original
+read-only environment check, original initial-issue scope replay check and
+publication/setup readiness gating connected before it can queue work. Do not
+wire the data-only validator directly into the poller: valid original evidence
+alone does not prove a failed publication or environment has recovered. The
+read-only pinned-environment reader is present and tested but is not yet a
+production wake condition. Current candidate environment, native custody,
+original measurement, independent qualification and later merge gates remain
+required. Final joined validation, documentation/seam review, independent
+engineering review, hosted CI, protected merge and normal updater rollout remain
+pending. No autonomous shipment is established by these component fixtures.
