@@ -984,11 +984,13 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let today = utc_day_now();
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
 
-    let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
-        .into_iter()
-        .partition(|i| !i.research_filed);
+    let mut candidates=rest_issue_candidates(&issues);
+    // Recovery wakes the ordinary selector, not a special execution path.
+    // Within human/research tiers, consider due recovery hints before
+    // unrelated fresh issues; stable sorting preserves normal newest-first.
+    candidates.sort_by_key(|issue|(issue.research_filed,!qualification_retries.contains(&issue.number)));
     let mut unavailable_history=None;
-    for iss in human.into_iter().chain(research) {
+    for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
@@ -1060,6 +1062,15 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             continue;
         }
         let candidate=Issue {number,title,body,author,author_trusted,research_filed};
+        match owner_controls.unchanged_initial_hold(repo_root,&repository,&candidate).await {
+            Ok(true)=>{info!(issue=number,"skip: initial input hold is unchanged; consider eligible peers");continue;},
+            Ok(false)=>{},
+            Err(error)=>{
+                warn!(issue=number,error=%error,"skip: held issue inputs unavailable; preserve hold and consider peers");
+                if unavailable_history.is_none() {unavailable_history=Some(error);}
+                continue;
+            },
+        }
         if acceptance::readiness::blocked(repo_root,&candidate).await? {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
@@ -21144,4 +21155,129 @@ print(json.dumps([{'number': 77, 'isDraft': False,
     async fn authorized_linked_pr_suppresses_remote_fresh_work() { fixture("remote").await; }
     #[tokio::test]
     async fn malformed_inventory_does_not_authorize_fresh_work() { fixture("malformed").await; }
+}
+
+#[cfg(test)]
+mod recovered_issue_selection_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(root:&Path,args:&[&str])->String {
+        let out=std::process::Command::new("/usr/bin/git").args(["-c","core.hooksPath=/dev/null"])
+            .args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+
+    #[tokio::test]
+    #[ignore="explicit read-only live selection diagnostic; requires AUTOSHIP_SELECTION_PROBE_ROOT/DB; no claim, mutation, provider or model call"]
+    async fn actual_recovered_issue_and_held_peer_selection_inputs_are_read_only() {
+        let root=PathBuf::from(std::env::var_os("AUTOSHIP_SELECTION_PROBE_ROOT").expect("explicit live repository"));
+        let database=PathBuf::from(std::env::var_os("AUTOSHIP_SELECTION_PROBE_DB").expect("explicit read-only workflow database"));
+        assert_eq!(workflow::path().canonicalize().unwrap(),database.canonicalize().unwrap(),"probe authority differs from configured workflow store");
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&database).unwrap().unwrap();
+        let ids=["nolanmak/jarvis#1830","nolanmak/jarvis#1833"];
+        let before=ids.iter().map(|id|(store.snapshot(id).unwrap(),store.events(id).unwrap())).collect::<Vec<_>>();
+        let due=qualification_reconcile::issue_retries(&root).await.unwrap();
+        let (ok,raw,_)=run(&gh_bin(),&["api","repos/nolanmak/Jarvis/issues/1833"],&root).await.unwrap();assert!(ok);
+        let value:serde_json::Value=serde_json::from_str(&raw).unwrap();
+        let author=value["user"]["login"].as_str().unwrap().to_owned();let association=value["author_association"].as_str().unwrap();
+        let trusted=author_is_trusted(&author,association,&trusted_authors(&root).await);
+        let issue=Issue {number:1833,title:value["title"].as_str().unwrap().into(),body:value["body"].as_str().unwrap().into(),author,author_trusted:trusted,research_filed:false};
+        assert!(issue.author_trusted,"read-only probe does not authorize an untrusted source");
+        assert!(due.contains(&1830),"actual recovered source is not in the existing due view");
+        assert!(workflow::FreshIssueControls::open().unwrap().unchanged_initial_hold(&root,"nolanmak/jarvis",&issue).await.unwrap(),"actual newer peer is not a provably unchanged owned input hold");
+        for (index,id) in ids.iter().enumerate() {
+            assert_eq!(store.snapshot(id).unwrap(),before[index].0,"live selection diagnostic changed or raced workflow state");
+            assert_eq!(store.events(id).unwrap(),before[index].1,"live selection diagnostic changed or raced workflow events");
+        }
+        eprintln!("actual selection inputs: recovered #1830 is due; #1833 unchanged hold confirmed; snapshots/events/historical model calls unchanged; no claim or dispatch");
+    }
+
+    #[tokio::test]
+    async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
+        const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            for case in ["recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+                let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
+                git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
+                std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
+                git(&repo,&["add","."]);git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","original"]);
+                let head=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&head]);
+                let bin=root.path().join("bin");std::fs::create_dir(&bin).unwrap();let rustc=bin.join("rustc");
+                std::fs::write(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let gh=bin.join("gh.py");std::fs::write(&gh,r#"#!/usr/bin/python3
+import json,os,sys
+args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
+with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
+if args[:2]==['repo','view']:print('fixture-owner/repo');sys.exit(0)
+if args[:2]==['pr','list']:print('[]');sys.exit(0)
+if args[:1]==['api'] and '/git/ref/heads/main' in args[1]:print(open(os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']).read().strip());sys.exit(0)
+if args[:1]==['api'] and '/issues?' in args[1]:
+ def issue(n,title,body):return dict(number=n,title=title,body=body,labels=[],user={'login':'fixture-owner'},author_association='OWNER')
+ held=issue(1833,'Correct newer widget rounding','Keep widget rounding consistent.'+(' Owner changed the desired result.' if mode=='changed-source' else ''))
+ recovered=issue(1830,'Correct retained widget rounding','Preserve exact rounding behavior.')
+ if mode=='untrusted':recovered.update(user={'login':'outside-contributor'},author_association='NONE')
+ if mode=='manual':recovered['labels']=[{'name':'autoship-manual'}]
+ if mode=='research':recovered['body']+=' Auto-filed by the daily research pipeline.'
+ fresh=issue(1829,'Correct older widget rounding','Keep older widget rounding consistent.')
+ rows=[held,recovered,fresh] if mode not in ['held-only','changed-source','changed-candidate','missing-context','upstream-only','changed-environment'] else [held,fresh]
+ print(json.dumps(rows if args[1].endswith('page=1') else []));sys.exit(0)
+raise AssertionError(args)
+"#).unwrap();std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let head_file=root.path().join("upstream-head");std::fs::write(&head_file,&head).unwrap();
+                let out=tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","self_improve::recovered_issue_selection_regressions::real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds","--nocapture"])
+                    .env_clear().env("PATH",format!("{}:/usr/bin:/bin",bin.display())).env("HOME",root.path())
+                    .env("XDG_STATE_HOME",root.path().join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+                    .env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","fixture-owner").env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner")
+                    .env("AUTOSHIP_RECOVERED_SELECTION_CASE",case).env("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE",head_file)
+                    .env("AUTOSHIP_RECOVERED_SELECTION_CALLS",root.path().join("calls")).env(CHILD,&repo).current_dir(&repo).output().await.unwrap();
+                assert!(out.status.success(),"{case}: {}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            }
+            return;
+        }
+        let repo=PathBuf::from(std::env::var_os(CHILD).unwrap());let case=std::env::var("AUTOSHIP_RECOVERED_SELECTION_CASE").unwrap();
+        let database=workflow::path();let head=git(&repo,&["rev-parse","HEAD"]);let held_id="fixture-owner/repo#1833";
+        for (number,title,body) in [(1833,"Correct newer widget rounding","Keep widget rounding consistent."),(1830,"Correct retained widget rounding","Preserve exact rounding behavior.")] {
+            let worktree=repo.join(format!(".self-improve-worktrees/current-issue-{number}"));let branch=format!("agent-fix/issue-{number}");
+            git(&repo,&["worktree","add","--quiet","-b",&branch,worktree.to_str().unwrap()]);
+            let contract=serde_json::to_string(&(number,title,body)).unwrap();let environment=recovery::environment_identity(&worktree,&head).await.unwrap();
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:&repo,worktree:&worktree,repository:"fixture-owner/repo",source_issue:Some(number),pr:None,branch:&branch,contract:&contract,environment:&environment}).await.unwrap().unwrap();
+            guard.hold_initial_acceptance(if number==1833 {"readiness_assessment_invalid"}else{"acceptance_contract_invalid"},if number==1833 {"await_readiness_input_change"}else{"await_acceptance_input_change"}).await.unwrap();guard.finish().unwrap();
+        }
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let ready_id="fixture-owner/repo#1830";
+        if !matches!(case.as_str(),"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment") {
+            let controls=workflow::FreshIssueControls::open().unwrap();
+            let issue=Issue {number:1830,title:"Correct retained widget rounding".into(),body:"Preserve exact rounding behavior.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
+            let in_flight_preview=controls.unchanged_initial_hold(&repo,"fixture-owner/repo",&issue);
+            let held=store.snapshot(ready_id).unwrap().unwrap();
+            let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)};
+            assert!(store.recover_retained_qualification(&held,None,chrono::Utc::now().timestamp_millis(),|_|Ok(Some(reference))).unwrap());
+            assert!(!in_flight_preview.await.unwrap(),"a genuine cue arriving during free inspection stayed hidden behind an older hold");
+            if case=="paused" {store.set_owner_pause(ready_id,"fixture-owner",0,true,chrono::Utc::now().timestamp_millis()).unwrap();}
+            let mut ledger=AttemptLedger::load(&attempt_ledger_path());ledger.day=utc_day_now();ledger.issues=vec![1830];ledger.save(&attempt_ledger_path());
+        }
+        if case=="changed-candidate" {std::fs::write(repo.join(".self-improve-worktrees/current-issue-1833/code.txt"),"owner changed candidate\n").unwrap();}
+        if case=="missing-context" {rusqlite::Connection::open(&database).unwrap().execute("DELETE FROM qualification_execution_context WHERE workflow=?1",[held_id]).unwrap();}
+        if case=="upstream-only" {
+            std::fs::write(repo.join("upstream.txt"),"unrelated current-main input\n").unwrap();git(&repo,&["add","upstream.txt"]);
+            git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","main advanced"]);
+            let current=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&current]);
+            std::fs::write(std::env::var_os("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap(),current).unwrap();
+        }
+        if case=="changed-environment" {
+            let compiler=PathBuf::from(std::env::var_os("GH_BIN").unwrap()).parent().unwrap().join("rustc");
+            std::fs::write(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
+        }
+        let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
+        let selected=pick_issue(&repo,true).await.unwrap().expect("eligible ordinary peer was starved");
+        let expected=match case.as_str(){"recovered"=>1830,"changed-source"|"changed-candidate"|"changed-environment"=>1833,_=>1829};
+        assert_eq!(selected.number,expected,"{case}: real issue selector chose an unchanged hold ahead of eligible work");
+        assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+        assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+        assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+        let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_RECOVERED_SELECTION_CALLS").unwrap()).unwrap();
+        assert!(!calls.contains("\"edit\"") && !calls.contains("\"comment\"") && !calls.contains("\"merge\""),"selection mutated remote state");
+    }
 }
