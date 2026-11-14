@@ -2877,6 +2877,9 @@ class BuildScratchTests(unittest.TestCase):
             class Unavailable(ValueError):
                 pass
 
+            class CommandTimedOut(Unavailable):
+                pass
+
             class Runtime:
                 @staticmethod
                 def load(path):
@@ -3176,6 +3179,30 @@ class BuildScratchTests(unittest.TestCase):
             policy.run_command('cargo build')
         self.assertIn('JARVIS_READINESS:build_cache_full', str(raised.exception))
         self.assertIn('build-cache.img', str(raised.exception))
+
+    def test_controller_vm_timeout_reaches_the_model_as_execution_failure(self):
+        policy = self.policy()
+        def deadline(*args, **kwargs):
+            raise self.fake_vm.CommandTimedOut('SYNTHETIC_PRIVATE_DEADLINE_DETAIL')
+        self.fake_vm.run = staticmethod(deadline)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test', 'timeout': 1}}})
+        self.assertTrue(response['isError'])
+        text = response['content'][0]['text']
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:command_timeout '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('JARVIS_READINESS:', text, 'an executed timeout is not a preflight refusal')
+
+    def test_guest_error_text_cannot_impersonate_a_controller_timeout(self):
+        policy = self.policy()
+        def guest_error(*args, **kwargs):
+            raise self.fake_vm.Unavailable('VM command timed out')
+        self.fake_vm.run = staticmethod(guest_error)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        self.assertTrue(response['isError'])
+        self.assertNotIn('JARVIS_EXECUTION:command_timeout', response['content'][0]['text'])
 
     def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
         import os

@@ -30,6 +30,10 @@ class Unavailable(ValueError):
     pass
 
 
+class CommandTimedOut(Unavailable):
+    """Controller deadline, distinct from guest-supplied failure text."""
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -432,7 +436,7 @@ poweroff -f
                         storage_lease.check()
                     remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
-                        raise Unavailable('VM command timed out')
+                        raise CommandTimedOut('VM command timed out')
                     broker.poll(remaining)
                     try:
                         status = process.wait(timeout=min(0.05, max(0.001, remaining)))
