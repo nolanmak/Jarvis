@@ -19,16 +19,20 @@ pub(super) async fn issue_retries(root: &Path) -> Result<std::collections::BTree
         return Ok(Default::default());
     }
     let repository = workflow::canonical_repository(root).await?;
-    let Some(store) = WorkflowStore::open_read_only(&workflow::path())? else {
-        return Ok(Default::default());
-    };
+    let store = WorkflowStore::open_read_only(&workflow::path())?
+        .context("observed qualification recovery history disappeared during repository inspection")?;
     let prefix = format!("{}#", repository.to_ascii_lowercase());
     let mut retries = std::collections::BTreeSet::new();
     for id in store.due_qualification_recovery(Some(&repository), now)? {
-        if store
-            .snapshot(&id)?
-            .is_some_and(|snapshot| snapshot.pr.is_none())
-        {
+        let snapshot=match store.snapshot(&id) {
+            Ok(snapshot)=>snapshot,
+            // The complete due-view query succeeded. A bad individual row
+            // supplies no hint; the normal per-issue reader preserves its hold.
+            Err(error) if error.downcast_ref::<serde_json::Error>().is_some()
+                || error.downcast_ref::<rusqlite::Error>().is_some_and(WorkflowStore::is_row_data_error)=>continue,
+            Err(error)=>return Err(error),
+        };
+        if snapshot.is_some_and(|snapshot| snapshot.pr.is_none()) {
             if let Some(number) = id.strip_prefix(&prefix).and_then(|s| s.parse().ok()) {
                 retries.insert(number);
             }

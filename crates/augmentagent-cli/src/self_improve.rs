@@ -21236,7 +21236,7 @@ mod recovered_issue_selection_regressions {
     async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
         const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            for case in ["recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+            for case in ["recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
                 let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
                 git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
                 std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
@@ -21248,7 +21248,11 @@ mod recovered_issue_selection_regressions {
 import json,os,sys
 args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
 with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
-if args[:2]==['repo','view']:print('fixture-owner/repo');sys.exit(0)
+if args[:2]==['repo','view']:
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-recovery-store'
+ if mode=='recovery-history-disappeared' and os.path.exists(marker):
+  os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ print('fixture-owner/repo');sys.exit(0)
 if args[:2]==['pr','list']:print('[]');sys.exit(0)
 if args[:1]==['api'] and '/git/ref/heads/main' in args[1]:
  marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-store'
@@ -21265,7 +21269,7 @@ if args[:1]==['api'] and '/issues?' in args[1]:
  fresh=issue(1829,'Correct older widget rounding','Keep older widget rounding consistent.')
  rows=[held,recovered,fresh] if mode not in ['held-only','changed-source','changed-candidate','missing-context','upstream-only','changed-environment','physical-restored','physical-missing','semantic-native'] else [held,fresh]
  if mode.startswith('preview-'):rows=[] if mode.startswith('preview-empty') else [held]
- if mode=='recovery-priority':rows.insert(0,issue(1834,'Correct newest eligible widget','Keep the newest widget behavior consistent.'))
+ if mode=='recovery-priority' or mode.startswith('corrupt-recovery-peer-'):rows.insert(0,issue(1834,'Correct newest eligible widget','Keep the newest widget behavior consistent.'))
  print(json.dumps(rows if args[1].endswith('page=1') else []));sys.exit(0)
 raise AssertionError(args)
 "#).unwrap();std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -21340,6 +21344,17 @@ raise AssertionError(args)
             std::fs::write(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
         }
         let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
+        if case=="recovery-history-disappeared" {
+            std::fs::write(format!("{}.lose-recovery-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable recovery-store fault").unwrap();
+            let outcome=qualification_reconcile::issue_retries(&repo).await;
+            let missing=PathBuf::from(format!("{}.fixture-missing",database.display()));assert!(missing.exists(),"fault did not reach recovery repository inspection");
+            std::fs::rename(missing,&database).unwrap();
+            assert!(outcome.is_err(),"previously observed recovery storage disappeared but became an initial empty hint view");
+            assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+            assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+            assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+            return;
+        }
         if case=="recovery-history-unavailable" {
             // A disposable schema fault keeps basic owner-control reads valid
             // while preventing the recovery reader's pending-operation query.
@@ -21388,10 +21403,32 @@ raise AssertionError(args)
             assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
             return;
         }
-        let selected=match select_issue_with_fallback(&repo,true,true,||async {anyhow::bail!("eligible ordinary work unexpectedly yielded to fallback")}).await.unwrap() {
-            IssueSelection::Issue(issue)=>issue,IssueSelection::Report(_)=>panic!("eligible ordinary peer was starved"),
-        };
-        let expected=match case.as_str(){"recovered"|"recovery-priority"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
+        let corrupt=case.starts_with("corrupt-recovery-peer-");
+        let mut injected_checkpoint=None;
+        if corrupt {
+            let mut checkpoint=held_before.as_ref().unwrap().checkpoint.clone();
+            checkpoint.stage=crate::autoship_workflow::Stage::Reconcile;
+            checkpoint.next=crate::autoship_workflow::NextAction {reason:"original_semantic_witness_recovered".into(),action:"requalify_original_measurement".into(),eligible_at_ms:0};
+            let raw=match case.as_str() {
+                "corrupt-recovery-peer-schema"=>serde_json::json!({"stage":"reconcile","next":checkpoint.next}).to_string(),
+                "corrupt-recovery-peer-json"=>"not-json".to_string(),
+                _=>serde_json::to_string(&checkpoint).unwrap(),
+            };
+            let fault=rusqlite::Connection::open(&database).unwrap();
+            fault.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![held_id,raw]).unwrap();
+            if case=="corrupt-recovery-peer-snapshot" {fault.execute("UPDATE workflow SET pr='fixture-invalid-pr' WHERE id=?1",[held_id]).unwrap();}
+            injected_checkpoint=Some(raw);
+        }
+        let outcome=select_issue_with_fallback(&repo,true,true,||async {anyhow::bail!("eligible ordinary work unexpectedly yielded to fallback")}).await;
+        if let Some(injected)=injected_checkpoint {
+            let fault=rusqlite::Connection::open(&database).unwrap();
+            let (raw,pr):(String,Option<String>)=fault.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[held_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(raw,injected,"selection rewrote malformed workflow history");
+            assert_eq!(pr,(case=="corrupt-recovery-peer-snapshot").then(||"fixture-invalid-pr".to_string()),"selection repaired unknown PR ownership");
+            fault.execute("UPDATE workflow SET checkpoint=?2,pr=NULL WHERE id=?1",rusqlite::params![held_id,serde_json::to_string(&held_before.as_ref().unwrap().checkpoint).unwrap()]).unwrap();
+        }
+        let selected=match outcome.unwrap() {IssueSelection::Issue(issue)=>issue,IssueSelection::Report(_)=>panic!("eligible ordinary peer was starved")};
+        let expected=match case.as_str(){"recovered"|"recovery-priority"|"corrupt-recovery-peer-schema"|"corrupt-recovery-peer-json"|"corrupt-recovery-peer-snapshot"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
         assert_eq!(selected.number,expected,"{case}: real issue selector chose an unchanged hold ahead of eligible work");
         assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
         assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);

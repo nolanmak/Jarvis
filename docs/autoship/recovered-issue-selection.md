@@ -32,14 +32,26 @@ already recognizes the existing native-custody and original-measurement recovery
 shapes. It requires a due, unleased, unpaused workflow with no pending owner
 messages, publication operations or uncertain merge reconciliation.
 
-A successful empty view differs from a failed protected recovery-history read.
-The latter stops fresh selection with the fixed
-`qualification-recovery-history-unavailable` hold. It is not silently converted
-into empty hints, does not consume model calls or reset the daily ledger, and
-cannot take the per-issue-preview waiting-work fallback. Basic owner-control
-queries succeeding does not prove this additional recovery view readable. The
-existing reader's successful empty result for genuinely absent initial storage
-remains unchanged; this rule concerns an unsuccessful read, not first install.
+A successful empty view differs from a failed shared recovery query. Failure to
+execute that protected query stops fresh selection with the fixed
+`qualification-recovery-history-unavailable` hold; it is not silently converted
+into empty hints, spends no model calls, resets no ledger and cannot take the
+per-issue-preview waiting-work fallback. Basic owner-control queries succeeding
+does not prove the additional shared recovery query readable.
+
+Individual malformed checkpoints are different: the due reader decodes the
+canonical Checkpoint rather than letting one invalid JSON/schema row abort the
+shared lookup. Such a row supplies no recovery hint and remains unknown to the
+ordinary per-issue history/claim readers, which preserve it and inspect peers.
+After a complete due query, an identified workflow's snapshot JSON/typed-column
+conversion failure likewise supplies no hint; SQL/schema/storage failures still
+propagate. Nothing infers terminal state, repairs the row or makes it fresh work.
+Healthy recovered peers retain their priority over newer eligible fresh issues.
+
+A genuinely absent store at the initial read still gives the existing empty
+first-install result. Once the reader has observed due recovery history, losing
+that store across repository inspection is a global unavailable-history error,
+not a new installation or an empty successful view.
 
 Priority lasts only while that current checkpoint satisfies the view. An active
 lease, future eligibility time, pause/pending mutation or move out of the
@@ -205,3 +217,22 @@ hold after resolving recovery-reader failure policy and the preview-versus-norma
 triage scope. These read-only spec checks are not engineering review or rollout
 acceptance. Final exact-head hosted CI/review and the natural live exits above
 remain required.
+
+
+The subsequent hosted CLI run exposed two unchanged terminal-history regression
+tests: malformed individual metadata was incorrectly promoted to a shared-query
+failure. Both were reproduced locally before the repair (three related tests
+passed, two failed). The view now decodes canonical checkpoints and separates
+identified-row conversion errors from SQL/schema/storage failure. Additional REDs
+cover a valid-JSON checkpoint missing required fields (0.50 seconds) and an
+observed store disappearing across repository inspection (0.45 seconds).
+
+Current validation passes the complete affected self-improve suite (889 passed,
+zero failed, 34 explicit ignores, 317.81 seconds), including those two unchanged
+regressions and all 27 selector/reader/routing scenarios. The workflow-store suite
+also passes (233 passed, zero failed). The current actual-input read-only probe
+passes in 1.13 seconds with unchanged workflow snapshots/events/historical calls.
+Changed seam checks were repeated against this source; no unresolved findings
+remain. A full final-head hosted CLI/integration result, independent review,
+normal rollout and the live acceptance exits above are still required. The local
+long-scratch Unix-socket limitation remains separately tracked in #2088.

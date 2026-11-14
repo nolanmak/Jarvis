@@ -262,6 +262,13 @@ impl WorkflowStore {
 
     /// A recovery handoff is a wake hint, not execution or qualification
     /// authority. The normal selector and productive lease recheck all guards.
+    /// Only conversion of an identified row's stored value is local data
+    /// unavailability. SQL preparation, schema and storage failures stay errors.
+    pub(crate) fn is_row_data_error(error:&rusqlite::Error)->bool {
+        matches!(error,rusqlite::Error::FromSqlConversionFailure(..)|rusqlite::Error::IntegralValueOutOfRange(..)
+            |rusqlite::Error::InvalidColumnType(..)|rusqlite::Error::Utf8Error(..))
+    }
+
     pub fn has_due_qualification_recovery(&self,repository:Option<&str>,now:i64)->Result<bool> {
         Ok(!self.due_qualification_recovery(repository,now)?.is_empty())
     }
@@ -270,22 +277,27 @@ impl WorkflowStore {
         let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow')",[],|r|r.get(0))?;
         if !exists {return Ok(vec![]);}
         let controls:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",[],|r|r.get(0))?;
-        let mut sql=String::from("SELECT w.id FROM workflow w WHERE w.lease_until<=?2
-            AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
-            AND json_extract(w.checkpoint,'$.stage')='reconcile'
-            AND ((json_extract(w.checkpoint,'$.next.reason')='original_verifier_measurement_recovered'
-                AND json_extract(w.checkpoint,'$.next.action') IN ('qualify_original_measurement','correct_original_verifier'))
-                OR (json_extract(w.checkpoint,'$.next.reason')='original_native_custody_recovered'
-                AND json_extract(w.checkpoint,'$.next.action')='requalify_original')
-                OR (json_extract(w.checkpoint,'$.next.reason')='original_semantic_witness_recovered'
-                AND json_extract(w.checkpoint,'$.next.action') IN ('reconsider_verifier','requalify_original_measurement')))
+        let mut sql=String::from("SELECT w.id,w.checkpoint FROM workflow w WHERE w.lease_until<=?2
             AND (?1 IS NULL OR instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)");
         if controls {sql.push_str(" AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)");}
         let mut query=self.conn.prepare(&sql)?;
-        let rows=query.query_map(params![repository.map(str::to_ascii_lowercase),now],|r|r.get::<_,String>(0))?;
+        let rows=query.query_map(params![repository.map(str::to_ascii_lowercase),now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1))))?;
         let mut ready=Vec::new();
-        for row in rows {let id=row?;if self.pending_operations(&id)?.is_empty() && self.pending_owner_messages(&id)?==0
-            && !self.merge_reconciliation_needed(&id)? {ready.push(id);}}
+        for row in rows {
+            let (id,raw)=row?;
+            let raw=match raw {Ok(raw)=>raw,Err(error) if Self::is_row_data_error(&error)=>continue,Err(error)=>return Err(error.into())};
+            // A malformed individual checkpoint is unknown for this source,
+            // not a failed shared query or a valid recovery hint. Its normal
+            // history/claim readers still refuse it without changing evidence.
+            let Ok(checkpoint)=serde_json::from_str::<Checkpoint>(&raw) else {continue};
+            let recovery=matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
+                ("original_verifier_measurement_recovered","qualify_original_measurement"|"correct_original_verifier")
+                |("original_native_custody_recovered","requalify_original")
+                |("original_semantic_witness_recovered","reconsider_verifier"|"requalify_original_measurement"));
+            if checkpoint.stage!=Stage::Reconcile || checkpoint.next.eligible_at_ms>now || !recovery {continue;}
+            if self.pending_operations(&id)?.is_empty() && self.pending_owner_messages(&id)?==0
+                && !self.merge_reconciliation_needed(&id)? {ready.push(id);}
+        }
         Ok(ready)
     }
 
