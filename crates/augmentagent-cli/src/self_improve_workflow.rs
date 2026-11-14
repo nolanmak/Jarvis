@@ -59,13 +59,27 @@ impl std::fmt::Display for OwnerControlUnavailable {
 }
 impl std::error::Error for OwnerControlUnavailable {}
 
+#[derive(Debug)]
+pub(super) struct SharedIssueHistoryUnavailable;
+impl std::fmt::Display for SharedIssueHistoryUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("shared-issue-history-unavailable")}
+}
+impl std::error::Error for SharedIssueHistoryUnavailable {}
+fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
+    if error.downcast_ref::<SharedIssueHistoryUnavailable>().is_none()
+        && error.downcast_ref::<rusqlite::Error>().is_some_and(|error|!WorkflowStore::is_row_data_error(error)) {
+        error.context(SharedIssueHistoryUnavailable)
+    }else {error}
+}
+
 /// Free selection reads existing owner and workflow history without registering
 /// a workflow or initializing storage. The productive claim still rechecks pause
 /// and terminal state atomically; this is a fairness filter, never admission.
-pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
+pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
-    pub(super) fn open()->Result<Self> {
-        WorkflowStore::open_read_only(&path()).and_then(|store| {
+    pub(super) fn open()->Result<Self> {Self::open_at(&path())}
+    fn open_at(state:&Path)->Result<Self> {
+        WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
                 // queries to check structural capabilities even with no issues,
@@ -73,7 +87,7 @@ impl FreshIssueControls {
                 store.snapshot("")?;
                 store.owner_control("")?;
             }
-            Ok(Self {store})
+            Ok(Self {store,state:state.to_path_buf()})
         }).map_err(|error|error.context(OwnerControlUnavailable))
     }
     /// A per-issue preview already observed existing protected history. Its
@@ -81,12 +95,22 @@ impl FreshIssueControls {
     pub(super) fn require_existing(&self)->Result<()> {
         anyhow::ensure!(self.store.is_some(),OwnerControlUnavailable);Ok(())
     }
+    fn reopen(state:&Path,observed_existing:bool)->Result<Self> {
+        let current=Self::open_at(state).map_err(|error|error.context(SharedIssueHistoryUnavailable))?;
+        if observed_existing {current.require_existing().map_err(|error|error.context(SharedIssueHistoryUnavailable))?;}
+        Ok(current)
+    }
+    /// Close asynchronous selection gaps without turning an observed store
+    /// disappearance into a new installation. This never claims or writes.
+    pub(super) fn require_current_history(&self)->Result<()> {
+        Self::reopen(&self.state,self.store.is_some()).map(|_|())
+    }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {
             let id=durable::workflow_id(repository,issue)?;
             let snapshot=self.store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
             Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
-        })().map_err(|error|error.context(OwnerControlUnavailable))
+        })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
     }
     /// Fairness preview only: unchanged initial holds are skipped unless exact
     /// native custody has recovered. Read the same context/environment/binding inputs,
@@ -109,7 +133,7 @@ impl FreshIssueControls {
             if context.source_request!=request {return Ok(None);}
             Ok(Some((snapshot,context,request)))
         })();
-        let root=root.to_path_buf();let repository=repository.to_owned();let number=issue.number;let state=path();
+        let root=root.to_path_buf();let repository=repository.to_owned();let number=issue.number;let state=self.state.clone();
         async move {
             let result=async {
                 let Some((snapshot,context,request))=inspected? else{return Ok(false)};
@@ -126,7 +150,8 @@ impl FreshIssueControls {
                 let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
                 // A genuine recovery cue arriving during Git inspection must
                 // rejoin selection. Productive claim still checks atomically.
-                let store=WorkflowStore::open_read_only(&state)?.context("held issue history unavailable after inspection")?;
+                let reopened=Self::reopen(&state,true)?;
+                let store=reopened.store.as_ref().expect("existing history was required above");
                 // Standalone self-improve has no background inspector: restored
                 // physical custody can be recovered by the ordinary atomic claim
                 // even when the binding and checkpoint have not changed yet.
@@ -135,7 +160,7 @@ impl FreshIssueControls {
                 let current=store.snapshot(&snapshot.workflow)?.context("held issue history disappeared during inspection")?;
                 Ok(binding==snapshot.checkpoint.binding && current==snapshot && !custody_recovered)
             }.await;
-            result.map_err(|error:anyhow::Error|error.context(OwnerControlUnavailable))
+            result.map_err(|error:anyhow::Error|classify_issue_history_error(error).context(OwnerControlUnavailable))
         }
     }
     pub(super) fn paused(&self,repository:&str,issue:u64)->Result<bool> {
@@ -143,7 +168,7 @@ impl FreshIssueControls {
             let id=durable::workflow_id(repository,issue)?;
             let control=self.store.as_ref().map(|store|store.owner_control(&id)).transpose()?.flatten();
             Ok(control.is_some_and(|control|control.paused))
-        })().map_err(|error|error.context(OwnerControlUnavailable))
+        })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
     }
 }
 

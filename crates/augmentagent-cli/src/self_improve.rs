@@ -1022,6 +1022,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 continue;
             }
             Ok(false)=>{},
+            Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
             Err(error)=> {
                 warn!(issue=iss.number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
                 if unavailable_history.is_none() {unavailable_history=Some(error);}
@@ -1084,6 +1085,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         match owner_controls.unchanged_initial_hold(repo_root,&repository,&candidate).await {
             Ok(true)=>{info!(issue=number,"skip: initial input hold is unchanged; consider eligible peers");continue;},
             Ok(false)=>{},
+            Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
             Err(error)=>{
                 warn!(issue=number,error=%error,"skip: held issue inputs unavailable; preserve hold and consider peers");
                 if unavailable_history.is_none() {unavailable_history=Some(error);}
@@ -1094,6 +1096,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
         }
+        owner_controls.require_current_history()?;
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -1106,6 +1109,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     if !dry_run {
         retriage_gave_up(repo_root, &issues).await;
     }
+    owner_controls.require_current_history()?;
     if let Some(error)=unavailable_history {return Err(error.context(IssuePreviewUnavailable));}
     Ok(None)
 }
@@ -21236,7 +21240,7 @@ mod recovered_issue_selection_regressions {
     async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
         const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            for case in ["corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+            for case in ["preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
                 let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
                 git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
                 std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
@@ -21245,7 +21249,7 @@ mod recovered_issue_selection_regressions {
                 let bin=root.path().join("bin");std::fs::create_dir(&bin).unwrap();let rustc=bin.join("rustc");
                 std::fs::write(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let gh=bin.join("gh.py");std::fs::write(&gh,r#"#!/usr/bin/python3
-import json,os,sys
+import json,os,sys,sqlite3
 args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
 with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
 if args[:2]==['repo','view']:
@@ -21253,11 +21257,20 @@ if args[:2]==['repo','view']:
  if mode=='recovery-history-disappeared' and os.path.exists(marker):
   os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
  print('fixture-owner/repo');sys.exit(0)
-if args[:2]==['pr','list']:print('[]');sys.exit(0)
+if args[:2]==['pr','list']:
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-after-preview'
+ if mode=='preview-global-between-peers' and os.path.exists(marker):
+  os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ print('[]');sys.exit(0)
 if args[:1]==['api'] and '/git/ref/heads/main' in args[1]:
  marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-store'
- if mode=='preview-global-disappeared' and os.path.exists(marker):
+ if mode.startswith('preview-global-disappeared') and os.path.exists(marker):
   os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ if mode=='preview-global-between-peers':open(os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-after-preview','w').write('armed')
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-schema'
+ if mode=='preview-global-schema-peer' and os.path.exists(marker):
+  os.unlink(marker)
+  with sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']) as db:db.execute('ALTER TABLE workflow RENAME COLUMN checkpoint TO fixture_checkpoint_unavailable')
  print(open(os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']).read().strip());sys.exit(0)
 if args[:1]==['api'] and '/issues?' in args[1]:
  def issue(n,title,body):return dict(number=n,title=title,body=body,labels=[],user={'login':'fixture-owner'},author_association='OWNER')
@@ -21269,6 +21282,7 @@ if args[:1]==['api'] and '/issues?' in args[1]:
  fresh=issue(1829,'Correct older widget rounding','Keep older widget rounding consistent.')
  rows=[held,recovered,fresh] if mode not in ['held-only','changed-source','changed-candidate','missing-context','upstream-only','changed-environment','physical-restored','physical-missing','semantic-native'] else [held,fresh]
  if mode.startswith('preview-'):rows=[] if mode.startswith('preview-empty') else [held]
+ if mode in ['preview-global-disappeared-peer','preview-global-between-peers','preview-global-schema-peer','preview-local-unavailable-peer']:rows=[held,fresh]
  if mode=='recovery-priority' or mode.startswith('corrupt-recovery-peer-'):rows.insert(0,issue(1834,'Correct newest eligible widget','Keep the newest widget behavior consistent.'))
  print(json.dumps(rows if args[1].endswith('page=1') else []));sys.exit(0)
 raise AssertionError(args)
@@ -21332,7 +21346,7 @@ raise AssertionError(args)
             let mut ledger=AttemptLedger::load(&attempt_ledger_path());ledger.day=utc_day_now();ledger.issues=vec![1830];ledger.save(&attempt_ledger_path());
         }
         if case=="changed-candidate" {std::fs::write(repo.join(".self-improve-worktrees/current-issue-1833/code.txt"),"owner changed candidate\n").unwrap();}
-        if matches!(case.as_str(),"missing-context"|"preview-fallback"|"preview-no-fallback"|"preview-build-lane") {rusqlite::Connection::open(&database).unwrap().execute("DELETE FROM qualification_execution_context WHERE workflow=?1",[held_id]).unwrap();}
+        if matches!(case.as_str(),"missing-context"|"preview-fallback"|"preview-no-fallback"|"preview-build-lane"|"preview-local-unavailable-peer") {rusqlite::Connection::open(&database).unwrap().execute("DELETE FROM qualification_execution_context WHERE workflow=?1",[held_id]).unwrap();}
         if case=="upstream-only" {
             std::fs::write(repo.join("upstream.txt"),"unrelated current-main input\n").unwrap();git(&repo,&["add","upstream.txt"]);
             git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","main advanced"]);
@@ -21374,8 +21388,11 @@ raise AssertionError(args)
             return;
         }
         if case.starts_with("preview-") {
-            let schema=case=="preview-global-error";let disappeared=case=="preview-global-disappeared";let global=schema || disappeared;
-            if disappeared {std::fs::write(format!("{}.lose-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable fixture fault").unwrap();}
+            let schema=case=="preview-global-error";let during_schema=case=="preview-global-schema-peer";
+            let between=case=="preview-global-between-peers";let disappeared=case.starts_with("preview-global-disappeared") || between;
+            let global=schema || during_schema || disappeared;
+            if during_schema {std::fs::write(format!("{}.lose-schema",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable fixture schema fault").unwrap();}
+            if disappeared && !between {std::fs::write(format!("{}.lose-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable fixture fault").unwrap();}
             if schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE workflow RENAME TO fixture_workflow_unavailable;").unwrap();}
             let calls=std::sync::atomic::AtomicUsize::new(0);
             let outcome=select_issue_with_fallback(&repo,true,case!="preview-build-lane",||async {
@@ -21385,19 +21402,23 @@ raise AssertionError(args)
                 Ok((matches!(case.as_str(),"preview-fallback"|"preview-empty-fallback")).then(||RunReport::held("scripted waiting draft fallback".to_string())))
             }).await;
             if schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE fixture_workflow_unavailable RENAME TO workflow;").unwrap();}
+            if during_schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE workflow RENAME COLUMN fixture_checkpoint_unavailable TO checkpoint;").unwrap();}
             if disappeared {
                 let missing=PathBuf::from(format!("{}.fixture-missing",database.display()));assert!(missing.exists(),"temporary store-loss fault did not reach preview inspection");
                 std::fs::rename(missing,&database).unwrap();
             }
             if matches!(case.as_str(),"preview-fallback"|"preview-empty-fallback") {
                 assert!(matches!(outcome,Ok(IssueSelection::Report(ref report)) if report.message=="scripted waiting draft fallback"),"per-issue preview failure starved guarded waiting work");
+            }else if case=="preview-local-unavailable-peer" {
+                assert!(matches!(outcome,Ok(IssueSelection::Issue(ref issue)) if issue.number==1829),"candidate-local missing context suppressed a healthy peer");
             }else if case=="preview-empty" {
                 assert!(matches!(outcome,Ok(IssueSelection::Report(ref report)) if report.message==IDLE_MSG),"empty inventory no longer idles after an empty fallback");
             }else {
                 let error=match outcome {Err(error)=>error,_=>panic!("unavailable issue history became fresh/idle success")};
                 assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"original unavailable-history outcome was lost");
+                if during_schema || disappeared {assert!(error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some(),"shared store failure became a candidate-local hold");}
             }
-            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),usize::from(!global && case!="preview-build-lane"),"fallback ran outside its reserved combined-lane boundary");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),usize::from(!global && case!="preview-build-lane" && case!="preview-local-unavailable-peer"),"fallback ran outside its reserved combined-lane boundary");
             assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
             assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
             assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());

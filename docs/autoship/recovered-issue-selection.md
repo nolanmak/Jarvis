@@ -251,3 +251,25 @@ fixtures test scheduling and custody preservation, not execution or shipment.
 
 The updated 30-case real selector/routing fixture passes in 15.90 seconds.
 Final-head broader suites, hosted checks and review remain required.
+
+
+Final review of c400 identified an additional shared-store race: a held preview
+could lose protected history, retain that error, and then return an eligible
+fresh peer through its old connection. The real selector reproduced this before
+the fix (0.54 seconds). A typed shared-history error now stops candidate scanning
+immediately; malformed individual row data and missing candidate context remain
+candidate-local. Read-only controls retain their originally selected store path,
+reopen/validate shared history after held inspection, and check availability
+before returning either an eligible issue or an exhausted inventory. A store
+observed as existing cannot become a fresh installation during those rechecks.
+The atomic productive claim remains the final authority.
+
+The real selector/routing regression now covers 34 cases and passes in 18.50
+seconds. New cases cover disappearance with an eligible peer, disappearance
+between a successfully skipped held issue and a fresh peer, shared schema loss
+during inspection, and a candidate-local missing context with a selectable peer.
+Shared failures return the existing public owner-history hold and invoke no
+fallback; local failure still permits the healthy peer without fallback. Raw
+state, snapshots/events, charges and command-job absence remain checked.
+Broader affected tests, fresh exact-head hosted CI and engineering review are
+required on the amended source. No rollout or shipping acceptance is claimed.
