@@ -1104,3 +1104,12 @@ consumer; they do not resolve original/corrective source authentication for
 migration, Pending v2 and immutable constructor-prompt decisions remain root-owned
 rollout blockers. No production activation, new approval, native execution grant,
 autonomous merge or full combined CLI pass is established by this checkpoint.
+
+
+The subsequent complete managed CLI command on `16fa6266` passed 2,168 unit
+tests, zero failures, 47 explicit ignores (475.68 seconds), and every integration/
+contract set. This is the first full combined-branch pass after the main-recovery
+merge and reader amendments. The explicitly delegated approved-command custody
+case remains outside that ordinary run and unresolved; the source-context,
+capability, scheduling, migration and activation blockers above remain open.
+This documentation-only checkpoint changes no verified Rust source.
