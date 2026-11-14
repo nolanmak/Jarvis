@@ -230,6 +230,76 @@ fn short_card_reference_attaches_and_inspects_a_same_conversation_compose() {
     assert!(store.list_imessage_outbox(10).unwrap().is_empty());
 }
 
+/// #1830 — the socialapi DM card keys its conversation as
+/// `instagram:<conversation>`; the receipt comes from the bare-keyed trigger
+/// message, and the full action id must still link the two.
+#[test]
+fn socialapi_card_attaches_the_same_conversation_receipt_by_full_action_id() {
+    let dir = fixture();
+    let root = dir.path();
+    let store = Store::open(root.join("db")).unwrap();
+    let dm = |message_id: &str, thread_id: &str, kind: &str| Email {
+        message_id: message_id.into(),
+        thread_id: Some(thread_id.into()),
+        from: "peer <socialapi:instagram:9001>".into(),
+        to: String::new(),
+        cc: String::new(),
+        attachments: vec![],
+        subject: "[Instagram DM from peer]".into(),
+        body: "Can you confirm the plan?".into(),
+        date: "2026-01-01T00:00:00Z".into(),
+        account_entity_id: Some("socialapi-account".into()),
+        platform: "socialapi".into(),
+        kind: kind.into(),
+    };
+    store
+        .upsert_email_backfill(&dm("social-source", "conversation-42", "dm"), 1)
+        .unwrap();
+    let compose = dm(
+        "compose:socialapi:dm:instagram:conversation-42",
+        "instagram:conversation-42",
+        "compose",
+    );
+    store.upsert_email(&compose).unwrap();
+    let receipt = store
+        .save_draft_context_receipt("social-source", &serde_json::json!({"version":1}))
+        .unwrap();
+    let action = store
+        .log_action(
+            &compose.message_id,
+            compose.thread_id.as_deref(),
+            &compose.from,
+            &compose.subject,
+            None,
+            Some("Draft"),
+            ActionStatus::Pending,
+        )
+        .unwrap();
+    let attached = output(
+        command(root)
+            .args([
+                "messages",
+                "context-attach",
+                "--receipt-id",
+                &receipt,
+                "--action-id",
+                &action,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(attached["action_id"], action);
+    let receipts = output(
+        command(root)
+            .args(["messages", "context-receipts", "--action-id", &action])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(receipts.as_array().unwrap().len(), 1);
+    assert_eq!(store.pending_actions().unwrap().len(), 1);
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}
+
 #[test]
 fn ambiguous_card_references_do_not_attach_or_disclose_receipts() {
     let dir = fixture();
