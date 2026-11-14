@@ -26,6 +26,10 @@
 //! Call sites: Discord replies via `attachments::prepare_answer_delivery`
 //! and `/loop` results in `loops.rs`; email bodies via `gmail compose|
 //! update-draft|send-now` in `main.rs`, refused before any Gmail write.
+//! The DM compose paths (iMessage/WhatsApp bundles, socialapi, LinkedIn) run
+//! the recipient-sample half through [`attach_dm_register_warning`], which
+//! only annotates the approval card: a mismatch there warns and still sends
+//! (#2014).
 
 use std::fmt;
 
@@ -395,6 +399,108 @@ pub fn audit_draft_against_sample(sample: &str, draft: &str) -> Option<String> {
     contradiction("the recipient writes in", declared, &paragraphs)
 }
 
+/// The advisory register warning for a drafted DM (#2014): the recipient's
+/// own recent messages are classified and the draft held to *their* casing —
+/// the check the Gmail path runs against `--reply-to-body`, and which no DM
+/// path ran.
+///
+/// `samples` must be recipient-authored text only: the owner's own turns say
+/// nothing about the register the recipient writes in. Insufficient evidence
+/// yields `None`, so an owner-started compose with no message from the other
+/// side is never guessed at, and an owner override this turn
+/// (`register: lowercase (you asked)`, #1107) is not second-guessed. A receipt
+/// that merely classifies is dropped from the audited prose, since its
+/// lowercase keyword is evidence for nothing.
+pub fn dm_register_warning<'a>(
+    samples: impl IntoIterator<Item = &'a str>,
+    draft: &str,
+) -> Option<String> {
+    let lead = draft.trim_start_matches(['\r', '\n']);
+    let (first, rest) = lead.split_once('\n').unwrap_or((lead, ""));
+    if is_owner_override_receipt(first) {
+        return None;
+    }
+    let prose = if is_register_receipt(first) { rest } else { lead };
+    // Only what the recipient would read is audited: an `<!--aa:assumes`
+    // block is card metadata, and its `aa` would read as a lowercase start.
+    let prose = crate::layout::strip_assumes_for_send(prose);
+    let prose = prose.as_str();
+    let declared = recipient_register(samples)?;
+    let (paragraphs, _) = draft_paragraphs(&prose.lines().collect::<Vec<_>>(), None);
+    contradiction("the recipient writes in", declared, &paragraphs)
+}
+
+/// The register a DM recipient writes in, from their own recent messages.
+/// Each message is classified on its own and the majority wins; a message of
+/// under three words (`ok`, `see you`) is evidence for neither register, so
+/// an acknowledgement does not cancel a person's sentence-shaped messages.
+/// A tie, or nothing to classify, is `None`: nothing is guessed.
+fn recipient_register<'a>(samples: impl IntoIterator<Item = &'a str>) -> Option<Register> {
+    let (mut standard, mut lowercase) = (0, 0);
+    for sample in samples {
+        let words = sample.split_whitespace().filter(|w| w.chars().any(char::is_alphabetic)).count();
+        if words < 3 {
+            continue;
+        }
+        match register_of(sample) {
+            Some(Register::Standard) => standard += 1,
+            Some(Register::Lowercase) => lowercase += 1,
+            None => {}
+        }
+    }
+    match standard.cmp(&lowercase) {
+        std::cmp::Ordering::Greater => Some(Register::Standard),
+        std::cmp::Ordering::Less => Some(Register::Lowercase),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// Append the recipient's register to a DM drafter's prompt (#2014). The
+/// proactive drafters wrote in the owner's lowercase voice even to someone
+/// who capitalizes, because nothing told them how the recipient writes; the
+/// card warning only caught it afterwards. The section goes last so it reads
+/// after the owner's tone. Thin or mixed evidence leaves the prompt unchanged.
+pub fn with_register_guidance<'a>(
+    prompt: String,
+    samples: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let guidance = match recipient_register(samples) {
+        Some(Register::Standard) => {
+            "This person writes in standard capitalization. Mirror them: capitalize the first \
+             word of every sentence and the pronoun \"I\" in your reply, even where the owner's \
+             usual voice is lowercase."
+        }
+        Some(Register::Lowercase) => {
+            "This person writes in lowercase. Mirror them: lowercase sentence starts are fine."
+        }
+        None => return prompt,
+    };
+    format!("{prompt}\n\n<recipient_register>\n{guidance}\n</recipient_register>\n")
+}
+
+/// [`dm_register_warning`], attached to the draft as card-only metadata
+/// (#2014). Returns the draft to persist and post — unchanged when there is
+/// nothing to warn about — plus the warning itself, for the caller's log.
+///
+/// The marker rides AHEAD of any needs-input marker (which the card renderer
+/// truncates at), and callers must store and card the same returned string so
+/// Approve still matches the draft it was shown. Nothing here refuses.
+pub fn attach_dm_register_warning<'a>(
+    samples: impl IntoIterator<Item = &'a str>,
+    draft: &str,
+) -> (String, Option<String>) {
+    let (prose, needs) = crate::layout::split_needs_input(draft);
+    let Some(warning) = dm_register_warning(samples, &prose) else {
+        return (draft.to_string(), None);
+    };
+    let asks: Vec<(String, String)> = needs.into_iter().map(|n| (n.kind, n.text)).collect();
+    let marked = crate::layout::append_needs_input_marker(
+        &crate::layout::append_register_warning(&prose, &warning),
+        &asks,
+    );
+    (marked, Some(warning))
+}
+
 /// Notes for a reply or body: each `register:` receipt is checked against
 /// every paragraph of the draft under it. A fenced block that is not under
 /// a receipt is skipped whole, so a code example quoting the receipt format
@@ -698,6 +804,80 @@ mod tests {
             ));
             assert_eq!(notes.len(), 1, "{draft:?}: {notes:?}");
         }
+    }
+
+    /// #2014: the drafter is told the register the recipient writes in, from
+    /// their own sentence-shaped messages; a short acknowledgement is not
+    /// evidence, and thin or tied evidence adds nothing to the prompt.
+    #[test]
+    fn issue_2014_dm_drafter_is_told_the_recipients_register() {
+        let standard = "Sounds good. I sent the document yesterday afternoon, check email.";
+        let lower = "sounds good, i sent it yesterday. check your email";
+        let told = with_register_guidance("PROMPT".into(), [standard, "ok"]);
+        assert!(told.starts_with("PROMPT\n\n<recipient_register>\n"), "{told}");
+        assert!(told.contains("capitalize the first word of every sentence"), "{told}");
+        let told = with_register_guidance("PROMPT".into(), [lower, lower, standard]);
+        assert!(told.contains("writes in lowercase"), "{told}");
+        for samples in [vec![], vec!["ok", "see you"], vec![standard, lower]] {
+            assert_eq!(with_register_guidance("PROMPT".into(), samples.clone()), "PROMPT", "{samples:?}");
+        }
+        // Card metadata is not prose: a correctly cased reply carrying an
+        // assumption is not flagged for the marker's lowercase `aa`.
+        let with_assumes = crate::layout::append_assumes_marker(
+            "Got it, I see it. I'll send it back.",
+            &["you're free on Thursday".to_string()],
+        );
+        assert!(dm_register_warning([standard], &with_assumes).is_none(), "{with_assumes}");
+        // The card backstop reads the same evidence: an `ok` no longer
+        // cancels a capitalizing contact's sentence-shaped message.
+        assert!(dm_register_warning([standard, "ok"], "got it, i see it. i'll send it back").is_some());
+    }
+
+    /// #2014: the DM paths hold a draft to the recipient's own casing and
+    /// carry the mismatch as card metadata. Advisory, so the draft itself is
+    /// untouched apart from the marker, and an owner override or thin
+    /// evidence warns about nothing.
+    #[test]
+    fn issue_2014_dm_drafts_are_held_to_the_recipients_casing() {
+        let standard = "Hi, I wanted to check in on the proposal. Does Thursday still work?";
+        let lower = "hey casey, sending it tonight. thursday still works";
+        let mirrored = "Sending it tonight. Thursday works.";
+        let note = dm_register_warning([standard], lower).expect("mismatch");
+        assert!(note.contains("the recipient writes in standard"), "{note}");
+
+        // Mirroring casing, the owner's own turns as the only samples, and no
+        // sample at all each decide nothing. Nor is an owner override this
+        // turn second-guessed, and an ordinary receipt is dropped from the
+        // prose rather than read as a lowercase sentence.
+        for (samples, draft) in [
+            (vec![standard], mirrored),
+            (vec!["ok", "see you"], lower),
+            (vec![], lower),
+            (vec![standard], &*format!("register: lowercase (you asked)\n{lower}")),
+            (vec![standard], "register: standard (she capitalizes), mirroring\nSending it tonight."),
+        ] {
+            assert!(dm_register_warning(samples, draft).is_none(), "{draft}");
+        }
+
+        // The warning rides as card-only metadata: the marked draft splits
+        // back to the drafted text and ships without a trace of it.
+        let (marked, carried) = attach_dm_register_warning([standard], lower);
+        assert_eq!(carried.as_deref(), Some(note.as_str()));
+        assert_eq!(crate::layout::split_register(&marked), (lower.to_string(), Some(note.clone())));
+        assert_eq!(crate::layout::strip_assumes_for_send(&marked), lower);
+
+        // A needs-input marker stays last, so the card still decodes both.
+        let asked = crate::layout::append_needs_input_marker(
+            lower,
+            &[("scheduling".to_string(), "which Thursday".to_string())],
+        );
+        let (marked, _) = attach_dm_register_warning([standard], &asked);
+        let (human, needs) = crate::layout::split_needs_input(&marked);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(crate::layout::split_register(&human).1.as_deref(), Some(note.as_str()));
+
+        // Nothing to warn about ⇒ byte-identical draft.
+        assert_eq!(attach_dm_register_warning([standard], mirrored).0, mirrored);
     }
 
     /// URL/handle/brand sentence starts, greetings, sign-offs, list items

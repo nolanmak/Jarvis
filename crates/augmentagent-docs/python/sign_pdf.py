@@ -517,7 +517,13 @@ def process(data, op):
     signed = output.getvalue()
     if len(signed) <= len(pdf) or signed[:len(pdf)] != pdf:
         raise ValueError('signing would alter the original document bytes')
-    verify_other_pages(reader, PdfReader(io.BytesIO(signed), strict=True), page_number - 1)
+    # Compare against a fresh parse of the original bytes, never `reader`:
+    # text extraction above rewrites a Type0 font's indirect /DescendantFonts
+    # entry with the resolved font in place (pypdf), so that reader no longer
+    # describes the file and every other page sharing the font looked changed
+    # (#2081, Chrome/Skia and Word exports).
+    verify_other_pages(PdfReader(io.BytesIO(pdf), strict=True),
+                       PdfReader(io.BytesIO(signed), strict=True), page_number - 1)
     return signed
 
 

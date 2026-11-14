@@ -8,7 +8,7 @@ const REPOSITORY:&str="fixture-owner/repo";
 
 async fn exercise(case:&str,test:&str) {
     if std::env::var_os(CHILD).is_some() {child(case).await;return;}
-    let routes:&[&str]=if case=="race" || case.starts_with("trust-") {&["primary"]}else{&["primary","configured"]};
+    let routes:&[&str]=if case=="race" || case=="terminal-race" || case.starts_with("trust-") {&["primary"]}else{&["primary","configured"]};
     for &route in routes {
         let root=tempfile::tempdir_in("/tmp").unwrap();
         let gh=root.path().join("github.py");
@@ -82,6 +82,7 @@ fn ordered_numbers()->[u64;3] {
 async fn child(case:&str) {
     let repo=PathBuf::from(std::env::var_os(CHILD).unwrap());
     let path=workflow::path();
+    if case.starts_with("terminal-") {terminal_child(&repo,&path,case).await;return;}
     if case.starts_with("manual-") {manual_child(&repo,&path,case).await;return;}
     if case.starts_with("trust-") {trust_child(&repo,&path,case).await;return;}
     let [first,second,peer_number]=ordered_numbers();
@@ -284,3 +285,106 @@ async fn all_manual_engineering_inventory_stays_idle() {exercise("manual-all","a
 async fn removing_manual_routing_restores_normal_eligibility() {exercise("manual-remove","removing_manual_routing_restores_normal_eligibility").await;}
 #[tokio::test]
 async fn manual_routing_precedes_blast_radius_triage() {exercise("manual-risk","manual_routing_precedes_blast_radius_triage").await;}
+
+// #2076: the real inventory can retain an open source after its workflow
+// merged. Selection must advance without reopening or charging completed work.
+async fn terminal_child(repo:&Path,path:&Path,case:&str) {
+    use crate::autoship_workflow::{Checkpoint,NextAction,Stage};
+    let [first,second,peer]=ordered_numbers();
+    if case=="terminal-schema-empty" {
+        inventory(&[]);
+        {
+            let conn=rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated(value TEXT);").unwrap();
+        }
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before=std::fs::read(path).unwrap();
+        let error=select(repo).await.err().expect("incompatible protected store was reported as an ordinary empty inventory");
+        assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"lost typed shared-store hold: {error:#}");
+        assert_eq!(std::fs::read(path).unwrap(),before,"free schema inspection initialized or migrated state");
+        return;
+    }
+    if matches!(case,"terminal-all"|"terminal-corrupt") {inventory(&[first,second]);}else{inventory(&[42,41,40]);}
+    let binding=workflow::git_binding(repo,"original request","fixture-environment",&[]).await.unwrap();
+    let mut store=WorkflowStore::open(path).unwrap();
+    for (number,stage) in [(first,Stage::Merged),(second,Stage::Retired)] {
+        let id=workflow_id(REPOSITORY,number).unwrap();store.register(&id,"fixture",binding.clone(),1).unwrap();
+        let lease=store.claim(&id,"past-worker",2,100).unwrap().unwrap();
+        store.charge(&lease,"past-work",ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},3).unwrap();
+        // A controller fixture checkpoint is not an autonomous merge receipt.
+        store.checkpoint(&lease,&Checkpoint {stage,binding:binding.clone(),evidence:vec![],
+            next:NextAction {reason:"fixture_terminal_history".into(),action:"complete".into(),eligible_at_ms:0}},4).unwrap();
+        store.release(&lease,5).unwrap();
+    }
+    let before=[first,second].map(|n| {let id=workflow_id(REPOSITORY,n).unwrap();
+        (store.snapshot(&id).unwrap(),store.owner_control(&id).unwrap(),store.events(&id).unwrap())});drop(store);
+    if case.starts_with("terminal-corrupt") {
+        let bad=workflow_id(REPOSITORY,first).unwrap();
+        rusqlite::Connection::open(path).unwrap().execute("UPDATE workflow SET checkpoint='not-json' WHERE id=?1",[&bad]).unwrap();
+        let result=select(repo).await;
+        if case=="terminal-corrupt-peer" {
+            assert_eq!(result.unwrap().map(|issue|issue.number),Some(peer),"unreadable workflow blocked a healthy ordinary peer");
+        }else {
+            let error=result.err().expect("unknown-only history was misreported as a healthy empty inventory");
+            assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"lost typed protected-history hold: {error:#}");
+        }
+        let store=WorkflowStore::open_read_only(path).unwrap().unwrap();
+        assert_eq!(store.events(&bad).unwrap(),before[0].2,"unknown candidate history was changed");
+        assert_eq!(store.owner_control(&bad).unwrap(),before[0].1);
+        assert!(store.snapshot(&workflow_id(REPOSITORY,peer).unwrap()).unwrap().is_none());
+        store.query_connection(|conn| {
+            let raw:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&bad],|r|r.get(0))?;
+            assert_eq!(raw,"not-json","selection repaired/overwrote unknown history");
+            Ok(())
+        }).unwrap();
+        return;
+    }
+    let chosen=select(repo).await.unwrap();
+    assert_eq!(chosen.as_ref().map(|i|i.number),if case=="terminal-all" {None}else{Some(peer)},
+        "already completed workflow consumed an ordinary peer's selection turn");
+    let mut store=WorkflowStore::open(path).unwrap();
+    for (n,prior) in [first,second].into_iter().zip(before) {
+        let id=workflow_id(REPOSITORY,n).unwrap();
+        assert_eq!((store.snapshot(&id).unwrap(),store.owner_control(&id).unwrap(),store.events(&id).unwrap()),prior,
+            "selection changed terminal history, charges or owner intent");
+    }
+    let id=workflow_id(REPOSITORY,peer).unwrap();assert!(store.snapshot(&id).unwrap().is_none());
+    if case=="terminal-race" {
+        store.register(&id,"fixture",binding.clone(),10).unwrap();let lease=store.claim(&id,"completion-race",11,100).unwrap().unwrap();
+        store.checkpoint(&lease,&Checkpoint {stage:Stage::Retired,binding,evidence:vec![],
+            next:NextAction {reason:"target_closed".into(),action:"complete".into(),eligible_at_ms:0}},12).unwrap();
+        store.release(&lease,13).unwrap();let prior=store.snapshot(&id).unwrap().unwrap();drop(store);
+        let guard=workflow::WorkflowGuard::acquire_fixture(path,workflow::Start {repo_root:repo,worktree:repo,repository:REPOSITORY,
+            source_issue:Some(peer),pr:None,branch:"fixture",contract:"original request",environment:"fixture-environment"}).await.unwrap();
+        assert!(guard.is_none(),"terminal transition after selection reached a productive claim");
+        let store=WorkflowStore::open(path).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap(),prior);
+    }else {drop(store);}
+    let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_PAUSED_CALLS").unwrap()).unwrap();
+    for call in calls.lines() {
+        let args:Vec<String>=serde_json::from_str(call).unwrap();
+        if matches!(args.first().map(String::as_str),Some("issue"|"pr")) {
+            assert_eq!(args.get(1).map(String::as_str),Some("list"),"terminal selection attempted a remote mutation");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(),"original candidate\n");
+    assert!(!repo.join(".self-improve-worktrees").exists());
+}
+
+#[tokio::test]
+async fn terminal_workflows_do_not_starve_ordinary_peer() {exercise("terminal-peer","terminal_workflows_do_not_starve_ordinary_peer").await;}
+#[tokio::test]
+async fn terminal_only_inventory_is_idle_without_reopening_history() {exercise("terminal-all","terminal_only_inventory_is_idle_without_reopening_history").await;}
+#[tokio::test]
+async fn terminal_history_corruption_is_a_free_typed_hold() {exercise("terminal-corrupt","terminal_history_corruption_is_a_free_typed_hold").await;}
+#[tokio::test]
+async fn primary_terminal_transition_after_selection_still_blocks_productive_claim() {exercise("terminal-race","primary_terminal_transition_after_selection_still_blocks_productive_claim").await;}
+
+#[tokio::test]
+async fn terminal_history_corruption_does_not_starve_healthy_peer() {
+    exercise("terminal-corrupt-peer","terminal_history_corruption_does_not_starve_healthy_peer").await;
+}
+
+#[tokio::test]
+async fn terminal_reader_requires_compatible_store_even_when_inventory_empty() {
+    exercise("terminal-schema-empty","terminal_reader_requires_compatible_store_even_when_inventory_empty").await;
+}
