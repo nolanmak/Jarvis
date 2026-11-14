@@ -207,6 +207,32 @@ impl WorkflowStore {
 mod tests {
     use super::*;
     #[test]
+    fn contract_invalid_metadata_hold_enters_only_free_inspection() {
+        for attached in [false,true] {
+            let dir=tempfile::tempdir_in("/tmp").unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+            let id="owner/repo#7";let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"environment".into()};
+            store.register(id,"candidate",binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,1000).unwrap().unwrap();
+            if attached {store.attach_pr_in_repo(&lease,"owner/repo",42,2).unwrap();}
+            store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:dir.path().into(),
+                source_request:"original request".into(),source_pr:attached.then_some(42),contract:"original request".into(),environment:"environment".into(),binding:binding.clone()},3).unwrap();
+            let purpose=format!("{BASELINE_NATIVE_PURPOSE_PREFIX}{}","a".repeat(64));
+            store.charge_admitted_model(&lease,"original-call",3,None,Some((&purpose,&binding,1)),Some(submission::Provider::Codex),true).unwrap();
+            let (raw,proof)=baseline_native_response_keys(&purpose).unwrap();
+            store.record_scope_stage_response_pair(&lease,&binding,&raw,"scripted completed witness",&proof,"scripted private reference",4).unwrap();
+            let held=Checkpoint {stage:Stage::Scope,binding:binding.clone(),evidence:vec![],next:NextAction {
+                reason:"acceptance_contract_invalid".into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0}};
+            store.checkpoint(&lease,&held,5).unwrap();store.release(&lease,6).unwrap();
+            let before=store.snapshot(id).unwrap().unwrap();
+            assert!(store.claim_productive_for_binding(id,"unchanged",7,1000,&binding).unwrap().is_none(),"metadata hold became productive before inspection");
+            let selected=store.reserve_qualification_recovery("owner/repo",10,1,&Default::default()).unwrap();
+            assert_eq!(selected.len(),1,"contract-invalid metadata evidence never reaches free inspection (attached={attached})");
+            assert_eq!(selected[0].snapshot.workflow,id);
+            assert_eq!(store.snapshot(id).unwrap().unwrap(),before,"inspection selection claimed or charged productive work");
+            assert!(store.reserve_qualification_recovery("owner/repo",11,1,&Default::default()).unwrap().is_empty(),"unchanged metadata inspection bypassed its five-minute fairness reservation");
+        }
+    }
+
+    #[test]
     fn semantic_hold_enters_free_selection_and_queued_reconsideration_wakes_normal_work() {
         let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
         let id="owner/repo#7";let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
