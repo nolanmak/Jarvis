@@ -634,11 +634,13 @@ mod tests {
 
     #[test]
     fn quota_repair_resumes_same_cue_without_filesystem_space_change() {
-        for repair in ["space_limit","inode_limit","space_hard","inode_hard","space_usage","inode_usage","disabled","grace","identity"] {
+        for repair in ["space_limit","inode_limit","space_hard","inode_hard","space_usage","inode_usage","space_usage_during_grace","inode_usage_during_grace","disabled","grace","identity"] {
             let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
             assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
             let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-            let quota=RetainedSetupQuota {id:1000,enabled:true,space_limit_blocks:100,space_hard_blocks:100,space_used_bytes:51200,inode_limit:10,inode_hard_limit:10,inodes_used:10,space_grace:50,inode_grace:50};
+            let mut quota=RetainedSetupQuota {id:1000,enabled:true,space_limit_blocks:100,space_hard_blocks:100,space_used_bytes:51200,inode_limit:10,inode_hard_limit:10,inodes_used:10,space_grace:50,inode_grace:50};
+            if repair=="space_usage_during_grace" {quota.space_hard_blocks=200;quota.space_used_bytes=200*512;quota.space_grace=4_102_444_800;}
+            if repair=="inode_usage_during_grace" {quota.inode_hard_limit=20;quota.inodes_used=20;quota.inode_grace=4_102_444_800;}
             let quotas=std::collections::BTreeMap::from([("1".repeat(64),quota.clone()),("2".repeat(64),quota.clone()),("3".repeat(64),quota.clone())]);
             let failed=RetainedSetupDependency {version:2,operation:"prepared".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),
                 capacity:Some(std::collections::BTreeMap::from([("f".repeat(64),RetainedSetupCapacity {available_blocks:1000,available_inodes:1000,block_size:4096,entries:1,name_bytes:4})])),quotas:Some(quotas),completed:false};
@@ -661,6 +663,7 @@ mod tests {
                 "inode_limit"=>{value.inode_limit+=1;value.inode_hard_limit+=1;},
                 "space_hard"=>value.space_hard_blocks+=1,"inode_hard"=>value.inode_hard_limit+=1,
                 "space_usage"=>value.space_used_bytes-=512,"inode_usage"=>value.inodes_used-=1,
+                "space_usage_during_grace"=>value.space_used_bytes-=4*512,"inode_usage_during_grace"=>value.inodes_used-=4,
                 "disabled"=>*value=RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_hard_blocks:0,space_used_bytes:0,inode_limit:0,inode_hard_limit:0,inodes_used:0,space_grace:0,inode_grace:0},
                 "grace"=>value.space_grace+=1,"identity"=>value.id+=1,_=>unreachable!(),
             }

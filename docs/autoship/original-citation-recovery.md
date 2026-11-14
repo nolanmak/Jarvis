@@ -1615,3 +1615,7 @@ all 26 recovery-store tests passed (1.20s), and the read-only actual #1830 probe
 passed again (11.46s) with unchanged scope/evidence/history/12 model calls.
 The 2,115-test full run above is the preceding `36317efa` checkpoint; the final
 hard-limit amendment requires its own exact-head hosted CI and review.
+The recovery-store fixture additionally covers freeing four blocks/inodes while
+usage remains above the unchanged soft limit and below the hard limit during
+recorded grace, matching independent review's follow-up example. All 26 store
+recovery tests passed again (1.37s); this last change extends tests only.
