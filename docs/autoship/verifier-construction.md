@@ -944,3 +944,79 @@ selection passed 32 tests, zero failures and two explicit delegated-service
 ignores (147.78s). These synthetic DTO/capture fixtures do not establish a native
 approval or new execution grant. Current main was merged normally into this
 engineering branch before the change; nothing was activated or deployed.
+
+
+## Main recovery integration and complete retained witness data
+
+Main #2083 was merged normally into this engineering branch. Its baseline
+admission reader retains historical bindings while the constructor/adjudicator
+readers preserve their separate purpose, charge and role checks. Main's immutable
+captured-fact reader and this branch's approved-parent data reader now share the
+same mode-aware validation: a baseline-only plan still refuses transition facts;
+v2 plan data still grants no approval, ownership or execution authority.
+
+Current qualification data preserves the v1 native judgment format. For a v2
+retained qualification it returns a versioned data object containing the fully
+revalidated protected qualification recipe and **every** applicable checked native
+judgment alongside its exact checked-response identity. Each judgment retains its
+original native context; the current qualification header stays separate. The
+same validator checks all applicable semantic dispositions and canonical digests
+before either data reads or `assert_current` succeed. No convenient response is
+selected and no source/native bytes are changed. Unqualified preparation alone
+still cannot return qualified witness data.
+
+The disposable initial/enrolled issue and PR regression now reads these facts
+only after normal retained qualification. It checks the exact original judgment,
+stable repeat reads, unchanged workflow/events and zero new reasoner calls. It
+first failed at that qualified boundary because metadata-only evidence omitted
+the native facts (72.70 seconds); the data-reader amendment passes. These are
+scripted native/capture fixtures, not an actual-provider or shipment receipt.
+
+This merge/data amendment is not an activated correction pipeline. Root still
+owns the actual Stage consumers: semantic adjudication attribution must consume
+all qualified judgments, and bounded original-source collection must authenticate
+the original/corrective request relationship across retained native contexts.
+The old flat `verifiers` / `context` assumptions cannot be used for the v2 data
+object. Those joins, approved v2 ownership/publication, live/frozen execution
+capabilities, actual captured execution, caller/hold/recovery and Pending activation
+must be finished and tested before a #2058 PR or rollout. The delegated approved
+custody regression remains RED at its preceding run. The combined branch's full
+CLI verification has not yet passed after this merge; the first attempt exposed
+merge duplicates and this witness-data handoff, now corrected in source.
+
+
+### Audit and remaining implementation decisions at this checkpoint
+
+The fresh-reader pass covered all three integration joins and identified six
+load-bearing decisions. Root owns them under #2058; all block a production
+handoff/activation. The new data-reader test is one parent test covering both
+issue and PR children (196.00 seconds), not a full combined CLI pass.
+
+1. Define the all-judgment applicability/aggregation rules for the exact staged
+   measurement, preserving every checked response and refusing any applicable
+   negative, missing member or swapped identity. Implement/test this with the
+   actual Stage consumer before allowing authority admission from v2 data.
+2. Define and test the original/corrective native request and source-selection
+   relationship under each retained context, including absent/foreign/conflicting
+   and oversized evidence. Correct Git bytes alone are insufficient. This blocks
+   `original_source`; no convenient historical context may be substituted.
+3. Define the complete semantic attribution projection used for authority replay,
+   including which changes are material and which are only native wording or
+   publication metadata. Preserve existing reservations/charges and do not turn
+   the new serialized data shape into a budget reset. Implement/test together
+   with decision 1 before accepting any v2 Stage authority key.
+4. Finish the already-open frozen-recipe recovery capability and its caller matrix:
+   complete data reads, capture-only settlement and resumed/fresh commands remain
+   separate. DTO decoding or a parent-data read is never a grant.
+5. Finish the already-open held-work eligibility/claim/stop/cue table, including
+   pauses, lifecycle, active leases, finite budgets, unknown effects and completed
+   refusals, before claiming that ordinary held work reaches construction.
+6. Finish the already-open role-specific unadmitted producer-policy migration and
+   atomic admission-absence proof before rollout; missing output is not proof of
+   no admission. Completed decisions/charges remain authoritative.
+
+Items 1–3 are the newly exposed consumer/replay seams. Items 4–6 remain the
+existing explicitly open recovery, scheduling and policy-migration work above;
+this checkpoint does not replace or close them. The spec remains a draft and the
+branch remains unactivated until these decisions, implementation and actual
+custody/end-to-end tests are complete.

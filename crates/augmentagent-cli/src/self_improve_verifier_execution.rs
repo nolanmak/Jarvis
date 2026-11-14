@@ -73,16 +73,6 @@ impl Plan {
     }
 }
 
-impl Plan {
-    fn checked(workflow:&str,key:&str,body:&str)->Result<Self> {
-        ensure!(body.len()<=2*1024*1024,"original plan exceeds evidence envelope");
-        let plan:Self=serde_json::from_str(body)?;
-        ensure!(plan.version==1 && plan.kind=="original_verifier_plan" && plan.workflow==workflow && !plan.executor.is_empty()
-            && amendment::digest(&serde_json::to_vec(&("original-verifier-plan-v1",body))?)==key,"original plan accounting identity changed");
-        Ok(plan)
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct OriginalExecutionFailed {pub(super) plan:String}
 impl std::fmt::Display for OriginalExecutionFailed {

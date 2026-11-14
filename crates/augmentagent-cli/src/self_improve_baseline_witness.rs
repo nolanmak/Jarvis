@@ -451,6 +451,9 @@ pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&Prepa
 }
 
 fn checked_retained_responses(root:&Path,data:&RetainedOriginalWitnessData)->Result<Vec<CheckedNativeResponse>> {
+    Ok(checked_retained_judgments(root,data)?.into_iter().map(|(checked,_)|checked).collect())
+}
+fn checked_retained_judgments(root:&Path,data:&RetainedOriginalWitnessData)->Result<Vec<(CheckedNativeResponse,Judgment)>> {
     let prepared=&data.original.prepared;let mut checked=Vec::new();
     for run in &data.runs {
         ensure!(!run.replies.is_empty(),"retained witness run has no completed decision");
@@ -465,11 +468,11 @@ fn checked_retained_responses(root:&Path,data:&RetainedOriginalWitnessData)->Res
             // Every applicable negative, including an earlier Unknown, blocks
             // positive qualification. Never pick a convenient positive run.
             disposition(&judgment)?;
-            checked.push(CheckedNativeResponse {native_context:run.context.clone(),slot:reply.slot,input:reply.input.clone(),
+            checked.push((CheckedNativeResponse {native_context:run.context.clone(),slot:reply.slot,input:reply.input.clone(),
                 response_sha256:amendment::digest(reply.response.as_bytes()),
-                canonical_judgment_sha256:amendment::digest(&serde_json::to_vec(&judgment)?)});
+                canonical_judgment_sha256:amendment::digest(&serde_json::to_vec(&judgment)?)},judgment));
         }
-        ensure!(checked.last().is_some_and(|last|last.native_context==run.context && last.slot==run.replies.last().unwrap().slot),
+        ensure!(checked.last().is_some_and(|(last,_)|last.native_context==run.context && last.slot==run.replies.last().unwrap().slot),
             "final retained witness response was not checked");
     }
     ensure!(!checked.is_empty(),"retained witness has no checked decision");
@@ -582,7 +585,7 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
         })().map_err(requalification_error)
     })
 }
-fn assert_requalified(root:&Path,prepared:&PreparedAcceptance,expected:&str,artifact:RequalifiedArtifact)->Result<()> {
+fn assert_requalified(root:&Path,prepared:&PreparedAcceptance,expected:&str,artifact:RequalifiedArtifact)->Result<serde_json::Value> {
     ensure!(artifact.version==2 && artifact.context==expected && artifact.rule==REQUALIFICATION_RULE,"retained qualification rule/context changed");
     let repository=crate::autoship_workflow::submission::normalized_repository(&artifact.repository)?;
     ensure!(repository==artifact.repository,"retained qualification repository is not canonical");
@@ -603,8 +606,12 @@ fn assert_requalified(root:&Path,prepared:&PreparedAcceptance,expected:&str,arti
     store.read_verifier_evidence(&artifact.workflow,|evidence| {
         let data=retained_original_witness_data(root,&native_control,&artifact.plan,&artifact.result,evidence)?.context("retained qualification original data unavailable")?;
         ensure!(data.identity==artifact.data && serde_json::to_vec(&data.original.prepared)?==serde_json::to_vec(prepared)?,"retained qualification original/native facts changed");
-        ensure!(checked_retained_responses(root,&data)?==artifact.checked,"retained qualification checked data changed");
-        Ok(())
+        let judgments=checked_retained_judgments(root,&data)?;
+        ensure!(judgments.iter().map(|(checked,_)|checked).eq(artifact.checked.iter()),"retained qualification checked data changed");
+        let witnesses=judgments.into_iter().map(|(checked,judgment)|serde_json::json!({"checked":checked,"judgment":judgment})).collect::<Vec<_>>();
+        // Preserve every checked native judgment under its original context.
+        // The current qualification header is distinct from those native facts.
+        Ok(serde_json::json!({"version":2,"qualification":artifact,"original_witnesses":witnesses}))
     })
 }
 
@@ -616,13 +623,9 @@ fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authorit
 }
 
 pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
-    disposition(&current_judgment(root,control,prepared)?)
+    current_data(root,control,prepared).map(|_|())
 }
 pub(super) fn current_data(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<serde_json::Value> {
-    let judgment=current_judgment(root,control,prepared)?;disposition(&judgment)?;
-    Ok(serde_json::to_value(judgment)?)
-}
-fn current_judgment(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<Judgment> {
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     prepared.baseline.registration.verify_integrity(root)?;
     let control=control.canonicalize()?;
@@ -632,7 +635,7 @@ fn current_judgment(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Resu
     let bytes=private_bytes(&path,64*1024).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     let header:serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|anyhow::Error::from(e).context(initial_repair::Hold::EvidenceUnknown))?;
     if header["version"]==2 {
-        return (||->Result<()> {assert_requalified(root,prepared,&expected,serde_json::from_slice(&bytes)?)})().map_err(requalification_error);
+        return (||->Result<serde_json::Value> {assert_requalified(root,prepared,&expected,serde_json::from_slice(&bytes)?)})().map_err(requalification_error);
     }
     let checked=(||->Result<Judgment> {
         let artifact:Artifact=serde_json::from_slice(&bytes)?;
@@ -646,7 +649,8 @@ fn current_judgment(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Resu
         scope_authority::verify_witness_reply(&artifact.native_control,prepared.baseline.registration.baseline_head(),&expected,&reply)?;
         validate(root,&prepared.proposal,&prepared.baseline,&expected,&reply.text)
     })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    Ok(checked)
+    disposition(&checked)?;
+    Ok(serde_json::to_value(checked)?)
 }
 
 fn qualification_prompt(expected:&str,prepared:&PreparedAcceptance)->Result<String> {
@@ -1639,6 +1643,7 @@ mod tests {
             let enrolled=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
                 &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
             assert_eq!(serde_json::to_vec(&enrolled).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            assert!(current_data(root.path(),&native_control,&enrolled).is_err(),"preparation alone published witness qualification");
             assert_eq!(reasoner.calls(),0,"retained metadata preparation made a paid model call");
             // Retained-data qualification must survive a later candidate head
             // without a second checkout. Fresh native qualification still
@@ -1673,6 +1678,14 @@ mod tests {
             assert!(!std::fs::read_dir(&native_control).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().starts_with("witness-baseline-")),"retained data allocated an unnecessary original checkout");
             assert_eq!(reasoner.calls(),0);
             assert_current(root.path(),&native_control,&prepared).unwrap();
+            let projection_before=store.snapshot(guard.id()).unwrap();let projection_events=store.events(guard.id()).unwrap();
+            let projected=current_data(root.path(),&native_control,&enrolled).unwrap();
+            let witnesses=projected["original_witnesses"].as_array().expect("requalified construction input omitted actual native witness facts");
+            assert_eq!(witnesses.len(),1);assert_eq!(witnesses[0]["judgment"]["context"],origin);
+            assert_eq!(witnesses[0]["judgment"]["verifiers"],judgment["verifiers"]);
+            assert_eq!(witnesses[0]["checked"]["native_context"],origin);
+            assert_eq!(projected,current_data(root.path(),&native_control,&enrolled).unwrap(),"witness data projection is not stable");
+            assert_eq!(store.snapshot(guard.id()).unwrap(),projection_before);assert_eq!(store.events(guard.id()).unwrap(),projection_events);
             let unpublished=native_control.join("fixture-unpublished-prepared.json");
             std::fs::rename(&prepared_path,&unpublished).unwrap();
             assert!(guard.bind_acceptance(&prepared,&native_control).is_err(),"qualified but unpublished prepared evidence settled the recovery handoff");

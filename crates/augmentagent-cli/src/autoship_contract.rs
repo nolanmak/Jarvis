@@ -622,19 +622,6 @@ impl RegisteredContract {
         Ok(())
     }
 
-    /// Stored proposal bytes only, never installed candidate integrity or a
-    /// qualification grant. Callers separately authenticate their provenance.
-    pub(crate) fn verify_pinned_data(&self,files:&BTreeMap<String,String>)->Result<()> {
-        self.verify_metadata()?;
-        let pinned=self.contract.verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<BTreeSet<_>>();
-        ensure!(pinned.len()==self.file_hashes.len() && pinned.iter().all(|path|self.file_hashes.contains_key(*path)),"registered source file set changed");
-        for (file,expected) in &self.file_hashes {
-            let body=files.get(file).context("original pinned source is absent")?;
-            ensure!(body.len() as u64<=MAX_FILE_BYTES && digest(body.as_bytes())==*expected,"original pinned source changed");
-        }
-        Ok(())
-    }
-
     pub fn verify_integrity(&self, root: &Path) -> Result<()> {
         self.verify_metadata()?;
         for (file, expected) in &self.file_hashes {
