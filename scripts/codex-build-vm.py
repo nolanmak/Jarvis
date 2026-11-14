@@ -30,6 +30,21 @@ class Unavailable(ValueError):
     pass
 
 
+class CommandTimedOut(Unavailable):
+    """Controller deadline, distinct from guest-supplied failure text."""
+
+
+class CleanupUnverified(Unavailable):
+    """Controller could not prove descendant cleanup after execution."""
+
+
+def cleanup_verified(path):
+    try:
+        return path.is_file() and path.read_bytes() == b'all-descendants-reaped\n'
+    except OSError:
+        return False
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -432,15 +447,17 @@ poweroff -f
                         storage_lease.check()
                     remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
-                        raise Unavailable('VM command timed out')
+                        raise CommandTimedOut('VM command timed out')
                     broker.poll(remaining)
                     try:
                         status = process.wait(timeout=min(0.05, max(0.001, remaining)))
                         break
                     except subprocess.TimeoutExpired:
                         continue
-                if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
-                    raise Unavailable('VM execution or cleanup failed')
+                if not cleanup_verified(cleanup):
+                    raise CleanupUnverified('VM command cleanup could not be verified')
+                if status:
+                    raise Unavailable('VM execution failed')
                 try:
                     result = private_json(control / 'outcome.json')
                 except (OSError, ValueError) as exc:
@@ -466,3 +483,8 @@ poweroff -f
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
+                # Every post-launch exit requires the exact supervisor receipt,
+                # including exceptions while waiting. A valid receipt permits
+                # a nonzero terminated status to retain its original category.
+                if not cleanup_verified(cleanup):
+                    raise CleanupUnverified('VM command cleanup could not be verified')

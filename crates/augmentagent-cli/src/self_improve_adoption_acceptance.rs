@@ -28,7 +28,7 @@ draft=not (root/'ready').exists()
 merge_commit=(root/'merge-commit').read_text() if state=='MERGED' else None
 row=dict(number=841,id='PR_disposable_adoption',url='https://github.com/'+c['repository']+'/pull/841',
  headRefName=c['branch'],headRefOid=head,baseRefName='main',isCrossRepository=False,isDraft=draft,
- author={'login':'autoship-canary'},title=c['title'],body=c['body'],closingIssuesReferences=[],state=state,
+ author={'login':'autoship-canary'},title=c['title'],body=c['body'],closingIssuesReferences=[],labels=[],state=state,
  mergeable='MERGEABLE',mergeCommit={'oid':merge_commit,'message':git('show','-s','--format=%B',merge_commit)} if state=='MERGED' else None,
  files=[{'path':p} for p in git('diff','--name-only',c['base'],head,'--').splitlines()])
 with (root/'gh-calls.jsonl').open('a') as stream:stream.write(json.dumps(a)+'\n')
@@ -213,7 +213,7 @@ async fn run_pipeline() -> Result<()> {
     let builder =
         augmentagent_channel_core::build_pinned(Codex).context("native Codex unavailable")?;
     let report = shared_ci::fixture::scope(
-        &repo, adopted_execution::resume(&repo, &builder, selected, false),
+        &repo, adopted_execution::resume_automatic(&repo, &builder, selected, false),
     ).await??;
     println!("Initial adopted execution: {}", report.message);
     let store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;

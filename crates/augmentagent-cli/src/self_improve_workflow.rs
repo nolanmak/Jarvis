@@ -2157,9 +2157,14 @@ impl WorkflowGuard {
         kind: &str,
         findings: &str,
         dry_run: bool,
-    ) -> Result<()> {
+        automatic: bool,
+        source: Option<u64>,
+    ) -> Result<bool> {
         if dry_run {
-            return Ok(());
+            return Ok(true);
+        }
+        if !manual_routing::permit_mutation(repo_root,pr,source,automatic,self).await? {
+            return Ok(false);
         }
         let head = self.push(branch).await?;
         let _ = write_optional_pr_note(
@@ -2168,7 +2173,7 @@ impl WorkflowGuard {
             &round_comment(round, kind, findings, &head),
         )
         .await;
-        Ok(())
+        Ok(true)
     }
 
     /// Caller has waited for worker teardown. Stage/evidence must already be

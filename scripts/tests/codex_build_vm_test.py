@@ -103,6 +103,71 @@ class BuildScratchPlacementTests(unittest.TestCase):
         runtime.config.update(modules=[str(artifact)], memory_mb=512)
         return runtime
 
+    def deadline_fixture(self, receipt, status, expired=True):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
+            runtime = self.runtime(root)
+            process = Mock()
+            process.poll.return_value = None
+            storage = Mock(fd=123, fds=(123,))
+            seen = {}
+            def launch(command, **kwargs):
+                seen['cleanup'] = Path(command[3])
+                self.assertEqual(kwargs['pass_fds'], (123,))
+                self.assertEqual(kwargs['env']['JARVIS_STORAGE_LEASE_FDS'], '123')
+                return process
+            def wait(**kwargs):
+                if receipt is not None:
+                    seen['cleanup'].write_bytes(receipt.encode())
+                process.poll.return_value = status
+                return status
+            process.wait.side_effect = wait
+            def certificate(command, **kwargs):
+                Path(command[command.index('-keyout') + 1]).write_bytes(b'fixture key')
+                Path(command[command.index('-out') + 1]).write_bytes(b'fixture certificate')
+            with patch.object(vm.subprocess, 'run', side_effect=certificate), \
+                    patch.object(vm, 'initrd', return_value=b'fixture'), \
+                    patch.object(vm, 'qemu_command', return_value=['synthetic-qemu']), \
+                    patch.object(vm.dependency_proxy, 'Broker'), \
+                    patch.object(vm.subprocess, 'Popen', side_effect=launch), \
+                    patch.object(vm.time, 'monotonic', side_effect=[0.0, 2.0 if expired else 0.0]):
+                with self.assertRaises(vm.Unavailable) as raised:
+                    vm.run(runtime, workspace, ['true'], {}, timeout=1, storage_lease=storage)
+            if expired:
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with()
+            else:
+                process.terminate.assert_not_called()
+                self.assertEqual(process.wait.call_count, 1)
+            self.assertEqual(storage.check.call_count, 2)
+            return raised.exception
+
+    def test_controller_deadline_has_a_distinct_type_after_process_cleanup(self):
+        error = self.deadline_fixture('all-descendants-reaped\n', 143)
+        self.assertIsInstance(error, vm.CommandTimedOut,
+                              'verified cleanup after SIGTERM must retain the deadline category')
+
+    def test_controller_deadline_without_cleanup_proof_is_not_a_verified_timeout(self):
+        for receipt, status in [(None, 143), ('incomplete\n', 143), (None, 125), (None, 0),
+                                ('all-descendants-reaped\r\n', 143), ('all-descendants-reaped\r', 143)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                error = self.deadline_fixture(receipt, status)
+                self.assertNotIsInstance(error, vm.CommandTimedOut,
+                                         'unverified descendant cleanup was reported as a timeout')
+                self.assertEqual(type(error).__name__, 'CleanupUnverified',
+                                 'cleanup failure needs a controller-owned category through the bridge')
+
+    def test_cleanup_failure_without_a_deadline_keeps_its_controller_category(self):
+        for receipt, status in [(None, 125), (None, 0), ('incomplete\n', 0),
+                                ('all-descendants-reaped\r\n', 125), ('all-descendants-reaped\r', 0)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                error = self.deadline_fixture(receipt, status, expired=False)
+                self.assertIsInstance(error, vm.CleanupUnverified)
+        error = self.deadline_fixture('all-descendants-reaped\n', 125, expired=False)
+        self.assertIs(type(error), vm.Unavailable,
+                      'a verified nonzero supervisor exit is execution failure, not missing cleanup')
+
     def test_explicit_ort_cache_is_read_only_and_pinned_in_guest_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()

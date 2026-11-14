@@ -26,6 +26,24 @@ class Denied(ValueError):
     """An operation is outside the declared profile."""
 
 
+class CommandTimeout(RuntimeError):
+    """Execution failure; neither a profile refusal nor preflight readiness."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:command_timeout The isolated build command reached its '
+                         'execution time limit. Inspect current work and prior results before '
+                         'deciding whether to retry.')
+
+
+class CleanupUnverified(RuntimeError):
+    """An executed command has no verified descendant-cleanup receipt."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:cleanup_unverified The isolated command stopped without '
+                         'verified descendant cleanup. Preserve retained execution and storage '
+                         'ownership; establish cleanup before starting another build.')
+
+
 class Readiness(Denied):
     """Public diagnostics contain fixed categories, never configuration."""
     MESSAGES = {
@@ -2143,6 +2161,12 @@ class Policy:
                         owner.cleanup()
                         raise
                 return result
+        except vm.CleanupUnverified as exc:
+            raise CleanupUnverified() from exc
+        except vm.CommandTimedOut as exc:
+            # Only the controller deadline type gets this public category.
+            # Guest error prose and arbitrary runtime failures stay sanitized.
+            raise CommandTimeout() from exc
         except vm.Unavailable as exc:
             if str(exc) == 'VM build cache is full':
                 raise Readiness('build_cache_full', scratch.cache, 'the session build cache image is full') from exc
@@ -2780,6 +2804,9 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
+            except (CommandTimeout, CleanupUnverified) as error:
+                return {'isError': True, 'content': [{'type': 'text',
+                        'text': runner_prefix(error) + str(error)}]}
             except Readiness as error:
                 content = [{'type': 'text', 'text': runner_prefix(error) + str(error)}]
                 numbers = {key: value for key, value in error.observation.items()

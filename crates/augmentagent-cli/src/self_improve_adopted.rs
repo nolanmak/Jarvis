@@ -13,7 +13,8 @@ async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>
     if let Some(owner) = repository.split('/').next() {
         allowed.push(owner.into());
     }
-    let candidates = adoption::authorized(&serde_json::from_str(&raw)?, &repository, &allowed);
+    let mut candidates = adoption::authorized(&serde_json::from_str(&raw)?, &repository, &allowed);
+    manual_routing::filter(repo, &mut candidates).await;
     if !dry_run {
         adoption::persist(&workflow::path(), &candidates)?;
     }
@@ -184,11 +185,21 @@ async fn select_from_inventory(repo:&Path,candidates:Vec<adoption::AdoptedPr>,dr
     reserve_source_less(state, fair_path, eligible, dry_run)
 }
 
+pub(super) async fn resume_automatic(
+    repo:&Path,reasoner:&Arc<FallbackReasoner>,pr:adoption::AdoptedPr,dry_run:bool,
+)->Result<RunReport> {
+    if !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+        return Ok(RunReport::held("automatic PR routing held".into()));
+    }
+    resume(repo,reasoner,pr,dry_run,true).await
+}
+
 pub(super) async fn resume(
     repo: &Path,
     reasoner: &Arc<FallbackReasoner>,
     pr: adoption::AdoptedPr,
     dry_run: bool,
+    automatic: bool,
 ) -> Result<RunReport> {
     if dry_run {
         return Ok(RunReport::held(format!(
@@ -209,6 +220,9 @@ pub(super) async fn resume(
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
     let upstream_main = workflow::remote_main_head(&worktree,&pr.repository).await?;
     let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
+    if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+        return Ok(RunReport::held("automatic PR routing held".into()));
+    }
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: repo,
         worktree: &worktree,
@@ -240,6 +254,7 @@ pub(super) async fn resume(
         &environment,
         &mut guard,
         &capacity_accounting,
+        automatic,
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
@@ -309,6 +324,7 @@ async fn execute(
     environment: &str,
     guard: &mut workflow::WorkflowGuard,
     capacity_accounting:&workflow::CapacityAccounting,
+    automatic:bool,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
     let grounded_request=match preparation_request(worktree,pr,request,guard).await? {
@@ -412,6 +428,9 @@ async fn execute(
         .await;
         last_review_unavailable = review.why_unavailable.as_ref().map(ReviewUnavailable::code);
         if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
+            }
             guard.push(&pr.branch).await?;
             checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
             return Ok(RunReport::built(format!(
@@ -469,6 +488,9 @@ async fn execute(
         )
         .await?;
         if review.approved() {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
+            }
             guard.push(&pr.branch).await?;
             acceptance::assert_receipt_current(worktree, &prepared, &receipt).await?;
             if guard.published_pr_ready(pr.pr,&review).await? {
@@ -531,7 +553,11 @@ async fn execute(
                 row["headRefOid"].as_str() == Some(binding.head.as_str()),
                 "PR head changed after review"
             );
-            if row["isDraft"].as_bool() == Some(true) {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic ready routing held",pr.pr)));
+            }
+            let readied=row["isDraft"].as_bool()==Some(true);
+            if readied {
                 let intent = guard.intent(OperationKind::ReadyPr)?;
                 guard.validate_binding(&binding).await?;
                 let (ok, _, error) =
@@ -563,6 +589,10 @@ async fn execute(
                 )?;
             }
             guard.validate_binding(&binding).await?;
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                manual_routing::restore_draft(repo,pr.pr,readied,guard).await;
+                return Ok(RunReport::held(format!("PR #{}: automatic merge routing held",pr.pr)));
+            }
             let intent = guard.intent(OperationKind::MergePr)?;
             let mutation =
                 publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?).await;
@@ -636,6 +666,9 @@ async fn execute(
         result?;
         round += 1;
     }
+    if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+        return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
+    }
     guard.push(&pr.branch).await?;
     guard
         .transition(
@@ -654,16 +687,17 @@ async fn execute(
 /// Free reconciliation remains available while a different PR's builder runs.
 pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
     let candidates = discover(repo, dry_run).await?;
-    sweep_candidates(repo, dry_run, candidates).await
+    sweep_candidates(repo, dry_run, candidates, true).await
 }
 
-pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>) -> Result<usize> {
+pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>, automatic:bool) -> Result<usize> {
     let store = WorkflowStore::open(&workflow::path())?;
     let mut merged = 0;
     for pr in candidates
         .into_iter()
         .filter(|p| p.source_issue.is_none() && p.ready_for_review())
     {
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         let Some(verdict) = approved(&store, &pr)? else {
             continue;
         };
@@ -724,13 +758,15 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
             continue;
         };
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
-        if ready_for_merge(repo, pr.pr, row["isDraft"].as_bool())
-            .await
-            .is_none()
-        {
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
+        let Some(readied)=ready_for_merge(repo,pr.pr,row["isDraft"].as_bool()).await else {continue};
+        lease.validate_remote(repo, pr.pr, &pr.head).await?;
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+            if readied && lease.validate_remote(repo,pr.pr,&pr.head).await.is_ok() {
+                let _=run(&gh_bin(),&["pr","ready",&pr.pr.to_string(),"--undo"],repo).await;
+            }
             continue;
         }
-        lease.validate_remote(repo, pr.pr, &pr.head).await?;
         let intent = lease.merge_intent()?;
         let mutation =
             publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;
@@ -755,6 +791,7 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     if pr.ready_for_review() {
         return Ok(false);
     }
+    if !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {return Ok(false);}
     let (ok, raw, _) = run(
         &gh_bin(),
         &[
@@ -843,6 +880,8 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
                 && row["isCrossRepository"].as_bool() == Some(false),
             "child changed before retarget"
         );
+        anyhow::ensure!(manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await,
+            "automatic parent routing held");
         let intent = guard.intent(OperationKind::RetargetPr)?;
         guard.validate_before_side_effect()?;
         let (ok, _, error) = run(

@@ -185,6 +185,20 @@ A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
 call runs), passed as `build_timeout_secs` and capped at the tool maximum of
 900 s. Other commands default to 120 s. An explicit timeout is honoured.
 
+When the controller's VM deadline expires, the native tool returns
+`[runner=vm] JARVIS_EXECUTION:command_timeout` with a fixed diagnostic. This is
+an execution failure, separate from a profile denial or preflight readiness
+refusal. Guest-provided error text cannot assert this controller-owned category.
+That category requires the supervisor's descendant-cleanup receipt after exit.
+All post-launch exits require the exact `all-descendants-reaped\n` bytes;
+CRLF/CR endings are not equivalent cleanup evidence.
+Missing or invalid cleanup proof instead returns the fixed
+`[runner=vm] JARVIS_EXECUTION:cleanup_unverified` diagnostic. It remains distinct
+from both a verified deadline and a profile refusal, and requires cleanup proof
+before another build can start.
+The existing deadline and process/storage cleanup remain in force; reporting the
+timeout does not automatically retry the command or grant further permissions.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
