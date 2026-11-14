@@ -22,6 +22,8 @@ mod verifier_execution;
 pub(super) use verifier_execution::recover_original_verifier;
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
+#[path = "self_improve_recovery_environment.rs"]
+mod recovery_environment;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -276,19 +278,21 @@ fn environment_id(root: &Path) -> Result<String> {
     environment_id_with_exporter(root, Some(verifier_checkout::EXPORTER))
 }
 fn environment_id_with_exporter(root: &Path, exporter: Option<&str>) -> Result<String> {
+    environment_id_from_inputs(&compiler_control_inputs(root)?,exporter,|name| {
+        let path=root.join(name);
+        if path.exists() {Ok(Some(std::fs::read(path)?))}else{Ok(None)}
+    })
+}
+fn environment_id_from_inputs(controls:&[(String,String)],exporter:Option<&str>,
+    mut content:impl FnMut(&str)->Result<Option<Vec<u8>>>)->Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
     if let Some(exporter) = exporter { hash.update(exporter.as_bytes()); }
     hash.update(DEPENDENCY_AUDIT.as_bytes());
-    hash.update(serde_json::to_vec(&compiler_control_inputs(root)?)?);
-    if root.join("Cargo.lock").exists() {
-        hash.update(std::fs::read(root.join("Cargo.lock"))?);
-    }
-    for name in ["rust-toolchain", "rust-toolchain.toml"] {
-        if root.join(name).exists() {
-            hash.update(std::fs::read(root.join(name))?);
-        }
+    hash.update(serde_json::to_vec(controls)?);
+    for name in ["Cargo.lock","rust-toolchain","rust-toolchain.toml"] {
+        if let Some(bytes)=content(name)? {hash.update(bytes);}
     }
     for path in [
         PathBuf::from("/usr/bin/python3"),

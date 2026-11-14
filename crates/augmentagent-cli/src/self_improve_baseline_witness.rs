@@ -583,8 +583,12 @@ pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptanc
     }
     ensure!(actual_head(root).await?==prepared.baseline.registration.baseline_head(),"qualification must use the original baseline checkout");
     prepared.baseline.registration.verify_integrity(root)?;
-    ensure!(environment_id(root)?==prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id,
-        "baseline_witness_invalid: environment changed before production witness qualification");
+    if environment_id(root)?!=prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id {
+        let error=anyhow::anyhow!("baseline_witness_invalid: environment changed before production witness qualification");
+        return Err(if workflow.retained_qualification_reference(prepared)?.is_some() {
+            error.context(initial_repair::Hold::InfrastructureUnavailable)
+        }else{error});
+    }
     if requalify_retained(root,control,prepared,workflow)? {return assert_current(root,control,prepared);}
     let prompt=qualification_prompt(&expected,prepared)?;
     // Frozen controller policy from main 7353e9cd. This reconstructs the exact
@@ -699,6 +703,55 @@ mod tests {
         std::fs::remove_file(&response).unwrap();
         let lost=assert_current(root.path(),control.path(),&prepared).unwrap_err();
         assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"missing physical evidence must remain an unpaid hold");
+    }
+
+    #[tokio::test]
+    async fn retained_environment_mismatch_cannot_enter_paid_verifier_amendment() {
+        const CHILD:&str="AUTOSHIP_RETAINED_ENVIRONMENT_FIXTURE";
+        if let Some(script)=std::env::var_os(CHILD).map(PathBuf::from) {
+            use std::os::unix::fs::PermissionsExt;
+            for known in [false,true] {
+                let (root,control,mut prepared)=fixture();let base=prepared.baseline.registration.baseline_head().to_owned();
+                let registration=RegisteredContract::register(root.path(),prepared.proposal.contract.clone(),base.clone(),"previous original environment".into()).unwrap();
+                let observed=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+                let receipt=registration.observe(root.path(),"observe",registration.binding(&base).unwrap(),&observed).unwrap();
+                prepared.baseline=BaselineEvidence {registration,receipts:vec![receipt]};
+                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+                std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let database=control.path().join("workflow.db");
+                let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                    branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+                let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                let epoch=amendment::digest(&serde_json::to_vec(&(AcceptanceSource::PullRequest(840),&base,environment_id(root.path()).unwrap())).unwrap());
+                for _ in 0..4 {assert!(guard.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
+                if known {
+                    guard.transition(crate::autoship_workflow::Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0).await.unwrap();
+                    let id=guard.id().to_owned();guard.finish().unwrap();
+                    let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let held=store.snapshot(&id).unwrap().unwrap();
+                    // Synthetic missing-data identity isolates environment/error
+                    // routing; this callback proves no witness or qualification.
+                    let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),
+                        prepared:amendment::digest(&serde_json::to_vec(&prepared).unwrap()),contract:prepared.baseline.registration.contract_hash().into()};
+                    assert!(store.recover_retained_qualification(&held,None,chrono::Utc::now().timestamp_millis(),|_|Ok(Some(reference))).unwrap());
+                    guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+                }
+                let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+                let error=qualify_or_amend(&reasoner,AcceptanceSource::PullRequest(840),"original requirement",root.path(),control.path(),&mut prepared,&mut guard).await.unwrap_err();
+                let expected=if known {initial_repair::Hold::InfrastructureUnavailable}else{initial_repair::Hold::Exhausted};
+                assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&expected),"environment failure took the wrong repair route: known={known}, error={error:#}");
+                assert_eq!(guard.epoch_attempts("verifier-amend-total",&epoch).unwrap(),4);
+                assert_eq!(reasoner.calls(),0);
+                assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+                guard.finish().unwrap();
+            }
+            return;
+        }
+        let scripts=tempfile::tempdir_in("/tmp").unwrap();let script=scripts.path().join("gh");
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::retained_environment_mismatch_cannot_enter_paid_verifier_amendment","--nocapture"])
+            .env(CHILD,&script).env("GH_BIN",&script).env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env("AUGMENTAGENT_RUN_RESOURCES","1").env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
     }
 
     #[tokio::test]
@@ -1639,6 +1692,8 @@ mod tests {
         let prepared=&prepared[0];let base=prepared.baseline.registration.baseline_head();
         assert_eq!(base,"b9e09d46864928a90c78ceb52841b1e0d5968bb9");
         let original_environment=prepared.baseline.registration.binding(base).unwrap().environment_id;
+        assert_eq!(recovery_environment::original_environment(&recovery.worktree,base,&prepared.proposal.files).unwrap(),original_environment,
+            "read-only original environment does not match actual captured environment");
         let scope_context=amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",id,&recovery.source_request,base,&original_environment)).unwrap());
         let original_scope=read_initial_scope(&scope_context,|key|evidence.scope_response(key)).unwrap()
             .expect("actual retained source has no authenticated original scope snapshot");
