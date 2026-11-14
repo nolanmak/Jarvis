@@ -32,6 +32,15 @@ already recognizes the existing native-custody and original-measurement recovery
 shapes. It requires a due, unleased, unpaused workflow with no pending owner
 messages, publication operations or uncertain merge reconciliation.
 
+A successful empty view differs from a failed protected recovery-history read.
+The latter stops fresh selection with the fixed
+`qualification-recovery-history-unavailable` hold. It is not silently converted
+into empty hints, does not consume model calls or reset the daily ledger, and
+cannot take the per-issue-preview waiting-work fallback. Basic owner-control
+queries succeeding does not prove this additional recovery view readable. The
+existing reader's successful empty result for genuinely absent initial storage
+remains unchanged; this rule concerns an unsuccessful read, not first install.
+
 Priority lasts only while that current checkpoint satisfies the view. An active
 lease, future eligibility time, pause/pending mutation or move out of the
 recognized reconcile shape removes it. Releasing a claim still at that shape can
@@ -75,14 +84,50 @@ in `reconcile` is not that shape and rejoins ordinary selection. The preview:
 
 Missing, malformed or unowned per-issue history preserves the hold and allows
 inspection of peers. Unavailability of the shared owner-control store itself
-retains the existing global fail-closed behavior. If no eligible peer exists, the existing fixed unavailable-history
-outcome is reported. Selection never registers, claims, refreshes native capacity,
+retains the existing global fail-closed behavior. If no eligible fresh peer exists,
+the picker passes its unavailable-history error to the routing boundary below.
+The fixed public hold is emitted only after any permitted waiting-work fallback
+has found no work. Selection never registers, claims, refreshes native capacity,
 writes workflow events, changes owner controls, resets counters or publishes a
 command job. SQLite borrows/transactions do not cross async filesystem reads;
 only owned immutable inputs cross those awaits. The final productive claim
 remains the atomic authority and rechecks concurrent pause, lifecycle and input
 changes. A filesystem change after a free preview can delay selection until a
 later poll; the preview is not a reservation or admission grant.
+
+## Waiting-work fallback after per-issue preview failures
+
+An individual held issue's unavailable inputs must not suppress the combined
+lane's existing waiting-work fallback. After the complete issue inventory has
+been considered with no eligible fresh issue, a retained preview error carries
+`IssuePreviewUnavailable` while preserving the original unavailable-history
+cause. It is not a fresh issue or a cleared hold.
+
+Only the existing reserved build slot (`prefer_build`) can use that result to
+try the same waiting-draft and adopted-PR fallback already used for an empty
+issue inventory. Eligible fresh/recovered issues still win that reserved slot.
+Build-only and resume-only lane behavior remains unchanged. The extracted
+production fallback still performs its existing draft/adoption, owner controls,
+exact-head, readiness and productive claim checks; the routing helper grants no
+execution or merge permission and does not itself reset fairness debt or resource
+counters. Actual guarded fallback work retains its ordinary model/resource
+accounting and scheduling settlement.
+
+Before trying fallback after a preview error, protected shared history is
+reopened and required to exist. If it became unreadable, structurally invalid or
+disappeared, selection keeps the global unavailable-owner-history outcome; a
+missing store cannot be reinterpreted as a fresh install in this continuation.
+Incomplete inventory and global owner-control errors are never classified as
+per-issue preview exhaustion and never take this fallback path.
+
+If waiting work is available, its guarded result becomes the normal run result.
+If none is available, the original preview error returns through the existing
+fixed public unavailable-history hold. Empty inventory with no preview error
+retains ordinary idle behavior after an empty fallback. The unchanged-hold
+preview and its error-routing continuation do not resubmit, relabel or re-enroll
+the held source or give it a new attempt. Existing normal blast-radius triage
+still applies before preview, including to genuinely changed issue requests;
+this repair does not suppress that pre-existing source classification.
 
 ## Verification and rollout limits
 
@@ -100,6 +145,11 @@ Coverage includes recovered priority, eligible peers without a recovery cue,
 a genuinely eligible newer peer, restored/missing/semantic native-custody holds,
 changed owner/candidate/compiler input, upstream-only movement, paused/untrusted/
 manual/research sources, missing context and a recovery arriving during inspection.
+The real picker and production selection-routing helper also cover a preview
+failure with waiting work, no available fallback, build-only behavior, malformed
+global history, a store disappearing during inspection, and empty inventory with
+or without waiting work. A scripted availability callback tests routing only;
+it is not native execution or a completed draft-resumption receipt.
 Snapshots, events, model calls and command-job absence remain unchanged during
 selection. Temporary database fault injection is confined to disposable fixtures.
 
@@ -111,9 +161,47 @@ performs no claim, source edit, provider call or dispatch. It is a selection-inp
 check, not proof that this patch is deployed or that ordinary work has shipped.
 
 Normal exact-head CI, independent engineering review, supported rollback snapshots,
-protected merge and updater rollout precede live acceptance. Observe ordinary
+protected merge and updater rollout precede live acceptance. The implementation
+agent owns that acceptance: verify both running binaries and effective worker
+configuration, then correlate a natural selection/claim of already-recovered
+ordinary #1830 (or a genuinely equivalent open issue) with its protected workflow
+and retained original measurement. It must requalify that original evidence and
+reach its next normal productive stage without a forced submission, replacement
+witness or reset of historical charges. A selection log or heartbeat alone does
+not satisfy that exit. The unchanged held peer must receive no new claim/charge
+merely because its inputs stayed the same.
+
+If suitable ordinary work never appears, or the observed workflow stays held
+before retained requalification completes, live recovery acceptance remains
+pending with the implementation agent; absence of evidence is not success. A
+new independent blocker must be recorded and repaired through the normal path.
+The waiting-fallback path has live acceptance only when a natural reserved-slot
+opportunity correlates the per-issue preview failure with actual guarded waiting
+work and preserves the original held source. Until then its scripted regression
+is component evidence, and live fallback observation remains part of #1703's
+fault/soak work rather than a claimed shipment. No production fault or source
+change is fabricated to create such an opportunity.
+
+ Observe ordinary
 work naturally after rollout, without resubmission, source edits, SQL writes or
 counter resets. Repair PRs are manual engineering and count zero autonomous merges.
 This selection fix does not establish ordinary PR/merge completion or close the
 remaining #1703 capacity, custody, CLI/private Discord, five-merge or fault/soak
 acceptance requirements. Separate #2058 correction construction remains unfinished.
+
+
+The later waiting-work review finding was reproduced through the actual picker
+and production routing helper: an unavailable held-issue preview returned before
+the scripted waiting-work callback (0.47 seconds, RED). The recovery-reader
+failure-policy audit then reproduced a separate RED (0.64 seconds): basic owner
+reads succeeded, the protected recovery query failed, and selection silently
+continued as though no recovery hints existed. The final 23-scenario selector/
+routing regression passes (12.53 seconds), preserving snapshots/events/charges
+and command-job absence; availability callbacks remain scheduling data only.
+
+The fresh-reader audit and all 30 consolidated seam checks (covering every one
+of the 57 original mapped crossings and the added live-acceptance boundaries)
+hold after resolving recovery-reader failure policy and the preview-versus-normal
+triage scope. These read-only spec checks are not engineering review or rollout
+acceptance. Final exact-head hosted CI/review and the natural live exits above
+remain required.

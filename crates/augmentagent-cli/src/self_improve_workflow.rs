@@ -76,6 +76,11 @@ impl FreshIssueControls {
             Ok(Self {store})
         }).map_err(|error|error.context(OwnerControlUnavailable))
     }
+    /// A per-issue preview already observed existing protected history. Its
+    /// fallback must not reinterpret a disappeared store as a fresh install.
+    pub(super) fn require_existing(&self)->Result<()> {
+        anyhow::ensure!(self.store.is_some(),OwnerControlUnavailable);Ok(())
+    }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {
             let id=durable::workflow_id(repository,issue)?;
