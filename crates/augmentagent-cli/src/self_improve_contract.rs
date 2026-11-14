@@ -206,41 +206,58 @@ pub(super) fn harness_path(path: &str) -> bool {
             && parts.last().unwrap().starts_with("autoship_")
             && path.ends_with(".rs"))
 }
+/// Only create declared empty parent directories; never follow a redirected
+/// harness ancestor. Both installation and recovery readiness use this path.
+fn harness_parent(root:&Path,relative:&str)->Result<PathBuf> {
+    ensure!(harness_path(relative),"invalid harness path");
+    let mut parent=root.to_path_buf();let parts=relative.split('/').collect::<Vec<_>>();
+    for part in &parts[..parts.len()-1] {
+        parent.push(part);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta)=>ensure!(meta.is_dir() && !meta.file_type().is_symlink(),"harness parent is not a real directory"),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                match std::fs::create_dir(&parent) {
+                    Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(error)=>return Err(error.into()),
+                }
+                let meta=std::fs::symlink_metadata(&parent)?;
+                ensure!(meta.is_dir() && !meta.file_type().is_symlink(),"harness parent changed during preparation");
+            },
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    Ok(parent)
+}
+
+fn existing_harness(destination:&Path,expected:&[u8])->Result<bool> {
+    use std::{io::Read,os::unix::fs::OpenOptionsExt};
+    let file=match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(destination) {
+        Ok(file)=>file,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+            ensure!(std::fs::symlink_metadata(destination).is_err_and(|error|error.kind()==std::io::ErrorKind::NotFound),"harness path is redirected");
+            return Ok(false);
+        },
+        Err(error)=>return Err(error.into()),
+    };
+    let meta=file.metadata()?;
+    ensure!(meta.is_file() && meta.len()==expected.len() as u64,"registered harness is not an unchanged regular file");
+    let mut bytes=Vec::new();file.take(expected.len() as u64+1).read_to_end(&mut bytes)?;
+    ensure!(bytes==expected,"candidate attempted to change registered verifier");
+    Ok(true)
+}
+
 /// Caller must own an exclusive clean baseline checkout. Refuses any existing
 /// harness rather than replacing implementation or a previously pinned test.
 pub(super) fn install_harness(root: &Path, proposal: &ContractProposal) -> Result<()> {
     use std::io::Write;
     let root = root.canonicalize()?;
     for (relative, body) in &proposal.files {
-        ensure!(harness_path(relative), "invalid harness path");
-        let mut parent = root.clone();
-        let parts: Vec<_> = relative.split('/').collect();
-        for part in &parts[..parts.len() - 1] {
-            parent.push(part);
-            match std::fs::symlink_metadata(&parent) {
-                Ok(meta) => ensure!(
-                    meta.is_dir() && !meta.file_type().is_symlink(),
-                    "harness parent is not a real directory"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(&parent)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let destination = root.join(relative);
-        // Merged auto-ship PRs keep their pinned harnesses on main, so a
-        // proposal can name a path that already exists at the baseline. The
-        // same bytes are that harness; different bytes must never overwrite
-        // it. Say which path, so the scoped retry picks a unique name instead
-        // of failing on a bare "File exists (os error 17)" every attempt.
-        if let Ok(meta) = std::fs::symlink_metadata(&destination) {
-            ensure!(meta.is_file() && !meta.file_type().is_symlink(),
-                "harness path {relative} already exists at the baseline and is not a regular file");
-            ensure!(std::fs::read(&destination)? == body.as_bytes(),
-                "harness path {relative} already exists at the baseline with different contents; \
-                 name a new harness for this issue (for example autoship_issue_<number>)");
-            continue;
+        harness_parent(&root,relative)?;
+        let destination=root.join(relative);
+        match existing_harness(&destination,body.as_bytes()) {
+            Ok(true)=>continue,
+            Ok(false)=>{},
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some()=>return Err(error).context(format!("read existing harness {relative}")),
+            Err(error)=>bail!("harness path {relative} already exists at the baseline with different contents or type; name a new harness for this issue: {error}"),
         }
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -1245,27 +1262,17 @@ fn evidence_path(control: &Path, source: AcceptanceSource, base: &str) -> Result
     Ok(control.join(format!("{}-base-{base}.json", source.key())))
 }
 fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
-    // Existing files must match exactly, including files installed before a
-    // restart. Never silently restore a builder-modified verifier.
-    let mut missing = prepared.proposal.clone();
-    missing
-        .files
-        .retain(|path, _| !candidate.join(path).exists());
-    for (relative, bytes) in &prepared.proposal.files {
-        let path = candidate.join(relative);
-        if path.exists() {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "candidate verifier is not a regular file"
-            );
-            ensure!(
-                std::fs::read(&path)? == bytes.as_bytes(),
-                "candidate attempted to change registered verifier"
-            );
+    // Candidate tampering must retain its own diagnostic, rather than the
+    // baseline author's instruction to choose a new independent harness name.
+    let root=candidate.canonicalize()?;let mut missing=prepared.proposal.clone();missing.files.clear();
+    for (relative,body) in &prepared.proposal.files {
+        harness_parent(&root,relative)?;
+        if !existing_harness(&root.join(relative),body.as_bytes())
+            .with_context(||format!("candidate attempted to change registered verifier {relative}"))? {
+            missing.files.insert(relative.clone(),body.clone());
         }
     }
-    install_harness(candidate, &missing)?;
+    install_harness(candidate,&missing)?;
     prepared.baseline.registration.verify_integrity(candidate)
 }
 
@@ -2386,6 +2393,8 @@ pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:Ac
     baseline_witness::require_retained_publication(root,control,&context.repository,&snapshot.workflow,&prepared,&reference,evidence)
         .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     require_retained_registration(root,&prepared).map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    recovery_publication::probe_harness(root,&prepared.proposal.files)
+        .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     Ok(Some(reference))
 }
 

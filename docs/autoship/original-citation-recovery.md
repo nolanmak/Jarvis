@@ -1136,3 +1136,70 @@ coverage status. It does not close the harness destination, current-main merge,
 final joined checks, full spec/seam and independent engineering reviews, hosted
 CI, protected rollout, natural ordinary acceptance or the complete #1703 goal.
 No positive workflow was queued or model call spent by the actual-source probe.
+
+
+## 24. Missing-harness readiness without candidate-side probe files
+
+D13. Keep actual harness installation in normal guarded preparation. Recovery
+readiness must not install executable code, change registered harness bytes,
+leave named probes in the candidate or exempt files from `git_binding`.
+Both the installer and readiness now use the same parent-path validation and
+bounded existing-file reader. Only declared empty parent directories may be
+created during readiness; Git does not record them as source evidence.
+
+Every proposed pin must retain the normal dedicated harness-path rule, <=512 KiB
+per file, <=256 registration pins and <=4 MiB aggregate prepared-data envelope.
+Parents must be real directories without redirected ancestors. An existing pin
+is opened no-follow/nonblocking and must be a regular file with exact expected
+length and bytes. Changed, dangling or nonregular pins refuse inspection without
+overwrite. Candidate tampering retains its distinct diagnostic; a baseline name
+collision still identifies its relative path and differing contents so the
+independent author can choose a new name rather than repeat an opaque failure.
+
+Missing files are grouped by their actual parent directory. Each parent must
+be owned and writable; ordinary repository group-read/write modes are not
+mistaken for private controller-directory policy. On supported Linux filesystems,
+readiness opens O_TMPFILE in that exact parent and writes/syncs bounded anonymous
+scratch for the missing bodies plus metadata margin. It creates no target or
+probe directory entry, no permanent lock and no new native registration. The
+kernel releases the allocation on process death. Missing parent-directory
+creation uses the real installer's path/mkdir logic, so those permission and
+redirect failures occur before queueing. Unsupported unnamed-allocation storage
+stays held rather than silently using a candidate-side named fallback.
+
+This tests current allocation/quota/write/fsync availability and existing pin
+integrity. It is an advisory readiness observation, not a reservation or a
+substitute for the real create-new writer and subsequent original-integrity
+check. Filesystem state or a target can change afterwards; normal preparation
+must still refuse overwrite and preserve the restrictive same-cue failure path.
+No claim of arbitrary filesystem-policy support or completed fault/soak
+acceptance follows from this preflight.
+
+The test-first regression reproduced an unwritable missing-harness destination
+passing readiness. Tests now cover actual permission refusal, injected ENOSPC,
+healthy missing parents without installing code, exact-byte installation by the
+real writer, changed-verifier preservation, redirected parents and dangling pins.
+The Git status before and after successful/failed allocation is unchanged. A
+separate child exits while anonymous scratch is open, without Rust destructors;
+restart still finds no candidate-side file or changed Git evidence and can probe
+again. The normal source/store callbacks use this readiness after the controller
+and literal-registration checks, before queueing a productive claim.
+
+Final joined CLI verification for this branch checkpoint: **2,097 passed,
+0 failed, 42 explicit ignores**. The previous full core result (746/0/16) remains
+for unchanged core code. The actual #1830 compatibility inventory is a separate
+explicit read-only check, never this mutating directory/allocation phase.
+Current-main integration, fresh complete seam review, independent engineering
+review, exact-head hosted CI, supported snapshot, protected merge and updater
+rollout remain required. Natural ordinary shipping and the complete #1703
+acceptance remain unproven.
+
+The next source-comparison checkpoint is `qualify_original_baseline`: it still
+creates an original temporary worktree when the current receipt is absent,
+including for an authenticated retained measurement. Validate that dependency
+and its resource/failure behavior before declaring the entire connected recovery
+path ready. Do not drop fresh-witness original-head/environment gates, substitute
+candidate code for original facts, or admit new native calls to repair metadata.
+Any data-only optimization must prove the recorded original head, original
+measurement, native question/provenance, original environment and every current
+semantic criterion under the normal live owner/lease/dispatch fences.
