@@ -59,13 +59,27 @@ impl std::fmt::Display for OwnerControlUnavailable {
 }
 impl std::error::Error for OwnerControlUnavailable {}
 
+#[derive(Debug)]
+pub(super) struct SharedIssueHistoryUnavailable;
+impl std::fmt::Display for SharedIssueHistoryUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("shared-issue-history-unavailable")}
+}
+impl std::error::Error for SharedIssueHistoryUnavailable {}
+fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
+    if error.downcast_ref::<SharedIssueHistoryUnavailable>().is_none()
+        && error.downcast_ref::<rusqlite::Error>().is_some_and(|error|!WorkflowStore::is_row_data_error(error)) {
+        error.context(SharedIssueHistoryUnavailable)
+    }else {error}
+}
+
 /// Free selection reads existing owner and workflow history without registering
 /// a workflow or initializing storage. The productive claim still rechecks pause
 /// and terminal state atomically; this is a fairness filter, never admission.
-pub(super) struct FreshIssueControls {store:Option<WorkflowStore>}
+pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
-    pub(super) fn open()->Result<Self> {
-        WorkflowStore::open_read_only(&path()).and_then(|store| {
+    pub(super) fn open()->Result<Self> {Self::open_at(&path())}
+    fn open_at(state:&Path)->Result<Self> {
+        WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
                 // queries to check structural capabilities even with no issues,
@@ -73,22 +87,88 @@ impl FreshIssueControls {
                 store.snapshot("")?;
                 store.owner_control("")?;
             }
-            Ok(Self {store})
+            Ok(Self {store,state:state.to_path_buf()})
         }).map_err(|error|error.context(OwnerControlUnavailable))
+    }
+    /// A per-issue preview already observed existing protected history. Its
+    /// fallback must not reinterpret a disappeared store as a fresh install.
+    pub(super) fn require_existing(&self)->Result<()> {
+        anyhow::ensure!(self.store.is_some(),OwnerControlUnavailable);Ok(())
+    }
+    fn reopen(state:&Path,observed_existing:bool)->Result<Self> {
+        let current=Self::open_at(state).map_err(|error|error.context(SharedIssueHistoryUnavailable))?;
+        if observed_existing {current.require_existing().map_err(|error|error.context(SharedIssueHistoryUnavailable))?;}
+        Ok(current)
+    }
+    /// Close asynchronous selection gaps without turning an observed store
+    /// disappearance into a new installation. This never claims or writes.
+    pub(super) fn require_current_history(&self)->Result<()> {
+        Self::reopen(&self.state,self.store.is_some()).map(|_|())
     }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {
             let id=durable::workflow_id(repository,issue)?;
             let snapshot=self.store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
             Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
-        })().map_err(|error|error.context(OwnerControlUnavailable))
+        })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
+    }
+    /// Fairness preview only: unchanged initial holds are skipped unless exact
+    /// native custody has recovered. Read the same context/environment/binding inputs,
+    /// without register, claim, capacity refresh or checkout preparation.
+    pub(super) fn unchanged_initial_hold(&self,root:&Path,repository:&str,issue:&Issue)
+        ->impl std::future::Future<Output=Result<bool>>+Send+'static {
+        // Keep SQLite borrows entirely in this synchronous read. Only immutable
+        // data crosses awaits; reopen the same protected store for the final
+        // race check instead of retaining a connection or transaction.
+        let inspected=(||->Result<Option<(durable::Snapshot,durable::RecoveryContext,String)>> {
+            let Some(store)=self.store.as_ref() else{return Ok(None)};
+            let id=durable::workflow_id(repository,issue.number)?;
+            let Some(snapshot)=store.snapshot(&id)? else{return Ok(None)};
+            if snapshot.pr.is_some() || !durable::awaits_initial_input(&snapshot.checkpoint) {return Ok(None);}
+            let context=store.recovery_context(&id,&snapshot.checkpoint.binding)?
+                .context("held issue execution context unavailable")?;
+            anyhow::ensure!(context.workflow==id && context.repository.eq_ignore_ascii_case(repository)
+                && context.binding==snapshot.checkpoint.binding && context.source_pr.is_none(),"held issue context differs");
+            let request=serde_json::to_string(&(issue.number,&issue.title,&issue.body))?;
+            if context.source_request!=request {return Ok(None);}
+            Ok(Some((snapshot,context,request)))
+        })();
+        let root=root.to_path_buf();let repository=repository.to_owned();let number=issue.number;let state=self.state.clone();
+        async move {
+            let result=async {
+                let Some((snapshot,context,request))=inspected? else{return Ok(false)};
+                let expected=workspace::candidate_parent(&root).await?
+                    .join(format!("{}-issue-{}",lane_from_env().worktree_name(),number));
+                recovery::existing_checkout(&root,&context.worktree).await?;
+                anyhow::ensure!(context.worktree.canonicalize()?==expected.canonicalize()?
+                    && snapshot.branch==format!("{BRANCH_PREFIX}{number}"),"held issue checkout differs from execution lane");
+                let (ok,branch,_)=run("git",&["symbolic-ref","--quiet","--short","HEAD"],&context.worktree).await?;
+                anyhow::ensure!(ok && branch.trim()==snapshot.branch,"held issue branch differs");
+                let upstream=remote_main_head(&root,&repository).await?;
+                let current_environment=recovery::environment_identity(&context.worktree,&upstream).await?;
+                if !recovery_context_matches(&context,&request,&expected,&current_environment,true) {return Ok(false);}
+                let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
+                // A genuine recovery cue arriving during Git inspection must
+                // rejoin selection. Productive claim still checks atomically.
+                let reopened=Self::reopen(&state,true)?;
+                let store=reopened.store.as_ref().expect("existing history was required above");
+                // Standalone self-improve has no background inspector: restored
+                // physical custody can be recovered by the ordinary atomic claim
+                // even when the binding and checkpoint have not changed yet.
+                let custody_recovered=store.native_custody_recovery_available(
+                    &snapshot,&context.worktree,acceptance::require_retained_native_custody)?;
+                let current=store.snapshot(&snapshot.workflow)?.context("held issue history disappeared during inspection")?;
+                Ok(binding==snapshot.checkpoint.binding && current==snapshot && !custody_recovered)
+            }.await;
+            result.map_err(|error:anyhow::Error|classify_issue_history_error(error).context(OwnerControlUnavailable))
+        }
     }
     pub(super) fn paused(&self,repository:&str,issue:u64)->Result<bool> {
         (||->Result<bool> {
             let id=durable::workflow_id(repository,issue)?;
             let control=self.store.as_ref().map(|store|store.owner_control(&id)).transpose()?.flatten();
             Ok(control.is_some_and(|control|control.paused))
-        })().map_err(|error|error.context(OwnerControlUnavailable))
+        })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
     }
 }
 
@@ -832,24 +912,10 @@ impl WorkflowGuard {
             if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
-        let context=context.filter(|context|context.source_request==start.contract
-            && context.worktree.canonicalize().ok()==start.worktree.canonicalize().ok()
-            && (context.contract.starts_with("registered:") || context.environment==start.environment
-                || initial_wait && recovery::same_initial_verifier_environment(&context.environment,start.environment)));
+        let context=context.filter(|context|recovery_context_matches(context,start.contract,start.worktree,start.environment,initial_wait));
         let contract=context.as_ref().map_or(start.contract,|c|c.contract.as_str());
         let environment=context.as_ref().map_or(start.environment,|c|c.environment.as_str());
-        let receipts = existing
-            .as_ref()
-            .map(|s| s.checkpoint.evidence.clone())
-            .unwrap_or_default();
-        let mut binding =
-            git_binding(start.worktree, contract, environment, &receipts).await?;
-        if existing
-            .as_ref()
-            .is_some_and(|s| s.checkpoint.binding != binding)
-        {
-            binding = git_binding(start.worktree, contract, environment, &[]).await?;
-        }
+        let mut binding=existing_candidate_binding(start.worktree,contract,environment,existing.as_ref()).await?;
         if mode==AcquireMode::OwnerTurn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
         } else if mode==AcquireMode::VerifierRecovery {
@@ -2195,6 +2261,22 @@ fn charge_elapsed(
 /// Hash only canonical non-secret evidence. Inputs include both committed tree
 /// and tracked dirty changes, so a failed stage cannot reuse the previous head's
 /// receipt while a builder has left edits in its worktree.
+/// Shared with free selection. A preview cannot invent a different definition
+/// of changed input from productive acquisition or normalize an unknown shape.
+fn recovery_context_matches(context:&durable::RecoveryContext,request:&str,worktree:&Path,environment:&str,initial_wait:bool)->bool {
+    context.source_request==request
+        && context.worktree.canonicalize().ok()==worktree.canonicalize().ok()
+        && (context.contract.starts_with("registered:") || context.environment==environment
+            || initial_wait && recovery::same_initial_verifier_environment(&context.environment,environment))
+}
+async fn existing_candidate_binding(worktree:&Path,contract:&str,environment:&str,existing:Option<&durable::Snapshot>)->Result<Binding> {
+    let receipts=existing.map(|snapshot|snapshot.checkpoint.evidence.as_slice()).unwrap_or(&[]);
+    let binding=git_binding(worktree,contract,environment,receipts).await?;
+    if existing.is_some_and(|snapshot|snapshot.checkpoint.binding!=binding) {
+        git_binding(worktree,contract,environment,&[]).await
+    }else {Ok(binding)}
+}
+
 pub(super) async fn git_binding(
     worktree: &Path,
     contract: &str,

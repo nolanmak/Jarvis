@@ -277,6 +277,13 @@ fn waiting_setup_dependency(conn:&Connection,workflow:&str,generation:i64,checkp
 }
 
 impl WorkflowStore {
+    /// Read-only scheduling preview of the same exact custody predicate used by
+    /// the productive claim. This grants neither a lease nor model permission.
+    /// Callers must recheck the snapshot after filesystem inspection as well.
+    pub(crate) fn native_custody_recovery_available(&self,expected:&Snapshot,root:&Path,validate:CustodyValidator)->Result<bool> {
+        if self.snapshot(&expected.workflow)?.as_ref()!=Some(expected) {return Ok(false);}
+        recovered(&self.conn,&expected.workflow,expected.generation,&expected.checkpoint,(root,validate))
+    }
     /// Exact failure-time input observation, not permission to accept later edits.
     pub(crate) fn retained_setup_candidate(&self,expected:&Snapshot)->Result<Option<Binding>> {
         if self.snapshot(&expected.workflow)?.as_ref()!=Some(expected) {return Ok(None);}
@@ -471,7 +478,7 @@ impl WorkflowStore {
     }
 }
 
-fn admissions(tx: &Transaction<'_>, workflow: &str) -> Result<Option<String>> {
+fn admissions(tx: &Connection, workflow: &str) -> Result<Option<String>> {
     let mut query = tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
     let rows = query.query_map([workflow], |row| row.get::<_, String>(0))?;
     let mut original = Vec::new();
@@ -516,7 +523,7 @@ pub(super) fn record(tx:&Transaction<'_>,lease:&Lease,checkpoint:&Checkpoint,phy
 /// The same transaction that grants the productive lease checks the original
 /// failure descriptor and every admitted result. Inspection has no model or
 /// subprocess API and does not alter accounting or the old evidence.
-pub(super) fn recovered(tx: &Transaction<'_>, workflow: &str, generation: i64, checkpoint: &Checkpoint, check: CustodyCheck<'_>) -> Result<bool> {
+pub(super) fn recovered(tx: &Connection, workflow: &str, generation: i64, checkpoint: &Checkpoint, check: CustodyCheck<'_>) -> Result<bool> {
     if !native_hold(checkpoint) { return Ok(false); }
     let classification:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='native_custody_hold_classified' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|row|row.get(0)).optional()?;
     let expected=serde_json::json!({"physical":true,"checkpoint":checkpoint}).to_string();
