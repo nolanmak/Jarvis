@@ -22,7 +22,7 @@ pub(super) fn report(error: &anyhow::Error) -> Option<RunReport> {
         .map(|hold| RunReport::held(hold.to_string()))
 }
 
-fn validate_reference(reference: &serde_json::Value) -> Result<()> {
+pub(super) fn validate_reference(reference: &serde_json::Value) -> Result<()> {
     let number = reference["number"]
         .as_u64()
         .filter(|n| *n > 0)

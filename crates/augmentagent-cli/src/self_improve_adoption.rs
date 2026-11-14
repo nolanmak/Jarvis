@@ -178,18 +178,27 @@ pub(super) fn episode_retries(
             result.insert(candidate.pr);
             continue;
         }
-        let qualification_recovered=recovered.contains(&id) && snapshot.pr==Some(candidate.pr)
+        let verification_requested=snapshot.checkpoint.stage==crate::autoship_workflow::Stage::Verify
+            && snapshot.checkpoint.next.reason=="verification_infrastructure_retry"
+            && snapshot.checkpoint.next.action=="retry_verification";
+        let owned_candidate=(recovered.contains(&id) || verification_requested)
+            && snapshot.pr==Some(candidate.pr)
             && snapshot.branch==candidate.branch && candidate.ready_for_review()
             && (snapshot.checkpoint.binding.head==candidate.head
                 || store.retained_candidate_head(&candidate.repository,candidate.pr,&candidate.branch,&candidate.head,
                     &snapshot.checkpoint.binding.head,now)?.as_deref()==Some(snapshot.checkpoint.binding.head.as_str()));
+        let qualification_recovered=recovered.contains(&id) && owned_candidate;
+        let verification_retry=verification_requested && owned_candidate
+            && store.pending_owner_messages(&id)?==0
+            && store.pending_operations(&id)?.is_empty()
+            && !store.merge_reconciliation_needed(&id)?;
         let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
             && snapshot.checkpoint.next.reason == "review_main_changed"
             && snapshot.checkpoint.next.action == "reconcile_main";
         if snapshot.lease_until_ms <= now
             && snapshot.checkpoint.next.eligible_at_ms <= now
             && !store.owner_control(&id)?.is_some_and(|control| control.paused)
-            && (main_changed || qualification_recovered || matches!(
+            && (main_changed || qualification_recovered || verification_retry || matches!(
                 snapshot.checkpoint.next.action.as_str(),
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
@@ -442,6 +451,62 @@ pub(super) async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn due_verification_infrastructure_retry_survives_the_same_day_marker() {
+        use crate::autoship_workflow::{Binding,NextAction,OperationKind,ResourceCharge,Stage};
+        for fault in ["none","retained","future","active","pause","stage","reason","action",
+            "head","branch","dependency","pending-push","pending-merge","retained-without-publication"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let mut peer=row(10,"fix/issue-8");
+            peer["closingIssuesReferences"]=serde_json::json!([{"number":8,"url":"https://github.com/owner/repo/issues/8"}]);
+            let mut candidates=authorized(&serde_json::json!([row(9,"fix/issue-7"),peer]),"owner/repo",&["owner".into()]);
+            let candidate=&mut candidates[0];let id="owner/repo#7";
+            let original=Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(id,&candidate.branch,original.clone(),1).unwrap();
+            let lease=store.claim(id,"original",2,1000).unwrap().unwrap();
+            store.attach_pr_in_repo(&lease,"owner/repo",9,3).unwrap();
+            store.charge(&lease,"old-work",ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},4).unwrap();
+            if fault!="retained-without-publication" {
+                let push=store.begin_operation(&lease,OperationKind::Push,&original,5).unwrap();
+                store.complete_operation(&lease,&push.id,"git-head:head-one",6).unwrap();
+            }
+            let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;
+            cp.stage=Stage::Verify;
+            cp.next=NextAction {reason:"verification_infrastructure_retry".into(),action:"retry_verification".into(),eligible_at_ms:10};
+            if fault.starts_with("retained") {cp.binding.head="retained-head".into();}
+            match fault {
+                "future"=>cp.next.eligible_at_ms=11,
+                "stage"=>cp.stage=Stage::Held,
+                "reason"=>cp.next.reason="acceptance_verifier_repair_exhausted".into(),
+                "action"=>cp.next.action="await_acceptance_input_change".into(),
+                "head"=>candidate.head="foreign-head".into(),
+                "branch"=>candidate.branch="foreign-branch".into(),
+                "dependency"=>candidate.dependency=Dependency::AwaitParent {pr:8},
+                "pending-push"|"pending-merge"=>cp.binding.evidence_hash="pending-evidence".into(),
+                _=>{},
+            }
+            store.checkpoint(&lease,&cp,7).unwrap();
+            if matches!(fault,"pending-push"|"pending-merge") {
+                let pending=store.begin_operation(&lease,if fault=="pending-push" {OperationKind::Push}else{OperationKind::MergePr},&cp.binding,8).unwrap();
+                assert!(pending.receipt.is_none(),"fixture reused a completed operation");
+                assert!(!store.pending_operations(id).unwrap().is_empty(),"fixture has no unsettled operation");
+            }
+            if fault!="active" {store.release(&lease,9).unwrap();}
+            if fault=="pause" {store.set_owner_pause(id,"github:owner",0,true,9).unwrap();}
+            let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
+            let mut ledger=AttemptLedger::default();ledger.mark(1,7);
+            let retries=episode_retries(&path,&candidates,10).unwrap();
+            let allowed=matches!(fault,"none"|"retained");
+            assert_eq!(retries.contains(&9),allowed,"{fault}: due infrastructure retry was lost or an unsafe retry was admitted");
+            let selected=select_linked_with_retries(&candidates,&ledger,1,&Default::default(),None,0,&retries).unwrap();
+            assert_eq!(selected.0,if allowed {9}else{10},"{fault}: selector must resume the due owned candidate or advance its eligible peer");
+            assert!(ledger.attempted_today(1,7),"selection erased today's marker");
+            assert_eq!(store.snapshot(id).unwrap(),before,"{fault}: retry inspection changed historical work");
+            assert_eq!(store.events(id).unwrap(),events,"{fault}: retry inspection changed evidence/accounting");
+        }
+    }
+
     #[test]
     fn qualification_recovered_retry_requires_the_same_available_owned_candidate() {
         for obstruction in ["none","pause","head","branch","dependency","message","mutation"] {

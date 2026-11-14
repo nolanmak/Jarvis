@@ -13,7 +13,8 @@ async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>
     if let Some(owner) = repository.split('/').next() {
         allowed.push(owner.into());
     }
-    let candidates = adoption::authorized(&serde_json::from_str(&raw)?, &repository, &allowed);
+    let mut candidates = adoption::authorized(&serde_json::from_str(&raw)?, &repository, &allowed);
+    manual_routing::filter(repo, &mut candidates).await;
     if !dry_run {
         adoption::persist(&workflow::path(), &candidates)?;
     }
@@ -184,11 +185,21 @@ async fn select_from_inventory(repo:&Path,candidates:Vec<adoption::AdoptedPr>,dr
     reserve_source_less(state, fair_path, eligible, dry_run)
 }
 
+pub(super) async fn resume_automatic(
+    repo:&Path,reasoner:&Arc<FallbackReasoner>,pr:adoption::AdoptedPr,dry_run:bool,
+)->Result<RunReport> {
+    if !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+        return Ok(RunReport::held("automatic PR routing held".into()));
+    }
+    resume(repo,reasoner,pr,dry_run,true).await
+}
+
 pub(super) async fn resume(
     repo: &Path,
     reasoner: &Arc<FallbackReasoner>,
     pr: adoption::AdoptedPr,
     dry_run: bool,
+    automatic: bool,
 ) -> Result<RunReport> {
     if dry_run {
         return Ok(RunReport::held(format!(
@@ -209,6 +220,9 @@ pub(super) async fn resume(
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
     let upstream_main = workflow::remote_main_head(&worktree,&pr.repository).await?;
     let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
+    if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+        return Ok(RunReport::held("automatic PR routing held".into()));
+    }
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: repo,
         worktree: &worktree,
@@ -654,16 +668,17 @@ async fn execute(
 /// Free reconciliation remains available while a different PR's builder runs.
 pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
     let candidates = discover(repo, dry_run).await?;
-    sweep_candidates(repo, dry_run, candidates).await
+    sweep_candidates(repo, dry_run, candidates, true).await
 }
 
-pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>) -> Result<usize> {
+pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>, automatic:bool) -> Result<usize> {
     let store = WorkflowStore::open(&workflow::path())?;
     let mut merged = 0;
     for pr in candidates
         .into_iter()
         .filter(|p| p.source_issue.is_none() && p.ready_for_review())
     {
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         let Some(verdict) = approved(&store, &pr)? else {
             continue;
         };
@@ -724,6 +739,7 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
             continue;
         };
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         if ready_for_merge(repo, pr.pr, row["isDraft"].as_bool())
             .await
             .is_none()
@@ -731,6 +747,7 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
             continue;
         }
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         let intent = lease.merge_intent()?;
         let mutation =
             publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;
@@ -755,6 +772,7 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     if pr.ready_for_review() {
         return Ok(false);
     }
+    if !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {return Ok(false);}
     let (ok, raw, _) = run(
         &gh_bin(),
         &[
@@ -843,6 +861,8 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
                 && row["isCrossRepository"].as_bool() == Some(false),
             "child changed before retarget"
         );
+        anyhow::ensure!(manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await,
+            "automatic parent routing held");
         let intent = guard.intent(OperationKind::RetargetPr)?;
         guard.validate_before_side_effect()?;
         let (ok, _, error) = run(

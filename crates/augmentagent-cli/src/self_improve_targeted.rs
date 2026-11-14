@@ -551,7 +551,7 @@ pub(super) async fn execute_pr(
     if let Some(issue) = pr.source_issue {
         resume_draft_pr(repo, &builder, pr.pr, issue, &pr.branch, dry_run, Some(&pr.head)).await
     } else {
-        adopted_execution::resume(repo, &builder, pr, dry_run).await
+        adopted_execution::resume(repo, &builder, pr, dry_run, false).await
     }
 }
 
