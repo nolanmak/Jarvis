@@ -2660,6 +2660,31 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
     scope.fixable=true;
 }
 
+
+struct InitialPreparation {retained:bool,context:String,saved:Option<InitialScopeSnapshot>}
+
+/// Choose the existing original episode before any readiness or scoping call.
+fn initial_preparation(root:&Path,workflow:&workflow::WorkflowGuard,source:crate::autoship_contract::AcceptanceSource,
+    base:&str,owner_request:&str)->Result<InitialPreparation> {
+    let retained=workflow.retained_preparation()?;
+    let context=if let Some(prepared)=&retained {
+        anyhow::ensure!(prepared.proposal.contract.source()?==source,"retained initial preparation source changed");
+        acceptance::retained_initial_scope_context(workflow,prepared)?
+    }else{acceptance::initial_scope_context(root,workflow,base)?};
+    let saved=match read_initial_scope(&context,|key|workflow.recorded_scope_stage_response(key)) {
+        Ok(saved)=>saved,
+        Err(error) if retained.is_some()=>return Err(workflow.retained_preparation_failure(error)?),
+        Err(error)=>return Err(error),
+    };
+    if retained.is_some() {
+        if saved.is_none() {return Err(workflow.retained_preparation_failure(anyhow::anyhow!("original scope metadata is unavailable"))?);}
+    }else {
+        let inputs=saved.as_ref().map(|saved|initial_acceptance_inputs(saved.scope.as_ref(),owner_request));
+        acceptance::preflight_initial_scope(root,workflow,source,base,inputs.as_ref().map(|(scope,criteria)|(scope.as_str(),criteria.as_slice())))?;
+    }
+    Ok(InitialPreparation {retained:retained.is_some(),context,saved})
+}
+
 #[derive(serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InitialScopeSnapshot {version:u32,context:String,#[serde(deserialize_with="required_initial_scope")] scope:Option<ScopeOutcome>}
@@ -8297,21 +8322,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
     let owner_request=acceptance_owner_request(&issue);
-    let scope_context=match acceptance::initial_scope_context(&worktree,&workflow_guard,candidate_base) {
-        Ok(context)=>context,
+    let initial=match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
+        Ok(initial)=>initial,
         Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
     };
-    let saved_scope=match read_initial_scope(&scope_context,|key|workflow_guard.recorded_scope_stage_response(key)) {
-        Ok(saved)=>saved,
-        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
-    };
-
-    let saved_inputs=saved_scope.as_ref().map(|saved|initial_acceptance_inputs(saved.scope.as_ref(),&owner_request));
-    if let Err(error)=acceptance::preflight_initial_scope(&worktree,&workflow_guard,
-        crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,
-        saved_inputs.as_ref().map(|(scope,criteria)|(scope.as_str(),criteria.as_slice()))) {
-        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
-    }
+    let retained_preparation=initial.retained;
+    let scope_context=initial.context;
+    let saved_scope=initial.saved;
 
     // Failed stages retain committed and unfinished work. Publication alone is
     // not permission to erase the only local recovery copy.
@@ -8348,44 +8365,47 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // be served at all. The build preset is the demanding one; when every
     // provider cleared for it is latched on quota, the scoping call buys
     // nothing and the tick used to end as a failure rather than a pause.
-    match reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic) {
-        augmentagent_channel_core::LaneAvailability::Available => {}
-        augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
-            let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
-            info!(issue = issue.number, "auto-PR held: {why}");
-            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            return Ok(RunReport::held(why));
+    let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    if !retained_preparation {
+        match reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic) {
+            augmentagent_channel_core::LaneAvailability::Available => {}
+            augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
+                let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
+                info!(issue = issue.number, "auto-PR held: {why}");
+                workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::held(why));
+            }
+            augmentagent_channel_core::LaneAvailability::NoEligibleProvider => {
+                // NOT a pause. No provider in the chain is cleared for the build
+                // preset at all, so waiting will never fix it — that is a
+                // configuration or deployment fault and must stay loud, or a
+                // misconfigured chain looks exactly like a quiet quota day.
+                workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                bail!(
+                    "no provider in the chain is cleared for a FullAgentic call; \
+                     the build lane cannot run until the chain is fixed \
+                     (`augmentagent reasoner-selftest`)"
+                );
+            }
         }
-        augmentagent_channel_core::LaneAvailability::NoEligibleProvider => {
-            // NOT a pause. No provider in the chain is cleared for the build
-            // preset at all, so waiting will never fix it — that is a
-            // configuration or deployment fault and must stay loud, or a
-            // misconfigured chain looks exactly like a quiet quota day.
-            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            bail!(
-                "no provider in the chain is cleared for a FullAgentic call; \
-                 the build lane cannot run until the chain is fixed \
-                 (`augmentagent reasoner-selftest`)"
-            );
-        }
+
+        let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
+            acceptance::readiness::Decision::Ready(evidence)=>evidence,
+            acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+        };
+        scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
+        // #1515 — what landed on main since the issue was written, so the scoper
+        // judges the issue against today's code rather than the code it
+        // described. Empty when nothing merged or the date is unknown.
+        scope_prompt.push_str(&merged_since_section(
+            &merged_since_filed(repo_root, &worktree, issue.number).await,
+        ));
     }
 
-    let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
-        acceptance::readiness::Decision::Ready(evidence)=>evidence,
-        acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
-    };
-    let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
-    scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
-    // #1515 — what landed on main since the issue was written, so the scoper
-    // judges the issue against today's code rather than the code it
-    // described. Empty when nothing merged or the date is unknown.
-    scope_prompt.push_str(&merged_since_section(
-        &merged_since_filed(repo_root, &worktree, issue.number).await,
-    ));
     let mut scope = if let Some(scope)=replay_initial_scope(&saved_scope) {scope}else{match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {

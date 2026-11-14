@@ -148,6 +148,15 @@ impl std::fmt::Display for SemanticSourceUnavailable {
 }
 impl std::error::Error for SemanticSourceUnavailable {}
 
+fn record_semantic_source_failure(store:&mut WorkflowStore,lease:&Lease,binding:&Binding,cue:&str,error:&anyhow::Error)->Result<()> {
+    store.hold_semantic_source_unavailable(lease,binding,cue,millis())?;
+    let detail=format!("{error:#}");
+    let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,cue,&detail))?));
+    let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
+    store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+    Ok(())
+}
+
 /// Source data is rechecked at preparation and both launch gates. This has
 /// no model or verifier execution and never substitutes an old positive approval.
 fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,repository:&str)->Result<Option<acceptance::PreparedAcceptance>> {
@@ -182,11 +191,7 @@ fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,
     match source {
         Ok(prepared)=>Ok(prepared),
         Err(error)=> {
-            store.hold_semantic_source_unavailable(lease,binding,&cue.key,millis())?;
-            let detail=format!("{error:#}");
-            let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,&cue.key,&detail))?));
-            let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
-            store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+            record_semantic_source_failure(store,lease,binding,&cue.key,&error)?;
             Err(SemanticSourceUnavailable.into())
         }
     }
@@ -1650,6 +1655,45 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?;
         semantic_preparation_source(&mut store,&self.lease,&self.worktree,&self.repository)
+    }
+
+    pub(super) fn retained_preparation(&self)->Result<Option<acceptance::PreparedAcceptance>> {
+        self.validate_before_side_effect()?;
+        let reference=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?
+            .retained_qualification_history(self.id(),&self.binding)?;
+        let Some(reference)=reference else{return Ok(None)};
+        let checked=(||->Result<Option<acceptance::PreparedAcceptance>> {
+            let source=self.acceptance_source.context("retained preparation source identity missing")?;
+            let control=acceptance::control_directories(&self.repository,self.id())?.workflow_acceptance;
+            if acceptance::retained_qualification_superseded(&control,source,&reference)? {return Ok(None);}
+            let prepared=match self.semantic_preparation_source()? {
+                Some(prepared)=>prepared,
+                None=> {
+                    if acceptance::retained_qualification_superseded(&control,source,&reference)? {return Ok(None);}
+                    match acceptance::retained_prepared(&self.worktree,&control,source) {
+                        Ok(Some(prepared))=>prepared,
+                        Ok(None)=>anyhow::bail!("retained prepared evidence is unavailable"),
+                        Err(error)=>return Err(error),
+                    }
+                },
+            };
+            anyhow::ensure!(self.retained_qualification_reference(&prepared)?.as_ref()==Some(&reference),"retained preparation source changed");
+            Ok(Some(prepared))
+        })();
+        match checked {
+            Ok(prepared)=>Ok(prepared),
+            Err(error) if self.semantic_source_waiting()?=>Err(error),
+            Err(error)=>Err(self.retained_preparation_failure(error)?),
+        }
+    }
+
+    pub(super) fn retained_preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        self.validate_before_side_effect()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?;
+        store.validate_dispatch(&self.lease,&self.binding,millis())?;
+        let cue=store.retained_qualification_cue(self.id(),&self.binding)?.context("retained preparation source reference missing")?;
+        record_semantic_source_failure(&mut store,&self.lease,&self.binding,&cue.key,&error)?;
+        Ok(SemanticSourceUnavailable.into())
     }
 
     /// A completed handoff stops overriding preparation, but remains proof

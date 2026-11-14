@@ -654,7 +654,8 @@ pub(super) fn prepared_fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedA
 #[cfg(test)]
 mod tests {
     use super::*;
-    pub(super) fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {
+    pub(super) fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {fixture_for_source(AcceptanceSource::PullRequest(840))}
+    fn fixture_for_source(source:AcceptanceSource)->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {
         let root=tempfile::tempdir_in("/tmp").unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(root.path().join("behavior.py"),"READY = False\n").unwrap();
         for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","baseline"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
@@ -663,10 +664,10 @@ mod tests {
         let base=original_git(root.path(),&["rev-parse","HEAD"]).unwrap().trim().to_owned();
         let path="autoship_verifiers/observe.py";
         let proposal=parse_proposal_for(&format!("```autoship-contract\n{}\n```",serde_json::json!({
-            "contract":{"schema_version":1,"revision":1,"pull_request":840,"criteria":[{"id":"READY","requirement":"Readiness becomes true","verifier_ids":["observe"]}],"allowed_paths":[{"kind":"file","path":"behavior.py"}],
+            "contract":{"schema_version":1,"revision":1,"issue":source.issue(),"pull_request":source.pull_request(),"criteria":[{"id":"READY","requirement":"Readiness becomes true","verifier_ids":["observe"]}],"allowed_paths":[{"kind":"file","path":"behavior.py"}],
             "verifiers":[{"id":"observe","command":{"kind":"black_box","invocation":{"kind":"python_script","file":path,"args":[]},"oracle":{"kind":"json","value":true}},"pinned_files":[path],"failure_witness":"readiness is false"}]},
             "files":{path:"import json,sys\nfrom pathlib import Path\nsys.path.insert(0,str(Path.cwd()))\nimport behavior\nprint(json.dumps(behavior.READY))\n"}
-        })),AcceptanceSource::PullRequest(840)).unwrap();
+        })),source).unwrap();
         install_harness(root.path(),&proposal).unwrap();
         let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),base.clone(),environment_id(root.path()).unwrap()).unwrap();
         let observed=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
@@ -1250,7 +1251,8 @@ mod tests {
         const CHILD:&str="AUTOSHIP_RETAINED_QUALIFICATION_FIXTURE";
         if let Some(script)=std::env::var_os(CHILD).map(PathBuf::from) {
             use std::os::unix::fs::PermissionsExt;
-            let (root,control,prepared)=fixture();
+            let source=if std::env::var("AUTOSHIP_RETAINED_QUALIFICATION_SOURCE").as_deref()==Ok("issue") {AcceptanceSource::Issue(840)}else{AcceptanceSource::PullRequest(840)};
+            let (root,control,prepared)=fixture_for_source(source);
             persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
             let mut judgment=saved_judgment(control.path(),&prepared);
             let current=context(&prepared.proposal,&prepared.baseline).unwrap();
@@ -1261,8 +1263,9 @@ mod tests {
             std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
             std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
             let database=workflow::path();
+            assert_eq!(database,script.parent().unwrap().join("workflow.db"),"fault injection requires disposable fixture state");
             let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
-                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
                 branch:"fixture",contract:"original scope",environment:"test",
             }).await.unwrap().unwrap();
             let native_control=control_directories("owner/repo",guard.id()).unwrap().workflow_acceptance;
@@ -1290,6 +1293,12 @@ mod tests {
             let (controller_raw,controller_proof)=witness_controller_keys(&origin,&guard.binding().contract,0);
             guard.record_scope_stage_response_pair(&controller_raw,&raw,&controller_proof,&encoded).unwrap();
             persist(control.path(),&origin,&native_control,&scope_authority::NativeReply {text:raw.clone(),provenance:reference.clone()}).unwrap();
+            if source.issue().is_some() {
+                let initial_context=retained_initial_scope_context(&guard,&prepared).unwrap();
+                let scoped=ScopeOutcome {fixable:true,complexity:Complexity::Medium,est_diff_lines:Some(12),guarded_paths:false,
+                    body:"Original independent implementation guidance".into(),criteria:prepared.proposal.contract.criteria.iter().map(|criterion|criterion.requirement.clone()).collect(),relevance:Relevance::Current};
+                retain_initial_scope(&initial_context,Some(scoped),|key,raw|guard.record_scope_stage_response(key,raw)).unwrap();
+            }
             let (plan,result)=verifier_execution::retain_scripted_captured_original_data(root.path(),&native_control,&prepared,&guard).unwrap();
             // Establish all fixture prerequisites before testing the live caller.
             prepared.baseline.registration.verify_integrity(root.path()).unwrap();
@@ -1347,13 +1356,28 @@ mod tests {
             assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
                 inspect_retained_qualification(root.path(),&native_control,source,&held.checkpoint.binding,evidence)).unwrap());
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
-                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
                 branch:"fixture",contract:"original scope",environment:"test",
             }).await.unwrap().unwrap();
             let recovered=guard.semantic_preparation_source().unwrap()
                 .expect("normal initial preparation lost the typed original witness cue");
             assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
             let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            let prelude_events=store.events(guard.id()).unwrap();
+            if source.issue().is_some() {
+                let early=initial_preparation(root.path(),&guard,source,base,"original scope").unwrap();
+                assert!(early.retained,"initial issue prelude retried paid preparation for retained evidence");
+                let scope=early.saved.unwrap().scope.unwrap();
+                assert_eq!(scope.complexity,Complexity::Medium);assert_eq!(scope.est_diff_lines,Some(12));
+                assert_eq!(scope.body,"Original independent implementation guidance");
+                assert_eq!(scope.criteria,prepared.proposal.contract.criteria.iter().map(|criterion|criterion.requirement.clone()).collect::<Vec<_>>());
+            }else {
+                let pr=adoption::AdoptedPr {repository:"owner/repo".into(),pr:840,source_issue:None,branch:"fixture".into(),head:base.into(),base:base.into(),
+                    author:"fixture".into(),title:"Readiness".into(),body:"original scope".into(),dependency:adoption::Dependency::Main};
+                let early=adopted_execution::preparation_request(root.path(),&pr,"original scope",&mut guard).await.unwrap();
+                assert!(matches!(early,adopted_execution::PreparationRequest::Request(ref request) if request=="original scope"),"PR prelude asked for another readiness decision");
+            }
+            assert_eq!(store.events(guard.id()).unwrap(),prelude_events,"retained prelude created fresh scope/readiness/budget work");
             let initial=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
                 &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
             assert_eq!(serde_json::to_vec(&initial).unwrap(),serde_json::to_vec(&prepared).unwrap(),"initial preparation regenerated the verifier");
@@ -1375,19 +1399,40 @@ mod tests {
             assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().is_none(),"qualified published preparation still overrides later verifier revisions");
             guard.bind_acceptance(&prepared,&native_control).unwrap();
             assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),1);
+            let settled=guard.retained_preparation().unwrap().expect("settled restart repeated paid preparation");
+            assert_eq!(serde_json::to_vec(&settled).unwrap(),serde_json::to_vec(&prepared).unwrap());
             let mut superseding=manifest.clone();superseding.contract_revision+=1;superseding.contract_hash="e".repeat(64);
             std::fs::write(&index,serde_json::to_vec(&superseding).unwrap()).unwrap();
             assert!(guard.semantic_preparation_source().unwrap().is_none(),"historical source overrode a later registered verifier");
             std::fs::write(&index,serde_json::to_vec(&manifest).unwrap()).unwrap();
-            for missing in ["native_proof","published_prepared"] {
+            let faults=if source.issue().is_some() {vec!["native_proof","published_prepared","initial_scope"]}else{vec!["native_proof","published_prepared"]};
+            let restorations=faults.len();
+            for missing in faults {
                 guard.transition(crate::autoship_workflow::Stage::Build,"qualified_work_started","build",0).await.unwrap();
+                let scope_context=retained_initial_scope_context(&guard,&prepared).unwrap();
+                let scope_key=initial_scope_key(&scope_context);
+                let original_scope=if missing=="initial_scope" {Some(guard.recorded_scope_stage_response(&scope_key).unwrap().unwrap())}else{None};
                 let lost=if missing=="native_proof" {&reference.artifact}else{&prepared_path};
-                let held_file=native_control.join("fixture-unavailable-source");std::fs::rename(lost,&held_file).unwrap();
-                assert!(guard.semantic_preparation_source().is_err(),"settled {missing} loss was invisible to the real dispatch/preparation guard");
+                let held_file=native_control.join("fixture-unavailable-source");
+                if missing=="initial_scope" {
+                    // Corrupt only this disposable fixture's committed scope
+                    // row, then restore the exact original bytes below.
+                    rusqlite::Connection::open(&database).unwrap().execute("UPDATE scope_stage_response SET response='unavailable' WHERE workflow=?1 AND key=?2",
+                        rusqlite::params![guard.id(),scope_key]).unwrap();
+                    assert!(initial_preparation(root.path(),&guard,source,base,"original scope").is_err());
+                }else {
+                    std::fs::rename(lost,&held_file).unwrap();
+                    assert!(guard.semantic_preparation_source().is_err(),"settled {missing} loss was invisible to the real dispatch/preparation guard");
+                }
                 assert!(guard.semantic_source_waiting().unwrap());
                 let parked_events=store.events(guard.id()).unwrap();
-                assert!(guard.semantic_preparation_source().is_err());
+                if missing=="initial_scope" {assert!(initial_preparation(root.path(),&guard,source,base,"original scope").is_err());}
+                else {assert!(guard.semantic_preparation_source().is_err());}
                 assert_eq!(store.events(guard.id()).unwrap(),parked_events,"unchanged loss repeatedly claimed work");
+                if let Some(original)=original_scope {
+                    rusqlite::Connection::open(&database).unwrap().execute("UPDATE scope_stage_response SET response=?3 WHERE workflow=?1 AND key=?2",
+                        rusqlite::params![guard.id(),scope_key,original]).unwrap();
+                }
                 if missing=="native_proof" {std::fs::rename(&held_file,lost).unwrap();}
                 let id=guard.id().to_owned();guard.finish().unwrap();
                 let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
@@ -1399,9 +1444,13 @@ mod tests {
                     Ok(found)
                 }).unwrap());
                 guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
-                    repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                    repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
                     branch:"fixture",contract:"original scope",environment:"test",
                 }).await.unwrap().unwrap();
+                if source.issue().is_some() {
+                    let early=initial_preparation(root.path(),&guard,source,base,"original scope").unwrap();
+                    assert!(early.retained);assert_eq!(early.saved.unwrap().scope.unwrap().complexity,Complexity::Medium);
+                }
                 let recovered=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
                     &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
                 assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
@@ -1413,8 +1462,8 @@ mod tests {
                 assert_eq!(reasoner.calls(),0);
             }
             assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
-            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),2);
-            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),3);
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),restorations);
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),restorations+1);
             assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,
                 "metadata-only requalification admitted another model call");
             assert_eq!(private_bytes(&reference.artifact,64*1024).unwrap(),native_bytes,"qualification rewrote native provenance");
@@ -1453,14 +1502,16 @@ mod tests {
             assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
             return;
         }
+        for source_kind in ["pr","issue"] {
         let scripts=tempfile::tempdir_in("/tmp").unwrap();let script=scripts.path().join("gh");
         let out=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::acceptance::baseline_witness::tests::qualify_reuses_complete_retained_original_witness_without_native_admission","--nocapture"])
-            .env(CHILD,&script).env("GH_BIN",&script).env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env(CHILD,&script).env("AUTOSHIP_RETAINED_QUALIFICATION_SOURCE",source_kind).env("GH_BIN",&script).env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
             .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",scripts.path().join("workflow.db"))
             .env("AUGMENTAGENT_RUN_RESOURCES","1").env("XDG_STATE_HOME",scripts.path().join("state"))
             .output().unwrap();
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+        }
     }
 
 
@@ -1587,6 +1638,12 @@ mod tests {
         assert_eq!(prepared.len(),1,"actual original reproduced measurement is absent or ambiguous");
         let prepared=&prepared[0];let base=prepared.baseline.registration.baseline_head();
         assert_eq!(base,"b9e09d46864928a90c78ceb52841b1e0d5968bb9");
+        let original_environment=prepared.baseline.registration.binding(base).unwrap().environment_id;
+        let scope_context=amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",id,&recovery.source_request,base,&original_environment)).unwrap());
+        let original_scope=read_initial_scope(&scope_context,|key|evidence.scope_response(key)).unwrap()
+            .expect("actual retained source has no authenticated original scope snapshot");
+        println!("actual original scope preserved: fallback={}, complexity={}",original_scope.scope.is_none(),
+            original_scope.scope.as_ref().map_or("hard",|scope|scope.complexity.as_str()));
         let reference=inspect_retained_qualification(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&before.checkpoint.binding,&evidence).unwrap()
             .expect("actual metadata hold has no typed retained original handoff");
         let recovered=retained_qualification_source(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&reference,&evidence).unwrap();

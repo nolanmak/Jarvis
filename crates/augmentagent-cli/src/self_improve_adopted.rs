@@ -286,6 +286,20 @@ pub(super) async fn resume(
     }
 }
 
+pub(super) enum PreparationRequest {Request(String),Dependency(String)}
+
+pub(super) async fn preparation_request(root:&Path,pr:&adoption::AdoptedPr,request:&str,guard:&mut workflow::WorkflowGuard)->Result<PreparationRequest> {
+    anyhow::ensure!(pr.source_issue.is_none() && guard.id()==pr.workflow_id()?,"source-less preparation identity mismatch");
+    if let Some(prepared)=guard.retained_preparation()? {
+        anyhow::ensure!(prepared.proposal.contract.source()?==AcceptanceSource::PullRequest(pr.pr),"retained PR preparation source changed");
+        return Ok(PreparationRequest::Request(request.into()));
+    }
+    match acceptance::readiness::assess_pr(root,pr,guard).await? {
+        acceptance::readiness::Decision::Ready(grounding)=>Ok(PreparationRequest::Request(format!("{request}\nIndependent readiness evidence (grounding, not approval):\n{grounding}"))),
+        acceptance::readiness::Decision::Dependency(reason)=>Ok(PreparationRequest::Dependency(reason)),
+    }
+}
+
 async fn execute(
     repo: &Path,
     reasoner: &FallbackReasoner,
@@ -297,11 +311,10 @@ async fn execute(
     capacity_accounting:&workflow::CapacityAccounting,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
-    let grounding=match acceptance::readiness::assess_pr(worktree,pr,guard).await? {
-        acceptance::readiness::Decision::Ready(evidence)=>evidence,
-        acceptance::readiness::Decision::Dependency(reason)=>return Ok(RunReport::held(format!("PR #{}: grounded external decision; re-evaluate on PR/main change: {}",pr.pr,truncate(&reason,1200)))),
+    let grounded_request=match preparation_request(worktree,pr,request,guard).await? {
+        PreparationRequest::Request(request)=>request,
+        PreparationRequest::Dependency(reason)=>return Ok(RunReport::held(format!("PR #{}: grounded external decision; re-evaluate on PR/main change: {}",pr.pr,truncate(&reason,1200)))),
     };
-    let grounded_request=format!("{request}\nIndependent readiness evidence (grounding, not approval):\n{grounding}");
     let control = acceptance::control_directories(&pr.repository, guard.id())?.workflow_acceptance;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;
     anyhow::ensure!(ok, "cannot resolve adopted acceptance baseline: {error}");

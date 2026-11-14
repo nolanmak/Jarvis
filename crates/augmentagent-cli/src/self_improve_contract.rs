@@ -1589,6 +1589,12 @@ pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard
     (||->Result<String> {initial_scope_origin(workflow,base,&environment_id(root)?)})().map_err(initial_scope_replay_error)
 }
 
+pub(super) fn retained_initial_scope_context(workflow:&workflow::WorkflowGuard,prepared:&PreparedAcceptance)->Result<String> {
+    let base=prepared.baseline.registration.baseline_head();
+    let environment=prepared.baseline.registration.binding(base)?.environment_id;
+    initial_scope_origin(workflow,base,&environment)
+}
+
 pub(super) fn preflight_initial_scope(root:&Path,workflow:&workflow::WorkflowGuard,source:AcceptanceSource,base:&str,
     saved:Option<(&str,&[String])>)->Result<()> {
     // Registered acceptance has its own original-source/qualification owner.
