@@ -905,6 +905,24 @@ const ISSUES_PER_PAGE: u32 = 100;
 /// never evidence that an older repair issue or child does not exist.
 const MAX_ISSUE_PAGES: u32 = 100;
 
+/// Complete inventory was inspected, but individual held issues could not be
+/// previewed. This is distinct from unavailable global owner-control history.
+#[derive(Debug)]
+struct IssuePreviewUnavailable;
+impl std::fmt::Display for IssuePreviewUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("issue-preview-unavailable")}
+}
+impl std::error::Error for IssuePreviewUnavailable {}
+
+#[derive(Debug)]
+struct RecoveryHistoryUnavailable;
+impl std::fmt::Display for RecoveryHistoryUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("qualification-recovery-history-unavailable")}
+}
+impl std::error::Error for RecoveryHistoryUnavailable {}
+
+
+
 /// #1517 — walk `fetch` over pages 1.. and merge the rows into one REST
 /// issues array, preserving the newest-first order the pages arrive in.
 ///
@@ -987,13 +1005,16 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .map_err(|error|error.context(workflow::OwnerControlUnavailable))?;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
-    let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
+    let qualification_retries=qualification_reconcile::issue_retries(repo_root).await
+        .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
-        .into_iter()
-        .partition(|i| !i.research_filed);
+    let mut candidates=rest_issue_candidates(&issues);
+    // Recovery wakes the ordinary selector, not a special execution path.
+    // Within human/research tiers, consider due recovery hints before
+    // unrelated fresh issues; stable sorting preserves normal newest-first.
+    candidates.sort_by_key(|issue|(issue.research_filed,!qualification_retries.contains(&issue.number)));
     let mut unavailable_history=None;
-    for iss in human.into_iter().chain(research) {
+    for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
@@ -1006,6 +1027,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 continue;
             }
             Ok(false)=>{},
+            Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
             Err(error)=> {
                 warn!(issue=iss.number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
                 if unavailable_history.is_none() {unavailable_history=Some(error);}
@@ -1065,10 +1087,21 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             continue;
         }
         let candidate=Issue {number,title,body,author,author_trusted,research_filed};
+        match owner_controls.unchanged_initial_hold(repo_root,&repository,&candidate).await {
+            Ok(true)=>{info!(issue=number,"skip: initial input hold is unchanged; consider eligible peers");continue;},
+            Ok(false)=>{},
+            Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
+            Err(error)=>{
+                warn!(issue=number,error=%error,"skip: held issue inputs unavailable; preserve hold and consider peers");
+                if unavailable_history.is_none() {unavailable_history=Some(error);}
+                continue;
+            },
+        }
         if acceptance::readiness::blocked(repo_root,&candidate).await? {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
         }
+        owner_controls.require_current_history()?;
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -1081,7 +1114,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     if !dry_run {
         retriage_gave_up(repo_root, &issues).await;
     }
-    if let Some(error)=unavailable_history {return Err(error);}
+    owner_controls.require_current_history()?;
+    if let Some(error)=unavailable_history {return Err(error.context(IssuePreviewUnavailable));}
     Ok(None)
 }
 
@@ -8064,6 +8098,56 @@ where F:for<'a> FnOnce(&'a Path,bool,Option<targeted::Resolved>)->futures::futur
     dispatch(repo_root,dry_run,selected).await.map(|mut report|{report.resumed|=resumed;report})
 }
 
+enum IssueSelection {Issue(Issue),Report(RunReport)}
+
+/// Selection routing only. The supplied production fallback retains its own
+/// draft/adoption, owner-control, exact-head and execution admission checks.
+async fn select_issue_with_fallback<F,Fut>(repo_root:&Path,dry_run:bool,prefer_build:bool,fallback:F)->Result<IssueSelection>
+where F:FnOnce()->Fut,Fut:std::future::Future<Output=Result<Option<RunReport>>> {
+    let preview_error=match pick_issue(repo_root,dry_run).await {
+        Ok(Some(issue))=>return Ok(IssueSelection::Issue(issue)),
+        Ok(None)=>None,
+        Err(error) if prefer_build && error.downcast_ref::<IssuePreviewUnavailable>().is_some()=> {
+            // Recheck shared history before trying the independently guarded
+            // fallback. Missing storage is not a new installation at this point.
+            workflow::FreshIssueControls::open()?.require_existing()?;
+            Some(error)
+        },
+        Err(error)=>return Err(error),
+    };
+    if prefer_build {
+        if let Some(report)=fallback().await? {return Ok(IssueSelection::Report(report));}
+    }
+    match preview_error {Some(error)=>Err(error),None=>Ok(IssueSelection::Report(RunReport::idle()))}
+}
+
+async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<RunReport>> {
+    if let Some((pr, issue_no, resume_branch)) =
+        find_resumable_draft(repo_root, None, dry_run).await
+    {
+        let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
+        return resume_draft_pr(
+            repo_root,
+            &reasoner,
+            pr,
+            issue_no,
+            &resume_branch,
+            dry_run,
+            None,
+        )
+        .await
+        .map(|mut r| {
+            r.resumed = true;
+            r
+        }).map(Some);
+    }
+    if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
+        return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report }).map(Some);
+    }
+
+    Ok(None)
+}
+
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
@@ -8212,41 +8296,16 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     let issue = match red_main_issue {
         Some(issue) => issue,
-        None => match pick_issue(repo_root, dry_run).await {
-            Ok(Some(issue)) => issue,
+        None => match select_issue_with_fallback(repo_root, dry_run, prefer_build, || waiting_issue_fallback(repo_root,dry_run)).await {
+            Ok(IssueSelection::Issue(issue))=>issue,
+            Ok(IssueSelection::Report(report))=>return Ok(report),
+            Err(error) if error.downcast_ref::<RecoveryHistoryUnavailable>().is_some()=> {
+                return Ok(RunReport::held(RecoveryHistoryUnavailable.to_string()));
+            },
             Err(error) if error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some()=> {
                 return Ok(RunReport::held(workflow::OwnerControlUnavailable.to_string()));
             },
             Err(error)=>return Err(error),
-            Ok(None) => {
-                // #1532 — a slot reserved for a build with nothing to build
-                // is spent on a waiting draft, never on idling.
-                if prefer_build {
-                    if let Some((pr, issue_no, resume_branch)) =
-                        find_resumable_draft(repo_root, None, dry_run).await
-                    {
-                        let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
-                        return resume_draft_pr(
-                            repo_root,
-                            &reasoner,
-                            pr,
-                            issue_no,
-                            &resume_branch,
-                            dry_run,
-                            None,
-                        )
-                        .await
-                        .map(|mut r| {
-                            r.resumed = true;
-                            r
-                        });
-                    }
-                    if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
-                        return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
-                    }
-                }
-                return Ok(RunReport::idle());
-            }
         },
     };
     note_current_issue(issue.number);
@@ -15085,14 +15144,8 @@ CODEX-REVIEW: lgtm").0);
         let resume_first = body
             .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
             .expect("the resume-first block yields a reserved slot");
-        let pick = body.find("match pick_issue(repo_root, dry_run).await {").expect("the picker");
-        assert!(resume_first < pick, "resume-first still precedes the picker");
-        let none_arm = &body[pick..];
-        let none_arm = &none_arm[none_arm.find("Ok(None) => {").expect("the empty selector result")..];
-        let fallback = none_arm.find("if prefer_build {").expect("the reserved-slot fallback");
-        let resume = none_arm.find("find_resumable_draft(repo_root, None, dry_run)").expect("fallback resume");
-        let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");
-        assert!(fallback < resume && resume < idle, "fall back to a draft, then idle");
+        let pick=body.find("match select_issue_with_fallback(repo_root, dry_run, prefer_build, || waiting_issue_fallback(repo_root,dry_run)).await").expect("production picker and guarded waiting-work fallback");
+        assert!(resume_first<pick,"resume-first still precedes reserved-slot issue selection");
 
     }
 
@@ -21149,4 +21202,288 @@ print(json.dumps([{'number': 77, 'isDraft': False,
     async fn authorized_linked_pr_suppresses_remote_fresh_work() { fixture("remote").await; }
     #[tokio::test]
     async fn malformed_inventory_does_not_authorize_fresh_work() { fixture("malformed").await; }
+}
+
+#[cfg(test)]
+mod recovered_issue_selection_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(root:&Path,args:&[&str])->String {
+        let out=std::process::Command::new("/usr/bin/git").args(["-c","core.hooksPath=/dev/null"])
+            .args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+
+    #[tokio::test]
+    #[ignore="explicit read-only live selection diagnostic; requires AUTOSHIP_SELECTION_PROBE_ROOT/DB; no claim, mutation, provider or model call"]
+    async fn actual_recovered_issue_and_held_peer_selection_inputs_are_read_only() {
+        let root=PathBuf::from(std::env::var_os("AUTOSHIP_SELECTION_PROBE_ROOT").expect("explicit live repository"));
+        let database=PathBuf::from(std::env::var_os("AUTOSHIP_SELECTION_PROBE_DB").expect("explicit read-only workflow database"));
+        assert_eq!(workflow::path().canonicalize().unwrap(),database.canonicalize().unwrap(),"probe authority differs from configured workflow store");
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&database).unwrap().unwrap();
+        let ids=["nolanmak/jarvis#1830","nolanmak/jarvis#1833"];
+        let before=ids.iter().map(|id|(store.snapshot(id).unwrap(),store.events(id).unwrap())).collect::<Vec<_>>();
+        let due=qualification_reconcile::issue_retries(&root).await.unwrap();
+        let (ok,raw,_)=run(&gh_bin(),&["api","repos/nolanmak/Jarvis/issues/1833"],&root).await.unwrap();assert!(ok);
+        let value:serde_json::Value=serde_json::from_str(&raw).unwrap();
+        let author=value["user"]["login"].as_str().unwrap().to_owned();let association=value["author_association"].as_str().unwrap();
+        let trusted=author_is_trusted(&author,association,&trusted_authors(&root).await);
+        let issue=Issue {number:1833,title:value["title"].as_str().unwrap().into(),body:value["body"].as_str().unwrap().into(),author,author_trusted:trusted,research_filed:false};
+        assert!(issue.author_trusted,"read-only probe does not authorize an untrusted source");
+        assert!(due.contains(&1830),"actual recovered source is not in the existing due view");
+        assert!(workflow::FreshIssueControls::open().unwrap().unchanged_initial_hold(&root,"nolanmak/jarvis",&issue).await.unwrap(),"actual newer peer is not a provably unchanged owned input hold");
+        for (index,id) in ids.iter().enumerate() {
+            assert_eq!(store.snapshot(id).unwrap(),before[index].0,"live selection diagnostic changed or raced workflow state");
+            assert_eq!(store.events(id).unwrap(),before[index].1,"live selection diagnostic changed or raced workflow events");
+        }
+        eprintln!("actual selection inputs: recovered #1830 is due; #1833 unchanged hold confirmed; snapshots/events/historical model calls unchanged; no claim or dispatch");
+    }
+
+    #[tokio::test]
+    async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
+        const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            for case in ["preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+                let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
+                git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
+                std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
+                git(&repo,&["add","."]);git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","original"]);
+                let head=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&head]);
+                let bin=root.path().join("bin");std::fs::create_dir(&bin).unwrap();let rustc=bin.join("rustc");
+                std::fs::write(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let gh=bin.join("gh.py");std::fs::write(&gh,r#"#!/usr/bin/python3
+import json,os,sys,sqlite3
+args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
+with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
+if args[:2]==['repo','view']:
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-recovery-store'
+ if mode=='recovery-history-disappeared' and os.path.exists(marker):
+  os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ print('fixture-owner/repo');sys.exit(0)
+if args[:2]==['pr','list']:
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-after-preview'
+ if mode=='preview-global-between-peers' and os.path.exists(marker):
+  os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ print('[]');sys.exit(0)
+if args[:1]==['api'] and '/git/ref/heads/main' in args[1]:
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-store'
+ if mode.startswith('preview-global-disappeared') and os.path.exists(marker):
+  os.unlink(marker);state=os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB'];os.rename(state,state+'.fixture-missing')
+ if mode=='preview-global-between-peers':open(os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-after-preview','w').write('armed')
+ marker=os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']+'.lose-schema'
+ if mode=='preview-global-schema-peer' and os.path.exists(marker):
+  os.unlink(marker)
+  with sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']) as db:db.execute('ALTER TABLE workflow RENAME COLUMN checkpoint TO fixture_checkpoint_unavailable')
+ print(open(os.environ['AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE']).read().strip());sys.exit(0)
+if args[:1]==['api'] and '/issues?' in args[1]:
+ def issue(n,title,body):return dict(number=n,title=title,body=body,labels=[],user={'login':'fixture-owner'},author_association='OWNER')
+ held=issue(1833,'Correct newer widget rounding','Keep widget rounding consistent.'+(' Owner changed the desired result.' if mode=='changed-source' else ''))
+ recovered=issue(1830,'Correct retained widget rounding','Preserve exact rounding behavior.')
+ if mode=='untrusted':recovered.update(user={'login':'outside-contributor'},author_association='NONE')
+ if mode=='manual':recovered['labels']=[{'name':'autoship-manual'}]
+ if mode=='research':recovered['body']+=' Auto-filed by the daily research pipeline.'
+ fresh=issue(1829,'Correct older widget rounding','Keep older widget rounding consistent.')
+ rows=[held,recovered,fresh] if mode not in ['held-only','changed-source','changed-candidate','missing-context','upstream-only','changed-environment','physical-restored','physical-missing','semantic-native'] else [held,fresh]
+ if mode.startswith('preview-'):rows=[] if mode.startswith('preview-empty') else [held]
+ if mode in ['preview-global-disappeared-peer','preview-global-between-peers','preview-global-schema-peer','preview-local-unavailable-peer']:rows=[held,fresh]
+ if mode=='recovery-priority' or mode.startswith('corrupt-recovery-peer-'):rows.insert(0,issue(1834,'Correct newest eligible widget','Keep the newest widget behavior consistent.'))
+ print(json.dumps(rows if args[1].endswith('page=1') else []));sys.exit(0)
+raise AssertionError(args)
+"#).unwrap();std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let head_file=root.path().join("upstream-head");std::fs::write(&head_file,&head).unwrap();
+                let out=tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","self_improve::recovered_issue_selection_regressions::real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds","--nocapture"])
+                    .env_clear().env("PATH",format!("{}:/usr/bin:/bin",bin.display())).env("HOME",root.path())
+                    .env("XDG_STATE_HOME",root.path().join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+                    .env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","fixture-owner").env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner")
+                    .env("AUTOSHIP_RECOVERED_SELECTION_CASE",case).env("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE",head_file)
+                    .env("AUTOSHIP_RECOVERED_SELECTION_CALLS",root.path().join("calls")).env(CHILD,&repo).current_dir(&repo).output().await.unwrap();
+                assert!(out.status.success(),"{case}: {}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            }
+            return;
+        }
+        let repo=PathBuf::from(std::env::var_os(CHILD).unwrap());let case=std::env::var("AUTOSHIP_RECOVERED_SELECTION_CASE").unwrap();
+        let database=workflow::path();let head=git(&repo,&["rev-parse","HEAD"]);let held_id="fixture-owner/repo#1833";
+        for (number,title,body) in [(1833,"Correct newer widget rounding","Keep widget rounding consistent."),(1830,"Correct retained widget rounding","Preserve exact rounding behavior.")] {
+            let worktree=repo.join(format!(".self-improve-worktrees/current-issue-{number}"));let branch=format!("agent-fix/issue-{number}");
+            git(&repo,&["worktree","add","--quiet","-b",&branch,worktree.to_str().unwrap()]);
+            let contract=serde_json::to_string(&(number,title,body)).unwrap();let environment=recovery::environment_identity(&worktree,&head).await.unwrap();
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:&repo,worktree:&worktree,repository:"fixture-owner/repo",source_issue:Some(number),pr:None,branch:&branch,contract:&contract,environment:&environment}).await.unwrap().unwrap();
+            if number==1833 && matches!(case.as_str(),"physical-restored"|"physical-missing"|"semantic-native") {
+                use augmentagent_channel_core::{ProviderKind,native_session};
+                use sha2::Digest;
+                let input="f".repeat(64);let purpose=format!("{}{input}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX);
+                guard.bounded_native_calls(purpose.clone(),1,native_session::fresh_review_scope(ProviderKind::Codex,async {
+                    let session=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut native=session.begin(ProviderKind::Codex)?;
+                    guard.audit_logger().model_call_admitted("codex")?;native.observe("scripted original physical custody")?;native.finish()?;Ok::<_,anyhow::Error>(())
+                })).await.unwrap();
+                let control=acceptance::control_directories("fixture-owner/repo",guard.id()).unwrap().workflow_acceptance;
+                std::fs::create_dir_all(&control).unwrap();std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let response="scripted original source data";
+                let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"head":head,"provider":"codex","native_session":"scripted physical-custody fixture",
+                    "supplied_request_hash":"a".repeat(64),"response_hash":format!("{:x}",sha2::Sha256::digest(response.as_bytes())),"purpose":"source_selection",
+                    "scope_context_hash":"b".repeat(64),"native_input_hash":input,"scope_request_hash":"c".repeat(64),"scope_policy_hash":"d".repeat(64)})).unwrap();
+                let artifact=control.join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+                std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let reference=serde_json::json!({"artifact":artifact,"artifact_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}).to_string();
+                let (raw,proof)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
+                guard.record_scope_stage_response_pair(&raw,response,&proof,&reference).unwrap();
+                std::fs::remove_file(&artifact).unwrap();
+                guard.hold_initial_acceptance_custody("acceptance_verifier_evidence_unknown","await_original_evidence_recovery",case!="semantic-native").await.unwrap();
+                guard.finish().unwrap();
+                if case!="physical-missing" {std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();}
+            }else {
+                guard.hold_initial_acceptance(if number==1833 {"readiness_assessment_invalid"}else{"acceptance_contract_invalid"},if number==1833 {"await_readiness_input_change"}else{"await_acceptance_input_change"}).await.unwrap();guard.finish().unwrap();
+            }
+        }
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let ready_id="fixture-owner/repo#1830";
+        if !case.starts_with("preview-") && !matches!(case.as_str(),"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
+            let controls=workflow::FreshIssueControls::open().unwrap();
+            let issue=Issue {number:1830,title:"Correct retained widget rounding".into(),body:"Preserve exact rounding behavior.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
+            let in_flight_preview=controls.unchanged_initial_hold(&repo,"fixture-owner/repo",&issue);
+            let held=store.snapshot(ready_id).unwrap().unwrap();
+            let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)};
+            assert!(store.recover_retained_qualification(&held,None,chrono::Utc::now().timestamp_millis(),|_|Ok(Some(reference))).unwrap());
+            assert!(!in_flight_preview.await.unwrap(),"a genuine cue arriving during free inspection stayed hidden behind an older hold");
+            if case=="paused" {store.set_owner_pause(ready_id,"fixture-owner",0,true,chrono::Utc::now().timestamp_millis()).unwrap();}
+            let mut ledger=AttemptLedger::load(&attempt_ledger_path());ledger.day=utc_day_now();ledger.issues=vec![1830];ledger.save(&attempt_ledger_path());
+        }
+        if case=="changed-candidate" {std::fs::write(repo.join(".self-improve-worktrees/current-issue-1833/code.txt"),"owner changed candidate\n").unwrap();}
+        if matches!(case.as_str(),"missing-context"|"preview-fallback"|"preview-no-fallback"|"preview-build-lane"|"preview-local-unavailable-peer") {rusqlite::Connection::open(&database).unwrap().execute("DELETE FROM qualification_execution_context WHERE workflow=?1",[held_id]).unwrap();}
+        if case=="upstream-only" {
+            std::fs::write(repo.join("upstream.txt"),"unrelated current-main input\n").unwrap();git(&repo,&["add","upstream.txt"]);
+            git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","main advanced"]);
+            let current=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&current]);
+            std::fs::write(std::env::var_os("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap(),current).unwrap();
+        }
+        if case=="changed-environment" {
+            let compiler=PathBuf::from(std::env::var_os("GH_BIN").unwrap()).parent().unwrap().join("rustc");
+            std::fs::write(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
+        }
+        let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
+        if case=="recovery-history-disappeared" {
+            std::fs::write(format!("{}.lose-recovery-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable recovery-store fault").unwrap();
+            let outcome=qualification_reconcile::issue_retries(&repo).await;
+            let missing=PathBuf::from(format!("{}.fixture-missing",database.display()));assert!(missing.exists(),"fault did not reach recovery repository inspection");
+            std::fs::rename(missing,&database).unwrap();
+            assert!(outcome.is_err(),"previously observed recovery storage disappeared but became an initial empty hint view");
+            assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+            assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+            assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+            return;
+        }
+        if case=="recovery-history-unavailable" {
+            // A disposable schema fault keeps basic owner-control reads valid
+            // while preventing the recovery reader's pending-operation query.
+            let fault=rusqlite::Connection::open(&database).unwrap();
+            fault.execute_batch("ALTER TABLE operation RENAME COLUMN receipt TO fixture_receipt_unavailable;").unwrap();
+            let controls=workflow::FreshIssueControls::open().unwrap();assert!(!controls.paused("fixture-owner/repo",1833).unwrap());
+            assert!(qualification_reconcile::issue_retries(&repo).await.is_err(),"fault did not reach the protected recovery reader");
+            let calls=std::sync::atomic::AtomicUsize::new(0);
+            let outcome=select_issue_with_fallback(&repo,true,true,||async {calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(None)}).await;
+            fault.execute_batch("ALTER TABLE operation RENAME COLUMN fixture_receipt_unavailable TO receipt;").unwrap();
+            let error=match outcome {Err(error)=>error,_=>panic!("unavailable recovery history became an empty successful hint set")};
+            assert!(error.downcast_ref::<RecoveryHistoryUnavailable>().is_some(),"recovery history lost its precise global hold");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0,"unknown recovery history reached waiting-work execution");
+            assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+            assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+            assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+            return;
+        }
+        if case.starts_with("preview-") {
+            let schema=case=="preview-global-error";let during_schema=case=="preview-global-schema-peer";
+            let between=case=="preview-global-between-peers";let disappeared=case.starts_with("preview-global-disappeared") || between;
+            let global=schema || during_schema || disappeared;
+            if during_schema {std::fs::write(format!("{}.lose-schema",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable fixture schema fault").unwrap();}
+            if disappeared && !between {std::fs::write(format!("{}.lose-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable fixture fault").unwrap();}
+            if schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE workflow RENAME TO fixture_workflow_unavailable;").unwrap();}
+            let calls=std::sync::atomic::AtomicUsize::new(0);
+            let outcome=select_issue_with_fallback(&repo,true,case!="preview-build-lane",||async {
+                calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                // Script scheduling availability only; this is not a native
+                // provider, draft execution or autonomous-shipping receipt.
+                Ok((matches!(case.as_str(),"preview-fallback"|"preview-empty-fallback")).then(||RunReport::held("scripted waiting draft fallback".to_string())))
+            }).await;
+            if schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE fixture_workflow_unavailable RENAME TO workflow;").unwrap();}
+            if during_schema {rusqlite::Connection::open(&database).unwrap().execute_batch("ALTER TABLE workflow RENAME COLUMN fixture_checkpoint_unavailable TO checkpoint;").unwrap();}
+            if disappeared {
+                let missing=PathBuf::from(format!("{}.fixture-missing",database.display()));assert!(missing.exists(),"temporary store-loss fault did not reach preview inspection");
+                std::fs::rename(missing,&database).unwrap();
+            }
+            if matches!(case.as_str(),"preview-fallback"|"preview-empty-fallback") {
+                assert!(matches!(outcome,Ok(IssueSelection::Report(ref report)) if report.message=="scripted waiting draft fallback"),"per-issue preview failure starved guarded waiting work");
+            }else if case=="preview-local-unavailable-peer" {
+                assert!(matches!(outcome,Ok(IssueSelection::Issue(ref issue)) if issue.number==1829),"candidate-local missing context suppressed a healthy peer");
+            }else if case=="preview-empty" {
+                assert!(matches!(outcome,Ok(IssueSelection::Report(ref report)) if report.message==IDLE_MSG),"empty inventory no longer idles after an empty fallback");
+            }else {
+                let error=match outcome {Err(error)=>error,_=>panic!("unavailable issue history became fresh/idle success")};
+                assert!(error.downcast_ref::<workflow::OwnerControlUnavailable>().is_some(),"original unavailable-history outcome was lost");
+                if during_schema || disappeared {assert!(error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some(),"shared store failure became a candidate-local hold");}
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),usize::from(!global && case!="preview-build-lane" && case!="preview-local-unavailable-peer"),"fallback ran outside its reserved combined-lane boundary");
+            assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+            assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+            assert_eq!(held_before.unwrap().model_calls,0);assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+            return;
+        }
+        let corrupt=case.starts_with("corrupt-recovery-peer-");
+        let mut injected_checkpoint=None;
+        if corrupt {
+            let mut checkpoint=held_before.as_ref().unwrap().checkpoint.clone();
+            checkpoint.stage=crate::autoship_workflow::Stage::Reconcile;
+            checkpoint.next=crate::autoship_workflow::NextAction {reason:"original_semantic_witness_recovered".into(),action:"requalify_original_measurement".into(),eligible_at_ms:0};
+            let raw=match case.as_str() {
+                "corrupt-recovery-peer-schema"=>serde_json::json!({"stage":"reconcile","next":checkpoint.next}).to_string(),
+                "corrupt-recovery-peer-json"=>"not-json".to_string(),
+                _=>serde_json::to_string(&checkpoint).unwrap(),
+            };
+            let fault=rusqlite::Connection::open(&database).unwrap();
+            fault.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![held_id,raw]).unwrap();
+            if case=="corrupt-recovery-peer-snapshot" {fault.execute("UPDATE workflow SET pr='fixture-invalid-pr' WHERE id=?1",[held_id]).unwrap();}
+            if case.starts_with("corrupt-recovery-peer-operation-") {
+                let kind=if case=="corrupt-recovery-peer-operation-kind" {"not-json".to_owned()}else{serde_json::to_string(&crate::autoship_workflow::OperationKind::Push).unwrap()};
+                let binding=if case=="corrupt-recovery-peer-operation-binding" {"{}".to_owned()}else{serde_json::to_string(&checkpoint.binding).unwrap()};
+                fault.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES('corrupt-peer-operation',?1,?2,?3,0)",rusqlite::params![held_id,kind,binding]).unwrap();
+                if case=="corrupt-recovery-peer-operation-column" {fault.execute("UPDATE operation SET kind=x'00ff' WHERE id='corrupt-peer-operation'",[]).unwrap();}
+            }
+            injected_checkpoint=Some(raw);
+        }
+        let operation_before=if case.starts_with("corrupt-recovery-peer-operation-") {
+            Some(rusqlite::Connection::open(&database).unwrap().query_row("SELECT kind,binding,receipt FROM operation WHERE id='corrupt-peer-operation'",[],|row|Ok((row.get::<_,rusqlite::types::Value>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).unwrap())
+        }else{None};
+        let outcome=select_issue_with_fallback(&repo,true,true,||async {anyhow::bail!("eligible ordinary work unexpectedly yielded to fallback")}).await;
+        if let Some(injected)=injected_checkpoint {
+            let fault=rusqlite::Connection::open(&database).unwrap();
+            let (raw,pr):(String,Option<String>)=fault.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[held_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(raw,injected,"selection rewrote malformed workflow history");
+            assert_eq!(pr,(case=="corrupt-recovery-peer-snapshot").then(||"fixture-invalid-pr".to_string()),"selection repaired unknown PR ownership");
+            if let Some(before)=operation_before {
+                let after=fault.query_row("SELECT kind,binding,receipt FROM operation WHERE id='corrupt-peer-operation'",[],|row|Ok((row.get::<_,rusqlite::types::Value>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).unwrap();
+                assert_eq!(after,before,"selection rewrote or settled unknown pending-operation history");
+                fault.execute("DELETE FROM operation WHERE id='corrupt-peer-operation'",[]).unwrap();
+            }
+            fault.execute("UPDATE workflow SET checkpoint=?2,pr=NULL WHERE id=?1",rusqlite::params![held_id,serde_json::to_string(&held_before.as_ref().unwrap().checkpoint).unwrap()]).unwrap();
+        }
+        let selected=match outcome.unwrap() {IssueSelection::Issue(issue)=>issue,IssueSelection::Report(_)=>panic!("eligible ordinary peer was starved")};
+        let expected=match case.as_str(){case if case.starts_with("corrupt-recovery-peer-")=>1830,"recovered"|"recovery-priority"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
+        assert_eq!(selected.number,expected,"{case}: real issue selector chose an unchanged hold ahead of eligible work");
+        assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
+        assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
+        assert_eq!(held_before.as_ref().unwrap().model_calls,u64::from(matches!(case.as_str(),"physical-restored"|"physical-missing"|"semantic-native")));assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+        let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_RECOVERED_SELECTION_CALLS").unwrap()).unwrap();
+        assert!(!calls.contains("\"edit\"") && !calls.contains("\"comment\"") && !calls.contains("\"merge\""),"selection mutated remote state");
+        if case=="physical-restored" {
+            let held=held_before.unwrap();let context=store.recovery_context(held_id,&held.checkpoint.binding).unwrap().unwrap();
+            let resumed=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:&repo,worktree:&context.worktree,repository:"fixture-owner/repo",source_issue:Some(1833),pr:None,
+                branch:&held.branch,contract:&context.source_request,environment:&context.environment}).await.unwrap().expect("standalone acquisition could not recover restored original custody");
+            let recovered=store.snapshot(held_id).unwrap().unwrap();assert_eq!(recovered.model_calls,1);
+            assert_eq!(recovered.checkpoint.next.reason,"original_native_custody_recovered");
+            assert_eq!(recovered.checkpoint.next.action,"requalify_original");
+            assert!(resumed.audit_logger().model_call_admitted("codex").is_err(),"physical recovery granted an unqualified builder");
+            resumed.finish().unwrap();
+        }
+    }
 }
