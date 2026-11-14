@@ -1988,6 +1988,24 @@ mod tests {
     }
 
     #[test]
+    #[ignore="explicit actual #1830 readiness diagnostic; controller filesystem probes only; no model, qualification, dispatch or workflow mutation"]
+    fn actual_1830_retained_recovery_readiness() {
+        let state=PathBuf::from(std::env::var_os("AUTOSHIP_CITATION_PROBE_DB").expect("explicit workflow database"));
+        let id="nolanmak/jarvis#1830";
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();let events=store.events(id).unwrap();
+        let recovery=store.recovery_context(id,&before.checkpoint.binding).unwrap().expect("original frontend context missing");
+        let control=control_directories(&recovery.repository,id).unwrap().workflow_acceptance;
+        let evidence=store.inspect_verifier_evidence(id);
+        let readiness=inspect_retained_recovery_ready_with_setup(&recovery.worktree,&control,AcceptanceSource::Issue(1830),
+            &before,&recovery,&evidence,None,None);
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),before,"readiness changed the workflow");
+        assert_eq!(store.events(id).unwrap(),events,"readiness emitted workflow events");
+        assert!(readiness.is_ok(),"actual retained readiness unavailable: {readiness:#?}");
+        assert!(readiness.unwrap().is_some(),"actual retained source absent");
+    }
+
+    #[test]
     #[ignore="explicit read-only actual #1830 native/source inventory; requires AUTOSHIP_CITATION_PROBE_DB; no model, grant or workflow mutation"]
     fn actual_1830_retained_citation_native_and_original_measurement_inventory() {
         let state=PathBuf::from(std::env::var_os("AUTOSHIP_CITATION_PROBE_DB").expect("explicit read-only workflow database"));

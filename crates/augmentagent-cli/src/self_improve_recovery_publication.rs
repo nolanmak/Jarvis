@@ -7,6 +7,25 @@ const PROBE_FINAL:&str=".jarvis-recovery-publication-final";
 const MAX_PROBE_BYTES:usize=4*1024*1024+3*64*1024+PROBE_MARKER.len();
 
 
+/// Effective privacy comes from the first owner-only ancestor, not the leaf
+/// umask. Require a literal owner-owned chain up to that boundary. Unlike the
+/// native-custody writer-exclusion fallback, public/sticky ancestry alone is
+/// insufficient for publication storage. This never changes owner permissions.
+fn private_directory(path:&Path)->Result<std::fs::Metadata> {
+    let owner=unsafe{libc::geteuid()};
+    ensure!(path.is_absolute() && path.canonicalize()?==path,"publication directory is redirected");
+    let leaf=std::fs::symlink_metadata(path)?;
+    ensure!(leaf.is_dir() && !leaf.file_type().is_symlink() && leaf.uid()==owner && leaf.mode()&0o300==0o300,
+        "publication directory is not owned writable controller storage");
+    for ancestor in path.ancestors() {
+        let meta=std::fs::symlink_metadata(ancestor)?;
+        ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==owner && meta.mode()&0o100!=0,
+            "publication directory has no owned private boundary");
+        if meta.mode()&0o077==0 {return Ok(leaf);}
+    }
+    anyhow::bail!("publication directory has no private boundary")
+}
+
 pub(super) fn probe_harness(root:&Path,files:&BTreeMap<String,String>)->Result<()> {
     probe_harness_with(root,files,write_allocation)
 }
@@ -68,8 +87,7 @@ fn prepare_registration_parent(path:&Path)->Result<PathBuf> {
             Ok(meta)=>{
                 ensure!(meta.is_dir() && !meta.file_type().is_symlink() && current.canonicalize()?==current,
                     "registration parent is redirected");
-                ensure!(meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o022==0 && meta.mode()&0o300==0o300,
-                    "registration storage is not owned writable control state");
+                private_directory(&current)?;
                 break;
             },
             Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
@@ -84,9 +102,7 @@ fn prepare_registration_parent(path:&Path)->Result<PathBuf> {
         match std::fs::DirBuilder::new().mode(0o700).create(&current) {
             Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(error)=>return Err(error.into()),
         }
-        let meta=std::fs::symlink_metadata(&current)?;
-        ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==unsafe{libc::geteuid()}
-            && meta.mode()&0o022==0 && meta.mode()&0o300==0o300,"registration control directory changed");
+        private_directory(&current)?;
     }
     Ok(current)
 }
@@ -104,11 +120,8 @@ pub(super) fn probe(control:&Path,receipt:&Path,expected:&[u8],additional_bytes:
 }
 fn probe_with(control:&Path,receipt:&Path,expected:&[u8],additional_bytes:usize,
     write:impl FnOnce(&mut std::fs::File,usize)->Result<()>)->Result<()> {
-    use std::os::unix::fs::MetadataExt;
     ensure!(expected.len()<=64*1024 && additional_bytes<=4*1024*1024+64*1024,"publication readiness exceeds envelope");
-    let metadata=std::fs::symlink_metadata(control)?;
-    ensure!(metadata.is_dir() && metadata.uid()==unsafe{libc::geteuid()} && metadata.mode()&0o077==0
-        && metadata.mode()&0o300==0o300,"publication directory is not private writable controller storage");
+    private_directory(control)?;
     let control=control.canonicalize()?;
     ensure!(receipt.parent().context("publication receipt parent missing")?.canonicalize()?==control,
         "publication receipt leaves controller storage");
@@ -134,11 +147,12 @@ impl Drop for ProbeLock {
 }
 fn probe_lock(control:&Path)->Result<ProbeLock> {
     use std::os::fd::AsRawFd;
+    let expected=private_directory(control)?;
     let file=std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open(control)?;
     let meta=file.metadata()?;
-    ensure!(meta.is_dir() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o022==0,
-        "publication probe lock is not owned control storage");
+    ensure!(meta.is_dir() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o300==0o300
+        && meta.dev()==expected.dev() && meta.ino()==expected.ino(),"publication probe directory changed");
     if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {return Err(std::io::Error::last_os_error().into());}
     Ok(ProbeLock(file))
 }
@@ -203,6 +217,42 @@ fn named_probe(control:&Path,length:usize,write:impl FnOnce(&mut std::fs::File,u
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn publication_and_registration_readiness_use_effective_private_ancestry() {
+        let boundary=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(boundary.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let control=boundary.path().join("umask-created");
+        std::fs::create_dir(&control).unwrap();
+        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o775)).unwrap();
+        let receipt=control.join("receipt.json");
+        probe(&control,&receipt,b"immutable receipt",0).unwrap();
+        let publication=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {
+            path:control.join("admission/missing/scope.json"),bytes:b"exact registration".to_vec(),registered:false};
+        probe_registration(&publication).unwrap();
+        assert!(!receipt.exists());assert!(!publication.path.exists());
+        assert_eq!(std::fs::metadata(&control).unwrap().mode()&0o777,0o775,"readiness changed owner permissions");
+        assert_eq!(std::fs::read_dir(&control).unwrap().count(),1,"readiness left probe files");
+        std::fs::set_permissions(boundary.path(),std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(probe(&control,&receipt,b"immutable receipt",0).is_err(),"unsearchable private ancestor accepted");
+        std::fs::set_permissions(boundary.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(probe(&control,&receipt,b"immutable receipt",0).is_err(),"private ancestor excused an unwritable leaf");
+        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o775)).unwrap();
+        let alias=boundary.path().join("alias");std::os::unix::fs::symlink(&control,&alias).unwrap();
+        assert!(probe(&alias,&alias.join("receipt.json"),b"immutable receipt",0).is_err(),"redirected controller accepted");
+        let redirected=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {
+            path:alias.join("new/scope.json"),bytes:b"exact registration".to_vec(),registered:false};
+        assert!(probe_registration(&redirected).is_err(),"redirected registration parent accepted");
+        for mode in [0o755,0o775] {
+            let exposed=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::set_permissions(exposed.path(),std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(probe(exposed.path(),&exposed.path().join("receipt.json"),b"immutable receipt",0).is_err(),"exposed storage accepted");
+            let publication=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {
+                path:exposed.path().join("new/scope.json"),bytes:b"exact registration".to_vec(),registered:false};
+            assert!(probe_registration(&publication).is_err(),"exposed registration accepted");
+        }
+    }
+
     #[test]
     fn harness_readiness_refuses_an_unwritable_missing_destination() {
         let root=tempfile::tempdir().unwrap();let parent=root.path().join("autoship_verifiers/readonly");
@@ -280,6 +330,7 @@ mod tests {
     #[test]
     fn registration_probe_checks_its_actual_destination_without_creating_a_grant() {
         let root=tempfile::tempdir().unwrap();let parent=root.path().join("admission");
+        std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(&parent).unwrap();std::fs::set_permissions(&parent,std::fs::Permissions::from_mode(0o500)).unwrap();
         let publication=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {path:parent.join("scope.json"),bytes:b"original serialized admission".to_vec(),registered:false};
         assert!(probe_registration(&publication).is_err(),"unwritable admission destination passed recovery readiness");

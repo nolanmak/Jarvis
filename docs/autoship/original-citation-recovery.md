@@ -1009,7 +1009,7 @@ literal write-admission store. Those remaining destinations stay merge blockers.
 
 The operation holds a nonblocking exclusive descriptor lock on the actual private
 controller directory. It creates no permanent lock file. Directory type,
-controller UID, private permissions and writable owner bits remain required.
+controller UID, effective private ancestry and writable owner bits remain required (see §31).
 The lock is explicitly unlocked on return/error and released by the kernel on
 process death. Explicit unlock prevents a transient pre-exec fork that inherited
 the open description from extending the completed probe's ownership. A live
@@ -1106,8 +1106,9 @@ otherwise readiness refuses without overwrite. Actual registration remains the
 normal guarded preparation writer's responsibility.
 
 Pending parents must be literal absolute, nonredirected, owned, writable control
-storage without group/world write access. Existing 0755 parents are permitted;
-record and probe files remain private. Missing directories are created with mode
+storage beneath an owner-only private boundary (§31). Existing 0755 or 0775
+parents below that boundary are permitted; exposed parents are refused.
+Record and probe files remain private. Missing directories are created with mode
 0700. The shared normal writer also creates new controller directories with mode
 0700, avoiding the inherited group-writable umask found by the lifecycle fixture.
 No existing directory is silently chmodded and no unsafe parent is treated as
@@ -1619,3 +1620,46 @@ The recovery-store fixture additionally covers freeing four blocks/inodes while
 usage remains above the unchanged soft limit and below the hard limit during
 recorded grace, matching independent review's follow-up example. All 26 store
 recovery tests passed again (1.37s); this last change extends tests only.
+
+## 31. Effective directory privacy at recovery publication (#2084)
+
+After #2083 deployed, ordinary #1830 still had generation 1, twelve historical
+model calls and no PR. An explicit diagnostic at the real readiness boundary
+reproduced `publication directory is not private writable controller storage`,
+while preserving its snapshot and events. The controller leaf is umask-created
+0775 beneath owner-only 0700 ancestors. The earlier actual-source inventory
+proved source/custody facts but did not call this publication-readiness boundary.
+
+Publication and pending registration readiness now require an actual owner-only
+ancestor, a literal canonical path, and owner-owned real directories throughout
+the chain from the destination to that boundary. The destination must remain
+owner-writable and searchable. A public or sticky ancestor alone is insufficient;
+exposed 0755/0775 directories, redirected paths, foreign owners and unwritable
+destinations remain refusals. The predicate requires an absolute path equal to
+its canonical form, an owner-owned real destination with owner write/search bits,
+and an owner-owned searchable directory at each ancestor until the first one
+whose group/other permission bits are all zero. Without such a boundary it
+refuses; a root-owned ancestor or sticky directory is not a substitute. This is
+effective owner-only access, not permission to trust arbitrary group-writable storage. No directory is chmodded. New pending
+registration parents remain 0700. The descriptor lock rechecks the opened
+inode/device against the validated destination. The actual immutable receipt
+writer already writes private files without requiring a 0700 leaf; the normal
+registration writer uses private missing directories and files without rejecting
+an existing 0775 parent. Thus no separate writer leaf-mode refusal is bypassed
+by readiness. Both writers remain authoritative: readiness is a current probe,
+not a reservation against later owner permission changes or storage races.
+
+Private receipt/probe file checks, actual allocation/write/fsync/no-clobber,
+fixed-name bounded cleanup, exact source/native/capture validation and all normal
+claim/qualification/review/CI gates are unchanged. No receipt, registration,
+harness, native grant, workflow event, budget or counter is created by readiness.
+The ignored actual-source diagnostic performs bounded controller filesystem
+probes only and verifies unchanged workflow/events; it is not an autonomous run.
+
+Test-first evidence: the actual-source diagnostic and a self-contained private-
+ancestry regression both failed on the exact leaf-mode check before the fix.
+Regression coverage includes publication and registration beneath a private
+boundary, unchanged modes/no published authority, exposed storage, redirects and
+unwritable destinations. Hosted review/CI and natural ordinary recovery must be
+verified separately before claiming a restored shipping pipeline. This follow-up
+is manual engineering, excluded from autoship selection and autonomous accounting.
