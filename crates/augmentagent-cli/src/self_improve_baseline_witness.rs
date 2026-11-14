@@ -65,6 +65,9 @@ fn context_with_policy(proposal:&ContractProposal,baseline:&BaselineEvidence,pol
     Ok(amendment::digest(&serde_json::to_vec(&("baseline-measurement-qualification-v1",proposal,baseline,policy))?))
 }
 fn artifact_path(control:&Path,context:&str)->PathBuf {control.join(format!("baseline-witness-{context}.json"))}
+pub(super) fn qualification_destination(control:&Path,prepared:&PreparedAcceptance)->Result<PathBuf> {
+    Ok(artifact_path(control,&context(&prepared.proposal,&prepared.baseline)?))
+}
 fn raw_path(control:&Path,context:&str,hash:&str)->PathBuf {control.join(format!("baseline-witness-{context}-{hash}.response"))}
 pub(super) fn private_bytes(path:&Path,limit:usize)->Result<Vec<u8>> {
     let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
@@ -452,7 +455,8 @@ fn checked_retained_responses(root:&Path,data:&RetainedOriginalWitnessData)->Res
     Ok(checked)
 }
 fn requalification_error(error:anyhow::Error)->anyhow::Error {
-    if error.downcast_ref::<BaselineNotRed>().is_some() {error}else {error.context(initial_repair::Hold::EvidenceUnknown)}
+    if setup_dependency::failure(&error).is_some() {error.context(initial_repair::Hold::InfrastructureUnavailable)}
+    else if error.downcast_ref::<BaselineNotRed>().is_some() {error}else {error.context(initial_repair::Hold::EvidenceUnknown)}
 }
 pub(super) fn retained_qualification_reference(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
@@ -515,7 +519,8 @@ pub(super) fn qualify_known_retained(root:&Path,control:&Path,prepared:&Prepared
     (||->Result<()> {
         ensure!(requalify_retained(root,control,prepared,workflow)?,"known retained original witness unavailable");
         assert_current(root,control,prepared)
-    })().map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    })().map_err(|error|if error.downcast_ref::<initial_repair::Hold>()==Some(&initial_repair::Hold::InfrastructureUnavailable) {error}
+        else {error.context(initial_repair::Hold::EvidenceUnknown)})?;
     Ok(true)
 }
 
@@ -550,7 +555,8 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
             let reference=crate::autoship_workflow::RetainedWitnessReference {plan:plan.clone(),result:result.clone(),data:data.identity,
                 prepared:amendment::digest(&serde_json::to_vec(prepared)?),contract:prepared.baseline.registration.contract_hash().into()};
             let (expected,bytes)=encode_requalified(prepared,workflow.repository(),workflow.id(),database,&native_control,&reference,checked)?;
-            immutable(&control,&artifact_path(&control,&expected),&bytes)?;
+            immutable(&control,&artifact_path(&control,&expected),&bytes).map_err(|error|
+                if retained.is_some() {setup_dependency::capture(root,&control,prepared,"qualification",error)}else{error})?;
             Ok(true)
         })().map_err(requalification_error)
     })
@@ -1530,6 +1536,35 @@ mod tests {
                 assert!(matches!(early,adopted_execution::PreparationRequest::Request(ref request) if request=="original scope"),"PR prelude asked for another readiness decision");
             }
             assert_eq!(store.events(guard.id()).unwrap(),prelude_events,"retained prelude created fresh scope/readiness/budget work");
+            // Inject only the real writer's named-create denial after its
+            // anonymous readiness succeeds. All custody and persistence use
+            // this explicitly disposable fixture's actual production paths.
+            let harness=root.path().join(prepared.proposal.files.keys().next().unwrap());
+            std::fs::remove_file(&harness).unwrap();let parent=harness.parent().unwrap();
+            std::fs::set_permissions(parent,std::fs::Permissions::from_mode(0o700)).unwrap();
+            recovery_publication::probe_harness(root.path(),&prepared.proposal.files).unwrap();
+            let denied=setup_dependency::run(&guard,root.path(),&native_control,&prepared,"harness",||->Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::EACCES).into())
+            }).unwrap_err();
+            assert!(setup_dependency::failure(&denied).unwrap().fingerprint.is_some());
+            guard.preparation_failure_at_current(denied).await.unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+            let held=writer.snapshot(&id).unwrap().unwrap();assert_eq!(held.checkpoint.next.reason,"acceptance_verifier_infrastructure_unavailable");
+            assert_eq!(writer.retained_setup_candidate(&held).unwrap(),Some(workflow::git_binding(root.path(),"original scope","test",&held.checkpoint.evidence).await.unwrap()));
+            let recovery_context=writer.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();let parked=writer.events(&id).unwrap();
+            for _ in 0..2 {
+                assert!(!writer.recover_retained_qualification_with_setup(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence,failed|
+                    inspect_retained_recovery_ready_with_setup(root.path(),&native_control,source,&held,&recovery_context,evidence,Some(&retained),failed)).unwrap(),"unchanged named-create denial restored a productive claim");
+                assert_eq!(writer.snapshot(&id).unwrap().unwrap(),held);assert_eq!(writer.events(&id).unwrap(),parked);
+            }
+            std::fs::set_permissions(parent,std::fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(writer.recover_retained_qualification_with_setup(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence,failed|
+                inspect_retained_recovery_ready_with_setup(root.path(),&native_control,source,&held,&recovery_context,evidence,Some(&retained),failed)).unwrap());
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:source.issue(),pr:source.pull_request(),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await.unwrap().unwrap();
             let initial=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
                 &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
             assert_eq!(serde_json::to_vec(&initial).unwrap(),serde_json::to_vec(&prepared).unwrap(),"initial preparation regenerated the verifier");
@@ -1645,7 +1680,7 @@ mod tests {
                 assert_eq!(reasoner.calls(),0);
             }
             assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
-            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),restorations);
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),restorations+1);
             assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),restorations+1);
             assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,
                 "metadata-only requalification admitted another model call");

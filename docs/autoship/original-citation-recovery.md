@@ -1243,7 +1243,7 @@ The final explicit read-only #1830 inventory passed in 11.26 seconds with its
 snapshot/events and twelve historical model calls unchanged; it published no
 qualification and queued no work.
 
-## 26. Fresh-audit finding still blocking final handoff
+## 26. Fresh-audit liveness finding and branch resolution
 
 The fresh-reader audit of §§1–25 identified one unresolved liveness contract:
 advisory readiness may pass while a later real writer repeatedly fails the same
@@ -1251,7 +1251,10 @@ operation. A stable cue prevents another initial grant, but restoration episodes
 alone do not prove changed setup dependencies. The five-minute inspection
 cooldown controls rate; it is not a dependency-change predicate or a complete
 bound on productive claims. The new data-only path in §25 removes the full
-original-checkout dependency, but does not resolve this general writer gap.
+original-checkout dependency, but did not by itself resolve this general writer
+gap. D15–D17 below now implement the dependency/completion and checkout handoffs;
+their branch validation checkpoint is recorded after §29. Final independent
+review, complete spec recheck, hosted CI and rollout remain required.
 
 The current source comparison identifies these real operations:
 
@@ -1267,7 +1270,7 @@ This inventory narrows the next regression to an unchanged failing real operatio
 whose readiness continues to pass. It does not establish a general guarantee
 against concurrent filesystem changes or unsupported per-name security policy.
 
-Root owns the remaining test-first resolution before final handoff/activation:
+Root owned the test-first resolution before final handoff/activation:
 enumerate real writer operations against the actual readiness operations;
 reproduce repeated successful readiness with an unchanged failing real writer;
 then define and implement the durable operation-specific change predicate or
@@ -1275,7 +1278,8 @@ explicit bounded retry policy. Verify claims, attempts, model calls and events
 across restart, with legitimate resource/source restoration still able to recover
 without changing the original owner request, resetting charges or inventing
 new original data. No hidden generic retry or merely relabeled hold is an exit.
-This obligation is not delegated to the owner and is not an approval question.
+These mechanisms are implemented and tested on the branch below. No remaining
+review or rollout obligation is delegated to the owner as a product question.
 
 The latest map identifies **105 seams** across §§1–25. Mapping is not checking.
 Bounded read-only audits and root recheck currently cover **S61–S105: 45 checked,
@@ -1284,3 +1288,231 @@ writer/readiness contract and any affected seams must also be checked after its
 resolution. These counts do not close the separate fresh-reader liveness finding.
 No independent engineering approval,
 hosted CI result, snapshot, rollout or natural autonomous merge is implied.
+
+## 27. Operation-specific setup dependencies (implementation in progress)
+
+D15. A real retained-setup I/O failure must retain a bounded dependency record
+atomically with its same-cue restrictive checkpoint. The record contains protocol
+version 1, the operation (`prepared`, `manifest`, `harness`, `registration` or
+`qualification`), condition class (`permission`, `capacity` or `other`) and an
+optional SHA-256 filesystem fingerprint. A capacity condition also carries
+bounded available-block/inode observations keyed by opaque namespace hashes.
+It contains neither raw private paths
+nor an authorization grant. The existing loss event advances to version 2 only
+when this field is present; version-1 source losses keep their existing semantics.
+Malformed records and unsupported operations/versions remain held.
+
+The fingerprint covers the operation's actual setup namespace, the literal path
+and ancestor existence/type/device/inode/owner/group/mode and applicable ACL and
+security labels. It excludes directory timestamps and probe bookkeeping so the
+inspector cannot manufacture a change by running itself. Current filesystem
+read-only state and process access identity are relevant. Only capacity failures
+add available blocks/inodes and affected directory-entry counts/name-byte totals;
+unrelated
+free-space changes must not wake a persistent permission denial. Existing source,
+environment, scope, integrity and real readiness checks are still prerequisites.
+No source/build hash, clock, generation, owner revision or day enters this record.
+Use an explicit versioned deterministic encoding; future code edits alone must
+not change its meaning or refill any existing allowance.
+
+Operations share their actual destinations: harness paths/parents come from the
+registered original proposal, registration from the normal publication planner,
+and prepared/manifest/qualification from the protected controller directory.
+Only bounded metadata, ACL/label bytes and, for capacity failures, entry names
+are read; no source code is executed and no setup artifact is published by this
+inspection. Unobservable dependencies are recorded as an absent fingerprint;
+current inspection must produce a complete observed fingerprint before queueing.
+Bounds: at most 256 targets, 8,192 distinct path observations, 256 process groups,
+16 KiB per security attribute and 8 MiB aggregate security-attribute reads.
+Read only `system.posix_acl_access`, `system.posix_acl_default` and
+`security.selinux`, hashing their bytes rather than storing them. A capacity
+inventory is nonrecursive, at most 8,192 entry names and 4 MiB of aggregate name
+bytes across the actual setup parents. The full deterministic encoding is at
+most 4 MiB. Refuse redirected namespaces and incomplete/over-bound observations.
+This does not authorize a broader metadata sweep, candidate-side probe files,
+new registration grants or moving guarded setup publication into free polling.
+
+The store—not the scheduler cooldown—enforces the recovery predicate inside the
+existing expected-snapshot/owner/pending-effect transaction. A waiting setup loss
+requires the same operation and condition and a complete current observation.
+A namespace/access fingerprint change is eligible for current validation. For a
+capacity condition, increased available bytes/inodes or fewer entries/name bytes
+under the same namespace identity is also eligible. Merely consumed space,
+added entries or an arbitrary equal-size rename cannot
+restore a claim: writing its own diagnostic or running a probe must not manufacture
+recovery. Capacity counters are therefore compared structurally and excluded
+from the namespace fingerprint; entry names are never part of that hash, and
+the two reserved readiness names are excluded
+from the directory-entry inventory. This observation grants nothing without all
+normal source/readiness checks. The legacy reference-only
+callback supplies no such proof and cannot bypass the predicate. The callback
+still authenticates the original reference and passes all current readiness
+checks. Unchanged/worse conditions, unknown current state or mismatched proof queue
+nothing and changes no checkpoint, generation, calls, tokens or loss events.
+An observed dependency becoming readable after an unobservable failure is a real
+change; it is not an invented owner-input edit. A later failed operation records
+its newly observed conditions rather than replenishing a retry allowance.
+
+Why: source bytes can remain identical while storage permissions or capacity
+are repaired. Requiring source edits would strand legitimate recovery, while an
+advisory success alone would permit unchanged failing writers to loop. Relevant
+filesystem changes are necessary but not sufficient; current source/readiness
+validation and the actual live-fenced writer still decide whether work proceeds.
+Arbitrary external per-name security-policy changes that have no observable
+filesystem manifestation are not inferred from time or a new binary. Such a
+case remains explicitly held until a genuine observable filesystem/ACL/label or
+mount repair supplies new evidence. No workflow force-resume override, artificial
+input change or fresh metadata/model allowance is introduced for it.
+
+Implementation order: first reproduce unchanged advisory-success recovery in a
+reopened store, including the legacy-callback bypass; then add atomic loss/proof
+validation and negative transaction tests; then capture real writer failures,
+implement bounded filesystem observations, wire production inspection and test
+actual issue/PR preparation across unchanged failure and legitimate repair.
+The root agent owns the implementation and revalidation. The branch checkpoint
+below records the current exits; no review, deployment or ordinary-acceptance
+claim follows.
+
+## 28. Frozen dependency encoding and terminal setup observations
+
+D16. Freeze the v1 fingerprint bytes as compact `serde_json` UTF-8 serialization
+of this ordered tuple, then lowercase SHA-256:
+
+`("retained-setup-filesystem-dependencies-v1", operation, condition, access, targets, nodes, spaces)`.
+
+- `operation`/`condition` are the exact lower-case strings in D15. No source or
+  executable-version hash participates.
+- `access` is an object in declaration order `uid`, `gid`, `groups`: unsigned
+  effective user/group IDs and sorted/deduplicated supplementary group IDs.
+- `targets` are literal absolute UTF-8 path strings, sorted by UTF-8 string order
+  and deduplicated. They are the actual D15 operation namespaces, not source
+  citations or a different staging location.
+- `nodes` is a BTreeMap ordered by absolute UTF-8 prefix path. Every target
+  ancestor is represented. Missing paths are JSON `null`; existing nodes have
+  fields in order `dev`, `ino`, `uid`, `gid`, `mode`, `size`, `labels`. `mode`
+  includes Unix type bits; `size` is unsigned length for a regular file and null
+  for a directory. Symlinks/refused traversal and unreadable metadata produce an
+  incomplete observation, never a fabricated missing state.
+  The qualification namespace additionally has the fixed logical key
+  `@qualification` for metadata of its actual current receipt target. Its
+  generated context/policy filename is not encoded. This observes an actual
+  target permission/removal repair without inserting a checker/build hash into
+  the dependency protocol; two absent targets remain the same observation even
+  if an unrelated build selects a new current context.
+- `labels` is the fixed ordered array of `(name, hash-or-null)` pairs for
+  `system.posix_acl_access`, `system.posix_acl_default`, `security.selinux`.
+  Hashes cover exact attribute bytes. ENODATA and ENOTSUP mean null; other errors
+  or changing/oversized reads make the observation incomplete.
+- `spaces` is a BTreeMap from each nearest existing real setup-parent directory
+  to its unsigned read-only mount flag (`statvfs.f_flag & ST_RDONLY`). Capacity
+  counters and directory-entry values are excluded entirely from these bytes.
+  Directory times/link counts/length, unrelated files and probe execution do not
+  participate.
+
+The synthetic `/fixture/case.py` codec vector in
+`setup_fingerprint_encoding_keeps_a_frozen_data_vector_without_code_or_clock`
+pins exact JSON bytes and SHA-256
+`a8be73b4c4cb6e0c50b1c71010115fe035095fa13bc287d642769d9cb17aa6de`.
+The dependency object has fields in declaration order `version`, `operation`,
+`condition`, `fingerprint`, `capacity`, `completed`. Unobservable fingerprints
+and inapplicable capacity are JSON null, not omitted or replaced with zero.
+All private persisted readers reject unknown fields/unsupported versions;
+older source-loss version 1 omits both `setup` and `setup_candidate`.
+
+Capacity observations are a separate BTreeMap. Its opaque key is SHA-256 of the
+compact tuple `("retained-setup-capacity-namespace-v1", absolute_parent_path)`.
+Each value's field order is `available_blocks`, `available_inodes`, `block_size`,
+`entries`, `name_bytes`; all are unsigned integers. Available bytes are compared
+as blocks × block size using u128. A block size must be 1–1,048,576; the D15
+namespace/entry bounds apply. Improvement means at least one available-resource
+increase or entry/name-byte decrease, still subject to all current readiness
+checks. A new entry, equal-size rename, or diagnostic consuming space is not an
+improvement. The reserved stage/final readiness names contribute neither entries
+nor name bytes. Namespace sets must match for a counter-only comparison; a real
+namespace/access change is independently visible in the fingerprint.
+
+An observation also has a controller-derived `completed` boolean, initially
+false in every failed-operation record. Current recovery may set it true only
+when that actual writer's normal idempotent exit is already established:
+
+| Operation | Read-only completion observation |
+| --- | --- |
+| Harness | Every declared pin passes the same bounded exact-file/parent checks used by installation; no missing pin remains. |
+| Registration | The normal shared publication planner reports the complete expected private registration already present. |
+| Prepared | The normal retained-prepared reader yields the complete exact original prepared bytes. |
+| Manifest | The actual private manifest exists and exactly equals the normal expected manifest, including its validated evidence-file selection. Never call the orphan-recovering manifest writer from free inspection. |
+| Qualification | The actual current qualification reader succeeds, including its complete original/native evidence checks. |
+
+Why: an I/O failure can happen after valid bytes were published. Requiring an
+artificial metadata change would strand a writer that now returns success without
+writing. Complete observed state, a genuine dependency change, or genuine capacity
+improvement can restore this same cue. All require a complete current observation
+and all source/readiness fences; no boolean supplied by a model or disk preview
+establishes completion. Actual prepared publication, current qualification and
+guarded settlement still decide builder authority. The restored event retains
+the exact observed setup proof for audit. The failed record cannot claim its own
+completion or replace an existing waiting dependency.
+
+## 29. Preserve partial setup through the real checkout boundary
+
+D17. Keep the existing exact Git-input fence for ordinary, negative/native and
+physical re-execution recovery. A retained setup failure may additionally retain
+one exact full candidate binding observed by its live healthy guard after the
+failed operation. It is stored atomically in the same version-2 loss event as
+`setup_candidate`, not in a second ownership ledger or in the stable cue key.
+The recorded head and contract must equal the lease/checkpoint head and contract;
+only evidence may differ after local setup. Git observation failure stores no
+invented binding. Later free inspection cannot replace this record.
+
+This amends §21's binding handoff only for that authenticated positive setup loss.
+The real poller still checks exact registered checkout/root ownership, branch or
+canonical detached-PR identity, repository, remote publication/head ownership and
+the unchanged protected owner request. If current Git inputs differ from the old
+checkpoint, they must equal the complete `setup_candidate` from that exact waiting
+loss. A new head, later edit, missing observation, different branch/checkout or
+another workflow's record is refused. This preserves already-written pins without
+ignoring them in Git evidence or broadly accepting dirty worktrees.
+
+Only the retained-data inspection route can use this recorded binding. Negative
+semantic recovery and physical native/original-plan re-execution keep their exact
+binding rules and cannot borrow it. The positive queue transaction still compares
+the original expected snapshot/owner/pause/pending-effect state, authenticates all
+original data and setup proof, and creates no native allowance. On the normal next
+claim, existing guard acquisition rotates the current binding/audit and records
+the protected recovery context before consuming the same cue. Candidate tests,
+review and hosted CI remain bound to the actual later candidate revision.
+
+Reason: a real guarded setup operation can write pins before a subsequent failure.
+Its full checkout evidence then differs from the earlier checkpoint. Rejecting
+that observed state forever would strand the repair; accepting arbitrary current
+changes would weaken custody. Retaining the exact failure-time observation closes
+that handoff while keeping later changes outside its authority. This is still
+implementation/validation work, not an authorization to deploy or a claim that
+full fault/soak acceptance passed.
+
+Branch validation: the unchanged-writer/restart regression first failed because
+advisory success requeued the same conditions. The capacity-repair regression
+then exposed missing structural capacity comparison. The completed-operation
+and actual linked-checkout regressions both failed before their corresponding
+fixes. Those cases are now green, along with malformed/mismatched/atomic-loss
+checks, bounded metadata/redirect tests, exact codec bytes, the issue/PR
+preparation → loss → unchanged inspection → real condition change → normal
+qualification/settlement chain, and the later native-source restoration cases.
+No injected failure or scripted native fixture is live acceptance evidence.
+
+A final private-diagnostic regression reproduced an immutable-key collision
+when the same error recurred after an owned binding rotation. The diagnostic
+projection now uses domain `semantic-source-diagnostic-v2` with workflow, cue,
+the complete binding and diagnostic text. Its body remains diagnostic v1; it is
+not a recovery grant or another budget ledger. Repeats on the same binding are
+idempotent, while legitimately different bindings retain their own exact record.
+
+Final joined CLI checkpoint: **2,109 passed, zero failures, 42 explicit ignores,
+376.80 seconds**. The separate explicit read-only #1830 inventory passed in
+**11.34 seconds**, with its complete snapshot/events and twelve historical model
+calls unchanged, and no qualification or dispatch. Current remote main remains
+`36fcb99ab3de28d9415a84f634e29c609a015a35`, already merged normally into this
+branch. These are implementation/source-compatibility results. Final seam
+rechecks, independent engineering review, exact-head hosted CI, supported
+snapshot, protected merge, normal updater and natural ordinary shipping remain
+required. #1703 and #2058 retain their complete outstanding scopes.

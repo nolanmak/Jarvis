@@ -26,6 +26,13 @@ mod baseline_witness;
 mod recovery_environment;
 #[path = "self_improve_recovery_publication.rs"]
 mod recovery_publication;
+#[path = "self_improve_setup_dependency.rs"]
+mod setup_dependency;
+pub(super) fn retained_setup_failure(error:&anyhow::Error)->Option<&crate::autoship_workflow::RetainedSetupDependency> {
+    setup_dependency::failure(error)
+}
+pub(super) fn retained_setup_candidate(error:&anyhow::Error)->Option<&crate::autoship_workflow::Binding> {setup_dependency::candidate(error)}
+pub(super) fn stamp_retained_setup_candidate(error:anyhow::Error,binding:crate::autoship_workflow::Binding)->anyhow::Error {setup_dependency::stamp(error,binding)}
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -1563,7 +1570,9 @@ pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,er
 /// Inspect the original cause before returning any public-safe typed error.
 async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error)->Result<Option<initial_repair::Hold>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
-    workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
+    if let Some(setup)=retained_setup_failure(error) {
+        workflow.hold_enrolled_setup_failure(prepared,setup).await?;
+    }else {workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;}
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
@@ -1873,6 +1882,17 @@ fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptanc
     std::fs::File::open(control)?.sync_all()?;Ok(())
 }
 
+fn prepared_destination(control:&Path,source:AcceptanceSource,base:&str,manifest:Option<&WorkflowManifest>)->Result<PathBuf> {
+    match manifest.and_then(|manifest|manifest.evidence_file.as_ref()) {
+        Some(name)=>{
+            let manifest=manifest.context("amended manifest missing")?;
+            ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"invalid amended evidence filename");
+            Ok(control.join(name))
+        },
+        None=>evidence_path(control,source,base),
+    }
+}
+
 fn write_admission_inputs(prepared:&PreparedAcceptance)->(Vec<augmentagent_channel_core::autoship_write_scope::DeclaredPath>,Vec<String>) {
     let allowed=prepared.proposal.contract.allowed_paths.iter().map(|scope|match scope {
         crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
@@ -1897,7 +1917,7 @@ pub(super) async fn prepare_acceptance_for(repo:&Path,candidate:&Path,control:&P
         prepare_acceptance_for_inner(repo,candidate,control,source,base,scope,reasoner,writable_roots,required_criteria,workflow));
     match execution.await {
         Ok(prepared)=>Ok(prepared),
-        Err(error)=>Err(workflow.preparation_failure(error)?),
+        Err(error)=>Err(workflow.preparation_failure_at_current(error).await?),
     }
 }
 
@@ -1925,7 +1945,9 @@ async fn prepare_acceptance_for_inner(
         );
     }
     amendment::resume_pending(candidate, &control, source).await?;
-    let manifest = original_manifest(&control, source)?;
+    let manifest = if let Some(prepared)=semantic.as_ref() {
+        setup_dependency::run(workflow,candidate,&control,prepared,"manifest",||original_manifest(&control,source))?
+    }else {original_manifest(&control,source)?};
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
@@ -1933,28 +1955,10 @@ async fn prepare_acceptance_for_inner(
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
-    let path = match manifest
-        .as_ref()
-        .and_then(|manifest| manifest.evidence_file.as_ref())
-    {
-        Some(name) => {
-            let manifest = manifest.as_ref().unwrap();
-            ensure!(
-                name == &format!(
-                    "{}-revision-{}-{}.json",
-                    source.key(),
-                    manifest.contract_revision,
-                    manifest.contract_hash
-                ),
-                "invalid amended evidence filename"
-            );
-            control.join(name)
-        }
-        None => evidence_path(&control, source, base)?,
-    };
+    let path=prepared_destination(&control,source,base,manifest.as_ref())?;
     let prepared = if let Some(prepared)=semantic {
         ensure!(prepared.proposal.contract.source()?==source && prepared.baseline.registration.baseline_head()==base,"queued semantic preparation source changed");
-        if !path.try_exists()? {persist_initial_prepared(&control,&path,&prepared)?;}
+        if !path.try_exists()? {setup_dependency::run(workflow,candidate,&control,&prepared,"prepared",||persist_initial_prepared(&control,&path,&prepared))?;}
         prepared
     } else if path.exists() {
         let file = std::fs::OpenOptions::new()
@@ -2040,14 +2044,15 @@ async fn prepare_acceptance_for_inner(
             "workflow contract revision changed without bound adjudication"
         );
     } else {
-        write_manifest(&control, &binding)?;
+        setup_dependency::run(workflow,candidate,&control,&prepared,"manifest",||write_manifest(&control,&binding))?;
     }
     // Main may have advanced; preserve the original reproduced base. Only a
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
-    install_candidate_harness(candidate, &prepared)?;
+    setup_dependency::run(workflow,candidate,&control,&prepared,"harness",||install_candidate_harness(candidate,&prepared))?;
     let (allowed,pinned)=write_admission_inputs(&prepared);
-    augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned)?;
+    setup_dependency::run(workflow,candidate,&control,&prepared,"registration",||
+        augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned))?;
     Ok(prepared)
 }
 
@@ -2397,6 +2402,22 @@ pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:Ac
     recovery_publication::probe_harness(root,&prepared.proposal.files)
         .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     Ok(Some(reference))
+}
+
+pub(super) fn inspect_retained_recovery_ready_with_setup(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>,failed:Option<&crate::autoship_workflow::RetainedSetupDependency>)
+    ->Result<Option<(crate::autoship_workflow::RetainedWitnessReference,Option<crate::autoship_workflow::RetainedSetupDependency>)>> {
+    let Some(reference)=inspect_retained_recovery_ready(root,control,source,snapshot,context,evidence,reference)? else{return Ok(None)};
+    let current=if let Some(failed)=failed {
+        let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+        let mut current=setup_dependency::observe(root,control,&prepared,&failed.operation,&failed.condition)
+            .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+        current.completed=setup_dependency::completed(root,control,&prepared,&failed.operation)?;
+        Some(current)
+    }else{None};
+    Ok(Some((reference,current)))
 }
 
 /// Consume immutable plan/result references rather than requiring the original

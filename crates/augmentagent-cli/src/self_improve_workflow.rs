@@ -149,9 +149,10 @@ impl std::fmt::Display for SemanticSourceUnavailable {
 impl std::error::Error for SemanticSourceUnavailable {}
 
 fn record_semantic_source_failure(store:&mut WorkflowStore,lease:&Lease,binding:&Binding,cue:&str,error:&anyhow::Error)->Result<()> {
-    store.hold_semantic_source_unavailable(lease,binding,cue,millis())?;
+    if let Some(setup)=acceptance::retained_setup_failure(error) {store.hold_retained_setup_failure(lease,binding,cue,setup,acceptance::retained_setup_candidate(error),millis())?;}
+    else {store.hold_semantic_source_unavailable(lease,binding,cue,millis())?;}
     let detail=format!("{error:#}");
-    let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,cue,&detail))?));
+    let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v2",&lease.workflow,cue,binding,&detail))?));
     let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
     store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
     Ok(())
@@ -1627,6 +1628,15 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    pub(super) async fn hold_enrolled_setup_failure(&mut self,prepared:&acceptance::PreparedAcceptance,setup:&durable::RetainedSetupDependency)->Result<()> {
+        self.healthy_lease()?;self.validate_acceptance_source(prepared)?;self.audit_health().await?;
+        let candidate=self.failed_setup_candidate().await.ok();
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("enrolled setup store poisoned"))?;
+        let cue=store.retained_qualification_cue(self.id(),&self.binding)?.context("retained setup cue missing")?;
+        store.hold_retained_setup_failure(&self.lease,&self.binding,&cue.key,setup,candidate.as_ref(),millis())
+    }
+
     /// A fresh issue must not keep spending once an authorized linked PR exists.
     /// PR-bound recovery uses its original independent execution authority.
     pub(super) async fn require_fresh_issue(&self,repo:&Path)->Result<()> {
@@ -1706,6 +1716,26 @@ impl WorkflowGuard {
         if !retained {return Ok(error);}
         if self.semantic_source_waiting()? {return Ok(SemanticSourceUnavailable.into());}
         self.retained_preparation_failure(error)
+    }
+
+    async fn failed_setup_candidate(&self)->Result<Binding> {
+        self.validate_before_side_effect()?;
+        let checkpoint=self.store.lock().map_err(|_|anyhow::anyhow!("failed setup store poisoned"))?
+            .snapshot(self.id())?.context("failed setup workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding,"failed setup checkpoint changed");
+        let observed=git_binding(&self.worktree,&self.contract,&self.environment,&checkpoint.evidence).await?;
+        anyhow::ensure!(observed.head==self.binding.head && observed.contract==self.binding.contract,"failed setup head/contract changed");
+        self.validate_before_side_effect()?;Ok(observed)
+    }
+
+    pub(super) async fn preparation_failure_at_current(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        let error=if acceptance::retained_setup_failure(&error).is_some() && !self.semantic_source_waiting()? {
+            match self.failed_setup_candidate().await {
+                Ok(candidate)=>acceptance::stamp_retained_setup_candidate(error,candidate),
+                Err(_)=>error,
+            }
+        }else{error};
+        self.preparation_failure(error)
     }
 
     pub(super) fn retained_preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {
@@ -2382,6 +2412,45 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_failure_diagnostics_survive_owned_binding_rotation_and_deduplicate_each_binding() {
+        let data=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&data.path().join("workflow.db")).unwrap();
+        let id="owner/repo#7";let first=Binding {head:"original-head".into(),contract:"original-contract".into(),evidence_hash:"first-evidence".into()};
+        store.register(id,"fixture",first.clone(),millis()).unwrap();let lease=store.claim(id,"fixture",millis(),60_000).unwrap().unwrap();
+        let context=|binding:&Binding|durable::RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:data.path().into(),
+            source_request:"original owner request".into(),source_pr:None,contract:"original owner request".into(),environment:"fixture".into(),binding:binding.clone()};
+        store.record_recovery_context(&lease,&first,&context(&first),millis()).unwrap();
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.stage=Stage::Scope;
+        cp.next=durable::NextAction {reason:"acceptance_contract_invalid".into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&cp,millis()).unwrap();store.release(&lease,millis()).unwrap();
+        let reference=durable::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)};
+        let held=store.snapshot(id).unwrap().unwrap();
+        assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(id,&first).unwrap().unwrap();
+        for turn in 0..2 {
+            let lease=store.claim_productive_for_binding(id,"fixture",millis(),60_000,&first).unwrap().unwrap();
+            let binding=if turn==0 {first.clone()}else{Binding {evidence_hash:"second-evidence".into(),..first.clone()}};
+            if turn==1 {
+                let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.binding=binding.clone();
+                cp.next=durable::NextAction {reason:"baseline_qualification_started".into(),action:"qualify_original_baseline".into(),eligible_at_ms:0};
+                store.checkpoint_with_execution_context(&lease,&cp,&context(&binding),millis()).unwrap();
+            }
+            let error=anyhow::anyhow!("identical unavailable original source");
+            record_semantic_source_failure(&mut store,&lease,&binding,&cue.key,&error)
+                .expect("same private cause on a new owned binding collided with the earlier immutable diagnostic");
+            let events=store.events(id).unwrap();
+            record_semantic_source_failure(&mut store,&lease,&binding,&cue.key,&error).unwrap();
+            assert_eq!(store.events(id).unwrap(),events,"duplicate diagnostic changed workflow history");
+            store.release(&lease,millis()).unwrap();
+            if turn==0 {
+                let held=store.snapshot(id).unwrap().unwrap();
+                assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference.clone()))).unwrap());
+            }
+        }
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+    }
     #[tokio::test]
     async fn retained_recovery_restart_after_settlement_keeps_qualification_gate() {
         let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");

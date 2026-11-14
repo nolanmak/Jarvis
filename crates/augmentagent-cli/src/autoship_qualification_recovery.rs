@@ -66,6 +66,41 @@ impl RetainedWitnessReference {
     fn valid(&self)->bool { [&self.plan,&self.result,&self.data,&self.prepared,&self.contract].into_iter().all(|value|semantic_hash(value)) }
 }
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedSetupCapacity {
+    pub available_blocks:u64,
+    pub available_inodes:u64,
+    pub block_size:u64,
+    pub entries:u64,
+    pub name_bytes:u64,
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedSetupDependency {
+    pub version:u32,
+    pub operation:String,
+    pub condition:String,
+    pub fingerprint:Option<String>,
+    pub capacity:Option<std::collections::BTreeMap<String,RetainedSetupCapacity>>,
+    pub completed:bool,
+}
+impl RetainedSetupDependency {
+    fn valid(&self)->bool {
+        self.version==1 && ["prepared","manifest","harness","registration","qualification"].contains(&self.operation.as_str())
+            && ["permission","capacity","other"].contains(&self.condition.as_str())
+            && self.fingerprint.as_ref().is_none_or(|value|semantic_hash(value))
+            && match (&self.capacity,self.condition.as_str(),self.fingerprint.is_some()) {
+                (None,"capacity",false)=>true,
+                (Some(values),"capacity",true)=>!values.is_empty() && values.len()<=256 && values.iter().all(|(key,value)|
+                    semantic_hash(key) && value.block_size>0 && value.block_size<=1024*1024 && value.entries<=8192 && value.name_bytes<=4*1024*1024)
+                    && values.values().map(|value|value.entries as u128).sum::<u128>()<=8192
+                    && values.values().map(|value|value.name_bytes as u128).sum::<u128>()<=4*1024*1024,
+                (None,"permission"|"other",_)=>true,
+                _=>false,
+            }
+    }
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(tag="kind",rename_all="snake_case",deny_unknown_fields)]
 enum QualificationRecoverySource {
     RetainedOriginalWitness {evidence:RetainedWitnessReference,owner_request_sha256:String},
@@ -132,7 +167,13 @@ fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)-
 
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SemanticSourceUnavailable {version:u32,cue:String,checkpoint:Checkpoint}
+struct SemanticSourceUnavailable {
+    version:u32,cue:String,checkpoint:Checkpoint,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    setup:Option<RetainedSetupDependency>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    setup_candidate:Option<Binding>,
+}
 
 fn retained_preparation_settled(conn:&Connection,workflow:&str,key:&str)->Result<bool> {
     let (prepared,loss):(Option<i64>,Option<i64>)=conn.query_row(
@@ -145,14 +186,23 @@ fn retained_preparation_settled(conn:&Connection,workflow:&str,key:&str)->Result
 /// The restrictive checkpoint and its continuation reference share the lease
 /// transaction. This records source loss, not another judgment or grant.
 pub(super) fn record_source_unavailable(tx:&Transaction<'_>,lease:&Lease,previous:&Checkpoint,
-    checkpoint:&Checkpoint,cue_key:&str,now:i64)->Result<()> {
+    checkpoint:&Checkpoint,cue_key:&str,setup:Option<&RetainedSetupDependency>,candidate:Option<&Binding>,now:i64)->Result<()> {
     ensure!((native_hold(checkpoint) || infrastructure_hold(checkpoint)) && previous.binding==checkpoint.binding
         && matches!(previous.stage,Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"semantic source loss changed its owned input");
     let cue=semantic_cue(tx,&lease.workflow,&checkpoint.binding,lease.generation)?.context("semantic source reference missing")?;
     ensure!(cue.key==cue_key,"semantic source reference changed");
     ensure!(!infrastructure_hold(checkpoint) || cue.retained_witness().is_some(),"infrastructure continuation requires retained original witness");
-    let body=serde_json::to_string(&SemanticSourceUnavailable {version:1,cue:cue.key,checkpoint:checkpoint.clone()})?;
     let old:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
+    let old_record=old.as_deref().map(serde_json::from_str::<SemanticSourceUnavailable>).transpose()?;
+    let retained=old_record.as_ref().filter(|old|previous==checkpoint && old.checkpoint==*checkpoint && old.cue==cue.key).and_then(|old|old.setup.as_ref());
+    if let Some(retained)=retained {ensure!(setup.is_none_or(|setup|setup==retained),"waiting setup dependency cannot be replaced");}
+    let setup=setup.or(retained);
+    let old_candidate=old_record.as_ref().filter(|old|previous==checkpoint && old.checkpoint==*checkpoint && old.cue==cue.key).and_then(|old|old.setup_candidate.as_ref());
+    if let Some(old)=old_candidate {ensure!(candidate.is_none_or(|candidate|candidate==old),"waiting setup candidate cannot be replaced");}
+    let candidate=candidate.or(old_candidate);
+    if let Some(candidate)=candidate {candidate.validate()?;ensure!(setup.is_some() && candidate.head==checkpoint.binding.head && candidate.contract==checkpoint.binding.contract,"setup observation changed its owned head/contract");}
+    ensure!(setup.is_none_or(|setup|setup.valid() && !setup.completed && cue.retained_witness().is_some()),"setup loss requires valid retained original authority");
+    let body=serde_json::to_string(&SemanticSourceUnavailable {version:if setup.is_some(){2}else{1},cue:cue.key,checkpoint:checkpoint.clone(),setup:setup.cloned(),setup_candidate:candidate.cloned()})?;
     if old.as_deref()!=Some(body.as_str()) || previous!=checkpoint {event(tx,&lease.workflow,lease.generation,"semantic_source_unavailable",&body,now)?;}
     Ok(())
 }
@@ -162,16 +212,32 @@ pub(super) fn waiting_semantic_source(conn:&Connection,workflow:&str,generation:
     let saved:Option<(i64,String)>=conn.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='semantic_source_unavailable' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((sequence,raw))=saved else{return Ok(None)};
     let saved:SemanticSourceUnavailable=serde_json::from_str(&raw)?;
-    ensure!(saved.version==1,"semantic source loss version changed");
+    ensure!(matches!((saved.version,saved.setup.as_ref(),saved.setup_candidate.as_ref()),(1,None,None)) || saved.version==2 && saved.setup.as_ref().is_some_and(|setup|setup.valid() && !setup.completed),"semantic source loss version/dependency changed");
+    if let Some(candidate)=&saved.setup_candidate {candidate.validate()?;ensure!(candidate.head==saved.checkpoint.binding.head && candidate.contract==saved.checkpoint.binding.contract,"failed setup candidate changed its head/contract");}
     if saved.checkpoint!=*checkpoint {return Ok(None);}
     let cue=semantic_cue(conn,workflow,&checkpoint.binding,generation)?.context("semantic source continuation missing")?;
     ensure!(saved.cue==cue.key,"semantic source continuation changed");
+    ensure!(saved.setup.is_none() || cue.retained_witness().is_some(),"setup continuation requires retained original witness");
     ensure!(!infrastructure_hold(checkpoint) || cue.retained_witness().is_some(),"infrastructure continuation requires retained original witness");
     let consumed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_source_restored' AND json_extract(payload,'$.loss_sequence')=?2)",params![workflow,sequence],|r|r.get(0))?;
     Ok((!consumed).then_some((sequence,cue)))
 }
 
+fn waiting_setup_dependency(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<Option<RetainedSetupDependency>> {
+    let Some((sequence,_))=waiting_semantic_source(conn,workflow,generation,checkpoint)? else{return Ok(None)};
+    let raw:String=conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,sequence],|row|row.get(0))?;
+    Ok(serde_json::from_str::<SemanticSourceUnavailable>(&raw)?.setup)
+}
+
 impl WorkflowStore {
+    /// Exact failure-time input observation, not permission to accept later edits.
+    pub(crate) fn retained_setup_candidate(&self,expected:&Snapshot)->Result<Option<Binding>> {
+        if self.snapshot(&expected.workflow)?.as_ref()!=Some(expected) {return Ok(None);}
+        let Some((sequence,_))=waiting_semantic_source(&self.conn,&expected.workflow,expected.generation,&expected.checkpoint)? else{return Ok(None)};
+        let raw:String=self.conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND seq=?2",params![expected.workflow,sequence],|row|row.get(0))?;
+        let loss:SemanticSourceUnavailable=serde_json::from_str(&raw)?;
+        Ok(loss.setup.and(loss.setup_candidate))
+    }
     /// Recover the existing source reference across intermediate checkpoints,
     /// not a fresh reconsideration, qualification or model admission.
     pub(crate) fn semantic_reconsideration(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
@@ -208,7 +274,7 @@ impl WorkflowStore {
         checkpoint.stage=Stage::Scope;
         checkpoint.next=NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0};
         self.checkpoint_with_custody_cause(lease,&checkpoint,now,
-            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key),setup:None,setup_candidate:None}),None)
     }
 
     pub(crate) fn hold_retained_infrastructure(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,now:i64)->Result<()> {
@@ -217,7 +283,22 @@ impl WorkflowStore {
         checkpoint.stage=Stage::Scope;
         checkpoint.next=NextAction {reason:"acceptance_verifier_infrastructure_unavailable".into(),action:"await_verifier_infrastructure_recovery".into(),eligible_at_ms:0};
         self.checkpoint_with_custody_cause(lease,&checkpoint,now,
-            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key),setup:None,setup_candidate:None}),None)
+    }
+
+    pub(crate) fn hold_retained_setup_failure(&mut self,lease:&Lease,binding:&Binding,cue_key:&str,setup:&RetainedSetupDependency,candidate:Option<&Binding>,now:i64)->Result<()> {
+        let mut checkpoint=self.snapshot(&lease.workflow)?.context("retained setup workflow missing")?.checkpoint;
+        ensure!(checkpoint.binding==*binding && setup.valid(),"retained setup binding/dependency changed");
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=NextAction {reason:"acceptance_verifier_infrastructure_unavailable".into(),action:"await_verifier_infrastructure_recovery".into(),eligible_at_ms:0};
+        self.checkpoint_with_custody_cause(lease,&checkpoint,now,
+            Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key),setup:Some(setup),setup_candidate:candidate}),None)
+    }
+
+    pub(crate) fn recover_retained_qualification_with_setup<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,now:i64,validate:F)->Result<bool>
+    where F:FnOnce(&VerifierEvidenceInspection<'_>,Option<&RetainedSetupDependency>)->Result<Option<(RetainedWitnessReference,Option<RetainedSetupDependency>)>> {
+        self.recover_qualification_source(expected,owner_revision,&retained_policy(),now,true,|_,evidence,setup|
+            Ok(validate(evidence,setup)?.map(|(reference,current)|(reference.data.clone(),Some(reference),current))))
     }
 
     /// Queue consideration of authenticated negative source data. This grants
@@ -225,20 +306,20 @@ impl WorkflowStore {
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
         policy:&str,now:i64,validate:F)->Result<bool>
     where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<String>> {
-        self.recover_qualification_source(expected,owner_revision,policy,now,false,|custody,evidence|
-            Ok(validate(custody,evidence)?.map(|identity|(identity,None))))
+        self.recover_qualification_source(expected,owner_revision,policy,now,false,|custody,evidence,_|
+            Ok(validate(custody,evidence)?.map(|identity|(identity,None,None))))
     }
 
     /// Queue exact retained metadata for normal preparation, not an amendment
     /// or a model call. Its stable rule cannot be replaced by a caller build hash.
     pub(crate) fn recover_retained_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,now:i64,validate:F)->Result<bool>
     where F:FnOnce(&VerifierEvidenceInspection<'_>)->Result<Option<RetainedWitnessReference>> {
-        self.recover_qualification_source(expected,owner_revision,&retained_policy(),now,true,|_,evidence|
-            Ok(validate(evidence)?.map(|reference|(reference.data.clone(),Some(reference)))))
+        self.recover_qualification_source(expected,owner_revision,&retained_policy(),now,true,|_,evidence,_|
+            Ok(validate(evidence)?.map(|reference|(reference.data.clone(),Some(reference),None))))
     }
 
     fn recover_qualification_source<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,policy:&str,now:i64,retained:bool,validate:F)->Result<bool>
-    where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<(String,Option<RetainedWitnessReference>)>> {
+    where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>,Option<&RetainedSetupDependency>)->Result<Option<(String,Option<RetainedWitnessReference>,Option<RetainedSetupDependency>)>> {
         ensure!(semantic_hash(policy),"semantic recovery policy identity is invalid");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row:Option<(String,i64,i64,String,Option<u64>)>=tx.query_row(
@@ -254,8 +335,21 @@ impl WorkflowStore {
             || pending_mutation(&tx,&expected.workflow)? || super::owner_inbox::pending(&tx,&expected.workflow)?>0 {return Ok(false);}
         let custody=baseline_native_custody(&tx,&expected.workflow)?;
         let inspection=VerifierEvidenceInspection::new(&tx,&expected.workflow);
-        let Some((identity,reference))=validate(&custody,&inspection)? else{return Ok(false)};
+        let failed_setup=waiting_setup_dependency(&tx,&expected.workflow,generation,&checkpoint)?;
+        let Some((identity,reference,current_setup))=validate(&custody,&inspection,failed_setup.as_ref())? else{return Ok(false)};
         ensure!(semantic_hash(&identity) && retained==reference.is_some() && reference.as_ref().is_none_or(|reference|reference.valid() && reference.data==identity),"qualification recovery source identity is invalid");
+        if let Some(failed)=&failed_setup {
+            let Some(current)=current_setup.as_ref() else{return Ok(false)};
+            ensure!(retained && current.valid() && current.operation==failed.operation && current.condition==failed.condition,"setup recovery proof differs from failed operation");
+            let capacity_improved=match (&failed.capacity,&current.capacity) {
+                (Some(before),Some(after)) if before.keys().eq(after.keys())=>before.iter().any(|(key,old)| {
+                    let new=&after[key];new.available_blocks as u128*new.block_size as u128>old.available_blocks as u128*old.block_size as u128
+                        || new.available_inodes>old.available_inodes || new.entries<old.entries || new.name_bytes<old.name_bytes
+                }),
+                _=>false,
+            };
+            if current.fingerprint.is_none() || current.fingerprint==failed.fingerprint && !capacity_improved && !current.completed {return Ok(false);}
+        }else {ensure!(current_setup.is_none(),"unrequested setup proof cannot create a recovery episode");}
         let source=if let Some(reference)=&reference {
             let context=qualification_schedule::context(&tx,&expected.workflow,&checkpoint.binding)?.context("retained qualification execution context missing")?;
             Some(QualificationRecoverySource::RetainedOriginalWitness {evidence:reference.clone(),
@@ -277,8 +371,9 @@ impl WorkflowStore {
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
         event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
         if let Some((sequence,_))=continuation {
-            event(&tx,&expected.workflow,generation,"original_semantic_source_restored",
-                &serde_json::json!({"version":1,"key":key,"loss_sequence":sequence,"qualification_required":true}).to_string(),now)?;
+            let mut restored=serde_json::json!({"version":if current_setup.is_some(){2}else{1},"key":key,"loss_sequence":sequence,"qualification_required":true});
+            if let Some(setup)=current_setup {restored["setup"]=serde_json::to_value(setup)?;}
+            event(&tx,&expected.workflow,generation,"original_semantic_source_restored",&restored.to_string(),now)?;
         }else {
             let cue=SemanticReconsideration {version:if retained {2}else{1},key,judgment:identity,policy:policy.into(),original_generation:generation,
                 binding:checkpoint.binding,qualification_required:true,source};
@@ -417,6 +512,97 @@ mod tests {
         store.record_recovery_context(&lease,&hold.binding,&context,4).unwrap();
         store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
         let snapshot=store.snapshot(&lease.workflow).unwrap().unwrap();(dir,store,snapshot)
+    }
+
+    #[test]
+    fn unchanged_real_setup_failure_cannot_restore_from_an_advisory_success_after_restart() {
+        let (dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
+        let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();
+        let recorded=store.events(&id).unwrap();store.hold_retained_infrastructure(&lease,&binding,&cue.key,9).unwrap();
+        assert_eq!(store.events(&id).unwrap(),recorded,"generic duplicate erased the actual setup dependency");
+        store.release(&lease,10).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        for now in [11,300011,86400011] {
+            let recovered=store.recover_retained_qualification_with_setup(&held,None,now,|_,_|Ok(Some((reference.clone(),Some(failed.clone()))))).unwrap();
+            assert!(!recovered,"unchanged actual writer failure requeued work merely because advisory readiness succeeded");
+            assert!(store.claim_productive_for_binding(&id,"unchanged",now+1,1000,&binding).unwrap().is_none());
+            assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);assert_eq!(store.events(&id).unwrap(),events);
+        }
+        assert!(!store.recover_retained_qualification(&held,None,86400012,|_|Ok(Some(reference.clone()))).unwrap(),"old inspection API bypassed failed setup dependency");
+        for field in ["operation","condition","version"] {
+            let mut bad=failed.clone();match field {"operation"=>bad.operation="manifest".into(),"condition"=>bad.condition="other".into(),_=>bad.version=2};
+            assert!(store.recover_retained_qualification_with_setup(&held,None,86400012,|_,_|Ok(Some((reference.clone(),Some(bad))))).is_err(),"{field} proof crossed the failed operation");
+            assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);assert_eq!(store.events(&id).unwrap(),events);
+        }
+        let changed=RetainedSetupDependency {fingerprint:Some("b".repeat(64)),..failed.clone()};
+        assert!(store.recover_retained_qualification_with_setup(&held,None,86400013,|_,saved| {
+            assert_eq!(saved,Some(&failed));Ok(Some((reference.clone(),Some(changed))))
+        }).unwrap());
+        let next=store.snapshot(&id).unwrap().unwrap();assert_eq!((next.model_calls,next.tokens),(held.model_calls,held.tokens));
+        assert!(store.claim_productive_for_binding(&id,"changed",86400014,1000,&binding).unwrap().is_some());
+        assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+    }
+
+    #[test]
+    fn capacity_recovery_requires_improvement_rather_than_inspection_storage_churn() {
+        let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
+        let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+        let state=|blocks,inodes|std::collections::BTreeMap::from([("f".repeat(64),RetainedSetupCapacity {available_blocks:blocks,available_inodes:inodes,block_size:4096,entries:1,name_bytes:4})]);
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),capacity:Some(state(100,100)),completed:false};
+        store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();store.release(&lease,10).unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        for (blocks,inodes,entries,names) in [(100,100,1,4),(99,100,1,4),(100,99,1,4),(99,99,1,4),(100,100,2,8)] {
+            let mut capacity=state(blocks,inodes);let values=capacity.values_mut().next().unwrap();values.entries=entries;values.name_bytes=names;
+            let current=RetainedSetupDependency {capacity:Some(capacity),..failed.clone()};
+            assert!(!store.recover_retained_qualification_with_setup(&held,None,11,|_,_|Ok(Some((reference.clone(),Some(current))))).unwrap(),"unchanged/worse capacity restored a claim");
+            assert_eq!(store.events(&id).unwrap(),events);
+        }
+        let improved=RetainedSetupDependency {capacity:Some(state(101,100)),..failed};
+        assert!(store.recover_retained_qualification_with_setup(&held,None,12,|_,_|Ok(Some((reference,Some(improved))))).unwrap(),"real available capacity repair remained invisible under the same namespace identity");
+    }
+
+    #[test]
+    fn completed_setup_recovery_does_not_require_an_artificial_filesystem_change() {
+        let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+        let failed=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        store.hold_retained_setup_failure(&lease,&binding,&cue.key,&failed,None,9).unwrap();store.release(&lease,10).unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();let complete=RetainedSetupDependency {completed:true,..failed};
+        assert!(store.recover_retained_qualification_with_setup(&held,None,11,|_,_|Ok(Some((reference,Some(complete))))).unwrap(),"an already completed real writer still required a manufactured filesystem change");
+    }
+
+    #[test]
+    fn setup_loss_and_dependency_are_atomic_and_cannot_replace_a_waiting_failure() {
+        for fault in ["storage","binding","lease","invalid"] {
+            let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+            assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference))).unwrap());
+            let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
+            let mut lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+            let mut setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+            let mut supplied=binding.clone();
+            if fault=="binding" {supplied.head="another head".into();}
+            if fault=="lease" {lease.generation+=1;}
+            if fault=="invalid" {setup.operation="unknown".into();}
+            if fault=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_setup_loss BEFORE INSERT ON workflow_event WHEN NEW.kind='semantic_source_unavailable' BEGIN SELECT RAISE(ABORT,'setup loss unavailable'); END;").unwrap();}
+            let previous=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+            assert!(store.hold_retained_setup_failure(&lease,&supplied,&cue.key,&setup,None,9).is_err(),"{fault} stored partial setup recovery authority");
+            assert_eq!(store.snapshot(&id).unwrap().unwrap(),previous);assert_eq!(store.events(&id).unwrap(),events);
+        }
+        let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(retained_reference()))).unwrap());
+        let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
+        let setup=RetainedSetupDependency {version:1,operation:"harness".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,completed:false};
+        store.hold_retained_setup_failure(&lease,&binding,&cue.key,&setup,None,9).unwrap();let events=store.events(&id).unwrap();
+        assert!(store.hold_retained_setup_failure(&lease,&binding,&cue.key,&RetainedSetupDependency {fingerprint:Some("b".repeat(64)),..setup},None,10).is_err());
+        assert_eq!(store.events(&id).unwrap(),events);
     }
 
     #[test]

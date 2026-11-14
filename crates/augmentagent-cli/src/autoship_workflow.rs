@@ -41,7 +41,7 @@ pub(crate) mod tool_capacity;
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
 mod qualification_recovery;
-pub(crate) use qualification_recovery::{SemanticReconsideration,RetainedWitnessReference,RETAINED_REQUALIFICATION_RULE};
+pub(crate) use qualification_recovery::{SemanticReconsideration,RetainedWitnessReference,RetainedSetupDependency,RetainedSetupCapacity,RETAINED_REQUALIFICATION_RULE};
 #[path="autoship_qualification_schedule.rs"]
 mod qualification_schedule;
 pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
@@ -382,7 +382,7 @@ fn read_scope_response_keys(conn:&Connection,workflow:&str,after:&str)->Result<V
     Ok(keys)
 }
 
-struct CustodyHold<'a> {physical:bool,plan:Option<&'a str>,semantic_source:Option<&'a str>}
+struct CustodyHold<'a> {physical:bool,plan:Option<&'a str>,semantic_source:Option<&'a str>,setup:Option<&'a RetainedSetupDependency>,setup_candidate:Option<&'a Binding>}
 
 impl WorkflowStore {
     /// Inspect already charged original responses without granting a lease or
@@ -1113,11 +1113,11 @@ impl WorkflowStore {
     }
 
     pub(crate) fn checkpoint_native_custody_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan:None,semantic_source:None}),None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan:None,semantic_source:None,setup:None,setup_candidate:None}),None)
     }
 
     pub(crate) fn checkpoint_verifier_recovery_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool,plan:Option<&str>)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan,semantic_source:None}),None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(CustodyHold {physical,plan,semantic_source:None,setup:None,setup_candidate:None}),None)
     }
 
     pub(crate) fn checkpoint_with_execution_context(&mut self,lease:&Lease,checkpoint:&Checkpoint,context:&RecoveryContext,now:i64)->Result<()> {
@@ -1158,7 +1158,7 @@ impl WorkflowStore {
                 "original semantic source must be restored before changing this hold");
         }
         if let Some(key)=cause.as_ref().and_then(|cause|cause.semantic_source) {
-            qualification_recovery::record_source_unavailable(&tx,lease,&serde_json::from_str(&previous)?,&checkpoint,key,now_ms)?;
+            qualification_recovery::record_source_unavailable(&tx,lease,&serde_json::from_str(&previous)?,&checkpoint,key,cause.as_ref().and_then(|cause|cause.setup),cause.as_ref().and_then(|cause|cause.setup_candidate),now_ms)?;
         }
         if previous != raw {
             let previous: Checkpoint = serde_json::from_str(&previous)?;
