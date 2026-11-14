@@ -81,23 +81,32 @@ pub(crate) struct RetainedSetupQuota {
     pub enabled:bool,
     /// Linux X quota read ABI block limits use 512-byte units; zero is unlimited.
     pub space_limit_blocks:u64,
+    pub space_hard_blocks:u64,
     pub space_used_bytes:u64,
     pub inode_limit:u64,
+    pub inode_hard_limit:u64,
     pub inodes_used:u64,
     pub space_grace:u64,
     pub inode_grace:u64,
 }
 impl RetainedSetupQuota {
     fn valid(&self)->bool {
-        (self.enabled && self.space_used_bytes%512==0) || (!self.enabled && self.id==0 && self.space_limit_blocks==0 && self.space_used_bytes==0
-            && self.inode_limit==0 && self.inodes_used==0 && self.space_grace==0 && self.inode_grace==0)
+        (self.enabled && self.space_used_bytes%512==0
+            && (self.space_hard_blocks==0 || self.space_limit_blocks>0 && self.space_limit_blocks<=self.space_hard_blocks)
+            && (self.inode_hard_limit==0 || self.inode_limit>0 && self.inode_limit<=self.inode_hard_limit))
+            || (!self.enabled && self.id==0 && self.space_limit_blocks==0 && self.space_hard_blocks==0 && self.space_used_bytes==0
+            && self.inode_limit==0 && self.inode_hard_limit==0 && self.inodes_used==0 && self.space_grace==0 && self.inode_grace==0)
     }
     fn improved_from(&self,old:&Self)->bool {
         if !old.enabled {return false;}
         if !self.enabled || self.id!=old.id {return true;}
         let remaining=|limit:u64,used:u64,unit:u128|if limit==0 {u128::MAX}else{(limit as u128*unit).saturating_sub(used as u128)};
         remaining(self.space_limit_blocks,self.space_used_bytes,512)>remaining(old.space_limit_blocks,old.space_used_bytes,512)
+            // Actual readiness remains mandatory: an expired soft quota must
+            // still pass it, while a hard repair during grace stays visible.
+            || remaining(self.space_hard_blocks,self.space_used_bytes,512)>remaining(old.space_hard_blocks,old.space_used_bytes,512)
             || remaining(self.inode_limit,self.inodes_used,1)>remaining(old.inode_limit,old.inodes_used,1)
+            || remaining(self.inode_hard_limit,self.inodes_used,1)>remaining(old.inode_hard_limit,old.inodes_used,1)
             || old.space_grace>0 && self.space_grace>old.space_grace
             || old.inode_grace>0 && self.inode_grace>old.inode_grace
     }
@@ -625,11 +634,11 @@ mod tests {
 
     #[test]
     fn quota_repair_resumes_same_cue_without_filesystem_space_change() {
-        for repair in ["space_limit","inode_limit","space_usage","inode_usage","disabled","grace","identity"] {
+        for repair in ["space_limit","inode_limit","space_hard","inode_hard","space_usage","inode_usage","disabled","grace","identity"] {
             let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
             assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
             let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();let lease=store.claim_productive_for_binding(&id,"first",8,1000,&binding).unwrap().unwrap();
-            let quota=RetainedSetupQuota {id:1000,enabled:true,space_limit_blocks:100,space_used_bytes:51200,inode_limit:10,inodes_used:10,space_grace:50,inode_grace:50};
+            let quota=RetainedSetupQuota {id:1000,enabled:true,space_limit_blocks:100,space_hard_blocks:100,space_used_bytes:51200,inode_limit:10,inode_hard_limit:10,inodes_used:10,space_grace:50,inode_grace:50};
             let quotas=std::collections::BTreeMap::from([("1".repeat(64),quota.clone()),("2".repeat(64),quota.clone()),("3".repeat(64),quota.clone())]);
             let failed=RetainedSetupDependency {version:2,operation:"prepared".into(),condition:"capacity".into(),fingerprint:Some("a".repeat(64)),
                 capacity:Some(std::collections::BTreeMap::from([("f".repeat(64),RetainedSetupCapacity {available_blocks:1000,available_inodes:1000,block_size:4096,entries:1,name_bytes:4})])),quotas:Some(quotas),completed:false};
@@ -648,9 +657,11 @@ mod tests {
             }
             let mut current=failed.clone();let value=current.quotas.as_mut().unwrap().values_mut().next().unwrap();
             match repair {
-                "space_limit"=>value.space_limit_blocks+=1,"inode_limit"=>value.inode_limit+=1,
+                "space_limit"=>{value.space_limit_blocks+=1;value.space_hard_blocks+=1;},
+                "inode_limit"=>{value.inode_limit+=1;value.inode_hard_limit+=1;},
+                "space_hard"=>value.space_hard_blocks+=1,"inode_hard"=>value.inode_hard_limit+=1,
                 "space_usage"=>value.space_used_bytes-=512,"inode_usage"=>value.inodes_used-=1,
-                "disabled"=>*value=RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_used_bytes:0,inode_limit:0,inodes_used:0,space_grace:0,inode_grace:0},
+                "disabled"=>*value=RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_hard_blocks:0,space_used_bytes:0,inode_limit:0,inode_hard_limit:0,inodes_used:0,space_grace:0,inode_grace:0},
                 "grace"=>value.space_grace+=1,"identity"=>value.id+=1,_=>unreachable!(),
             }
             assert!(store.recover_retained_qualification_with_setup(&held,None,12,|_,_|Ok(Some((reference.clone(),Some(current))))).unwrap(),"{repair} remained invisible despite the repaired quota");

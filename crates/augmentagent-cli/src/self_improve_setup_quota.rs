@@ -140,14 +140,14 @@ mod linux {
         let project=if flags & 0x2a!=0 {reader.project()?}else{0};
         for kind in 0..3 {
             if flags & (1<<(kind*2+1))==0 {
-                values.push(RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_used_bytes:0,
-                    inode_limit:0,inodes_used:0,space_grace:0,inode_grace:0});continue;
+                values.push(RetainedSetupQuota {id:0,enabled:false,space_limit_blocks:0,space_hard_blocks:0,space_used_bytes:0,
+                    inode_limit:0,inode_hard_limit:0,inodes_used:0,space_grace:0,inode_grace:0});continue;
             }
             let id=match kind {0=>uid,1=>reader.group(meta,gid)?,_=>project};
             let quota=reader.quota(kind,id)?;let big=quota.mask & (1<<15)!=0;
-            values.push(RetainedSetupQuota {id,enabled:true,space_limit_blocks:minimum(quota.block_hard,quota.block_soft),
+            values.push(RetainedSetupQuota {id,enabled:true,space_limit_blocks:minimum(quota.block_hard,quota.block_soft),space_hard_blocks:quota.block_hard,
                 space_used_bytes:quota.blocks.checked_mul(512).context("quota usage exceeds bound")?,
-                inode_limit:minimum(quota.inode_hard,quota.inode_soft),inodes_used:quota.inodes,
+                inode_limit:minimum(quota.inode_hard,quota.inode_soft),inode_hard_limit:quota.inode_hard,inodes_used:quota.inodes,
                 space_grace:timer(quota.block_time,quota.block_time_hi,big)?,inode_grace:timer(quota.inode_time,quota.inode_time_hi,big)?});
         }
         values.try_into().map_err(|_|anyhow::anyhow!("quota observation incomplete"))
@@ -167,7 +167,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
-        struct Fake {flags:u16,expected_uid:u32,expected_gid:u32,denied:bool,bsdgroups:bool}
+        struct Fake {flags:u16,expected_uid:u32,expected_gid:u32,denied:bool,bsdgroups:bool,hard_extra:u64}
         impl Reader for Fake {
             fn flags(&self)->Result<u16> {Ok(self.flags)}
             fn project(&self)->Result<u32> {Ok(71)}
@@ -177,7 +177,7 @@ mod linux {
             fn quota(&self,kind:u32,id:u32)->Result<DiskQuota> {
                 ensure!(!self.denied,"quota read refused");
                 assert_eq!(id,[self.expected_uid,self.expected_gid,71][kind as usize]);
-                Ok(DiskQuota {version:1,id,block_hard:200,block_soft:100,blocks:100,inode_hard:20,inode_soft:10,inodes:10,
+                Ok(DiskQuota {version:1,id,block_hard:200+self.hard_extra,block_soft:100,blocks:100,inode_hard:20+self.hard_extra,inode_soft:10,inodes:10,
                     block_time:100,inode_time:200,..Default::default()})
             }
         }
@@ -188,11 +188,11 @@ mod linux {
             for (mode,gid) in [(0o700,77),(0o2700,std::fs::metadata(directory.path()).unwrap().gid())] {
                 std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(mode)).unwrap();
                 let meta=std::fs::metadata(directory.path()).unwrap();
-                let values=observe_with(&Fake {flags:0x3f,expected_uid:42,expected_gid:gid,denied:false,bsdgroups:false},&meta,42,77).unwrap();
+                let values=observe_with(&Fake {flags:0x3f,expected_uid:42,expected_gid:gid,denied:false,bsdgroups:false,hard_extra:0},&meta,42,77).unwrap();
                 assert_eq!(values[0].space_limit_blocks,100);assert_eq!(values[0].space_used_bytes,51200);
                 assert_eq!(values[1].inode_limit,10);assert_eq!(values[2].id,71);
-                assert!(observe_with(&Fake {flags:2,expected_uid:42,expected_gid:gid,denied:true,bsdgroups:false},&meta,42,77).is_err());
-                let disabled=observe_with(&Fake {flags:0x15,expected_uid:42,expected_gid:gid,denied:true,bsdgroups:false},&meta,42,77).unwrap();
+                assert!(observe_with(&Fake {flags:2,expected_uid:42,expected_gid:gid,denied:true,bsdgroups:false,hard_extra:0},&meta,42,77).is_err());
+                let disabled=observe_with(&Fake {flags:0x15,expected_uid:42,expected_gid:gid,denied:true,bsdgroups:false,hard_extra:0},&meta,42,77).unwrap();
                 assert!(disabled.iter().all(|quota|!quota.enabled));
                 assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
             }
@@ -204,7 +204,7 @@ mod linux {
             use std::os::unix::fs::PermissionsExt;
             let directory=tempfile::tempdir().unwrap();std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
             let meta=std::fs::metadata(directory.path()).unwrap();let gid=meta.gid().checked_add(1).unwrap();
-            let values=observe_with(&Fake {flags:8,expected_uid:42,expected_gid:meta.gid(),denied:false,bsdgroups:true},&meta,42,gid).unwrap();
+            let values=observe_with(&Fake {flags:8,expected_uid:42,expected_gid:meta.gid(),denied:false,bsdgroups:true,hard_extra:0},&meta,42,gid).unwrap();
             assert_eq!(values[1].id,meta.gid(),"group quota did not use the actual inherited owner");
             assert!(group_option("rw\ngrpid\n",true).unwrap());
             assert!(!group_option("rw\nnogrpid\n",true).unwrap());
@@ -215,6 +215,13 @@ mod linux {
             assert!(!xfs_group_option(20,&view.replace("xfs /dev/b rw,grpid","xfs /dev/b rw")).unwrap());
             assert!(xfs_group_option(19,view).is_err());assert!(xfs_group_option(21,view).is_err());
             assert!(xfs_group_option(20,&format!("{view}{view}")).is_err());
+        }
+        #[test]
+        fn quota_observation_keeps_hard_limit_repairs_separate_from_soft_limits() {
+            let directory=tempfile::tempdir().unwrap();let meta=std::fs::metadata(directory.path()).unwrap();
+            let before=observe_with(&Fake {flags:0x3f,expected_uid:42,expected_gid:meta.gid(),denied:false,bsdgroups:false,hard_extra:0},&meta,42,meta.gid()).unwrap();
+            let repaired=observe_with(&Fake {flags:0x3f,expected_uid:42,expected_gid:meta.gid(),denied:false,bsdgroups:false,hard_extra:1},&meta,42,meta.gid()).unwrap();
+            assert_ne!(repaired,before,"hard-quota repair disappeared behind an unchanged soft limit");
         }
         #[test]
         fn quota_native_observation_is_read_only_or_explicitly_unavailable() {

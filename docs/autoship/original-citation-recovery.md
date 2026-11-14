@@ -1572,17 +1572,21 @@ created to guess its quota owner. `FS_IOC_FSGETXATTR` supplies inherited project
 realtime allocation, whose counters are outside this normal-data contract.
 
 Each strict quota record contains `id`, `enabled`, `space_limit_blocks`,
-`space_used_bytes`, `inode_limit`, `inodes_used`, `space_grace`, `inode_grace`, in
+`space_hard_blocks`, `space_used_bytes`, `inode_limit`, `inode_hard_limit`,
+`inodes_used`, `space_grace`, `inode_grace`, in
 that declaration order. Space limits use 512-byte units, usage uses bytes,
 inode values are counts and grace values are recorded Unix deadlines, not the
-current clock. Limits select the smaller nonzero hard/soft limit; zero means
-unlimited. Disabled entries are explicit `enabled:false` and all-zero fields.
+current clock. The combined limits select the smaller nonzero hard/soft limit; the
+separate hard limits preserve increases during a soft-limit grace period, when
+the smaller soft limit alone cannot describe available hard-quota headroom.
+Zero means unlimited. A nonzero hard limit bounds a positive combined limit. Disabled entries are explicit `enabled:false` and all-zero fields.
 Unavailable/denied/unsupported quota queries remain unknown, never disabled.
 Linux's no-enabled-quota `ENOSYS` result is disambiguated only when all three
 `Q_GETINFO` reads positively report inactive (`ESRCH`).
 
 Under the existing complete source/readiness/store fences, a same-fingerprint
-quota loss can restore only for increased applicable remaining quota, observed
+quota loss can restore only for increased applicable combined or hard-quota
+headroom (actual full readiness still precedes comparison), observed
 removal of enforcement, a changed charged identity, an extension of an already
 recorded grace deadline, or exact read-only operation completion. Filesystem
 free-space and directory-entry changes alone cannot release a quota hold.
@@ -1602,3 +1606,12 @@ scope/native/capture evidence, snapshot/events and 12 historical model calls
 unchanged. That host observation does not claim an active-quota integration test
 or a restored autonomous merge. Independent new-head review, hosted CI, supported
 snapshot and protected rollout remain required.
+
+A final test-first projection regression reproduced loss of a hard-limit increase
+behind an unchanged soft limit. Separate raw hard limits now preserve that repair
+through the native observer and same-cue comparator; invalid combined/hard
+relationships remain unavailable. The final focused run passed nine quota tests,
+all 26 recovery-store tests passed (1.20s), and the read-only actual #1830 probe
+passed again (11.46s) with unchanged scope/evidence/history/12 model calls.
+The 2,115-test full run above is the preceding `36317efa` checkpoint; the final
+hard-limit amendment requires its own exact-head hosted CI and review.
