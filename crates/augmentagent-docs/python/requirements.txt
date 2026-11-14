@@ -1,6 +1,6 @@
 # Pin the complete renderer dependency set, including transitive dependencies.
-Markdown==3.5.2
-reportlab==4.4.10
-pillow==11.3.0
-charset-normalizer==3.4.7
-pypdf==6.20.1
+Markdown==3.11.2
+reportlab==5.1.0
+pillow==13.0.0
+charset-normalizer==3.5.2
+pypdf==6.21.2
