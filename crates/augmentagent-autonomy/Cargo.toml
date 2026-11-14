@@ -33,7 +33,7 @@ hex = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-toml = "0.9"
+toml = "1.1"
 
 [dev-dependencies]
 tempfile = "3"

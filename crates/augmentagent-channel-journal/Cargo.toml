@@ -34,13 +34,13 @@ aws-sdk-kms = "1"
 
 # CryptoJS/OpenSSL-EVP compatible entry-content crypto (pure Rust, no
 # openssl linkage): Salted__ header, MD5 EVP_BytesToKey, AES-256-CBC.
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
-md-5 = "0.10"
-base64 = "0.22"
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+md-5 = "0.11"
+base64 = "0.23"
 rand = "0.8"
 
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 libc = "0.2"
 

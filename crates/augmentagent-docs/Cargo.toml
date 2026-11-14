@@ -14,12 +14,12 @@ repository.workspace = true
 # live in core without a cycle.
 
 [dependencies]
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 # Keyring-first `MISTRAL_API_KEY` lookup (#128 pattern), env fallback.
 augmentagent-auth = { path = "../augmentagent-auth" }
 
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

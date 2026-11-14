@@ -31,7 +31,7 @@ hex = { workspace = true }
 # ONNX Runtime bindings. The default `download-binaries` feature fetches a
 # prebuilt runtime at BUILD time (pinned by the crate version); CI and the
 # deployment box both have network at build time. Runtime never downloads.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "ndarray"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "ndarray"] }
 ndarray = { version = "0.17", features = ["std"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
