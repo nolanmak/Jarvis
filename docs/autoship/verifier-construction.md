@@ -1186,3 +1186,9 @@ frozen recovery or Pending v2 activation. The actual approved-transition custody
 regression is still a known RED. Broader current-source acceptance/store tests
 are required; the earlier full CLI pass was on 36bdb96 before this component.
 No #2058 PR, production activation or autonomous shipment is claimed.
+
+Current-source broader validation for the publication component passes: 278
+acceptance tests / zero failures / 13 explicit isolation ignores (365.53 seconds),
+and 239 workflow-store tests / zero failures (6.92 seconds). The actual approved
+execution/capture regression remains one of the explicit isolation cases and
+has not been turned GREEN by this data-publication component.
