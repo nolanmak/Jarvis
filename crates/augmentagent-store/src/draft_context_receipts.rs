@@ -4,6 +4,46 @@ use crate::{
     Store, StoreResult,
 };
 
+/// Sub-platform qualifiers a SocialAPI conversation id may carry, mirroring the
+/// networks the channel labels. Only these are stripped, so two conversations
+/// that merely happen to be colon-separated are never treated as one.
+const SOCIALAPI_QUALIFIERS: &[&str] = &[
+    "instagram",
+    "ig",
+    "x",
+    "twitter",
+    "linkedin",
+    "li",
+    "facebook",
+    "fb",
+    "threads",
+    "tiktok",
+    "youtube",
+    "pinterest",
+];
+
+/// The bare conversation id behind a qualified SocialAPI reference, e.g.
+/// `instagram:<conversation>` → `<conversation>`.
+fn socialapi_unqualified(conversation: &str) -> Option<&str> {
+    let (qualifier, rest) = conversation.split_once(':')?;
+    (!rest.is_empty()
+        && SOCIALAPI_QUALIFIERS
+            .iter()
+            .any(|known| qualifier.eq_ignore_ascii_case(known)))
+    .then_some(rest)
+}
+
+/// #1830 — a `socialapi dm --post` card keys its conversation as
+/// `<sub-platform>:<conversation>` while the ingested trigger message keeps the
+/// bare conversation id. The two name the same thread, so compare the qualified
+/// form against the bare one. A qualifier on both sides still has to match
+/// exactly: `instagram:c` and `x:c` are different conversations.
+fn socialapi_same_conversation(source: &str, target: &str) -> bool {
+    source == target
+        || socialapi_unqualified(source) == Some(target)
+        || Some(source) == socialapi_unqualified(target)
+}
+
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS draft_context_receipts (
         id TEXT PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT,
@@ -44,6 +84,17 @@ impl Store {
         action_id: &str,
     ) -> StoreResult<bool> {
         self.with_conn(|c| {
+            c.create_scalar_function(
+                "aa_socialapi_same_conversation",
+                2,
+                crate::rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | crate::rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| {
+                    let source: String = ctx.get(0)?;
+                    let target: String = ctx.get(1)?;
+                    Ok(socialapi_same_conversation(&source, &target))
+                },
+            )?;
             Ok(c.execute(
                 "UPDATE draft_context_receipts SET action_id=?2
             WHERE id=?1 AND (action_id IS NULL OR action_id=?2)
@@ -53,7 +104,9 @@ impl Store {
                     WHERE source.messageId=draft_context_receipts.message_id
                       AND source.platform=target.platform
                       AND source.accountEntityId IS target.accountEntityId
-                      AND source.threadId=target.threadId AND source.threadId IS NOT NULL
+                      AND source.threadId IS NOT NULL AND target.threadId IS NOT NULL
+                      AND (source.threadId=target.threadId OR (source.platform='socialapi'
+                        AND aa_socialapi_same_conversation(source.threadId,target.threadId)))
                   )))",
                 params![receipt_id, action_id],
             )? == 1)
