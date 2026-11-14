@@ -790,7 +790,7 @@ success is claimed here. Final joined checks, seam review, independent review,
 hosted CI and the normal protected rollout remain pending.
 
 
-## 20. Publication readiness and poller integration
+## 20. Initial publication readiness and poller integration — refined in §22
 
 D10. Separate read-only source validation from filesystem readiness. Source,
 native, environment and original-scope inspection remains read-only (§19),
@@ -984,7 +984,78 @@ re-execution merely because its source becomes unavailable.
 | Live rebinding / initial and enrolled consumers | Binding/consumer rules above; actual claim, preparation, qualification, publication and settlement fixtures | Final current-main integration and exact-head review/CI. |
 | Loss, duplicate, interruption and settlement | Episode table above; atomicity, source-loss and restoration store/guard fixtures | Publication/setup coverage below and natural ordinary outcome. |
 | Bounded fair scheduling | Shared window rules above; scheduler rotation and refused-inspection tests | Fresh seam review; do not infer live recovery from selection counts. |
-| Publication destination and metadata operations | Current probe covers the receipt/controller directory's allocation/write/fsync and exact expected receipt collision | **OPEN, blocks merge/activation:** enumerate and validate every actual setup destination, including missing harness parents and literal write-admission storage. Anonymous allocation alone also does not prove named create/persist/link availability. Add an appropriate supported check or failure-condition hold before claiming full setup readiness. Root owns implementation next. |
+| Publication destination and metadata operations | Current probe covers the receipt/controller directory's allocation/write/fsync and exact expected receipt collision | **OPEN, blocks merge/activation:** enumerate and validate every actual setup destination, including missing harness parents and literal write-admission storage. §22 replaces the anonymous-only check with actual bounded no-clobber publication and owned restart cleanup. Validate that refinement and cover the other setup destinations before claiming full setup readiness. Root owns the remaining implementation. |
 | Physical recovery compatibility | Existing free custody restoration is ordered before optional positive inspection; original-plan fallback retains independent authority checks | Verify the connected routing and errors on current code, including incomplete optional positive data; do not broaden re-execution authority. |
 | Documentation and fresh review | This section supersedes historic open-status statements and specifies current cue/binding/episode/fairness rules | Fresh-reader findings require recheck; the mapped 100 seams have **not** all been audited. Spec audit is not independent engineering approval. |
 | Rollout and full #1703 | Protected merge, hosted CI, supported snapshot and normal updater; natural ordinary workflow acceptance | Entire requirement remains open. No forced resubmission, fabricated input/approval, budget reset or repair self-test. |
+
+
+## 22. Real controller publication operation and bounded restart cleanup
+
+D11. Replace §20's anonymous-only allocation approximation with the actual
+`NamedTempFile::persist_noclobber` operation used by the immutable receipt writer.
+Successful anonymous allocation does not establish successful named create or
+publication. This refinement covers the private controller directory; it does
+not silently establish readiness of missing harness parents or the separate
+literal write-admission store. Those remaining destinations stay merge blockers.
+
+The operation holds a nonblocking exclusive descriptor lock on the actual private
+controller directory. It creates no permanent lock file. Directory type,
+controller UID, private permissions and writable owner bits remain required.
+The lock is explicitly unlocked on return/error and released by the kernel on
+process death. Explicit unlock prevents a transient pre-exec fork that inherited
+the open description from extending the completed probe's ownership. A live
+competing probe refuses inspection rather than deleting its active scratch.
+
+Two fixed reserved names, `.jarvis-recovery-publication-stage` and
+`.jarvis-recovery-publication-final`, are owned solely by this protocol under the
+existing protected workflow-control directory. The marker is the exact bytes
+`jarvis-publication-readiness-v1\n`. Scratch contains that marker followed by
+bounded kernel-random padding, not a receipt, native response, registration,
+owner request or qualification. Noncompressible padding avoids inferring actual
+allocation from zero-fill on a compressing filesystem. The size bound is
+4 MiB + 192 KiB + marker length per file. Only these two names can be reconciled;
+no glob, arbitrary temporary-file sweep, snapshot deletion or storage-floor
+exception is added.
+
+Before another probe allocates, it reclaims interrupted state while holding the
+same directory lock. Each present reserved file must be a nonblocking-opened,
+no-follow regular file, owned by the controller, private and bounded. Its prefix
+must match the full marker or a valid partial marker. A two-link file is accepted
+only if both reserved names account for that same device/inode pair, covering an
+interrupted hard-link-based no-clobber fallback. An external/unaccounted link,
+FIFO, symlink, foreign UID/mode, oversize file or changed marker stays untouched
+and causes a refusal. Path/inode identity is checked again before removal.
+Unrecognized contents never become proof that deletion or workflow dispatch is
+permitted.
+
+After writing and syncing bounded scratch, the probe publishes only to the
+reserved final probe name using no-clobber persistence, syncs the directory,
+removes its recognized probe state and syncs the directory again. It never uses
+an actual artifact destination as scratch. A concurrent unexpected final-name
+conflict refuses publication without replacing that file. Ordinary staging
+errors use the publisher's normal temporary-path cleanup; process interruption
+leaves at most the bounded reserved state, which the next locked inspection can
+reconcile. If a workflow never resumes, this remains bounded state within its
+existing protected control-directory lifecycle (#1799), not a separate growing
+build cache or retention pool. Root still owns that epic lifecycle acceptance;
+this paragraph is not a claim that all #1799 cleanup work is finished.
+
+Tests exercise interrupted owned staging, actual child-process exit with no
+Rust destructors and a two-name hard-link interruption, active lock refusal,
+ENOSPC during writing, FIFO and unowned-hard-link refusal, changed/private-state
+checks, and an actual no-clobber final-name conflict after allocation succeeds.
+The original receipt remains unchanged. Success leaves no scratch or lock file;
+ordinary pre-publication errors clean staging through the normal temporary-path
+owner. A failure after persistence can leave the bounded recognized final name
+for the next locked reconciliation. The initial-issue/PR preparation and
+same-cue source-restoration fixtures also pass on this branch; this is component
+integration evidence, not deployed acceptance.
+
+This closes the named-operation design gap for the controller destination only.
+It grants no native/model allocation, productive lease, merge or deployment.
+Source/native/environment inspection and the explicit live inventory stay
+read-only; this separate filesystem readiness phase retains its limited side
+effects. The other setup destinations in §21, final current-main integration,
+complete seam and engineering reviews, hosted CI and protected rollout remain
+open. No broader autoship restoration or ordinary merge is claimed.
