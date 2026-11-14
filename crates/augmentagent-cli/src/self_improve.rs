@@ -7115,15 +7115,12 @@ async fn resume_draft_pr(
                     files.join(", "),
                     truncate(&rs, 600)
                 );
-                workflow.publish_round(
-                    branch,
-                    repo_root,
-                    pr,
-                    0,
-                    "conflict resolution",
-                    &findings,
-                    dry_run,
-                ).await?;
+                if !workflow.publish_round(
+                    branch,repo_root,pr,0,"conflict resolution",&findings,dry_run,
+                    expected_head.is_none(),Some(issue_no),
+                ).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                }
                 conflict_note = Some(format!("Conflict resolution: {}", truncate(&rs, 200)));
             }
             Err(why) => {
@@ -7270,7 +7267,9 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
-                    workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await?;
+                    if !workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                    }
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
@@ -7354,7 +7353,9 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
-                        workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await?;
+                        if !workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                        }
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -7412,7 +7413,9 @@ async fn resume_draft_pr(
                             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not commit CI repair: {error}");
                         }
-                        workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await?;
+                        if !workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                        }
                         summary = format!("{summary}\nCI repair: {}", truncate(&rs, 1000));
                         continue;
                     }
@@ -7784,7 +7787,9 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
-        workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await?;
+        if !workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run, expected_head.is_none(), Some(issue_no)).await? {
+            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+        }
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
     }.await;

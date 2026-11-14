@@ -190,6 +190,8 @@ When the controller's VM deadline expires, the native tool returns
 an execution failure, separate from a profile denial or preflight readiness
 refusal. Guest-provided error text cannot assert this controller-owned category.
 That category requires the supervisor's descendant-cleanup receipt after exit.
+All post-launch exits require the exact `all-descendants-reaped\n` bytes;
+CRLF/CR endings are not equivalent cleanup evidence.
 Missing or invalid cleanup proof instead returns the fixed
 `[runner=vm] JARVIS_EXECUTION:cleanup_unverified` diagnostic. It remains distinct
 from both a verified deadline and a profile refusal, and requires cleanup proof

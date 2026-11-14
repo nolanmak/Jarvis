@@ -20,8 +20,12 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             assert!(manual_routing::permit_mutation(&root,9,source,true,&mut guard).await.unwrap());
             let before=initial.snapshot(guard.id()).unwrap().unwrap();
             std::fs::write(root.join("manual-after-admission"),b"late owner routing").unwrap();
-            assert!(!manual_routing::permit_mutation(&root,9,source,true,&mut guard).await.unwrap(),
-                "an automatic publication boundary ignored a manual label applied after admission");
+            let published=guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Retained repair findings",false,true,source).await.unwrap();
+            let remote=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"])
+                .current_dir(&root).output().unwrap();
+            assert!(remote.status.success() && remote.stdout.is_empty(),
+                "production resume round pushed after a manual label was applied following admission");
+            assert!(!published,"production resume round continued after a late routing denial");
             let held=initial.snapshot(guard.id()).unwrap().unwrap();
             assert_eq!(held.model_calls,before.model_calls);assert_eq!(held.tokens,before.tokens);
             assert_eq!(held.checkpoint.binding,before.checkpoint.binding,"routing observation changed candidate evidence");
@@ -105,6 +109,11 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                     std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\n").unwrap();
+                    let remote=dir.path().join("remote.git");
+                    assert!(std::process::Command::new("/usr/bin/git").args(["init","--bare","--quiet"])
+                        .arg(&remote).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
+                    assert!(std::process::Command::new("/usr/bin/git").args(["remote","set-url","origin"])
+                        .arg(remote).current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
                 let references=|number|serde_json::json!([{"number":number,"url":format!("https://github.com/owner/repo/issues/{number}")}]);
                 let mut manual_refs=if route=="linked" {references(7)}else{serde_json::json!([])};

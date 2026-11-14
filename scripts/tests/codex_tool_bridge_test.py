@@ -3222,6 +3222,30 @@ class BuildScratchTests(unittest.TestCase):
         self.assertTrue(response['isError'])
         self.assertNotIn('JARVIS_EXECUTION:command_timeout', response['content'][0]['text'])
 
+    def test_non_deadline_controller_cleanup_proof_is_classified_through_dispatch(self):
+        from codex_build_vm_test import BuildScratchPlacementTests, vm
+        # Keep the real controller's exception identities through the VM shim.
+        # The controller fixture supervises a fake process; no KVM run is claimed.
+        self.fake_vm.Unavailable = vm.Unavailable
+        self.fake_vm.CommandTimedOut = vm.CommandTimedOut
+        self.fake_vm.CleanupUnverified = vm.CleanupUnverified
+        for receipt, status, cleanup_failed in [(None, 125, True), (None, 0, True),
+                ('incomplete\n', 0, True), ('all-descendants-reaped\r\n', 0, True),
+                ('all-descendants-reaped\r', 0, True), ('all-descendants-reaped\n', 125, False)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                def controller(*args, **kwargs):
+                    raise BuildScratchPlacementTests().deadline_fixture(receipt, status, expired=False)
+                self.fake_vm.run = staticmethod(controller)
+                response = bridge.Server(self.policy()).dispatch({'method': 'tools/call', 'params': {
+                    'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+                self.assertTrue(response['isError'])
+                text = response['content'][0]['text']
+                self.assertTrue(text.startswith('[runner=vm] '), text)
+                self.assertEqual('JARVIS_EXECUTION:cleanup_unverified ' in text, cleanup_failed, text)
+                self.assertNotIn('JARVIS_EXECUTION:command_timeout', text)
+                if cleanup_failed:
+                    self.assertNotIn('Operation denied', text)
+
     def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
         import os
         policy = self.policy()

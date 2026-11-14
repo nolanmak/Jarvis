@@ -38,6 +38,13 @@ class CleanupUnverified(Unavailable):
     """Controller could not prove descendant cleanup after execution."""
 
 
+def cleanup_verified(path):
+    try:
+        return path.is_file() and path.read_bytes() == b'all-descendants-reaped\n'
+    except OSError:
+        return False
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -433,7 +440,6 @@ poweroff -f
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
                 env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
                 pass_fds=() if storage_lease is None else tuple(getattr(storage_lease,'fds',[storage_lease.fd])))
-            timed_out = False
             try:
                 deadline = None if timeout is None else time.monotonic() + min(max(timeout, 1), 900)
                 while True:
@@ -441,7 +447,6 @@ poweroff -f
                         storage_lease.check()
                     remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
-                        timed_out = True
                         raise CommandTimedOut('VM command timed out')
                     broker.poll(remaining)
                     try:
@@ -449,8 +454,10 @@ poweroff -f
                         break
                     except subprocess.TimeoutExpired:
                         continue
-                if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
-                    raise Unavailable('VM execution or cleanup failed')
+                if not cleanup_verified(cleanup):
+                    raise CleanupUnverified('VM command cleanup could not be verified')
+                if status:
+                    raise Unavailable('VM execution failed')
                 try:
                     result = private_json(control / 'outcome.json')
                 except (OSError, ValueError) as exc:
@@ -476,13 +483,8 @@ poweroff -f
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
-                if timed_out:
-                    # A terminated supervisor may exit nonzero after proving
-                    # that it reaped every descendant. Its receipt is required
-                    # before an execution deadline can be reported as such.
-                    try:
-                        verified = cleanup.is_file() and cleanup.read_text() == 'all-descendants-reaped\n'
-                    except (OSError, UnicodeError):
-                        verified = False
-                    if not verified:
-                        raise CleanupUnverified('VM command cleanup could not be verified')
+                # Every post-launch exit requires the exact supervisor receipt,
+                # including exceptions while waiting. A valid receipt permits
+                # a nonzero terminated status to retain its original category.
+                if not cleanup_verified(cleanup):
+                    raise CleanupUnverified('VM command cleanup could not be verified')
