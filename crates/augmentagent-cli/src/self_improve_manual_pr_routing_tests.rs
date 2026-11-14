@@ -11,6 +11,54 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case=="late-adopted-retry" {
+            let git=|args:&[&str]| {
+                let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
+                assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            let published=git(&["rev-parse","HEAD"]);
+            // This is the owner's pre-existing PR, not an automation Push.
+            git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
+            let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
+            rows[0]["headRefOid"]=published.clone().into();
+            std::fs::write(root.join("prs.json"),serde_json::to_vec(&rows).unwrap()).unwrap();
+            let mut candidates=adoption::authorized(&rows,"owner/repo",&["owner".into()]);
+            candidates.retain(|p|p.pr==9);adoption::persist(&path,&candidates).unwrap();
+            let source=candidates[0].source_issue;
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:source,pr:Some(9),
+                branch:"feat/repair-9",contract:"Retained ordinary request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            git(&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+                "commit","--quiet","--allow-empty","-m","Preserved local revision"]);
+            guard.transition(crate::autoship_workflow::Stage::Build,"revision_created","publish_revision",0).await.unwrap();
+            let before=initial.snapshot(guard.id()).unwrap().unwrap();
+            std::fs::write(root.join("manual-after-admission"),b"late owner routing").unwrap();
+            assert!(!guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Retained findings",false,true,source).await.unwrap());
+            assert_eq!(git(&["ls-remote","--heads","origin","refs/heads/feat/repair-9"]).split_whitespace().next(),Some(published.as_str()));
+            let held=initial.snapshot(guard.id()).unwrap().unwrap();let id=guard.id().to_owned();guard.finish().unwrap();
+            std::fs::remove_file(root.join("manual-after-admission")).unwrap();
+            assert!(manual_routing::allowed(&root,"owner/repo",9,source).await);
+            let now=held.checkpoint.next.eligible_at_ms+1;
+            let snapshot=initial.snapshot(&id).unwrap();let events=initial.events(&id).unwrap();
+            assert_eq!(initial.retained_candidate_head("owner/repo",9,"feat/repair-9",&published,&held.checkpoint.binding.head,now).unwrap(),
+                Some(held.checkpoint.binding.head.clone()),"newly adopted local work lost its admitted published-head custody");
+            let retries=adoption::episode_retries(&path,&candidates,now).unwrap();
+            assert!(retries.contains(&9),"label removal stranded the due retained revision");
+            if let Some(issue)=source {
+                let mut ledger=AttemptLedger::default();ledger.mark(1,issue);
+                assert_eq!(adoption::select_linked_with_retries(&candidates,&ledger,1,&Default::default(),None,0,&retries).unwrap().0,9,
+                    "same-day marker hid the newly adopted retained revision after label removal");
+                assert!(ledger.attempted_today(1,issue),"recovery erased the original attempt marker");
+            }
+            assert_eq!(initial.snapshot(&id).unwrap(),snapshot);assert_eq!(initial.events(&id).unwrap(),events);
+            assert_eq!(held.model_calls,before.model_calls);assert_eq!(held.tokens,before.tokens);
+            let conn=rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM operation WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0,
+                "admission or recovery manufactured an automation Push receipt");
+            return;
+        }
         if case=="late-mutation" {
             let source=(std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked").then_some(7);
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
@@ -94,7 +142,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
                 std::fs::create_dir(&root).unwrap();
@@ -102,7 +150,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if case=="late-mutation" {
+                if matches!(case,"late-mutation"|"late-adopted-retry") {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());

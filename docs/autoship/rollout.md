@@ -239,6 +239,21 @@ no repository access and cannot clear an owner pause. Labels are remote routing
 observations, not a linearizable stop signal for an already-active turn: use the
 supported pause command to stop active repair work.
 
+Reviewer stand-down and completed-source retirement recheck routing before
+dispatching labels or a PR close. A label already dispatched remains observed
+state; a later manual/unknown route stops the close. Source retirement also
+honors issue/PR owner pauses for explicit commands. Already-closed remote PRs
+remain observable without dispatching another close.
+
+At productive admission, a candidate that still equals its trusted adopted PR
+head can retain an `adopted_publication_admitted` observation under the fenced
+workflow. This is not a Push operation or review/execution approval and changes
+no original charges. Retained-head recovery uses it only when no automation
+Push exists; any actual Push takes precedence. Alias, identity, due/idle,
+pause, pending-effect and Git-ancestry checks still apply. An already-different
+local head cannot create this original publication fact retroactively. Missing
+historical evidence stays held rather than acquiring a fabricated receipt.
+
 A due `verify` / `verification_infrastructure_retry` / `retry_verification`
 checkpoint remains eligible despite a same-day attempt marker. This requires an
 idle, unpaused owned candidate, no pending owner input or remote mutation, and

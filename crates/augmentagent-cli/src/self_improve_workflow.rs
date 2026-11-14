@@ -964,6 +964,13 @@ impl WorkflowGuard {
                 now,
             )?;
         }
+        if mode==AcquireMode::Productive {
+            if let Some(pr)=start.pr {
+                if let Err(error)=store.record_adopted_publication(&lease,&binding,start.repository,pr,start.branch,now) {
+                    store.release(&lease,now)?;return Err(error);
+                }
+            }
+        }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
         if mode!=AcquireMode::VerifierRecovery {

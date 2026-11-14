@@ -32,11 +32,36 @@ trait Github {
     async fn call(&mut self, args: &[&str]) -> Result<serde_json::Value>;
 }
 
-struct Transport<'a>(&'a Path);
+#[derive(Debug)]
+struct ControlHeld(&'static str);
+impl std::fmt::Display for ControlHeld {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(self.0)}
+}
+impl std::error::Error for ControlHeld {}
+
+struct Transport<'a> {root:&'a Path,issue:u64,automatic:bool}
 #[async_trait::async_trait]
 impl Github for Transport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<serde_json::Value> {
-        let (ok, out, _) = run(&gh_bin(), args, self.0).await?;
+        if args.starts_with(&["pr","close"]) {
+            let repository=workflow::canonical_repository(self.root).await.context(ControlHeld("repository-control-unavailable"))?;
+            let pr=args.get(2).context(ControlHeld("target-control-unavailable"))?.parse::<u64>()?;
+            if self.automatic && !manual_routing::allowed(self.root,&repository,pr,Some(self.issue)).await {
+                return Err(ControlHeld("automatic-pr-routing-held").into());
+            }
+            // A routing label is advisory for explicit commands. Existing owner
+            // pauses remain authoritative for every newly dispatched close.
+            if let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())
+                .context(ControlHeld("owner-control-unavailable"))? {
+                let mut ids=vec![crate::autoship_workflow::workflow_id(&repository,self.issue)?,
+                    crate::autoship_workflow::pr_workflow_id(&repository,pr)?];
+                if let Some(id)=store.resolve_pr(&repository,pr).context(ControlHeld("owner-control-unavailable"))? {ids.push(id);}
+                for id in ids {
+                    store.require_owner_dispatch(&id).context(ControlHeld("owner-control-held"))?;
+                }
+            }
+        }
+        let (ok, out, _) = run(&gh_bin(), args, self.root).await?;
         anyhow::ensure!(ok, "source reconciliation GitHub call failed");
         if out.trim().is_empty() {
             return Ok(serde_json::Value::Null);
@@ -49,12 +74,13 @@ impl Github for Transport<'_> {
     }
 }
 
-pub(super) async fn reconcile(root: &Path, pr: u64, issue: u64, dry_run: bool) -> SourceAction {
+pub(super) async fn reconcile(root: &Path, pr: u64, issue: u64, dry_run: bool, automatic:bool) -> SourceAction {
     let recorded = opened_prs::get(issue).is_some_and(|r| r.pr == pr);
-    match reconcile_with(&mut Transport(root), pr, issue, recorded, dry_run).await {
+    match reconcile_with(&mut Transport {root,issue,automatic}, pr, issue, recorded, dry_run).await {
         Ok(action) => action,
         Err(error) => {
             warn!(pr, issue, "source reconciliation deferred: {error:#}");
+            if let Some(held)=error.downcast_ref::<ControlHeld>() {return SourceAction::Hold(held.0);}
             SourceAction::Hold("source-reconciliation-unavailable")
         }
     }

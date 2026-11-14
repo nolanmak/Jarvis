@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_adopted_publication.rs"]
+mod adopted_publication;
+
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
 #[path = "autoship_resource_refusal.rs"]
@@ -2220,7 +2223,13 @@ impl WorkflowStore {
             params![id, serde_json::to_string(&OperationKind::Push)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
-        let Some((binding, receipt)) = latest else { return Ok(None); };
+        let Some((binding, receipt)) = latest else {
+            // An imported PR may have been published by its owner, before this
+            // workflow existed. Its fenced admission is a different fact from
+            // a Push; any actual Push above still takes precedence.
+            return Ok((adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published))
+                .then_some(snapshot.checkpoint.binding.head));
+        };
         let binding: Binding = serde_json::from_str(&binding)?;
         binding.validate()?;
         if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {

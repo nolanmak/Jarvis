@@ -1717,7 +1717,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
             continue;
         }
-        if source_reconcile::reconcile(repo_root, pr, issue, dry_run).await
+        if source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
             != source_reconcile::SourceAction::Continue {
             continue;
         }
@@ -1842,7 +1842,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     continue;
                 }
 
-                if source_reconcile::reconcile(repo_root, pr, issue, false).await
+                if source_reconcile::reconcile(repo_root, pr, issue, false, selected.is_none()).await
                     != source_reconcile::SourceAction::Continue {
                     continue;
                 }
@@ -6455,7 +6455,16 @@ async fn hold_unreviewable(
     why: &ReviewUnavailable,
     builder_ran: bool,
     dry_run: bool,
+    automatic: bool,
 ) -> RunReport {
+    let repository=if automatic {workflow::canonical_repository(repo_root).await.ok()}else{None};
+    let routing_allowed=||async {
+        if !automatic {true}
+        else if let Some(repository)=repository.as_deref() {manual_routing::allowed(repo_root,repository,pr,Some(issue)).await}
+        else {false}
+    };
+    let routing_held=||RunReport::held(format!("PR #{pr}: automatic reviewer hold routing deferred"));
+    if !routing_allowed().await {return routing_held();}
     let path = unreviewable_path();
     let today = utc_day_now();
     // A verdict that cannot change is not counted: it stands down now.
@@ -6496,6 +6505,7 @@ async fn hold_unreviewable(
     }
     let gh = gh_bin();
     if let Some(body) = &plan.wait_comment {
+        if !routing_allowed().await {return routing_held();}
         let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", body], repo_root).await;
     }
     if let Some(body) = &plan.stand_down {
@@ -6505,8 +6515,10 @@ async fn hold_unreviewable(
         // close WITHOUT the label invites the fresh lane to rebuild over the
         // branch, so a failed label leaves the draft open and unmarked; the
         // next pass (at most once a UTC day) tries again.
+        if !routing_allowed().await {return routing_held();}
         match label_gave_up(repo_root, issue, &format!("held:{}", why.code())).await {
             Ok(()) => {
+                if !routing_allowed().await {return routing_held();}
                 close_gave_up_pr(repo_root, pr, issue, body).await;
                 note_stood_down(&path, pr, issue, why);
                 notify_review(&format!(
@@ -6805,7 +6817,7 @@ async fn resume_draft_pr(
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
-    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run).await;
+    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run, expected_head.is_none()).await;
     if source != source_reconcile::SourceAction::Continue {
         return Ok(RunReport::held(format!("PR #{pr}: source reconciliation {source:?}")));
     }
@@ -6932,6 +6944,7 @@ async fn resume_draft_pr(
             &why,
             reasoner.calls() > 0,
             dry_run,
+            expected_head.is_none(),
         )
         .await);
     }
@@ -7514,6 +7527,7 @@ async fn resume_draft_pr(
                         &why,
                         reasoner.calls() > 0,
                         dry_run,
+                        expected_head.is_none(),
                     )
                     .await);
                 }
@@ -8195,6 +8209,7 @@ async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<Run
 }
 
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
+    let automatic_routing=selected.is_none();
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
         // Read-only, before lock/state creation, issue selection or model spend.
@@ -9839,7 +9854,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     if independent.approved() && !repaired_after_review {
         if let Some(pr)=pr_number {
-            if workflow_guard.published_pr_ready(pr,&independent).await? {
+            if let Some(pr)=pr_number {
+        if !manual_routing::permit_mutation(repo_root,pr,Some(issue.number),automatic_routing,&mut workflow_guard).await? {
+            return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+        }
+    }
+    if workflow_guard.published_pr_ready(pr,&independent).await? {
                 workflow_guard.finish()?;
                 return Ok(RunReport::built(format!("issue #{}: validated PR published; PR milestone complete — {pr_url}",issue.number)));
             }
@@ -9972,9 +9992,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             issue.number
         )));
     }
-    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false).await
+    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false, automatic_routing).await
         != source_reconcile::SourceAction::Continue {
         return Ok(RunReport::built(format!("issue #{}: source changed before merge; reconciliation retained — {pr_url}", issue.number)));
+    }
+    if !manual_routing::permit_mutation(repo_root,pr_number.unwrap(),Some(issue.number),automatic_routing,&mut workflow_guard).await? {
+        return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     workflow_guard.validate_binding(workflow_guard.binding()).await?;
     acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
@@ -20230,17 +20253,29 @@ with (root/'gh-calls.jsonl').open('a') as log:
     log.write(json.dumps(args)+'\n')
 if args[:1]==['api'] and '/issues/' in args[1]:
     number=int(args[1].rsplit('/',1)[1])
+    completed=(root/'source-completed').exists()
+    if completed:(root/'manual-now').write_text('owner changed routing during source observation')
     print(json.dumps({'number':number,'title':'Synthetic casing rule','body':'Synthetic issue body.',
-        'state':'open','labels':[],'user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
+        'state':'closed' if completed else 'open','state_reason':'completed' if completed else None,
+        'labels':[],'user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
 elif args[:2]==['repo','view']:
     print('synthetic-owner/synthetic')
 elif args[:2]==['pr','view']:
-    print(json.dumps({'number':int(args[2]),'labels':[],'closingIssuesReferences':[],
+    fields=args[args.index('--json')+1] if '--json' in args else ''
+    if fields=='body' and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text() in ('manual','unavailable'):
+        (root/'manual-now').write_text('owner changed routing after admission')
+    late=(root/'manual-now').exists() and 'labels' in fields
+    if late and (root/'inject-manual-after-entry').read_text() in ('unavailable','unavailable-after-label'):sys.exit(1)
+    print(json.dumps({'number':int(args[2]),'labels':[{'name':'autoship-manual'}] if late else [],'closingIssuesReferences':[],
+        'state':'CLOSED' if (root/'closed-pr').exists() else 'OPEN','headRefName':'agent-fix/issue-70994','isCrossRepository':False,
         'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
 elif args[:2]==['issue','edit'] and (root/'fail-label').exists():
     sys.stderr.write('synthetic label failure\n')
     sys.exit(1)
 elif args[:2] in (['pr','comment'],['pr','close'],['issue','edit']):
+    if args[:2]==['pr','close'] and (root/'source-completed').exists():(root/'closed-pr').write_text('closed')
+    if args[:2]==['issue','edit'] and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text().endswith('after-label'):
+        (root/'manual-now').write_text('owner changed routing after label dispatch')
     print('ok')
 else:
     sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n')
@@ -20260,6 +20295,7 @@ else:
             .env("JARVIS_1037_ROOT", root)
             .env("HOME", root.join("home"))
             .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.join("state"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("workflow.db"))
             .env("GH_BIN", fake_gh_1037(root))
             .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "synthetic-owner")
             .env("AUGMENTAGENT_GH_OWNER", "synthetic-owner")
@@ -20331,6 +20367,81 @@ else:
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn source_retirement_rechecks_automatic_routing_but_still_observes_external_closure() {
+        const NAME:&str="self_improve::tests::source_retirement_rechecks_automatic_routing_but_still_observes_external_closure";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            let fixture=tempfile::tempdir().unwrap();run_1037_child(NAME,fixture.path());return;
+        };
+        std::fs::write(root.join("inject-manual-after-entry"),"manual-source-close").unwrap();
+        std::fs::write(root.join("source-completed"),b"completed").unwrap();
+        let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
+        let remote=root.join("remote.git");
+        let head=std::process::Command::new("git").args(["--git-dir",remote.to_str().unwrap(),"rev-parse",&branch]).output().unwrap();
+        assert!(head.status.success());let head=String::from_utf8(head.stdout).unwrap();
+        record_opened_pr(&opened_prs_path(),70994,71000,head.trim(),None);
+        assert!(manual_routing::allowed(&repo,"synthetic-owner/synthetic",71000,Some(70994)).await);
+        let result=source_reconcile::reconcile(&repo,71000,70994,false,true).await;
+        assert!(matches!(result,source_reconcile::SourceAction::Hold(_)),
+            "automatic source retirement closed a newly manual PR: {result:?}");
+        assert!(!gh_calls_1037(&root).iter().any(|c|gh_call_is(c,&["pr","close"])));
+        let path=workflow::path();let mut store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        for id in ["synthetic-owner/synthetic#70994","synthetic-owner/synthetic/pr/71000"] {
+            store.register(id,&branch,crate::autoship_workflow::Binding {head:head.trim().into(),contract:"request".into(),evidence_hash:"evidence".into()},1).unwrap();
+            store.set_owner_pause(id,"github:synthetic-owner",0,true,2).unwrap();
+            assert!(matches!(source_reconcile::reconcile(&repo,71000,70994,false,false).await,source_reconcile::SourceAction::Hold(_)),
+                "explicit routing bypassed the existing owner pause");
+            assert!(!gh_calls_1037(&root).iter().any(|c|gh_call_is(c,&["pr","close"])));
+            store.set_owner_pause(id,"github:synthetic-owner",1,false,3).unwrap();
+        }
+        assert_eq!(source_reconcile::reconcile(&repo,71000,70994,false,false).await,source_reconcile::SourceAction::Retired,
+            "routing label revoked explicit source retirement");
+        let calls=gh_calls_1037(&root).iter().filter(|c|gh_call_is(c,&["pr","close"])).count();
+        assert_eq!(source_reconcile::reconcile(&repo,71000,70994,false,true).await,source_reconcile::SourceAction::Retired,
+            "manual routing prevented observation of an already-closed target");
+        assert_eq!(gh_calls_1037(&root).iter().filter(|c|gh_call_is(c,&["pr","close"])).count(),calls,
+            "terminal observation repeated an external close");
+    }
+
+    #[tokio::test]
+    async fn late_manual_routing_blocks_stand_down_without_revoking_explicit_targeting() {
+        const NAME:&str="self_improve::tests::late_manual_routing_blocks_stand_down_without_revoking_explicit_targeting";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            for mode in ["manual","unavailable","manual-after-label","unavailable-after-label"] {
+                let fixture=tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("inject-manual-after-entry"),mode).unwrap();
+                run_1037_child(NAME,fixture.path());
+            }
+            return;
+        };
+        let branch=format!("{BRANCH_PREFIX}70994");
+        let repo=fixture_repo_1037(&root,&[&branch]);
+        let reasoner=build_reasoner();
+        let held=resume_draft_pr(&repo,&reasoner,71000,70994,&branch,false,None).await.unwrap();
+        assert!(root.join("manual-now").exists(),"fixture never changed routing after entry");
+        let calls=gh_calls_1037(&root);
+        let after_label=std::fs::read_to_string(root.join("inject-manual-after-entry")).unwrap().ends_with("after-label");
+        assert!(!calls.iter().any(|c|gh_call_is(c,&["pr","close"]) || gh_call_is(c,&["pr","comment"])),
+            "automatic stand-down mutated a newly manual/unknown PR: {calls:?}");
+        assert_eq!(calls.iter().any(|c|gh_call_is(c,&["issue","edit"])),after_label,
+            "a label already dispatched must be preserved, without admitting the close");
+        assert!(held.is_idle() && !held.billed,"routing refusal must remain an unpaid hold");
+        assert_eq!(reasoner.calls(),0);
+        assert!(read_unreviewable(&root.join("unreviewable.json")).is_empty(),"manual routing created stand-down debt");
+        let before=calls.len();
+        let explicit_reasoner=build_reasoner();
+        let remote=root.join("remote.git");
+        let head=std::process::Command::new("git").args(["--git-dir",remote.to_str().unwrap(),"rev-parse",&branch]).output().unwrap();
+        assert!(head.status.success());let head=String::from_utf8(head.stdout).unwrap();
+        let explicit=resume_draft_pr(&repo,&explicit_reasoner,71000,70994,&branch,false,Some(head.trim())).await.unwrap();
+        assert!(!explicit.billed);
+        let calls=gh_calls_1037(&root);
+        assert!(calls[before..].iter().any(|c|gh_call_is(c,&["issue","edit"])),"explicit result: {}; calls: {:?}",explicit.message,&calls[before..]);
+        assert!(calls[before..].iter().any(|c|gh_call_is(c,&["pr","close"])),"automatic routing revoked explicit targeting");
+        assert_eq!(reasoner.calls(),0);
+        assert_eq!(explicit_reasoner.calls(),0);
     }
 
     /// C5 — the currently open pre-deploy draft, as a synthetic fixture: an
@@ -20427,7 +20538,7 @@ else:
         let when = until.format("%Y-%m-%d %H:%M UTC").to_string();
         assert!(why.headline().contains(&format!("reviewer latched until {when}")), "{}", why.headline());
 
-        let first = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        let first = hold_unreviewable(&root, 71001, 70995, &why, false, false, false).await;
         assert!(!first.billed && first.is_idle(), "{}", first.message);
         let calls = gh_calls_1037(&root);
         let wait = calls.iter().find(|c| gh_call_is(c, &["pr", "comment", "71001"])).expect("the wait is explained");
@@ -20441,7 +20552,7 @@ else:
         record.get_mut("71001").expect("today was counted").days = vec![today - 2, today - 1];
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 
-        let third = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        let third = hold_unreviewable(&root, 71001, 70995, &why, false, false, false).await;
         assert!(!third.billed, "{}", third.message);
         assert!(third.message.contains("still draft"), "{}", third.message);
         let calls = gh_calls_1037(&root);
@@ -20531,7 +20642,7 @@ else:
         };
         std::fs::write(root.join("fail-label"), b"").unwrap();
         let why = ReviewUnavailable::ProvenanceUnknown;
-        let first = hold_unreviewable(&root, 71007, 70997, &why, false, false).await;
+        let first = hold_unreviewable(&root, 71007, 70997, &why, false, false, false).await;
         let calls = gh_calls_1037(&root);
         assert!(calls.iter().any(|c| gh_call_is(c, &["issue", "edit", "70997"])), "the label was attempted");
         assert!(!calls.iter().any(|c| gh_call_is(c, &["pr", "close"])), "no close without the label: {calls:?}");
@@ -20540,7 +20651,7 @@ else:
 
         // The label works next time: now it stands down.
         std::fs::remove_file(root.join("fail-label")).unwrap();
-        let second = hold_unreviewable(&root, 71007, 70997, &why, false, false).await;
+        let second = hold_unreviewable(&root, 71007, 70997, &why, false, false, false).await;
         assert!(gh_calls_1037(&root).iter().any(|c| gh_call_is(c, &["pr", "close", "71007"])));
         assert!(!second.billed && !second.is_idle(), "{}", second.message);
     }
