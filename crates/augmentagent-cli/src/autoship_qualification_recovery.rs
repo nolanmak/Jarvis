@@ -51,6 +51,26 @@ pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkp
     Ok(value.as_deref()==Some(serde_json::json!({"physical":true,"checkpoint":checkpoint}).to_string().as_str()))
 }
 
+pub(crate) const RETAINED_REQUALIFICATION_RULE:&str="retained-original-witness-current-validation-v1";
+
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedWitnessReference {
+    pub plan:String,
+    pub result:String,
+    pub data:String,
+    pub prepared:String,
+    pub contract:String,
+}
+impl RetainedWitnessReference {
+    fn valid(&self)->bool { [&self.plan,&self.result,&self.data,&self.prepared,&self.contract].into_iter().all(|value|semantic_hash(value)) }
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(tag="kind",rename_all="snake_case",deny_unknown_fields)]
+enum QualificationRecoverySource {
+    RetainedOriginalWitness {evidence:RetainedWitnessReference,owner_request_sha256:String},
+}
+
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SemanticReconsideration {
@@ -61,6 +81,21 @@ pub(crate) struct SemanticReconsideration {
     original_generation:i64,
     pub binding:Binding,
     qualification_required:bool,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    source:Option<QualificationRecoverySource>,
+}
+impl SemanticReconsideration {
+    pub(crate) fn retained_witness(&self)->Option<&RetainedWitnessReference> {
+        self.source.as_ref().map(|source|match source {QualificationRecoverySource::RetainedOriginalWitness {evidence,..}=>evidence})
+    }
+}
+fn retained_policy()->String {format!("{:x}",Sha256::digest(RETAINED_REQUALIFICATION_RULE.as_bytes()))}
+fn retained_key(workflow:&str,evidence:&RetainedWitnessReference,policy:&str)->Result<String> {
+    Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&("retained-qualification-recovery-v1",workflow,evidence,policy))?)))
+}
+pub(super) fn metadata_hold(checkpoint:&Checkpoint)->bool {
+    checkpoint.stage==Stage::Scope && checkpoint.next.reason=="acceptance_contract_invalid"
+        && checkpoint.next.action=="await_acceptance_input_change"
 }
 
 fn semantic_key(workflow:&str,identity:&str,policy:&str)->Result<String> {
@@ -74,10 +109,25 @@ fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)-
     let saved:Option<(i64,String)>=conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
     let Some((recorded_generation,raw))=saved else{return Ok(None)};
     let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
-    ensure!(cue.version==1 && cue.qualification_required && cue.original_generation==recorded_generation
-        && recorded_generation<=generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment)
-        && cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration reference changed");
-    Ok((cue.binding==*binding).then_some(cue))
+    ensure!(cue.qualification_required && cue.original_generation==recorded_generation
+        && recorded_generation<=generation && semantic_hash(&cue.policy) && semantic_hash(&cue.judgment),"semantic reconsideration reference changed");
+    match (&cue.source,cue.version) {
+        (None,1)=>{
+            ensure!(cue.key==semantic_key(workflow,&cue.judgment,&cue.policy)?,"semantic reconsideration key changed");
+            Ok((cue.binding==*binding).then_some(cue))
+        },
+        (Some(QualificationRecoverySource::RetainedOriginalWitness {evidence,owner_request_sha256}),2)=>{
+            ensure!(evidence.valid() && semantic_hash(owner_request_sha256) && evidence.data==cue.judgment
+                && cue.key==retained_key(workflow,evidence,&cue.policy)?,"retained qualification reference changed");
+            // Only a protected CURRENT execution context can connect original
+            // facts to a new live binding. Neither a head nor a plan grants it.
+            let Some(context)=qualification_schedule::context(conn,workflow,binding)? else{return Ok(None)};
+            let owner=format!("{:x}",Sha256::digest(context.source_request.as_bytes()));
+            let same_contract=context.contract==context.source_request || context.contract==format!("registered:{}",evidence.contract);
+            Ok((owner==*owner_request_sha256 && same_contract).then_some(cue))
+        },
+        _=>bail!("unsupported qualification recovery source"),
+    }
 }
 
 #[derive(Serialize,Deserialize)]
@@ -117,7 +167,20 @@ impl WorkflowStore {
     pub(crate) fn semantic_reconsideration(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
         let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
         if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
-        semantic_cue(&self.conn,workflow,binding,snapshot.generation)
+        let cue=semantic_cue(&self.conn,workflow,binding,snapshot.generation)?;
+        if let Some(cue)=&cue {
+            if cue.retained_witness().is_some() {
+                let settled:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='retained_qualification_prepared' AND json_extract(payload,'$.key')=?2)",params![workflow,cue.key],|r|r.get(0))?;
+                if settled {return Ok(None);}
+            }
+        }
+        Ok(cue)
+    }
+
+    pub(crate) fn retained_qualification_history(&self,workflow:&str,binding:&Binding)->Result<Option<RetainedWitnessReference>> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
+        if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
+        Ok(semantic_cue(&self.conn,workflow,binding,snapshot.generation)?.and_then(|cue|cue.retained_witness().cloned()))
     }
 
     pub(crate) fn semantic_source_waiting(&self,workflow:&str,binding:&Binding)->Result<bool> {
@@ -140,6 +203,20 @@ impl WorkflowStore {
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
         policy:&str,now:i64,validate:F)->Result<bool>
     where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<String>> {
+        self.recover_qualification_source(expected,owner_revision,policy,now,false,|custody,evidence|
+            Ok(validate(custody,evidence)?.map(|identity|(identity,None))))
+    }
+
+    /// Queue exact retained metadata for normal preparation, not an amendment
+    /// or a model call. Its stable rule cannot be replaced by a caller build hash.
+    pub(crate) fn recover_retained_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,now:i64,validate:F)->Result<bool>
+    where F:FnOnce(&VerifierEvidenceInspection<'_>)->Result<Option<RetainedWitnessReference>> {
+        self.recover_qualification_source(expected,owner_revision,&retained_policy(),now,true,|_,evidence|
+            Ok(validate(evidence)?.map(|reference|(reference.data.clone(),Some(reference)))))
+    }
+
+    fn recover_qualification_source<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,policy:&str,now:i64,retained:bool,validate:F)->Result<bool>
+    where F:FnOnce(&[NativeScopeCustody],&VerifierEvidenceInspection<'_>)->Result<Option<(String,Option<RetainedWitnessReference>)>> {
         ensure!(semantic_hash(policy),"semantic recovery policy identity is invalid");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row:Option<(String,i64,i64,String,Option<u64>)>=tx.query_row(
@@ -147,24 +224,32 @@ impl WorkflowStore {
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let Some((raw,leased,generation,branch,pr))=row else{return Ok(false)};
         let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-        if !(native_hold(&checkpoint) || legacy_amendment_input(&checkpoint).is_some()) || checkpoint!=expected.checkpoint || generation!=expected.generation
+        if !(native_hold(&checkpoint) || if retained {metadata_hold(&checkpoint)}else{legacy_amendment_input(&checkpoint).is_some()}) || checkpoint!=expected.checkpoint || generation!=expected.generation
             || branch!=expected.branch || pr!=expected.pr || leased>now || checkpoint.next.eligible_at_ms>now {return Ok(false);}
         let control=owner_control::read(&tx,&expected.workflow)?;
         if control.as_ref().is_some_and(|c|c.paused) || control.as_ref().map(|c|c.revision)!=owner_revision
             || pending_mutation(&tx,&expected.workflow)? || super::owner_inbox::pending(&tx,&expected.workflow)?>0 {return Ok(false);}
         let custody=baseline_native_custody(&tx,&expected.workflow)?;
         let inspection=VerifierEvidenceInspection::new(&tx,&expected.workflow);
-        let Some(identity)=validate(&custody,&inspection)? else{return Ok(false)};
-        ensure!(semantic_hash(&identity),"semantic recovery judgment identity is invalid");
+        let Some((identity,reference))=validate(&custody,&inspection)? else{return Ok(false)};
+        ensure!(semantic_hash(&identity) && retained==reference.is_some() && reference.as_ref().is_none_or(|reference|reference.valid() && reference.data==identity),"qualification recovery source identity is invalid");
+        let source=if let Some(reference)=&reference {
+            let context=qualification_schedule::context(&tx,&expected.workflow,&checkpoint.binding)?.context("retained qualification execution context missing")?;
+            Some(QualificationRecoverySource::RetainedOriginalWitness {evidence:reference.clone(),
+                owner_request_sha256:format!("{:x}",Sha256::digest(context.source_request.as_bytes()))})
+        }else{None};
         // Generation and owner revisions fence this transaction, but must not
         // turn the same original judgment into a fresh reconsideration budget.
         let continuation=waiting_semantic_source(&tx,&expected.workflow,generation,&checkpoint)?;
-        if continuation.as_ref().is_some_and(|(_,cue)|cue.judgment!=identity) {return Ok(false);}
-        let key=if let Some((_,cue))=&continuation {cue.key.clone()}else{semantic_key(&expected.workflow,&identity,policy)?};
+        if continuation.as_ref().is_some_and(|(_,cue)|cue.judgment!=identity || cue.source!=source) {return Ok(false);}
+        let key=if let Some((_,cue))=&continuation {cue.key.clone()}else if let Some(reference)=&reference {
+            retained_key(&expected.workflow,reference,policy)?
+        }else{semantic_key(&expected.workflow,&identity,policy)?};
         let consumed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' AND json_extract(payload,'$.key')=?2)",params![expected.workflow,key],|r|r.get(0))?;
         if consumed && continuation.is_none() {return Ok(false);}
         checkpoint.stage=Stage::Reconcile;
-        checkpoint.next=NextAction {reason:"original_semantic_witness_recovered".into(),action:"reconsider_verifier".into(),eligible_at_ms:now};
+        checkpoint.next=NextAction {reason:"original_semantic_witness_recovered".into(),
+            action:if retained {"requalify_original_measurement"}else{"reconsider_verifier"}.into(),eligible_at_ms:now};
         let raw=serde_json::to_string(&checkpoint)?;
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
         event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
@@ -172,9 +257,28 @@ impl WorkflowStore {
             event(&tx,&expected.workflow,generation,"original_semantic_source_restored",
                 &serde_json::json!({"version":1,"key":key,"loss_sequence":sequence,"qualification_required":true}).to_string(),now)?;
         }else {
-            event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
-                &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"binding":checkpoint.binding,"qualification_required":true}).to_string(),now)?;
+            let cue=SemanticReconsideration {version:if retained {2}else{1},key,judgment:identity,policy:policy.into(),original_generation:generation,
+                binding:checkpoint.binding,qualification_required:true,source};
+            event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",&serde_json::to_value(&cue)?.to_string(),now)?;
         }
+        tx.commit()?;Ok(true)
+    }
+
+    pub(crate) fn settle_retained_qualification<F>(&mut self,lease:&Lease,binding:&Binding,now:i64,validate:F)->Result<bool>
+    where F:FnOnce(&RetainedWitnessReference,&VerifierEvidenceInspection<'_>)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;owner_turn::require_native_dispatch(&tx,lease,now)?;
+        ensure!(!pending_mutation(&tx,&lease.workflow)?,"retained qualification has unsettled publication");
+        let Some(cue)=semantic_cue(&tx,&lease.workflow,binding,lease.generation)? else{return Ok(false)};
+        let Some(reference)=cue.retained_witness() else{return Ok(false)};
+        let done:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='retained_qualification_prepared' AND json_extract(payload,'$.key')=?2)",params![lease.workflow,cue.key],|r|r.get(0))?;
+        if done {return Ok(false);}
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"retained qualification workflow is not active");
+        ensure!(waiting_semantic_source(&tx,&lease.workflow,lease.generation,&checkpoint)?.is_none(),"retained qualification source is still held");
+        validate(reference,&VerifierEvidenceInspection::new(&tx,&lease.workflow))?;
+        event(&tx,&lease.workflow,lease.generation,"retained_qualification_prepared",&serde_json::json!({"version":1,"key":cue.key,"data":reference.data,"prepared":reference.prepared,"qualification_required":false}).to_string(),now)?;
         tx.commit()?;Ok(true)
     }
 
@@ -278,6 +382,84 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    fn retained_reference()->RetainedWitnessReference {
+        RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)}
+    }
+    fn retained_fixture()->(tempfile::TempDir,WorkflowStore,Snapshot) {
+        let (dir,mut store,lease,mut hold)=fixture();
+        hold.next=NextAction {reason:"acceptance_contract_invalid".into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+        let context=RecoveryContext {version:1,workflow:lease.workflow.clone(),repository:"owner/repo".into(),worktree:dir.path().into(),
+            source_request:"original owner request".into(),source_pr:None,contract:"original owner request".into(),environment:"original environment".into(),binding:hold.binding.clone()};
+        store.record_recovery_context(&lease,&hold.binding,&context,4).unwrap();
+        store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
+        let snapshot=store.snapshot(&lease.workflow).unwrap().unwrap();(dir,store,snapshot)
+    }
+
+    #[test]
+    fn retained_wake_is_typed_once_and_survives_binding_rotation_and_source_restoration() {
+        let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let queued=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((queued.attempts,queued.generation,queued.model_calls,queued.tokens),(before.attempts,before.generation,before.model_calls,before.tokens));
+        assert_eq!(queued.checkpoint.next.action,"requalify_original_measurement");
+        let cue=store.semantic_reconsideration(&id,&queued.checkpoint.binding).unwrap().unwrap();
+        assert_eq!(cue.version,2);assert_eq!(cue.retained_witness(),Some(&reference));assert_eq!(cue.policy,retained_policy());
+        assert_eq!(store.due_qualification_recovery(Some("owner/repo"),8).unwrap(),vec![id.clone()]);
+        assert!(!store.recover_retained_qualification(&before,None,8,|_|panic!("stale preview reached source inspector")).unwrap());
+        let lease=store.claim_productive_for_binding(&id,"normal-worker",9,1000,&queued.checkpoint.binding).unwrap().unwrap();
+        let mut checkpoint=queued.checkpoint.clone();checkpoint.binding.head="main-integrated-head".into();
+        checkpoint.binding.contract=reference.contract.clone();checkpoint.binding.evidence_hash="new-registered-evidence".into();
+        let context=RecoveryContext {version:1,workflow:id.clone(),repository:"owner/repo".into(),worktree:_dir.path().into(),source_request:"original owner request".into(),source_pr:None,
+            contract:format!("registered:{}",reference.contract),environment:"original environment".into(),binding:checkpoint.binding.clone()};
+        store.checkpoint_with_execution_context(&lease,&checkpoint,&context,10).unwrap();
+        assert_eq!(store.semantic_reconsideration(&id,&checkpoint.binding).unwrap().unwrap(),cue,"live binding rotation replaced/lost immutable metadata source");
+        store.hold_semantic_source_unavailable(&lease,&checkpoint.binding,&cue.key,11).unwrap();store.release(&lease,12).unwrap();
+        let lost=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        assert!(!store.recover_retained_qualification(&lost,None,13,|_|Ok(None)).unwrap());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),lost);assert_eq!(store.events(&id).unwrap(),events);
+        assert!(store.recover_retained_qualification(&lost,None,14,|_|Ok(Some(reference.clone()))).unwrap());
+        assert_eq!(store.semantic_reconsideration(&id,&checkpoint.binding).unwrap().unwrap(),cue,"restoration minted another cue");
+        let lease=store.claim_productive_for_binding(&id,"normal-restored",15,1000,&checkpoint.binding).unwrap().unwrap();
+        assert!(store.settle_retained_qualification(&lease,&checkpoint.binding,16,|_,_|bail!("qualification/prepared publication incomplete")).is_err());
+        assert!(store.semantic_reconsideration(&id,&checkpoint.binding).unwrap().is_some());
+        assert!(store.settle_retained_qualification(&lease,&checkpoint.binding,17,|actual,_|{assert_eq!(actual,&reference);Ok(())}).unwrap());
+        assert!(store.semantic_reconsideration(&id,&checkpoint.binding).unwrap().is_none(),"settled preparation still overrides later verifier revisions");
+        assert_eq!(store.retained_qualification_history(&id,&checkpoint.binding).unwrap(),Some(reference.clone()));
+        assert!(!store.settle_retained_qualification(&lease,&checkpoint.binding,18,|_,_|panic!("settlement repeated")).unwrap());
+        let mut hold=checkpoint.clone();hold.stage=Stage::Scope;hold.next=NextAction {reason:"acceptance_contract_invalid".into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&hold,19).unwrap();store.release(&lease,20).unwrap();
+        let final_hold=store.snapshot(&id).unwrap().unwrap();
+        assert!(!store.recover_retained_qualification(&final_hold,None,86_400_001,|_|Ok(Some(reference))).unwrap(),"UTC rollover/input hold refilled the same metadata wake");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
+        let events=store.events(&id).unwrap();
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),1);
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),1);
+    }
+
+    #[test]
+    fn retained_source_cannot_cross_owner_or_registered_contract_and_rolls_back_failed_wake() {
+        for fault in ["owner","contract","storage"] {
+            let (dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let reference=retained_reference();
+            if fault=="storage" {
+                store.conn.execute_batch("CREATE TRIGGER refuse_retained_cue BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_witness_recovered' BEGIN SELECT RAISE(ABORT,'handoff unavailable'); END;").unwrap();
+                let events=store.events(&id).unwrap();
+                assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference))).is_err());
+                assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);continue;
+            }
+            assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+            let queued=store.snapshot(&id).unwrap().unwrap();
+            let lease=store.claim_productive_for_binding(&id,"normal",8,1000,&queued.checkpoint.binding).unwrap().unwrap();
+            let mut checkpoint=queued.checkpoint.clone();checkpoint.binding.head="new-head".into();
+            let request=if fault=="owner" {"different owner request"}else{"original owner request"};
+            let context=RecoveryContext {version:1,workflow:id.clone(),repository:"owner/repo".into(),worktree:dir.path().into(),source_request:request.into(),source_pr:None,
+                contract:if fault=="contract" {format!("registered:{}","f".repeat(64))}else{request.into()},environment:"original environment".into(),binding:checkpoint.binding.clone()};
+            store.checkpoint_with_execution_context(&lease,&checkpoint,&context,9).unwrap();
+            assert!(store.semantic_reconsideration(&id,&checkpoint.binding).unwrap().is_none(),"{fault} change reused historical work authority");
+            assert!(store.retained_qualification_history(&id,&checkpoint.binding).unwrap().is_none());
+        }
     }
 
     #[test]

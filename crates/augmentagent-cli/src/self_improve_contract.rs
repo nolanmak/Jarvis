@@ -2295,6 +2295,68 @@ pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:Acceptan
 pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:AcceptanceSource,
     binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<(PreparedAcceptance,String)>> {
+    let candidates=retained_preparation_candidates(root,control,source,binding,evidence)?;
+    let mut selected:Option<(PreparedAcceptance,String)>=None;
+    for prepared in candidates {
+        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
+        if let Some((previous,key))=&selected {
+            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
+        }else{selected=Some((prepared,identity));}
+    }
+    Ok(selected)
+}
+
+
+/// Read exact original facts for free metadata recovery. Current semantic
+/// validation produces a reference, never a qualification receipt or lease.
+pub(super) fn inspect_retained_qualification(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    let mut selected=None;
+    for prepared in retained_preparation_candidates(root,control,source,binding,evidence)? {
+        let Some(reference)=baseline_witness::retained_qualification_reference(root,control,&prepared,evidence)? else{continue};
+        if let Some(previous)=&selected {ensure!(previous==&reference,"retained qualification source is ambiguous");}
+        else{selected=Some(reference);}
+    }
+    Ok(selected)
+}
+
+/// Consume immutable plan/result references rather than requiring the original
+/// execution binding to equal a later candidate or registered-contract binding.
+/// The store separately authenticates that association to the current request.
+pub(super) fn retained_qualification_source(root:&Path,control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<PreparedAcceptance> {
+    let original=verifier_execution::exact_original_result(&reference.plan,&reference.result,evidence)?;
+    let prepared=original.prepared;
+    ensure!(prepared.proposal.contract.source()?==source,"retained qualification source identity changed");
+    ensure!(amendment::digest(&serde_json::to_vec(&prepared)?)==reference.prepared
+        && prepared.baseline.registration.contract_hash()==reference.contract,"retained qualification prepared reference changed");
+    prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
+    // A later registered verifier revision always wins over an old recovery
+    // reference, including when that later revision's evidence is unavailable.
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if index.try_exists()? {
+        let manifest:WorkflowManifest=private_json(&index)?;
+        validate_retained_manifest(control,&manifest,source)?;
+        ensure!(manifest.original_base==prepared.baseline.registration.baseline_head()
+            && manifest.contract_hash==reference.contract && manifest.contract_revision==prepared.proposal.contract.revision,
+            "retained qualification cannot replace a newer registered verifier");
+    }
+    match retained_prepared(root,control,source) {
+        Ok(Some(published))=>ensure!(serde_json::to_vec(&published)?==serde_json::to_vec(&prepared)?,"published prepared evidence differs from retained qualification"),
+        Ok(None)=>{},
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{},
+        Err(error)=>return Err(error),
+    }
+    ensure!(baseline_witness::retained_qualification_reference(root,control,&prepared,evidence)?.as_ref()==Some(reference),
+        "retained qualification source is unavailable or changed");
+    Ok(prepared)
+}
+
+fn retained_preparation_candidates(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Vec<PreparedAcceptance>> {
     let mut candidates=match retained_prepared(root,control,source) {
         Ok(Some(prepared))=>vec![prepared],
         Ok(None)=>verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
@@ -2310,14 +2372,7 @@ pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:Acceptanc
             && prepared.baseline.registration.contract_hash()==manifest.contract_hash
             && prepared.proposal.contract.revision==manifest.contract_revision);
     }
-    let mut selected:Option<(PreparedAcceptance,String)>=None;
-    for prepared in candidates {
-        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
-        if let Some((previous,key))=&selected {
-            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
-        }else{selected=Some((prepared,identity));}
-    }
-    Ok(selected)
+    Ok(candidates)
 }
 
 fn validate_retained_manifest(control:&Path,manifest:&WorkflowManifest,source:AcceptanceSource)->Result<()> {

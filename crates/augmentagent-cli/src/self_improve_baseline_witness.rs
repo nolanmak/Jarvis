@@ -37,7 +37,7 @@ struct Artifact {
     provenance:scope_authority::NativeReplyReference,
 }
 
-const REQUALIFICATION_RULE:&str="retained-original-witness-current-validation-v1";
+const REQUALIFICATION_RULE:&str=crate::autoship_workflow::RETAINED_REQUALIFICATION_RULE;
 #[derive(Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(deny_unknown_fields)]
 struct CheckedNativeResponse {
@@ -54,7 +54,7 @@ struct RequalifiedArtifact {
 pub(super) fn policy_hash()->String {
     amendment::digest(&serde_json::to_vec(&("original-production-witness-v1",amendment::digest(include_bytes!("self_improve_baseline_witness.rs")),
         amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
-        amendment::digest(include_bytes!("self_improve_verifier_checkout.rs")),scope_authority::witness_policy_hash())).unwrap())
+        amendment::digest(include_bytes!("self_improve_verifier_checkout.rs")),scope_authority::witness_policy_hash(),REQUALIFICATION_RULE)).unwrap())
 }
 fn context(proposal:&ContractProposal,baseline:&BaselineEvidence)->Result<String> {
     context_with_policy(proposal,baseline,&policy_hash())
@@ -453,6 +453,19 @@ fn checked_retained_responses(root:&Path,data:&RetainedOriginalWitnessData)->Res
 }
 fn requalification_error(error:anyhow::Error)->anyhow::Error {
     if error.downcast_ref::<BaselineNotRed>().is_some() {error}else {error.context(initial_repair::Hold::EvidenceUnknown)}
+}
+pub(super) fn retained_qualification_reference(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    if retained_controller_slots(root,control,prepared,evidence)?.is_empty() {return Ok(None);}
+    let references=verifier_execution::matching_original_results(prepared,evidence)?;
+    ensure!(references.len()==1,"retained witness original measurement is missing or ambiguous");
+    let (plan,result)=&references[0];
+    let data=retained_original_witness_data(root,control,plan,result,evidence)?.context("retained original witness data missing")?;
+    let serialized=serde_json::to_vec(prepared)?;
+    ensure!(serde_json::to_vec(&data.original.prepared)?==serialized,"retained original measurement changed");
+    checked_retained_responses(root,&data)?;
+    Ok(Some(crate::autoship_workflow::RetainedWitnessReference {plan:plan.clone(),result:result.clone(),data:data.identity,
+        prepared:amendment::digest(&serialized),contract:prepared.baseline.registration.contract_hash().into()}))
 }
 fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
@@ -1240,6 +1253,41 @@ mod tests {
             assert_eq!(checked.runs.len(),1);assert_eq!(checked.runs[0].replies.len(),1);
             let before=store.snapshot(guard.id()).unwrap().unwrap();assert_eq!(before.model_calls,1);
             let native_bytes=private_bytes(&reference.artifact,64*1024).unwrap();
+            let events=store.events(guard.id()).unwrap();
+            let retained=retained_qualification_reference(root.path(),&native_control,&prepared,&store.inspect_verifier_evidence(guard.id())).unwrap()
+                .expect("complete original evidence cannot enter the typed metadata recovery handoff");
+            assert_eq!(retained.plan,plan);assert_eq!(retained.result,result);assert_eq!(retained.data,checked.identity);
+            assert_eq!(retained.prepared,amendment::digest(&serde_json::to_vec(&prepared).unwrap()));
+            assert_eq!(retained.contract,prepared.baseline.registration.contract_hash());
+            let source=prepared.proposal.contract.source().unwrap();
+            let evidence=store.inspect_verifier_evidence(guard.id());
+            assert_eq!(inspect_retained_qualification(root.path(),&native_control,source,guard.binding(),&evidence).unwrap(),Some(retained.clone()));
+            let recovered=retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).unwrap();
+            assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            assert!(retained_qualification_source(root.path(),&native_control,AcceptanceSource::PullRequest(841),&retained,&evidence).is_err());
+            for field in ["plan","result","data","prepared","contract"] {
+                let mut changed=serde_json::to_value(&retained).unwrap();changed[field]="f".repeat(64).into();
+                let changed=serde_json::from_value(changed).unwrap();
+                assert!(retained_qualification_source(root.path(),&native_control,source,&changed,&evidence).is_err(),"changed {field} reached preparation");
+            }
+            let manifest=WorkflowManifest::from_prepared(source,&prepared);
+            let index=native_control.join(format!("{}-workflow.json",source.key()));
+            write_manifest(&native_control,&manifest).unwrap();
+            // Recover the crash window after manifest publication, then the
+            // ordinary enrolled case. Neither may generate new original data.
+            retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).unwrap();
+            let prepared_path=evidence_path(&native_control,source,base).unwrap();
+            persist_initial_prepared(&native_control,&prepared_path,&prepared).unwrap();
+            retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).unwrap();
+            assert_eq!(inspect_retained_qualification(root.path(),&native_control,source,guard.binding(),&evidence).unwrap(),Some(retained.clone()));
+            let mut later=manifest.clone();later.contract_revision+=1;later.contract_hash="e".repeat(64);
+            std::fs::write(&index,serde_json::to_vec(&later).unwrap()).unwrap();
+            assert!(retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).is_err(),
+                "old original data replaced a later registered verifier whose prepared evidence was missing");
+            std::fs::write(&index,serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(),before);
+            assert_eq!(store.events(guard.id()).unwrap(),events,"free metadata inspection mutated workflow history");
+            assert!(!artifact_path(control.path(),&current).exists(),"free inspection published qualification");
             let outcome=qualify(root.path(),control.path(),&prepared,&guard).await;
             assert!(outcome.is_ok(),"complete retained original witness required new native generation instead of current requalification: {outcome:?}");
             assert_current(root.path(),control.path(),&prepared).unwrap();
@@ -1415,6 +1463,10 @@ mod tests {
         assert_eq!(prepared.len(),1,"actual original reproduced measurement is absent or ambiguous");
         let prepared=&prepared[0];let base=prepared.baseline.registration.baseline_head();
         assert_eq!(base,"b9e09d46864928a90c78ceb52841b1e0d5968bb9");
+        let reference=inspect_retained_qualification(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&before.checkpoint.binding,&evidence).unwrap()
+            .expect("actual metadata hold has no typed retained original handoff");
+        let recovered=retained_qualification_source(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&reference,&evidence).unwrap();
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(prepared).unwrap());
         let mut cursor=0;let mut captured_originals=0;
         loop {
             let rows=evidence.page("original_verifier_result",cursor).unwrap();if rows.is_empty(){break;}

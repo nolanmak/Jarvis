@@ -278,7 +278,7 @@ impl WorkflowStore {
                 OR (json_extract(w.checkpoint,'$.next.reason')='original_native_custody_recovered'
                 AND json_extract(w.checkpoint,'$.next.action')='requalify_original')
                 OR (json_extract(w.checkpoint,'$.next.reason')='original_semantic_witness_recovered'
-                AND json_extract(w.checkpoint,'$.next.action')='reconsider_verifier'))
+                AND json_extract(w.checkpoint,'$.next.action') IN ('reconsider_verifier','requalify_original_measurement')))
             AND (?1 IS NULL OR instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)");
         if controls {sql.push_str(" AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)");}
         let mut query=self.conn.prepare(&sql)?;
