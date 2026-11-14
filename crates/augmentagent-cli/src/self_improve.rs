@@ -21236,7 +21236,7 @@ mod recovered_issue_selection_regressions {
     async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
         const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            for case in ["recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+            for case in ["corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
                 let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
                 git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
                 std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
@@ -21417,18 +21417,32 @@ raise AssertionError(args)
             let fault=rusqlite::Connection::open(&database).unwrap();
             fault.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![held_id,raw]).unwrap();
             if case=="corrupt-recovery-peer-snapshot" {fault.execute("UPDATE workflow SET pr='fixture-invalid-pr' WHERE id=?1",[held_id]).unwrap();}
+            if case.starts_with("corrupt-recovery-peer-operation-") {
+                let kind=if case=="corrupt-recovery-peer-operation-kind" {"not-json".to_owned()}else{serde_json::to_string(&crate::autoship_workflow::OperationKind::Push).unwrap()};
+                let binding=if case=="corrupt-recovery-peer-operation-binding" {"{}".to_owned()}else{serde_json::to_string(&checkpoint.binding).unwrap()};
+                fault.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES('corrupt-peer-operation',?1,?2,?3,0)",rusqlite::params![held_id,kind,binding]).unwrap();
+                if case=="corrupt-recovery-peer-operation-column" {fault.execute("UPDATE operation SET kind=x'00ff' WHERE id='corrupt-peer-operation'",[]).unwrap();}
+            }
             injected_checkpoint=Some(raw);
         }
+        let operation_before=if case.starts_with("corrupt-recovery-peer-operation-") {
+            Some(rusqlite::Connection::open(&database).unwrap().query_row("SELECT kind,binding,receipt FROM operation WHERE id='corrupt-peer-operation'",[],|row|Ok((row.get::<_,rusqlite::types::Value>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).unwrap())
+        }else{None};
         let outcome=select_issue_with_fallback(&repo,true,true,||async {anyhow::bail!("eligible ordinary work unexpectedly yielded to fallback")}).await;
         if let Some(injected)=injected_checkpoint {
             let fault=rusqlite::Connection::open(&database).unwrap();
             let (raw,pr):(String,Option<String>)=fault.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[held_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
             assert_eq!(raw,injected,"selection rewrote malformed workflow history");
             assert_eq!(pr,(case=="corrupt-recovery-peer-snapshot").then(||"fixture-invalid-pr".to_string()),"selection repaired unknown PR ownership");
+            if let Some(before)=operation_before {
+                let after=fault.query_row("SELECT kind,binding,receipt FROM operation WHERE id='corrupt-peer-operation'",[],|row|Ok((row.get::<_,rusqlite::types::Value>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).unwrap();
+                assert_eq!(after,before,"selection rewrote or settled unknown pending-operation history");
+                fault.execute("DELETE FROM operation WHERE id='corrupt-peer-operation'",[]).unwrap();
+            }
             fault.execute("UPDATE workflow SET checkpoint=?2,pr=NULL WHERE id=?1",rusqlite::params![held_id,serde_json::to_string(&held_before.as_ref().unwrap().checkpoint).unwrap()]).unwrap();
         }
         let selected=match outcome.unwrap() {IssueSelection::Issue(issue)=>issue,IssueSelection::Report(_)=>panic!("eligible ordinary peer was starved")};
-        let expected=match case.as_str(){"recovered"|"recovery-priority"|"corrupt-recovery-peer-schema"|"corrupt-recovery-peer-json"|"corrupt-recovery-peer-snapshot"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
+        let expected=match case.as_str(){case if case.starts_with("corrupt-recovery-peer-")=>1830,"recovered"|"recovery-priority"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
         assert_eq!(selected.number,expected,"{case}: real issue selector chose an unchanged hold ahead of eligible work");
         assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
         assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);

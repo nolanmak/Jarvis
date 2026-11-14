@@ -236,3 +236,18 @@ Changed seam checks were repeated against this source; no unresolved findings
 remain. A full final-head hosted CLI/integration result, independent review,
 normal rollout and the live acceptance exits above are still required. The local
 long-scratch Unix-socket limitation remains separately tracked in #2088.
+
+
+Final engineering review found the same row-local boundary missing from pending
+operations: malformed operation JSON could still discard every healthy recovery
+hint. The real selector reproduced that global hold before the fix (0.49 seconds).
+The recovery view now excludes only the affected workflow on operation JSON or
+typed-column conversion errors; SQL/schema/storage errors still propagate.
+The three added cases cover malformed kind, malformed binding and a non-text
+kind column, and require the exact pending record to remain unchanged. The
+existing operation-schema failure case must still stop selection globally.
+Pending messages and merge-reconciliation guards remain unchanged. These
+fixtures test scheduling and custody preservation, not execution or shipment.
+
+The updated 30-case real selector/routing fixture passes in 15.90 seconds.
+Final-head broader suites, hosted checks and review remain required.

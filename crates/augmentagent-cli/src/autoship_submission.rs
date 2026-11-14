@@ -295,7 +295,15 @@ impl WorkflowStore {
                 |("original_native_custody_recovered","requalify_original")
                 |("original_semantic_witness_recovered","reconsider_verifier"|"requalify_original_measurement"));
             if checkpoint.stage!=Stage::Reconcile || checkpoint.next.eligible_at_ms>now || !recovery {continue;}
-            if self.pending_operations(&id)?.is_empty() && self.pending_owner_messages(&id)?==0
+            let operations=match self.pending_operations(&id) {
+                Ok(operations)=>operations,
+                // The query identified this workflow. Malformed operation data
+                // leaves its outcome unknown without discarding healthy peers.
+                Err(error) if error.downcast_ref::<serde_json::Error>().is_some()
+                    || error.downcast_ref::<rusqlite::Error>().is_some_and(Self::is_row_data_error)=>continue,
+                Err(error)=>return Err(error),
+            };
+            if operations.is_empty() && self.pending_owner_messages(&id)?==0
                 && !self.merge_reconciliation_needed(&id)? {ready.push(id);}
         }
         Ok(ready)
