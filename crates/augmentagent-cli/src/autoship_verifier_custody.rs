@@ -184,7 +184,14 @@ impl WorkflowStore {
             ensure!(key.len()==64 && key.bytes().all(|c|c.is_ascii_hexdigit()) && body.len()<=2*1024*1024,"invalid bounded verifier evidence");
             ensure!(matches!(kind,"original_verifier_plan"|"original_verifier_attempt"|"original_verifier_attempt_interrupted"|"original_verifier_command_admission"|"original_verifier_command_quiescent"|"original_verifier_result"|"construction_original_plan_owner"),"unknown verifier evidence role");
             let parsed:serde_json::Value=serde_json::from_str(body)?;
-            ensure!(parsed["version"]==1 && parsed["kind"]==kind && parsed["workflow"]==lease.workflow,"verifier evidence owner or role changed");
+            ensure!(parsed["kind"]==kind && parsed["workflow"]==lease.workflow,"verifier evidence owner or role changed");
+            if kind=="original_verifier_plan" && parsed["version"]==2 {
+                // Recipe validation is data only. The existing owned batch is
+                // still atomic; no command or native grant is minted here.
+                crate::self_improve::validate_approved_plan_publication(&lease.workflow,key,body,binding)?;
+            }else {
+                ensure!(parsed["version"]==1,"unsupported verifier evidence role or version");
+            }
         }
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;

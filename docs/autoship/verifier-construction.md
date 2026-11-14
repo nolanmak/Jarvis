@@ -1160,3 +1160,29 @@ must not change existing semantic authority replay keys or replenish any call
 or decision budget. All other open joins above remain required before a #2058
 PR or rollout. No provider call, execution permission or ordinary shipment was
 created by this integration validation.
+
+
+### Approved-plan publication validation (component implementation)
+
+The existing atomic owner/plan batch can now index v2 recipe data after the
+canonical Plan checker verifies its semantic key, registration mode, native
+reference structure and unchanged registered-contract identity. A narrow pure
+validation bridge crosses the storage/module boundary; it returns no plan,
+capability or dispatch permission. All other evidence roles retain version 1;
+unsupported versions, missing recipes, false keys and foreign contract bindings
+reject before mutation. V1 serialization and execution guards remain unchanged.
+
+The test-first publication regression failed on a valid recipe being rejected
+(5.22 seconds). It now passes in 5.58 seconds and verifies an actual second-write
+SQL failure rolls back both owner and plan plus events, successful retry indexes
+both, invalid records preserve history, workflow resources stay unchanged, and
+synthetic owner data cannot become an initial-repair/constructor grant. The
+synthetic DTO is deliberately not a native approval or live constructor charge.
+
+This implements data validation and the existing batch transaction only. It does
+not finish stable first-body reuse, historical native/constructor ownership,
+OriginalExecution's live approved mode, capture/result retention, restricted
+frozen recovery or Pending v2 activation. The actual approved-transition custody
+regression is still a known RED. Broader current-source acceptance/store tests
+are required; the earlier full CLI pass was on 36bdb96 before this component.
+No #2058 PR, production activation or autonomous shipment is claimed.

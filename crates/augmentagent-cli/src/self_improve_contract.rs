@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
+pub(super) fn validate_approved_plan_publication(workflow:&str,key:&str,body:&str,binding:&crate::autoship_workflow::Binding)->Result<()> {
+    verifier_execution::validate_approved_plan_publication(workflow,key,body,binding)
+}
+
 #[cfg(all(test,target_os="linux"))]
 #[path = "self_improve_fixture_probe.rs"]
 mod fixture_probe;

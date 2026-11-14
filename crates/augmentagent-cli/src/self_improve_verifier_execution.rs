@@ -108,6 +108,16 @@ fn result_key(plan:&str,attempt:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",plan,attempt)).unwrap())
 }
 
+/// Validate only an immutable approved recipe for the storage publication
+/// boundary. Native approval, constructor ownership and command grants remain
+/// separate; this function cannot return an execution capability.
+pub(super) fn validate_approved_plan_publication(workflow:&str,key:&str,body:&str,binding:&crate::autoship_workflow::Binding)->Result<()> {
+    let plan=Plan::checked(workflow,key,body)?;
+    ensure!(plan.version==2 && plan.approved.is_some() && plan.binding.contract==binding.contract,
+        "approved original plan differs from its publication role or contract");
+    Ok(())
+}
+
 /// Private captured facts only; no execution, qualification or budget grant.
 #[derive(Debug,Serialize)]
 pub(super) struct CapturedCommandData {
@@ -799,6 +809,55 @@ mod tests {
     }
     fn encode_plan(plan:&Plan)->(String,String) {
         let body=serde_json::to_string(plan).unwrap();(plan.identity(&body).unwrap(),body)
+    }
+
+    #[tokio::test]
+    async fn approved_plan_publication_is_atomic_and_validates_only_its_data_role() {
+        let (_root,control,prepared,guard)=fixture().await;
+        let mut raw=serde_json::to_value(approved_plan_dto(&prepared,&guard)).unwrap();
+        raw["binding"]=serde_json::to_value(guard.binding()).unwrap();
+        raw["approved"]["authority"]["old_contract"]=guard.binding().contract.clone().into();
+        let plan:Plan=serde_json::from_value(raw).unwrap();
+        let (key,body)=encode_plan(&plan);
+        let owner_key=amendment::digest(&serde_json::to_vec(&("construction-original-plan-owner-v1",&key)).unwrap());
+        // This is synthetic historical data, not a live constructor or review
+        // capability. Publication must not turn it into execution authority.
+        let owner=serde_json::json!({"version":1,"kind":"construction_original_plan_owner","workflow":guard.id(),
+            "plan":key,"episode":"b".repeat(64),"slot":0,"intent_sha256":"c".repeat(64)}).to_string();
+        let database=control.path().join("workflow.db");
+        let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let before=store.snapshot(guard.id()).unwrap();let events=store.events(guard.id()).unwrap();
+        let connection=rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(&format!("CREATE TRIGGER deny_approved_plan BEFORE INSERT ON scope_stage_response WHEN NEW.key='{key}' BEGIN SELECT RAISE(ABORT,'scripted approved-plan write failure'); END;")).unwrap();
+        let refused=guard.record_constructed_original_plan(&key,&body,&owner_key,&owner).unwrap_err();
+        assert!(format!("{refused:#}").contains("scripted approved-plan write failure"),"fault did not reach the approved plan insert: {refused:#}");
+        assert!(guard.recorded_scope_stage_response(&owner_key).unwrap().is_none());
+        assert!(guard.recorded_scope_stage_response(&key).unwrap().is_none());
+        assert_eq!(store.snapshot(guard.id()).unwrap(),before);assert_eq!(store.events(guard.id()).unwrap(),events);
+        connection.execute_batch("DROP TRIGGER deny_approved_plan;").unwrap();
+        guard.record_constructed_original_plan(&key,&body,&owner_key,&owner).expect("valid v2 recipe data cannot be indexed with its ownership record");
+        assert_eq!(guard.verifier_evidence(&key,"original_verifier_plan").unwrap().as_deref(),Some(body.as_str()));
+        assert_eq!(guard.verifier_evidence(&owner_key,"construction_original_plan_owner").unwrap().as_deref(),Some(owner.as_str()));
+        let published=store.events(guard.id()).unwrap();
+        let mut foreign=serde_json::to_value(&plan).unwrap();
+        foreign["binding"]["contract"]="9".repeat(64).into();
+        foreign["approved"]["authority"]["old_contract"]="9".repeat(64).into();
+        let (foreign_key,foreign_body)=encode_plan(&serde_json::from_value(foreign).unwrap());
+        let mut missing=serde_json::to_value(&plan).unwrap();missing.as_object_mut().unwrap().remove("approved");
+        for (bad_key,bad_kind,bad_body) in [
+            (foreign_key,"original_verifier_plan",foreign_body),
+            (key.clone(),"original_verifier_plan",missing.to_string()),
+            ("f".repeat(64),"original_verifier_plan",body.clone()),
+            (key.clone(),"original_verifier_plan",body.replace("\"version\":2","\"version\":3")),
+            (key.clone(),"original_verifier_attempt",body.replace("original_verifier_plan","original_verifier_attempt")),
+        ] {
+            assert!(guard.record_verifier_evidence(&bad_key,bad_kind,&bad_body).is_err(),"unsupported role/version/semantic key was published");
+            assert_eq!(store.events(guard.id()).unwrap(),published,"invalid data publication changed history");
+        }
+        assert_eq!(store.snapshot(guard.id()).unwrap(),before,"data publication altered workflow or charged resources");
+        assert!(guard.verifier_evidence_page("original_verifier_command_admission",0).unwrap().is_empty());
+        assert!(retained_original_plan_budget_contexts(_root.path(),control.path(),&guard).is_err(),"synthetic owner data became a constructor or initial-repair grant");
+        drop(connection);drop(store);guard.finish().unwrap();
     }
 
     #[tokio::test]

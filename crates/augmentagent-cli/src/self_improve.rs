@@ -93,6 +93,11 @@ mod workspace;
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
+/// Storage may authenticate recipe data without receiving execution authority.
+pub(crate) fn validate_approved_plan_publication(workflow:&str,key:&str,body:&str,binding:&crate::autoship_workflow::Binding)->Result<()> {
+    acceptance::validate_approved_plan_publication(workflow,key,body,binding)
+}
+
 #[path = "self_improve_alignment.rs"]
 mod alignment;
 #[path = "self_improve_publication.rs"]
