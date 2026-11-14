@@ -1375,6 +1375,46 @@ mod tests {
             assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().is_none(),"qualified published preparation still overrides later verifier revisions");
             guard.bind_acceptance(&prepared,&native_control).unwrap();
             assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),1);
+            let mut superseding=manifest.clone();superseding.contract_revision+=1;superseding.contract_hash="e".repeat(64);
+            std::fs::write(&index,serde_json::to_vec(&superseding).unwrap()).unwrap();
+            assert!(guard.semantic_preparation_source().unwrap().is_none(),"historical source overrode a later registered verifier");
+            std::fs::write(&index,serde_json::to_vec(&manifest).unwrap()).unwrap();
+            for missing in ["native_proof","published_prepared"] {
+                guard.transition(crate::autoship_workflow::Stage::Build,"qualified_work_started","build",0).await.unwrap();
+                let lost=if missing=="native_proof" {&reference.artifact}else{&prepared_path};
+                let held_file=native_control.join("fixture-unavailable-source");std::fs::rename(lost,&held_file).unwrap();
+                assert!(guard.semantic_preparation_source().is_err(),"settled {missing} loss was invisible to the real dispatch/preparation guard");
+                assert!(guard.semantic_source_waiting().unwrap());
+                let parked_events=store.events(guard.id()).unwrap();
+                assert!(guard.semantic_preparation_source().is_err());
+                assert_eq!(store.events(guard.id()).unwrap(),parked_events,"unchanged loss repeatedly claimed work");
+                if missing=="native_proof" {std::fs::rename(&held_file,lost).unwrap();}
+                let id=guard.id().to_owned();guard.finish().unwrap();
+                let mut writer=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+                let parked=writer.snapshot(&id).unwrap().unwrap();
+                let original_reference=writer.retained_qualification_history(&id,&parked.checkpoint.binding).unwrap().unwrap();
+                assert!(writer.recover_retained_qualification(&parked,None,chrono::Utc::now().timestamp_millis(),|evidence| {
+                    let found=inspect_retained_qualification_with_reference(root.path(),&native_control,source,&parked.checkpoint.binding,evidence,Some(&original_reference))?;
+                    ensure!(found.as_ref()==Some(&original_reference),"free inspector lost saved original reference after {missing} loss");
+                    Ok(found)
+                }).unwrap());
+                guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+                    repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                    branch:"fixture",contract:"original scope",environment:"test",
+                }).await.unwrap().unwrap();
+                let recovered=prepare_acceptance_for(root.path(),root.path(),&native_control,source,base,"original scope",
+                    &reasoner,&worker_roots(root.path()),&[],&guard).await.unwrap();
+                assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
+                if missing=="published_prepared" {std::fs::remove_file(&held_file).unwrap();}
+                qualify(root.path(),&native_control,&prepared,&guard).await.unwrap();
+                guard.bind_acceptance(&prepared,&native_control).unwrap();
+                assert!(!guard.semantic_source_waiting().unwrap());
+                assert!(store.semantic_reconsideration(guard.id(),guard.binding()).unwrap().is_none());
+                assert_eq!(reasoner.calls(),0);
+            }
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),2);
+            assert_eq!(store.events(guard.id()).unwrap().iter().filter(|(_,kind,_,_)|kind=="retained_qualification_prepared").count(),3);
             assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls,
                 "metadata-only requalification admitted another model call");
             assert_eq!(private_bytes(&reference.artifact,64*1024).unwrap(),native_bytes,"qualification rewrote native provenance");

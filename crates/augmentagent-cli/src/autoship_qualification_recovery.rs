@@ -185,9 +185,13 @@ impl WorkflowStore {
     }
 
     pub(crate) fn retained_qualification_history(&self,workflow:&str,binding:&Binding)->Result<Option<RetainedWitnessReference>> {
+        Ok(self.retained_qualification_cue(workflow,binding)?.and_then(|cue|cue.retained_witness().cloned()))
+    }
+
+    pub(crate) fn retained_qualification_cue(&self,workflow:&str,binding:&Binding)->Result<Option<SemanticReconsideration>> {
         let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
         if snapshot.checkpoint.binding!=*binding || matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired) {return Ok(None);}
-        Ok(semantic_cue(&self.conn,workflow,binding,snapshot.generation)?.and_then(|cue|cue.retained_witness().cloned()))
+        Ok(semantic_cue(&self.conn,workflow,binding,snapshot.generation)?.filter(|cue|cue.retained_witness().is_some()))
     }
 
     pub(crate) fn semantic_source_waiting(&self,workflow:&str,binding:&Binding)->Result<bool> {

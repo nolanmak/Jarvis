@@ -2321,6 +2321,16 @@ pub(super) fn inspect_retained_qualification(root:&Path,control:&Path,source:Acc
     Ok(selected)
 }
 
+pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    if let Some(reference)=reference {
+        retained_qualification_source(root,control,source,reference,evidence)?;
+        return Ok(Some(reference.clone()));
+    }
+    inspect_retained_qualification(root,control,source,binding,evidence)
+}
+
 /// Consume immutable plan/result references rather than requiring the original
 /// execution binding to equal a later candidate or registered-contract binding.
 /// The store separately authenticates that association to the current request.
@@ -2352,6 +2362,26 @@ pub(super) fn retained_qualification_source(root:&Path,control:&Path,source:Acce
     ensure!(baseline_witness::retained_qualification_reference(root,control,&prepared,evidence)?.as_ref()==Some(reference),
         "retained qualification source is unavailable or changed");
     Ok(prepared)
+}
+
+pub(super) fn retained_qualification_superseded(control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference)->Result<bool> {
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if !index.try_exists()? {return Ok(false);}
+    let manifest:WorkflowManifest=private_json(&index)?;
+    validate_retained_manifest(control,&manifest,source)?;
+    Ok(manifest.contract_hash!=reference.contract)
+}
+
+/// A settled handoff stops supplying preparation, but its publication and
+/// original proof must remain available before another model can be admitted.
+pub(super) fn check_settled_retained_preparation(root:&Path,control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    let prepared=retained_prepared(root,control,source)?.context("settled prepared evidence is unavailable")?;
+    ensure!(amendment::digest(&serde_json::to_vec(&prepared)?)==reference.prepared,"settled prepared evidence changed");
+    retained_qualification_source(root,control,source,reference,evidence)?;
+    require_qualified_baseline(root,control,&prepared)
 }
 
 fn retained_preparation_candidates(root:&Path,control:&Path,source:AcceptanceSource,

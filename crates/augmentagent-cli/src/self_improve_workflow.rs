@@ -149,29 +149,38 @@ impl std::fmt::Display for SemanticSourceUnavailable {
 impl std::error::Error for SemanticSourceUnavailable {}
 
 /// Source data is rechecked at preparation and both launch gates. This has
-/// no subprocess/model API and never substitutes an old positive approval.
+/// no model or verifier execution and never substitutes an old positive approval.
 fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,repository:&str)->Result<Option<acceptance::PreparedAcceptance>> {
     let snapshot=store.snapshot(&lease.workflow)?.context("semantic workflow missing")?;
     let binding=&snapshot.checkpoint.binding;
-    let cue:Option<durable::SemanticReconsideration>=store.semantic_reconsideration(&lease.workflow,binding)?;
-    let Some(cue)=cue else{return Ok(None)};
+    let (cue,settled):(durable::SemanticReconsideration,bool)=match store.semantic_reconsideration(&lease.workflow,binding)? {
+        Some(cue)=>(cue,false),
+        None=>match store.retained_qualification_cue(&lease.workflow,binding)? {
+            Some(cue)=>(cue,true),None=>return Ok(None),
+        },
+    };
     store.validate_dispatch(lease,binding,millis())?;
     if store.semantic_source_waiting(&lease.workflow,binding)? {return Err(SemanticSourceUnavailable.into());}
-    let source=(||->Result<acceptance::PreparedAcceptance> {
+    let source=(||->Result<Option<acceptance::PreparedAcceptance>> {
         let source=source_from_workflow(&lease.workflow).context("semantic source identity missing")?;
         let control=acceptance::control_directories(repository,&lease.workflow)?.workflow_acceptance;
         if let Some(reference)=cue.retained_witness() {
+            if acceptance::retained_qualification_superseded(&control,source,reference)? {return Ok(None);}
+            if settled {
+                acceptance::check_settled_retained_preparation(root,&control,source,reference,&store.inspect_verifier_evidence(&lease.workflow))?;
+                return Ok(None);
+            }
             return acceptance::retained_qualification_source(root,&control,source,reference,
-                &store.inspect_verifier_evidence(&lease.workflow));
+                &store.inspect_verifier_evidence(&lease.workflow)).map(Some);
         }
         let custody=store.baseline_native_custody(lease,binding,millis())?;
         let (prepared,identity)=acceptance::retained_semantic_source(root,&control,source,binding,&custody,&store.inspect_verifier_evidence(&lease.workflow))?
             .context("original semantic prepared source is unavailable")?;
         anyhow::ensure!(identity==cue.judgment,"semantic source differs from its queued judgment");
-        Ok(prepared)
+        Ok(Some(prepared))
     })();
     match source {
-        Ok(prepared)=>Ok(Some(prepared)),
+        Ok(prepared)=>Ok(prepared),
         Err(error)=> {
             store.hold_semantic_source_unavailable(lease,binding,&cue.key,millis())?;
             let detail=format!("{error:#}");
