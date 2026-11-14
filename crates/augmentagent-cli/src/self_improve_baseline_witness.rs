@@ -1452,6 +1452,21 @@ mod tests {
                 // initial issue scoping that was never part of that path.
                 require_retained_recovery_inputs(root.path(),source,Some(840),guard.id(),"original scope",&prepared,&evidence).unwrap();
                 rusqlite::Connection::open(&database).unwrap().execute("UPDATE scope_stage_response SET response=?3 WHERE workflow=?1 AND key=?2",rusqlite::params![guard.id(),key,original]).unwrap();
+                // Retaining the body without its committed custody receipt
+                // must fail free readiness just as it fails leased replay.
+                let fixture_db=rusqlite::Connection::open(&database).unwrap();
+                let (seq,generation,payload,at):(i64,i64,String,i64)=fixture_db.query_row(
+                    "SELECT seq,generation,payload,at_ms FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2",
+                    rusqlite::params![guard.id(),key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                fixture_db.execute("DELETE FROM workflow_event WHERE seq=?1",[seq]).unwrap();
+                let held_snapshot=store.snapshot(guard.id()).unwrap();
+                let held_events=store.events(guard.id()).unwrap();
+                assert!(require_retained_recovery_inputs(root.path(),source,None,guard.id(),"original scope",&prepared,&evidence).is_err(),
+                    "free readiness accepted a scope body without committed custody");
+                assert_eq!(serde_json::to_value(store.snapshot(guard.id()).unwrap()).unwrap(),serde_json::to_value(held_snapshot).unwrap());
+                assert_eq!(serde_json::to_value(store.events(guard.id()).unwrap()).unwrap(),serde_json::to_value(held_events).unwrap());
+                fixture_db.execute("INSERT INTO workflow_event(seq,workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,'scope_stage_response_recorded',?4,?5)",
+                    rusqlite::params![seq,guard.id(),generation,payload,at]).unwrap();
             }
             let recovered=retained_qualification_source(root.path(),&native_control,source,&retained,&evidence).unwrap();
             assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(&prepared).unwrap());
@@ -1860,7 +1875,7 @@ mod tests {
         assert_eq!(recovery_environment::original_environment(&recovery.worktree,base,&prepared.proposal.files).unwrap(),original_environment,
             "read-only original environment does not match actual captured environment");
         let scope_context=amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",id,&recovery.source_request,base,&original_environment)).unwrap());
-        let original_scope=read_initial_scope(&scope_context,|key|evidence.scope_response(key)).unwrap()
+        let original_scope=read_initial_scope(&scope_context,|key|evidence.recorded_scope_response(key)).unwrap()
             .expect("actual retained source has no authenticated original scope snapshot");
         println!("actual original scope preserved: fallback={}, complexity={}",original_scope.scope.is_none(),
             original_scope.scope.as_ref().map_or("hard",|scope|scope.complexity.as_str()));

@@ -681,7 +681,7 @@ Receipt publication follows the existing private immutable protocol:
 
 | Interruption/state | Result and ownership |
 | --- | --- |
-| Before final publication | Named private temporary file is not an artifact. Normal error/drop cleanup removes it; unclean-exit leftovers remain under existing protected-state lifecycle/retention ownership (#1799), never build-cache pruning. A receipt temporary file is bounded by 64 KiB. No current grant or model retry follows. |
+| Before final publication | Named private temporary file is not an artifact. Normal error/drop cleanup removes it; unclean-exit leftovers remain preserved protected state, never build-cache pruning. General crash-leftover retention is unfinished work owned by the root implementer under #1703, not by decomposition issue #1799. A receipt temporary file is bounded by 64 KiB. No current grant or model retry follows. |
 | Complete final file, caller/commit interrupted | Restart may use it only after full current/original/native revalidation and normal live dispatch guards; data alone does not create a lease or refill budgets. |
 | Existing byte-identical final file | Idempotent reuse; no rewrite or new publication episode. |
 | Partial, conflicting, malformed or nonprivate final file | Current validation fails and work remains held; never overwrite a native reply/proof or spend a model call to replace it. A conflict is not proof of a negative semantic decision. |
@@ -693,8 +693,13 @@ A final conflict/tamper hold needs restoration of authentic controller state or
 an explicitly supported repair of derived metadata; this change does not add an
 operator overwrite command. No raw database copies, ad hoc rollback directories,
 receipt deletion, snapshot-limit override or native-response rewrite is an
-activation path. Existing protected-state retention owns obsolete evidence;
-this patch adds no second copy or independent retention pool. The typed cue must
+activation path. This patch does not implement general obsolete-receipt or
+crash-leftover collection. Root owns that remaining #1703 lifecycle work: define
+protected references, interruption-safe collection and accounting before enabling
+any sweep. Trigger review when a workflow terminates or receipt policy changes;
+until then preserve evidence, account for its disk use, and hold on storage
+pressure rather than delete evidence or override snapshot limits. This patch
+adds no second copy or independent retention pool. The typed cue must
 retain its same episode through failed publication and genuine source restoration
 without unchanged productive reclaims; §§18–20 implement that scheduling and
 readiness path on the repair branch. Joined validation and rollout remain open.
@@ -756,7 +761,10 @@ prerequisites before returning the reference to the store's recovery callback:
 - For an initial issue with no attached PR, load the original committed scope
   snapshot using the exact workflow, protected original frontend request,
   original base and registered environment. Missing, malformed or mismatched
-  scope remains an evidence hold. Preserve the original decision, complexity,
+  scope remains an evidence hold. Free readiness and leased execution use the
+  same committed-response reader: a retained body without its matching
+  `scope_stage_response_recorded` event is unavailable, not ready work. Preserve
+  the original decision, complexity,
   criteria and fallback status. An attached PR uses its existing enrolled resume
   path and does not invent an initial issue scope requirement.
 
@@ -1036,10 +1044,12 @@ an actual artifact destination as scratch. A concurrent unexpected final-name
 conflict refuses publication without replacing that file. Ordinary staging
 errors use the publisher's normal temporary-path cleanup; process interruption
 leaves at most the bounded reserved state, which the next locked inspection can
-reconcile. If a workflow never resumes, this remains bounded state within its
-existing protected control-directory lifecycle (#1799), not a separate growing
-build cache or retention pool. Root still owns that epic lifecycle acceptance;
-this paragraph is not a claim that all #1799 cleanup work is finished.
+reconcile. If a workflow never resumes, at most these two fixed bounded names
+remain in its protected control directory. This patch does not implement
+general inactive-workflow cleanup. Root owns that unfinished #1703 retention
+contract described in §17; #1799 covers decomposition and does not supply it.
+No cleanup of original evidence, pending effects, paused workflows, deployment
+snapshots or charged custody follows from a probe being stale.
 
 Tests exercise interrupted owned staging, actual child-process exit with no
 Rust destructors and a two-name hard-link interruption, active lock refusal,
@@ -1516,3 +1526,18 @@ branch. These are implementation/source-compatibility results. Final seam
 rechecks, independent engineering review, exact-head hosted CI, supported
 snapshot, protected merge, normal updater and natural ordinary shipping remain
 required. #1703 and #2058 retain their complete outstanding scopes.
+
+Final reader-alignment checkpoint: the retained v2 cue reader now rejects even
+an internally consistent rekeyed payload with an unsupported policy; historical
+negative v1 policy handling is unchanged. Its test-first negative failed before
+the check and the 25 recovery tests passed afterwards. Free initial-scope
+readiness and leased replay now share the committed body/event reader. The
+issue/PR fixture first reproduced orphan-body acceptance, then passed with that
+receipt removed and exact snapshot/events unchanged (194.70s); the three scope
+pair custody/restart tests also passed. These focused results supplement, rather
+than replace or rerun, the preceding 2,109-test full-suite checkpoint. Independent
+review's quota-observation finding remains open; specification checks are not
+engineering approval or activation evidence.
+The stricter read-only actual #1830 inventory also passed (11.34s): committed
+original scope remains Medium with no fallback; snapshot/events and 12 historical
+model calls are unchanged; no qualification, grant or dispatch occurred.

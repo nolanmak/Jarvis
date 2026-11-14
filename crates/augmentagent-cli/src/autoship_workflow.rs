@@ -373,6 +373,16 @@ fn read_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<S
     Ok(value)
 }
 
+/// Budget recovery and readiness require the same committed body/receipt pair.
+fn read_recorded_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<String>> {
+    let value=read_scope_response(conn,workflow,key)?;
+    if value.is_some() {
+        let recorded:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.key')=?2 ELSE 0 END)",params![workflow,key],|row|row.get(0))?;
+        if !recorded {return Err(MissingScopeResponse.into());}
+    }
+    Ok(value)
+}
+
 fn read_scope_response_keys(conn:&Connection,workflow:&str,after:&str)->Result<Vec<String>> {
     let invalid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[workflow],|row|row.get(0))?;
     if invalid {return Err(MissingScopeResponse.into());}
@@ -428,11 +438,7 @@ impl WorkflowStore {
     /// Budget recovery needs both the immutable body and its committed receipt.
     pub(crate) fn recorded_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
-        let value=read_scope_response(&tx,&lease.workflow,key)?;
-        if value.is_some() {
-            let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.key')=?2 ELSE 0 END)",params![lease.workflow,key],|row|row.get(0))?;
-            if !recorded {return Err(MissingScopeResponse.into());}
-        }
+        let value=read_recorded_scope_response(&tx,&lease.workflow,key)?;
         tx.commit()?;Ok(value)
     }
     /// Bounded union includes receipts whose bodies were lost, never treating

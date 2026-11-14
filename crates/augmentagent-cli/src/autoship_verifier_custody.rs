@@ -43,6 +43,9 @@ impl<'a> VerifierEvidenceInspection<'a> {
     pub(crate) fn scope_response(&self,key:&str)->Result<Option<String>> {
         read_scope_response(self.conn,self.workflow,key)
     }
+    pub(crate) fn recorded_scope_response(&self,key:&str)->Result<Option<String>> {
+        read_recorded_scope_response(self.conn,self.workflow,key)
+    }
     pub(crate) fn scope_keys(&self,after:&str)->Result<Vec<String>> {
         read_scope_response_keys(self.conn,self.workflow,after)
     }

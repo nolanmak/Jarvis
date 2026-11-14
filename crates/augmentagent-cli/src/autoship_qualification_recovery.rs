@@ -152,6 +152,7 @@ fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)-
             Ok((cue.binding==*binding).then_some(cue))
         },
         (Some(QualificationRecoverySource::RetainedOriginalWitness {evidence,owner_request_sha256}),2)=>{
+            ensure!(cue.policy==retained_policy(),"unsupported retained qualification policy");
             ensure!(evidence.valid() && semantic_hash(owner_request_sha256) && evidence.data==cue.judgment
                 && cue.key==retained_key(workflow,evidence,&cue.policy)?,"retained qualification reference changed");
             // Only a protected CURRENT execution context can connect original
@@ -503,6 +504,17 @@ mod tests {
 
     fn retained_reference()->RetainedWitnessReference {
         RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)}
+    }
+    #[test]
+    fn retained_cue_rejects_a_self_consistent_but_unsupported_policy() {
+        let (_dir,mut store,before)=retained_fixture();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let mut cue=store.semantic_reconsideration(&before.workflow,&before.checkpoint.binding).unwrap().unwrap();
+        cue.policy="f".repeat(64);cue.key=retained_key(&before.workflow,&reference,&cue.policy).unwrap();
+        store.conn.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='original_semantic_witness_recovered'",
+            params![before.workflow,serde_json::to_string(&cue).unwrap()]).unwrap();
+        assert!(store.semantic_reconsideration(&before.workflow,&before.checkpoint.binding).is_err(),"unknown policy was accepted because its re-keyed payload was internally consistent");
+        assert!(store.retained_qualification_history(&before.workflow,&before.checkpoint.binding).is_err());
     }
     fn retained_fixture()->(tempfile::TempDir,WorkflowStore,Snapshot) {
         let (dir,mut store,lease,mut hold)=fixture();

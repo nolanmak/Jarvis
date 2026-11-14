@@ -2365,7 +2365,7 @@ fn require_retained_recovery_inputs(root:&Path,source:AcceptanceSource,attached_
     })().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     if source.issue().is_some() && attached_pr.is_none() {
         let context=initial_scope_origin_inputs(workflow,owner_request,base,&environment)?;
-        read_initial_scope(&context,|key|evidence.scope_response(key))?
+        read_initial_scope(&context,|key|evidence.recorded_scope_response(key))?
             .context("original initial scope decision remains unavailable")
             .map_err(initial_scope_replay_error)?;
     }
