@@ -1113,3 +1113,50 @@ merge and reader amendments. The explicitly delegated approved-command custody
 case remains outside that ordinary run and unresolved; the source-context,
 capability, scheduling, migration and activation blockers above remain open.
 This documentation-only checkpoint changes no verified Rust source.
+
+
+### November 14: current-main integration validation
+
+Normally merged main `a93e90137a2230e4e775b6acb2c7dbde5a3c1e04` into this
+construction branch at `36bdb96c8de62784cb82c653998b869a7710a915`, preserving
+history without rebase or force-push. The complete managed CLI run terminated
+successfully: 2,169 unit tests passed, zero failed, 48 explicit ignores
+(477.58 seconds), followed by all integration/contracts. The approved-v2
+delegated custody regression remains an explicit known RED outside that ordinary
+run; this result grants no production activation and closes none of the remaining
+source-context, frozen capability, held-work, migration or Pending joins.
+
+Root is refining the source-context contract next. Collection must authenticate
+current qualification against the exact indexed original measurement, then
+preserve each original/corrective request under every applicable retained native
+context. Those request relationships come from the protected controller slots
+and exact known correction matcher, not a convenient last response or the
+qualification header. A private, non-deserializable source-facts factory must
+bind the workflow, native namespace, original result and each actual request
+hash before source selection can consume it. Current v1 keeps its exact
+published witness/run association; v2 retains every qualified original run,
+including a rejected reply needed to authenticate its corrective question.
+
+The proposed data reader must match source custody to each exact original-base,
+context and request pair. Only the current producer protocol and the explicitly
+supported frozen indexed-source protocol are candidates; a general historical
+policy whitelist is excluded. Applying that frozen decoder to v2 requires an
+explicit projection anchored in the current qualification and exact retained
+original facts, not an invented current native question or an execution grant.
+Existing v1 replay callers keep their current-request authentication. Every
+mandatory pair must remain present and unambiguous. All selections share one
+existing source budget; duplicate immutable reads can be merged while their
+provenance remains bound, but mandatory members cannot be dropped or separately
+budgeted. Oversized mandatory evidence holds before paid admission.
+
+This is still a root-owned draft contract, not an implemented reader or handoff.
+Precise factory/renderer interfaces, frozen projection binding, aggregate
+working-set bounds, and actual Stage RED/GREEN cases for multiple contexts,
+shared-context corrective requests, missing/foreign/conflicting custody and
+aggregate overflow must be resolved before implementation is accepted. Read-only
+factory inspection must close SQLite borrows before asynchronous Git work and
+recheck its authenticated facts afterward. Source/qualification bookkeeping
+must not change existing semantic authority replay keys or replenish any call
+or decision budget. All other open joins above remain required before a #2058
+PR or rollout. No provider call, execution permission or ordinary shipment was
+created by this integration validation.
