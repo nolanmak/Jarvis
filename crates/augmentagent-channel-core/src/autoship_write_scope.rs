@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -52,6 +52,64 @@ fn location(state: &Path, worktree: &Path) -> PathBuf {
         Sha256::digest(worktree.as_os_str().as_encoded_bytes())
     ))
 }
+/// Exact pending controller publication, not a write grant or registration.
+pub struct RegistrationPublication {
+    pub path:PathBuf,
+    pub bytes:Vec<u8>,
+    pub registered:bool,
+}
+
+pub fn registration_publication(worktree:&Path,contract_hash:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>)
+    ->Result<RegistrationPublication> {
+    let state=crate::state_dir::state_dir().context("scope control state unavailable")?;
+    registration_publication_at(&state,worktree,contract_hash,allowed,pinned)
+}
+fn registration_publication_at(state:&Path,worktree:&Path,contract_hash:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>)
+    ->Result<RegistrationPublication> {
+    let worktree=worktree.canonicalize()?;
+    ensure!(!contract_hash.is_empty() && allowed.len()<=256 && pinned.len()<=256,"invalid scope admission");
+    for path in allowed.iter().map(|path|&path.path).chain(pinned.iter()) {relative(path)?;}
+    let admission=Admission {version:1,worktree:worktree.clone(),contract_hash:contract_hash.into(),allowed,pinned};
+    let path=location(state,&worktree);
+    let parent=pending_directory(path.parent().context("scope publication parent missing")?)?;
+    let path=parent.join(path.file_name().context("scope publication filename missing")?);
+    ensure!(!path.starts_with(&worktree),"write admission cannot live in candidate");
+    let registered=match fs::symlink_metadata(&path) {
+        Ok(metadata)=>{
+            ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),"write admission is not a regular controller file");
+            ensure!(read(&path)?==admission,"write contract changed without a new authorized workflow");
+            true
+        },
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>false,
+        Err(error)=>return Err(error.into()),
+    };
+    let bytes=serde_json::to_vec(&admission)?;
+    ensure!(bytes.len()<=1024*1024,"scope publication exceeds private evidence envelope");
+    Ok(RegistrationPublication {path,bytes,registered})
+}
+
+/// Resolve an existing ancestor without creating directories. A missing leaf
+/// must not hide a parent symlink that redirects control state into candidate.
+fn pending_directory(path:&Path)->Result<PathBuf> {
+    ensure!(path.is_absolute(),"scope control destination must be absolute");
+    let mut current=path.to_path_buf();let mut missing=Vec::new();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(_)=>{
+                let mut resolved=current.canonicalize()?;
+                ensure!(resolved.is_dir(),"scope control parent is not a directory");
+                for part in missing.into_iter().rev() {resolved.push(part);}
+                return Ok(resolved);
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                missing.push(current.file_name().context("scope control ancestor missing")?.to_os_string());
+                ensure!(current.pop(),"scope control root missing");
+            },
+            Err(error)=>return Err(error.into()),
+        }
+    }
+}
+
 pub fn register(
     worktree: &Path,
     contract_hash: &str,
@@ -68,47 +126,21 @@ pub(crate) fn register_at(
     allowed: Vec<DeclaredPath>,
     pinned: Vec<String>,
 ) -> Result<()> {
-    let worktree = worktree.canonicalize()?;
-    ensure!(
-        !contract_hash.is_empty() && allowed.len() <= 256 && pinned.len() <= 256,
-        "invalid scope admission"
-    );
-    for path in allowed.iter().map(|p| &p.path).chain(pinned.iter()) {
-        relative(path)?;
-    }
-    let admission = Admission {
-        version: 1,
-        worktree: worktree.clone(),
-        contract_hash: contract_hash.into(),
-        allowed,
-        pinned,
-    };
-    let path = location(state, &worktree);
-    fs::create_dir_all(path.parent().unwrap())?;
-    ensure!(
-        !path
-            .canonicalize()
-            .unwrap_or(path.clone())
-            .starts_with(&worktree),
-        "write admission cannot live in candidate"
-    );
-    if path.try_exists()? {
-        ensure!(
-            read(&path)? == admission,
-            "write contract changed without a new authorized workflow"
-        );
-        return Ok(());
-    }
-    let mut staged = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    staged.write_all(&serde_json::to_vec(&admission)?)?;
+    let publication=registration_publication_at(state,worktree,contract_hash,allowed,pinned)?;
+    if publication.registered {return Ok(());}
+    fs::DirBuilder::new().recursive(true).mode(0o700)
+        .create(publication.path.parent().context("scope publication parent missing")?)?;
+    let mut staged=tempfile::NamedTempFile::new_in(publication.path.parent().unwrap())?;
+    staged.write_all(&publication.bytes)?;
     staged.as_file().sync_all()?;
-    staged.persist_noclobber(path).map_err(|e| e.error)?;
+    staged.persist_noclobber(publication.path).map_err(|error|error.error)?;
     Ok(())
 }
+
 fn read(path: &Path) -> Result<Admission> {
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK)
         .open(path)?;
     let m = file.metadata()?;
     ensure!(
@@ -242,6 +274,36 @@ fn split(root: &Path, path: &Path, pins: &[PathBuf], grants: &mut Grants) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registration_preview_is_read_only_and_matches_the_actual_writer() {
+        let root=tempfile::tempdir().unwrap();let state=tempfile::tempdir().unwrap();
+        let allowed=vec![DeclaredPath {path:"src/edit.rs".into(),directory:false}];
+        let pinned=vec!["tests/original.py".into()];
+        let preview=registration_publication_at(state.path(),root.path(),"original-contract",allowed.clone(),pinned.clone()).unwrap();
+        assert!(!preview.registered,"missing registration was considered published");
+        assert_eq!(fs::read_dir(state.path()).unwrap().count(),0,"preview created controller state");
+        assert!(!preview.path.exists());
+        register_at(state.path(),root.path(),"original-contract",allowed.clone(),pinned.clone()).unwrap();
+        assert_eq!(fs::read(&preview.path).unwrap(),preview.bytes);
+        assert_eq!(fs::metadata(preview.path.parent().unwrap()).unwrap().mode()&0o077,0,"new controller storage inherited a group-writable umask");
+        assert!(registration_publication_at(state.path(),root.path(),"original-contract",allowed.clone(),pinned.clone()).unwrap().registered);
+        assert!(registration_publication_at(state.path(),root.path(),"changed-contract",allowed,pinned).is_err(),"preview accepted a different existing grant");
+    }
+
+    #[test]
+    fn registration_preview_resolves_missing_parents_without_redirecting_into_candidate() {
+        let root=tempfile::tempdir().unwrap();let state=tempfile::tempdir().unwrap();
+        let absent=state.path().join("new/owner-state");
+        let preview=registration_publication_at(&absent,root.path(),"contract",vec![],vec![]).unwrap();
+        assert!(!absent.exists());
+        register_at(&absent,root.path(),"contract",vec![],vec![]).unwrap();
+        assert_eq!(fs::read(preview.path).unwrap(),preview.bytes);
+        let redirected=state.path().join("redirected");std::os::unix::fs::symlink(root.path(),&redirected).unwrap();
+        assert!(registration_publication_at(&redirected,root.path(),"contract",vec![],vec![]).is_err());
+        assert!(register_at(&redirected,root.path(),"contract",vec![],vec![]).is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(),0,"rejected publication created candidate files");
+    }
+
     #[test]
     fn pinned_ancestors_are_split_and_new_literal_files_precreated() {
         let root = tempfile::tempdir().unwrap();

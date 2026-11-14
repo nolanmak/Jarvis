@@ -22,6 +22,17 @@ mod verifier_execution;
 pub(super) use verifier_execution::recover_original_verifier;
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
+#[path = "self_improve_recovery_environment.rs"]
+mod recovery_environment;
+#[path = "self_improve_recovery_publication.rs"]
+mod recovery_publication;
+#[path = "self_improve_setup_dependency.rs"]
+mod setup_dependency;
+pub(super) fn retained_setup_failure(error:&anyhow::Error)->Option<&crate::autoship_workflow::RetainedSetupDependency> {
+    setup_dependency::failure(error)
+}
+pub(super) fn retained_setup_candidate(error:&anyhow::Error)->Option<&crate::autoship_workflow::Binding> {setup_dependency::candidate(error)}
+pub(super) fn stamp_retained_setup_candidate(error:anyhow::Error,binding:crate::autoship_workflow::Binding)->anyhow::Error {setup_dependency::stamp(error,binding)}
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -202,41 +213,58 @@ pub(super) fn harness_path(path: &str) -> bool {
             && parts.last().unwrap().starts_with("autoship_")
             && path.ends_with(".rs"))
 }
+/// Only create declared empty parent directories; never follow a redirected
+/// harness ancestor. Both installation and recovery readiness use this path.
+fn harness_parent(root:&Path,relative:&str)->Result<PathBuf> {
+    ensure!(harness_path(relative),"invalid harness path");
+    let mut parent=root.to_path_buf();let parts=relative.split('/').collect::<Vec<_>>();
+    for part in &parts[..parts.len()-1] {
+        parent.push(part);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta)=>ensure!(meta.is_dir() && !meta.file_type().is_symlink(),"harness parent is not a real directory"),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                match std::fs::create_dir(&parent) {
+                    Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(error)=>return Err(error.into()),
+                }
+                let meta=std::fs::symlink_metadata(&parent)?;
+                ensure!(meta.is_dir() && !meta.file_type().is_symlink(),"harness parent changed during preparation");
+            },
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    Ok(parent)
+}
+
+fn existing_harness(destination:&Path,expected:&[u8])->Result<bool> {
+    use std::{io::Read,os::unix::fs::OpenOptionsExt};
+    let file=match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(destination) {
+        Ok(file)=>file,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+            ensure!(std::fs::symlink_metadata(destination).is_err_and(|error|error.kind()==std::io::ErrorKind::NotFound),"harness path is redirected");
+            return Ok(false);
+        },
+        Err(error)=>return Err(error.into()),
+    };
+    let meta=file.metadata()?;
+    ensure!(meta.is_file() && meta.len()==expected.len() as u64,"registered harness is not an unchanged regular file");
+    let mut bytes=Vec::new();file.take(expected.len() as u64+1).read_to_end(&mut bytes)?;
+    ensure!(bytes==expected,"candidate attempted to change registered verifier");
+    Ok(true)
+}
+
 /// Caller must own an exclusive clean baseline checkout. Refuses any existing
 /// harness rather than replacing implementation or a previously pinned test.
 pub(super) fn install_harness(root: &Path, proposal: &ContractProposal) -> Result<()> {
     use std::io::Write;
     let root = root.canonicalize()?;
     for (relative, body) in &proposal.files {
-        ensure!(harness_path(relative), "invalid harness path");
-        let mut parent = root.clone();
-        let parts: Vec<_> = relative.split('/').collect();
-        for part in &parts[..parts.len() - 1] {
-            parent.push(part);
-            match std::fs::symlink_metadata(&parent) {
-                Ok(meta) => ensure!(
-                    meta.is_dir() && !meta.file_type().is_symlink(),
-                    "harness parent is not a real directory"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(&parent)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let destination = root.join(relative);
-        // Merged auto-ship PRs keep their pinned harnesses on main, so a
-        // proposal can name a path that already exists at the baseline. The
-        // same bytes are that harness; different bytes must never overwrite
-        // it. Say which path, so the scoped retry picks a unique name instead
-        // of failing on a bare "File exists (os error 17)" every attempt.
-        if let Ok(meta) = std::fs::symlink_metadata(&destination) {
-            ensure!(meta.is_file() && !meta.file_type().is_symlink(),
-                "harness path {relative} already exists at the baseline and is not a regular file");
-            ensure!(std::fs::read(&destination)? == body.as_bytes(),
-                "harness path {relative} already exists at the baseline with different contents; \
-                 name a new harness for this issue (for example autoship_issue_<number>)");
-            continue;
+        harness_parent(&root,relative)?;
+        let destination=root.join(relative);
+        match existing_harness(&destination,body.as_bytes()) {
+            Ok(true)=>continue,
+            Ok(false)=>{},
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some()=>return Err(error).context(format!("read existing harness {relative}")),
+            Err(error)=>bail!("harness path {relative} already exists at the baseline with different contents or type; name a new harness for this issue: {error}"),
         }
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -276,19 +304,21 @@ fn environment_id(root: &Path) -> Result<String> {
     environment_id_with_exporter(root, Some(verifier_checkout::EXPORTER))
 }
 fn environment_id_with_exporter(root: &Path, exporter: Option<&str>) -> Result<String> {
+    environment_id_from_inputs(&compiler_control_inputs(root)?,exporter,|name| {
+        let path=root.join(name);
+        if path.exists() {Ok(Some(std::fs::read(path)?))}else{Ok(None)}
+    })
+}
+fn environment_id_from_inputs(controls:&[(String,String)],exporter:Option<&str>,
+    mut content:impl FnMut(&str)->Result<Option<Vec<u8>>>)->Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
     if let Some(exporter) = exporter { hash.update(exporter.as_bytes()); }
     hash.update(DEPENDENCY_AUDIT.as_bytes());
-    hash.update(serde_json::to_vec(&compiler_control_inputs(root)?)?);
-    if root.join("Cargo.lock").exists() {
-        hash.update(std::fs::read(root.join("Cargo.lock"))?);
-    }
-    for name in ["rust-toolchain", "rust-toolchain.toml"] {
-        if root.join(name).exists() {
-            hash.update(std::fs::read(root.join(name))?);
-        }
+    hash.update(serde_json::to_vec(controls)?);
+    for name in ["Cargo.lock","rust-toolchain","rust-toolchain.toml"] {
+        if let Some(bytes)=content(name)? {hash.update(bytes);}
     }
     for path in [
         PathBuf::from("/usr/bin/python3"),
@@ -1112,6 +1142,7 @@ pub(super) fn require_qualified_baseline(root:&Path,control:&Path,prepared:&Prep
 
 async fn qualify_original_baseline(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
     if baseline_witness::assert_current(root,control,prepared).is_ok() {return Ok(());}
+    if baseline_witness::qualify_known_retained(root,control,prepared,workflow)? {return Ok(());}
     let directory=tempfile::Builder::new().prefix("witness-baseline-").tempdir_in(control)?;
     let baseline=directory.path().join("checkout");let path=baseline.to_str().context("original baseline checkout UTF8")?;
     trusted_git(root,&["worktree","add","--detach",path,prepared.baseline.registration.baseline_head()]).await?;
@@ -1239,27 +1270,17 @@ fn evidence_path(control: &Path, source: AcceptanceSource, base: &str) -> Result
     Ok(control.join(format!("{}-base-{base}.json", source.key())))
 }
 fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
-    // Existing files must match exactly, including files installed before a
-    // restart. Never silently restore a builder-modified verifier.
-    let mut missing = prepared.proposal.clone();
-    missing
-        .files
-        .retain(|path, _| !candidate.join(path).exists());
-    for (relative, bytes) in &prepared.proposal.files {
-        let path = candidate.join(relative);
-        if path.exists() {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "candidate verifier is not a regular file"
-            );
-            ensure!(
-                std::fs::read(&path)? == bytes.as_bytes(),
-                "candidate attempted to change registered verifier"
-            );
+    // Candidate tampering must retain its own diagnostic, rather than the
+    // baseline author's instruction to choose a new independent harness name.
+    let root=candidate.canonicalize()?;let mut missing=prepared.proposal.clone();missing.files.clear();
+    for (relative,body) in &prepared.proposal.files {
+        harness_parent(&root,relative)?;
+        if !existing_harness(&root.join(relative),body.as_bytes())
+            .with_context(||format!("candidate attempted to change registered verifier {relative}"))? {
+            missing.files.insert(relative.clone(),body.clone());
         }
     }
-    install_harness(candidate, &missing)?;
+    install_harness(candidate,&missing)?;
     prepared.baseline.registration.verify_integrity(candidate)
 }
 
@@ -1549,7 +1570,9 @@ pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,er
 /// Inspect the original cause before returning any public-safe typed error.
 async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error)->Result<Option<initial_repair::Hold>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
-    workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
+    if let Some(setup)=retained_setup_failure(error) {
+        workflow.hold_enrolled_setup_failure(prepared,setup).await?;
+    }else {workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;}
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
@@ -1581,12 +1604,20 @@ pub(super) fn initial_scope_replay_error(error:anyhow::Error)->anyhow::Error {
 fn initial_plan_budget_context(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str)->Result<String> {
     Ok(amendment::digest(&serde_json::to_vec(&("initial-verifier-budget-context-v1",workflow,contract,source,base,environment))?))
 }
+fn initial_scope_origin_inputs(workflow:&str,owner_request:&str,base:&str,environment:&str)->Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow,owner_request,base,environment))?))
+}
 fn initial_scope_origin(workflow:&workflow::WorkflowGuard,base:&str,environment:&str)->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow.id(),
-        workflow.original_owner_request()?,base,environment))?))
+    initial_scope_origin_inputs(workflow.id(),&workflow.original_owner_request()?,base,environment)
 }
 pub(super) fn initial_scope_context(root:&Path,workflow:&workflow::WorkflowGuard,base:&str)->Result<String> {
     (||->Result<String> {initial_scope_origin(workflow,base,&environment_id(root)?)})().map_err(initial_scope_replay_error)
+}
+
+pub(super) fn retained_initial_scope_context(workflow:&workflow::WorkflowGuard,prepared:&PreparedAcceptance)->Result<String> {
+    let base=prepared.baseline.registration.baseline_head();
+    let environment=prepared.baseline.registration.binding(base)?.environment_id;
+    initial_scope_origin(workflow,base,&environment)
 }
 
 pub(super) fn preflight_initial_scope(root:&Path,workflow:&workflow::WorkflowGuard,source:AcceptanceSource,base:&str,
@@ -1851,7 +1882,46 @@ fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptanc
     std::fs::File::open(control)?.sync_all()?;Ok(())
 }
 
-pub(super) async fn prepare_acceptance_for(
+fn prepared_destination(control:&Path,source:AcceptanceSource,base:&str,manifest:Option<&WorkflowManifest>)->Result<PathBuf> {
+    match manifest.and_then(|manifest|manifest.evidence_file.as_ref()) {
+        Some(name)=>{
+            let manifest=manifest.context("amended manifest missing")?;
+            ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"invalid amended evidence filename");
+            Ok(control.join(name))
+        },
+        None=>evidence_path(control,source,base),
+    }
+}
+
+fn write_admission_inputs(prepared:&PreparedAcceptance)->(Vec<augmentagent_channel_core::autoship_write_scope::DeclaredPath>,Vec<String>) {
+    let allowed=prepared.proposal.contract.allowed_paths.iter().map(|scope|match scope {
+        crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
+        crate::autoship_contract::PathScope::Directory(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:true},
+    }).collect();
+    (allowed,prepared.proposal.files.keys().cloned().collect())
+}
+
+fn require_retained_registration(root:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    let (allowed,pinned)=write_admission_inputs(prepared);
+    let publication=augmentagent_channel_core::autoship_write_scope::registration_publication(root,
+        prepared.baseline.registration.contract_hash(),allowed,pinned)?;
+    for writable in worker_roots(root) {
+        if writable.exists() {ensure!(!publication.path.starts_with(writable.canonicalize()?),"write admission is writable by worker");}
+    }
+    recovery_publication::probe_registration(&publication)
+}
+
+pub(super) async fn prepare_acceptance_for(repo:&Path,candidate:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
+    reasoner:&dyn Reasoner,writable_roots:&[PathBuf],required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<PreparedAcceptance> {
+    let execution:futures::future::BoxFuture<'_,Result<PreparedAcceptance>>=Box::pin(
+        prepare_acceptance_for_inner(repo,candidate,control,source,base,scope,reasoner,writable_roots,required_criteria,workflow));
+    match execution.await {
+        Ok(prepared)=>Ok(prepared),
+        Err(error)=>Err(workflow.preparation_failure_at_current(error).await?),
+    }
+}
+
+async fn prepare_acceptance_for_inner(
     repo: &Path,
     candidate: &Path,
     control: &Path,
@@ -1875,7 +1945,9 @@ pub(super) async fn prepare_acceptance_for(
         );
     }
     amendment::resume_pending(candidate, &control, source).await?;
-    let manifest = original_manifest(&control, source)?;
+    let manifest = if let Some(prepared)=semantic.as_ref() {
+        setup_dependency::run(workflow,candidate,&control,prepared,"manifest",||original_manifest(&control,source))?
+    }else {original_manifest(&control,source)?};
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
@@ -1883,28 +1955,10 @@ pub(super) async fn prepare_acceptance_for(
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
-    let path = match manifest
-        .as_ref()
-        .and_then(|manifest| manifest.evidence_file.as_ref())
-    {
-        Some(name) => {
-            let manifest = manifest.as_ref().unwrap();
-            ensure!(
-                name == &format!(
-                    "{}-revision-{}-{}.json",
-                    source.key(),
-                    manifest.contract_revision,
-                    manifest.contract_hash
-                ),
-                "invalid amended evidence filename"
-            );
-            control.join(name)
-        }
-        None => evidence_path(&control, source, base)?,
-    };
+    let path=prepared_destination(&control,source,base,manifest.as_ref())?;
     let prepared = if let Some(prepared)=semantic {
         ensure!(prepared.proposal.contract.source()?==source && prepared.baseline.registration.baseline_head()==base,"queued semantic preparation source changed");
-        if !path.try_exists()? {persist_initial_prepared(&control,&path,&prepared)?;}
+        if !path.try_exists()? {setup_dependency::run(workflow,candidate,&control,&prepared,"prepared",||persist_initial_prepared(&control,&path,&prepared))?;}
         prepared
     } else if path.exists() {
         let file = std::fs::OpenOptions::new()
@@ -1990,37 +2044,15 @@ pub(super) async fn prepare_acceptance_for(
             "workflow contract revision changed without bound adjudication"
         );
     } else {
-        write_manifest(&control, &binding)?;
+        setup_dependency::run(workflow,candidate,&control,&prepared,"manifest",||write_manifest(&control,&binding))?;
     }
     // Main may have advanced; preserve the original reproduced base. Only a
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
-    install_candidate_harness(candidate, &prepared)?;
-    augmentagent_channel_core::autoship_write_scope::register(
-        candidate,
-        prepared.baseline.registration.contract_hash(),
-        prepared
-            .proposal
-            .contract
-            .allowed_paths
-            .iter()
-            .map(|scope| match scope {
-                crate::autoship_contract::PathScope::File(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: false,
-                    }
-                }
-                crate::autoship_contract::PathScope::Directory(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: true,
-                    }
-                }
-            })
-            .collect(),
-        prepared.proposal.files.keys().cloned().collect(),
-    )?;
+    setup_dependency::run(workflow,candidate,&control,&prepared,"harness",||install_candidate_harness(candidate,&prepared))?;
+    let (allowed,pinned)=write_admission_inputs(&prepared);
+    setup_dependency::run(workflow,candidate,&control,&prepared,"registration",||
+        augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned))?;
     Ok(prepared)
 }
 
@@ -2295,6 +2327,155 @@ pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:Acceptan
 pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:AcceptanceSource,
     binding:&crate::autoship_workflow::Binding,custody:&[crate::autoship_workflow::NativeScopeCustody],
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<(PreparedAcceptance,String)>> {
+    let candidates=retained_preparation_candidates(root,control,source,binding,evidence)?;
+    let mut selected:Option<(PreparedAcceptance,String)>=None;
+    for prepared in candidates {
+        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
+        if let Some((previous,key))=&selected {
+            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
+        }else{selected=Some((prepared,identity));}
+    }
+    Ok(selected)
+}
+
+
+/// Read exact original facts for free metadata recovery. Current semantic
+/// validation produces a reference, never a qualification receipt or lease.
+pub(super) fn inspect_retained_qualification(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    let mut selected=None;
+    for prepared in retained_preparation_candidates(root,control,source,binding,evidence)? {
+        let Some(reference)=baseline_witness::retained_qualification_reference(root,control,&prepared,evidence)? else{continue};
+        if let Some(previous)=&selected {ensure!(previous==&reference,"retained qualification source is ambiguous");}
+        else{selected=Some(reference);}
+    }
+    Ok(selected)
+}
+
+/// Read-only prerequisites for a retained-source wake, before a productive claim.
+fn require_retained_recovery_inputs(root:&Path,source:AcceptanceSource,attached_pr:Option<u64>,workflow:&str,
+    owner_request:&str,prepared:&PreparedAcceptance,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    let base=prepared.baseline.registration.baseline_head();
+    let environment=prepared.baseline.registration.binding(base)?.environment_id;
+    (||->Result<()> {
+        ensure!(recovery_environment::original_environment(root,base,&prepared.proposal.files)?==environment,
+            "original qualification environment remains unavailable");
+        Ok(())
+    })().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    if source.issue().is_some() && attached_pr.is_none() {
+        let context=initial_scope_origin_inputs(workflow,owner_request,base,&environment)?;
+        read_initial_scope(&context,|key|evidence.recorded_scope_response(key))?
+            .context("original initial scope decision remains unavailable")
+            .map_err(initial_scope_replay_error)?;
+    }
+    Ok(())
+}
+
+pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    ensure!(context.workflow==snapshot.workflow && context.binding==snapshot.checkpoint.binding,
+        "retained readiness context changed");
+    let reference=match reference {
+        Some(reference)=>Some(reference.clone()),
+        None=>inspect_retained_qualification(root,control,source,&snapshot.checkpoint.binding,evidence)?,
+    };
+    let Some(reference)=reference else{return Ok(None)};
+    let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+    require_retained_recovery_inputs(root,source,snapshot.pr,&snapshot.workflow,&context.source_request,&prepared,evidence)?;
+    Ok(Some(reference))
+}
+
+/// Source inspection remains read-only; only this separate readiness boundary
+/// performs bounded controller and write-admission filesystem preparation before queueing.
+pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
+    let Some(reference)=inspect_retained_qualification_with_reference(root,control,source,snapshot,context,evidence,reference)? else{return Ok(None)};
+    let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+    baseline_witness::require_retained_publication(root,control,&context.repository,&snapshot.workflow,&prepared,&reference,evidence)
+        .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    require_retained_registration(root,&prepared).map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    recovery_publication::probe_harness(root,&prepared.proposal.files)
+        .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    Ok(Some(reference))
+}
+
+pub(super) fn inspect_retained_recovery_ready_with_setup(root:&Path,control:&Path,source:AcceptanceSource,
+    snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
+    reference:Option<&crate::autoship_workflow::RetainedWitnessReference>,failed:Option<&crate::autoship_workflow::RetainedSetupDependency>)
+    ->Result<Option<(crate::autoship_workflow::RetainedWitnessReference,Option<crate::autoship_workflow::RetainedSetupDependency>)>> {
+    let Some(reference)=inspect_retained_recovery_ready(root,control,source,snapshot,context,evidence,reference)? else{return Ok(None)};
+    let current=if let Some(failed)=failed {
+        let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
+        let mut current=setup_dependency::observe(root,control,&prepared,&failed.operation,&failed.condition,failed.version)
+            .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+        current.completed=setup_dependency::completed(root,control,&prepared,&failed.operation)?;
+        Some(current)
+    }else{None};
+    Ok(Some((reference,current)))
+}
+
+/// Consume immutable plan/result references rather than requiring the original
+/// execution binding to equal a later candidate or registered-contract binding.
+/// The store separately authenticates that association to the current request.
+pub(super) fn retained_qualification_source(root:&Path,control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<PreparedAcceptance> {
+    let original=verifier_execution::exact_original_result(&reference.plan,&reference.result,evidence)?;
+    let prepared=original.prepared;
+    ensure!(prepared.proposal.contract.source()?==source,"retained qualification source identity changed");
+    ensure!(amendment::digest(&serde_json::to_vec(&prepared)?)==reference.prepared
+        && prepared.baseline.registration.contract_hash()==reference.contract,"retained qualification prepared reference changed");
+    prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
+    // A later registered verifier revision always wins over an old recovery
+    // reference, including when that later revision's evidence is unavailable.
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if index.try_exists()? {
+        let manifest:WorkflowManifest=private_json(&index)?;
+        validate_retained_manifest(control,&manifest,source)?;
+        ensure!(manifest.original_base==prepared.baseline.registration.baseline_head()
+            && manifest.contract_hash==reference.contract && manifest.contract_revision==prepared.proposal.contract.revision,
+            "retained qualification cannot replace a newer registered verifier");
+    }
+    match retained_prepared(root,control,source) {
+        Ok(Some(published))=>ensure!(serde_json::to_vec(&published)?==serde_json::to_vec(&prepared)?,"published prepared evidence differs from retained qualification"),
+        Ok(None)=>{},
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{},
+        Err(error)=>return Err(error),
+    }
+    ensure!(baseline_witness::retained_qualification_reference(root,control,&prepared,evidence)?.as_ref()==Some(reference),
+        "retained qualification source is unavailable or changed");
+    Ok(prepared)
+}
+
+pub(super) fn retained_qualification_superseded(control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference)->Result<bool> {
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    if !index.try_exists()? {return Ok(false);}
+    let manifest:WorkflowManifest=private_json(&index)?;
+    validate_retained_manifest(control,&manifest,source)?;
+    Ok(manifest.contract_hash!=reference.contract)
+}
+
+/// A settled handoff stops supplying preparation, but its publication and
+/// original proof must remain available before another model can be admitted.
+pub(super) fn check_settled_retained_preparation(root:&Path,control:&Path,source:AcceptanceSource,
+    reference:&crate::autoship_workflow::RetainedWitnessReference,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<()> {
+    let prepared=retained_prepared(root,control,source)?.context("settled prepared evidence is unavailable")?;
+    ensure!(amendment::digest(&serde_json::to_vec(&prepared)?)==reference.prepared,"settled prepared evidence changed");
+    retained_qualification_source(root,control,source,reference,evidence)?;
+    require_qualified_baseline(root,control,&prepared)
+}
+
+fn retained_preparation_candidates(root:&Path,control:&Path,source:AcceptanceSource,
+    binding:&crate::autoship_workflow::Binding,evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Vec<PreparedAcceptance>> {
     let mut candidates=match retained_prepared(root,control,source) {
         Ok(Some(prepared))=>vec![prepared],
         Ok(None)=>verifier_execution::retained_original_prepared(root,source,binding,evidence)?,
@@ -2310,14 +2491,7 @@ pub(super) fn retained_semantic_source(root:&Path,control:&Path,source:Acceptanc
             && prepared.baseline.registration.contract_hash()==manifest.contract_hash
             && prepared.proposal.contract.revision==manifest.contract_revision);
     }
-    let mut selected:Option<(PreparedAcceptance,String)>=None;
-    for prepared in candidates {
-        let Some(identity)=baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)? else {continue};
-        if let Some((previous,key))=&selected {
-            ensure!(key==&identity && serde_json::to_vec(previous)?==serde_json::to_vec(&prepared)?,"retained semantic source is ambiguous");
-        }else{selected=Some((prepared,identity));}
-    }
-    Ok(selected)
+    Ok(candidates)
 }
 
 fn validate_retained_manifest(control:&Path,manifest:&WorkflowManifest,source:AcceptanceSource)->Result<()> {

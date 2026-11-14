@@ -103,10 +103,11 @@ async fn validate_recovery_checkout(
         &snapshot.checkpoint.evidence,
     )
     .await?;
-    anyhow::ensure!(
-        binding == context.binding && binding == snapshot.checkpoint.binding,
-        "original recovery inputs changed"
-    );
+    anyhow::ensure!(context.binding==snapshot.checkpoint.binding,"original recovery context changed");
+    if binding!=snapshot.checkpoint.binding {
+        let store=WorkflowStore::open_read_only(state)?.context("recovery workflow store unavailable")?;
+        anyhow::ensure!(store.retained_setup_candidate(snapshot)?.as_ref()==Some(&binding),"original recovery inputs changed without an owned failure observation");
+    }
     if let Some(pr) = pr {
         if pr.head != binding.head {
             let store = WorkflowStore::open_read_only(state)?.context("recovery workflow store unavailable")?;
@@ -195,23 +196,30 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
     let control=acceptance::control_directories(repository,&snapshot.workflow)?.workflow_acceptance;
     let mut store=WorkflowStore::open(&workflow::path())?;
     let owner_revision=store.owner_control(&snapshot.workflow)?.map(|control|control.revision);
-    if store.recover_semantic_qualification(&snapshot,owner_revision,
+    let exact_inputs=binding==snapshot.checkpoint.binding;
+    if exact_inputs && store.recover_semantic_qualification(&snapshot,owner_revision,
         &acceptance::semantic_policy_for_hold(&snapshot.checkpoint),chrono::Utc::now().timestamp_millis(),
         |custody,evidence|acceptance::inspect_semantic_hold(&context.worktree,&control,source,&snapshot.checkpoint,custody,evidence))? {
         return Ok(());
     }
-    drop(store);
-    // Physical native custody can be checked without a native allocation,
-    // execution claim, model call or any change to the attempt counters.
-    if WorkflowStore::open(&workflow::path())?.recover_native_qualification(
-        &snapshot.workflow,
-        &binding,
-        &context.worktree,
-        acceptance::require_retained_native_custody,
-        chrono::Utc::now().timestamp_millis(),
-    )? {
+    // Preserve the existing free physical-custody route before an optional
+    // retained-measurement inspection can discover incomplete original data.
+    if exact_inputs && store.recover_native_qualification(&snapshot.workflow,&binding,&context.worktree,
+        acceptance::require_retained_native_custody,chrono::Utc::now().timestamp_millis())? {
         return Ok(());
     }
+    let retained=store.retained_qualification_history(&snapshot.workflow,&snapshot.checkpoint.binding)?;
+    match store.recover_retained_qualification_with_setup(&snapshot,owner_revision,chrono::Utc::now().timestamp_millis(),|evidence,failed|
+        acceptance::inspect_retained_recovery_ready_with_setup(&context.worktree,&control,source,&snapshot,&context,evidence,retained.as_ref(),failed)) {
+        Ok(true)=>return Ok(()),
+        Ok(false)=>{},
+        Err(error) if retained.is_some()=>return Err(error),
+        Err(_)=>warn!("retained source unavailable; existing original-verifier recovery authority remains required"),
+    }
+    if !exact_inputs {return Ok(());}
+    drop(store);
+    // No retained cue authorizes re-execution. The existing original-plan
+    // descriptor, precise hold, owner and lease checks still decide fallback.
     let Some(mut guard) = workflow::WorkflowGuard::acquire_verifier_recovery(workflow::Start {
         repo_root: root,
         worktree: &context.worktree,
@@ -473,6 +481,30 @@ mod tests {
             assert_eq!(store.snapshot(&snapshot.workflow).unwrap(),before_snapshot,"inspection changed {mode} state");assert_eq!(store.events(&snapshot.workflow).unwrap(),before_events,"inspection changed {mode} events");
         }
         assert!(failures.is_empty(),"checkout boundary mismatches: {failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn recorded_setup_recovery_preserves_the_exact_failed_candidate_without_accepting_later_edits() {
+        for mode in ["captured","missing","later-edit","later-head"] {
+            let (root,data,mut store,before,context,pr)=retained_checkout_fixture("published").await;
+            let now=chrono::Utc::now().timestamp_millis();let reference=crate::autoship_workflow::RetainedWitnessReference {
+                plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)};
+            assert!(store.recover_retained_qualification(&before,None,now,|_|Ok(Some(reference))).unwrap());
+            let cue=store.semantic_reconsideration(&before.workflow,&before.checkpoint.binding).unwrap().unwrap();
+            let lease=store.claim_productive_for_binding(&before.workflow,"fixture-setup",now,60_000,&before.checkpoint.binding).unwrap().unwrap();
+            std::fs::create_dir_all(context.worktree.join("autoship_verifiers")).unwrap();
+            std::fs::write(context.worktree.join("autoship_verifiers/case.py"),b"print('original measurement')\n").unwrap();
+            let captured=workflow::git_binding(&context.worktree,&context.contract,&context.environment,&before.checkpoint.evidence).await.unwrap();
+            assert_ne!(captured,before.checkpoint.binding);
+            let setup=crate::autoship_workflow::RetainedSetupDependency {version:1,operation:"registration".into(),condition:"permission".into(),fingerprint:Some("a".repeat(64)),capacity:None,quotas:None,completed:false};
+            store.hold_retained_setup_failure(&lease,&before.checkpoint.binding,&cue.key,&setup,(mode!="missing").then_some(&captured),now).unwrap();
+            store.release(&lease,now).unwrap();let snapshot=store.snapshot(&before.workflow).unwrap().unwrap();let events=store.events(&before.workflow).unwrap();
+            if mode=="later-edit" {std::fs::write(context.worktree.join("code"),b"unrecorded later edits\n").unwrap();}
+            if mode=="later-head" {fixture_git(&context.worktree,&["commit","--allow-empty","-qm","unrecorded later commit"]);}
+            let checked=validate_recovery_checkout(&data.path().join("workflow.db"),root.path(),&snapshot,&context,Some(&pr)).await;
+            assert_eq!(checked.is_ok(),mode=="captured","recorded setup recovery boundary: {mode}: {checked:?}");
+            assert_eq!(store.snapshot(&before.workflow).unwrap().unwrap(),snapshot);assert_eq!(store.events(&before.workflow).unwrap(),events);
+        }
     }
 
     #[tokio::test]

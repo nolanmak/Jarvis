@@ -148,32 +148,51 @@ impl std::fmt::Display for SemanticSourceUnavailable {
 }
 impl std::error::Error for SemanticSourceUnavailable {}
 
+fn record_semantic_source_failure(store:&mut WorkflowStore,lease:&Lease,binding:&Binding,cue:&str,error:&anyhow::Error)->Result<()> {
+    if let Some(setup)=acceptance::retained_setup_failure(error) {store.hold_retained_setup_failure(lease,binding,cue,setup,acceptance::retained_setup_candidate(error),millis())?;}
+    else {store.hold_semantic_source_unavailable(lease,binding,cue,millis())?;}
+    let detail=format!("{error:#}");
+    let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v2",&lease.workflow,cue,binding,&detail))?));
+    let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
+    store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+    Ok(())
+}
+
 /// Source data is rechecked at preparation and both launch gates. This has
-/// no subprocess/model API and never substitutes an old positive approval.
+/// no model or verifier execution and never substitutes an old positive approval.
 fn semantic_preparation_source(store:&mut WorkflowStore,lease:&Lease,root:&Path,repository:&str)->Result<Option<acceptance::PreparedAcceptance>> {
     let snapshot=store.snapshot(&lease.workflow)?.context("semantic workflow missing")?;
     let binding=&snapshot.checkpoint.binding;
-    let cue:Option<durable::SemanticReconsideration>=store.semantic_reconsideration(&lease.workflow,binding)?;
-    let Some(cue)=cue else{return Ok(None)};
+    let (cue,settled):(durable::SemanticReconsideration,bool)=match store.semantic_reconsideration(&lease.workflow,binding)? {
+        Some(cue)=>(cue,false),
+        None=>match store.retained_qualification_cue(&lease.workflow,binding)? {
+            Some(cue)=>(cue,true),None=>return Ok(None),
+        },
+    };
     store.validate_dispatch(lease,binding,millis())?;
     if store.semantic_source_waiting(&lease.workflow,binding)? {return Err(SemanticSourceUnavailable.into());}
-    let source=(||->Result<acceptance::PreparedAcceptance> {
+    let source=(||->Result<Option<acceptance::PreparedAcceptance>> {
         let source=source_from_workflow(&lease.workflow).context("semantic source identity missing")?;
         let control=acceptance::control_directories(repository,&lease.workflow)?.workflow_acceptance;
+        if let Some(reference)=cue.retained_witness() {
+            if acceptance::retained_qualification_superseded(&control,source,reference)? {return Ok(None);}
+            if settled {
+                acceptance::check_settled_retained_preparation(root,&control,source,reference,&store.inspect_verifier_evidence(&lease.workflow))?;
+                return Ok(None);
+            }
+            return acceptance::retained_qualification_source(root,&control,source,reference,
+                &store.inspect_verifier_evidence(&lease.workflow)).map(Some);
+        }
         let custody=store.baseline_native_custody(lease,binding,millis())?;
         let (prepared,identity)=acceptance::retained_semantic_source(root,&control,source,binding,&custody,&store.inspect_verifier_evidence(&lease.workflow))?
             .context("original semantic prepared source is unavailable")?;
         anyhow::ensure!(identity==cue.judgment,"semantic source differs from its queued judgment");
-        Ok(prepared)
+        Ok(Some(prepared))
     })();
     match source {
-        Ok(prepared)=>Ok(Some(prepared)),
+        Ok(prepared)=>Ok(prepared),
         Err(error)=> {
-            store.hold_semantic_source_unavailable(lease,binding,&cue.key,millis())?;
-            let detail=format!("{error:#}");
-            let key=format!("{:x}",Sha256::digest(serde_json::to_vec(&("semantic-source-diagnostic-v1",&lease.workflow,&cue.key,&detail))?));
-            let body=serde_json::json!({"version":1,"kind":"semantic_source_diagnostic","workflow":lease.workflow,"binding":binding,"diagnostic":detail});
-            store.record_scope_stage_response(lease,binding,&key,&body.to_string(),millis()).map_err(|_|anyhow::Error::from(SemanticSourceUnavailable))?;
+            record_semantic_source_failure(store,lease,binding,&cue.key,&error)?;
             Err(SemanticSourceUnavailable.into())
         }
     }
@@ -803,7 +822,9 @@ impl WorkflowGuard {
         };
         let existing = store.snapshot(&id)?;
         let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
-        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered") || semantic.is_some(),"semantic recovery source reference is missing");
+        let retained=if let Some(snapshot)=&existing {store.retained_qualification_history(&id,&snapshot.checkpoint.binding)?}else{None};
+        anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered")
+            || semantic.is_some() || retained.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
@@ -885,10 +906,6 @@ impl WorkflowGuard {
             })?;
             store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         }
-        let semantic=store.semantic_reconsideration(&id,&binding)?;
-        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() {
-            AcceptanceAuthority::RecoveryOnly
-        }else {AcceptanceAuthority::Unbound};
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -905,15 +922,26 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
-            acceptance_authority:Arc::new(Mutex::new(acceptance_authority)),
+            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
         };
-        guard.install_model_accounting()?;
         if let Some(context)=guard.execution_context(&guard.binding)? {
             let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
                 .record_recovery_context(&guard.lease,&guard.binding,&context,now);
             if let Err(error)=result {guard.finish()?;return Err(error);}
         }
+        // A retained source belongs to the original request, not an old head.
+        // Publish the authorized current context before resolving that source
+        // and before installing any model admission observer.
+        let semantic=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+            .semantic_reconsideration(&id,&guard.binding)?;
+        let retained=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+            .retained_qualification_history(&id,&guard.binding)?;
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" || semantic.is_some() || retained.is_some() {
+            AcceptanceAuthority::RecoveryOnly
+        }else {AcceptanceAuthority::Unbound};
+        *guard.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=acceptance_authority;
+        guard.install_model_accounting()?;
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
@@ -1222,8 +1250,27 @@ impl WorkflowGuard {
         control:&Path,
     ) -> Result<()> {
         self.validate_acceptance_source(prepared)?;
+        let retained=self.store.lock().map_err(|_|anyhow::anyhow!("baseline qualification store poisoned"))?
+            .semantic_reconsideration(self.id(),&self.binding)?.is_some_and(|cue|cue.retained_witness().is_some());
+        if retained {
+            *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        }
         acceptance::require_qualified_baseline(&self.worktree,control,prepared)?;
         self.bind_acceptance_identity(prepared)?;
+        if retained {
+            let source=self.acceptance_source.context("retained qualification source identity missing")?;
+            let native_control=acceptance::control_directories(&self.repository,self.id())?.workflow_acceptance;
+            let settled=self.store.lock().map_err(|_|anyhow::anyhow!("baseline qualification store poisoned"))?
+                .settle_retained_qualification(&self.lease,&self.binding,millis(),|reference,evidence| {
+                    let original=acceptance::retained_qualification_source(&self.worktree,&native_control,source,reference,evidence)?;
+                    let expected=serde_json::to_vec(prepared)?;
+                    anyhow::ensure!(serde_json::to_vec(&original)?==expected,"qualified preparation differs from its retained source");
+                    let published=acceptance::retained_prepared(&self.worktree,control,source)?.context("qualified prepared evidence is not published")?;
+                    anyhow::ensure!(serde_json::to_vec(&published)?==expected,"published prepared evidence differs from qualified preparation");
+                    acceptance::require_qualified_baseline(&self.worktree,control,prepared)
+                })?;
+            anyhow::ensure!(settled,"retained qualification handoff changed before settlement");
+        }
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Qualified {prepared:prepared.clone(),control:control.canonicalize()?};
         Ok(())
     }
@@ -1565,8 +1612,29 @@ impl WorkflowGuard {
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        if reason=="acceptance_verifier_infrastructure_unavailable" && action=="await_verifier_infrastructure_recovery" {
+            if let Some(cue)=store.retained_qualification_cue(self.id(),&self.binding)? {
+                store.hold_retained_infrastructure(&self.lease,&self.binding,&cue.key,millis())?;
+                return Ok(());
+            }
+        }
+        if reason=="acceptance_verifier_evidence_unknown" && action=="await_original_evidence_recovery" {
+            if let Some(cue)=store.retained_qualification_cue(self.id(),&self.binding)? {
+                store.hold_semantic_source_unavailable(&self.lease,&self.binding,&cue.key,millis())?;
+                return Ok(());
+            }
+        }
         store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
+    }
+
+    pub(super) async fn hold_enrolled_setup_failure(&mut self,prepared:&acceptance::PreparedAcceptance,setup:&durable::RetainedSetupDependency)->Result<()> {
+        self.healthy_lease()?;self.validate_acceptance_source(prepared)?;self.audit_health().await?;
+        let candidate=self.failed_setup_candidate().await.ok();
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("enrolled setup store poisoned"))?;
+        let cue=store.retained_qualification_cue(self.id(),&self.binding)?.context("retained setup cue missing")?;
+        store.hold_retained_setup_failure(&self.lease,&self.binding,&cue.key,setup,candidate.as_ref(),millis())
     }
 
     /// A fresh issue must not keep spending once an authorized linked PR exists.
@@ -1609,6 +1677,87 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("semantic preparation store poisoned"))?;
         semantic_preparation_source(&mut store,&self.lease,&self.worktree,&self.repository)
+    }
+
+    pub(super) fn retained_preparation(&self)->Result<Option<acceptance::PreparedAcceptance>> {
+        self.validate_before_side_effect()?;
+        let reference=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?
+            .retained_qualification_history(self.id(),&self.binding)?;
+        let Some(reference)=reference else{return Ok(None)};
+        let checked=(||->Result<Option<acceptance::PreparedAcceptance>> {
+            let source=self.acceptance_source.context("retained preparation source identity missing")?;
+            let control=acceptance::control_directories(&self.repository,self.id())?.workflow_acceptance;
+            if acceptance::retained_qualification_superseded(&control,source,&reference)? {return Ok(None);}
+            let prepared=match self.semantic_preparation_source()? {
+                Some(prepared)=>prepared,
+                None=> {
+                    if acceptance::retained_qualification_superseded(&control,source,&reference)? {return Ok(None);}
+                    match acceptance::retained_prepared(&self.worktree,&control,source) {
+                        Ok(Some(prepared))=>prepared,
+                        Ok(None)=>anyhow::bail!("retained prepared evidence is unavailable"),
+                        Err(error)=>return Err(error),
+                    }
+                },
+            };
+            anyhow::ensure!(self.retained_qualification_reference(&prepared)?.as_ref()==Some(&reference),"retained preparation source changed");
+            Ok(Some(prepared))
+        })();
+        match checked {
+            Ok(prepared)=>Ok(prepared),
+            Err(error) if self.semantic_source_waiting()?=>Err(error),
+            Err(error)=>Err(self.retained_preparation_failure(error)?),
+        }
+    }
+
+    pub(super) fn preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        self.validate_before_side_effect()?;
+        let retained=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?
+            .retained_qualification_cue(self.id(),&self.binding)?.is_some();
+        if !retained {return Ok(error);}
+        if self.semantic_source_waiting()? {return Ok(SemanticSourceUnavailable.into());}
+        self.retained_preparation_failure(error)
+    }
+
+    async fn failed_setup_candidate(&self)->Result<Binding> {
+        self.validate_before_side_effect()?;
+        let checkpoint=self.store.lock().map_err(|_|anyhow::anyhow!("failed setup store poisoned"))?
+            .snapshot(self.id())?.context("failed setup workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding,"failed setup checkpoint changed");
+        let observed=git_binding(&self.worktree,&self.contract,&self.environment,&checkpoint.evidence).await?;
+        anyhow::ensure!(observed.head==self.binding.head && observed.contract==self.binding.contract,"failed setup head/contract changed");
+        self.validate_before_side_effect()?;Ok(observed)
+    }
+
+    pub(super) async fn preparation_failure_at_current(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        let error=if acceptance::retained_setup_failure(&error).is_some() && !self.semantic_source_waiting()? {
+            match self.failed_setup_candidate().await {
+                Ok(candidate)=>acceptance::stamp_retained_setup_candidate(error,candidate),
+                Err(_)=>error,
+            }
+        }else{error};
+        self.preparation_failure(error)
+    }
+
+    pub(super) fn retained_preparation_failure(&self,error:anyhow::Error)->Result<anyhow::Error> {
+        self.validate_before_side_effect()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("retained preparation store poisoned"))?;
+        store.validate_dispatch(&self.lease,&self.binding,millis())?;
+        let cue=store.retained_qualification_cue(self.id(),&self.binding)?.context("retained preparation source reference missing")?;
+        record_semantic_source_failure(&mut store,&self.lease,&self.binding,&cue.key,&error)?;
+        Ok(SemanticSourceUnavailable.into())
+    }
+
+    /// A completed handoff stops overriding preparation, but remains proof
+    /// that these exact prepared bytes already had an original witness.
+    pub(super) fn retained_qualification_reference(&self,prepared:&acceptance::PreparedAcceptance)->Result<Option<durable::RetainedWitnessReference>> {
+        self.validate_before_side_effect()?;self.validate_acceptance_source(prepared)?;
+        let expected=format!("{:x}",Sha256::digest(serde_json::to_vec(prepared)?));
+        let reference=self.store.lock().map_err(|_|anyhow::anyhow!("retained qualification store poisoned"))?
+            .retained_qualification_history(self.id(),&self.binding)?.filter(|reference|reference.prepared==expected);
+        if let Some(reference)=&reference {
+            anyhow::ensure!(reference.contract==prepared.baseline.registration.contract_hash(),"retained qualification contract reference changed");
+        }
+        Ok(reference)
     }
 
     pub(super) fn semantic_source_waiting(&self)->Result<bool> {
@@ -1655,6 +1804,13 @@ impl WorkflowGuard {
     }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
+    }
+
+    pub(super) fn with_qualification_evidence<T>(&self,
+        read:impl FnOnce(&Path,&durable::VerifierEvidenceInspection<'_>)->Result<T>)->Result<T> {
+        self.healthy_lease()?;self.audit.protected_health()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow evidence lock poisoned"))?
+            .with_qualification_evidence(&self.lease,&self.binding,millis(),read)
     }
 
     pub(super) fn record_verifier_evidence(&self,key:&str,kind:&str,body:&str)->Result<()> {
@@ -2256,6 +2412,112 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_failure_diagnostics_survive_owned_binding_rotation_and_deduplicate_each_binding() {
+        let data=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&data.path().join("workflow.db")).unwrap();
+        let id="owner/repo#7";let first=Binding {head:"original-head".into(),contract:"original-contract".into(),evidence_hash:"first-evidence".into()};
+        store.register(id,"fixture",first.clone(),millis()).unwrap();let lease=store.claim(id,"fixture",millis(),60_000).unwrap().unwrap();
+        let context=|binding:&Binding|durable::RecoveryContext {version:1,workflow:id.into(),repository:"owner/repo".into(),worktree:data.path().into(),
+            source_request:"original owner request".into(),source_pr:None,contract:"original owner request".into(),environment:"fixture".into(),binding:binding.clone()};
+        store.record_recovery_context(&lease,&first,&context(&first),millis()).unwrap();
+        let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.stage=Stage::Scope;
+        cp.next=durable::NextAction {reason:"acceptance_contract_invalid".into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&cp,millis()).unwrap();store.release(&lease,millis()).unwrap();
+        let reference=durable::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),prepared:"d".repeat(64),contract:"e".repeat(64)};
+        let held=store.snapshot(id).unwrap().unwrap();
+        assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(id,&first).unwrap().unwrap();
+        for turn in 0..2 {
+            let lease=store.claim_productive_for_binding(id,"fixture",millis(),60_000,&first).unwrap().unwrap();
+            let binding=if turn==0 {first.clone()}else{Binding {evidence_hash:"second-evidence".into(),..first.clone()}};
+            if turn==1 {
+                let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.binding=binding.clone();
+                cp.next=durable::NextAction {reason:"baseline_qualification_started".into(),action:"qualify_original_baseline".into(),eligible_at_ms:0};
+                store.checkpoint_with_execution_context(&lease,&cp,&context(&binding),millis()).unwrap();
+            }
+            let error=anyhow::anyhow!("identical unavailable original source");
+            record_semantic_source_failure(&mut store,&lease,&binding,&cue.key,&error)
+                .expect("same private cause on a new owned binding collided with the earlier immutable diagnostic");
+            let events=store.events(id).unwrap();
+            record_semantic_source_failure(&mut store,&lease,&binding,&cue.key,&error).unwrap();
+            assert_eq!(store.events(id).unwrap(),events,"duplicate diagnostic changed workflow history");
+            store.release(&lease,millis()).unwrap();
+            if turn==0 {
+                let held=store.snapshot(id).unwrap().unwrap();
+                assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference.clone()))).unwrap());
+            }
+        }
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+    }
+    #[tokio::test]
+    async fn retained_recovery_restart_after_settlement_keeps_qualification_gate() {
+        let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+        let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        original.transition(Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0).await.unwrap();
+        let id=original.id().to_owned();original.finish().unwrap();
+        let reference=durable::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),
+            prepared:format!("{:x}",Sha256::digest(serde_json::to_vec(&prepared).unwrap())),contract:prepared.baseline.registration.contract_hash().into()};
+        {
+            let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&id).unwrap().unwrap();
+            assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference))).unwrap());
+        }
+        let guard=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        {
+            let mut store=guard.store.lock().unwrap();
+            // Script only the store completion boundary, without qualifying
+            // the guard. Model admission must still recheck real evidence.
+            assert!(store.settle_retained_qualification(&guard.lease,&guard.binding,millis(),|_,_|Ok(())).unwrap());
+            assert!(store.semantic_reconsideration(&id,&guard.binding).unwrap().is_none());
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.reason,"original_semantic_witness_recovered");
+        }
+        guard.finish().unwrap();
+        let restarted=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().expect("settled recovery checkpoint was parked after restart");
+        assert!(matches!(*restarted.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"historical completion bypassed current qualification after restart");
+        let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.events(&id).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        restarted.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_recovery_keeps_recovery_only_authority_across_a_changed_candidate_head() {
+        for (registered,owner_changed) in [(false,false),(true,false),(false,true),(true,true)] {
+            let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
+            let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original owner request",environment:"frontend environment"};
+            let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+            if registered {original.bind_acceptance_for_recovery(&prepared).unwrap();}
+            original.checkpoint(Stage::Scope,"acceptance_contract_invalid","await_acceptance_input_change",0,&[]).await.unwrap();
+            let workflow=original.id().to_owned();let binding=original.binding().clone();original.finish().unwrap();
+            // Synthetic data identities isolate binding/authority assembly;
+            // this callback neither validates a witness nor grants approval.
+            let reference=durable::RetainedWitnessReference {plan:"a".repeat(64),result:"b".repeat(64),data:"c".repeat(64),
+                prepared:"d".repeat(64),contract:prepared.baseline.registration.contract_hash().into()};
+            let cue={
+                let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&workflow).unwrap().unwrap();
+                assert!(store.recover_retained_qualification(&held,None,millis(),|_|Ok(Some(reference.clone()))).unwrap());
+                store.semantic_reconsideration(&workflow,&binding).unwrap().unwrap()
+            };
+            git_evidence(repo.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+                "-c","core.hooksPath=/dev/null","commit","--allow-empty","-qm","candidate integration"]).await.unwrap();
+            let mut next=start();if owner_changed {next.contract="changed owner request";}
+            let resumed=WorkflowGuard::acquire_fixture(&state,next).await.unwrap().unwrap();
+            assert_ne!(resumed.binding().head,binding.head);
+            assert_eq!(matches!(*resumed.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),!owner_changed,
+                "current owner request did not determine recovery-only authority; registered={registered}, owner_changed={owner_changed}");
+            let store=WorkflowStore::open(&state).unwrap();
+            assert_eq!(store.semantic_reconsideration(&workflow,resumed.binding()).unwrap(),(!owner_changed).then_some(cue));
+            let context=store.recovery_context(&workflow,resumed.binding()).unwrap().unwrap();
+            assert_eq!(context.source_request,if owner_changed {"changed owner request"}else{"original owner request"});assert_eq!(context.binding,*resumed.binding());
+            let snapshot=store.snapshot(&workflow).unwrap().unwrap();assert_eq!(snapshot.model_calls,0);assert_eq!(snapshot.tokens,0);
+            assert_eq!(store.events(&workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+            resumed.finish().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn semantic_recovery_reuses_registered_context_without_builder_authority() {
         let (repo,control,prepared)=acceptance::qualification_fixture();let state=control.path().join("workflow.db");
