@@ -189,6 +189,8 @@ When the controller's VM deadline expires, the native tool returns
 `[runner=vm] JARVIS_EXECUTION:command_timeout` with a fixed diagnostic. This is
 an execution failure, separate from a profile denial or preflight readiness
 refusal. Guest-provided error text cannot assert this controller-owned category.
+That category requires the supervisor's descendant-cleanup receipt after exit;
+missing or invalid cleanup proof remains a VM failure, even after a deadline.
 The existing deadline and process/storage cleanup remain in force; reporting the
 timeout does not automatically retry the command or grant further permissions.
 

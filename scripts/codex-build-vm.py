@@ -429,6 +429,7 @@ poweroff -f
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
                 env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
                 pass_fds=() if storage_lease is None else tuple(getattr(storage_lease,'fds',[storage_lease.fd])))
+            timed_out = False
             try:
                 deadline = None if timeout is None else time.monotonic() + min(max(timeout, 1), 900)
                 while True:
@@ -436,6 +437,7 @@ poweroff -f
                         storage_lease.check()
                     remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
+                        timed_out = True
                         raise CommandTimedOut('VM command timed out')
                     broker.poll(remaining)
                     try:
@@ -470,3 +472,13 @@ poweroff -f
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
+                if timed_out:
+                    # A terminated supervisor may exit nonzero after proving
+                    # that it reaped every descendant. Its receipt is required
+                    # before an execution deadline can be reported as such.
+                    try:
+                        verified = cleanup.is_file() and cleanup.read_text() == 'all-descendants-reaped\n'
+                    except (OSError, UnicodeError):
+                        verified = False
+                    if not verified:
+                        raise Unavailable('VM command cleanup could not be verified')
