@@ -1460,6 +1460,20 @@ mod tests {
             let held=writer.snapshot(&id).unwrap().unwrap();
             let revision=writer.owner_control(&id).unwrap().map(|owner|owner.revision);
             let recovery_context=writer.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();
+            let (allowed,pinned)=write_admission_inputs(&prepared);
+            let admission=augmentagent_channel_core::autoship_write_scope::registration_publication(root.path(),
+                prepared.baseline.registration.contract_hash(),allowed,pinned).unwrap();
+            assert!(!admission.registered,"isolated fixture must start before native registration");
+            std::fs::create_dir_all(admission.path.parent().unwrap()).unwrap();
+            std::fs::set_permissions(admission.path.parent().unwrap(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(&admission.path,b"unrecognized write admission").unwrap();
+            std::fs::set_permissions(&admission.path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let unchanged=writer.events(&id).unwrap();
+            assert!(writer.recover_retained_qualification(&held,revision,chrono::Utc::now().timestamp_millis(),|evidence|
+                inspect_retained_recovery_ready(root.path(),&native_control,source,&held,&recovery_context,evidence,None)).is_err(),"corrupt admission queued a productive retry");
+            assert_eq!(writer.snapshot(&id).unwrap().unwrap(),held);assert_eq!(writer.events(&id).unwrap(),unchanged);
+            assert_eq!(std::fs::read(&admission.path).unwrap(),b"unrecognized write admission");
+            std::fs::remove_file(&admission.path).unwrap();
             let conflicting=artifact_path(&native_control,&context(&prepared.proposal,&prepared.baseline).unwrap());
             std::fs::write(&conflicting,b"conflicting immutable receipt").unwrap();
             std::fs::set_permissions(&conflicting,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1767,6 +1781,23 @@ mod tests {
         assert_eq!(inspect_retained_qualification_with_reference(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&before,&recovery,&evidence,None).unwrap(),Some(reference.clone()));
         let recovered=retained_qualification_source(&recovery.worktree,&control,AcceptanceSource::Issue(1830),&reference,&evidence).unwrap();
         assert_eq!(serde_json::to_vec(&recovered).unwrap(),serde_json::to_vec(prepared).unwrap());
+        let (allowed,pinned)=write_admission_inputs(&recovered);
+        let admission=augmentagent_channel_core::autoship_write_scope::registration_publication(&recovery.worktree,
+            recovered.baseline.registration.contract_hash(),allowed,pinned).unwrap();
+        for writable in worker_roots(&recovery.worktree) {
+            if writable.exists() {assert!(!admission.path.starts_with(writable.canonicalize().unwrap()));}
+        }
+        let mut missing_harness=0;
+        for (relative,body) in &recovered.proposal.files {
+            let path=recovery.worktree.join(relative);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata)=>{assert!(metadata.is_file() && !metadata.file_type().is_symlink());assert_eq!(std::fs::read(path).unwrap(),body.as_bytes());},
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>missing_harness+=1,
+                Err(error)=>panic!("retained harness inventory unavailable: {error}"),
+            }
+        }
+        println!("actual setup inventory: admission_registered={}, harness_files={}, missing_harness={}; inspection only",
+            admission.registered,recovered.proposal.files.len(),missing_harness);
         let mut cursor=0;let mut captured_originals=0;
         loop {
             let rows=evidence.page("original_verifier_result",cursor).unwrap();if rows.is_empty(){break;}

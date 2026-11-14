@@ -7,14 +7,64 @@ const PROBE_FINAL:&str=".jarvis-recovery-publication-final";
 const MAX_PROBE_BYTES:usize=4*1024*1024+3*64*1024+PROBE_MARKER.len();
 
 
+pub(super) fn probe_registration(publication:&augmentagent_channel_core::autoship_write_scope::RegistrationPublication)->Result<()> {
+    ensure!(publication.bytes.len()<=1024*1024,"registration publication exceeds envelope");
+    if publication.registered {return Ok(());}
+    let parent=prepare_registration_parent(publication.path.parent().context("registration parent missing")?)?;
+    match std::fs::symlink_metadata(&publication.path) {
+        Ok(metadata)=>{
+            ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),"registration destination is not a regular file");
+            ensure!(baseline_witness::private_bytes(&publication.path,1024*1024)?==publication.bytes,"registration publication conflicts");
+        },
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(error)=>return Err(error.into()),
+    }
+    named_probe(&parent,publication.bytes.len()+64*1024,write_allocation)
+}
+
+fn prepare_registration_parent(path:&Path)->Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    ensure!(path.is_absolute() && path.components().all(|part|matches!(part,std::path::Component::RootDir|std::path::Component::Normal(_))),
+        "registration control path is not absolute and literal");
+    let mut current=path.to_path_buf();let mut missing=Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta)=>{
+                ensure!(meta.is_dir() && !meta.file_type().is_symlink() && current.canonicalize()?==current,
+                    "registration parent is redirected");
+                ensure!(meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o022==0 && meta.mode()&0o300==0o300,
+                    "registration storage is not owned writable control state");
+                break;
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                missing.push(current.file_name().context("registration ancestor missing")?.to_os_string());
+                ensure!(current.pop(),"registration root missing");
+            },
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    for part in missing.into_iter().rev() {
+        current.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&current) {
+            Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(error)=>return Err(error.into()),
+        }
+        let meta=std::fs::symlink_metadata(&current)?;
+        ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==unsafe{libc::geteuid()}
+            && meta.mode()&0o022==0 && meta.mode()&0o300==0o300,"registration control directory changed");
+    }
+    Ok(current)
+}
+
+fn write_allocation(file:&mut std::fs::File,length:usize)->Result<()> {
+    use std::io::{Read,Write};
+    let mut entropy=std::fs::File::open("/dev/urandom")?;
+    let mut block=[0u8;65536];let mut remaining=length;
+    while remaining>0 {let count=remaining.min(block.len());entropy.read_exact(&mut block[..count])?;file.write_all(&block[..count])?;remaining-=count;}
+    file.sync_all()?;Ok(())
+}
+
 pub(super) fn probe(control:&Path,receipt:&Path,expected:&[u8],additional_bytes:usize)->Result<()> {
-    probe_with(control,receipt,expected,additional_bytes,|file,length| {
-        use std::io::{Read,Write};
-        let mut entropy=std::fs::File::open("/dev/urandom")?;
-        let mut block=[0u8;65536];let mut remaining=length;
-        while remaining>0 {let count=remaining.min(block.len());entropy.read_exact(&mut block[..count])?;file.write_all(&block[..count])?;remaining-=count;}
-        file.sync_all()?;Ok(())
-    })
+    probe_with(control,receipt,expected,additional_bytes,write_allocation)
 }
 fn probe_with(control:&Path,receipt:&Path,expected:&[u8],additional_bytes:usize,
     write:impl FnOnce(&mut std::fs::File,usize)->Result<()>)->Result<()> {
@@ -51,8 +101,8 @@ fn probe_lock(control:&Path)->Result<ProbeLock> {
     let file=std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open(control)?;
     let meta=file.metadata()?;
-    ensure!(meta.is_dir() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0,
-        "publication probe lock is not private owned storage");
+    ensure!(meta.is_dir() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o022==0,
+        "publication probe lock is not owned control storage");
     if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {return Err(std::io::Error::last_os_error().into());}
     Ok(ProbeLock(file))
 }
@@ -117,6 +167,23 @@ fn named_probe(control:&Path,length:usize,write:impl FnOnce(&mut std::fs::File,u
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn registration_probe_checks_its_actual_destination_without_creating_a_grant() {
+        let root=tempfile::tempdir().unwrap();let parent=root.path().join("admission");
+        std::fs::create_dir(&parent).unwrap();std::fs::set_permissions(&parent,std::fs::Permissions::from_mode(0o500)).unwrap();
+        let publication=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {path:parent.join("scope.json"),bytes:b"original serialized admission".to_vec(),registered:false};
+        assert!(probe_registration(&publication).is_err(),"unwritable admission destination passed recovery readiness");
+        std::fs::set_permissions(&parent,std::fs::Permissions::from_mode(0o755)).unwrap();
+        probe_registration(&publication).unwrap();
+        assert!(!publication.path.exists(),"readiness created a native write grant");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(),0,"registration readiness leaked scratch");
+        let nested=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {path:parent.join("new/child/scope.json"),bytes:b"bounded admission".to_vec(),registered:false};
+        probe_registration(&nested).unwrap();assert!(nested.path.parent().unwrap().is_dir());assert!(!nested.path.exists());
+        let redirect=root.path().join("redirect");std::os::unix::fs::symlink(&parent,&redirect).unwrap();
+        let redirected=augmentagent_channel_core::autoship_write_scope::RegistrationPublication {path:redirect.join("scope.json"),bytes:vec![],registered:false};
+        assert!(probe_registration(&redirected).is_err(),"registration readiness followed a redirected control parent");
+    }
+
     #[test]
     fn publication_probe_reclaims_only_owned_interrupted_publication() {
         let root=tempfile::tempdir().unwrap();let control=root.path();

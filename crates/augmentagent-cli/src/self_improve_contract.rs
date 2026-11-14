@@ -1865,6 +1865,24 @@ fn persist_initial_prepared(control:&Path,path:&Path,prepared:&PreparedAcceptanc
     std::fs::File::open(control)?.sync_all()?;Ok(())
 }
 
+fn write_admission_inputs(prepared:&PreparedAcceptance)->(Vec<augmentagent_channel_core::autoship_write_scope::DeclaredPath>,Vec<String>) {
+    let allowed=prepared.proposal.contract.allowed_paths.iter().map(|scope|match scope {
+        crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
+        crate::autoship_contract::PathScope::Directory(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:true},
+    }).collect();
+    (allowed,prepared.proposal.files.keys().cloned().collect())
+}
+
+fn require_retained_registration(root:&Path,prepared:&PreparedAcceptance)->Result<()> {
+    let (allowed,pinned)=write_admission_inputs(prepared);
+    let publication=augmentagent_channel_core::autoship_write_scope::registration_publication(root,
+        prepared.baseline.registration.contract_hash(),allowed,pinned)?;
+    for writable in worker_roots(root) {
+        if writable.exists() {ensure!(!publication.path.starts_with(writable.canonicalize()?),"write admission is writable by worker");}
+    }
+    recovery_publication::probe_registration(&publication)
+}
+
 pub(super) async fn prepare_acceptance_for(repo:&Path,candidate:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
     reasoner:&dyn Reasoner,writable_roots:&[PathBuf],required_criteria:&[String],workflow:&workflow::WorkflowGuard)->Result<PreparedAcceptance> {
     let execution:futures::future::BoxFuture<'_,Result<PreparedAcceptance>>=Box::pin(
@@ -2020,31 +2038,8 @@ async fn prepare_acceptance_for_inner(
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
     install_candidate_harness(candidate, &prepared)?;
-    augmentagent_channel_core::autoship_write_scope::register(
-        candidate,
-        prepared.baseline.registration.contract_hash(),
-        prepared
-            .proposal
-            .contract
-            .allowed_paths
-            .iter()
-            .map(|scope| match scope {
-                crate::autoship_contract::PathScope::File(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: false,
-                    }
-                }
-                crate::autoship_contract::PathScope::Directory(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: true,
-                    }
-                }
-            })
-            .collect(),
-        prepared.proposal.files.keys().cloned().collect(),
-    )?;
+    let (allowed,pinned)=write_admission_inputs(&prepared);
+    augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned)?;
     Ok(prepared)
 }
 
@@ -2381,7 +2376,7 @@ pub(super) fn inspect_retained_qualification_with_reference(root:&Path,control:&
 }
 
 /// Source inspection remains read-only; only this separate readiness boundary
-/// performs the bounded anonymous controller-filesystem probe before queueing.
+/// performs bounded controller and write-admission filesystem preparation before queueing.
 pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:AcceptanceSource,
     snapshot:&crate::autoship_workflow::Snapshot,context:&crate::autoship_workflow::RecoveryContext,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,
@@ -2390,6 +2385,7 @@ pub(super) fn inspect_retained_recovery_ready(root:&Path,control:&Path,source:Ac
     let prepared=retained_qualification_source(root,control,source,&reference,evidence)?;
     baseline_witness::require_retained_publication(root,control,&context.repository,&snapshot.workflow,&prepared,&reference,evidence)
         .map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    require_retained_registration(root,&prepared).map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
     Ok(Some(reference))
 }
 

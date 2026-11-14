@@ -1059,3 +1059,80 @@ read-only; this separate filesystem readiness phase retains its limited side
 effects. The other setup destinations in §21, final current-main integration,
 complete seam and engineering reviews, hosted CI and protected rollout remain
 open. No broader autoship restoration or ordinary merge is claimed.
+
+
+## 23. Write-admission destination readiness and actual setup inventory
+
+D12. Share the literal write-admission writer's planning logic with recovery;
+do not invent its filename, serialization or existing-record policy in a second
+component. `autoship_write_scope::registration_publication` returns the exact
+canonical destination, expected v1 JSON bytes and an observed `registered` flag.
+This is a read-only, non-serialized controller API, not a model response, grant
+or cached authorization. An existing record must pass the normal private-file
+reader and equal the expected canonical worktree, contract, allowed paths and
+pinned paths. A changed contract or malformed/nonprivate/symlink record refuses
+inspection. Missing state is reported without creating any directory or file.
+
+The normal writer uses this same plan. Existing matching registration is
+idempotent; pending registration uses the same bytes and no-clobber publication.
+The existing <=256 allowed/pinned entry bounds and literal-relative-path checks
+are preserved. Serialization is bounded to the existing 1 MiB reader envelope.
+An existing ancestor is resolved before appending missing directory components,
+so a missing final record cannot conceal a parent redirect into the candidate.
+The resolved destination must remain outside that candidate; the recovery caller
+also checks every existing worker-writable root, even for a matching existing
+registration. No current role, workflow/model budget or qualification is inferred
+from the preview's `registered` flag.
+
+Actual preparation and recovery now share `write_admission_inputs`: the original
+contract's allowed-path order/directory bits and the proposal's pinned-file order
+are not reconstructed differently by the two callers. During readiness, a matching
+existing record requires no new registration write. For a pending record, the
+separate filesystem phase prepares only its controller-owned parent directories
+and runs §22's real no-clobber scratch probe at that destination, bounded by the
+expected registration bytes plus 64 KiB. It creates no actual registration or
+native write grant. A concurrent final record must be private and byte-identical;
+otherwise readiness refuses without overwrite. Actual registration remains the
+normal guarded preparation writer's responsibility.
+
+Pending parents must be literal absolute, nonredirected, owned, writable control
+storage without group/world write access. Existing 0755 parents are permitted;
+record and probe files remain private. Missing directories are created with mode
+0700. The shared normal writer also creates new controller directories with mode
+0700, avoiding the inherited group-writable umask found by the lifecycle fixture.
+No existing directory is silently chmodded and no unsafe parent is treated as
+ready. The deployed admission directory was inspected at mode 0700; permission
+policy was not weakened to make the tests pass.
+
+The test-first preview regression required an exact pending destination without
+side effects; its output now matches the actual writer's bytes. The filesystem
+regression reproduced an unwritable admission destination being treated as ready.
+Core tests cover read-only preview, idempotent existing state, changed-contract
+refusal, private new directories and missing-parent redirects into the candidate.
+The initial-issue and PR lifecycle fixture adds corrupt admission state in its
+explicitly verified disposable state directory and proves that the real store
+callback refuses queueing with unchanged checkpoint/events and original bad bytes.
+Only that fixture state is restored for subsequent healthy preparation.
+
+Current verification: full core library **746 passed / 0 failed / 16 explicit
+ignores**; CLI publication checks **7 passed / 0 failed**; original witness and
+issue/PR lifecycle group **27 passed / 0 failed / 2 explicit ignores**. The explicit
+read-only actual #1830 probe passed again with its original Medium decision,
+unchanged workflow/events and twelve historical model calls. It calls only the
+read-only registration planner, not its directory/probe/writer phase.
+
+The actual source inventory now establishes the next concrete requirement:
+**#1830 has no current registration, and its single proposed harness file is
+missing from the retained checkout.** The admission destination is now covered;
+missing-harness readiness still blocks activation. Trace the actual installer
+and parent filesystems next. Do not create persistent probe/bookkeeping files
+inside candidate or broadly exempt candidate files from `git_binding`: that
+binding includes tracked changes and untracked evidence. Preserve exact existing
+harness bytes and original provenance, do not overwrite a tampered verifier, and
+ensure interruption cannot strand unexplained probe files before binding checks.
+
+This section supersedes the literal-registration portion of §§21–22's open
+coverage status. It does not close the harness destination, current-main merge,
+final joined checks, full spec/seam and independent engineering reviews, hosted
+CI, protected rollout, natural ordinary acceptance or the complete #1703 goal.
+No positive workflow was queued or model call spent by the actual-source probe.
