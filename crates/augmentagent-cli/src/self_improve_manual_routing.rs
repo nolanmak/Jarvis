@@ -20,8 +20,13 @@ async fn inspect(root:&Path,repository:&str,pr:u64,source:Option<u64>)->Result<b
     ensure!(ok && raw.len()<=1024*1024,"automatic PR routing unavailable");
     let row:serde_json::Value=serde_json::from_str(&raw)?;
     ensure!(row["number"].as_u64()==Some(pr),"automatic PR routing target changed");
+    // gh hydrates only the first 100 entries of nested PR connections. A
+    // saturated page cannot prove absence of a manual label/source.
+    ensure!(row["labels"].as_array().is_some_and(|labels|labels.len()<100),
+        "automatic PR labels incomplete");
     if manual(&row)? {return Ok(false);}
     let references=row["closingIssuesReferences"].as_array().context("automatic PR sources unavailable")?;
+    ensure!(references.len()<100,"automatic PR sources incomplete");
     let mut sources=std::collections::BTreeSet::new();
     sources.extend(source);
     for reference in references {

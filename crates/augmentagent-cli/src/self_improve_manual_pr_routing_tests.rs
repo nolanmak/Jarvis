@@ -59,7 +59,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
                 std::fs::create_dir(&root).unwrap();
@@ -101,6 +101,8 @@ elif a[:2]==['pr','view']:
  row=next(p for p in prs if p['number']==int(a[2]))
  if row['number']==9 and case=='race':row['labels']=[dict(name='autoship-manual')]
  if row['number']==9 and case=='malformed-pr':row.pop('labels')
+ if row['number']==9 and case=='saturated-pr-labels':row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
+ if row['number']==9 and case=='saturated-references':row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
  print(json.dumps(row))
 elif a[:1]==['api'] and '/issues/' in a[1]:
  n=a[1].split('/issues/',1)[1]

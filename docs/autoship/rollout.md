@@ -230,8 +230,8 @@ Do not use `agent-gave-up` for this routing choice: that label reports failures.
 Automatic PR adoption and resume also inspect the PR's labels and its linked
 source labels before recording ownership. The same routing check runs again at
 automatic workflow admission, parent retargeting and merge-sweep mutations.
-Missing or malformed label observations defer that candidate and leave eligible
-peers available. Existing pending remote effects still reconcile. Explicit
+Missing, malformed or saturated PR label/source observations defer that candidate
+and leave eligible peers available. Existing pending remote effects still reconcile. Explicit
 authorized CLI/Discord targeting retains its own route; a routing label grants
 no repository access and cannot clear an owner pause. Labels are remote routing
 observations, not a linearizable stop signal for an already-active turn: use the
