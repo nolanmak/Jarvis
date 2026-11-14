@@ -2206,8 +2206,11 @@ impl WorkflowStore {
         if snapshot.pr != Some(pr) || snapshot.branch != branch
             || snapshot.checkpoint.binding.head != local || local == published
             || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
-            || !matches!(snapshot.checkpoint.stage,
+            || !(matches!(snapshot.checkpoint.stage,
                 Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+                || (snapshot.checkpoint.stage==Stage::Held
+                    && snapshot.checkpoint.next.reason=="automatic_pr_routing_held"
+                    && snapshot.checkpoint.next.action=="retry_automatic_pr_routing"))
             || self.owner_control(&id)?.is_some_and(|control| control.paused)
             || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
             return Ok(None);

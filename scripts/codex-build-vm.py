@@ -34,6 +34,10 @@ class CommandTimedOut(Unavailable):
     """Controller deadline, distinct from guest-supplied failure text."""
 
 
+class CleanupUnverified(Unavailable):
+    """Controller could not prove descendant cleanup after execution."""
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -481,4 +485,4 @@ poweroff -f
                     except (OSError, UnicodeError):
                         verified = False
                     if not verified:
-                        raise Unavailable('VM command cleanup could not be verified')
+                        raise CleanupUnverified('VM command cleanup could not be verified')

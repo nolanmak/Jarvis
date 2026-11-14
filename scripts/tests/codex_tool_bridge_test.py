@@ -2880,6 +2880,9 @@ class BuildScratchTests(unittest.TestCase):
             class CommandTimedOut(Unavailable):
                 pass
 
+            class CleanupUnverified(Unavailable):
+                pass
+
             class Runtime:
                 @staticmethod
                 def load(path):
@@ -3193,6 +3196,21 @@ class BuildScratchTests(unittest.TestCase):
         self.assertNotIn('SYNTHETIC_PRIVATE', text)
         self.assertNotIn('Operation denied', text)
         self.assertNotIn('JARVIS_READINESS:', text, 'an executed timeout is not a preflight refusal')
+
+    def test_controller_cleanup_failure_reaches_the_model_without_becoming_a_profile_refusal(self):
+        policy = self.policy()
+        def unverified(*args, **kwargs):
+            raise self.fake_vm.CleanupUnverified('SYNTHETIC_PRIVATE_CLEANUP_PATH')
+        self.fake_vm.run = staticmethod(unverified)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test', 'timeout': 1}}})
+        self.assertTrue(response['isError'])
+        text = response['content'][0]['text']
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:cleanup_unverified '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('command_timeout', text)
+        self.assertNotIn('JARVIS_READINESS:', text)
 
     def test_guest_error_text_cannot_impersonate_a_controller_timeout(self):
         policy = self.policy()

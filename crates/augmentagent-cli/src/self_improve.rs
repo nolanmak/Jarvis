@@ -1712,6 +1712,8 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         let Some(issue) = issue_from_branch(branch).or_else(|| adopted.as_ref().and_then(|owned| owned.source_issue)) else {
             continue;
         };
+        // Routing observations cost network reads even when the PR is excluded.
+        examined += 1;
         if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
             continue;
         }
@@ -1723,8 +1725,6 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        // Past the free filters, so this candidate costs network reads.
-        examined += 1;
         let head_sha = row
             .get("headRefOid")
             .and_then(serde_json::Value::as_str)
@@ -1854,6 +1854,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 // turns a silent TOCTOU into a failed merge — and a failed
                 // merge restores the draft below.
                 if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                    if readied && sweep_lease.validate_remote(repo_root,pr,&head).await.is_ok() {
+                        let _=run(&gh,&["pr","ready",&pr.to_string(),"--undo"],repo_root).await;
+                    }
                     continue;
                 }
                 let merge_intent = match sweep_lease.merge_intent() { Ok(intent) => intent, Err(_) => continue };
@@ -7445,6 +7448,9 @@ async fn resume_draft_pr(
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
                 );
                 if !dry_run {
+                    if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+                    }
                     workflow.push(branch).await?;
                 }
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
@@ -7492,6 +7498,9 @@ async fn resume_draft_pr(
                     // including whether this run is billed, which it is only if a
                     // builder call was actually made.
                     if !dry_run {
+                        if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+                        }
                         workflow.push(branch).await?;
                     }
                     checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await?;
@@ -7597,6 +7606,9 @@ async fn resume_draft_pr(
             let reviewed_head = reviewed_head.trim();
             // Push whatever the rounds committed (the merge-with-main commit
             // included), surface the verdicts, and merge per policy.
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             workflow.push(branch).await?;
             acceptance::assert_receipt_current(&worktree,&prepared_acceptance,&acceptance_receipt).await?;
             // Preserve approval for a future explicit merge authorization too.
@@ -7638,6 +7650,9 @@ async fn resume_draft_pr(
                     .and_then(|v| v.get("isDraft").and_then(serde_json::Value::as_bool)),
                 _ => None,
             };
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
                 workflow.transition(Stage::AwaitChecks, "ready_state_unavailable", "reconcile_checks", chrono::Utc::now().timestamp_millis()+60_000).await?;
                 return Ok(RunReport::built(format!(
@@ -7647,6 +7662,10 @@ async fn resume_draft_pr(
             workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
             anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
             acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
+                return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
+            }
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
             let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?).await;
@@ -7679,6 +7698,9 @@ async fn resume_draft_pr(
         let open_notes = if qa_ok { independent.notes.clone() } else { qa_notes.clone() };
         if rounds_done >= revise_rounds() {
             // Out of rounds: publish the improved state + verdicts, stay draft.
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             workflow.push(branch).await?;
             if !qa_ok {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;

@@ -254,6 +254,7 @@ pub(super) async fn resume(
         &environment,
         &mut guard,
         &capacity_accounting,
+        automatic,
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
@@ -323,6 +324,7 @@ async fn execute(
     environment: &str,
     guard: &mut workflow::WorkflowGuard,
     capacity_accounting:&workflow::CapacityAccounting,
+    automatic:bool,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
     let grounded_request=match preparation_request(worktree,pr,request,guard).await? {
@@ -426,6 +428,9 @@ async fn execute(
         .await;
         last_review_unavailable = review.why_unavailable.as_ref().map(ReviewUnavailable::code);
         if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
+            }
             guard.push(&pr.branch).await?;
             checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
             return Ok(RunReport::built(format!(
@@ -483,6 +488,9 @@ async fn execute(
         )
         .await?;
         if review.approved() {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
+            }
             guard.push(&pr.branch).await?;
             acceptance::assert_receipt_current(worktree, &prepared, &receipt).await?;
             if guard.published_pr_ready(pr.pr,&review).await? {
@@ -545,7 +553,11 @@ async fn execute(
                 row["headRefOid"].as_str() == Some(binding.head.as_str()),
                 "PR head changed after review"
             );
-            if row["isDraft"].as_bool() == Some(true) {
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                return Ok(RunReport::held(format!("PR #{}: automatic ready routing held",pr.pr)));
+            }
+            let readied=row["isDraft"].as_bool()==Some(true);
+            if readied {
                 let intent = guard.intent(OperationKind::ReadyPr)?;
                 guard.validate_binding(&binding).await?;
                 let (ok, _, error) =
@@ -577,6 +589,10 @@ async fn execute(
                 )?;
             }
             guard.validate_binding(&binding).await?;
+            if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+                manual_routing::restore_draft(repo,pr.pr,readied,guard).await;
+                return Ok(RunReport::held(format!("PR #{}: automatic merge routing held",pr.pr)));
+            }
             let intent = guard.intent(OperationKind::MergePr)?;
             let mutation =
                 publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?).await;
@@ -649,6 +665,9 @@ async fn execute(
         }
         result?;
         round += 1;
+    }
+    if !manual_routing::permit_mutation(repo,pr.pr,pr.source_issue,automatic,guard).await? {
+        return Ok(RunReport::held(format!("PR #{}: automatic publication routing held",pr.pr)));
     }
     guard.push(&pr.branch).await?;
     guard
@@ -740,14 +759,14 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
         };
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
-        if ready_for_merge(repo, pr.pr, row["isDraft"].as_bool())
-            .await
-            .is_none()
-        {
+        let Some(readied)=ready_for_merge(repo,pr.pr,row["isDraft"].as_bool()).await else {continue};
+        lease.validate_remote(repo, pr.pr, &pr.head).await?;
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
+            if readied && lease.validate_remote(repo,pr.pr,&pr.head).await.is_ok() {
+                let _=run(&gh_bin(),&["pr","ready",&pr.pr.to_string(),"--undo"],repo).await;
+            }
             continue;
         }
-        lease.validate_remote(repo, pr.pr, &pr.head).await?;
-        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         let intent = lease.merge_intent()?;
         let mutation =
             publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;

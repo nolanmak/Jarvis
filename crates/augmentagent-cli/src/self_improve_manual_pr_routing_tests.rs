@@ -11,6 +11,37 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case=="late-mutation" {
+            let source=(std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked").then_some(7);
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:source,pr:Some(9),
+                branch:"feat/repair-9",contract:"Retained ordinary request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            assert!(manual_routing::permit_mutation(&root,9,source,true,&mut guard).await.unwrap());
+            let before=initial.snapshot(guard.id()).unwrap().unwrap();
+            std::fs::write(root.join("manual-after-admission"),b"late owner routing").unwrap();
+            assert!(!manual_routing::permit_mutation(&root,9,source,true,&mut guard).await.unwrap(),
+                "an automatic publication boundary ignored a manual label applied after admission");
+            let held=initial.snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(held.model_calls,before.model_calls);assert_eq!(held.tokens,before.tokens);
+            assert_eq!(held.checkpoint.binding,before.checkpoint.binding,"routing observation changed candidate evidence");
+            assert_eq!(held.checkpoint.next.reason,"automatic_pr_routing_held");
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty());
+            assert!(manual_routing::permit_mutation(&root,9,source,false,&mut guard).await.unwrap(),
+                "automatic routing revoked explicit dispatch authorization");
+            assert_eq!(initial.snapshot(guard.id()).unwrap().unwrap(),held,
+                "explicit routing observation cleared a durable hold or changed charges");
+            std::fs::write(root.join("actual-head"),&guard.binding().head).unwrap();
+            manual_routing::restore_draft(&root,9,false,&guard).await;
+            assert!(!root.join("draft-restored").exists(),"undo touched a PR this turn did not ready");
+            manual_routing::restore_draft(&root,9,true,&guard).await;
+            assert!(root.join("draft-restored").exists(),"late routing denial left this turn's exact-head PR ready");
+            std::fs::remove_file(root.join("draft-restored")).unwrap();
+            std::fs::write(root.join("actual-head"),"foreign-head").unwrap();
+            manual_routing::restore_draft(&root,9,true,&guard).await;
+            assert!(!root.join("draft-restored").exists(),"draft undo touched a changed remote candidate");
+            guard.finish().unwrap();return;
+        }
         if case.starts_with("paused-") {
             let id=if case=="paused-pr" {"owner/repo/pr/9"}else{"owner/repo#7"};
             let binding=crate::autoship_workflow::Binding {head:format!("{:040x}",9),contract:"contract".into(),evidence_hash:"evidence".into()};
@@ -59,13 +90,21 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
                 std::fs::create_dir(&root).unwrap();
                 for args in [vec!["init","-q"],vec!["remote","add","origin","https://github.com/owner/repo.git"]] {
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
+                }
+                if case=="late-mutation" {
+                    assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                        "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
+                        .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
+                    assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
+                        .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
+                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\n").unwrap();
                 }
                 let references=|number|serde_json::json!([{"number":number,"url":format!("https://github.com/owner/repo/issues/{number}")}]);
                 let mut manual_refs=if route=="linked" {references(7)}else{serde_json::json!([])};
@@ -100,6 +139,8 @@ elif a[:2]==['pr','view']:
  if case=='unknown-pr' and a[2]=='9':sys.exit(1)
  row=next(p for p in prs if p['number']==int(a[2]))
  if row['number']==9 and case=='race':row['labels']=[dict(name='autoship-manual')]
+ if row['number']==9 and (root/'manual-after-admission').exists():row['labels']=[dict(name='autoship-manual')]
+ if row['number']==9 and (root/'actual-head').exists():row['headRefOid']=(root/'actual-head').read_text()
  if row['number']==9 and case=='malformed-pr':row.pop('labels')
  if row['number']==9 and case=='saturated-pr-labels':row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
  if row['number']==9 and case=='saturated-references':row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
@@ -111,6 +152,7 @@ elif a[:1]==['api'] and '/issues/' in a[1]:
  if case=='malformed-source' and n=='7':row.pop('labels')
  print(json.dumps(row))
 elif a[:2]==['api','user']:print('owner')
+elif a[:2]==['pr','ready'] and case=='late-mutation' and '--undo' in a:(root/'draft-restored').write_text('restored')
 else:raise AssertionError('Unexpected or mutating GitHub call: '+repr(a))
 "#).unwrap();
                 std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();

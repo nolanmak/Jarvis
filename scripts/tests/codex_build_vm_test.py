@@ -150,6 +150,8 @@ class BuildScratchPlacementTests(unittest.TestCase):
                 error = self.deadline_fixture(receipt, status)
                 self.assertNotIsInstance(error, vm.CommandTimedOut,
                                          'unverified descendant cleanup was reported as a timeout')
+                self.assertEqual(type(error).__name__, 'CleanupUnverified',
+                                 'cleanup failure needs a controller-owned category through the bridge')
 
     def test_explicit_ort_cache_is_read_only_and_pinned_in_guest_environment(self):
         with tempfile.TemporaryDirectory() as temporary:

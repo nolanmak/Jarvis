@@ -1,6 +1,7 @@
 //! Automatic routing only. Labels do not grant execution or clear owner controls.
 use super::*;
 use anyhow::ensure;
+use crate::autoship_workflow::Stage;
 
 fn manual(value:&serde_json::Value)->Result<bool> {
     let labels=value["labels"].as_array().context("automatic routing labels unavailable")?;
@@ -66,4 +67,30 @@ pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>) 
         if allowed(root,&candidate.repository,candidate.pr,candidate.source_issue).await {eligible.push(candidate);}
     }
     *candidates=eligible;
+}
+
+/// Publication boundary extracted from the resume paths. Explicit dispatch is
+/// still subject to the workflow's existing authorization and owner controls.
+pub(super) async fn permit_mutation(root:&Path,pr:u64,source:Option<u64>,automatic:bool,
+    workflow:&mut workflow::WorkflowGuard)->Result<bool> {
+    if !automatic {return Ok(true);}
+    ensure!(workflow.pr()?==Some(pr),"automatic mutation routing target changed");
+    if allowed(root,workflow.repository(),pr,source).await {return Ok(true);}
+    workflow.transition(Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",
+        chrono::Utc::now().timestamp_millis()+300_000).await?;
+    Ok(false)
+}
+
+/// Undo only this turn's ready transition while its fenced exact-head PR is
+/// still open and local to the repository. Unknown ownership leaves it alone.
+pub(super) async fn restore_draft(root:&Path,pr:u64,readied:bool,workflow:&workflow::WorkflowGuard) {
+    if !readied || workflow.validate_before_side_effect().is_err() {return;}
+    let Ok((true,raw,_))=run(&gh_bin(),&["pr","view",&pr.to_string(),"--repo",workflow.repository(),
+        "--json","number,state,headRefOid,isCrossRepository"],root).await else {return};
+    let Ok(row)=serde_json::from_str::<serde_json::Value>(&raw) else {return};
+    if row["number"].as_u64()==Some(pr) && row["state"]=="OPEN" && row["isCrossRepository"]==false
+        && row["headRefOid"].as_str()==Some(workflow.binding().head.as_str())
+        && workflow.validate_before_side_effect().is_ok() {
+        let _=run(&gh_bin(),&["pr","ready",&pr.to_string(),"--undo","--repo",workflow.repository()],root).await;
+    }
 }

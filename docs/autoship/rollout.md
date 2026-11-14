@@ -229,7 +229,9 @@ Do not use `agent-gave-up` for this routing choice: that label reports failures.
 
 Automatic PR adoption and resume also inspect the PR's labels and its linked
 source labels before recording ownership. The same routing check runs again at
-automatic workflow admission, parent retargeting and merge-sweep mutations.
+automatic workflow admission, parent retargeting, resume publication and
+merge-sweep mutations. A late routing denial preserves local work and restores
+this turn's ready transition only while the exact remote PR remains owned.
 Missing, malformed or saturated PR label/source observations defer that candidate
 and leave eligible peers available. Existing pending remote effects still reconcile. Explicit
 authorized CLI/Discord targeting retains its own route; a routing label grants
@@ -243,6 +245,11 @@ idle, unpaused owned candidate, no pending owner input or remote mutation, and
 the same published head or an authenticated retained unpublished head. The
 existing backoff and all original charges, review/CI requirements and allowance
 remain intact. Other input holds do not gain a blanket retry.
+
+The precise `held` / `automatic_pr_routing_held` / `retry_automatic_pr_routing`
+checkpoint follows those same due/idle/ownership/input/effect guards. Current
+manual labels still exclude it before adoption; after removal, a same-day marker
+cannot strand its retained work. An unknown routing read remains an unpaid hold.
 
 A fresh-selection `owner-control-unavailable` hold means the existing protected
 control state or canonical identity could not be read reliably. It is unpaid;
