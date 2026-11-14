@@ -209,6 +209,14 @@ impl WorkflowStore {
             Some(CustodyHold {physical:false,plan:None,semantic_source:Some(cue_key)}),None)
     }
 
+    pub(crate) fn hold_retained_infrastructure(&mut self,lease:&Lease,binding:&Binding,_cue_key:&str,now:i64)->Result<()> {
+        let mut checkpoint=self.snapshot(&lease.workflow)?.context("retained workflow missing")?.checkpoint;
+        ensure!(checkpoint.binding==*binding,"retained infrastructure binding changed");
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=NextAction {reason:"acceptance_verifier_infrastructure_unavailable".into(),action:"await_verifier_infrastructure_recovery".into(),eligible_at_ms:0};
+        self.checkpoint(lease,&checkpoint,now)
+    }
+
     /// Queue consideration of authenticated negative source data. This grants
     /// neither a lease nor positive qualification and never creates a budget.
     pub(crate) fn recover_semantic_qualification<F>(&mut self,expected:&Snapshot,owner_revision:Option<i64>,
@@ -405,6 +413,37 @@ mod tests {
         store.record_recovery_context(&lease,&hold.binding,&context,4).unwrap();
         store.checkpoint(&lease,&hold,5).unwrap();store.release(&lease,6).unwrap();
         let snapshot=store.snapshot(&lease.workflow).unwrap().unwrap();(dir,store,snapshot)
+    }
+
+    #[test]
+    fn retained_infrastructure_preserves_blocker_and_same_cue_until_validated_recovery() {
+        let (_dir,mut store,before)=retained_fixture();let id=before.workflow.clone();let binding=before.checkpoint.binding.clone();let reference=retained_reference();
+        assert!(store.recover_retained_qualification(&before,None,7,|_|Ok(Some(reference.clone()))).unwrap());
+        let cue=store.semantic_reconsideration(&id,&binding).unwrap().unwrap();
+        let lease=store.claim_productive_for_binding(&id,"worker",8,1000,&binding).unwrap().unwrap();
+        assert!(store.settle_retained_qualification(&lease,&binding,9,|_,_|Ok(())).unwrap());
+        store.hold_retained_infrastructure(&lease,&binding,&cue.key,10).unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();
+        assert!(infrastructure_hold(&held.checkpoint));
+        assert!(store.semantic_source_waiting(&id,&binding).unwrap(),"infrastructure hold lost the retained continuation");
+        assert_eq!(store.semantic_reconsideration(&id,&binding).unwrap(),Some(cue.clone()));
+        let events=store.events(&id).unwrap();
+        store.hold_retained_infrastructure(&lease,&binding,&cue.key,11).unwrap();
+        assert_eq!(store.events(&id).unwrap(),events,"duplicate failure added a new loss episode");
+        store.release(&lease,12).unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        assert!(store.claim_productive_for_binding(&id,"unchanged",13,1000,&binding).unwrap().is_none());
+        assert!(!store.recover_retained_qualification(&held,None,14,|_|Ok(None)).unwrap());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);assert_eq!(store.events(&id).unwrap(),events);
+        assert_eq!(store.reserve_qualification_recovery("owner/repo",15,1,&Default::default()).unwrap().len(),1);
+        assert!(store.recover_retained_qualification(&held,None,16,|_|Ok(Some(reference.clone()))).unwrap());
+        assert_eq!(store.semantic_reconsideration(&id,&binding).unwrap(),Some(cue));
+        let lease=store.claim_productive_for_binding(&id,"restored",17,1000,&binding).unwrap().unwrap();
+        assert!(store.settle_retained_qualification(&lease,&binding,18,|_,_|Ok(())).unwrap());
+        let after=store.snapshot(&id).unwrap().unwrap();assert_eq!((after.model_calls,after.tokens),(before.model_calls,before.tokens));
+        let events=store.events(&id).unwrap();
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_witness_recovered").count(),1);
+        assert_eq!(events.iter().filter(|(_,kind,_,_)|kind=="original_semantic_source_restored").count(),1);
     }
 
     #[test]
