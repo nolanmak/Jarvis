@@ -11,6 +11,23 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case=="round-label-during-push" {
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
+                branch:"feat/repair-9",contract:"Retained original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let hook=root.join(".git/hooks/pre-push");
+            std::fs::write(&hook,format!("#!/usr/bin/python3\nfrom pathlib import Path\nPath({:?}).write_text('owner changed routing during actual push')\n",root.join("manual-after-admission"))).unwrap();
+            std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result=guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Synthetic verified findings",false,true,Some(7)).await.unwrap();
+            assert!(root.join("manual-after-admission").exists(),"hook never changed routing during the push");
+            assert!(!root.join("note-writes").exists(),"a successful Push was followed by a note despite the new manual route");
+            assert!(!result,"round publication continued after late manual routing");
+            let remote=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"]).current_dir(&root).output().unwrap();
+            assert!(remote.status.success() && !remote.stdout.is_empty(),"fixture never made a successful real Push");
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"routing denial lost the already-observed Push outcome");
+            guard.finish().unwrap();return;
+        }
         if case.starts_with("post-note-") {
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
@@ -28,7 +45,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             assert!(manual_routing::published_note(&root,&mut guard,9,7,false,manual_routing::NoteTarget::Pr,"Explicit owner note").await.unwrap());
             guard.finish().unwrap();return;
         }
-        if matches!(case.as_str(),"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"late-fresh-recheck") {
+        if matches!(case.as_str(),"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {
             let git=|args:&[&str]| {
                 let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
                 assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
@@ -50,18 +67,39 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 let id=guard.id().to_owned();let binding=guard.binding().clone();guard.finish().unwrap();
                 let now=chrono::Utc::now().timestamp_millis();
                 let lease=initial.claim(&id,"lost-response-controller",now,1000).unwrap().unwrap();
+                let missing_peer=if case=="fresh-uncertain-missing-peer" {
+                    let peer="owner/repo#8";
+                    initial.register(peer,"feat/missing-8",binding.clone(),now-20).unwrap();
+                    let peer_lease=initial.claim(peer,"prior-controller",now-19,1000).unwrap().unwrap();
+                    initial.charge(&peer_lease,"original-work",crate::autoship_workflow::ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},now-18).unwrap();
+                    initial.begin_operation(&peer_lease,crate::autoship_workflow::OperationKind::Push,&binding,now-17).unwrap();
+                    initial.release(&peer_lease,now-16).unwrap();
+                    Some((initial.snapshot(peer).unwrap(),initial.events(peer).unwrap()))
+                }else {None};
                 let operation=initial.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,now).unwrap();
                 // Simulate a genuinely dispatched push whose response was lost.
-                if case=="fresh-uncertain" {git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);}
+                if matches!(case.as_str(),"fresh-uncertain"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer") {git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);}
+                if matches!(case.as_str(),"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch") {
+                    let other=root.parent().unwrap().join("other.git");git(&["init","--bare","--quiet",other.to_str().unwrap()]);
+                    if case=="fresh-uncertain-other-fetch" {git(&["remote","set-url","origin",other.to_str().unwrap()]);}
+                }
+                // Network I/O is served by the existing scripted GitHub API;
+                // effective push destination parsing is the actual Git command.
+                git(&["remote","set-url","--push","origin",if case=="fresh-uncertain-wrong-push" {"https://github.com/owner/other.git"}else{"https://github.com/owner/repo.git"}]);
                 initial.release(&lease,now+1).unwrap();
                 let recovery_before=initial.snapshot(&id).unwrap();let events_before=initial.events(&id).unwrap();
                 assert!(publication::claimed_after_reconcile(&root,7,false).await.unwrap());
-                if case=="fresh-uncertain-unobserved" {
+                if matches!(case.as_str(),"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push") {
                     assert!(initial.pending_operations(&id).unwrap().iter().any(|row|row.id==operation.id),"unknown push was cleared without its exact remote head");
                     assert_eq!(initial.snapshot(&id).unwrap(),recovery_before);assert_eq!(initial.events(&id).unwrap(),events_before);
                     return;
                 }
-                assert!(initial.pending_operations(&id).unwrap().is_empty());
+                assert!(initial.pending_operations(&id).unwrap().is_empty(),"observable Push remained pending: expected={}, actual={}, calls={}, read={}",binding.head,git(&["ls-remote","--heads",root.parent().unwrap().join("remote.git").to_str().unwrap(),"refs/heads/feat/repair-9"]),std::fs::read_to_string(root.join("calls")).unwrap(),std::fs::read_to_string(root.join("push-read-output")).unwrap_or_default());
+                if let Some((snapshot,events))=missing_peer {
+                    assert_eq!(initial.snapshot("owner/repo#8").unwrap(),snapshot);
+                    assert_eq!(initial.events("owner/repo#8").unwrap(),events);
+                    assert_eq!(initial.pending_operations("owner/repo#8").unwrap().len(),1);
+                }
                 let conn=rusqlite::Connection::open(&path).unwrap();
                 assert_eq!(conn.query_row("SELECT COUNT(*) FROM operation WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),1,"reconciliation manufactured another Push");
                 assert_eq!(conn.query_row("SELECT receipt FROM operation WHERE id=?1",[&operation.id],|r|r.get::<_,String>(0)).unwrap(),format!("git-head:{}",binding.head));
@@ -225,7 +263,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-wrong-push","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
@@ -234,13 +272,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"late-fresh-recheck") || case.starts_with("post-note-") {
+                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case=="round-label-during-push" {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                     assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
-                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\n").unwrap();
+                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\npush-read-output\n").unwrap();
                     let remote=dir.path().join("remote.git");
                     assert!(std::process::Command::new("/usr/bin/git").args(["init","--bare","--quiet"])
                         .arg(&remote).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
@@ -248,7 +286,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                         .arg(remote).current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
                 let references=|number|serde_json::json!([{"number":number,"url":format!("https://github.com/owner/repo/issues/{number}")}]);
-                let mut manual_refs=if route=="linked" || matches!(case,"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"late-fresh-recheck") {references(7)}else{serde_json::json!([])};
+                let mut manual_refs=if route=="linked" || matches!(case,"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {references(7)}else{serde_json::json!([])};
                 if route=="source-less" && matches!(case,"source-label"|"unknown-source"|"malformed-source") {
                     manual_refs=serde_json::json!([{"number":7,"url":"https://github.com/owner/repo/issues/7"},
                         {"number":8,"url":"https://github.com/owner/repo/issues/8"}]);
@@ -262,7 +300,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     "baseRefName":"main","isCrossRepository":false,"headRepositoryOwner":{"login":"owner"},
                     "author":{"login":"owner"},"title":"Repair a widget","body":"Synthetic owner work",
                     "closingIssuesReferences":refs,"labels":labels,"files":[],"mergeable":"MERGEABLE"});
-                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"late-fresh-recheck") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
+                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
                     row(10,if route=="linked" {references(8)}else{serde_json::json!([])},serde_json::json!([]))]);
                 let issues=serde_json::json!({"7":{"number":7,"state":"open","labels":if case=="source-label" {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}},
                     "8":{"number":8,"state":"open","labels":[]},"70":{"number":70,"state":"open","labels":[]}});
@@ -270,7 +308,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
                 let gh=dir.path().join("github.py");
                 std::fs::write(&gh,r#"#!/usr/bin/python3
-import json,os,pathlib,sys
+import json,os,pathlib,sys,subprocess,urllib.parse
 a=sys.argv[1:];root=pathlib.Path(os.environ['AUTOSHIP_MANUAL_PR_FIXTURE'])
 prs=json.loads((root/'prs.json').read_text());issues=json.loads((root/'issues.json').read_text())
 case=os.environ['MANUAL_PR_CASE']
@@ -279,7 +317,7 @@ if a[:2]==['repo','view']: print(('READ' if case=='explicit-revoked' else 'ADMIN
 elif a[:2]==['pr','list']:
  if case=='late-fresh-recheck':
   p=root/'fresh-observations';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));print(json.dumps([] if n<=2 else prs))
- else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved') and not (root/'fresh-claim-appeared').exists() else prs))
+ else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-wrong-push','fresh-uncertain-other-fetch','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
 elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
@@ -291,13 +329,23 @@ elif a[:2]==['pr','view']:
  if row['number']==9 and case=='saturated-pr-labels':row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
  if row['number']==9 and case=='saturated-references':row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
  print(json.dumps(row))
+elif a[:1]==['api'] and a[1].startswith('https://api.github.com/repos/') and '/git/ref/heads/' in a[1]:
+ branch=urllib.parse.unquote(a[1].split('/git/ref/heads/',1)[1])
+ remote=root.parent/('other.git' if '/owner/other/' in a[1] else 'remote.git')
+ out=subprocess.run(['/usr/bin/git','ls-remote','--heads',str(remote),'refs/heads/'+branch],capture_output=True,text=True)
+ (root/'push-read-output').write_text(json.dumps(dict(code=out.returncode,stdout=out.stdout,stderr=out.stderr)))
+ if out.returncode:sys.exit(1)
+ words=out.stdout.split()
+ if '--include' in a:print('HTTP/2.0 '+('200 OK' if len(words)==2 else '404 Not Found')+'\nContent-Type: application/json\n')
+ if len(words)!=2:print('{"message":"Not Found"}');sys.exit(1)
+ print(words[0])
 elif a[:1]==['api'] and '/issues/' in a[1]:
  n=a[1].split('/issues/',1)[1]
  if case=='unknown-source' and n=='7':sys.exit(1)
  row=issues[n]
  if case=='malformed-source' and n=='7':row.pop('labels')
  print(json.dumps(row))
-elif a[:2] in (['pr','comment'],['issue','comment']) and case.startswith('post-note-'):
+elif a[:2] in (['pr','comment'],['issue','comment']) and (case.startswith('post-note-') or case=='round-label-during-push'):
  with (root/'note-writes').open('a') as out:out.write(json.dumps(a)+'\n')
  (root/'manual-after-admission').write_text('owner changed routing during publication note');print('ok')
 elif a[:2]==['api','user']:print('owner')

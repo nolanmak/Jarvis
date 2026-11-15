@@ -7140,23 +7140,15 @@ async fn resume_draft_pr(
             Err(why) => {
                 let _ = run("git", &["merge", "--abort"], &worktree).await;
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                let _ = run(
-                    &gh,
-                    &[
-                        "pr",
-                        "comment",
-                        &pr.to_string(),
-                        "--body",
-                        &format!(
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!(
                             "Auto-resume: this branch no longer merges cleanly with \
                                 `main` and the loop could not resolve it ({why}); it \
                                 needs a human rebase before the loop can pick it up \
                                 again."
-                        ),
-                    ],
-                    repo_root,
-                )
-                .await;
+                        )).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
@@ -7208,20 +7200,17 @@ async fn resume_draft_pr(
             // closed, with the way back spelled out on the PR.
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let reason = format!("the diff touches the guarded path `{pattern}`");
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!(
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!(
                       "Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```\n\n\
                        This verdict cannot change on a later tick — the branch's diff is \
                        fixed — so the loop is standing down on this PR rather than \
                        re-refusing it every day. To bring it back: push a diff that avoids \
                        the guarded path, remove the `{GAVE_UP_LABEL}` label from the issue, \
                        and reopen."
-                  )],
-                repo_root,
-            )
-            .await;
+                  )).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
@@ -7251,15 +7240,12 @@ async fn resume_draft_pr(
             // on an oversized diff; the next round's only job is to cut.
             if rounds_done >= revise_rounds() {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                let _ = run(
-                    &gh,
-                    &["pr", "comment", &pr.to_string(), "--body",
-                      &format!("Auto-resume refused: diff is {lines_now} lines \
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume refused: diff is {lines_now} lines \
                                 (cap {MAX_DIFF_LINES}) and the revision budget \
-                                is exhausted.")],
-                    repo_root,
-                )
-                .await;
+                                is exhausted.")).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
                 record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:size", &format!("diff is {lines_now} lines (cap {MAX_DIFF_LINES})")))).await.ok();
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: resume refused — oversized after revisions"
@@ -7389,15 +7375,12 @@ async fn resume_draft_pr(
                 }
             }
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: verification gate failed against current \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: verification gate failed against current \
                             `main` and the repair budget is exhausted:\n```\n{}\n```",
-                           truncate(&gate_err.to_string(), 1200))],
-                repo_root,
-            )
-            .await;
+                           truncate(&gate_err.to_string(), 1200))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
@@ -7503,8 +7486,10 @@ async fn resume_draft_pr(
         if independent.available && !independent.notes.is_empty() {
             prior_notes = Some(independent.notes.clone());
             if !dry_run {
-                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
-                    &independent_findings_comment(&independent.notes)], repo_root).await;
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &independent_findings_comment(&independent.notes)).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
             }
         }
         {
@@ -7579,15 +7564,12 @@ async fn resume_draft_pr(
                 // without the full suite passing once (#870).
                 if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await? {
                     workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                    let _ = run(
-                        &gh,
-                        &["pr", "comment", &pr.to_string(), "--body",
-                          &format!("Auto-resume: double LGTM, but the final \
+                    if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: double LGTM, but the final \
                                     full-workspace gate failed:\n```\n{}\n```",
-                                   truncate(&gate_err.to_string(), 1200))],
-                        repo_root,
-                    )
-                    .await;
+                                   truncate(&gate_err.to_string(), 1200))).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                    }
                     record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:final-gate", &detail) })).await.ok();
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: LGTM but final full gate failed"
@@ -7637,17 +7619,14 @@ async fn resume_draft_pr(
                 workflow.finish()?;
                 return Ok(RunReport::built(format!("PR #{pr}: validated revision published; PR milestone complete")));
             }
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: LGTM from internal reviewers (QA approve; independent: {}) \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: LGTM from internal reviewers (QA approve; independent: {}) \
                             after {rounds_done} revision round(s) against current \
                             `main`.\n\n{}",
                            independent.status(),
-                           truncate(&independent.notes, 2500))],
-                repo_root,
-            )
-            .await;
+                           truncate(&independent.notes, 2500))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if !policy_allows {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 notify_review(&format!(
@@ -7723,20 +7702,20 @@ async fn resume_draft_pr(
             }
             workflow.push(branch).await?;
             if !qa_ok {
-                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &qa_findings_comment(&qa_notes)).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
             }
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: no double LGTM after {rounds_done} revision \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: no double LGTM after {rounds_done} revision \
                             round(s) ({}). Revisions were verified against the \
                             changed crates' tests; the full workspace suite \
                             runs before any merge. Latest findings:\n\n{}",
                            notes_log.join("; "),
-                           truncate(&open_notes, 2500))],
-                repo_root,
-            )
-            .await;
+                           truncate(&open_notes, 2500))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
@@ -17976,8 +17955,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let abort = body.find(r#""merge", "--abort""#).expect("abort call");
         let after = &body[abort..];
         let ret = after
-            .find("return Ok(RunReport::")
-            .expect("return after abort");
+            .find("return Ok(if builder_ran")
+            .expect("accounted return after abort");
         let arm = &after[..ret];
         assert!(
             arm.contains("record_attempt("),
@@ -19685,7 +19664,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let at = body
             .find("if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {")
             .expect("blast-radius arm");
-        let ret = at + body[at..].find("return Ok(RunReport::").expect("arm return");
+        let ret = at + body[at..].find("return Ok(RunReport::triage(").expect("accounted arm return");
         let arm = &body[at..ret];
         assert!(arm.contains("record_attempt("), "the attempt must be recorded");
         assert!(arm.contains("label_gave_up("), "and the issue labelled out");

@@ -347,3 +347,21 @@ That same automatic selection boundary also excludes protected owner pauses,
 follow-up waits, active leases, future eligibility and pending remote effects.
 Such candidates yield to eligible peers without changing the attempt ledger or
 rewriting adoption facts. Removing a routing label does not clear those controls.
+
+Linked-resume round, review, QA, verification-failure and exhausted-round notes
+also recheck current routing and protected controls at each write. A successful
+Push does not authorize its following round note if routing changed during the
+Push; the genuine Push observation remains retained.
+
+Free Push recovery binds one effective `origin` push destination to the protected
+GitHub repository. It does not infer that identity from the fetch URL. Ambiguous,
+foreign or unsupported destinations retain the pending effect. The matching
+repository ref is read through the authoritative GitHub API, so applying Git URL
+rewrites a second time cannot redirect the observation. A missing ref yields to
+peers; service and rate-limit failures retain effects and stop the batch.
+
+The bounded raw Push scan advances a separate derived per-repository cursor even
+when rows are paused, malformed or have a different head. Later retained effects
+therefore receive observation without claiming a workflow, resetting accounting,
+erasing an uncertain operation or clearing owner controls. Receipt completion
+still rechecks the original protected workflow facts atomically.

@@ -2210,6 +2210,8 @@ impl WorkflowGuard {
             return Ok(false);
         }
         let head = self.push(branch).await?;
+        if !manual_routing::permit_mutation(repo_root,pr,source,automatic,self).await? {return Ok(false);}
+        self.validate_before_side_effect()?;
         let _ = write_optional_pr_note(
             repo_root,
             &pr.to_string(),

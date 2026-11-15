@@ -115,6 +115,53 @@ struct PendingPublication {
     contract:String,environment:String,args:Vec<String>,
 }
 
+struct GitPushRead<'a>(&'a Path);
+impl GitPushRead<'_> {
+    async fn destinations(&mut self)->Result<Vec<String>> {
+        let (ok,raw,_)=run("git",&["remote","get-url","--push","--all","origin"],self.0).await?;
+        anyhow::ensure!(ok && raw.len()<=16384,"Push destination unavailable");
+        Ok(raw.lines().map(str::trim).filter(|value|!value.is_empty()).map(str::to_owned).collect())
+    }
+    async fn head_at(&mut self,destination:&str,reference:&str)->Result<Option<String>> {
+        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?;
+        let (owner,repository)=repository.split_once('/').context("network Push identity malformed")?;
+        let reference=reference.strip_prefix("refs/").context("Push reference malformed")?;
+        // Observe the verified destination through its authoritative GitHub
+        // identity. Reusing a resolved URL as a Git input could apply URL
+        // rewrites a second time and read a different transport destination.
+        let mut endpoint=reqwest::Url::parse("https://api.github.com/")?;
+        endpoint.path_segments_mut().map_err(|_|anyhow::anyhow!("Push endpoint unavailable"))?
+            .extend(["repos",owner,repository,"git","ref"]).extend(reference.split('/'));
+        let (ok,raw,_)=run(&gh_bin(),&["api",endpoint.as_str(),"--include","--jq",".object.sha"],self.0).await?;
+        observed_push_head(ok,&raw)
+    }
+}
+// Expected absent refs must yield to peers; transport/rate-limit failures
+// stop this batch rather than amplify a repository-wide outage.
+fn observed_push_head(ok:bool,raw:&str)->Result<Option<String>> {
+    anyhow::ensure!(raw.len()<=32768,"Push observation response exceeds bound");
+    let (headers,body)=raw.split_once("\r\n\r\n").or_else(||raw.split_once("\n\n"))
+        .context("Push observation response malformed")?;
+    let mut lines=headers.lines();
+    let status=lines.next().context("Push observation status missing")?;
+    let mut status=status.split_whitespace();
+    anyhow::ensure!(matches!(status.next(),Some("HTTP/1.0"|"HTTP/1.1"|"HTTP/2.0"|"HTTP/2")),"Push observation protocol malformed");
+    let code=status.next().context("Push observation code missing")?;
+    anyhow::ensure!(!lines.any(|line|line.starts_with("HTTP/")),"Push observation status ambiguous");
+    if code=="404" {return Ok(None);}
+    anyhow::ensure!(ok && code=="200","Push destination observation unavailable");
+    let head=body.trim();
+    anyhow::ensure!(matches!(head.len(),40|64) && head.bytes().all(|byte|byte.is_ascii_hexdigit()),"Push observation head malformed");
+    Ok(Some(head.to_owned()))
+}
+fn verified_push_destination<'a>(repository:&str,destinations:&'a [String])->Option<&'a str> {
+    let [destination]=destinations else {return None};
+    // Reuse the strict existing GitHub URL grammar; its local-mirror
+    // alternative supplies no network repository identity here.
+    let identity=crate::wiki_sync_remote(destination).ok().flatten()?;
+    identity.eq_ignore_ascii_case(repository).then_some(destination.as_str())
+}
+
 /// The fresh pipeline calls this before its linked-PR dedup return.
 pub(super) async fn claimed_after_reconcile(repo:&Path,issue:u64,dry_run:bool)->Result<bool> {
     // Only observe already-dispatched pushes here. This early dedup boundary
@@ -141,16 +188,20 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     Ok(())
 }
 async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore)->Result<()> {
-    for pending in store.pending_push_observations(&repository,chrono::Utc::now().timestamp_millis(),32)? {
+    let mut reader=GitPushRead(repo);
+    let pending=store.pending_push_observations(repository,chrono::Utc::now().timestamp_millis(),32)?;
+    if pending.is_empty() {return Ok(());}
+    let Ok(destinations)=reader.destinations().await else {return Ok(())};
+    let Some(destination)=verified_push_destination(repository,&destinations) else {
+        warn!(repository,"Push destination identity unavailable; original effects retained");return Ok(());
+    };
+    for pending in pending {
         let reference=format!("refs/heads/{}",pending.branch());
         let (valid,_,_)=run("git",&["check-ref-format",&reference],repo).await?;
         if !valid {continue;}
-        let (ok,raw,_)=run("git",&["ls-remote","--heads","origin",&reference],repo).await?;
-        if !ok {break;} // One transport outage must not multiply across the batch.
-        let words=raw.split_whitespace().collect::<Vec<_>>();
-        if words.len()!=2 || words[1]!=reference || words[0]!=pending.head()
-            || !matches!(words[0].len(),40|64) || !words[0].bytes().all(|byte|byte.is_ascii_hexdigit()) {continue;}
-        if store.observe_idle_push(&pending,words[0],chrono::Utc::now().timestamp_millis())? {
+        let head=match reader.head_at(destination,&reference).await {Ok(Some(head))=>head,Ok(None)=>continue,Err(_)=>break};
+        if head!=pending.head() {continue;}
+        if store.observe_idle_push(&pending,&head,chrono::Utc::now().timestamp_millis())? {
             info!(workflow=%pending.workflow(),"observed prior Push without dispatching or claiming a work turn");
         }
     }
@@ -743,6 +794,37 @@ pub(super) async fn merged_exact(root: &Path, number: u64, head: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn push_observation_distinguishes_absent_refs_from_service_failures() {
+        let head="a".repeat(40);
+        for separator in ["\n","\r\n"] {
+            let raw=format!("HTTP/2.0 200 OK{separator}Content-Type: application/json{separator}{separator}{head}\n");
+            assert_eq!(super::observed_push_head(true,&raw).unwrap(),Some(head.clone()));
+        }
+        assert_eq!(super::observed_push_head(false,"HTTP/2.0 404 Not Found\nContent-Type: application/json\n\n{}").unwrap(),None);
+        for (ok,raw) in [
+            (false,format!("HTTP/2.0 200 OK\n\n{head}")),
+            (false,"HTTP/2.0 429 Too Many Requests\n\n{}".into()),
+            (false,"HTTP/2.0 503 Unavailable\n\n{}".into()),
+            (false,"transport failed".into()),
+            (true,format!("HTTP/2.0 200 OK\nHTTP/2.0 404 Not Found\n\n{head}")),
+            (true,format!("UNKNOWN 200 OK\n\n{head}")),
+            (true,"HTTP/2.0 200 OK\n\nnot-a-head".into()),
+        ] {assert!(super::observed_push_head(ok,&raw).is_err());}
+    }
+
+    #[test]
+    fn push_destination_binds_the_protected_network_repository_without_using_fetch_identity() {
+        for url in ["https://github.com/owner/repo.git","git@github.com:owner/repo.git","ssh://git@github.com/owner/repo.git"] {
+            assert_eq!(super::verified_push_destination("OWNER/REPO",&[url.into()]),Some(url));
+        }
+        for url in ["https://github.com/owner/other.git","https://example.org/owner/repo.git","https://token@github.com/owner/repo.git","http://github.com/owner/repo.git","/tmp/repo.git","file:///tmp/repo.git","owner/repo","https://github.com/owner/repo.git?x"] { // pii-ok: synthetic rejected credential URL; no real credential.
+            assert!(super::verified_push_destination("owner/repo",&[url.into()]).is_none(),"unsupported/unbound destination accepted");
+        }
+        assert!(super::verified_push_destination("owner/repo",&[]).is_none());
+        assert!(super::verified_push_destination("owner/repo",&["https://github.com/owner/repo.git".into(),"https://github.com/owner/other.git".into()]).is_none());
+    }
+
     use super::*;
     use std::collections::VecDeque;
 

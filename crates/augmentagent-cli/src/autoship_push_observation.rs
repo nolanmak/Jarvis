@@ -12,25 +12,40 @@ impl PendingPush {
     pub(crate) fn head(&self)->&str {&self.binding.head}
 }
 impl WorkflowStore {
-    pub(crate) fn pending_push_observations(&self,repository:&str,now:i64,limit:usize)->Result<Vec<PendingPush>> {
+    pub(crate) fn pending_push_observations(&mut self,repository:&str,now:i64,limit:usize)->Result<Vec<PendingPush>> {
         ensure!((1..=64).contains(&limit),"pending Push observation batch exceeds bound");
         let repository=repository.to_ascii_lowercase();workflow_id(&repository,1)?;
-        let mut statement=self.conn.prepare("SELECT w.id,w.branch,w.generation,w.checkpoint,o.id,o.binding FROM workflow w JOIN operation o ON o.workflow=w.id
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Derived scheduling state only: it never claims a workflow or alters
+        // its original accounting, checkpoint, controls or uncertain effects.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS pending_push_observation_cursor(repository TEXT PRIMARY KEY,created_at INTEGER NOT NULL,operation TEXT NOT NULL);")?;
+        let after:Option<(i64,String)>=tx.query_row("SELECT created_at,operation FROM pending_push_observation_cursor WHERE repository=?1",[&repository],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let (after_time,after_id)=after.unwrap_or((i64::MIN,String::new()));
+        let mut statement=tx.prepare("SELECT w.id,w.branch,w.generation,w.checkpoint,o.id,o.binding,o.created_at FROM workflow w JOIN operation o ON o.workflow=w.id
             WHERE o.kind=?1 AND o.receipt IS NULL AND w.lease_until<=?2
             AND (instr(w.id,?3||'#')=1 OR instr(w.id,?3||'/pr/')=1)
-            ORDER BY o.created_at,o.id LIMIT ?4")?;
-        let rows=statement.query_map(params![serde_json::to_string(&OperationKind::Push)?,now,repository,limit as i64],|row|
-            Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?;
+            ORDER BY CASE WHEN o.created_at>?4 OR (o.created_at=?4 AND o.id>?5) THEN 0 ELSE 1 END,o.created_at,o.id LIMIT ?6")?;
+        let rows=statement.query_map(params![serde_json::to_string(&OperationKind::Push)?,now,repository,after_time,after_id,limit as i64],|row|
+            Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if let Some((_,_,_,_,operation,_,created))=rows.last() {
+            tx.execute("INSERT INTO pending_push_observation_cursor(repository,created_at,operation) VALUES(?1,?2,?3)
+                ON CONFLICT(repository) DO UPDATE SET created_at=excluded.created_at,operation=excluded.operation",params![repository,created,operation])?;
+        }
         let mut result=Vec::new();
-        for row in rows {
-            let (workflow,branch,generation,checkpoint,operation,binding)=row?;
-            let checkpoint:Checkpoint=serde_json::from_str(&checkpoint)?;let binding:Binding=serde_json::from_str(&binding)?;binding.validate()?;
-            if checkpoint.binding!=binding || matches!(checkpoint.stage,Stage::Merged|Stage::Retired)
-                || owner_control::read(&self.conn,&workflow)?.is_some_and(|control|control.paused)
-                || owner_inbox::pending(&self.conn,&workflow)?>0 {continue;}
+        for (workflow,branch,generation,checkpoint,operation,binding,_) in rows {
+            let (Ok(checkpoint),Ok(binding))=(serde_json::from_str::<Checkpoint>(&checkpoint),serde_json::from_str::<Binding>(&binding)) else {
+                tracing::warn!(workflow,"pending Push metadata unavailable; original effect retained");continue;
+            };
+            if binding.validate().is_err() || checkpoint.binding!=binding || matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {continue;}
+            let controls=owner_control::read(&tx,&workflow);
+            let inbox=owner_inbox::pending(&tx,&workflow);
+            let (Ok(controls),Ok(inbox))=(controls,inbox) else {continue;};
+            if controls.is_some_and(|control|control.paused) || inbox>0 {continue;}
             result.push(PendingPush {workflow,branch,generation,operation,binding});
         }
-        Ok(result)
+        tx.commit()?;Ok(result)
     }
 
     /// A controller observed the exact original head on the exact remote ref.
@@ -61,6 +76,29 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_observation_advances_past_retained_rows_without_claiming_work() {
+        for paused in [true,false] {
+            let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+            let mut before=Vec::new();
+            for issue in 1..=33 {
+                let id=format!("owner/repo#{issue}");let binding=Binding {head:if issue==33 {"a".repeat(40)}else{"b".repeat(40)},contract:"contract".into(),evidence_hash:"evidence".into()};
+                store.register(&id,&format!("fixture-{issue}"),binding.clone(),1).unwrap();let lease=store.claim(&id,"original",2,100).unwrap().unwrap();
+                store.charge(&lease,"past-work",ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},3).unwrap();
+                store.begin_operation(&lease,OperationKind::Push,&binding,issue).unwrap();store.release(&lease,100).unwrap();
+                if paused && issue<33 {store.set_owner_pause(&id,"github:owner",0,true,101).unwrap();}
+                before.push((id.clone(),store.snapshot(&id).unwrap(),store.events(&id).unwrap()));
+            }
+            let mut found=false;
+            for _ in 0..3 {
+                let rows=store.pending_push_observations("owner/repo",200,32).unwrap();assert!(rows.len()<=32);
+                found|=rows.iter().any(|row|row.workflow()=="owner/repo#33" && row.head()=="a".repeat(40));
+            }
+            assert!(found,"32 retained {} rows starved a later observable Push",if paused {"paused"}else{"mismatching-head"});
+            for (id,snapshot,events) in before {assert_eq!(store.snapshot(&id).unwrap(),snapshot);assert_eq!(store.events(&id).unwrap(),events);}
+        }
+    }
+
     #[test]
     fn positive_push_observation_is_idle_fenced_and_never_claims_or_spends_a_turn() {
         for fault in ["none","foreign-head","binding","generation","active","branch","pause","terminal","foreign-repo"] {
