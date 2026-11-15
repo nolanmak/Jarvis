@@ -62,8 +62,9 @@ fn declared_auth(report:readiness::CredentialReport)->Result<bool> {
 pub(crate) fn declared_router_auth(provider:&str)->Result<bool> {
     let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(false)};
     let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?)?;
-    ensure!(policy.version==1,"invalid native VM policy version");
+    policy_readiness::limits(&policy)?;
     let Some(profile)=policy.providers.get(provider) else{return Ok(false)};
+    policy_readiness::refresh_grant(&policy, provider, profile)?;
     let keys:&[&str]=if provider=="claude" {&["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_BASE_URL"]}
         else {&["AUGMENTAGENT_ROUTER_API_KEY"]};
     Ok(keys.iter().all(|key|profile.environment.iter().any(|name|name==key)))

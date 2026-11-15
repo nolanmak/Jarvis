@@ -113,3 +113,57 @@ fn invalid_launch_limits_cannot_pass_readiness_with_usable_credentials() {
         );
     }
 }
+
+#[test]
+fn routed_auth_cannot_bypass_native_launch_declarations() {
+    const CHILD: &str = "NATIVE_ROUTED_GRANT_FIXTURE";
+    const TEST: &str =
+        "native_vm::readiness::grant_tests::routed_auth_cannot_bypass_native_launch_declarations";
+    if std::env::var_os(CHILD).is_some() {
+        let allowed = super::super::declared_router_auth("codex").unwrap_or(false);
+        assert_eq!(allowed, std::env::var(CHILD).unwrap() == "allowed");
+        return;
+    }
+    for scenario in ["read-only", "bad-grant", "imported-grant", "invalid-limits"] {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = root.path().join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let auth = credentials.join("codex.json");
+        write(&auth, br#"{"OPENAI_API_KEY":"fixture"}"#).unwrap();
+        let mut policy = serde_json::json!({"version":1,"runtime_config":"/runtime.json","guest_runtime":"/guest",
+            "state_root":root.path(),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+            "providers":{"codex":{"gateway":{},"auth_relative":".codex/auth.json",
+                "environment":["AUGMENTAGENT_ROUTER_API_KEY"]}}});
+        match scenario {
+            "bad-grant" => policy["providers"]["codex"]["refresh_auth"] = true.into(),
+            "imported-grant" => {
+                policy["providers"]["codex"]["refresh_auth"] = true.into();
+                policy["providers"]["codex"]["auth_file"] = serde_json::to_value(auth).unwrap();
+            }
+            "invalid-limits" => policy["memory_mb"] = 511.into(),
+            _ => (),
+        }
+        let path = root.path().join("policy.json");
+        write(&path, policy.to_string().as_bytes()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY", &path)
+            .env(
+                CHILD,
+                if matches!(scenario, "read-only" | "imported-grant") {
+                    "allowed"
+                } else {
+                    "blocked"
+                },
+            )
+            .status()
+            .unwrap();
+        assert!(status.success(), "{scenario}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!root.path().join("state.lock").exists());
+    }
+}
