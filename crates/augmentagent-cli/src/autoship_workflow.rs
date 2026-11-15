@@ -15,6 +15,8 @@ mod push_observation;
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
+#[path = "autoship_merge_escalation.rs"]
+pub(crate) mod merge_escalation;
 #[path = "autoship_resource_refusal.rs"]
 pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
@@ -61,6 +63,7 @@ pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
+pub use merge_escalation::UnresolvedMergeHold;
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
