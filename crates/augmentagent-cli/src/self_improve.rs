@@ -73,6 +73,8 @@ mod manual_routing;
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
 mod legacy_readmission;
+#[path = "self_improve_closed_targets.rs"]
+mod closed_targets;
 #[path = "self_improve_qualification_reconcile.rs"]
 mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
@@ -12433,6 +12435,11 @@ impl AutoPrLoop {
                 let root = controller.as_ref().map_or(root.as_path(), |controller| controller.root.as_path());
                 let merged=merge_sweep(root,dry_run).await;
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
+                // Waiting workflows never re-check their target, so one whose
+                // issue was fixed by hand stays queued forever (#2040, #2081).
+                if !dry_run {
+                    if let Err(error)=closed_targets::sweep(root,&workflow::path()).await {warn!("closed-target sweep deferred: {error:#}");}
+                }
                 merged
             }
         });
