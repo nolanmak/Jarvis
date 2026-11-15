@@ -32,9 +32,20 @@ fn hold(reason_code: &'static str) -> Hold {
 #[serde(deny_unknown_fields)]
 struct Fingerprint {
     directory: (u64, u64),
+    directory_created: Option<(u64, u32)>,
     git_entry: (u64, u64),
+    git_file_change: Option<(i64, i64)>,
     git_pointer_sha256: Option<String>,
     common_directory: (u64, u64),
+    common_created: Option<(u64, u32)>,
+}
+fn created(metadata: &std::fs::Metadata) -> Option<(u64, u32)> {
+    let time = metadata
+        .created()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((time.as_secs(), time.subsec_nanos()))
 }
 fn fingerprint(root: &Path, common: &Path) -> Result<Fingerprint> {
     let directory = std::fs::symlink_metadata(root)?;
@@ -75,9 +86,16 @@ fn fingerprint(root: &Path, common: &Path) -> Result<Fingerprint> {
     };
     Ok(Fingerprint {
         directory: (directory.dev(), directory.ino()),
+        directory_created: created(&directory),
         git_entry: (git_entry.dev(), git_entry.ino()),
+        // Linked Git pointer files do not change during ordinary commits or
+        // dirty edits. Their change time also detects recycled inode numbers.
+        git_file_change: git_entry
+            .is_file()
+            .then(|| (git_entry.ctime(), git_entry.ctime_nsec())),
         git_pointer_sha256,
         common_directory: (common_directory.dev(), common_directory.ino()),
+        common_created: created(&common_directory),
     })
 }
 
@@ -133,6 +151,105 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
     anyhow::ensure!(ok, hold("checkout_identity_unavailable"));
     Ok(output.trim().to_owned())
 }
+fn receipt_path(state: &Path, workflow: &str, root: &Path) -> Result<PathBuf> {
+    let state = state.canonicalize()?;
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(&state, workflow, root))?)
+    );
+    Ok(state
+        .parent()
+        .context("checkout control directory unavailable")?
+        .join("workflow-checkout-identities")
+        .join(format!("{key}.json")))
+}
+
+/// An in-process handoff from the existing lease-fenced reconstruction path.
+/// It can be captured only while the path is absent; ordinary acquisitions
+/// never refresh a physical identity merely because its bytes still match.
+pub(super) struct MissingRestore {
+    receipt: PathBuf,
+    previous: Option<Ownership>,
+}
+impl MissingRestore {
+    pub(super) fn begin(state: &Path, worktree: &Path, workflow: &str) -> Result<Self> {
+        anyhow::ensure!(
+            matches!(std::fs::symlink_metadata(worktree),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+            hold("checkout_restore_requires_absence")
+        );
+        let receipt = receipt_path(state, workflow, &std::path::absolute(worktree)?)?;
+        let previous = read_receipt(&receipt)?;
+        Ok(Self { receipt, previous })
+    }
+    pub(super) async fn complete(
+        self,
+        state: &Path,
+        repo: &Path,
+        worktree: &Path,
+        repository: &str,
+        branch: &str,
+        store: &mut WorkflowStore,
+        lease: &Lease,
+        binding: &Binding,
+    ) -> Result<()> {
+        store.validate_dispatch(lease, binding, chrono::Utc::now().timestamp_millis())?;
+        anyhow::ensure!(
+            read_receipt(&self.receipt)? == self.previous,
+            hold("checkout_receipt_changed")
+        );
+        let identity = Identity::observe_inner(
+            state,
+            repo,
+            worktree,
+            &lease.workflow,
+            repository,
+            branch,
+            Some(&self),
+        )
+        .await?;
+        anyhow::ensure!(
+            identity.receipt == self.receipt
+                && git(worktree, &["rev-parse", "HEAD"]).await? == binding.head,
+            hold("checkout_restore_binding_changed")
+        );
+        store.validate_dispatch(lease, binding, chrono::Utc::now().timestamp_millis())?;
+        if self.previous.is_some() {
+            // Replace only the exact prior private record after the existing
+            // recovery constructor verified head, registration and a clean tree.
+            let parent = self
+                .receipt
+                .parent()
+                .context("checkout receipt parent unavailable")?;
+            let meta = std::fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o077 == 0,
+                hold("checkout_receipt_invalid")
+            );
+            use std::io::Write;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            temporary.write_all(&serde_json::to_vec(&identity.ownership)?)?;
+            temporary.as_file().sync_all()?;
+            anyhow::ensure!(
+                read_receipt(&self.receipt)? == self.previous,
+                hold("checkout_receipt_changed")
+            );
+            temporary
+                .persist(&self.receipt)
+                .map_err(|error| error.error)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            identity.validate()
+        } else {
+            identity.enroll(store, lease, binding, chrono::Utc::now().timestamp_millis())
+        }
+    }
+}
+
 impl Identity {
     /// Observe existing evidence before workflow registration or claim changes.
     /// A first enrollment is permitted only later, under the current lease.
@@ -143,6 +260,17 @@ impl Identity {
         workflow: &str,
         repository: &str,
         branch: &str,
+    ) -> Result<Self> {
+        Self::observe_inner(state, repo, worktree, workflow, repository, branch, None).await
+    }
+    async fn observe_inner(
+        state: &Path,
+        repo: &Path,
+        worktree: &Path,
+        workflow: &str,
+        repository: &str,
+        branch: &str,
+        restored: Option<&MissingRestore>,
     ) -> Result<Self> {
         let root = worktree.canonicalize()?;
         anyhow::ensure!(
@@ -176,29 +304,29 @@ impl Identity {
         // Existing producers constrain candidate paths/branches and registration.
         // The receipt adds continuity, including when a byte-identical worktree
         // replaces that path. Separate stores never manufacture shared authority.
-        let state = state.canonicalize()?;
-        let key = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(&state, workflow, &root))?)
-        );
-        let receipt = state
-            .parent()
-            .context("checkout control directory unavailable")?
-            .join("workflow-checkout-identities")
-            .join(format!("{key}.json"));
+        let receipt = receipt_path(state, workflow, &root)?;
         let current = fingerprint(worktree, &common)?;
         let ownership = match read_receipt(&receipt)? {
-            Some(recorded) => {
+            Some(mut recorded) => {
                 anyhow::ensure!(
                     recorded.version == 1
                         && recorded.workflow == workflow
                         && recorded.repository.eq_ignore_ascii_case(repository)
                         && recorded.source_branch == branch
                         && recorded.worktree == root
-                        && recorded.common == common
-                        && recorded.fingerprint == current,
+                        && recorded.common == common,
                     hold("checkout_identity_changed")
                 );
+                if recorded.fingerprint != current {
+                    anyhow::ensure!(
+                        restored.is_some_and(|permit| permit.receipt == receipt
+                            && permit.previous.as_ref() == Some(&recorded))
+                            && recorded.fingerprint.common_directory == current.common_directory
+                            && recorded.fingerprint.common_created == current.common_created,
+                        hold("checkout_identity_changed")
+                    );
+                    recorded.fingerprint = current;
+                }
                 recorded
             }
             None => Ownership {
