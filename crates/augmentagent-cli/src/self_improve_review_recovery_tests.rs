@@ -98,6 +98,8 @@ import json, subprocess, sys
 args=sys.argv[1:]
 if args[:2]==['repo','view']: print('owner/repo')
 elif args[:2]==['issue','list']: print('[]')
+elif args[:2]==['pr','view']: print(json.dumps(dict(number=1604,labels=[],closingIssuesReferences=[{'number':1,'url':'https://github.com/owner/repo/issues/1'}])))
+elif args[:2]==['api','repos/owner/repo/issues/1']: print(json.dumps(dict(number=1,labels=[])))
 elif args[:2]==['pr','list']:
  head=subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],text=True).strip()
  print(json.dumps([dict(number=1604,isDraft=True,headRefName='agent-fix/issue-1',headRefOid=head,baseRefName='main',isCrossRepository=False,author={'login':'owner'},title='Recover review',body='Closes #1',closingIssuesReferences=[{'number':1,'url':'https://github.com/owner/repo/issues/1'}])]))
