@@ -183,13 +183,18 @@ pub(super) fn episode_retries(
             && (snapshot.checkpoint.binding.head==candidate.head
                 || store.retained_candidate_head(&candidate.repository,candidate.pr,&candidate.branch,&candidate.head,
                     &snapshot.checkpoint.binding.head,now)?.as_deref()==Some(snapshot.checkpoint.binding.head.as_str()));
+        let review_capacity_wait = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Held
+            && matches!(snapshot.checkpoint.next.reason.as_str(), "no-reviewer-capacity" | "reviewer-latched")
+            && snapshot.checkpoint.next.action == "resume_preserved_work"
+            && snapshot.checkpoint.binding.head == candidate.head
+            && owner_resume_matches(&store, &id, candidate)?;
         let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
             && snapshot.checkpoint.next.reason == "review_main_changed"
             && snapshot.checkpoint.next.action == "reconcile_main";
         if snapshot.lease_until_ms <= now
             && snapshot.checkpoint.next.eligible_at_ms <= now
             && !store.owner_control(&id)?.is_some_and(|control| control.paused)
-            && (main_changed || qualification_recovered || matches!(
+            && (review_capacity_wait || main_changed || qualification_recovered || matches!(
                 snapshot.checkpoint.next.action.as_str(),
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
@@ -566,5 +571,37 @@ mod tests {
             authorized(&serde_json::json!([child]), "owner/repo", &["owner".into()])[0]
                 .ready_for_review()
         );
+    }
+}
+
+#[cfg(test)]
+mod review_recovery_regression {
+    use super::*;
+    #[test]
+    fn review_capacity_wait_returns_to_normal_scheduler_without_owner_retry() {
+        use crate::autoship_workflow::{Binding, Stage, NextAction};
+        let dir=tempfile::tempdir().unwrap();
+        let git=|args:&[&str]| {
+            let output=std::process::Command::new("git").args(args).current_dir(dir.path()).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init","-q"]);
+        git(&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","--allow-empty","-qm","base"]);
+        let head=git(&["rev-parse","HEAD"]);
+        let path=dir.path().join("state.db");
+        let id="owner/repo#1";
+        let mut store=WorkflowStore::open(&path).unwrap();
+        store.register(id,"agent-fix/issue-1",Binding {head:head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
+        let lease=store.claim(id,"worker",20,1000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",1604,21).unwrap();
+        let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Held;
+        checkpoint.next=NextAction {reason:"no-reviewer-capacity".into(),action:"resume_preserved_work".into(),eligible_at_ms:30};
+        store.checkpoint(&lease,&checkpoint,25).unwrap();
+        store.release(&lease,26).unwrap();
+        let candidate=AdoptedPr {repository:"owner/repo".into(),pr:1604,source_issue:Some(1),branch:"agent-fix/issue-1".into(),head,base:"main".into(),author:"owner".into(),title:"review".into(),body:String::new(),dependency:Dependency::Main};
+        assert!(episode_retries(&path,&[candidate],31).unwrap().contains(&1604),
+            "review capacity hold disappeared behind the daily attempt filter instead of returning to guarded preflight");
     }
 }

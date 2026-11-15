@@ -64,6 +64,11 @@ mod linked_claim_boundaries;
 #[cfg(test)]
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
+#[cfg(test)]
+#[path = "self_improve_review_recovery_tests.rs"]
+mod review_recovery_tests;
+#[path = "self_improve_review_recovery.rs"]
+mod review_recovery;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
@@ -1730,6 +1735,14 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // the half that binds to a specific pull request rather than a shape.
         let record = opened_prs::get(issue);
         let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
+        if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
+            if let Some(head) = head_sha.as_deref() {
+                if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
+                    record.as_ref(), chrono::Utc::now().timestamp_millis()) {
+                    warn!(pr, "review recovery scheduling unavailable: {error:#}");
+                }
+            }
+        }
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -4018,7 +4031,11 @@ async fn find_resumable_draft(
     policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let now=chrono::Utc::now().timestamp_millis();
-    let mut retries = adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default();
+    let mut retries = match review_recovery::filter(&workflow::path(), &mut adopted, now, dry_run) {
+        Ok(retries) => retries,
+        Err(error) => { warn!("review recovery scheduling unavailable: {error:#}"); return None; }
+    };
+    retries.extend(adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
     let select = |cursor| {
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
@@ -6903,6 +6920,12 @@ async fn resume_draft_pr(
     let reviewer = if imported && authors.is_ok() { adoption::imported_reviewer() }
         else { select_session_isolated_reviewer(&reviewer_pool(), authors, reviewer_status) };
     if let Err(why) = reviewer {
+        if !dry_run {
+            let repository = workflow::canonical_repository(repo_root).await?;
+            if review_recovery::unavailable(&workflow::path(), &repository, pr, branch, &why, chrono::Utc::now().timestamp_millis())? {
+                return Ok(RunReport::held(format!("PR #{pr}: independent review waiting: {}", why.code())));
+            }
+        }
         return Ok(hold_unreviewable(
             repo_root,
             pr,
