@@ -92,6 +92,8 @@ pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
 }
 #[path = "self_improve_source.rs"]
 mod source_reconcile;
+#[path = "self_improve_ownership.rs"]
+pub(crate) mod ownership;
 #[path = "self_improve_workflow.rs"]
 mod workflow;
 #[path = "self_improve_recovery.rs"]
