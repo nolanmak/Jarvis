@@ -2723,6 +2723,7 @@ class BuildRunnerReadinessTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'workspace'
         self.root.mkdir()
+        self.scratch=Path(self.temp.name)/'scratch';self.scratch.mkdir(mode=0o700)
         self.fakebin = Path(self.temp.name) / 'bin'
         self.fakebin.mkdir()
         for name in ('cargo', 'npm', 'npx', 'printf'):
@@ -2734,7 +2735,8 @@ class BuildRunnerReadinessTests(unittest.TestCase):
         config = {'cwd': str(self.root), 'read_roots': [str(self.root)],
                   'write_roots': [str(self.root)],
                   'allowed_tools': ['Bash(cargo *)', 'Bash(npm *)', 'Bash(npx *)', 'Bash(printf *)'],
-                  'environment': {'PATH': str(self.fakebin) + ':/usr/bin'}}
+                  'environment': {'PATH': str(self.fakebin) + ':/usr/bin'},
+                  'build_scratch_dir':str(self.scratch)}
         config.update(extra)
         return bridge.Policy(config)
 
@@ -2877,6 +2879,15 @@ class BuildScratchTests(unittest.TestCase):
             class Unavailable(ValueError):
                 pass
 
+            class CommandTimedOut(Unavailable):
+                pass
+
+            class ExecutionFailed(Unavailable):
+                pass
+
+            class CleanupUnverified(Unavailable):
+                pass
+
             class Runtime:
                 @staticmethod
                 def load(path):
@@ -2885,7 +2896,7 @@ class BuildScratchTests(unittest.TestCase):
 
             @staticmethod
             def run(runtime, workspace, argv, environment, timeout=120, node_workspaces=(),
-                    download_info=None, scratch_dir=None, build_cache=None, storage_lease=None):
+                    download_info=None, scratch_dir=None, build_cache=None, storage_lease=None, cleanup_receipt=None):
                 test.calls.append({'workspace': Path(workspace), 'argv': argv, 'environment': environment,
                                    'timeout': timeout, 'scratch_dir': scratch_dir, 'build_cache': build_cache})
                 return {'exit_code': 0, 'stdout': '', 'stderr': ''}
@@ -3176,6 +3187,209 @@ class BuildScratchTests(unittest.TestCase):
             policy.run_command('cargo build')
         self.assertIn('JARVIS_READINESS:build_cache_full', str(raised.exception))
         self.assertIn('build-cache.img', str(raised.exception))
+
+    def test_controller_vm_timeout_reaches_the_model_as_execution_failure(self):
+        policy = self.policy()
+        def deadline(*args, **kwargs):
+            raise self.fake_vm.CommandTimedOut('SYNTHETIC_PRIVATE_DEADLINE_DETAIL')
+        self.fake_vm.run = staticmethod(deadline)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test', 'timeout': 1}}})
+        self.assertTrue(response['isError'])
+        text = response['content'][0]['text']
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:command_timeout '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('JARVIS_READINESS:', text, 'an executed timeout is not a preflight refusal')
+
+    def test_controller_cleanup_failure_reaches_the_model_without_becoming_a_profile_refusal(self):
+        policy = self.policy()
+        def unverified(*args, **kwargs):
+            raise self.fake_vm.CleanupUnverified('SYNTHETIC_PRIVATE_CLEANUP_PATH')
+        self.fake_vm.run = staticmethod(unverified)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test', 'timeout': 1}}})
+        self.assertTrue(response['isError'])
+        text = response['content'][0]['text']
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:cleanup_unverified '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('command_timeout', text)
+        self.assertNotIn('JARVIS_READINESS:', text)
+
+    def test_cleanup_hold_refuses_a_second_build_without_storage_configuration(self):
+        policy=self.policy();calls=[]
+        def unverified(*args,**kwargs):
+            calls.append(Path(args[1]))
+            if len(calls)==1:raise self.fake_vm.CleanupUnverified('synthetic unknown descendants')
+            return {'exit_code':0,'stdout':'','stderr':''}
+        self.fake_vm.run=staticmethod(unverified);server=bridge.Server(policy)
+        request={'method':'tools/call','params':{'name':'Bash','arguments':{'command':'cargo test'}}}
+        first=server.dispatch(request);second=server.dispatch(request)
+        self.assertTrue(first['isError'])
+        self.assertEqual(len(calls),1,'cleanup hold dispatched a second VM build')
+        self.assertTrue(second['isError']);self.assertIn('cleanup_unverified',second['content'][0]['text'])
+
+    def test_cleanup_hold_retains_workspace_and_session_after_close(self):
+        policy=self.policy();seen={}
+        def unverified(runtime,workspace,*args,**kwargs):
+            seen['workspace']=Path(workspace)
+            raise self.fake_vm.CleanupUnverified('synthetic unknown descendants')
+        self.fake_vm.run=staticmethod(unverified)
+        response=bridge.Server(policy).dispatch({'method':'tools/call','params':{'name':'Bash','arguments':{'command':'cargo test'}}})
+        self.assertTrue(response['isError']);session=policy._scratch.session
+        self.assertTrue(seen['workspace'].is_dir(),'unknown live VM lost its workspace')
+        policy.close()
+        self.assertTrue(session.is_dir(),'bridge close removed an unverified VM session')
+        self.assertTrue(seen['workspace'].is_dir(),'bridge close removed an unverified VM workspace')
+
+    def test_failed_prelaunch_marker_write_does_not_create_a_cleanup_hold(self):
+        from unittest.mock import patch
+        policy=self.policy();original=bridge.json.dump
+        def no_space(value,*args,**kwargs):
+            if isinstance(value,dict) and 'receipt' in value:raise OSError('synthetic prelaunch marker write failure')
+            return original(value,*args,**kwargs)
+        with patch.object(bridge.json,'dump',side_effect=no_space):
+            response=bridge.Server(policy).dispatch({'method':'tools/call','params':{
+                'name':'Bash','arguments':{'command':'cargo test'}}})
+        self.assertTrue(response['isError']);self.assertEqual(self.calls,[],'marker failure dispatched a VM')
+        self.assertFalse(policy._scratch.cleanup_pending(),'known prelaunch failure left an uncertain execution hold')
+        self.assertNotIn('[runner=',response['content'][0]['text'],'marker write failure claimed a process started')
+        policy.run_command('cargo test');self.assertEqual(len(self.calls),1,'prelaunch storage recovery could not proceed')
+
+    def test_marker_lookup_failure_cannot_release_retained_workspace(self):
+        from unittest.mock import patch
+        policy=self.policy();seen={}
+        def unverified(runtime,workspace,*args,**kwargs):
+            seen['workspace']=Path(workspace)
+            raise self.fake_vm.CleanupUnverified('synthetic unknown descendants')
+        self.fake_vm.run=staticmethod(unverified)
+        response=bridge.Server(policy).dispatch({'method':'tools/call','params':{
+            'name':'Bash','arguments':{'command':'cargo test'}}})
+        self.assertTrue(response['isError']);marker=policy._scratch.session/policy._scratch.CLEANUP_MARKER
+        original=bridge.os.lstat
+        def unavailable(path,*args,**kwargs):
+            if Path(path)==marker:raise PermissionError('synthetic marker lookup failure')
+            return original(path,*args,**kwargs)
+        with patch.object(bridge.os,'lstat',side_effect=unavailable):policy.close()
+        self.assertTrue(seen['workspace'].is_dir(),'failed marker lookup was treated as verified cleanup')
+
+    def test_cleanup_hold_survives_a_new_bridge_policy(self):
+        first=self.policy();calls=[]
+        def unverified(*args,**kwargs):
+            calls.append(1)
+            raise self.fake_vm.CleanupUnverified('synthetic unknown descendants')
+        self.fake_vm.run=staticmethod(unverified)
+        request={'method':'tools/call','params':{'name':'Bash','arguments':{'command':'cargo test'}}}
+        self.assertTrue(bridge.Server(first).dispatch(request)['isError']);first.close()
+        second=self.policy();response=bridge.Server(second).dispatch(request)
+        self.assertEqual(len(calls),1,'a new bridge policy bypassed the retained cleanup hold')
+        self.assertTrue(response['isError']);self.assertIn('cleanup_unverified',response['content'][0]['text'])
+
+    def test_live_inflight_command_reports_busy_without_calling_it_failed_cleanup(self):
+        policy=self.policy();policy._scratch.open()
+        private=policy._scratch.tmp/'jarvis-vm-build-inflight';private.mkdir(mode=0o700)
+        policy._scratch.command_cleanup(private/'cleanup-complete')
+        second=self.policy();response=bridge.Server(second).dispatch({'method':'tools/call','params':{
+            'name':'Bash','arguments':{'command':'cargo test'}}})
+        self.assertTrue(response['isError'])
+        self.assertIn('JARVIS_READINESS:build_storage_busy',response['content'][0]['text'])
+        self.assertNotIn('cleanup_unverified',response['content'][0]['text']);self.assertEqual(self.calls,[])
+        self.assertTrue(policy._scratch.cleanup_pending(),'busy observation mutated the live command marker')
+        # Fixture has not launched a process, so end this pre-launch marker.
+        policy._scratch.command_cleanup()
+
+    def test_cleanup_hold_releases_only_for_its_exact_private_receipt(self):
+        policy=self.policy();seen=[]
+        def run(runtime,workspace,*args,**kwargs):
+            seen.append(Path(kwargs['cleanup_receipt']))
+            if len(seen)==1:raise self.fake_vm.CleanupUnverified('synthetic unknown descendants')
+            return {'exit_code':0,'stdout':'','stderr':''}
+        self.fake_vm.run=staticmethod(run);server=bridge.Server(policy)
+        request={'method':'tools/call','params':{'name':'Bash','arguments':{'command':'cargo test'}}}
+        self.assertTrue(server.dispatch(request)['isError'])
+        unrelated=policy._scratch.tmp/'unrelated-receipt';unrelated.write_bytes(b'all-descendants-reaped\n');unrelated.chmod(0o600)
+        for receipt in [b'all-descendants-reaped\r\n',b'all-descendants-reaped',b'incomplete\n']:
+            seen[0].write_bytes(receipt);seen[0].chmod(0o600)
+            self.assertTrue(server.dispatch(request)['isError']);self.assertEqual(len(seen),1)
+        seen[0].write_bytes(b'all-descendants-reaped\n');seen[0].chmod(0o600)
+        self.assertFalse(server.dispatch(request).get('isError',False));self.assertEqual(len(seen),2)
+        self.assertFalse(policy._scratch.cleanup_pending())
+        session=policy._scratch.session;policy.close();self.assertFalse(session.exists())
+
+    def test_verified_supervisor_failure_is_fixed_execution_diagnostic(self):
+        policy = self.policy()
+        def failed(*args, **kwargs):
+            raise self.fake_vm.ExecutionFailed('SYNTHETIC_PRIVATE_SUPERVISOR_DETAIL')
+        self.fake_vm.run = staticmethod(failed)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        text = response['content'][0]['text']
+        self.assertTrue(response['isError'])
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:supervisor_failure '), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE', text)
+        self.assertNotIn('Operation denied', text)
+        self.assertNotIn('JARVIS_READINESS:', text)
+
+    def test_guest_error_text_cannot_impersonate_a_controller_supervisor_failure(self):
+        policy = self.policy()
+        def failed(*args, **kwargs):
+            raise self.fake_vm.Unavailable('VM execution failed')
+        self.fake_vm.run = staticmethod(failed)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        self.assertTrue(response['isError'])
+        self.assertNotIn('JARVIS_EXECUTION:supervisor_failure', response['content'][0]['text'])
+
+    def test_guest_nonzero_exit_codes_remain_command_results(self):
+        for status in (1, 125, 137):
+            with self.subTest(guest_status=status):
+                def failed(*args, **kwargs):
+                    return {'exit_code': status, 'stdout': '', 'stderr': 'synthetic guest failure'}
+                self.fake_vm.run = staticmethod(failed)
+                result = self.policy().run_vm_build(['cargo', 'test'], 1)
+                self.assertEqual(result['exit_code'], status)
+                self.assertEqual(result['stderr'], 'synthetic guest failure')
+
+    def test_guest_error_text_cannot_impersonate_a_controller_timeout(self):
+        policy = self.policy()
+        def guest_error(*args, **kwargs):
+            raise self.fake_vm.Unavailable('VM command timed out')
+        self.fake_vm.run = staticmethod(guest_error)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+        self.assertTrue(response['isError'])
+        self.assertNotIn('JARVIS_EXECUTION:command_timeout', response['content'][0]['text'])
+
+    def test_non_deadline_controller_cleanup_proof_is_classified_through_dispatch(self):
+        from codex_build_vm_test import BuildScratchPlacementTests, vm
+        # Keep the real controller's exception identities through the VM shim.
+        # The controller fixture supervises a fake process; no KVM run is claimed.
+        self.fake_vm.Unavailable = vm.Unavailable
+        self.fake_vm.CommandTimedOut = vm.CommandTimedOut
+        self.fake_vm.CleanupUnverified = vm.CleanupUnverified
+        self.fake_vm.ExecutionFailed = vm.ExecutionFailed
+        for receipt, status, cleanup_failed in [(None, 125, True), (None, 0, True),
+                ('incomplete\n', 0, True), ('all-descendants-reaped\r\n', 0, True),
+                ('all-descendants-reaped\r', 0, True), ('all-descendants-reaped\n', 125, False)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                def controller(*args, **kwargs):
+                    raise BuildScratchPlacementTests().deadline_fixture(receipt, status, expired=False)
+                self.fake_vm.run = staticmethod(controller)
+                # Each independent controller scenario gets its own scratch;
+                # an earlier unknown-cleanup case must not admit another run.
+                case_scratch=Path(self.temp.name)/('case-'+str(len(list(Path(self.temp.name).glob('case-*')))))
+                case_scratch.mkdir(mode=0o700)
+                response = bridge.Server(self.policy(build_scratch_dir=str(case_scratch))).dispatch({'method': 'tools/call', 'params': {
+                    'name': 'Bash', 'arguments': {'command': 'cargo test'}}})
+                self.assertTrue(response['isError'])
+                text = response['content'][0]['text']
+                self.assertTrue(text.startswith('[runner=vm] '), text)
+                self.assertEqual('JARVIS_EXECUTION:cleanup_unverified ' in text, cleanup_failed, text)
+                self.assertNotIn('JARVIS_EXECUTION:command_timeout', text)
+                self.assertNotIn('Operation denied', text)
+                if not cleanup_failed:
+                    self.assertTrue(text.startswith('[runner=vm] JARVIS_EXECUTION:supervisor_failure '), text)
 
     def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
         import os

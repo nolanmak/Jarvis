@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_adopted_publication.rs"]
+mod adopted_publication;
+
+#[path = "autoship_push_observation.rs"]
+mod push_observation;
+
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
 #[path = "autoship_merge_escalation.rs"]
@@ -728,6 +734,8 @@ impl WorkflowStore {
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_mutation_receipt (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), receipt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS push_dispatch_destination (
+                operation TEXT PRIMARY KEY REFERENCES operation(id), destination TEXT NOT NULL, reference TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_allowance_dispatch (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), repository TEXT NOT NULL,
                 pr INTEGER NOT NULL, pr_node_id TEXT NOT NULL, head TEXT NOT NULL,
@@ -1242,8 +1250,11 @@ impl WorkflowStore {
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
-        tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
+        let inserted=tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
+        if inserted==1 && kind==OperationKind::MergePr {
+            event(&tx,&lease.workflow,lease.generation,"merge_intent_created_v1",&id,now_ms)?;
+        }
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(
             "SELECT receipt,binding FROM operation WHERE id=?1",
             [&id],
@@ -1257,6 +1268,25 @@ impl WorkflowStore {
             binding: serde_json::from_str(&recorded_binding)?,
             receipt,
         })
+    }
+
+    /// A current-protocol intent denied before dispatch is not an unknown
+    /// remote effect. Keep its audit history, but allow a future fresh intent.
+    /// Legacy intents without protocol provenance remain untouched.
+    pub(crate) fn cancel_unused_merge(&mut self,lease:&Lease,operation:&Operation,now:i64)->Result<bool> {
+        ensure!(operation.kind==OperationKind::MergePr && operation.workflow==lease.workflow,"merge intent ownership changed");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,&operation.binding,now)?;
+        let known:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='merge_intent_created_v1' AND payload=?2)",
+            params![lease.workflow,operation.id],|row|row.get(0))?;
+        let dispatched:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch WHERE operation=?1)
+            OR EXISTS(SELECT 1 FROM merge_transport_response WHERE operation=?1)
+            OR EXISTS(SELECT 1 FROM merge_mutation_receipt WHERE operation=?1)",[&operation.id],|row|row.get(0))?;
+        if !known || dispatched {return Ok(false);}
+        let removed=tx.execute("DELETE FROM operation WHERE id=?1 AND workflow=?2 AND binding=?3 AND receipt IS NULL",
+            params![operation.id,lease.workflow,serde_json::to_string(&operation.binding)?])?;
+        if removed==1 {event(&tx,&lease.workflow,lease.generation,"merge_intent_cancelled_before_dispatch",&operation.id,now)?;}
+        tx.commit()?;Ok(removed==1)
     }
 
     /// Complete after observing the remote result (including reconciliation).
@@ -2209,8 +2239,11 @@ impl WorkflowStore {
         if snapshot.pr != Some(pr) || snapshot.branch != branch
             || snapshot.checkpoint.binding.head != local || local == published
             || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
-            || !matches!(snapshot.checkpoint.stage,
+            || !(matches!(snapshot.checkpoint.stage,
                 Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+                || (snapshot.checkpoint.stage==Stage::Held
+                    && snapshot.checkpoint.next.reason=="automatic_pr_routing_held"
+                    && snapshot.checkpoint.next.action=="retry_automatic_pr_routing"))
             || self.owner_control(&id)?.is_some_and(|control| control.paused)
             || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
             return Ok(None);
@@ -2220,7 +2253,13 @@ impl WorkflowStore {
             params![id, serde_json::to_string(&OperationKind::Push)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
-        let Some((binding, receipt)) = latest else { return Ok(None); };
+        let Some((binding, receipt)) = latest else {
+            // An imported PR may have been published by its owner, before this
+            // workflow existed. Its fenced admission is a different fact from
+            // a Push; any actual Push above still takes precedence.
+            return Ok((adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published))
+                .then_some(snapshot.checkpoint.binding.head));
+        };
         let binding: Binding = serde_json::from_str(&binding)?;
         binding.validate()?;
         if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {
@@ -2309,6 +2348,38 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unused_merge_cancellation_preserves_dispatched_legacy_and_stale_lease_intents() {
+        for fault in ["none","legacy","dispatched","stale-lease"] {
+            let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+            let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register("owner/repo#7","branch",binding.clone(),1).unwrap();
+            let lease=store.claim("owner/repo#7","controller",2,1000).unwrap().unwrap();
+            store.attach_pr(&lease,9,3).unwrap();
+            store.charge(&lease,"original-work",ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},4).unwrap();
+            let operation=store.begin_operation(&lease,OperationKind::MergePr,&binding,5).unwrap();
+            if fault=="legacy" {
+                // Disposable fixture: simulate a pre-provenance operation.
+                store.conn.execute("DELETE FROM workflow_event WHERE kind='merge_intent_created_v1'",[]).unwrap();
+            }
+            if fault=="dispatched" {
+                store.reserve_merge(&lease,&operation,"owner/repo",9,"PR_fixture",6,5).unwrap();
+                store.dispatch_marked_merge(&lease,&operation,7,5).unwrap();
+            }
+            let before=store.snapshot(&lease.workflow).unwrap();
+            let result=store.cancel_unused_merge(&lease,&operation,if fault=="stale-lease" {2000}else{8});
+            if fault=="stale-lease" {assert!(result.is_err());}
+            else {assert_eq!(result.unwrap(),fault=="none","{fault}");}
+            assert_eq!(store.pending_operations(&lease.workflow).unwrap().is_empty(),fault=="none","{fault}");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap(),before,"cancellation rewrote original work");
+            if fault=="none" {
+                let retry=store.begin_operation(&lease,OperationKind::MergePr,&binding,9).unwrap();
+                assert_eq!(retry.id,operation.id);assert!(retry.receipt.is_none());
+                assert_eq!(store.pending_operations(&lease.workflow).unwrap().len(),1);
+            }
+        }
+    }
 
     #[test]
     fn retained_candidate_recovery_requires_idle_authority_and_latest_confirmed_publication() {

@@ -17,6 +17,7 @@ def own():
   closingIssuesReferences=[{'number':7,'url':'https://github.com/owner/repo/issues/7'}])
 if a[:2]==['repo','view']:print('owner/repo')
 elif a[:2]==['issue','view']:print(json.dumps({'state':'OPEN'}))
+elif a[:1]==['api'] and a[1].endswith('/issues/7'):print(json.dumps(dict(number=7,state='open',labels=[])))
 elif a[:1]==['api']:print(json.dumps({'object':{'sha':head}}))
 elif a[:2]==['pr','view']:
  assert a[2]=='12' and (root/'own-visible').exists()
@@ -210,14 +211,14 @@ async fn publication_claims_preserve_intents_and_reconcile_original_identity() {
         "main",
     ];
     if mode == "lost-response-claim" {
-        let error = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args)
+        let error = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args, true)
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<linked_claims::Hold>().is_none());
         assert_eq!(create_count(&root), 1);
     }
     std::fs::write(root.join("blocked"), "").unwrap();
-    let error = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args)
+    let error = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args, true)
         .await
         .unwrap_err();
     let hold = if mode.starts_with("unknown") {
@@ -254,7 +255,7 @@ async fn publication_claims_preserve_intents_and_reconcile_original_identity() {
     // Original exact identity must settle even while issue inventory is unknown.
     std::fs::write(root.join("own-visible"), "").unwrap();
     std::fs::write(root.join("inventory-fail"), "").unwrap();
-    let found = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args)
+    let found = publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args, true)
         .await
         .unwrap();
     assert_eq!(found.number, 12);
@@ -267,7 +268,7 @@ async fn publication_claims_preserve_intents_and_reconcile_original_identity() {
     guard.save_publication(&pending_body).unwrap();
     std::fs::write(root.join("history-fail"), "").unwrap();
     assert_eq!(
-        publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args)
+        publication::publish(&guard, &worktree, "agent-fix/issue-7", &head, 7, &args, true)
             .await
             .unwrap()
             .number,
