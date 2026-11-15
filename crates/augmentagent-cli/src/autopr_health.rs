@@ -425,10 +425,25 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 detail: "No confirmed autonomous merge is recorded since allowance activation; main commits do not prove autoship progress.".into(),
                 fix: "Check provider readiness and workflow blockers; verify an accepted autonomous merge receipt.".into() });
         }
-        if a.oldest_pending_at_ms.is_some_and(|at| now.timestamp_millis().saturating_sub(at) >= 15 * 60_000) {
+        // Without the dispatch ledger, fall back to the conservative oldest hold.
+        if i.merge_unresolved_holds.is_none()
+            && a.oldest_pending_at_ms.is_some_and(|at| now.timestamp_millis().saturating_sub(at) >= 15 * 60_000) {
             out.push(Finding { severity: Severity::Alert, code: "merge-reconciliation-required",
                 detail: format!("{} pending merge capacity hold(s); oldest unresolved for at least 15 minutes. These are not confirmed shipments.", a.pending),
                 fix: "Inspect the durable merge intent and remote evidence before resolving; do not replay an uncertain mutation.".into() });
+        }
+    }
+    // #1705 — ambiguity starts when the remote mutation was authorized.
+    if let Some(holds) = &i.merge_unresolved_holds {
+        use crate::autoship_workflow::merge_escalation as escalation;
+        let overdue = escalation::overdue_merge_holds(holds, now.timestamp_millis());
+        if !overdue.is_empty() {
+            let commands: Vec<String> = overdue.iter().take(5)
+                .map(|h| format!("`{}`", escalation::merge_resolution_command(&h.operation))).collect();
+            out.push(Finding { severity: Severity::Alert, code: "merge-reconciliation-required",
+                detail: escalation::merge_escalation_detail(&overdue, now.timestamp_millis()),
+                fix: format!("Gather the remote PR state and merge-commit evidence, then resolve each operation: {}. \
+                    Never replay an uncertain mutation, release its capacity without proof, or reset the ledger.", commands.join("; ")) });
         }
     }
 
@@ -552,6 +567,10 @@ pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     if let Some(r) = i.merge_allowance {
         out.push_str(&format!("\nconfirmed auto-merges today (UTC): {} of {}; remaining allowance: {}; pending capacity holds: {}; available to dispatch: {}",
             r.confirmed, r.cap, r.remaining, r.pending, r.available));
+        if let Some(now) = i.now_or_epoch {
+            out.push_str(&format!("\n{}", crate::autoship_workflow::merge_escalation::allowance_clock_line(
+                now, r.last_merged_at_ms, &chrono::Local)));
+        }
     } else if let Some(error) = &i.merge_allowance_error {
         out.push_str(&format!("\nmerge allowance unavailable: {error}"));
     }
