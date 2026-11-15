@@ -9,7 +9,7 @@ pub(crate) struct Args {
     #[arg(long)] json:bool,
 }
 
-async fn apply(repo:&Path,path:&Path,id:&str)->anyhow::Result<Value> {
+pub(crate) async fn apply(repo:&Path,path:&Path,id:&str)->anyhow::Result<Value> {
     let (repository,target)=super::target(id)?;
     let number=target["number"].as_u64().unwrap();
     let store=WorkflowStore::open_read_only(path)?.ok_or_else(||anyhow::anyhow!("workflow store unavailable"))?;
