@@ -85,8 +85,36 @@ fn escalation_names_identity_dispatch_time_and_supported_resolution_command() {
         "16 min", "no response journaled", "not confirmed shipments"] {
         assert!(detail.contains(expected), "missing {expected:?}: {detail}");
     }
-    assert_eq!(merge_resolution_command("op-7"),
-        "augmentagent autopr resolve-merge --operation op-7 --classification <autonomous|manual|not-merged> --evidence <evidence.json>");
+    assert_eq!(merge_resolution_command("op-7", None),
+        "augmentagent autopr resolve-merge --operation 'op-7' --classification <autonomous|manual|not-merged> --evidence <evidence.json>");
+}
+
+/// Review #2098: resolve-merge reads AUGMENTAGENT_AUTOPR_WORKFLOW_DB or the
+/// caller's default, so the printed command must name the worker's store.
+#[test]
+fn resolution_command_targets_the_store_holding_the_dispatch_shell_quoted() {
+    let store = std::path::Path::new("/var/lib/worker's state/autopr workflow.sqlite3");
+    assert_eq!(merge_resolution_command("op-7", Some(store)),
+        "AUGMENTAGENT_AUTOPR_WORKFLOW_DB='/var/lib/worker'\\''s state/autopr workflow.sqlite3' \
+         augmentagent autopr resolve-merge --operation 'op-7' --classification <autonomous|manual|not-merged> --evidence <evidence.json>");
+}
+
+/// Review #2098: notifications clip the report at 1800 characters. Many
+/// overdue 64-hex operations must not push the command or safety rule out.
+#[test]
+fn escalation_stays_within_budget_and_keeps_complete_command_and_safety_rule() {
+    let holds: Vec<UnresolvedMergeHold> = (0..40).map(|n| UnresolvedMergeHold {
+        operation: format!("{n:064x}"), workflow: format!("nolanmak/jarvis#{n}"),
+        repository: "nolanmak/jarvis".into(), pr: 2000 + n, head: "d".repeat(40), reserved_at_ms: 0,
+        dispatched_at_ms: n as i64, response_journaled: n % 2 == 0 }).collect();
+    let store = std::path::Path::new("/home/worker/.local/state/augmentagent/autopr-workflow.sqlite3");
+    let now = 100 * DAY;
+    let overdue = overdue_merge_holds(&holds, now);
+    let (detail, fix) = (merge_escalation_detail(&overdue, now), merge_escalation_fix(&overdue, Some(store)));
+    assert!(detail.len() + fix.len() <= MERGE_ESCALATION_BUDGET, "{} chars:\n{detail}\n{fix}", detail.len() + fix.len());
+    assert!(detail.starts_with("40 dispatched merge(s)") && detail.contains(&holds[0].operation) && detail.contains("more"), "{detail}");
+    assert!(fix.contains(&merge_resolution_command(&holds[0].operation, Some(store))), "{fix}");
+    assert!(fix.ends_with("Never replay an uncertain mutation, release its capacity without proof, or reset the ledger."), "{fix}");
 }
 
 #[test]

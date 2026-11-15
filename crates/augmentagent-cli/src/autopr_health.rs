@@ -130,6 +130,8 @@ pub struct HealthInputs {
     pub merge_allowance_error: Option<String>,
     /// #1705 — dispatched merges lacking a receipt; `None` when unreadable.
     pub merge_unresolved_holds: Option<Vec<crate::autoship_workflow::UnresolvedMergeHold>>,
+    /// The worker-selected store those holds came from; resolution must target it.
+    pub merge_store_path: Option<std::path::PathBuf>,
     /// Fresh local observation only; never execution or cleanup authority.
     pub native_state_capacity: Option<serde_json::Value>,
     /// Active, unpaused workflows waiting on resource admission.
@@ -438,12 +440,9 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         use crate::autoship_workflow::merge_escalation as escalation;
         let overdue = escalation::overdue_merge_holds(holds, now.timestamp_millis());
         if !overdue.is_empty() {
-            let commands: Vec<String> = overdue.iter().take(5)
-                .map(|h| format!("`{}`", escalation::merge_resolution_command(&h.operation))).collect();
             out.push(Finding { severity: Severity::Alert, code: "merge-reconciliation-required",
                 detail: escalation::merge_escalation_detail(&overdue, now.timestamp_millis()),
-                fix: format!("Gather the remote PR state and merge-commit evidence, then resolve each operation: {}. \
-                    Never replay an uncertain mutation, release its capacity without proof, or reset the ledger.", commands.join("; ")) });
+                fix: escalation::merge_escalation_fix(&overdue, i.merge_store_path.as_deref()) });
         }
     }
 
@@ -1046,9 +1045,11 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         DISK_DROP_WINDOW_HOURS,
     );
     crate::disk::save_readings(&filesystems, now);
+    let mut merge_store_path=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
+            merge_store_path=Some(config.path.clone());
             let native=config.native_policy.as_deref().map(|path| {
                 serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect_at(Some(path)))
                     .expect("native capacity report serializes")
@@ -1094,6 +1095,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         merge_allowance,
         merge_allowance_error,
         merge_unresolved_holds,
+        merge_store_path,
         native_state_capacity,
         resource_capacity_waits,
         resource_capacity_wait_error,
@@ -1355,10 +1357,12 @@ mod tests {
         let op=store.begin_operation(&lease,OperationKind::MergePr,&binding,t).unwrap();
         store.reserve_merge(&lease,&op,"owner/repo",9,"PR_9",t,5).unwrap();
         store.dispatch_merge(&lease,&op,t+19*min,5).unwrap();
+        let store_path=path.clone();
         let config=crate::autoship_deployment::WorkerWorkflowConfiguration{path,daily_cap:5,native_policy:None};
         let observe=|now:i64| {
             let metrics=workflow_metrics(&config,now).unwrap();
             let mut i=healthy();
+            i.merge_store_path=Some(config.path.clone());
             i.now_or_epoch=DateTime::from_timestamp_millis(now);
             i.merge_allowance=metrics.allowance;i.merge_unresolved_holds=metrics.unresolved_holds;
             i
@@ -1370,7 +1374,8 @@ mod tests {
         let findings=analyze(&late,&Thresholds::default());
         let finding=findings.iter().find(|f|f.code=="merge-reconciliation-required").expect("16-minute ambiguity escalates");
         assert!(finding.detail.contains(&op.id)&&finding.detail.contains("owner/repo#9"),"{}",finding.detail);
-        assert!(finding.fix.contains(&format!("augmentagent autopr resolve-merge --operation {}",op.id)),"{}",finding.fix);
+        assert!(finding.fix.contains(&crate::autoship_workflow::merge_escalation::merge_resolution_command(&op.id,Some(&store_path))),"{}",finding.fix);
+        assert!(finding.fix.contains("AUGMENTAGENT_AUTOPR_WORKFLOW_DB="),"{}",finding.fix);
         let report=render_text(&findings,&late);
         for expected in ["confirmed auto-merges today (UTC): 0 of 5","pending capacity holds: 1","allowance day "] {
             assert!(report.contains(expected),"missing {expected:?}: {report}");
@@ -1453,6 +1458,7 @@ mod tests {
             merge_allowance: None,
             merge_allowance_error: None,
             merge_unresolved_holds: None,
+            merge_store_path: None,
             native_state_capacity: None,
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,

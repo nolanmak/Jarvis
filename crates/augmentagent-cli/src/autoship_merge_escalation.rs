@@ -53,28 +53,53 @@ pub fn overdue_merge_holds(holds: &[UnresolvedMergeHold], now: i64) -> Vec<&Unre
     holds.iter().filter(|h| now.saturating_sub(h.dispatched_at_ms) >= MERGE_AMBIGUITY_ESCALATION_MS).collect()
 }
 
-/// The supported operator command that settles one ambiguous dispatch.
-pub fn merge_resolution_command(operation: &str) -> String {
-    format!("augmentagent autopr resolve-merge --operation {operation} \
-        --classification <autonomous|manual|not-merged> --evidence <evidence.json>")
+/// Notifications clip the whole report at 1800 characters; the escalation
+/// (detail + fix) stays well inside so its command and safety text survive.
+pub const MERGE_ESCALATION_BUDGET: usize = 1200;
+const DETAIL_BUDGET: usize = 560;
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// At most this many holds are itemized; the count always covers all.
-const ITEMIZED: usize = 5;
+/// The supported operator command that settles one ambiguous dispatch,
+/// bound to the store that holds it (the worker's, not the caller's default).
+pub fn merge_resolution_command(operation: &str, store: Option<&std::path::Path>) -> String {
+    let env = store.map_or_else(String::new,
+        |path| format!("AUGMENTAGENT_AUTOPR_WORKFLOW_DB={} ", shell_quote(&path.to_string_lossy())));
+    format!("{env}augmentagent autopr resolve-merge --operation {} \
+        --classification <autonomous|manual|not-merged> --evidence <evidence.json>", shell_quote(operation))
+}
 
 /// Evidence for an escalation: identity, dispatch time and journal presence.
+/// Itemizes the oldest holds that fit the budget; the count always covers all.
 pub fn merge_escalation_detail(overdue: &[&UnresolvedMergeHold], now: i64) -> String {
-    let items: Vec<String> = overdue.iter().take(ITEMIZED).map(|h| {
+    let mut items: Vec<String> = Vec::new();
+    let mut used = 0;
+    for h in overdue {
         let at = chrono::DateTime::from_timestamp_millis(h.dispatched_at_ms)
             .map_or_else(|| h.dispatched_at_ms.to_string(), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        format!("operation {} for {}#{} head {} dispatched {at} ({} min unresolved, {})",
-            h.operation, h.repository, h.pr, h.head.chars().take(12).collect::<String>(),
+        let item = format!("operation {} for {}#{} head {} dispatched {at} ({} min unresolved, {})",
+            h.operation.chars().take(80).collect::<String>(), h.repository.chars().take(100).collect::<String>(),
+            h.pr, h.head.chars().take(12).collect::<String>(),
             now.saturating_sub(h.dispatched_at_ms) / 60_000,
-            if h.response_journaled { "response journaled without receipt" } else { "no response journaled" })
-    }).collect();
-    let more = overdue.len().saturating_sub(ITEMIZED);
+            if h.response_journaled { "response journaled without receipt" } else { "no response journaled" });
+        if !items.is_empty() && used + item.len() > DETAIL_BUDGET { break; }
+        used += item.len();
+        items.push(item);
+    }
+    let more = overdue.len().saturating_sub(items.len());
     format!("{} dispatched merge(s) unresolved for at least 15 minutes; their capacity stays held and they are not confirmed shipments: {}{}",
         overdue.len(), items.join("; "), if more > 0 { format!("; and {more} more") } else { String::new() })
+}
+
+/// One complete command (the oldest hold) and how to repeat it, plus the
+/// safety rule. Bounded regardless of how many holds are overdue.
+pub fn merge_escalation_fix(overdue: &[&UnresolvedMergeHold], store: Option<&std::path::Path>) -> String {
+    let command = overdue.first().map_or_else(String::new, |h| merge_resolution_command(&h.operation, store));
+    format!("Gather the remote PR state and merge-commit evidence, then resolve each listed operation, \
+        oldest first: `{command}` (repeat with each operation above). \
+        Never replay an uncertain mutation, release its capacity without proof, or reset the ledger.")
 }
 
 /// The UTC charging day rendered for a reader in `tz`, with its offset.
