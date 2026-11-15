@@ -5,6 +5,7 @@ Runtime configuration is owner-private operator state. No network device, host
 home, daemon environment or host process namespace is made available to jobs.
 """
 import gzip
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
@@ -28,6 +29,46 @@ MAX_OUTPUT = 8 * 1024 * 1024
 
 class Unavailable(ValueError):
     pass
+
+
+class CommandTimedOut(Unavailable):
+    """Controller deadline, distinct from guest-supplied failure text."""
+
+
+class ExecutionFailed(Unavailable):
+    """Controller observed a failed supervisor after verified cleanup."""
+
+
+class CleanupUnverified(Unavailable):
+    """Controller could not prove descendant cleanup after execution."""
+
+
+@contextmanager
+def command_directory(*, prefix, dir):
+    # No implicit finalizer: a missing cleanup proof must retain the resources
+    # a detached VM may still be using, including on exception unwinding.
+    directory = tempfile.mkdtemp(prefix=prefix, dir=dir)
+    retained = False
+    try:
+        yield directory
+    except CleanupUnverified:
+        retained = True
+        raise
+    finally:
+        if not retained:
+            shutil.rmtree(directory)
+
+
+def cleanup_verified(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+                    and not info.st_mode & 0o077 and info.st_size <= 64
+                    and stream.read(65) == b'all-descendants-reaped\n')
+    except OSError:
+        return False
 
 
 def private_json(path):
@@ -262,7 +303,7 @@ def validate_snapshot_links(workspace):
 
 
 def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
-        scratch_dir=None, build_cache=None, storage_lease=None, ci_context=None):
+        scratch_dir=None, build_cache=None, storage_lease=None, ci_context=None, cleanup_receipt=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit.
 
     `scratch_dir` holds the VM's private control files (default temp dir when
@@ -327,8 +368,18 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         for key in ('runner','contract'):
             if not isinstance(ci_context[key],bytes) or not 0<len(ci_context[key])<=2*1024*1024:
                 raise Unavailable('invalid controller CI bundle')
+    if cleanup_receipt is not None:
+        cleanup_receipt = Path(cleanup_receipt)
+        parent = cleanup_receipt.parent
+        info = parent.lstat()
+        if (not cleanup_receipt.is_absolute() or cleanup_receipt.name != 'cleanup-complete'
+                or parent.resolve() != parent or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid() or info.st_mode & 0o077
+                or parent == workspace or parent.is_relative_to(workspace)
+                or os.path.lexists(cleanup_receipt)):
+            raise Unavailable('cleanup receipt requires a fresh controller-private path')
     config = runtime.config
-    with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-', dir=scratch_dir) as temporary:
+    with command_directory(prefix='jarvis-build-vm-', dir=scratch_dir) as temporary:
         private = Path(temporary)
         control = private / 'control'; control.mkdir(mode=0o700)
         openssl = shutil.which('openssl', path=os.defpath)
@@ -415,7 +466,7 @@ poweroff -f
         command = qemu_command(config, image, shares, build_cache)
         host_environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
         supervisor = Path(__file__).with_name('provider-supervisor.py')
-        cleanup = private / 'cleanup-complete'
+        cleanup = private / 'cleanup-complete' if cleanup_receipt is None else cleanup_receipt
         broker = dependency_proxy.Broker(control)
         if storage_lease is not None:
             storage_lease.check()
@@ -432,15 +483,17 @@ poweroff -f
                         storage_lease.check()
                     remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
-                        raise Unavailable('VM command timed out')
+                        raise CommandTimedOut('VM command timed out')
                     broker.poll(remaining)
                     try:
                         status = process.wait(timeout=min(0.05, max(0.001, remaining)))
                         break
                     except subprocess.TimeoutExpired:
                         continue
-                if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
-                    raise Unavailable('VM execution or cleanup failed')
+                if not cleanup_verified(cleanup):
+                    raise CleanupUnverified('VM command cleanup could not be verified')
+                if status:
+                    raise ExecutionFailed('VM execution failed')
                 try:
                     result = private_json(control / 'outcome.json')
                 except (OSError, ValueError) as exc:
@@ -453,16 +506,18 @@ poweroff -f
                     raise Unavailable('invalid VM result')
                 return result
             finally:
-                if process.poll() is None:
-                    process.terminate()
-                    if storage_lease is not None:
-                        # The subreaper owns detached descendants. Killing it
-                        # on an arbitrary cleanup timeout could release storage
-                        # while QEMU still writes; retain admission until reaped.
-                        process.wait()
-                    else:
+                try:
+                    if process.poll() is None:
                         try:
-                            process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait()
+                            process.terminate()
+                        except ProcessLookupError:
+                            pass  # Exit raced the signal; still wait and require proof.
+                        # The subreaper owns detached descendants even without
+                        # an optional storage lease. Never skip its cleanup by
+                        # killing it on an arbitrary controller timeout.
+                        process.wait()
+                finally:
+                    # Signal/wait errors cannot bypass proof or delete live
+                    # resources. Valid proof retains the original error type.
+                    if not cleanup_verified(cleanup):
+                        raise CleanupUnverified('VM command cleanup could not be verified')

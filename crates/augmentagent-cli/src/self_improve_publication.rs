@@ -11,17 +11,30 @@ pub(super) struct Published {
 }
 
 #[async_trait::async_trait]
-trait Github {
+trait Github: Send {
     async fn call(&mut self, args: &[&str]) -> Result<String>;
+    async fn authorize_new_merge(&mut self,_repository:&str,_pr:u64)->Result<()> {
+        anyhow::bail!("new merge routing context unavailable")
+    }
 }
-struct Transport<'a>(&'a Path, &'a workflow::WorkflowGuard);
+struct Transport<'a> {
+    root:&'a Path,
+    guard:&'a workflow::WorkflowGuard,
+    issue:u64,
+    automatic:bool,
+}
 #[async_trait::async_trait]
 impl Github for Transport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<String> {
         if args.starts_with(&["pr", "create"]) {
-            self.1.validate_binding(self.1.binding()).await?;
+            self.guard.validate_binding(self.guard.binding()).await?;
+            if self.automatic && !manual_routing::issue_allowed(self.root,self.guard.repository(),self.issue).await {
+                return Err(manual_routing::Hold.into());
+            }
+            // Binding/routing reads may outlive an owner control change.
+            self.guard.validate_note_dispatch()?;
         }
-        let (ok, out, err) = run(&gh_bin(), args, self.0).await?;
+        let (ok, out, err) = run(&gh_bin(), args, self.root).await?;
         anyhow::ensure!(ok, "GitHub publication call failed: {err}");
         Ok(out)
     }
@@ -113,6 +126,81 @@ async fn create_or_reconcile(
 struct PendingPublication {
     repository:String,worktree:PathBuf,issue:u64,branch:String,head:String,
     contract:String,environment:String,args:Vec<String>,
+    #[serde(default="default_automatic_publication")]
+    automatic:bool,
+}
+// Older retained requests never acquire a manual-routing bypass on upgrade.
+fn default_automatic_publication()->bool {true}
+
+struct GitPushRead<'a> {root:&'a Path,accessible:std::collections::BTreeSet<String>}
+impl<'a> GitPushRead<'a> {
+    fn new(root:&'a Path)->Self {Self {root,accessible:std::collections::BTreeSet::new()}}
+    async fn head_at(&mut self,destination:&str,reference:&str)->Result<Option<String>> {
+        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?.to_ascii_lowercase();
+        let head=self.query(destination,reference).await?;
+        if head.is_some() {self.accessible.insert(repository);return Ok(head);}
+        // A 404 may hide an inaccessible private repository. A successful Git
+        // ref read, not generic repository metadata, establishes data access.
+        if !self.accessible.contains(&repository) {
+            anyhow::ensure!(reference!="refs/heads/main" && self.query(destination,"refs/heads/main").await?.is_some(),
+                "Git-data access unavailable; ref absence is not established");
+            self.accessible.insert(repository);
+        }
+        Ok(None)
+    }
+    async fn query(&self,destination:&str,reference:&str)->Result<Option<String>> {
+        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?;
+        let (owner,repository)=repository.split_once('/').context("network Push identity malformed")?;
+        let reference=reference.strip_prefix("refs/").context("Push reference malformed")?;
+        // Observe the verified destination through its authoritative GitHub
+        // identity. Reusing a resolved URL as a Git input could apply URL
+        // rewrites a second time and read a different transport destination.
+        let mut endpoint=reqwest::Url::parse("https://api.github.com/")?;
+        endpoint.path_segments_mut().map_err(|_|anyhow::anyhow!("Push endpoint unavailable"))?
+            .extend(["repos",owner,repository,"git","ref"]).extend(reference.split('/'));
+        let (ok,raw,_)=run(&gh_bin(),&["api",endpoint.as_str(),"--include","--jq",".object.sha"],self.root).await?;
+        observed_push_head(ok,&raw)
+    }
+}
+// HTTP decoding only. A 404 becomes ref absence only after head_at proves
+// Git-data access; transport/rate-limit failures stop the bounded batch.
+fn observed_push_head(ok:bool,raw:&str)->Result<Option<String>> {
+    anyhow::ensure!(raw.len()<=32768,"Push observation response exceeds bound");
+    let (headers,body)=raw.split_once("\r\n\r\n").or_else(||raw.split_once("\n\n"))
+        .context("Push observation response malformed")?;
+    let mut lines=headers.lines();
+    let status=lines.next().context("Push observation status missing")?;
+    let mut status=status.split_whitespace();
+    anyhow::ensure!(matches!(status.next(),Some("HTTP/1.0"|"HTTP/1.1"|"HTTP/2.0"|"HTTP/2")),"Push observation protocol malformed");
+    let code=status.next().context("Push observation code missing")?;
+    anyhow::ensure!(!lines.any(|line|line.starts_with("HTTP/")),"Push observation status ambiguous");
+    if code=="404" {return Ok(None);}
+    anyhow::ensure!(ok && code=="200","Push destination observation unavailable");
+    let head=body.trim();
+    anyhow::ensure!(matches!(head.len(),40|64) && head.bytes().all(|byte|byte.is_ascii_hexdigit()),"Push observation head malformed");
+    Ok(Some(head.to_owned()))
+}
+pub(super) async fn read_bound_push_head(root:&Path,destination:&str,reference:&str)->Result<Option<String>> {
+    GitPushRead::new(root).head_at(destination,reference).await
+}
+fn verified_push_destination<'a>(repository:&str,destinations:&'a [String])->Option<&'a str> {
+    let [destination]=destinations else {return None};
+    // Reuse the strict existing GitHub URL grammar; its local-mirror
+    // alternative supplies no network repository identity here.
+    let identity=crate::wiki_sync_remote(destination).ok().flatten()?;
+    identity.eq_ignore_ascii_case(repository).then_some(destination.as_str())
+}
+
+/// The fresh pipeline calls this before its linked-PR dedup return.
+pub(super) async fn claimed_after_reconcile(repo:&Path,issue:u64,dry_run:bool)->Result<bool> {
+    // Only observe already-dispatched pushes here. This early dedup boundary
+    // does not gain authority to create another PR for a different workflow.
+    if !dry_run && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?.is_some() {
+        let repository=workflow::canonical_repository(repo).await?;
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+        observe_pushes(repo,&repository,&mut store).await?;
+    }
+    has_open_agent_pr(repo,issue).await
 }
 
 /// This lane spends no model calls and runs independently of builder capacity.
@@ -120,9 +208,37 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     if dry_run { return Ok(()); }
     let repository=workflow::canonical_repository(repo).await?;
     let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    observe_pushes(repo,&repository,&mut store).await?;
     for (id,raw) in store.pending_publications(&repository)? {
         if let Err(error)=reconcile_one(repo,&repository,&mut store,&id,&raw).await {
             warn!(workflow=%id,"pending publication reconciliation deferred: {error:#}");
+        }
+    }
+    Ok(())
+}
+async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore)->Result<()> {
+    observe_pushes_with(repo,repository,store,&mut GitPushRead::new(repo)).await
+}
+#[async_trait::async_trait]
+trait PushReader {
+    async fn read(&mut self,destination:&str,reference:&str)->Result<Option<String>>;
+}
+#[async_trait::async_trait]
+impl PushReader for GitPushRead<'_> {
+    async fn read(&mut self,destination:&str,reference:&str)->Result<Option<String>> {self.head_at(destination,reference).await}
+}
+async fn observe_pushes_with(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore,reader:&mut impl PushReader)->Result<()> {
+    let pending=store.pending_push_observations(repository,chrono::Utc::now().timestamp_millis(),32)?;
+    for pending in pending {
+        let destinations=[pending.destination().to_owned()];
+        let Some(destination)=verified_push_destination(repository,&destinations) else {continue};
+        let reference=pending.reference();
+        let (valid,_,_)=run("git",&["check-ref-format",&reference],repo).await?;
+        if !valid {continue;}
+        let head=match reader.read(destination,&reference).await {Ok(Some(head))=>head,Ok(None)=>continue,Err(_)=>{store.defer_push_observation_after(&pending)?;break}};
+        if head!=pending.head() {continue;}
+        if store.observe_idle_push(&pending,&head,chrono::Utc::now().timestamp_millis())? {
+            info!(workflow=%pending.workflow(),"observed prior Push without dispatching or claiming a work turn");
         }
     }
     Ok(())
@@ -146,8 +262,12 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
             guard.transition(crate::autoship_workflow::Stage::Reconcile,"pending_publication_candidate_changed","reverify_candidate",now).await?;
             guard.finish()?;return Ok(());
         }
+        if guard.pending_operations()?.iter().any(|operation|operation.kind==OperationKind::Push) {
+            if !store.retryable_bound_push(&id)? {guard.finish()?;return Ok(());}
+            guard.push_fresh(repo,&request.branch,request.automatic).await?;
+        }
         let result=publish(&guard,&request.worktree,&request.branch,&request.head,request.issue,
-            &request.args.iter().map(String::as_str).collect::<Vec<_>>()).await;
+            &request.args.iter().map(String::as_str).collect::<Vec<_>>(),request.automatic).await;
         match result {
             Ok(pr)=> {
                 let verdict=store.current_reviews(&id)?.into_iter().filter(|review|review.approved)
@@ -157,6 +277,10 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
             }
             Err(error)=> {
                 if linked_claims::report(&error).is_some() {guard.finish()?;return Ok(());}
+                if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                    guard.transition(crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",now+300_000).await?;
+                    guard.finish()?;return Ok(());
+                }
                 guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",now+60_000).await?;
                 warn!(workflow=%id,"publication reconciliation deferred: {error:#}");
             }
@@ -205,6 +329,7 @@ pub(super) async fn publish(
     head: &str,
     issue:u64,
     args: &[&str],
+    automatic:bool,
 ) -> Result<Published> {
     anyhow::ensure!(
         head == guard.binding().head,
@@ -213,7 +338,7 @@ pub(super) async fn publish(
     let (repository,retained,contract,environment)=guard.publication_inputs();
     anyhow::ensure!(retained==worktree,"publication worktree differs from workflow");
     guard.save_publication(&serde_json::to_string(&PendingPublication {repository:repository.into(),worktree:worktree.into(),issue,
-        branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),args:args.iter().map(|v|(*v).into()).collect()})?)?;
+        branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),automatic,args:args.iter().map(|v|(*v).into()).collect()})?)?;
     let operation = guard.intent(OperationKind::CreatePr)?;
     guard.validate_binding(guard.binding()).await?;
     // Direct identity survives the crash window after observe_remote commits
@@ -223,15 +348,15 @@ pub(super) async fn publish(
         .or_else(||operation.receipt.as_deref().and_then(|receipt|receipt.strip_prefix("github-pr:"))
             .and_then(|number|number.parse::<u64>().ok()).filter(|number|*number>0));
     let result = if let Some(number)=known {
-        direct_publication(&mut Transport(worktree,guard),number,branch,head).await?
+        direct_publication(&mut Transport {root:worktree,guard,issue,automatic},number,branch,head).await?
     } else if operation.receipt.is_some() {
         // A completed identity can never create another PR, even if it was
         // subsequently closed or its head changed.
-        find(&mut Transport(worktree, guard), branch, head)
+        find(&mut Transport {root:worktree,guard,issue,automatic}, branch, head)
             .await?
             .context("published workflow needs PR reconciliation; refusing duplicate creation")?
     } else {
-        let mut github=Transport(worktree,guard);
+        let mut github=Transport {root:worktree,guard,issue,automatic};
         if let Some(found)=find(&mut github,branch,head).await? {
             found
         } else {
@@ -291,12 +416,22 @@ pub(super) struct MergeMutationReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_message: Option<String>,
 }
-struct MergeTransport<'a>(&'a Path);
+struct MergeTransport<'a> {
+    root:&'a Path,
+    routing:Option<MergeRouting>,
+}
 #[async_trait::async_trait]
 impl Github for MergeTransport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<String> {
-        let (ok, out, error) = run(&gh_bin(), args, self.0).await?;
+        let (ok, out, error) = run(&gh_bin(), args, self.root).await?;
         merge_transport_output(ok, out, &error, args.starts_with(&["api", "graphql"]))
+    }
+    async fn authorize_new_merge(&mut self,repository:&str,pr:u64)->Result<()> {
+        let routing=self.routing.context("observation-only merge transport cannot dispatch")?;
+        if routing.automatic && !manual_routing::allowed(self.root,repository,pr,routing.source_issue).await {
+            return Err(manual_routing::Hold.into());
+        }
+        Ok(())
     }
 }
 fn merge_transport_output(ok: bool, out: String, error: &str, graphql: bool) -> Result<String> {
@@ -560,7 +695,7 @@ pub(super) async fn reconcile_merge_dispatches(root: &Path, dry_run: bool) -> Re
     if dry_run || !workflow::path().exists() { return Ok(0); }
     let repository = workflow::canonical_repository(root).await?;
     let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
-    reconcile_merge_records(&mut MergeTransport(root), &mut store, &repository).await
+    reconcile_merge_records(&mut MergeTransport {root,routing:None}, &mut store, &repository).await
 }
 
 /// Recover only this command's durable dispatches. No mutation or open-PR
@@ -569,7 +704,7 @@ pub(super) async fn reconcile_command_merge(root: &Path, repository: &str, id: &
     // The command already authenticated and checked this canonical repository.
     // Each proof read below remains bounded by the shared recovery deadline.
     let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
-    reconcile_merge_records_selected(&mut MergeTransport(root), &mut store, repository, Some(id)).await
+    reconcile_merge_records_selected(&mut MergeTransport {root,routing:None}, &mut store, repository, Some(id)).await
 }
 
 async fn merge_mutation(
@@ -635,6 +770,16 @@ async fn merge_mutation(
         .context("missing PR node identity")?;
     require_direct_merge_protocol(github, repository).await?;
     require_strict_integration(github, repository).await?;
+    // Only a new dispatch needs current routing. Existing dispatched effects
+    // above remain observation/recovery, even after an owner changes labels.
+    if let Err(error)=github.authorize_new_merge(repository,pr).await {
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {
+            store.cancel_unused_merge(lease,operation,chrono::Utc::now().timestamp_millis())?;
+        }
+        return Err(error);
+    }
+    // The following synchronous transactions recheck owner controls and lease
+    // after the last remote routing read, before reserving or dispatching.
     store.reserve_merge(lease, operation, repository, pr, node, chrono::Utc::now().timestamp_millis(), cap)?;
     let marker = store.dispatch_marked_merge(lease, operation, chrono::Utc::now().timestamp_millis(), cap)?;
     let query="mutation AutoshipMerge($id:ID!,$head:GitObjectID!,$request:String!,$body:String!){mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:SQUASH,clientMutationId:$request,commitBody:$body}){clientMutationId pullRequest{id number state headRefOid mergedAt mergeCommit{oid message} mergedBy{login}}}}";
@@ -664,6 +809,12 @@ async fn merge_mutation(
     Ok(Some(receipt))
 }
 
+#[derive(Clone,Copy)]
+pub(super) struct MergeRouting {
+    pub automatic:bool,
+    pub source_issue:Option<u64>,
+}
+
 pub(super) async fn merge_exact(
     root: &Path,
     repository: &str,
@@ -671,6 +822,7 @@ pub(super) async fn merge_exact(
     head: &str,
     operation: &crate::autoship_workflow::Operation,
     lease: &crate::autoship_workflow::Lease,
+    routing:MergeRouting,
 ) -> Result<Option<MergeMutationReceipt>> {
     anyhow::ensure!(
         operation.kind == OperationKind::MergePr && operation.binding.head == head,
@@ -678,7 +830,7 @@ pub(super) async fn merge_exact(
     );
     let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     merge_mutation(
-        &mut MergeTransport(root),
+        &mut MergeTransport {root,routing:Some(routing)},
         repository,
         pr,
         head,
@@ -714,6 +866,79 @@ pub(super) async fn merged_exact(root: &Path, number: u64, head: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_publication_requests_do_not_gain_explicit_routing() {
+        let raw=serde_json::json!({"repository":"owner/repo","worktree":"/synthetic/worktree","issue":7,
+            "branch":"fixture","head":"a".repeat(40),"contract":"original request","environment":"fixture","args":[]});
+        let automatic:super::PendingPublication=serde_json::from_value(raw.clone()).unwrap();
+        assert!(automatic.automatic,"upgrade gave an old request a routing bypass");
+        let mut explicit=raw;explicit["automatic"]=false.into();
+        let explicit:super::PendingPublication=serde_json::from_value(explicit).unwrap();
+        assert!(!serde_json::from_str::<super::PendingPublication>(&serde_json::to_string(&explicit).unwrap()).unwrap().automatic);
+    }
+
+    #[tokio::test]
+    async fn failed_first_push_read_does_not_starve_later_effect_or_fan_out() {
+        use crate::autoship_workflow::{WorkflowStore,Binding,ResourceCharge};
+        struct Reader {calls:Vec<String>}
+        #[async_trait::async_trait]
+        impl super::PushReader for Reader {
+            async fn read(&mut self,_:&str,reference:&str)->anyhow::Result<Option<String>> {
+                self.calls.push(reference.into());
+                if reference=="refs/heads/first" {anyhow::bail!("HTTP 503 fixture");}
+                Ok(Some("a".repeat(40)))
+            }
+        }
+        let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+        let mut snapshots=Vec::new();
+        for (issue,branch) in [(1,"first"),(2,"second")] {
+            let id=format!("owner/repo#{issue}");store.register(&id,branch,binding.clone(),1).unwrap();
+            let lease=store.claim(&id,"original",2,100).unwrap().unwrap();
+            store.charge(&lease,"original-work",ResourceCharge {model_calls:4,tokens:123,wall_ms:700},3).unwrap();
+            store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git",&format!("refs/heads/{branch}"),issue+4).unwrap();
+            store.release(&lease,10).unwrap();snapshots.push((id.clone(),store.snapshot(&id).unwrap()));
+        }
+        let mut reader=Reader {calls:Vec::new()};
+        super::observe_pushes_with(root.path(),"owner/repo",&mut store,&mut reader).await.unwrap();
+        assert_eq!(reader.calls,vec!["refs/heads/first"],"outage must stop this batch");
+        super::observe_pushes_with(root.path(),"owner/repo",&mut store,&mut reader).await.unwrap();
+        assert!(store.pending_operations("owner/repo#2").unwrap().is_empty(),"failed first read permanently starved the later observable effect");
+        assert_eq!(store.pending_operations("owner/repo#1").unwrap().len(),1,"failed read fabricated a receipt");
+        for (id,before) in snapshots {assert_eq!(store.snapshot(&id).unwrap(),before,"observation claimed work or changed original charges");}
+    }
+
+    #[test]
+    fn push_observation_distinguishes_absent_refs_from_service_failures() {
+        let head="a".repeat(40);
+        for separator in ["\n","\r\n"] {
+            let raw=format!("HTTP/2.0 200 OK{separator}Content-Type: application/json{separator}{separator}{head}\n");
+            assert_eq!(super::observed_push_head(true,&raw).unwrap(),Some(head.clone()));
+        }
+        assert_eq!(super::observed_push_head(false,"HTTP/2.0 404 Not Found\nContent-Type: application/json\n\n{}").unwrap(),None);
+        for (ok,raw) in [
+            (false,format!("HTTP/2.0 200 OK\n\n{head}")),
+            (false,"HTTP/2.0 429 Too Many Requests\n\n{}".into()),
+            (false,"HTTP/2.0 503 Unavailable\n\n{}".into()),
+            (false,"transport failed".into()),
+            (true,format!("HTTP/2.0 200 OK\nHTTP/2.0 404 Not Found\n\n{head}")),
+            (true,format!("UNKNOWN 200 OK\n\n{head}")),
+            (true,"HTTP/2.0 200 OK\n\nnot-a-head".into()),
+        ] {assert!(super::observed_push_head(ok,&raw).is_err());}
+    }
+
+    #[test]
+    fn push_destination_binds_the_protected_network_repository_without_using_fetch_identity() {
+        for url in ["https://github.com/owner/repo.git","git@github.com:owner/repo.git","ssh://git@github.com/owner/repo.git"] {
+            assert_eq!(super::verified_push_destination("OWNER/REPO",&[url.into()]),Some(url));
+        }
+        for url in ["https://github.com/owner/other.git","https://example.org/owner/repo.git","https://token@github.com/owner/repo.git","http://github.com/owner/repo.git","/tmp/repo.git","file:///tmp/repo.git","owner/repo","https://github.com/owner/repo.git?x"] { // pii-ok: synthetic rejected credential URL; no real credential.
+            assert!(super::verified_push_destination("owner/repo",&[url.into()]).is_none(),"unsupported/unbound destination accepted");
+        }
+        assert!(super::verified_push_destination("owner/repo",&[]).is_none());
+        assert!(super::verified_push_destination("owner/repo",&["https://github.com/owner/repo.git".into(),"https://github.com/owner/other.git".into()]).is_none());
+    }
+
     use super::*;
     use std::collections::VecDeque;
 
@@ -742,6 +967,12 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Github for MergeFake {
+        async fn authorize_new_merge(&mut self,_repository:&str,_pr:u64)->Result<()> {
+            anyhow::ensure!(self.calls.iter().any(|call|call.get(1).is_some_and(|arg|
+                arg.ends_with("/rules/branches/main") || arg.ends_with("/branches/main/protection"))),
+                "read-only recovery must not request new merge authorization");
+            Ok(())
+        }
         async fn call(&mut self, args: &[&str]) -> Result<String> {
             self.calls
                 .push(args.iter().map(|s| s.to_string()).collect());
@@ -1114,6 +1345,7 @@ import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_PENDING_PUBLICATION_FIXTURE']);a=sys.argv[1:]
 if a[:2]==['repo','view']: print('owner/repo')
 elif a[:2]==['issue','view']: print(json.dumps({'state':'OPEN'}))
+elif a[:1]==['api'] and a[1].endswith('/issues/1'): print(json.dumps(dict(number=1,state='open',labels=[])))
 elif a[:1]==['api']: print(json.dumps({'object':{'sha':(root/'head').read_text()}}))
 elif a[:2]==['pr','view']:
     if not (root/'visible').exists():sys.exit(1)
@@ -1156,7 +1388,7 @@ else:sys.exit(2)
         assert!(run("git",&["worktree","add","-b","agent-fix/issue-1",worktree.to_str().unwrap(),&head],&repo).await.unwrap().0);
         let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&worktree,repository:"owner/repo",source_issue:Some(1),pr:None,branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
         guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid builder admission.
-        assert!(publish(&guard,&worktree,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"]).await.is_err());
+        assert!(publish(&guard,&worktree,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"],true).await.is_err());
         guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",0).await.unwrap();
         let pending=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap().pending_publications("owner/repo").unwrap().into_iter().next().unwrap().1;
         let id=guard.id().to_owned();guard.finish().unwrap();

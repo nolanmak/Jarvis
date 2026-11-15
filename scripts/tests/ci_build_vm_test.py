@@ -224,7 +224,7 @@ class BuildVMExtensionTests(unittest.TestCase):
    class Process:
     pid=999999
     def __init__(self,argv,**kwargs):
-     self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
+     self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n');cleanup.chmod(0o600)
      result=cleanup.parent/'control/outcome.json';result.write_text('{"exit_code":0,"stdout":"finished","stderr":""}');result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
