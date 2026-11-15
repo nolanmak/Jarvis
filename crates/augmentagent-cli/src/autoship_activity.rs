@@ -174,6 +174,7 @@ pub(super) fn project(
             | "claimed"
             | "released"
             | "activity_policy_configured"
+            | "guarded_step_completed"
     ) {
         return Ok(());
     }
@@ -191,7 +192,7 @@ pub(super) fn project(
     let previous = read(tx, workflow)?;
     // Do not invent a fresh healthy clock for a legacy workflow from a new
     // heartbeat or repeat checkpoint. A fresh registration/gate is required.
-    if previous.is_none() && !matches!(kind, "registered" | "verification_gate_passed") {
+    if previous.is_none() && !matches!(kind, "registered" | "verification_gate_passed" | "guarded_step_completed") {
         return Ok(());
     }
     let mut state = previous.clone().unwrap_or_else(|| Activity {
@@ -228,6 +229,9 @@ pub(super) fn project(
         // Native entry point already checked the current lease and binding.
         // Its canonical payload is domain+binding, without timestamps/nonces.
         tx.execute("INSERT OR IGNORE INTO workflow_activity_progress(workflow,kind,semantic_key) VALUES(?1,?2,?3)", params![workflow,kind,payload])? == 1
+    } else if kind == "guarded_step_completed" {
+        let key=super::guarded_progress::event_key(payload)?;
+        tx.execute("INSERT OR IGNORE INTO workflow_activity_progress(workflow,kind,semantic_key) VALUES(?1,?2,?3)", params![workflow,kind,key])? == 1
     } else {
         false
     };
@@ -263,13 +267,15 @@ pub(super) fn project(
         state.next_observation_at = None;
     }
     // Duplicate gate observations must not mutate status, including reason/time.
-    if kind == "verification_gate_passed" && !meaningful {
+    if matches!(kind, "verification_gate_passed" | "guarded_step_completed") && !meaningful {
         return Ok(());
     }
     state.reason_code = if paused {
         "owner_paused".into()
     } else if !owned && !dependency_wait {
         "awaiting_worker_claim".into()
+    } else if meaningful && !waiting {
+        kind.into()
     } else {
         checkpoint.next.reason.clone()
     };
@@ -781,4 +787,9 @@ mod tests {
         assert_eq!(activity.inactivity_deadline_at, Some(START + 2 + 3_600_000));
         assert_eq!(activity.last_meaningful_progress_at, 0);
     }
+    #[cfg(target_os = "linux")]
+    mod guarded_steps {
+        include!("autoship_guarded_progress_tests.rs");
+    }
+
 }

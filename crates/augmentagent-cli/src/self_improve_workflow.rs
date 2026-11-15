@@ -1,6 +1,8 @@
 //! Production bridge between the autoship lanes and durable workflow state.
 //! Included beneath self_improve so Git commands use the same sanitized runner.
 use super::*;
+#[path = "self_improve_stage_activity.rs"]
+mod stage_activity;
 use crate::autoship_workflow::{
     self as durable, Binding, Checkpoint, Lease, NextAction, Operation, OperationKind,
     ResourceCharge, Review, Stage, WorkflowStore,
