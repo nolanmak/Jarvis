@@ -100,6 +100,8 @@ pub(crate) mod targeted;
 mod acceptance;
 #[path = "self_improve_alignment.rs"]
 mod alignment;
+#[path = "self_improve_push_destination.rs"]
+mod push_destination;
 #[path = "self_improve_publication.rs"]
 mod publication;
 #[path = "self_improve_review.rs"]
@@ -620,17 +622,13 @@ fn configured_ccat_public_push_for(args: &[&str], enabled: bool, remotes: &str) 
 
 fn require_ccat_pre_push_hook(cwd: &Path) -> std::result::Result<(), String> {
     let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(cwd)
-        .output()
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"])
+        .current_dir(cwd).output()
         .map_err(|_| "CCat public push refused: Git metadata is unavailable".to_string())?;
     if !output.status.success() {
         return Err("CCat public push refused: Git metadata is unavailable".into());
     }
-    let common = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let common = Path::new(&common);
-    let common = if common.is_absolute() { common.to_path_buf() } else { cwd.join(common) };
-    let hook = common.join("hooks/pre-push");
+    let hook=PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     let body = std::fs::read_to_string(&hook)
         .map_err(|_| "CCat public push refused: install the CCat pre-push hook first".to_string())?;
     if !body.contains("ccat-public-push-gate.sh") {

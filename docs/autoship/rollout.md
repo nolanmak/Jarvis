@@ -373,3 +373,25 @@ a completed Push stays observable after a pause even though its next note is
 refused. The fresh CodeRabbit observation uses the same note control boundary.
 An unresolved PR number holds for reconciliation without writing by branch
 selector. Optional comment timeouts/failures remain advisory after authorization.
+
+A bound Push intent now retains its effective Git destination and original ref
+atomically with the operation. Recovery reads that original pair even after
+remote configuration or workflow branch metadata changes. It never relabels an
+unknown legacy pending Push; completed legacy evidence remains historical.
+Destination/ref metadata participates in the immutable operation identity and
+is rechecked when recording a positive observation.
+
+The actual Git transport still uses origin. A private pre-push wrapper rejects
+any different resolved destination, then executes the original pre-push hook
+with unchanged arguments/stdin and the parent's Git configuration. Before
+a new Git dispatch, required CCAT validation checks the configured hook before
+creating its intent. Network
+observations use the verified GitHub Git-data API; local repository observations
+read Git metadata directly, avoiding a second URL rewrite. Empty or multiple
+push destinations are configuration holds, not uncertain new operations.
+
+A ref404 alone does not establish absence. Within each bounded observation
+batch, a successful Git-ref read from the same repository establishes Git-data
+access; otherwise the controller requires a valid main-ref observation. An
+inaccessible main ref, service error or rate limit stops the batch and preserves
+all effects. An authorized absent ref still yields to later observable pushes.

@@ -731,6 +731,8 @@ impl WorkflowStore {
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_mutation_receipt (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), receipt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS push_dispatch_destination (
+                operation TEXT PRIMARY KEY REFERENCES operation(id), destination TEXT NOT NULL, reference TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_allowance_dispatch (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), repository TEXT NOT NULL,
                 pr INTEGER NOT NULL, pr_node_id TEXT NOT NULL, head TEXT NOT NULL,

@@ -2,16 +2,54 @@
 //! dispatching a command, changing its binding or granting another operation.
 use super::*;
 
+fn destination_identity(workflow:&str,binding:&Binding,destination:&str,reference:&str)->Result<String> {
+    Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&("bound-push-v1",workflow,OperationKind::Push,binding,destination,reference))?)))
+}
+
 /// Protected idle snapshot, not serializable input or an execution grant.
 pub(crate) struct PendingPush {
-    workflow:String,branch:String,generation:i64,operation:String,binding:Binding,
+    workflow:String,branch:String,generation:i64,operation:String,binding:Binding,destination:String,reference:String,
 }
 impl PendingPush {
     pub(crate) fn workflow(&self)->&str {&self.workflow}
-    pub(crate) fn branch(&self)->&str {&self.branch}
     pub(crate) fn head(&self)->&str {&self.binding.head}
+    pub(crate) fn destination(&self)->&str {&self.destination}
+    pub(crate) fn reference(&self)->&str {&self.reference}
 }
 impl WorkflowStore {
+    /// The exact dispatch destination is immutable evidence, committed with
+    /// the intent. Unknown earlier Push effects cannot be relabelled or evaded.
+    pub(crate) fn begin_bound_push(&mut self,lease:&Lease,binding:&Binding,destination:&str,reference:&str,now:i64)->Result<Operation> {
+        ensure!(!destination.is_empty() && destination.len()<=16384
+            && !destination.bytes().any(|b|b.is_ascii_control()),"invalid Push destination envelope");
+        ensure!(reference.starts_with("refs/heads/") && reference.len()>11 && reference.len()<=2048
+            && !reference.bytes().any(|b|b.is_ascii_control()),"invalid Push reference envelope");
+        let kind=OperationKind::Push;
+        let id=destination_identity(&lease.workflow,binding,destination,reference)?;
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let branch:String=tx.query_row("SELECT branch FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+        ensure!(reference==format!("refs/heads/{branch}"),"Push reference differs from current workflow branch");
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
+        let other:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND kind=?2 AND receipt IS NULL AND id<>?3)",
+            params![lease.workflow,serde_json::to_string(&kind)?,id],|r|r.get(0))?;
+        ensure!(!other,"original uncertain Push must be reconciled before another destination or binding");
+        let inserted=tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
+            params![id,lease.workflow,serde_json::to_string(&kind)?,serde_json::to_string(binding)?,now])?;
+        if inserted==1 {
+            tx.execute("INSERT INTO push_dispatch_destination(operation,destination,reference) VALUES(?1,?2,?3)",params![id,destination,reference])?;
+        }else {
+            let original:Option<(String,String)>=tx.query_row("SELECT destination,reference FROM push_dispatch_destination WHERE operation=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            ensure!(original.as_ref().is_some_and(|(url,refname)|url==destination && refname==reference),"Push destination evidence missing or changed");
+        }
+        let (receipt,original):(Option<String>,String)=tx.query_row("SELECT receipt,binding FROM operation WHERE id=?1 AND workflow=?2",params![id,lease.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let original:Binding=serde_json::from_str(&original)?;
+        ensure!(original==*binding,"Push binding changed");
+        tx.commit()?;
+        Ok(Operation {id,workflow:lease.workflow.clone(),kind,binding:original,receipt})
+    }
+
     pub(crate) fn pending_push_observations(&mut self,repository:&str,now:i64,limit:usize)->Result<Vec<PendingPush>> {
         ensure!((1..=64).contains(&limit),"pending Push observation batch exceeds bound");
         let repository=repository.to_ascii_lowercase();workflow_id(&repository,1)?;
@@ -21,29 +59,31 @@ impl WorkflowStore {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS pending_push_observation_cursor(repository TEXT PRIMARY KEY,created_at INTEGER NOT NULL,operation TEXT NOT NULL);")?;
         let after:Option<(i64,String)>=tx.query_row("SELECT created_at,operation FROM pending_push_observation_cursor WHERE repository=?1",[&repository],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
         let (after_time,after_id)=after.unwrap_or((i64::MIN,String::new()));
-        let mut statement=tx.prepare("SELECT w.id,w.branch,w.generation,w.checkpoint,o.id,o.binding,o.created_at FROM workflow w JOIN operation o ON o.workflow=w.id
+        let mut statement=tx.prepare("SELECT w.id,w.branch,w.generation,w.checkpoint,o.id,o.binding,o.created_at,d.destination,d.reference FROM workflow w JOIN operation o ON o.workflow=w.id LEFT JOIN push_dispatch_destination d ON d.operation=o.id
             WHERE o.kind=?1 AND o.receipt IS NULL AND w.lease_until<=?2
             AND (instr(w.id,?3||'#')=1 OR instr(w.id,?3||'/pr/')=1)
             ORDER BY CASE WHEN o.created_at>?4 OR (o.created_at=?4 AND o.id>?5) THEN 0 ELSE 1 END,o.created_at,o.id LIMIT ?6")?;
         let rows=statement.query_map(params![serde_json::to_string(&OperationKind::Push)?,now,repository,after_time,after_id,limit as i64],|row|
-            Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?)))?
+            Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,Option<String>>(8)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        if let Some((_,_,_,_,operation,_,created))=rows.last() {
+        if let Some((_,_,_,_,operation,_,created,_,_))=rows.last() {
             tx.execute("INSERT INTO pending_push_observation_cursor(repository,created_at,operation) VALUES(?1,?2,?3)
                 ON CONFLICT(repository) DO UPDATE SET created_at=excluded.created_at,operation=excluded.operation",params![repository,created,operation])?;
         }
         let mut result=Vec::new();
-        for (workflow,branch,generation,checkpoint,operation,binding,_) in rows {
+        for (workflow,branch,generation,checkpoint,operation,binding,_,destination,reference) in rows {
+            let (Some(destination),Some(reference))=(destination,reference) else {continue};
             let (Ok(checkpoint),Ok(binding))=(serde_json::from_str::<Checkpoint>(&checkpoint),serde_json::from_str::<Binding>(&binding)) else {
                 tracing::warn!(workflow,"pending Push metadata unavailable; original effect retained");continue;
             };
+            if destination_identity(&workflow,&binding,&destination,&reference)?!=operation {continue;}
             if binding.validate().is_err() || checkpoint.binding!=binding || matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {continue;}
             let controls=owner_control::read(&tx,&workflow);
             let inbox=owner_inbox::pending(&tx,&workflow);
             let (Ok(controls),Ok(inbox))=(controls,inbox) else {continue;};
             if controls.is_some_and(|control|control.paused) || inbox>0 {continue;}
-            result.push(PendingPush {workflow,branch,generation,operation,binding});
+            result.push(PendingPush {workflow,branch,generation,operation,binding,destination,reference});
         }
         tx.commit()?;Ok(result)
     }
@@ -53,7 +93,7 @@ impl WorkflowStore {
     /// active lease, branch, binding or owner control. No turn is claimed and
     /// no original attempt, charge, checkpoint or uncertain peer effect changes.
     pub(crate) fn observe_idle_push(&mut self,pending:&PendingPush,remote_head:&str,now:i64)->Result<bool> {
-        if remote_head!=pending.binding.head {return Ok(false);}
+        if remote_head!=pending.binding.head || destination_identity(&pending.workflow,&pending.binding,&pending.destination,&pending.reference)?!=pending.operation {return Ok(false);}
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current:Option<(String,i64,i64,String)>=tx.query_row("SELECT branch,generation,lease_until,checkpoint FROM workflow WHERE id=?1",[&pending.workflow],|row|
             Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
@@ -63,8 +103,8 @@ impl WorkflowStore {
             || matches!(checkpoint.stage,Stage::Merged|Stage::Retired)
             || owner_control::read(&tx,&pending.workflow)?.is_some_and(|control|control.paused)
             || owner_inbox::pending(&tx,&pending.workflow)?>0 {return Ok(false);}
-        let operation:Option<(String,String,Option<String>)>=tx.query_row("SELECT kind,binding,receipt FROM operation WHERE id=?1 AND workflow=?2",
-            params![pending.operation,pending.workflow],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        let operation:Option<(String,String,Option<String>)>=tx.query_row("SELECT o.kind,o.binding,o.receipt FROM operation o JOIN push_dispatch_destination d ON d.operation=o.id WHERE o.id=?1 AND o.workflow=?2 AND d.destination=?3 AND d.reference=?4",
+            params![pending.operation,pending.workflow,pending.destination,pending.reference],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
         let Some((kind,binding,receipt))=operation else {return Ok(false)};
         if serde_json::from_str::<OperationKind>(&kind)?!=OperationKind::Push || serde_json::from_str::<Binding>(&binding)?!=pending.binding || receipt.is_some() {return Ok(false);}
         tx.execute("UPDATE operation SET receipt=?2 WHERE id=?1 AND receipt IS NULL",params![pending.operation,format!("git-head:{remote_head}")])?;
@@ -77,6 +117,33 @@ impl WorkflowStore {
 mod tests {
     use super::*;
     #[test]
+    fn destination_and_intent_publish_atomically_and_preserve_unknown_legacy_effects() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id="owner/repo#7";let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(id,"fixture",binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,100).unwrap().unwrap();
+        let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER refuse_destination BEFORE INSERT ON push_dispatch_destination BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
+        assert!(store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/fixture",3).is_err());
+        assert!(store.pending_operations(id).unwrap().is_empty(),"failed destination publication left an unbound new Push");
+        assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
+        store.conn.execute_batch("DROP TRIGGER refuse_destination;").unwrap();
+        let original=store.begin_operation(&lease,OperationKind::Push,&binding,3).unwrap();
+        assert!(store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/fixture",4).is_err(),"unknown legacy Push was evaded by another intent");
+        assert_eq!(store.pending_operations(id).unwrap().len(),1);
+        store.complete_operation(&lease,&original.id,"git-head:legacy",5).unwrap();
+        let bound=store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/fixture",6).unwrap();
+        assert_ne!(bound.id,original.id,"completed legacy evidence was relabelled");
+        assert_eq!(store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/fixture",7).unwrap().id,bound.id);
+        assert!(store.begin_bound_push(&lease,&binding,"https://github.com/owner/other.git","refs/heads/fixture",8).is_err());
+        store.release(&lease,9).unwrap();
+        let observations=store.pending_push_observations("owner/repo",10,32).unwrap();
+        assert_eq!(observations.len(),1);assert_eq!(observations[0].destination(),"https://github.com/owner/repo.git");
+        assert_eq!(store.conn.query_row("SELECT receipt FROM operation WHERE id=?1",[original.id],|r|r.get::<_,String>(0)).unwrap(),"git-head:legacy");
+        store.conn.execute("UPDATE push_dispatch_destination SET destination=?2 WHERE operation=?1",params![bound.id,"https://github.com/owner/other.git"]).unwrap();
+        assert!(store.pending_push_observations("owner/repo",11,32).unwrap().is_empty(),"changed destination no longer matches its immutable operation identity");
+    }
+
+    #[test]
     fn bounded_observation_advances_past_retained_rows_without_claiming_work() {
         for paused in [true,false] {
             let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
@@ -85,7 +152,7 @@ mod tests {
                 let id=format!("owner/repo#{issue}");let binding=Binding {head:if issue==33 {"a".repeat(40)}else{"b".repeat(40)},contract:"contract".into(),evidence_hash:"evidence".into()};
                 store.register(&id,&format!("fixture-{issue}"),binding.clone(),1).unwrap();let lease=store.claim(&id,"original",2,100).unwrap().unwrap();
                 store.charge(&lease,"past-work",ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},3).unwrap();
-                store.begin_operation(&lease,OperationKind::Push,&binding,issue).unwrap();store.release(&lease,100).unwrap();
+                store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git",&format!("refs/heads/fixture-{issue}"),issue).unwrap();store.release(&lease,100).unwrap();
                 if paused && issue<33 {store.set_owner_pause(&id,"github:owner",0,true,101).unwrap();}
                 before.push((id.clone(),store.snapshot(&id).unwrap(),store.events(&id).unwrap()));
             }
@@ -101,12 +168,12 @@ mod tests {
 
     #[test]
     fn positive_push_observation_is_idle_fenced_and_never_claims_or_spends_a_turn() {
-        for fault in ["none","foreign-head","binding","generation","active","branch","pause","terminal","foreign-repo"] {
+        for fault in ["none","foreign-head","binding","generation","active","branch","pause","terminal","destination","reference","foreign-repo"] {
             let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
             let id="owner/repo#7";let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
             store.register(id,"fixture",binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,100).unwrap().unwrap();
             store.charge(&lease,"past-work",ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},3).unwrap();
-            let operation=store.begin_operation(&lease,OperationKind::Push,&binding,4).unwrap();
+            let operation=store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/fixture",4).unwrap();
             let peer=store.begin_operation(&lease,OperationKind::MergePr,&binding,5).unwrap();
             store.release(&lease,6).unwrap();
             if fault=="foreign-repo" {assert!(store.pending_push_observations("foreign/repo",7,32).unwrap().is_empty());continue;}
@@ -124,6 +191,8 @@ mod tests {
             if fault=="branch" {store.conn.execute("UPDATE workflow SET branch='foreign' WHERE id=?1",[id]).unwrap();}
             if fault=="active" {store.conn.execute("UPDATE workflow SET lease_until=1000 WHERE id=?1",[id]).unwrap();}
             if fault=="pause" {store.set_owner_pause(id,"github:owner",0,true,8).unwrap();}
+            if fault=="reference" {store.conn.execute("UPDATE push_dispatch_destination SET reference=?2 WHERE operation=?1",params![pending.operation,"refs/heads/another"]).unwrap();}
+            if fault=="destination" {store.conn.execute("UPDATE push_dispatch_destination SET destination=?2 WHERE operation=?1",params![pending.operation,"https://github.com/owner/other.git"]).unwrap();}
             let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();
             let observed=store.observe_idle_push(&pending,if fault=="foreign-head" {"foreign"}else{&binding.head},11).unwrap();
             assert_eq!(observed,fault=="none","{fault}");

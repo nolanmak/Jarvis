@@ -115,14 +115,23 @@ struct PendingPublication {
     contract:String,environment:String,args:Vec<String>,
 }
 
-struct GitPushRead<'a>(&'a Path);
-impl GitPushRead<'_> {
-    async fn destinations(&mut self)->Result<Vec<String>> {
-        let (ok,raw,_)=run("git",&["remote","get-url","--push","--all","origin"],self.0).await?;
-        anyhow::ensure!(ok && raw.len()<=16384,"Push destination unavailable");
-        Ok(raw.lines().map(str::trim).filter(|value|!value.is_empty()).map(str::to_owned).collect())
-    }
+struct GitPushRead<'a> {root:&'a Path,accessible:std::collections::BTreeSet<String>}
+impl<'a> GitPushRead<'a> {
+    fn new(root:&'a Path)->Self {Self {root,accessible:std::collections::BTreeSet::new()}}
     async fn head_at(&mut self,destination:&str,reference:&str)->Result<Option<String>> {
+        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?.to_ascii_lowercase();
+        let head=self.query(destination,reference).await?;
+        if head.is_some() {self.accessible.insert(repository);return Ok(head);}
+        // A 404 may hide an inaccessible private repository. A successful Git
+        // ref read, not generic repository metadata, establishes data access.
+        if !self.accessible.contains(&repository) {
+            anyhow::ensure!(reference!="refs/heads/main" && self.query(destination,"refs/heads/main").await?.is_some(),
+                "Git-data access unavailable; ref absence is not established");
+            self.accessible.insert(repository);
+        }
+        Ok(None)
+    }
+    async fn query(&self,destination:&str,reference:&str)->Result<Option<String>> {
         let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?;
         let (owner,repository)=repository.split_once('/').context("network Push identity malformed")?;
         let reference=reference.strip_prefix("refs/").context("Push reference malformed")?;
@@ -132,12 +141,12 @@ impl GitPushRead<'_> {
         let mut endpoint=reqwest::Url::parse("https://api.github.com/")?;
         endpoint.path_segments_mut().map_err(|_|anyhow::anyhow!("Push endpoint unavailable"))?
             .extend(["repos",owner,repository,"git","ref"]).extend(reference.split('/'));
-        let (ok,raw,_)=run(&gh_bin(),&["api",endpoint.as_str(),"--include","--jq",".object.sha"],self.0).await?;
+        let (ok,raw,_)=run(&gh_bin(),&["api",endpoint.as_str(),"--include","--jq",".object.sha"],self.root).await?;
         observed_push_head(ok,&raw)
     }
 }
-// Expected absent refs must yield to peers; transport/rate-limit failures
-// stop this batch rather than amplify a repository-wide outage.
+// HTTP decoding only. A 404 becomes ref absence only after head_at proves
+// Git-data access; transport/rate-limit failures stop the bounded batch.
 fn observed_push_head(ok:bool,raw:&str)->Result<Option<String>> {
     anyhow::ensure!(raw.len()<=32768,"Push observation response exceeds bound");
     let (headers,body)=raw.split_once("\r\n\r\n").or_else(||raw.split_once("\n\n"))
@@ -153,6 +162,9 @@ fn observed_push_head(ok:bool,raw:&str)->Result<Option<String>> {
     let head=body.trim();
     anyhow::ensure!(matches!(head.len(),40|64) && head.bytes().all(|byte|byte.is_ascii_hexdigit()),"Push observation head malformed");
     Ok(Some(head.to_owned()))
+}
+pub(super) async fn read_bound_push_head(root:&Path,destination:&str,reference:&str)->Result<Option<String>> {
+    GitPushRead::new(root).head_at(destination,reference).await
 }
 fn verified_push_destination<'a>(repository:&str,destinations:&'a [String])->Option<&'a str> {
     let [destination]=destinations else {return None};
@@ -188,15 +200,12 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     Ok(())
 }
 async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore)->Result<()> {
-    let mut reader=GitPushRead(repo);
+    let mut reader=GitPushRead::new(repo);
     let pending=store.pending_push_observations(repository,chrono::Utc::now().timestamp_millis(),32)?;
-    if pending.is_empty() {return Ok(());}
-    let Ok(destinations)=reader.destinations().await else {return Ok(())};
-    let Some(destination)=verified_push_destination(repository,&destinations) else {
-        warn!(repository,"Push destination identity unavailable; original effects retained");return Ok(());
-    };
     for pending in pending {
-        let reference=format!("refs/heads/{}",pending.branch());
+        let destinations=[pending.destination().to_owned()];
+        let Some(destination)=verified_push_destination(repository,&destinations) else {continue};
+        let reference=pending.reference();
         let (valid,_,_)=run("git",&["check-ref-format",&reference],repo).await?;
         if !valid {continue;}
         let head=match reader.head_at(destination,&reference).await {Ok(Some(head))=>head,Ok(None)=>continue,Err(_)=>break};

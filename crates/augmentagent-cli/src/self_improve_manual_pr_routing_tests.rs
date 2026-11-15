@@ -11,6 +11,104 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if matches!(case.as_str(),"push-before-config-change"|"push-after-config-change"|"push-hook-composition"|"push-rewrite-once"|"push-missing-ccat"|"push-shadowed-ccat"|"push-valid-ccat"|"push-push-instead-of"|"push-nonbare-destination"|"push-empty-destination"|"push-multiple-destination") {
+            let git=|args:&[&str]| {
+                let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
+                assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            let mut first=git(&["remote","get-url","--push","origin"]);let other=root.parent().unwrap().join("other.git");
+            git(&["init","--bare","--quiet",other.to_str().unwrap()]);
+            let hook=root.join(".git/hooks/pre-push");
+            if case=="push-after-config-change" {
+                std::fs::write(&hook,format!("#!/usr/bin/python3\nimport subprocess\nfor args in [['remote','set-url','origin',{:?}],['remote','set-url','--push','origin',{:?}]]:subprocess.run(['/usr/bin/git',*args],check=True)\n",other.to_str().unwrap(),other.to_str().unwrap())).unwrap();
+                std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            if matches!(case.as_str(),"push-hook-composition"|"push-valid-ccat") {
+                std::fs::write(&hook,format!("#!/usr/bin/python3\n# ccat-public-push-gate.sh fixture marker; no native gate execution claimed\nimport pathlib,sys,json,subprocess\np=subprocess.run(['/usr/bin/git','config','--get','core.hooksPath'],capture_output=True,text=True)\npathlib.Path({:?}).write_text(json.dumps(dict(args=sys.argv[1:],input=sys.stdin.read(),configuration=p.stdout)))\n",root.join("hook-observation"))).unwrap();
+                std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            if matches!(case.as_str(),"push-empty-destination"|"push-multiple-destination") {
+                git(&["config","--add","remote.origin.pushurl",if case=="push-empty-destination" {""}else{other.to_str().unwrap()}]);
+                git(&["config","--add","remote.origin.pushurl",&first]);
+            }
+            if case=="push-nonbare-destination" {
+                let nonbare=root.parent().unwrap().join("nonbare");git(&["init","--quiet",nonbare.to_str().unwrap()]);
+                git(&["remote","set-url","--push","origin",nonbare.to_str().unwrap()]);
+                first=git(&["remote","get-url","--push","origin"]);
+            }
+            if case=="push-shadowed-ccat" {
+                std::fs::write(&hook,"#!/bin/sh\n# ccat-public-push-gate.sh fixture marker\nexit 0\n").unwrap();
+                std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let actual=root.parent().unwrap().join("actual-hooks");std::fs::create_dir(&actual).unwrap();
+                std::fs::write(actual.join("pre-push"),"#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(actual.join("pre-push"),std::fs::Permissions::from_mode(0o700)).unwrap();
+                git(&["config","core.hooksPath",actual.to_str().unwrap()]);
+            }
+            if case=="push-push-instead-of" {
+                git(&["config",&format!("url.{}.pushInsteadOf",other.display()),&first]);
+                first=git(&["remote","get-url","--push","origin"]);
+            }
+            if case=="push-rewrite-once" {
+                git(&["push","--quiet",other.to_str().unwrap(),"HEAD:refs/heads/feat/repair-9"]);
+                git(&["config",&format!("url.{}.insteadOf",first),"https://github.com/owner/repo.git"]);
+                git(&["config",&format!("url.{}.insteadOf",other.display()),&first]);
+                git(&["remote","set-url","--push","origin","https://github.com/owner/repo.git"]);
+            }
+            if case=="push-before-config-change" {
+                let frozen=push_destination::Resolved::resolve(&root,"owner/repo").await.unwrap();
+                let private=root.parent().unwrap().join("private-hook-control");std::fs::create_dir(&private).unwrap();
+                let guarded=frozen.hook(&root,&private).await.unwrap();
+                git(&["remote","set-url","--push","origin",other.to_str().unwrap()]);
+                let (ok,_,_)=run("git",&["-c",guarded.config(),"push","origin","HEAD:refs/heads/feat/repair-9"],&root).await.unwrap();
+                assert!(!ok,"configuration change bypassed the actual transport destination fence");
+                for remote in [&first,other.to_str().unwrap()] {assert!(git(&["ls-remote","--heads",remote,"refs/heads/feat/repair-9"]).is_empty());}
+                return;
+            }
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
+                branch:"feat/repair-9",contract:"Published original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let head=git(&["rev-parse","HEAD"]);let result=guard.push("feat/repair-9").await;
+            if matches!(case.as_str(),"push-missing-ccat"|"push-shadowed-ccat"|"push-empty-destination"|"push-multiple-destination") {
+                assert!(result.is_err(),"missing required CCAT hook allowed a Push");
+                assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"known missing pre-push gate left an un-dispatched uncertain intent");
+                guard.finish().unwrap();return;
+            }
+            assert_eq!(result.unwrap(),head);
+            // Read the actual bare repository without applying another URL rewrite.
+            let actual=git(&["-C",&first,"rev-parse","refs/heads/feat/repair-9"]);
+            assert_eq!(actual,head,"the pinned actual transport was not published");
+            if case=="push-after-config-change" {assert!(git(&["ls-remote","--heads",other.to_str().unwrap(),"refs/heads/feat/repair-9"]).is_empty());}
+            if matches!(case.as_str(),"push-hook-composition"|"push-valid-ccat") {
+                let proof:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("hook-observation")).unwrap()).unwrap();
+                assert_eq!(proof["args"],serde_json::json!(["origin",first]));
+                assert!(proof["input"].as_str().unwrap().contains(&head),"original hook lost Git's stdin");
+                assert_eq!(proof["configuration"],"","temporary hooksPath leaked into the original hook");
+            }
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty());
+            guard.finish().unwrap();return;
+        }
+        if case=="push-separate-remotes" {
+            let git=|args:&[&str]| {
+                let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
+                assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            let head=git(&["rev-parse","HEAD"]);
+            git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
+            let other=root.parent().unwrap().join("other.git");git(&["init","--bare","--quiet",other.to_str().unwrap()]);
+            git(&["remote","set-url","--push","origin",other.to_str().unwrap()]);
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
+                branch:"feat/repair-9",contract:"Published original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            assert_eq!(guard.push("feat/repair-9").await.unwrap(),head);
+            let pushed=git(&["ls-remote","--heads",other.to_str().unwrap(),"refs/heads/feat/repair-9"]);
+            assert_eq!(pushed.split_whitespace().next(),Some(head.as_str()),"matching fetch head falsely completed a Push without publishing to its different push destination");
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty());
+            guard.finish().unwrap();return;
+        }
         if case.starts_with("post-rabbit-") {
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
@@ -98,13 +196,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             assert!(manual_routing::published_note(&root,&mut guard,9,7,false,manual_routing::NoteTarget::Pr,"Explicit owner note").await.unwrap());
             guard.finish().unwrap();return;
         }
-        if matches!(case.as_str(),"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {
+        if matches!(case.as_str(),"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {
             let git=|args:&[&str]| {
                 let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
                 assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));
                 String::from_utf8(out.stdout).unwrap().trim().to_owned()
             };
-            let published=git(&["rev-parse","HEAD"]);git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
+            let published=git(&["rev-parse","HEAD"]);git(&["push","--quiet","origin","HEAD:refs/heads/main"]);git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:None,
                 branch:"feat/repair-9",contract:"Original request",environment:"fixture",
@@ -120,31 +218,44 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 let id=guard.id().to_owned();let binding=guard.binding().clone();guard.finish().unwrap();
                 let now=chrono::Utc::now().timestamp_millis();
                 let lease=initial.claim(&id,"lost-response-controller",now,1000).unwrap().unwrap();
-                let missing_peer=if case=="fresh-uncertain-missing-peer" {
+                let missing_peer=if matches!(case.as_str(),"fresh-uncertain-missing-peer"|"fresh-uncertain-access-denied") {
                     let peer="owner/repo#8";
                     initial.register(peer,"feat/missing-8",binding.clone(),now-20).unwrap();
                     let peer_lease=initial.claim(peer,"prior-controller",now-19,1000).unwrap().unwrap();
                     initial.charge(&peer_lease,"original-work",crate::autoship_workflow::ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},now-18).unwrap();
-                    initial.begin_operation(&peer_lease,crate::autoship_workflow::OperationKind::Push,&binding,now-17).unwrap();
+                    initial.begin_bound_push(&peer_lease,&binding,"https://github.com/owner/repo.git","refs/heads/feat/missing-8",now-17).unwrap();
                     initial.release(&peer_lease,now-16).unwrap();
                     Some((initial.snapshot(peer).unwrap(),initial.events(peer).unwrap()))
                 }else {None};
-                let operation=initial.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,now).unwrap();
+                let operation=if case=="fresh-uncertain-unbound" {
+                    initial.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,now).unwrap()
+                }else {initial.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git","refs/heads/feat/repair-9",now).unwrap()};
                 // Simulate a genuinely dispatched push whose response was lost.
-                if matches!(case.as_str(),"fresh-uncertain"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer") {git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);}
-                if matches!(case.as_str(),"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch") {
+                if matches!(case.as_str(),"fresh-uncertain"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer") {git(&["push","--quiet","origin","HEAD:refs/heads/feat/repair-9"]);}
+                if matches!(case.as_str(),"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed") {
                     let other=root.parent().unwrap().join("other.git");git(&["init","--bare","--quiet",other.to_str().unwrap()]);
                     if case=="fresh-uncertain-other-fetch" {git(&["remote","set-url","origin",other.to_str().unwrap()]);}
                 }
                 // Network I/O is served by the existing scripted GitHub API;
                 // effective push destination parsing is the actual Git command.
-                git(&["remote","set-url","--push","origin",if case=="fresh-uncertain-wrong-push" {"https://github.com/owner/other.git"}else{"https://github.com/owner/repo.git"}]);
+                git(&["remote","set-url","--push","origin",if matches!(case.as_str(),"fresh-uncertain-unbound"|"fresh-uncertain-destination-changed") {"https://github.com/owner/other.git"}else{"https://github.com/owner/repo.git"}]);
                 initial.release(&lease,now+1).unwrap();
+                if case=="fresh-uncertain-branch-changed" {
+                    // Isolate retained-effect identity from the mutable workflow
+                    // branch in this fixture; production state is never edited.
+                    rusqlite::Connection::open(&path).unwrap().execute("UPDATE workflow SET branch='feat/renamed-after-dispatch' WHERE id=?1",[&id]).unwrap();
+                }
                 let recovery_before=initial.snapshot(&id).unwrap();let events_before=initial.events(&id).unwrap();
                 assert!(publication::claimed_after_reconcile(&root,7,false).await.unwrap());
-                if matches!(case.as_str(),"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push") {
+                if matches!(case.as_str(),"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-access-denied") {
                     assert!(initial.pending_operations(&id).unwrap().iter().any(|row|row.id==operation.id),"unknown push was cleared without its exact remote head");
                     assert_eq!(initial.snapshot(&id).unwrap(),recovery_before);assert_eq!(initial.events(&id).unwrap(),events_before);
+                    if case=="fresh-uncertain-access-denied" {
+                        let calls=std::fs::read_to_string(root.join("calls")).unwrap();
+                        assert!(calls.contains("/git/ref/heads/main"),"ref404 was called absence without proving Git-data access");
+                        assert!(!calls.contains("/git/ref/heads/feat/repair-9"),"inaccessible Git API fanned out to a later pending ref");
+                        assert_eq!(initial.pending_operations("owner/repo#8").unwrap().len(),1);
+                    }
                     return;
                 }
                 assert!(initial.pending_operations(&id).unwrap().is_empty(),"observable Push remained pending: expected={}, actual={}, calls={}, read={}",binding.head,git(&["ls-remote","--heads",root.parent().unwrap().join("remote.git").to_str().unwrap(),"refs/heads/feat/repair-9"]),std::fs::read_to_string(root.join("calls")).unwrap(),std::fs::read_to_string(root.join("push-read-output")).unwrap_or_default());
@@ -316,7 +427,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-wrong-push","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
@@ -325,13 +436,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case.starts_with("post-control-") || case.starts_with("post-rabbit-") || case.starts_with("round-") {
+                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case.starts_with("post-control-") || case.starts_with("post-rabbit-") || case.starts_with("round-") || case.starts_with("push-") {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                     assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
-                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\npush-read-output\n").unwrap();
+                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\npush-read-output\nhook-observation\n").unwrap();
                     let remote=dir.path().join("remote.git");
                     assert!(std::process::Command::new("/usr/bin/git").args(["init","--bare","--quiet"])
                         .arg(&remote).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
@@ -339,7 +450,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                         .arg(remote).current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
                 let references=|number|serde_json::json!([{"number":number,"url":format!("https://github.com/owner/repo/issues/{number}")}]);
-                let mut manual_refs=if route=="linked" || matches!(case,"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {references(7)}else{serde_json::json!([])};
+                let mut manual_refs=if route=="linked" || matches!(case,"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {references(7)}else{serde_json::json!([])};
                 if route=="source-less" && matches!(case,"source-label"|"unknown-source"|"malformed-source") {
                     manual_refs=serde_json::json!([{"number":7,"url":"https://github.com/owner/repo/issues/7"},
                         {"number":8,"url":"https://github.com/owner/repo/issues/8"}]);
@@ -353,7 +464,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     "baseRefName":"main","isCrossRepository":false,"headRepositoryOwner":{"login":"owner"},
                     "author":{"login":"owner"},"title":"Repair a widget","body":"Synthetic owner work",
                     "closingIssuesReferences":refs,"labels":labels,"files":[],"mergeable":"MERGEABLE"});
-                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
+                let prs=serde_json::json!([row(9,manual_refs,if matches!(case,"pr-label"|"explicit-revoked"|"paused-pr"|"paused-issue"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}),
                     row(10,if route=="linked" {references(8)}else{serde_json::json!([])},serde_json::json!([]))]);
                 let issues=serde_json::json!({"7":{"number":7,"state":"open","labels":if case=="source-label" {serde_json::json!([{"name":"autoship-manual"}])}else{serde_json::json!([])}},
                     "8":{"number":8,"state":"open","labels":[]},"70":{"number":70,"state":"open","labels":[]}});
@@ -370,7 +481,7 @@ if a[:2]==['repo','view']: print(('READ' if case=='explicit-revoked' else 'ADMIN
 elif a[:2]==['pr','list']:
  if case=='late-fresh-recheck':
   p=root/'fresh-observations';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));print(json.dumps([] if n<=2 else prs))
- else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-wrong-push','fresh-uncertain-other-fetch','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
+ else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
 elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
@@ -394,7 +505,7 @@ elif a[:1]==['api'] and a[1].startswith('https://api.github.com/repos/') and '/g
  out=subprocess.run(['/usr/bin/git','ls-remote','--heads',str(remote),'refs/heads/'+branch],capture_output=True,text=True)
  (root/'push-read-output').write_text(json.dumps(dict(code=out.returncode,stdout=out.stdout,stderr=out.stderr)))
  if out.returncode:sys.exit(1)
- words=out.stdout.split()
+ words=[] if case=='fresh-uncertain-access-denied' else out.stdout.split()
  if '--include' in a:print('HTTP/2.0 '+('200 OK' if len(words)==2 else '404 Not Found')+'\nContent-Type: application/json\n')
  if len(words)!=2:print('{"message":"Not Found"}');sys.exit(1)
  print(words[0])
@@ -420,6 +531,8 @@ else:raise AssertionError('Unexpected or mutating GitHub call: '+repr(a))
                     .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
                     .env("AUGMENTAGENT_GH_OWNER","owner").env("GH_BIN",gh)
                     .env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+                    .env("AUGMENTAGENT_CCAT_ENABLED",if matches!(case,"push-missing-ccat"|"push-shadowed-ccat"|"push-valid-ccat") {"true"}else{"false"})
+                    .env("AUGMENTAGENT_CCAT_PUBLIC_REMOTES","origin")
                     .env(CHILD,&root).env("MANUAL_PR_ROUTE",route).env("MANUAL_PR_CASE",case)
                     .current_dir(&root).output().await.unwrap();
                 assert!(output.status.success(),"{route}/{case}/draft={draft}: {}\n{}",

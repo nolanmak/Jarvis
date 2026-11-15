@@ -1492,6 +1492,14 @@ impl WorkflowGuard {
         Ok(operation)
     }
 
+    fn bound_push_intent(&self,destination:&str,reference:&str)->Result<Operation> {
+        self.validate_before_side_effect()?;
+        let operation=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .begin_bound_push(&self.lease,&self.binding,destination,reference,millis())?;
+        self.audit_event("operation_intent",serde_json::json!({"operation_id":operation.id,"operation_kind":operation.kind}))?;
+        Ok(operation)
+    }
+
     /// Pending intents mean remote outcome unknown, never "safe to repeat".
     pub(super) fn publication_inputs(&self)->(&str,&Path,&str,&str) {
         (&self.repository,&self.worktree,&self.contract,&self.environment)
@@ -2143,60 +2151,35 @@ impl WorkflowGuard {
         }
         self.transition(Stage::Publish, "publishing_revision", "push", millis())
             .await?;
-        let target = format!("refs/heads/{branch}");
-        let (ok, out, _) = run(
-            "git",
-            &["ls-remote", "--heads", "origin", &target],
-            &self.worktree,
-        )
-        .await?;
-        anyhow::ensure!(ok, "cannot reconcile remote revision before push");
-        // Empty expected SHA is a create-if-absent compare-and-swap.
-        let remote = out.split_whitespace().next().unwrap_or("");
-        if remote == self.binding.head {
-            let operation=self.intent(OperationKind::Push)?;
-            self.observe_remote(&operation, &format!("git-head:{remote}"), None)?;
-            return Ok(remote.to_string());
+        let destination=push_destination::Resolved::resolve(&self.worktree,&self.repository).await?;
+        let target=format!("refs/heads/{branch}");
+        let remote=destination.head(&self.worktree,&self.repository,&target).await?.unwrap_or_default();
+        if remote==self.binding.head {
+            let operation=self.bound_push_intent(destination.destination(),&target)?;
+            self.observe_remote(&operation,&format!("git-head:{remote}"),None)?;
+            return Ok(remote);
         }
         if !remote.is_empty() {
-            let (ancestor, _, _) = run(
-                "git",
-                &["merge-base", "--is-ancestor", remote, "HEAD"],
-                &self.worktree,
-            )
-            .await?;
-            anyhow::ensure!(
-                ancestor,
-                "remote PR changed; reconcile before publishing preserved work"
-            );
+            let (ancestor,_,_)=run("git",&["merge-base","--is-ancestor",&remote,&self.binding.head],&self.worktree).await?;
+            anyhow::ensure!(ancestor,"remote PR changed; reconcile before publishing preserved work");
         }
+        // The actual transport still uses origin, preserving its credentials,
+        // pushInsteadOf rules and installed CCAT hook. Its pre-push wrapper
+        // refuses a destination change before any pack can be sent.
+        let hook=destination.hook(&self.worktree,self.audit.path().parent().context("private push control unavailable")?).await?;
         self.validate_before_side_effect()?;
         self.validate_binding(&self.binding.clone()).await?;
         if let Some((repo,automatic))=fresh {self.require_fresh_publication_route(repo,automatic).await?;}
-        // No await separates this new durable intent from starting its push.
-        // A denial above leaves no new effect requiring reconciliation.
-        let operation=self.intent(OperationKind::Push)?;
-        let expected = format!("--force-with-lease={target}:{remote}");
-        let refspec = format!("HEAD:{target}");
-        let (pushed, _, _) = run(
-            "git",
-            &["push", &expected, "origin", &refspec],
-            &self.worktree,
-        )
-        .await?;
-        let (observed, out, _) = run(
-            "git",
-            &["ls-remote", "--heads", "origin", &target],
-            &self.worktree,
-        )
-        .await?;
-        let observed_head = out.split_whitespace().next().unwrap_or("");
-        anyhow::ensure!(
-            observed && observed_head == operation.binding.head,
-            "push outcome not verified; preserved pending intent (command success: {pushed})"
-        );
-        self.observe_remote(&operation, &format!("git-head:{observed_head}"), None)?;
-        Ok(observed_head.to_string())
+        let operation=self.bound_push_intent(destination.destination(),&target)?;
+        let expected=format!("--force-with-lease={target}:{remote}");
+        let refspec=format!("{}:{target}",operation.binding.head);
+        let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
+        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
+        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
+            "push outcome not verified; preserved pending intent (command success: {pushed})");
+        let head=observed.context("Push observation unavailable")?;
+        self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
+        Ok(head)
     }
 
     pub(super) async fn publish_round(
@@ -3519,7 +3502,8 @@ mod tests {
             .transition(Stage::Publish, "next_candidate", "push", 0)
             .await
             .unwrap();
-        guard.intent(OperationKind::Push).unwrap();
+        let frozen=push_destination::Resolved::resolve(dir.path(),"owner/repo").await.unwrap();
+        guard.bound_push_intent(frozen.destination(),"refs/heads/fix/seven").unwrap();
         assert!(
             run(
                 "git",
