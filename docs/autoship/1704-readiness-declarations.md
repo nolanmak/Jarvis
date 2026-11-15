@@ -30,12 +30,23 @@ The exact baseline SHA, executable hash, command and exit code are recorded in
 also exercise valid imported grants, opaque subscription tokens and invalid
 launch limits using a fake clock. No live inference is required by these tests.
 
-Current-head GREEN and the full affected core suite remain pending: six managed
-CLI build admissions deferred with exit 75 while another session held the host
-build lease. The initial shared checks passed three targeted Rust tests before
-the routed and missing-file additions. This is not a passing current-head receipt.
-The new CLI integration target runs the nine-case Python fixture through normal
-Cargo test discovery; no CI contract bypass is required.
+Validation on source `11dbcd149828c56df0c6d653c6891fecc6790d4c` completed:
+
+- CLI readiness: 9 tests passed, including the packaged nine-case regression.
+- One full core run: 750 library tests passed, 16 ignored, and one unchanged
+  process-tree signal fixture failed because this nohup-launched test runner
+  inherited SIGHUP ignored (`kill -HUP $$` returned 0 instead of 129).
+- Restoring SIGHUP to its ordinary default in the test launcher only made that
+  isolated fixture pass. No production signal disposition or source changed.
+- Cargo stopped after the library failure, so remaining targets ran separately:
+  126 integration tests passed across 16 targets, 24 ignored; doc tests had
+  zero failures and one existing ignored example. No second full library run.
+
+The proof artifact retains the original failure, exact commands, launcher
+normalization, binary/log hashes and all continuation results. The new CLI
+integration target runs the packaged fixture through normal Cargo test discovery.
+The six earlier managed admission deferrals were resolved after the host lease
+was released; no cache or storage-safety rule was bypassed.
 
 ## Production handoff: activation and acceptance remain pending
 

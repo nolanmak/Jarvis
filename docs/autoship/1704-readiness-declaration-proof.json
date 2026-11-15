@@ -130,10 +130,181 @@
     "resources_status": "delegation-unavailable",
     "native_state_status": "capacity-observed"
   },
-  "validation_status": "blocked-build-lease",
+  "validation_status": "complete; original signal-fixture failure retained and resolved by test-launcher SIGHUP normalization only",
   "managed_cli_admission_deferrals": {
     "attempts": 6,
     "exit_code": 75,
-    "wait_seconds_each": 300
+    "wait_seconds_each": 300,
+    "scope": "Initial turn before orchestrator released the shared lease; resumed validation acquired admission."
+  },
+  "current_head_cli": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --test autoship_commands_cli --test native_policy_readiness_cli readiness -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 9,
+    "failed": 0,
+    "packaged_fixture_cases": 9,
+    "binary_sha256": "c909495215bb345f7b2a6d32575d6e35f90f08a0a6f7ed0296804d56b4d1e32a",
+    "profile": "debug; behavior verification, not production deployment acceptance"
+  },
+  "core_library_initial_run": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core -- --test-threads=2",
+    "managed_exit_code": 1,
+    "cargo_exit_code": 101,
+    "passed": 750,
+    "failed": 1,
+    "ignored": 16,
+    "failure": "process_tree::tests::supervisor_forwards_a_child_signal_death_as_128_plus_n",
+    "actual": "kill -HUP $$ exited 0; expected 129",
+    "test_launcher_sighup_inherited_ignored": true,
+    "note": "The unchanged signal fixture passed when the test launcher restored SIGHUP=SIG_DFL. Remaining integration/doc targets run separately because Cargo stopped after the library failure; no second full library run."
+  },
+  "signal_fixture_recheck": {
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.signal-recheck.log test -p augmentagent-channel-core --lib process_tree::tests::supervisor_forwards_a_child_signal_death_as_128_plus_n -- --exact --test-threads=2",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0,
+    "test_launcher_sighup": "SIG_DFL",
+    "production_signal_dispositions_changed": false
+  },
+  "core_integration_continuation": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.core-integration.log test -p augmentagent-channel-core --test '*' -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 126,
+    "failed": 0,
+    "ignored": 24,
+    "targets": [
+      {
+        "target": "capability_inventory.rs",
+        "status": "ok",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "code_mode_compute.rs",
+        "status": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 6
+      },
+      {
+        "target": "code_mode_prompt_snapshot.rs",
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "code_mode_runner.rs",
+        "status": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "draft_context.rs",
+        "status": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "draft_context_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "governor_load.rs",
+        "status": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "live_optional_mcp.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "native_session.rs",
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "native_session_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "phone_agent.rs",
+        "status": "ok",
+        "passed": 24,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "phone_call_reliability.rs",
+        "status": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "phone_native_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "provider_output_contracts.rs",
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 10
+      },
+      {
+        "target": "revision_edit_first.rs",
+        "status": "ok",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "surface_turn.rs",
+        "status": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      }
+    ]
+  },
+  "core_doc_continuation": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.core-doc.log test -p augmentagent-channel-core --doc -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 0,
+    "failed": 0,
+    "ignored": 1
+  },
+  "test_launcher_reproduction_prefix": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 python3 -c 'import os,signal,sys; signal.signal(signal.SIGHUP,signal.SIG_DFL); os.execvp(sys.argv[1],sys.argv[1:])' scripts/cargo-managed.sh",
+  "validation_log_sha256": {
+    "L2.packaged-red.log": "10c2dbfb2b8b7436d3fdb5f4f4539404d75e076a4f4e7e11a4ec1011e59ea7a1",
+    "L2.cli-green.log": "58136ba386dc312fe7259d2a1c7033734fa285d11f80e852e2f58dd43915325b",
+    "L2.core-suite.log": "37b1d3be0bf5c31a6cc93fb0578d941374eb0a87dc18e5cc6b84f8e2b4660848",
+    "L2.signal-recheck.log": "ec0c3948caa266a773c1e4039f031a9fdc487c301f1c20a1c0855288284493bb",
+    "L2.core-integration.log": "c2a36df6bc6c2e19b50911df921088bfda8ef070addf7419c5bcdeef28e93224",
+    "L2.core-doc.log": "47f6a05312f59f4cdb7779f66d7f458ddf931dde1528bb81c35c5347c04aa416"
   }
 }
