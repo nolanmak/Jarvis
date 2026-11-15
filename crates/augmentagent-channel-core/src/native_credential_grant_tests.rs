@@ -167,3 +167,13 @@ fn routed_auth_cannot_bypass_native_launch_declarations() {
         assert!(!root.path().join("state.lock").exists());
     }
 }
+
+#[test]
+fn runtime_distinguishes_missing_and_invalid_selected_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("policy.json");
+    assert_eq!(runtime::inspect_at(Some(&path)).status, "policy-missing");
+    write(&path, b"invalid-json").unwrap();
+    assert_eq!(runtime::inspect_at(Some(&path)).status, "policy-invalid");
+    assert!(!root.path().join("state.lock").exists());
+}

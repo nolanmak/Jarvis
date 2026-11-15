@@ -15,7 +15,7 @@ class NativePolicyReadiness(unittest.TestCase):
     def test_unlaunchable_declarations_never_pass_credentials_or_runtime(self):
         binary = Path(os.environ['AUGMENTAGENT_TEST_BINARY']).resolve(strict=True)
         for fault in ('refresh-file', 'refresh-environment', 'refresh-fileless', 'routed-refresh',
-                      'memory-low', 'memory-high', 'sessions-zero', 'bytes-low'):
+                      'memory-low', 'memory-high', 'sessions-zero', 'bytes-low', 'policy-file-missing'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 subprocess.run(['git', 'init', '-q', str(root)], check=True)
@@ -39,6 +39,8 @@ class NativePolicyReadiness(unittest.TestCase):
                     if fault == 'refresh-fileless':
                         del profile['auth_file']
                     expected = 'credential-invalid'
+                elif fault == 'policy-file-missing':
+                    expected = 'policy-missing'
                 else:
                     key, value = {'memory-low': ('memory_mb', 511), 'memory-high': ('memory_mb', 4097),
                                   'sessions-zero': ('max_sessions', 0), 'bytes-low': ('max_state_bytes', 1024)}[fault]
@@ -53,7 +55,8 @@ class NativePolicyReadiness(unittest.TestCase):
                                    'codex': {'quality': 'cx/gpt-5.4', 'fast': 'cx/gpt-5.4-mini'}}}))
                     router.chmod(0o600)
                 path = root / 'policy.json'
-                path.write_text(json.dumps(policy)); path.chmod(0o600)
+                if fault != 'policy-file-missing':
+                    path.write_text(json.dumps(policy)); path.chmod(0o600)
                 before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
                 env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'XDG_STATE_HOME': str(root / 'state'),
                        'AUGMENTAGENT_NATIVE_VM_POLICY': str(path), 'CODEX_CLI': str(provider),
@@ -76,7 +79,7 @@ class NativePolicyReadiness(unittest.TestCase):
                 self.assertEqual(body['credentials']['codex']['status'], expected)
                 self.assertEqual(body['roles']['builder']['status'], 'no-eligible-provider')
                 self.assertEqual(body['roles']['adjudicator']['status'], 'provider-unavailable')
-                if expected == 'policy-invalid':
+                if expected in ('policy-invalid', 'policy-missing'):
                     self.assertEqual(body['runtime']['status'], expected)
 
 
