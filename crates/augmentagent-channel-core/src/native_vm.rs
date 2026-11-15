@@ -38,6 +38,9 @@ struct Provider {
     environment: Vec<String>,
 }
 
+#[path = "native_policy_readiness.rs"]
+mod policy_readiness;
+
 #[path = "native_readiness.rs"]
 pub mod readiness;
 #[path = "native_state_capacity.rs"]
@@ -307,7 +310,7 @@ impl Launch {
         let policy_path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
             .context("required native VM policy unavailable")?;
         let policy: Policy = serde_json::from_slice(&private(Path::new(&policy_path))?)?;
-        ensure!(policy.version == 1 && (512..=4096).contains(&policy.memory_mb), "invalid native VM policy");
+        policy_readiness::limits(&policy)?;
         let resource_policy=match build_memory(bridge).and_then(|build_mb|
             crate::run_resources::composed_native_policy(u64::from(policy.memory_mb),build_mb)) {
             Ok(policy)=>policy,
@@ -322,14 +325,9 @@ impl Launch {
             let worker = worker.canonicalize()?;
             ensure!(!root.starts_with(&worker), "worker root overlaps native VM controller state");
         }
-        if profile.refresh_auth {
-            let expected = root.join("credentials").join(format!("{provider}.json"));
-            ensure!(profile.auth_file.as_ref() == Some(&expected),
-                "OAuth refresh requires an explicitly imported controller credential");
-        }
+        policy_readiness::refresh_grant(&policy, provider, profile)?;
         let state_lock=StateLock::acquire(&root)?;
         ensure!(!owner_retired(&root,owner_logger.path(),&audit_owner)?,"native runtime owner has been retired");
-        ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
         let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
         let capacity=state_capacity::observed(count,additional,policy.max_sessions,policy.max_state_bytes,

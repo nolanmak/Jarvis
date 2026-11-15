@@ -28,7 +28,7 @@ pub fn inspect_at(path:Option<&Path>) -> RuntimeReport {
     let Some(path)=path else{return report};
     let bytes=match private(path) {Ok(bytes)=>bytes,Err(_)=>{report.status="policy-invalid".into();return report}};
     report.policy_sha256=Some(format!("{:x}",Sha256::digest(&bytes)));
-    let policy=match serde_json::from_slice::<Policy>(&bytes) {Ok(policy) if policy.version==1=>policy,
+    let policy=match serde_json::from_slice::<Policy>(&bytes) {Ok(policy) if policy_readiness::limits(&policy).is_ok()=>policy,
         _=>{report.status="policy-invalid".into();return report}};
     for provider in policy.providers.keys() {
         report.providers.insert(provider.clone(),inspect_provider(&policy.guest_runtime,provider));
