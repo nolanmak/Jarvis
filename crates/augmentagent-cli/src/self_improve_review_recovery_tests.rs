@@ -419,6 +419,18 @@ fn capacity_return_wakes_the_same_durable_job_without_owner_action() {
             .unwrap(),
         Some(true)
     );
+    let wake: WorkflowEvent = serde_json::from_str(
+        &store
+            .events(id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.1 == "review_recovery_wait_changed")
+            .unwrap()
+            .2,
+    )
+    .unwrap();
+    wake.validate_after(&wait)
+        .expect("capacity recovery must satisfy the shared workflow transition contract");
     let candidate = adoption::AdoptedPr {
         repository: "owner/repo".into(),
         pr: 1604,

@@ -97,6 +97,7 @@ impl WorkflowStore {
         };
         let scheduled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='review_recovery_scheduled' AND json_extract(payload,'$.binding.head')=?2 AND json_extract(payload,'$.binding.contract_version')=?3 AND json_extract(payload,'$.binding.evidence_version')=?4)",
             params![id,checkpoint.binding.head,checkpoint.binding.contract,checkpoint.binding.evidence_hash],|r|r.get(0))?;
+        let previous_stage = checkpoint.stage;
         checkpoint.stage = stage;
         checkpoint.next = NextAction {
             reason: reason.into(),
@@ -137,7 +138,11 @@ impl WorkflowStore {
                     contract::WorkflowStage::Held
                 },
                 outcome,
-                transition: contract::ProgressTransition::Observation,
+                transition: if stage == previous_stage {
+                    contract::ProgressTransition::Observation
+                } else {
+                    contract::ProgressTransition::StageChanged
+                },
                 reason_code: reason.into(),
                 last_meaningful_progress_at_ms: progress,
                 next: contract::NextAction {
