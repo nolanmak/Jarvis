@@ -177,6 +177,12 @@ fn git(root: &Path, args: &[&str]) -> String {
             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .current_dir(root)
+        // A caller's hook environment must not redirect the fixture repository.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .unwrap();
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
@@ -204,6 +210,7 @@ async fn dirty_owner_checkout_never_refuses_controller_admission() {
     std::fs::write(repo.join("owner-note"), "private owner note").unwrap();
     let index = std::fs::read(repo.join(".git/index")).unwrap();
     let head = std::fs::read(repo.join(".git/HEAD")).unwrap();
+    let head_commit = git(repo, &["rev-parse", "HEAD"]);
 
     // Five ticks across the day, each lane in turn, all with a dirty owner.
     for lane in ["build", "resume", "sweep", "build", "recovery"] {
@@ -221,6 +228,7 @@ async fn dirty_owner_checkout_never_refuses_controller_admission() {
     }
     assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
     assert_eq!(std::fs::read(repo.join(".git/HEAD")).unwrap(), head);
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]), head_commit, "owner branch must not move");
     assert_eq!(std::fs::read_to_string(repo.join("code")).unwrap(), "owner unstaged");
     assert_eq!(std::fs::read_to_string(repo.join("owner-note")).unwrap(), "private owner note");
 }
