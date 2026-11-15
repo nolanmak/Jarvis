@@ -26,9 +26,13 @@ pub fn inspect_at(path:Option<&Path>) -> RuntimeReport {
         build_status:"unverified".into(),build_config_sha256:None,build_artifact_sha256:BTreeMap::new(),providers:BTreeMap::new(),
         verified_files:0,verified_bytes:0,live_verified:false};
     let Some(path)=path else{return report};
-    let bytes=match private(path) {Ok(bytes)=>bytes,Err(_)=>{report.status="policy-invalid".into();return report}};
+    let bytes=match private(path) {Ok(bytes)=>bytes,Err(error)=>{
+        report.status=if error.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::NotFound) {
+            "policy-missing"
+        } else {"policy-invalid"}.into();return report
+    }};
     report.policy_sha256=Some(format!("{:x}",Sha256::digest(&bytes)));
-    let policy=match serde_json::from_slice::<Policy>(&bytes) {Ok(policy) if policy.version==1=>policy,
+    let policy=match serde_json::from_slice::<Policy>(&bytes) {Ok(policy) if policy_readiness::limits(&policy).is_ok()=>policy,
         _=>{report.status="policy-invalid".into();return report}};
     for provider in policy.providers.keys() {
         report.providers.insert(provider.clone(),inspect_provider(&policy.guest_runtime,provider));
