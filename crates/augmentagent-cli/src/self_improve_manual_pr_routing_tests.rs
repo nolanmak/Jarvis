@@ -11,6 +11,68 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case=="cross-repository-source" {
+            let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
+            rows[0]["closingIssuesReferences"]=serde_json::json!([{"number":70,"url":"https://github.com/other/repo/issues/70"}]);
+            std::fs::write(root.join("prs.json"),serde_json::to_vec(&rows).unwrap()).unwrap();
+            assert!(!manual_routing::allowed(&root,"owner/repo",9,Some(7)).await,
+                "automatic routing silently ignored an unsupported cross-repository source");
+            return;
+        }
+        if case=="push-failed-recovery" {
+            let _=tracing_subscriber::fmt().with_writer(std::io::stderr).with_max_level(tracing::Level::WARN).try_init();
+            let source=(std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked").then_some(7);
+            let candidate=root.join("candidate");
+            assert!(std::process::Command::new("/usr/bin/git").args(["worktree","add","--quiet","--detach"])
+                .arg(&candidate).arg("HEAD").current_dir(&root).status().unwrap().success());
+            if source.is_some() {
+                let binding=workflow::git_binding(&candidate,"Original request","fixture",&[]).await.unwrap();
+                let now=chrono::Utc::now().timestamp_millis();
+                initial.register("owner/repo#7","feat/repair-9",binding,now).unwrap();
+                let lease=initial.claim("owner/repo#7","original-publisher",now,1000).unwrap().unwrap();
+                initial.attach_pr_in_repo(&lease,"owner/repo",9,now).unwrap();
+                initial.release(&lease,now+1).unwrap();
+            }
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&candidate,repository:"owner/repo",source_issue:source,pr:Some(9),
+                branch:"feat/repair-9",contract:"Original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let hook=root.join(".git/hooks/pre-push");
+            std::fs::write(&hook,"#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(guard.push("feat/repair-9").await.is_err(),"transport failure fixture did not fail");
+            let id=guard.id().to_owned();let head=guard.binding().head.clone();guard.finish().unwrap();
+            assert_eq!(initial.pending_operations(&id).unwrap().len(),1);
+            let before=initial.snapshot(&id).unwrap().unwrap();
+            assert!(initial.retryable_bound_push(&id).unwrap(),"failed Push lost its bound identity");
+            assert!(initial.recovery_context(&id,&before.checkpoint.binding).unwrap().is_some(),"failed Push lost its original context");
+            std::fs::remove_file(&hook).unwrap();
+            let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
+            rows[0]["headRefOid"]=head.clone().into();
+            std::fs::write(root.join("prs.json"),serde_json::to_vec(&rows).unwrap()).unwrap();
+            let mut candidates=adoption::authorized(&rows,"owner/repo",&["owner".into()]);
+            if source.is_some() {
+                let mut issues:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("issues.json")).unwrap()).unwrap();
+                issues["7"]["state"]="closed".into();issues["7"]["state_reason"]="completed".into();
+                std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
+                let mut closed=candidates.clone();manual_routing::filter(&root,&mut closed).await;
+                assert_eq!(initial.pending_operations(&id).unwrap().len(),1,"already completed source still replayed its pending Push");
+                assert_eq!(initial.snapshot(&id).unwrap().unwrap().attempts,before.attempts,"closed source admitted another attempt");
+                issues["7"]["state"]="open".into();issues["7"]["state_reason"]=serde_json::Value::Null;
+                std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
+            }
+            manual_routing::filter(&root,&mut candidates).await;
+            assert!(initial.pending_operations(&id).unwrap().is_empty(),"automatic inventory never recovered the failed bound Push");
+            let out=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"])
+                .current_dir(&root).output().unwrap();assert!(out.status.success());
+            assert!(String::from_utf8(out.stdout).unwrap().starts_with(&head));
+            let after=initial.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls,"Push recovery spent model work");
+            assert_eq!(after.tokens,before.tokens);assert_eq!(after.attempts,before.attempts+1,"count exactly one native transport recovery attempt");
+            assert!(adoption::episode_retries(&path,&candidates,chrono::Utc::now().timestamp_millis()).unwrap().contains(&9),
+                "recovered Push remained hidden by the same-day attempt marker");
+            return;
+        }
         if case.starts_with("create-manual-") {
             let automatic=case=="create-manual-auto";
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
@@ -61,8 +123,10 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             assert!(!root.join("merge-writes").exists(),"late manual routing still dispatched a merge mutation");
             assert!(result.unwrap_err().downcast_ref::<manual_routing::Hold>().is_some());
             assert!(initial.merge_dispatch(&operation.id).unwrap().is_none(),"routing hold reserved merge allowance");
+            assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"known unused merge intent permanently blocks retry");
             assert_eq!(initial.snapshot(guard.id()).unwrap(),before,"routing check changed original work accounting");
             // Explicit authorized targeting bypasses only the routing label.
+            let operation=guard.intent(crate::autoship_workflow::OperationKind::MergePr).unwrap();
             let _=publication::merge_exact(&root,"owner/repo",9,&head,&operation,&guard.merge_lease().unwrap(),
                 publication::MergeRouting {automatic:false,source_issue:None}).await;
             assert!(root.join("merge-writes").exists(),"manual label blocked explicit authorized targeting");
@@ -506,7 +570,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["create-manual-auto","create-manual-explicit","merge-label-during-policy","ready-pause-during-routing","source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["cross-repository-source","push-failed-recovery","create-manual-auto","create-manual-explicit","merge-label-during-policy","ready-pause-during-routing","source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");

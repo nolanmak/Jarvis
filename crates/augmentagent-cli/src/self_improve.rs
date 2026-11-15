@@ -7703,6 +7703,11 @@ async fn resume_draft_pr(
             if let Ok(Some(receipt)) = &mutation {
                 workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
             }
+            if mutation.as_ref().err().is_some_and(|error|error.downcast_ref::<manual_routing::Hold>().is_some()) {
+                manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
+                workflow.transition(Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
+            }
             let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
             if !publication::merged_exact(repo_root,pr,reviewed_head).await {
                 if readied {
@@ -9965,6 +9970,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?,publication::MergeRouting {automatic:automatic_routing,source_issue:Some(issue.number)}).await;
     if let Ok(Some(receipt)) = &mutation {
         workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+    }
+    if mutation.as_ref().err().is_some_and(|error|error.downcast_ref::<manual_routing::Hold>().is_some()) {
+        workflow_guard.transition(crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+        return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     let ok = mutation.is_ok();
     let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();

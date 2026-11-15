@@ -262,6 +262,10 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
             guard.transition(crate::autoship_workflow::Stage::Reconcile,"pending_publication_candidate_changed","reverify_candidate",now).await?;
             guard.finish()?;return Ok(());
         }
+        if guard.pending_operations()?.iter().any(|operation|operation.kind==OperationKind::Push) {
+            if !store.retryable_bound_push(&id)? {guard.finish()?;return Ok(());}
+            guard.push_fresh(repo,&request.branch,request.automatic).await?;
+        }
         let result=publish(&guard,&request.worktree,&request.branch,&request.head,request.issue,
             &request.args.iter().map(String::as_str).collect::<Vec<_>>(),request.automatic).await;
         match result {
@@ -768,7 +772,12 @@ async fn merge_mutation(
     require_strict_integration(github, repository).await?;
     // Only a new dispatch needs current routing. Existing dispatched effects
     // above remain observation/recovery, even after an owner changes labels.
-    github.authorize_new_merge(repository,pr).await?;
+    if let Err(error)=github.authorize_new_merge(repository,pr).await {
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {
+            store.cancel_unused_merge(lease,operation,chrono::Utc::now().timestamp_millis())?;
+        }
+        return Err(error);
+    }
     // The following synchronous transactions recheck owner controls and lease
     // after the last remote routing read, before reserving or dispatching.
     store.reserve_merge(lease, operation, repository, pr, node, chrono::Utc::now().timestamp_millis(), cap)?;

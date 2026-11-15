@@ -863,6 +863,48 @@ impl Drop for SweepGuard {
     }
 }
 
+/// Recover a failed transport before selectors exclude its pending effect.
+/// Reuses protected execution context and the original bound Push; no model is
+/// bound or called, and no unrelated pending operation becomes selectable.
+pub(super) async fn recover_pending_push(repo:&Path,candidate:&adoption::AdoptedPr)->Result<()> {
+    let Some(store)=WorkflowStore::open_read_only(&path())? else {return Ok(())};
+    let Some(id)=store.resolve_pr(&candidate.repository,candidate.pr)? else {return Ok(())};
+    let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
+    let now=millis();
+    if snapshot.branch!=candidate.branch || snapshot.lease_until_ms>now
+        || snapshot.checkpoint.next.eligible_at_ms>now || snapshot.checkpoint.stage!=Stage::Publish
+        || store.require_owner_dispatch(&id).is_err() || !store.retryable_bound_push(&id)? {return Ok(());}
+    let source=id.rsplit_once('#').map(|(_,number)|number.parse::<u64>()).transpose()?;
+    if !(source==candidate.source_issue && source.is_some()
+        || durable::pr_workflow_id(&candidate.repository,candidate.pr)?==id) {return Ok(());}
+    if let Some(issue)=candidate.source_issue {
+        if source_reconcile::reconcile(repo,candidate.pr,issue,true,true).await!=source_reconcile::SourceAction::Continue {
+            return Ok(());
+        }
+    }
+    let Some(context)=store.recovery_context(&id,&snapshot.checkpoint.binding)? else {return Ok(())};
+    anyhow::ensure!(context.repository.eq_ignore_ascii_case(&candidate.repository),"Push recovery repository changed");
+    recovery::existing_checkout(repo,&context.worktree).await?;
+    let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
+    anyhow::ensure!(binding==snapshot.checkpoint.binding,"pending Push candidate changed");
+    drop(store);
+    let Some(mut guard)=WorkflowGuard::acquire(Start {repo_root:repo,worktree:&context.worktree,
+        repository:&candidate.repository,source_issue:source,pr:Some(candidate.pr),branch:&snapshot.branch,
+        contract:&context.source_request,environment:&context.environment}).await? else {return Ok(())};
+    let result=async {
+        anyhow::ensure!(guard.binding()==&binding && guard.store.lock().map_err(|_|anyhow::anyhow!("Push recovery store poisoned"))?
+            .retryable_bound_push(guard.id())?,"pending Push recovery changed");
+        // A failed routing observation leaves the original pending Push in
+        // Publish so a later inventory pass can retry it without a reset.
+        if !manual_routing::allowed(repo,&candidate.repository,candidate.pr,source).await {return Ok(());}
+        guard.push(&snapshot.branch).await?;
+        guard.transition(Stage::Publish,"bound_push_recovered","resume_preserved_work",0).await?;
+        Ok::<(),anyhow::Error>(())
+    }.await;
+    guard.finish()?;
+    result
+}
+
 impl WorkflowGuard {
     pub(super) async fn acquire(start: Start<'_>) -> Result<Option<Self>> {
         Self::acquire_at(&path(), start, millis()).await
@@ -919,7 +961,7 @@ impl WorkflowGuard {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
                 || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
-            if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
+            if relevant || store.retryable_bound_push(&id)? {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
         let context=context.filter(|context|recovery_context_matches(context,start.contract,start.worktree,start.environment,initial_wait));

@@ -34,9 +34,9 @@ async fn inspect(root:&Path,repository:&str,pr:u64,source:Option<u64>)->Result<b
         linked_claims::validate_reference(reference)?;
         let number=reference["number"].as_u64().filter(|n|*n>0).context("automatic PR source number malformed")?;
         let raw=reference["url"].as_str().context("automatic PR source URL unavailable")?;
-        if raw.eq_ignore_ascii_case(&format!("https://github.com/{repository}/issues/{number}")) {
-            sources.insert(number);
-        }
+        ensure!(raw.eq_ignore_ascii_case(&format!("https://github.com/{repository}/issues/{number}")),
+            "cross-repository automatic source is unsupported");
+        sources.insert(number);
     }
     for number in sources {
         let endpoint=format!("repos/{repository}/issues/{number}");
@@ -114,7 +114,12 @@ pub(super) async fn terminal_allowed(root:&Path,issue:u64,pr:Option<u64>,automat
 pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>) {
     let mut eligible=Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
-        if allowed(root,&candidate.repository,candidate.pr,candidate.source_issue).await {eligible.push(candidate);}
+        if allowed(root,&candidate.repository,candidate.pr,candidate.source_issue).await {
+            if let Err(error)=workflow::recover_pending_push(root,&candidate).await {
+                warn!(pr=candidate.pr,"bound Push recovery deferred: {error:#}");
+            }
+            eligible.push(candidate);
+        }
     }
     if adoption::filter_owned_sources(&workflow::path(),&mut eligible).is_err() {
         warn!("protected PR source identity unavailable; deferring automatic selection");eligible.clear();

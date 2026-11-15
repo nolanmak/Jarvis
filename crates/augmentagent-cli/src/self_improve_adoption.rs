@@ -203,6 +203,7 @@ pub(super) fn episode_retries(
         }
         let retry_requested=matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
             (crate::autoship_workflow::Stage::Verify,"verification_infrastructure_retry","retry_verification")
+            | (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
             | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
         let owned_candidate=(recovered.contains(&id) || retry_requested)
             && snapshot.pr==Some(candidate.pr)

@@ -18,6 +18,21 @@ impl PendingPush {
     pub(crate) fn reference(&self)->&str {&self.reference}
 }
 impl WorkflowStore {
+    /// Only one exact, controller-bound Push may be recovered. Other pending
+    /// effects and unknown legacy Push intents retain their existing guards.
+    pub(crate) fn retryable_bound_push(&self,workflow:&str)->Result<bool> {
+        let pending=self.pending_operations(workflow)?;
+        let [operation]=pending.as_slice() else {return Ok(false)};
+        if operation.kind!=OperationKind::Push || self.merge_reconciliation_needed(workflow)? {return Ok(false);}
+        let Some(snapshot)=self.snapshot(workflow)? else {return Ok(false)};
+        let saved:Option<(String,String)>=self.conn.query_row(
+            "SELECT destination,reference FROM push_dispatch_destination WHERE operation=?1",[&operation.id],
+            |row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((destination,reference))=saved else {return Ok(false)};
+        Ok(snapshot.checkpoint.binding==operation.binding && reference==format!("refs/heads/{}",snapshot.branch)
+            && destination_identity(workflow,&operation.binding,&destination,&reference)?==operation.id)
+    }
+
     /// The exact dispatch destination is immutable evidence, committed with
     /// the intent. Unknown earlier Push effects cannot be relabelled or evaded.
     pub(crate) fn begin_bound_push(&mut self,lease:&Lease,binding:&Binding,destination:&str,reference:&str,now:i64)->Result<Operation> {
