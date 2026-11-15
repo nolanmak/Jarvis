@@ -50,6 +50,53 @@ impl Activity {
 }
 
 impl WorkflowStore {
+    /// Configure a controller-owned workflow's effective inactivity policy.
+    pub fn configure_activity_policy(
+        &mut self,
+        lease: &Lease,
+        policy: &Policy,
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            now >= 0
+                && policy.version > 0
+                && [
+                    policy.scope_ms,
+                    policy.build_ms,
+                    policy.verify_ms,
+                    policy.review_ms,
+                    policy.mutation_ms
+                ]
+                .iter()
+                .all(|budget| *budget > 0),
+            "invalid inactivity policy"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let mut state =
+            read(&tx, &lease.workflow)?.context("workflow activity history is unknown")?;
+        if state.policy == *policy {
+            return Ok(());
+        }
+        state.policy = policy.clone();
+        tx.execute(
+            "UPDATE workflow_activity SET payload=?2 WHERE workflow=?1",
+            params![lease.workflow, serde_json::to_string(&state)?],
+        )?;
+        event(
+            &tx,
+            &lease.workflow,
+            lease.generation,
+            "activity_policy_configured",
+            &serde_json::to_string(policy)?,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Read-only: missing legacy activity is unknown, never inferred from PID
     /// liveness or heartbeat time. This call must not migrate the database.
     pub fn activity_status(&self, workflow: &str) -> Result<Option<Activity>> {
@@ -98,10 +145,10 @@ impl Policy {
         }
         match checkpoint.stage {
             Stage::Scope => Some(self.scope_ms),
-            Stage::Build => Some(self.build_ms),
+            Stage::Build | Stage::Reconcile => Some(self.build_ms),
             Stage::Verify => Some(self.verify_ms),
             Stage::Review => Some(self.review_ms),
-            Stage::Reconcile | Stage::Publish | Stage::Merge => Some(self.mutation_ms),
+            Stage::Publish | Stage::Merge => Some(self.mutation_ms),
             Stage::Intake | Stage::AwaitChecks | Stage::Held | Stage::Retired | Stage::Merged => {
                 None
             }
@@ -120,18 +167,24 @@ pub(super) fn project(
 ) -> Result<()> {
     if !matches!(
         kind,
-        "registered" | "checkpoint" | "verification_gate_passed" | "owner_control_changed"
+        "registered"
+            | "checkpoint"
+            | "verification_gate_passed"
+            | "owner_control_changed"
+            | "claimed"
+            | "released"
+            | "activity_policy_configured"
     ) {
         return Ok(());
     }
-    let raw: Option<String> = tx
+    let raw: Option<(String, bool)> = tx
         .query_row(
-            "SELECT checkpoint FROM workflow WHERE id=?1",
+            "SELECT checkpoint, owner IS NOT NULL FROM workflow WHERE id=?1",
             [workflow],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(raw) = raw else {
+    let Some((raw, owned)) = raw else {
         return Ok(());
     };
     let checkpoint: Checkpoint = serde_json::from_str(&raw)?;
@@ -164,13 +217,13 @@ pub(super) fn project(
         [workflow],
         |r| r.get(0),
     )?;
-    let waiting = paused
-        || checkpoint.next.eligible_at_ms > now
+    let dependency_wait = checkpoint.next.eligible_at_ms > now
         || matches!(
             checkpoint.stage,
             Stage::Intake | Stage::AwaitChecks | Stage::Held | Stage::Retired | Stage::Merged
         )
         || checkpoint.next.action.starts_with("await_");
+    let waiting = paused || !owned || dependency_wait;
     let meaningful = if kind == "verification_gate_passed" {
         // Native entry point already checked the current lease and binding.
         // Its canonical payload is domain+binding, without timestamps/nonces.
@@ -215,6 +268,8 @@ pub(super) fn project(
     }
     state.reason_code = if paused {
         "owner_paused".into()
+    } else if !owned && !dependency_wait {
+        "awaiting_worker_claim".into()
     } else {
         checkpoint.next.reason.clone()
     };
@@ -556,5 +611,174 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unknown workflow"));
         assert!(store.activity_status("owner/repo#77").unwrap().is_none());
+    }
+    #[test]
+    fn released_work_waits_without_idle_debt_and_reclaim_starts_an_active_interval() {
+        let (root, mut store, lease, _) = setup(Stage::Build);
+        let original = store.activity_status(&lease.workflow).unwrap().unwrap();
+        store.release(&lease, START + 100).unwrap();
+        let released = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            released.inactivity_deadline_at, None,
+            "released workflow retained an active timer"
+        );
+        assert_eq!(released.reason_code, "awaiting_worker_claim");
+        assert_eq!(released.next_observation_at, Some(START + 300_100));
+        assert_eq!(released.last_meaningful_progress_at, 0);
+        assert_eq!(released.stage_started_at, original.stage_started_at);
+        drop(store);
+        let mut store = WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        let at = START + 7 * 3_600_000;
+        let resumed = store
+            .claim(&lease.workflow, "next-controller", at, 86_400_000)
+            .unwrap()
+            .unwrap();
+        let activity = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(activity.inactivity_started_at, Some(at));
+        assert_eq!(activity.inactivity_deadline_at, Some(at + 3_600_000));
+        assert_eq!(activity.stage_started_at, original.stage_started_at);
+        assert_eq!(activity.last_meaningful_progress_at, 0);
+        assert!(store.heartbeat(&lease, at + 1, 60_000).is_err());
+        assert!(resumed.generation > lease.generation);
+        let snapshot = store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            (snapshot.model_calls, snapshot.tokens, snapshot.wall_ms),
+            (4, 1234, 700)
+        );
+        assert_eq!(store.merge_allowance(at, 5).unwrap().confirmed, 0);
+    }
+
+    #[test]
+    fn reclaim_after_crash_cannot_erase_an_expired_activity_deadline() {
+        let (root, store, lease, _) = setup(Stage::Build);
+        let original = store.activity_status(&lease.workflow).unwrap().unwrap();
+        drop(store); // Crash: there was no verified teardown/release.
+        let mut store = WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        let at = START + 86_400_002;
+        let next = store
+            .claim(&lease.workflow, "recovery-controller", at, 60_000)
+            .unwrap()
+            .unwrap();
+        assert!(next.generation > lease.generation);
+        let activity = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            activity.inactivity_deadline_at,
+            original.inactivity_deadline_at
+        );
+        assert_eq!(activity.last_meaningful_progress_at, 0);
+        assert!(
+            activity.expired(at),
+            "new lease silently renewed stalled work"
+        );
+    }
+
+    #[test]
+    fn resuming_owner_control_on_released_work_does_not_start_execution() {
+        let (_root, mut store, lease, _) = setup(Stage::Build);
+        store
+            .set_owner_pause(&lease.workflow, "owner", 0, true, START + 100)
+            .unwrap();
+        store.release(&lease, START + 101).unwrap();
+        store
+            .set_owner_pause(&lease.workflow, "owner", 1, false, START + 200)
+            .unwrap();
+        let activity = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            activity.inactivity_deadline_at, None,
+            "owner resume manufactured an execution interval"
+        );
+        assert_eq!(activity.last_meaningful_progress_at, 0);
+        assert_eq!(
+            store
+                .snapshot(&lease.workflow)
+                .unwrap()
+                .unwrap()
+                .lease_until_ms,
+            0
+        );
+    }
+    #[test]
+    fn injected_policy_persists_effective_thresholds_without_progress_or_accounting_changes() {
+        let (root, mut store, lease, _) = setup(Stage::Build);
+        let policy = Policy {
+            version: 2,
+            scope_ms: 5,
+            build_ms: 10,
+            verify_ms: 20,
+            review_ms: 7,
+            mutation_ms: 3,
+        };
+        store
+            .configure_activity_policy(&lease, &policy, START + 3)
+            .unwrap();
+        let activity = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            activity.policy, policy,
+            "effective policy was not persisted"
+        );
+        assert_eq!(activity.inactivity_budget_ms, Some(10));
+        assert_eq!(activity.inactivity_deadline_at, Some(START + 12));
+        assert_eq!(activity.last_meaningful_progress_at, 0);
+        assert!(!activity.expired(START + 11));
+        assert!(activity.expired(START + 12));
+        let reopened = WorkflowStore::open_read_only(&root.path().join("workflow.db"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.activity_status(&lease.workflow).unwrap().unwrap(),
+            activity
+        );
+        let snapshot = store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            (snapshot.model_calls, snapshot.tokens, snapshot.wall_ms),
+            (4, 1234, 700)
+        );
+        assert_eq!(store.merge_allowance(START + 12, 5).unwrap().confirmed, 0);
+    }
+
+    #[test]
+    fn policy_configuration_rejects_stale_leases_and_invalid_thresholds_atomically() {
+        let (_root, mut store, lease, _) = setup(Stage::Build);
+        let before = store.activity_status(&lease.workflow).unwrap().unwrap();
+        let events = store.events(&lease.workflow).unwrap();
+        let mut invalid = Policy::default();
+        invalid.scope_ms = 0;
+        assert!(store
+            .configure_activity_policy(&lease, &invalid, START + 3)
+            .is_err());
+        invalid = Policy::default();
+        invalid.version = 0;
+        assert!(store
+            .configure_activity_policy(&lease, &invalid, START + 3)
+            .is_err());
+        let stale = Lease {
+            generation: lease.generation + 1,
+            ..lease.clone()
+        };
+        assert!(store
+            .configure_activity_policy(&stale, &Policy::default(), START + 3)
+            .is_err());
+        assert_eq!(
+            store.activity_status(&lease.workflow).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(store.events(&lease.workflow).unwrap(), events);
+    }
+
+    #[test]
+    fn acceptance_preparation_in_reconcile_uses_repair_budget_not_mutation_budget() {
+        let (_root, mut store, lease, _) = setup(Stage::Reconcile);
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.next.reason = "resume_started".into();
+        checkpoint.next.action = "reconcile_main".into();
+        store.checkpoint(&lease, &checkpoint, START + 3).unwrap();
+        let activity = store.activity_status(&lease.workflow).unwrap().unwrap();
+        assert_eq!(
+            activity.inactivity_budget_ms,
+            Some(3_600_000),
+            "model acceptance repair inherited the Git mutation budget"
+        );
+        assert_eq!(activity.inactivity_deadline_at, Some(START + 2 + 3_600_000));
+        assert_eq!(activity.last_meaningful_progress_at, 0);
     }
 }

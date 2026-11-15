@@ -5,6 +5,9 @@ native workflow checkpoint and verified-gate events. It records the effective
 versioned policy, stage start, last meaningful progress, active interval,
 inactivity budget and deadline, next observation, typed outcome, and reason.
 Owner pause/resume updates the same projection in its control transaction.
+Explicit lease release suspends active time; reclaim after release starts a new
+active interval. Reclaiming an unreleased crashed generation preserves its old
+deadline. Owner resume by itself cannot start an unleased execution interval.
 
 `WorkflowStore::activity_status` reads this state without migrating or changing
 the database. Missing legacy state is unknown. A heartbeat, usage charge,
@@ -15,7 +18,12 @@ with the same domain and candidate/contract/evidence binding cannot renew it.
 The default policy is version 1: scope 15 minutes, build 60 minutes,
 deterministic verification 90 minutes, review 30 minutes, and publication/merge
 mutation 5 minutes. Original baseline qualification uses the verification
-budget even while its workflow stage remains Scope. Waiting for eligibility, capacity, external checks, input,
+budget even while its workflow stage remains Scope. Reconcile includes model
+acceptance preparation and uses the build/repair budget. A controller holding
+the current lease can inject effective thresholds through
+`configure_activity_policy`; the change preserves the current interval anchor,
+meaningful progress and accounting, and persists across restart. Invalid policy
+values and stale leases are rejected transactionally. Waiting for eligibility, capacity, external checks, input,
 or an owner resume suspends the active inactivity deadline. Waiting workflows
 retain a next observation within five minutes. Heartbeat/lease renewal and
 compute accounting remain independent of these clocks.
