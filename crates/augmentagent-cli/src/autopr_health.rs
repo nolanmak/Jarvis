@@ -128,6 +128,8 @@ pub struct HealthInputs {
     /// Confirmed autonomous merges and separately held dispatch capacity.
     pub merge_allowance: Option<crate::autoship_workflow::MergeAllowance>,
     pub merge_allowance_error: Option<String>,
+    /// #1705 — dispatched merges lacking a receipt; `None` when unreadable.
+    pub merge_unresolved_holds: Option<Vec<crate::autoship_workflow::UnresolvedMergeHold>>,
     /// Fresh local observation only; never execution or cleanup authority.
     pub native_state_capacity: Option<serde_json::Value>,
     /// Active, unpaused workflows waiting on resource admission.
@@ -972,6 +974,7 @@ fn capacity_finding(i:&HealthInputs)->Option<Finding> {
 struct WorkflowMetrics {
     allowance:Option<crate::autoship_workflow::MergeAllowance>,
     allowance_error:Option<String>,
+    unresolved_holds:Option<Vec<crate::autoship_workflow::UnresolvedMergeHold>>,
     capacity_waits:Option<u64>,
     capacity_wait_error:bool,
 }
@@ -982,10 +985,11 @@ fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfigurat
     let (allowance,allowance_error)=match store.merge_allowance(now,config.daily_cap) {
         Ok(value)=>(Some(value),None),Err(_)=>(None,Some("worker merge allowance unavailable".into())),
     };
+    let unresolved_holds=store.unresolved_merge_holds().ok();
     let (capacity_waits,capacity_wait_error)=match store.resource_capacity_wait_count() {
         Ok(value)=>(Some(value),false),Err(_)=>(None,true),
     };
-    Ok(WorkflowMetrics{allowance,allowance_error,capacity_waits,capacity_wait_error})
+    Ok(WorkflowMetrics{allowance,allowance_error,unresolved_holds,capacity_waits,capacity_wait_error})
 }
 
 /// Gather everything the rules need from this box.
@@ -1023,7 +1027,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         DISK_DROP_WINDOW_HOURS,
     );
     crate::disk::save_readings(&filesystems, now);
-    let (merge_allowance,merge_allowance_error,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
+    let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
             let native=config.native_policy.as_deref().map(|path| {
@@ -1031,11 +1035,11 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
                     .expect("native capacity report serializes")
             });
             match workflow_metrics(&config,now.timestamp_millis()) {
-                Ok(metrics)=>(metrics.allowance,metrics.allowance_error,native,metrics.capacity_waits,metrics.capacity_wait_error),
-                Err(_)=>(None,Some("worker workflow metrics unavailable".into()),native,None,true),
+                Ok(metrics)=>(metrics.allowance,metrics.allowance_error,metrics.unresolved_holds,native,metrics.capacity_waits,metrics.capacity_wait_error),
+                Err(_)=>(None,Some("worker workflow metrics unavailable".into()),None,native,None,true),
             }
         }
-        Err(_)=>(None,Some("effective worker configuration unavailable".into()),None,None,true),
+        Err(_)=>(None,Some("effective worker configuration unavailable".into()),None,None,None,true),
     };
     HealthInputs {
         now_or_epoch: Some(now),
@@ -1070,6 +1074,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         policy_held_drafts: crate::self_improve::policy_held_drafts(),
         merge_allowance,
         merge_allowance_error,
+        merge_unresolved_holds,
         native_state_capacity,
         resource_capacity_waits,
         resource_capacity_wait_error,
@@ -1315,6 +1320,44 @@ mod tests {
         assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"merge-accounting-unavailable"));
     }
 
+    /// #1705 — a dispatched merge without a receipt is ambiguous from its
+    /// dispatch, not its reservation, and escalates with evidence plus the
+    /// supported resolution command. Read through the production metrics path.
+    #[test]
+    fn ambiguous_dispatch_escalates_from_dispatch_with_evidence_and_resolution_command() {
+        use crate::autoship_workflow::{Binding,OperationKind,WorkflowStore};
+        let root=tempfile::tempdir().unwrap();let path=root.path().canonicalize().unwrap().join("worker.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let t=t0().timestamp_millis();let min=60_000;
+        let binding=Binding{head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register("owner/repo#9","agent-fix/issue-9",binding.clone(),t).unwrap();
+        let lease=store.claim("owner/repo#9","worker",t,3*86_400_000).unwrap().unwrap();
+        store.attach_pr(&lease,9,t).unwrap();
+        let op=store.begin_operation(&lease,OperationKind::MergePr,&binding,t).unwrap();
+        store.reserve_merge(&lease,&op,"owner/repo",9,"PR_9",t,5).unwrap();
+        store.dispatch_merge(&lease,&op,t+19*min,5).unwrap();
+        let config=crate::autoship_deployment::WorkerWorkflowConfiguration{path,daily_cap:5,native_policy:None};
+        let observe=|now:i64| {
+            let metrics=workflow_metrics(&config,now).unwrap();
+            let mut i=healthy();
+            i.now_or_epoch=DateTime::from_timestamp_millis(now);
+            i.merge_allowance=metrics.allowance;i.merge_unresolved_holds=metrics.unresolved_holds;
+            i
+        };
+        let early=observe(t+20*min);
+        assert!(!codes(&analyze(&early,&Thresholds::default())).contains(&"merge-reconciliation-required"),
+            "reserved 20 minutes ago but dispatched 1 minute ago is not yet an escalation");
+        let late=observe(t+35*min);
+        let findings=analyze(&late,&Thresholds::default());
+        let finding=findings.iter().find(|f|f.code=="merge-reconciliation-required").expect("16-minute ambiguity escalates");
+        assert!(finding.detail.contains(&op.id)&&finding.detail.contains("owner/repo#9"),"{}",finding.detail);
+        assert!(finding.fix.contains(&format!("augmentagent autopr resolve-merge --operation {}",op.id)),"{}",finding.fix);
+        let report=render_text(&findings,&late);
+        for expected in ["confirmed auto-merges today (UTC): 0 of 5","pending capacity holds: 1","allowance day "] {
+            assert!(report.contains(expected),"missing {expected:?}: {report}");
+        }
+    }
+
     /// #1214 C6 — the report groups labelled issues by reason, and the
     /// block's counts sum to the number of labelled issues.
     #[test]
@@ -1390,6 +1433,7 @@ mod tests {
             policy_held_drafts: vec![],
             merge_allowance: None,
             merge_allowance_error: None,
+            merge_unresolved_holds: None,
             native_state_capacity: None,
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
