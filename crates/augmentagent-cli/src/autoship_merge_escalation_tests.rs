@@ -107,7 +107,7 @@ fn escalation_stays_within_budget_and_keeps_complete_command_and_safety_rule() {
         operation: format!("{n:064x}"), workflow: format!("nolanmak/jarvis#{n}"),
         repository: "nolanmak/jarvis".into(), pr: 2000 + n, head: "d".repeat(40), reserved_at_ms: 0,
         dispatched_at_ms: n as i64, response_journaled: n % 2 == 0 }).collect();
-    let store = std::path::Path::new("/home/worker/.local/state/augmentagent/autopr-workflow.sqlite3");
+    let store = std::path::Path::new("/srv/fixture-worker/autopr-workflow.sqlite3");
     let now = 100 * DAY;
     let overdue = overdue_merge_holds(&holds, now);
     let (detail, fix) = (merge_escalation_detail(&overdue, now), merge_escalation_fix(&overdue, Some(store)));
