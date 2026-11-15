@@ -11,6 +11,19 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case=="source-reopened-during-close-routing" {
+            let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
+            rows[0]["headRefName"]=format!("{BRANCH_PREFIX}7").into();
+            rows[0]["body"]=format!("{SELF_IMPROVE_BODY_MARKER}7.").into();
+            std::fs::write(root.join("prs.json"),serde_json::to_vec(&rows).unwrap()).unwrap();
+            let mut issues:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("issues.json")).unwrap()).unwrap();
+            issues["7"]["state"]="closed".into();issues["7"]["state_reason"]="completed".into();
+            std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
+            opened_prs::record(7,9,&"a".repeat(40),None);
+            assert_eq!(source_reconcile::reconcile(&root,9,7,false,true).await,source_reconcile::SourceAction::Hold("source-state-changed"),"source reopened while routing was read, but its PR was retired");
+            assert!(!root.join("close-writes").exists(),"reopened source still dispatched PR close");
+            return;
+        }
         if matches!(case.as_str(),"push-before-config-change"|"push-after-config-change"|"push-hook-composition"|"push-rewrite-once"|"push-missing-ccat"|"push-shadowed-ccat"|"push-valid-ccat"|"push-push-instead-of"|"push-nonbare-destination"|"push-empty-destination"|"push-multiple-destination") {
             let git=|args:&[&str]| {
                 let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(&root).output().unwrap();
@@ -69,10 +82,18 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
                 branch:"feat/repair-9",contract:"Published original request",environment:"fixture",
             }).await.unwrap().unwrap();
+            let empty_is_effective=if case=="push-empty-destination" {
+                // Git 2.43 retains empty entries; Git 2.56 clears the list.
+                // https://github.com/git/git/blob/v2.56.1/remote.c#L83
+                // The contract concerns effective destinations, not raw config.
+                let out=std::process::Command::new("/usr/bin/git").args(["remote","get-url","--push","--all","origin"])
+                    .current_dir(&root).output().unwrap();assert!(out.status.success());
+                String::from_utf8(out.stdout).unwrap()!=format!("{first}\n")
+            }else {false};
             let head=git(&["rev-parse","HEAD"]);let result=guard.push("feat/repair-9").await;
-            if matches!(case.as_str(),"push-missing-ccat"|"push-shadowed-ccat"|"push-empty-destination"|"push-multiple-destination") {
-                assert!(result.is_err(),"missing required CCAT hook allowed a Push");
-                assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"known missing pre-push gate left an un-dispatched uncertain intent");
+            if empty_is_effective || matches!(case.as_str(),"push-missing-ccat"|"push-shadowed-ccat"|"push-multiple-destination") {
+                assert!(result.is_err(),"invalid effective destination or missing required CCAT hook allowed a Push");
+                assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"known invalid push configuration left an un-dispatched uncertain intent");
                 guard.finish().unwrap();return;
             }
             assert_eq!(result.unwrap(),head);
@@ -427,7 +448,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
@@ -486,6 +507,8 @@ elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
  row=next(p for p in prs if p['number']==int(a[2]))
+ if case=='source-reopened-during-close-routing' and 'number,labels,closingIssuesReferences' in a:
+  issues['7']['state']='open';issues['7']['state_reason']=None;(root/'issues.json').write_text(json.dumps(issues))
  if row['number']==9 and case=='race':row['labels']=[dict(name='autoship-manual')]
  if row['number']==9 and (root/'manual-after-admission').exists():row['labels']=[dict(name='autoship-manual')]
  if row['number']==9 and (root/'actual-head').exists():row['headRefOid']=(root/'actual-head').read_text()
@@ -518,6 +541,7 @@ elif a[:1]==['api'] and '/issues/' in a[1]:
 elif a[:2] in (['pr','comment'],['issue','comment']) and (case.startswith('post-note-') or case.startswith('post-control-') or case.startswith('post-rabbit-') or case.startswith('round-')):
  with (root/'note-writes').open('a') as out:out.write(json.dumps(a)+'\n')
  (root/'manual-after-admission').write_text('owner changed routing during publication note');print('ok')
+elif a[:2]==['pr','close'] and case=='source-reopened-during-close-routing':(root/'close-writes').write_text('closed');print('')
 elif a[:2]==['api','user']:print('owner')
 elif a[:2]==['pr','ready'] and case=='late-mutation' and '--undo' in a:(root/'draft-restored').write_text('restored')
 else:raise AssertionError('Unexpected or mutating GitHub call: '+repr(a))

@@ -28,8 +28,12 @@ fn source_state(value: &serde_json::Value) -> SourceState {
 }
 
 #[async_trait::async_trait]
-trait Github {
+trait Github: Send {
     async fn call(&mut self, args: &[&str]) -> Result<serde_json::Value>;
+    async fn close(&mut self,pr:u64,_expected:&SourceState,comment:&str)->Result<()> {
+        self.call(&["pr","close",&pr.to_string(),"--comment",comment]).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -43,17 +47,6 @@ struct Transport<'a> {root:&'a Path,issue:u64,automatic:bool}
 #[async_trait::async_trait]
 impl Github for Transport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<serde_json::Value> {
-        if args.starts_with(&["pr","close"]) {
-            let repository=workflow::canonical_repository(self.root).await.context(ControlHeld("repository-control-unavailable"))?;
-            let pr=args.get(2).context(ControlHeld("target-control-unavailable"))?.parse::<u64>()?;
-            if self.automatic && !manual_routing::allowed(self.root,&repository,pr,Some(self.issue)).await {
-                return Err(ControlHeld("automatic-pr-routing-held").into());
-            }
-            // A routing label is advisory for explicit commands. Existing owner
-            // pauses remain authoritative for every newly dispatched close.
-            manual_routing::require_terminal_controls(&repository,self.issue,Some(pr))
-                .context(ControlHeld("owner-control-or-reconciliation-held"))?;
-        }
         let (ok, out, _) = run(&gh_bin(), args, self.root).await?;
         anyhow::ensure!(ok, "source reconciliation GitHub call failed");
         if out.trim().is_empty() {
@@ -65,6 +58,25 @@ impl Github for Transport<'_> {
         }
         Ok(serde_json::from_str(&out)?)
     }
+    async fn close(&mut self,pr:u64,expected:&SourceState,comment:&str)->Result<()> {
+        let repository=workflow::canonical_repository(self.root).await.context(ControlHeld("repository-control-unavailable"))?;
+        if self.automatic && !manual_routing::allowed(self.root,&repository,pr,Some(self.issue)).await {
+            return Err(ControlHeld("automatic-pr-routing-held").into());
+        }
+        // Routing reads can outlive the earlier source observation. Compare
+        // the exact expected terminal state after those reads, before closing.
+        let source=self.call(&["api",&format!("repos/{repository}/issues/{}",self.issue)]).await?;
+        if source_state(&source)!=*expected || !matches!(expected,SourceState::Completed|SourceState::Cancelled) {
+            return Err(ControlHeld("source-state-changed").into());
+        }
+        // Controls must also be current after the final remote read. Explicit
+        // targeting bypasses routing labels, never owner pauses or inbox work.
+        manual_routing::require_terminal_controls(&repository,self.issue,Some(pr))
+            .context(ControlHeld("owner-control-or-reconciliation-held"))?;
+        self.call(&["pr","close",&pr.to_string(),"--comment",comment]).await?;
+        Ok(())
+    }
+
 }
 
 pub(super) async fn reconcile(root: &Path, pr: u64, issue: u64, dry_run: bool, automatic:bool) -> SourceAction {
@@ -138,9 +150,7 @@ async fn reconcile_with(
         "cancelled"
     };
     let comment = format!("Autoship retired this managed PR because its source issue #{issue} is {reason}. The branch is preserved. Reopen the source and PR to resume this work.");
-    github
-        .call(&["pr", "close", &number, "--comment", &comment])
-        .await?;
+    github.close(pr,&state,&comment).await?;
     Ok(SourceAction::Retired)
 }
 

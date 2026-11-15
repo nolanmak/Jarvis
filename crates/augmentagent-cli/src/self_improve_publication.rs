@@ -200,7 +200,17 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     Ok(())
 }
 async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore)->Result<()> {
-    let mut reader=GitPushRead::new(repo);
+    observe_pushes_with(repo,repository,store,&mut GitPushRead::new(repo)).await
+}
+#[async_trait::async_trait]
+trait PushReader {
+    async fn read(&mut self,destination:&str,reference:&str)->Result<Option<String>>;
+}
+#[async_trait::async_trait]
+impl PushReader for GitPushRead<'_> {
+    async fn read(&mut self,destination:&str,reference:&str)->Result<Option<String>> {self.head_at(destination,reference).await}
+}
+async fn observe_pushes_with(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore,reader:&mut impl PushReader)->Result<()> {
     let pending=store.pending_push_observations(repository,chrono::Utc::now().timestamp_millis(),32)?;
     for pending in pending {
         let destinations=[pending.destination().to_owned()];
@@ -208,7 +218,7 @@ async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_wo
         let reference=pending.reference();
         let (valid,_,_)=run("git",&["check-ref-format",&reference],repo).await?;
         if !valid {continue;}
-        let head=match reader.head_at(destination,&reference).await {Ok(Some(head))=>head,Ok(None)=>continue,Err(_)=>break};
+        let head=match reader.read(destination,&reference).await {Ok(Some(head))=>head,Ok(None)=>continue,Err(_)=>{store.defer_push_observation_after(&pending)?;break}};
         if head!=pending.head() {continue;}
         if store.observe_idle_push(&pending,&head,chrono::Utc::now().timestamp_millis())? {
             info!(workflow=%pending.workflow(),"observed prior Push without dispatching or claiming a work turn");
@@ -803,6 +813,37 @@ pub(super) async fn merged_exact(root: &Path, number: u64, head: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_first_push_read_does_not_starve_later_effect_or_fan_out() {
+        use crate::autoship_workflow::{WorkflowStore,Binding,ResourceCharge};
+        struct Reader {calls:Vec<String>}
+        #[async_trait::async_trait]
+        impl super::PushReader for Reader {
+            async fn read(&mut self,_:&str,reference:&str)->anyhow::Result<Option<String>> {
+                self.calls.push(reference.into());
+                if reference=="refs/heads/first" {anyhow::bail!("HTTP 503 fixture");}
+                Ok(Some("a".repeat(40)))
+            }
+        }
+        let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+        let mut snapshots=Vec::new();
+        for (issue,branch) in [(1,"first"),(2,"second")] {
+            let id=format!("owner/repo#{issue}");store.register(&id,branch,binding.clone(),1).unwrap();
+            let lease=store.claim(&id,"original",2,100).unwrap().unwrap();
+            store.charge(&lease,"original-work",ResourceCharge {model_calls:4,tokens:123,wall_ms:700},3).unwrap();
+            store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git",&format!("refs/heads/{branch}"),issue+4).unwrap();
+            store.release(&lease,10).unwrap();snapshots.push((id.clone(),store.snapshot(&id).unwrap()));
+        }
+        let mut reader=Reader {calls:Vec::new()};
+        super::observe_pushes_with(root.path(),"owner/repo",&mut store,&mut reader).await.unwrap();
+        assert_eq!(reader.calls,vec!["refs/heads/first"],"outage must stop this batch");
+        super::observe_pushes_with(root.path(),"owner/repo",&mut store,&mut reader).await.unwrap();
+        assert!(store.pending_operations("owner/repo#2").unwrap().is_empty(),"failed first read permanently starved the later observable effect");
+        assert_eq!(store.pending_operations("owner/repo#1").unwrap().len(),1,"failed read fabricated a receipt");
+        for (id,before) in snapshots {assert_eq!(store.snapshot(&id).unwrap(),before,"observation claimed work or changed original charges");}
+    }
+
     #[test]
     fn push_observation_distinguishes_absent_refs_from_service_failures() {
         let head="a".repeat(40);

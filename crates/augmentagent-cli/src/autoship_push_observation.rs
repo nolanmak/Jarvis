@@ -9,6 +9,7 @@ fn destination_identity(workflow:&str,binding:&Binding,destination:&str,referenc
 /// Protected idle snapshot, not serializable input or an execution grant.
 pub(crate) struct PendingPush {
     workflow:String,branch:String,generation:i64,operation:String,binding:Binding,destination:String,reference:String,
+    scan_repository:String,scan_token:String,created_at:i64,
 }
 impl PendingPush {
     pub(crate) fn workflow(&self)->&str {&self.workflow}
@@ -57,6 +58,15 @@ impl WorkflowStore {
         // Derived scheduling state only: it never claims a workflow or alters
         // its original accounting, checkpoint, controls or uncertain effects.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS pending_push_observation_cursor(repository TEXT PRIMARY KEY,created_at INTEGER NOT NULL,operation TEXT NOT NULL);")?;
+        // Older development stores may predate the scan token. It fences
+        // late failure receipts from concurrent scans, not execution authority.
+        let has_token={
+            let mut columns=tx.prepare("PRAGMA table_info(pending_push_observation_cursor)")?;
+            let names=columns.query_map([],|row|row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|name|name=="scan_token")
+        };
+        if !has_token {tx.execute_batch("ALTER TABLE pending_push_observation_cursor ADD COLUMN scan_token TEXT NOT NULL DEFAULT '';")?;}
+        let scan_token:String=tx.query_row("SELECT lower(hex(randomblob(16)))",[],|row|row.get(0))?;
         let after:Option<(i64,String)>=tx.query_row("SELECT created_at,operation FROM pending_push_observation_cursor WHERE repository=?1",[&repository],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
         let (after_time,after_id)=after.unwrap_or((i64::MIN,String::new()));
         let mut statement=tx.prepare("SELECT w.id,w.branch,w.generation,w.checkpoint,o.id,o.binding,o.created_at,d.destination,d.reference FROM workflow w JOIN operation o ON o.workflow=w.id LEFT JOIN push_dispatch_destination d ON d.operation=o.id
@@ -68,11 +78,11 @@ impl WorkflowStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         if let Some((_,_,_,_,operation,_,created,_,_))=rows.last() {
-            tx.execute("INSERT INTO pending_push_observation_cursor(repository,created_at,operation) VALUES(?1,?2,?3)
-                ON CONFLICT(repository) DO UPDATE SET created_at=excluded.created_at,operation=excluded.operation",params![repository,created,operation])?;
+            tx.execute("INSERT INTO pending_push_observation_cursor(repository,created_at,operation,scan_token) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(repository) DO UPDATE SET created_at=excluded.created_at,operation=excluded.operation,scan_token=excluded.scan_token",params![repository,created,operation,scan_token])?;
         }
         let mut result=Vec::new();
-        for (workflow,branch,generation,checkpoint,operation,binding,_,destination,reference) in rows {
+        for (workflow,branch,generation,checkpoint,operation,binding,created_at,destination,reference) in rows {
             let (Some(destination),Some(reference))=(destination,reference) else {continue};
             let (Ok(checkpoint),Ok(binding))=(serde_json::from_str::<Checkpoint>(&checkpoint),serde_json::from_str::<Binding>(&binding)) else {
                 tracing::warn!(workflow,"pending Push metadata unavailable; original effect retained");continue;
@@ -83,9 +93,18 @@ impl WorkflowStore {
             let inbox=owner_inbox::pending(&tx,&workflow);
             let (Ok(controls),Ok(inbox))=(controls,inbox) else {continue;};
             if controls.is_some_and(|control|control.paused) || inbox>0 {continue;}
-            result.push(PendingPush {workflow,branch,generation,operation,binding,destination,reference});
+            result.push(PendingPush {workflow,branch,generation,operation,binding,destination,reference,scan_repository:repository.clone(),scan_token:scan_token.clone(),created_at});
         }
         tx.commit()?;Ok(result)
+    }
+
+    /// A service failure stops remote reads for this batch. Resume the next
+    /// batch after the failed attempt, rather than after the unattempted tail.
+    /// A newer scan owns its own cursor and cannot be rewound by an old reader.
+    pub(crate) fn defer_push_observation_after(&mut self,pending:&PendingPush)->Result<()> {
+        self.conn.execute("UPDATE pending_push_observation_cursor SET created_at=?2,operation=?3 WHERE repository=?1 AND scan_token=?4",
+            params![pending.scan_repository,pending.created_at,pending.operation,pending.scan_token])?;
+        Ok(())
     }
 
     /// A controller observed the exact original head on the exact remote ref.
@@ -164,6 +183,24 @@ mod tests {
             assert!(found,"32 retained {} rows starved a later observable Push",if paused {"paused"}else{"mismatching-head"});
             for (id,snapshot,events) in before {assert_eq!(store.snapshot(&id).unwrap(),snapshot);assert_eq!(store.events(&id).unwrap(),events);}
         }
+    }
+
+    #[test]
+    fn older_failed_scan_cannot_rewind_a_newer_scan_cursor() {
+        let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        for issue in 1..=3 {
+            let id=format!("owner/repo#{issue}");let branch=format!("fixture-{issue}");
+            let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(&id,&branch,binding.clone(),1).unwrap();let lease=store.claim(&id,"original",2,100).unwrap().unwrap();
+            store.begin_bound_push(&lease,&binding,"https://github.com/owner/repo.git",&format!("refs/heads/{branch}"),issue+3).unwrap();store.release(&lease,10).unwrap();
+        }
+        let old=store.pending_push_observations("owner/repo",200,2).unwrap();
+        let current=store.pending_push_observations("owner/repo",200,2).unwrap();
+        let cursor=|store:&WorkflowStore|store.conn.query_row("SELECT created_at,operation,scan_token FROM pending_push_observation_cursor WHERE repository='owner/repo'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap();
+        let before=cursor(&store);store.defer_push_observation_after(&old[1]).unwrap();
+        assert_eq!(cursor(&store),before,"stale remote failure rewound newer scan progress");
+        store.defer_push_observation_after(&current[0]).unwrap();
+        assert_eq!(cursor(&store).1,current[0].operation,"current failed attempt did not preserve its successor's turn");
     }
 
     #[test]
