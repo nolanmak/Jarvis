@@ -59,13 +59,17 @@ pub(crate) fn waiting(path: &Path, repository: &str, now: i64) -> Result<Vec<Str
 }
 
 /// The waiting workflows to look up now: not checked within [`RECHECK_MS`],
-/// in waiting order, at most [`PER_PASS`].
+/// never-checked first, then least recently checked, at most [`PER_PASS`].
+/// Rotating by last check works a queue longer than a few passes through end
+/// to end instead of re-checking its head forever.
 fn due(waiting: Vec<String>, last: &HashMap<String, i64>, now: i64) -> Vec<String> {
-    waiting
+    let mut eligible: Vec<(i64, String)> = waiting
         .into_iter()
-        .filter(|id| last.get(id).is_none_or(|at| now - at >= RECHECK_MS))
-        .take(PER_PASS)
-        .collect()
+        .map(|id| (last.get(&id).copied().unwrap_or(i64::MIN), id))
+        .filter(|(at, _)| *at == i64::MIN || now - at >= RECHECK_MS)
+        .collect();
+    eligible.sort_by_key(|(at, _)| *at); // stable: ties keep waiting order
+    eligible.into_iter().take(PER_PASS).map(|(_, id)| id).collect()
 }
 
 /// One sweep pass with an injected lookup, so the selection and throttle are
@@ -247,6 +251,25 @@ mod tests {
         .unwrap();
         assert_eq!(settled, 0);
         assert_eq!(*seen.lock().unwrap(), ["owner/repo#2", "owner/repo#3"]);
+    }
+
+    /// Review of #2095: with more open workflows than six passes cover,
+    /// re-checking the queue head starved the tail forever. Hourly passes
+    /// over 60 open workflows reach every one of them.
+    #[test]
+    fn hourly_passes_reach_every_workflow_of_a_long_open_queue() {
+        let ids: Vec<String> = (0..60).map(|n| format!("owner/repo#{n}")).collect();
+        let mut last = HashMap::new();
+        let mut reached = std::collections::BTreeSet::new();
+        for pass in 0..8 {
+            let now = pass * HOUR;
+            for id in due(ids.clone(), &last, now) {
+                reached.insert(id.clone());
+                last.insert(id, now);
+            }
+        }
+        let missed: Vec<&String> = ids.iter().filter(|id| !reached.contains(*id)).collect();
+        assert!(missed.is_empty(), "never looked up: {missed:?}");
     }
 
     /// A long queue is worked through a bounded number of lookups at a time.
