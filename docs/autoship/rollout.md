@@ -227,6 +227,45 @@ Pause already-active repair workflows through `autopr pause`; labeling alone
 does not stop them. Keep remaining engineering/acceptance work open and tracked.
 Do not use `agent-gave-up` for this routing choice: that label reports failures.
 
+Automatic PR adoption and resume also inspect the PR's labels and its linked
+source labels before recording ownership. The same routing check runs again at
+automatic workflow admission, parent retargeting, resume publication and
+merge-sweep mutations. A late routing denial preserves local work and restores
+this turn's ready transition only while the exact remote PR remains owned.
+Missing, malformed or saturated PR label/source observations defer that candidate
+and leave eligible peers available. Existing pending remote effects still reconcile. Explicit
+authorized CLI/Discord targeting retains its own route; a routing label grants
+no repository access and cannot clear an owner pause. Labels are remote routing
+observations, not a linearizable stop signal for an already-active turn: use the
+supported pause command to stop active repair work.
+
+Reviewer stand-down and completed-source retirement recheck routing before
+dispatching labels or a PR close. A label already dispatched remains observed
+state; a later manual/unknown route stops the close. Source retirement also
+honors issue/PR owner pauses for explicit commands. Already-closed remote PRs
+remain observable without dispatching another close.
+
+At productive admission, a candidate that still equals its trusted adopted PR
+head can retain an `adopted_publication_admitted` observation under the fenced
+workflow. This is not a Push operation or review/execution approval and changes
+no original charges. Retained-head recovery uses it only when no automation
+Push exists; any actual Push takes precedence. Alias, identity, due/idle,
+pause, pending-effect and Git-ancestry checks still apply. An already-different
+local head cannot create this original publication fact retroactively. Missing
+historical evidence stays held rather than acquiring a fabricated receipt.
+
+A due `verify` / `verification_infrastructure_retry` / `retry_verification`
+checkpoint remains eligible despite a same-day attempt marker. This requires an
+idle, unpaused owned candidate, no pending owner input or remote mutation, and
+the same published head or an authenticated retained unpublished head. The
+existing backoff and all original charges, review/CI requirements and allowance
+remain intact. Other input holds do not gain a blanket retry.
+
+The precise `held` / `automatic_pr_routing_held` / `retry_automatic_pr_routing`
+checkpoint follows those same due/idle/ownership/input/effect guards. Current
+manual labels still exclude it before adoption; after removal, a same-day marker
+cannot strand its retained work. An unknown routing read remains an unpaid hold.
+
 A fresh-selection `owner-control-unavailable` hold means the existing protected
 control state or canonical identity could not be read reliably. It is unpaid;
 inspect the configured state and its access rather than treating unknown state
@@ -277,3 +316,82 @@ This establishes deployment of PR #1603 and resource-unit configuration only.
 The stable native policy remained staged, not selected by the daemon, and
 shared local/GitHub CI PR #1616 was still under validation. Protected native
 issue-to-PR acceptance and sustained autonomous shipping remain outstanding.
+
+Terminal stand-down checks both issue and PR identities, including their
+protected alias, before bookkeeping and before each write. Owner pauses,
+follow-up input and uncertain remote effects hold automatic and explicitly
+targeted stand-down alike. A reason comment already dispatched does not license
+a later terminal label when routing or those controls change. Fresh issue pushes
+recheck linked claims before a new intent and again before dispatch. An existing
+uncertain push can still observe an already-published matching remote head;
+that observation neither sends another push nor starts model work. Retry hints
+also retain the workflow's source identity when closing references change.
+
+Automatic inventory is checked against its protected PR alias/source identity
+before persisting mutable metadata or selecting an unattempted linked issue.
+A changed or removed issue reference cannot redirect an existing issue workflow.
+Resume also checks owner/follow-up and remote-effect controls before recording
+its same-day attempt marker; a free hold cannot suppress later paid work.
+
+Fresh publication performs its final claim/routing and binding checks before
+creating a new Push intent. Known routing denials leave no new pending effect.
+The early fresh dedup path and normal publication reconciler can observe an
+existing idle Push whose exact head is already on its protected remote ref.
+That completion fences generation, active lease, branch, binding and owner
+controls without claiming a turn or changing attempts, charges or checkpoints.
+A missing/different remote head retains the original uncertain operation. This
+observer never creates a PR or pushes. Post-publication review, parked-PR and
+source notes each recheck routing and live owner controls before their write.
+
+That same automatic selection boundary also excludes protected owner pauses,
+follow-up waits, active leases, future eligibility and pending remote effects.
+Such candidates yield to eligible peers without changing the attempt ledger or
+rewriting adoption facts. Removing a routing label does not clear those controls.
+
+Linked-resume round, review, QA, verification-failure and exhausted-round notes
+also recheck current routing and protected controls at each write. A successful
+Push does not authorize its following round note if routing changed during the
+Push; the genuine Push observation remains retained.
+
+Free Push recovery binds one effective `origin` push destination to the protected
+GitHub repository. It does not infer that identity from the fetch URL. Ambiguous,
+foreign or unsupported destinations retain the pending effect. The matching
+repository ref is read through the authoritative GitHub API, so applying Git URL
+rewrites a second time cannot redirect the observation. A missing ref yields to
+peers; service and rate-limit failures retain effects and stop the batch.
+
+The bounded raw Push scan advances a separate derived per-repository cursor even
+when rows are paused, malformed or have a different head. Later retained effects
+therefore receive observation without claiming a workflow, resetting accounting,
+erasing an uncertain operation or clearing owner controls. Receipt completion
+still rechecks the original protected workflow facts atomically.
+
+New note dispatches check the protected owner pause and pending-input controls
+immediately before the write, after any preceding GitHub read or Push. This is
+separate from the lease/binding guard used to retain genuine completion receipts:
+a completed Push stays observable after a pause even though its next note is
+refused. The fresh CodeRabbit observation uses the same note control boundary.
+An unresolved PR number holds for reconciliation without writing by branch
+selector. Optional comment timeouts/failures remain advisory after authorization.
+
+A bound Push intent now retains its effective Git destination and original ref
+atomically with the operation. Recovery reads that original pair even after
+remote configuration or workflow branch metadata changes. It never relabels an
+unknown legacy pending Push; completed legacy evidence remains historical.
+Destination/ref metadata participates in the immutable operation identity and
+is rechecked when recording a positive observation.
+
+The actual Git transport still uses origin. A private pre-push wrapper rejects
+any different resolved destination, then executes the original pre-push hook
+with unchanged arguments/stdin and the parent's Git configuration. Before
+a new Git dispatch, required CCAT validation checks the configured hook before
+creating its intent. Network
+observations use the verified GitHub Git-data API; local repository observations
+read Git metadata directly, avoiding a second URL rewrite. Empty or multiple
+push destinations are configuration holds, not uncertain new operations.
+
+A ref404 alone does not establish absence. Within each bounded observation
+batch, a successful Git-ref read from the same repository establishes Git-data
+access; otherwise the controller requires a valid main-ref observation. An
+inaccessible main ref, service error or rate limit stops the batch and preserves
+all effects. An authorized absent ref still yields to later observable pushes.

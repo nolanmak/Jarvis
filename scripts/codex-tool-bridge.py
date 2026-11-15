@@ -26,6 +26,33 @@ class Denied(ValueError):
     """An operation is outside the declared profile."""
 
 
+class CommandTimeout(RuntimeError):
+    """Execution failure; neither a profile refusal nor preflight readiness."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:command_timeout The isolated build command reached its '
+                         'execution time limit. Inspect current work and prior results before '
+                         'deciding whether to retry.')
+
+
+class SupervisorFailure(RuntimeError):
+    """The isolated supervisor failed after verified descendant cleanup."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:supervisor_failure The isolated execution supervisor failed. '
+                         'Descendant cleanup was verified. Inspect retained work and execution '
+                         'evidence before deciding whether to retry.')
+
+
+class CleanupUnverified(RuntimeError):
+    """An executed command has no verified descendant-cleanup receipt."""
+
+    def __init__(self):
+        super().__init__('JARVIS_EXECUTION:cleanup_unverified The isolated command stopped without '
+                         'verified descendant cleanup. Preserve retained execution and storage '
+                         'ownership; establish cleanup before starting another build.')
+
+
 class Readiness(Denied):
     """Public diagnostics contain fixed categories, never configuration."""
     MESSAGES = {
@@ -77,6 +104,28 @@ def process_start_time(pid):
     return stat_line.rsplit(')', 1)[1].split()[19]
 
 
+class BuildDirectory:
+    """Explicit lifetime; unknown cleanup suppresses every cleanup callback."""
+    def __init__(self, *, prefix, dir, keep):
+        import tempfile
+        self.name = tempfile.mkdtemp(prefix=prefix, dir=dir)
+        self.keep = keep
+
+    def __enter__(self):
+        return self.name
+
+    def __exit__(self, *_):
+        self.cleanup()
+
+    def cleanup(self):
+        import shutil
+        if not self.keep():
+            try:
+                shutil.rmtree(self.name)
+            except FileNotFoundError:
+                pass
+
+
 class BuildScratch:
     """One bridge session's VM build files under the configured scratch root (#1036).
 
@@ -84,7 +133,8 @@ class BuildScratch:
     the owner record (for the daemon's stale-session sweep), a sparse ext4
     build-cache image that the guest mounts for the Cargo target directory and
     Cargo home (so a session's later builds are incremental), and `tmp/` for
-    each command's snapshot and VM control files. Closing the session removes it.
+    each command's snapshot and VM control files. Closing removes it only when
+    no command has unverified cleanup.
 
     Disk safety: a new session is admitted only if the volume keeps
     HEADROOM_BYTES free after reserving its whole image and every other
@@ -95,6 +145,7 @@ class BuildScratch:
     SESSION_PREFIX = 'jarvis-vm-session-'
     COMPUTE_SESSION_PREFIX = 'jarvis-vm-session-compute-'
     IMAGE_NAME = 'build-cache.img'
+    CLEANUP_MARKER = 'cleanup-pending'
     # One checkout's debug target for a couple of workspace crates is ~9-10 GiB
     # (the burn-down target holding channel-core and cli test builds is 9.4 GiB),
     # plus ~0.8 GiB of Cargo home.
@@ -124,6 +175,118 @@ class BuildScratch:
         self.limits_error = self._seed_limits(limits) if limits is not None else None
         self.statvfs = os.statvfs
         self.session = None
+
+    @staticmethod
+    def _private_bytes(directory, name, limit):
+        descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=directory)
+        with os.fdopen(descriptor,'rb') as stream:
+            info=os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid()
+                    or info.st_nlink!=1 or info.st_mode&0o077 or info.st_size>limit):
+                raise ValueError('cleanup evidence is not private')
+            data=stream.read(limit+1)
+            if len(data)>limit:raise ValueError('cleanup evidence exceeds bound')
+            return data
+
+    def _check_cleanup(self, root_fd, reconcile=False):
+        for name in os.listdir(root_fd):
+            if not name.startswith(self.SESSION_PREFIX):continue
+            try:
+                session=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=root_fd)
+            except (FileNotFoundError,NotADirectoryError):continue
+            try:
+                try:raw=self._private_bytes(session,self.CLEANUP_MARKER,4096)
+                except FileNotFoundError:continue
+                record={};inflight=False
+                try:
+                    record=json.loads(raw)
+                    if not isinstance(record,dict):raise ValueError('invalid cleanup record')
+                    relative=Path(record['receipt'])
+                    if (type(record.get('version')) is not int or record['version']!=1 or len(relative.parts)!=3 or relative.parts[0]!='tmp'
+                            or not relative.parts[1].startswith('jarvis-vm-build-') or relative.parts[2]!='cleanup-complete'):
+                        raise ValueError('invalid cleanup receipt binding')
+                    inflight=record.get('phase')=='inflight'
+                    descriptors=[];parent=session
+                    try:
+                        for component in relative.parts[:-1]:
+                            parent=os.open(component,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+                            descriptors.append(parent)
+                            info=os.fstat(parent)
+                            if info.st_uid!=os.getuid() or info.st_mode&0o077:raise ValueError('untrusted cleanup parent')
+                        valid=self._private_bytes(parent,relative.name,64)==b'all-descendants-reaped\n'
+                    finally:
+                        for descriptor in reversed(descriptors):os.close(descriptor)
+                    if valid:
+                        if reconcile:
+                            os.unlink(self.CLEANUP_MARKER,dir_fd=session);os.fsync(session)
+                        continue
+                except (OSError,ValueError,KeyError,TypeError):pass
+                # A healthy concurrent command is busy, not a failed cleanup.
+                try:
+                    owner=json.loads(self._private_bytes(session,'owner.json',4096))
+                    live=(type(owner['pid']) is int and owner['pid']>0 and isinstance(owner['start_time'],str)
+                          and owner['start_time'].isdecimal() and process_start_time(owner['pid'])==owner['start_time'])
+                except (OSError,ValueError,KeyError,TypeError):live=False
+                if inflight and live:raise Readiness('build_storage_busy')
+                raise CleanupUnverified()
+            except Readiness:
+                raise
+            except (OSError,ValueError,KeyError,TypeError):
+                raise CleanupUnverified() from None
+            finally:os.close(session)
+
+    def check_cleanup(self):
+        import fcntl
+        root_fd=self._open_root()
+        try:
+            fcntl.flock(root_fd,fcntl.LOCK_EX)
+            self._check_cleanup(root_fd,reconcile=True)
+        finally:os.close(root_fd)
+
+    def cleanup_pending(self):
+        if self.session is None:
+            return False
+        try:
+            (self.session/self.CLEANUP_MARKER).lstat()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # Unreadable ownership is unknown, never evidence of cleanup.
+            return True
+
+    def command_cleanup(self, receipt=None, unverified=False):
+        import fcntl
+        root_fd=self._open_root()
+        try:
+            fcntl.flock(root_fd,fcntl.LOCK_EX)
+            session=os.open(self.session.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=root_fd)
+            created=False
+            try:
+                if receipt is None:
+                    os.unlink(self.CLEANUP_MARKER,dir_fd=session)
+                else:
+                    relative=Path(receipt).relative_to(self.session)
+                    flags=os.O_WRONLY|os.O_NOFOLLOW|os.O_CLOEXEC
+                    flags|=os.O_TRUNC if unverified else os.O_CREAT|os.O_EXCL
+                    descriptor=os.open(self.CLEANUP_MARKER,flags,0o600,dir_fd=session)
+                    created=not unverified
+                    with os.fdopen(descriptor,'w') as stream:
+                        json.dump({'version':1,'phase':'unverified' if unverified else 'inflight','receipt':str(relative)},stream)
+                        stream.flush();os.fsync(stream.fileno())
+                os.fsync(session)
+            except BaseException:
+                if created:
+                    # The marker did not commit and vm.run has not been called.
+                    # Roll back only this new reservation, never an existing
+                    # hold or a failed post-launch cleanup update.
+                    try:
+                        os.unlink(self.CLEANUP_MARKER,dir_fd=session);os.fsync(session)
+                    except OSError:
+                        pass  # If storage itself refuses cleanup, retain it.
+                raise
+            finally:os.close(session)
+        finally:os.close(root_fd)
 
     def _seed_limits(self, limits):
         """Seed the per-session limits from the daemon's policy. Return an error
@@ -198,6 +361,7 @@ class BuildScratch:
             os.close(storage)
 
     def _require_space(self, root_fd):
+        self._check_cleanup(root_fd)
         # #1092: fail closed before touching the volume when the operator limits
         # are out of range; no session or image is created.
         if self.limits_error:
@@ -260,6 +424,7 @@ class BuildScratch:
         root_fd = self._open_root()
         try:
             if self.session is not None:
+                self._check_cleanup(root_fd)
                 if not self.cache.is_file():
                     raise Readiness('build_scratch_unavailable', self.session)
                 return self.session
@@ -326,7 +491,7 @@ class BuildScratch:
 
     def close(self):
         import shutil
-        if self.session is not None:
+        if self.session is not None and not self.cleanup_pending():
             shutil.rmtree(self.session, ignore_errors=True)
             self.session = None
 
@@ -1849,6 +2014,7 @@ class Policy:
         if timeout is None:
             timeout = self.build_timeout if build else COMMAND_TIMEOUT_DEFAULT
         try:
+            if runner == 'vm':self._scratch.check_cleanup()
             if runner == 'vm' and self.command_storage is not None:
                 if self._scratch.session is None:
                     self.preflight_builds()
@@ -2088,7 +2254,7 @@ class Policy:
                     # An install can repair a missing or changed dependency tree;
                     # do not require a matching linked-checkout lock first.
                     dependencies = self.local_node_dependencies(self.cwd)
-            with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-', dir=scratch.tmp) as temporary:
+            with BuildDirectory(prefix='jarvis-vm-build-', dir=scratch.tmp,keep=scratch.cleanup_pending) as temporary:
                 snapshot = BuildSnapshot(self, Path(temporary) / 'workspace')
                 view = Policy({'cwd': str(snapshot.root), 'read_roots': [str(snapshot.root)],
                     'allowed_tools': ['Read']})
@@ -2109,10 +2275,25 @@ class Policy:
                     build_environment = {
                         'CARGO_NET_OFFLINE': 'true' if {'--offline', '--frozen'} & set(guest) else 'false'}
                 downloads = {}
+                cleanup_receipt=Path(temporary)/'cleanup-complete'
+                scratch.command_cleanup(cleanup_receipt)
                 self.mark_command_started()
-                result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
-                    node_workspaces=[] if install else dependencies, download_info=downloads,
-                    scratch_dir=str(scratch.tmp), build_cache=build_cache, storage_lease=self._active_command_storage)
+                try:
+                    result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
+                        node_workspaces=[] if install else dependencies, download_info=downloads,
+                        scratch_dir=str(scratch.tmp), build_cache=build_cache, storage_lease=self._active_command_storage,
+                        cleanup_receipt=cleanup_receipt)
+                except vm.CleanupUnverified:
+                    try:scratch.command_cleanup(cleanup_receipt,unverified=True)
+                    except (OSError,ValueError):pass  # The existing marker still holds storage.
+                    raise
+                except BaseException:
+                    # Every actual post-launch exit of vm.run requires proof;
+                    # other failures are either pre-launch or already reaped.
+                    scratch.command_cleanup()
+                    raise
+                else:
+                    scratch.command_cleanup()
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
                     raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
@@ -2120,7 +2301,7 @@ class Policy:
                     # Never install guest-produced executables into the host
                     # checkout. Retain this bridge's private dependency copy and
                     # mount it read-only for subsequent build/test commands.
-                    owner = tempfile.TemporaryDirectory(prefix='jarvis-node-install-', dir=scratch.tmp)
+                    owner = BuildDirectory(prefix='jarvis-node-install-', dir=scratch.tmp,keep=scratch.cleanup_pending)
                     try:
                         roots = []
                         for relative, source in self.local_node_dependencies(snapshot.root):
@@ -2143,6 +2324,14 @@ class Policy:
                         owner.cleanup()
                         raise
                 return result
+        except vm.ExecutionFailed as exc:
+            raise SupervisorFailure() from exc
+        except vm.CleanupUnverified as exc:
+            raise CleanupUnverified() from exc
+        except vm.CommandTimedOut as exc:
+            # Only the controller deadline type gets this public category.
+            # Guest error prose and arbitrary runtime failures stay sanitized.
+            raise CommandTimeout() from exc
         except vm.Unavailable as exc:
             if str(exc) == 'VM build cache is full':
                 raise Readiness('build_cache_full', scratch.cache, 'the session build cache image is full') from exc
@@ -2780,6 +2969,9 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
+            except (CommandTimeout, CleanupUnverified, SupervisorFailure) as error:
+                return {'isError': True, 'content': [{'type': 'text',
+                        'text': runner_prefix(error) + str(error)}]}
             except Readiness as error:
                 content = [{'type': 'text', 'text': runner_prefix(error) + str(error)}]
                 numbers = {key: value for key, value in error.observation.items()
