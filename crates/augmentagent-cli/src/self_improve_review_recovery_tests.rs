@@ -111,7 +111,6 @@ else: raise AssertionError('Unexpected GitHub request: '+repr(args))
         .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", root.path())
         .env("XDG_STATE_HOME", root.path().join("state"))
         .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.path().join("workflow.db"))
-        .env("AUGMENTAGENT_AUTOPR_OPENED_FILE", root.path().join("opened.json"))
         .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner")
         .env("GH_BIN", gh).env(CHILD, &repo).current_dir(&repo).output().await.unwrap();
     assert!(
