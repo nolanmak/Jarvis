@@ -13,6 +13,9 @@ struct ProbeTransport<'a> {
 }
 #[async_trait::async_trait]
 impl Github for ProbeTransport<'_> {
+    async fn authorize_new_merge(&mut self,repository:&str,pr:u64)->Result<()> {
+        self.real.authorize_new_merge(repository,pr).await
+    }
     async fn call(&mut self, args: &[&str]) -> Result<String> {
         if args.starts_with(&["api", "graphql"]) {
             if let Some((branch, head)) = self.race.take() {
@@ -68,7 +71,7 @@ async fn disposable_github_merge_boundary() -> Result<()> {
     let mode = std::env::var("AUTOSHIP_GITHUB_PROBE_MODE")?;
     let pr: u64 = std::env::var("AUTOSHIP_GITHUB_PROBE_PR")?.parse()?;
     let head = std::env::var("AUTOSHIP_GITHUB_PROBE_HEAD")?;
-    let mut real = MergeTransport(&root);
+    let mut real = MergeTransport {root:&root,routing:Some(MergeRouting {automatic:false,source_issue:None})};
     let metadata: serde_json::Value = serde_json::from_str(&real.call(&["api", &format!("repos/{repository}")]).await?)?;
     anyhow::ensure!(metadata["description"] == "Synthetic autoship acceptance fixture; no production source or credentials.", "fixture marker missing");
     let state = root.join(format!("probe-{pr}-{mode}.sqlite3"));
