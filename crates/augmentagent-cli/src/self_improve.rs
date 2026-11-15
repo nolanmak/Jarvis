@@ -64,6 +64,11 @@ mod linked_claim_boundaries;
 #[cfg(test)]
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
+#[cfg(test)]
+#[path = "self_improve_manual_pr_routing_tests.rs"]
+mod manual_pr_routing_tests;
+#[path = "self_improve_manual_routing.rs"]
+mod manual_routing;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
@@ -97,6 +102,8 @@ pub(crate) mod targeted;
 mod acceptance;
 #[path = "self_improve_alignment.rs"]
 mod alignment;
+#[path = "self_improve_push_destination.rs"]
+mod push_destination;
 #[path = "self_improve_publication.rs"]
 mod publication;
 #[path = "self_improve_review.rs"]
@@ -620,17 +627,13 @@ fn configured_ccat_public_push_for(args: &[&str], enabled: bool, remotes: &str) 
 
 fn require_ccat_pre_push_hook(cwd: &Path) -> std::result::Result<(), String> {
     let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(cwd)
-        .output()
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"])
+        .current_dir(cwd).output()
         .map_err(|_| "CCat public push refused: Git metadata is unavailable".to_string())?;
     if !output.status.success() {
         return Err("CCat public push refused: Git metadata is unavailable".into());
     }
-    let common = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let common = Path::new(&common);
-    let common = if common.is_absolute() { common.to_path_buf() } else { cwd.join(common) };
-    let hook = common.join("hooks/pre-push");
+    let hook=PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     let body = std::fs::read_to_string(&hook)
         .map_err(|_| "CCat public push refused: install the CCat pre-push hook first".to_string())?;
     if !body.contains("ccat-public-push-gate.sh") {
@@ -1079,7 +1082,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED).await.ok();
+            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None).await.ok();
             continue;
         }
         if has_open_agent_pr(repo_root, number).await? {
@@ -1686,7 +1689,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
     let adopted = if let Some(target)=selected {
-        adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()]).await
+        adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()],false).await
     } else { adopted_execution::sweep(repo_root,dry_run).await };
     let mut merged = adopted.unwrap_or_else(|error| { warn!("adopted merge reconciliation failed: {error:#}"); 0 });
 
@@ -1712,7 +1715,12 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         let Some(issue) = issue_from_branch(branch).or_else(|| adopted.as_ref().and_then(|owned| owned.source_issue)) else {
             continue;
         };
-        if source_reconcile::reconcile(repo_root, pr, issue, dry_run).await
+        // Routing observations cost network reads even when the PR is excluded.
+        examined += 1;
+        if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+            continue;
+        }
+        if source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
             != source_reconcile::SourceAction::Continue {
             continue;
         }
@@ -1720,8 +1728,6 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        // Past the free filters, so this candidate costs network reads.
-        examined += 1;
         let head_sha = row
             .get("headRefOid")
             .and_then(serde_json::Value::as_str)
@@ -1818,8 +1824,11 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
                 }
                 // Preserve the original state when a merge must be retried.
+                if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                    continue;
+                }
                 let Some(readied) = ready_for_merge(repo_root, pr,
-                    row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
+                    row.get("isDraft").and_then(serde_json::Value::as_bool),||sweep_lease.validate_note_dispatch()).await else {
                     continue;
                 };
                 // Codex: a check can go green-to-red without a new commit —
@@ -1836,7 +1845,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     continue;
                 }
 
-                if source_reconcile::reconcile(repo_root, pr, issue, false).await
+                if source_reconcile::reconcile(repo_root, pr, issue, false, selected.is_none()).await
                     != source_reconcile::SourceAction::Continue {
                     continue;
                 }
@@ -1847,6 +1856,12 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 // `--match-head-commit` makes GitHub refuse instead, which
                 // turns a silent TOCTOU into a failed merge — and a failed
                 // merge restores the draft below.
+                if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                    if readied && sweep_lease.validate_remote(repo_root,pr,&head).await.is_ok() {
+                        let _=run(&gh,&["pr","ready",&pr.to_string(),"--undo"],repo_root).await;
+                    }
+                    continue;
+                }
                 let merge_intent = match sweep_lease.merge_intent() { Ok(intent) => intent, Err(_) => continue };
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep ownership/head changed before merge: {error:#}"); continue;
@@ -1855,7 +1870,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     Ok(lease) => lease,
                     Err(error) => { warn!(pr, "merge lease unavailable: {error:#}"); continue; }
                 };
-                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent,&lease).await;
+                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent,&lease,publication::MergeRouting {automatic:selected.is_none(),source_issue:Some(issue)}).await;
                 if let Ok(Some(receipt)) = &mutation {
                     if let Err(error) = sweep_lease.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt).expect("serializable mutation receipt")) {
                         warn!(pr,"merge response could not be recorded; retain intent: {error:#}");
@@ -1913,12 +1928,15 @@ async fn sweep_merged_exact(repo_root: &Path, pr: u64, expected: &str) -> bool {
 
 /// Return whether this attempt changed a draft to ready. Unknown state or a
 /// failed transition defers merging; an already-ready PR needs no mutation.
-async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Option<bool> {
+async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>, before_dispatch:impl FnOnce()->Result<()>) -> Option<bool> {
     match draft? {
         false => Some(false),
-        true => match run(&gh_bin(), &["pr", "ready", &pr.to_string()], repo_root).await {
-            Ok((true, ..)) => Some(true),
-            _ => None,
+        true => {
+            before_dispatch().ok()?;
+            match run(&gh_bin(), &["pr", "ready", &pr.to_string()], repo_root).await {
+                Ok((true, ..)) => Some(true),
+                _ => None,
+            }
         },
     }
 }
@@ -3191,7 +3209,7 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &wo
 /// Finish an over-cap scope decision after its optional plan has been generated.
 /// Keep the real parent mutation fallback behind the typed child-publication hold.
 async fn finish_scope_refusal(repo:&Path,issue:&Issue,reason:&str,scope_body:&str,plan:&[Slice],
-    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting)->Result<RunReport> {
+    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting,automatic:bool)->Result<RunReport> {
     if let Some(report)=accounting.report()? {return Ok(report);}
     if plan.len()>=MIN_SLICES {
         match file_slices(repo,issue,plan,guard).await {
@@ -3213,7 +3231,9 @@ async fn finish_scope_refusal(repo:&Path,issue:&Issue,reason:&str,scope_body:&st
     if let Some(report)=accounting.report()? {return Ok(report);}
     backoff_comment(repo,issue.number,&format!(
         "Auto-fix triage: refused before building — {reason}.\n\nThe work itself may be sound; it does not fit the unattended pipeline's bounds (focused diff ≤ 600 lines, no deploy/auth/secret/CI paths). Splitting it into smaller issues usually resolves the size case. Remove the `{GAVE_UP_LABEL}` label to re-triage it (for example if the path is only mentioned as background).\n\nScoping spec, for whoever picks this up:\n\n{}",truncate(scope_body,1500))).await.ok();
-    label_gave_up(repo,issue.number,GIVE_UP_SCOPER_PREDICTS_REFUSAL).await.ok();
+    if label_gave_up(repo,issue.number,GIVE_UP_SCOPER_PREDICTS_REFUSAL,automatic,None).await.is_err() {
+        return Ok(RunReport::held(format!("issue #{}: terminal labeling deferred",issue.number)));
+    }
     Ok(RunReport::triage(format!("issue #{}: refused pre-build ({reason}) — labeled out",issue.number)))
 }
 
@@ -4001,6 +4021,7 @@ async fn find_resumable_draft(
     let mut allowed = trusted_authors(repo_root).await;
     if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
     let mut adopted = adoption::authorized(&prs, &repository, &allowed);
+    manual_routing::filter(repo_root, &mut adopted).await;
     if !dry_run {
         if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
             warn!("cannot persist adopted PR ownership: {error:#}");
@@ -6442,7 +6463,11 @@ async fn hold_unreviewable(
     why: &ReviewUnavailable,
     builder_ran: bool,
     dry_run: bool,
+    automatic: bool,
 ) -> RunReport {
+    let routing_allowed=||manual_routing::terminal_allowed(repo_root,issue,Some(pr),automatic);
+    let routing_held=||RunReport::held(format!("PR #{pr}: reviewer stand-down deferred by current controls or routing"));
+    if !routing_allowed().await {return routing_held();}
     let path = unreviewable_path();
     let today = utc_day_now();
     // A verdict that cannot change is not counted: it stands down now.
@@ -6483,6 +6508,7 @@ async fn hold_unreviewable(
     }
     let gh = gh_bin();
     if let Some(body) = &plan.wait_comment {
+        if !routing_allowed().await {return routing_held();}
         let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", body], repo_root).await;
     }
     if let Some(body) = &plan.stand_down {
@@ -6492,8 +6518,10 @@ async fn hold_unreviewable(
         // close WITHOUT the label invites the fresh lane to rebuild over the
         // branch, so a failed label leaves the draft open and unmarked; the
         // next pass (at most once a UTC day) tries again.
-        match label_gave_up(repo_root, issue, &format!("held:{}", why.code())).await {
+        if !routing_allowed().await {return routing_held();}
+        match label_gave_up(repo_root, issue, &format!("held:{}", why.code()), automatic, Some(pr)).await {
             Ok(()) => {
+                if !routing_allowed().await {return routing_held();}
                 close_gave_up_pr(repo_root, pr, issue, body).await;
                 note_stood_down(&path, pr, issue, why);
                 notify_review(&format!(
@@ -6703,6 +6731,37 @@ async fn rabbit_review_now(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitR
     rabbit_findings_for_head(&reviews, &comments, head_sha)
 }
 
+/// The production fresh-publication observation boundary, independently
+/// callable with an existing workflow and scripted GitHub reads.
+async fn record_published_rabbit_observation(repo_root:&Path,workflow_guard:&mut workflow::WorkflowGuard,
+    pr_number:Option<u64>,head_sha:&str,pr_body:&str,_branch:&str,pr_url:&str,issue:u64,
+    automatic_routing:bool)->Result<bool> {
+    let Some(n)=pr_number else {
+        warn!(issue,%pr_url,"could not parse a PR number (no PR number to query); preserving publication for reconciliation");
+        return Ok(false);
+    };
+    let rabbit=if head_sha.is_empty() {
+        warn!(issue,pr=n,"could not read the PR head; CodeRabbit state unavailable");
+        RabbitReview::unavailable("its state could not be read (head lookup failed)")
+    }else {
+        tokio::time::timeout(std::time::Duration::from_secs(5),rabbit_review_now(repo_root,n,head_sha))
+            .await.unwrap_or_else(|_|RabbitReview::unavailable("optional observation timed out"))
+    };
+    let observed=pr_body.replace(RABBIT_NOT_WAITED_FOR,&rabbit_merge_note(&rabbit));
+    if observed!=pr_body {
+        // A read may outlive the authority that permitted it. Recheck after
+        // the read, immediately before this independently optional mutation.
+        if !manual_routing::permit_mutation(repo_root,n,Some(issue),automatic_routing,workflow_guard).await? {
+            return Ok(false);
+        }
+        workflow_guard.validate_note_dispatch()?;
+        if !write_optional_pr_note(repo_root,&n.to_string(),&observed).await {
+            warn!(issue,pr=n,"could not record CodeRabbit's merge-time state in the PR body; it was: {}",rabbit_merge_note(&rabbit));
+        }
+    }
+    Ok(true)
+}
+
 /// #1032 — what the PR body says about CodeRabbit on an auto-merged fresh PR.
 ///
 /// It states the POLICY, not a review state. Codex caught an earlier draft
@@ -6783,10 +6842,16 @@ async fn resume_draft_pr(
     expected_head: Option<&str>,
 ) -> Result<RunReport> {
     let gh = gh_bin();
+    let repository=workflow::canonical_repository(repo_root).await?;
+    if expected_head.is_none() {
+        if !manual_routing::allowed(repo_root,&repository,pr,Some(issue_no)).await {
+            return Ok(RunReport::held("automatic PR routing held".into()));
+        }
+    }
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
-    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run).await;
+    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run, expected_head.is_none()).await;
     if source != source_reconcile::SourceAction::Continue {
         return Ok(RunReport::held(format!("PR #{pr}: source reconciliation {source:?}")));
     }
@@ -6808,6 +6873,10 @@ async fn resume_draft_pr(
         return Ok(RunReport::triage(format!(
             "PR #{pr}: head branch `{branch}` is not on origin; skipped"
         )));
+    }
+
+    if manual_routing::require_terminal_controls(&repository,issue_no,Some(pr)).is_err() {
+        return Ok(RunReport::held(format!("PR #{pr}: resume controls require owner input or remote-effect reconciliation")));
     }
 
     // Whatever happens next counts as today's attempt on this issue, so a
@@ -6913,6 +6982,7 @@ async fn resume_draft_pr(
             &why,
             reasoner.calls() > 0,
             dry_run,
+            expected_head.is_none(),
         )
         .await);
     }
@@ -6931,6 +7001,9 @@ async fn resume_draft_pr(
     let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
     anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
     let environment = format!("resume-workspace-v1\n{}\n{}", std::env::consts::OS, toolchain);
+    if expected_head.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue_no)).await {
+        return Ok(RunReport::held("automatic PR routing held".into()));
+    }
     let Some(mut workflow) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root, worktree: &worktree, repository: &repository,
         source_issue: Some(issue.number), pr: Some(pr), branch,
@@ -7093,41 +7166,30 @@ async fn resume_draft_pr(
                     files.join(", "),
                     truncate(&rs, 600)
                 );
-                workflow.publish_round(
-                    branch,
-                    repo_root,
-                    pr,
-                    0,
-                    "conflict resolution",
-                    &findings,
-                    dry_run,
-                ).await?;
+                if !workflow.publish_round(
+                    branch,repo_root,pr,0,"conflict resolution",&findings,dry_run,
+                    expected_head.is_none(),Some(issue_no),
+                ).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                }
                 conflict_note = Some(format!("Conflict resolution: {}", truncate(&rs, 200)));
             }
             Err(why) => {
                 let _ = run("git", &["merge", "--abort"], &worktree).await;
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                let _ = run(
-                    &gh,
-                    &[
-                        "pr",
-                        "comment",
-                        &pr.to_string(),
-                        "--body",
-                        &format!(
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!(
                             "Auto-resume: this branch no longer merges cleanly with \
                                 `main` and the loop could not resolve it ({why}); it \
                                 needs a human rebase before the loop can pick it up \
                                 again."
-                        ),
-                    ],
-                    repo_root,
-                )
-                .await;
+                        )).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
-                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
                 // Preserve the draft and committed candidates for episode recovery.
                 }
                 let message = format!(
@@ -7175,20 +7237,17 @@ async fn resume_draft_pr(
             // closed, with the way back spelled out on the PR.
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let reason = format!("the diff touches the guarded path `{pattern}`");
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!(
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!(
                       "Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```\n\n\
                        This verdict cannot change on a later tick — the branch's diff is \
                        fixed — so the loop is standing down on this PR rather than \
                        re-refusing it every day. To bring it back: push a diff that avoids \
                        the guarded path, remove the `{GAVE_UP_LABEL}` label from the issue, \
                        and reopen."
-                  )],
-                repo_root,
-            )
-            .await;
+                  )).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
@@ -7202,7 +7261,9 @@ async fn resume_draft_pr(
             )
             .await
             .unwrap_or_else(|_| Tally::uncounted());
-            label_gave_up(repo_root, issue.number, "guard:blast-radius-diff").await.ok();
+            if label_gave_up(repo_root, issue.number, "guard:blast-radius-diff", expected_head.is_none(), Some(pr)).await.is_err() {
+                return Ok(RunReport::held(format!("PR #{pr}: terminal labeling deferred")));
+            }
                 // Preserve the draft and committed candidates for episode recovery.
             return Ok(RunReport::triage(format!(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
@@ -7216,15 +7277,12 @@ async fn resume_draft_pr(
             // on an oversized diff; the next round's only job is to cut.
             if rounds_done >= revise_rounds() {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                let _ = run(
-                    &gh,
-                    &["pr", "comment", &pr.to_string(), "--body",
-                      &format!("Auto-resume refused: diff is {lines_now} lines \
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume refused: diff is {lines_now} lines \
                                 (cap {MAX_DIFF_LINES}) and the revision budget \
-                                is exhausted.")],
-                    repo_root,
-                )
-                .await;
+                                is exhausted.")).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
                 record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:size", &format!("diff is {lines_now} lines (cap {MAX_DIFF_LINES})")))).await.ok();
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: resume refused — oversized after revisions"
@@ -7248,7 +7306,9 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
-                    workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await?;
+                    if !workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                    }
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
@@ -7332,7 +7392,9 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
-                        workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await?;
+                        if !workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                        }
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -7350,19 +7412,16 @@ async fn resume_draft_pr(
                 }
             }
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: verification gate failed against current \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: verification gate failed against current \
                             `main` and the repair budget is exhausted:\n```\n{}\n```",
-                           truncate(&gate_err.to_string(), 1200))],
-                repo_root,
-            )
-            .await;
+                           truncate(&gate_err.to_string(), 1200))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
                 // Preserve the draft and committed candidates for episode recovery.
             }
             return Ok(RunReport::built(format!(
@@ -7390,7 +7449,9 @@ async fn resume_draft_pr(
                             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not commit CI repair: {error}");
                         }
-                        workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await?;
+                        if !workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                        }
                         summary = format!("{summary}\nCI repair: {}", truncate(&rs, 1000));
                         continue;
                     }
@@ -7426,6 +7487,9 @@ async fn resume_draft_pr(
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
                 );
                 if !dry_run {
+                    if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+                    }
                     workflow.push(branch).await?;
                 }
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
@@ -7459,8 +7523,10 @@ async fn resume_draft_pr(
         if independent.available && !independent.notes.is_empty() {
             prior_notes = Some(independent.notes.clone());
             if !dry_run {
-                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
-                    &independent_findings_comment(&independent.notes)], repo_root).await;
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &independent_findings_comment(&independent.notes)).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
             }
         }
         {
@@ -7473,6 +7539,9 @@ async fn resume_draft_pr(
                     // including whether this run is billed, which it is only if a
                     // builder call was actually made.
                     if !dry_run {
+                        if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                            return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+                        }
                         workflow.push(branch).await?;
                     }
                     checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await?;
@@ -7483,6 +7552,7 @@ async fn resume_draft_pr(
                         &why,
                         reasoner.calls() > 0,
                         dry_run,
+                        expected_head.is_none(),
                     )
                     .await);
                 }
@@ -7531,15 +7601,12 @@ async fn resume_draft_pr(
                 // without the full suite passing once (#870).
                 if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await? {
                     workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                    let _ = run(
-                        &gh,
-                        &["pr", "comment", &pr.to_string(), "--body",
-                          &format!("Auto-resume: double LGTM, but the final \
+                    if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: double LGTM, but the final \
                                     full-workspace gate failed:\n```\n{}\n```",
-                                   truncate(&gate_err.to_string(), 1200))],
-                        repo_root,
-                    )
-                    .await;
+                                   truncate(&gate_err.to_string(), 1200))).await? {
+                        return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                    }
                     record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:final-gate", &detail) })).await.ok();
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: LGTM but final full gate failed"
@@ -7578,6 +7645,9 @@ async fn resume_draft_pr(
             let reviewed_head = reviewed_head.trim();
             // Push whatever the rounds committed (the merge-with-main commit
             // included), surface the verdicts, and merge per policy.
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             workflow.push(branch).await?;
             acceptance::assert_receipt_current(&worktree,&prepared_acceptance,&acceptance_receipt).await?;
             // Preserve approval for a future explicit merge authorization too.
@@ -7586,17 +7656,14 @@ async fn resume_draft_pr(
                 workflow.finish()?;
                 return Ok(RunReport::built(format!("PR #{pr}: validated revision published; PR milestone complete")));
             }
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: LGTM from internal reviewers (QA approve; independent: {}) \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: LGTM from internal reviewers (QA approve; independent: {}) \
                             after {rounds_done} revision round(s) against current \
                             `main`.\n\n{}",
                            independent.status(),
-                           truncate(&independent.notes, 2500))],
-                repo_root,
-            )
-            .await;
+                           truncate(&independent.notes, 2500))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             if !policy_allows {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 notify_review(&format!(
@@ -7619,7 +7686,10 @@ async fn resume_draft_pr(
                     .and_then(|v| v.get("isDraft").and_then(serde_json::Value::as_bool)),
                 _ => None,
             };
-            let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
+            let Some(readied) = ready_for_merge(repo_root, pr, draft,||workflow.validate_note_dispatch()).await else {
                 workflow.transition(Stage::AwaitChecks, "ready_state_unavailable", "reconcile_checks", chrono::Utc::now().timestamp_millis()+60_000).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
@@ -7628,11 +7698,20 @@ async fn resume_draft_pr(
             workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
             anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
             acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
+                return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
+            }
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
-            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?).await;
+            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?,publication::MergeRouting {automatic:expected_head.is_none(),source_issue:Some(issue_no)}).await;
             if let Ok(Some(receipt)) = &mutation {
                 workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+            }
+            if mutation.as_ref().err().is_some_and(|error|error.downcast_ref::<manual_routing::Hold>().is_some()) {
+                manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
+                workflow.transition(Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
             }
             let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
             if !publication::merged_exact(repo_root,pr,reviewed_head).await {
@@ -7660,29 +7739,32 @@ async fn resume_draft_pr(
         let open_notes = if qa_ok { independent.notes.clone() } else { qa_notes.clone() };
         if rounds_done >= revise_rounds() {
             // Out of rounds: publish the improved state + verdicts, stay draft.
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             workflow.push(branch).await?;
             if !qa_ok {
-                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;
+                if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &qa_findings_comment(&qa_notes)).await? {
+                    return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+                }
             }
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: no double LGTM after {rounds_done} revision \
+            if !manual_routing::published_note(repo_root,&mut workflow,pr,issue_no,expected_head.is_none(),manual_routing::NoteTarget::Pr,
+                    &format!("Auto-resume: no double LGTM after {rounds_done} revision \
                             round(s) ({}). Revisions were verified against the \
                             changed crates' tests; the full workspace suite \
                             runs before any merge. Latest findings:\n\n{}",
                            notes_log.join("; "),
-                           truncate(&open_notes, 2500))],
-                repo_root,
-            )
-            .await;
+                           truncate(&open_notes, 2500))).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: linked resume note routing held")));
+            }
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
                 // Preserve this PR for the durable adjudication/recovery path.
             }
             notify_review(&format!(
@@ -7743,7 +7825,9 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
-        workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await?;
+        if !workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run, expected_head.is_none(), Some(issue_no)).await? {
+            return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+        }
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
     }.await;
@@ -8142,13 +8226,14 @@ async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<Run
         }).map(Some);
     }
     if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
-        return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report }).map(Some);
+        return adopted_execution::resume_automatic(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report }).map(Some);
     }
 
     Ok(None)
 }
 
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
+    let automatic_routing=selected.is_none();
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
         // Read-only, before lock/state creation, issue selection or model spend.
@@ -8287,7 +8372,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     if red_main_issue.is_none() && lane != Lane::Build && !prefer_build {
         if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
-            return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
+            return adopted_execution::resume_automatic(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
         }
     }
     if lane == Lane::Resume {
@@ -8346,14 +8431,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // label it out of the selection pool immediately. Without this, the
         // unattended loop re-picks the same issue every tick: it head-of-line
         // blocks every other labeled issue and re-comments daily, forever.
-        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR).await.ok();
+        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR, automatic_routing, None).await.ok();
         return Ok(RunReport::triage(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
         )));
     }
 
-    match has_open_agent_pr(repo_root,issue.number).await {
+    match publication::claimed_after_reconcile(repo_root,issue.number,dry_run).await {
         Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
         Err(_)=>return Err(linked_claims::Hold::Unknown.into()),
@@ -8519,7 +8604,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         warn!(issue=issue.number,"slice planning failed: {error:#}");Vec::new()
                     })
             } else {Vec::new()};
-            let result=finish_scope_refusal(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting).await;
+            let result=finish_scope_refusal(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting,automatic_routing).await;
             cleanup(worktree,branch,repo_root.to_path_buf()).await;
             return result;
         }
@@ -8709,7 +8794,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         .await
         .ok();
         if attempts.exhausted() {
-            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: refused — diff hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -8813,7 +8898,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                 return Ok(RunReport::built(format!(
                     "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
                     issue.number
@@ -8935,7 +9020,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9153,7 +9238,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         .await
                         .ok();
                         if attempts.exhausted() {
-                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                         }
                         if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -9195,7 +9280,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9240,7 +9325,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9323,7 +9408,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9375,7 +9460,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9408,7 +9493,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     )
                     .await
                     .ok();
-                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -9539,7 +9624,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                                 let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
                                 if attempts.exhausted() {
-                                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
                                 }
                             }
                             return Ok(RunReport::built(message));
@@ -9565,17 +9650,19 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if park_charged {
             return Ok(RunReport::built(parked_publish_failed(issue.number, "git commit failed", &e)));
         }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }, automatic_routing).await));
     }
     // Compare-and-swap publication preserves concurrent remote work and
     // reconciles successful pushes whose responses were lost.
-    if let Err(error) = workflow_guard.push(&branch).await {
+    if let Err(error) = workflow_guard.push_fresh(repo_root,&branch,automatic_routing).await {
+        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
         let e = format!("{error:#}");
         if park_charged {
             return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
-            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines)).await));
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
     }
     // #1037 — the push landed, plainly or by superseding an orphan above, so
     // the remote branch is now exactly this attempt's work, built from `main`.
@@ -9721,10 +9808,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
     }
-    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args).await;
+    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args, automatic_routing).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
         Err(error) => {
+            if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                workflow_guard.transition(crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                workflow_guard.finish()?;
+                return capacity_accounting.retry_report(format!("issue #{}: fresh PR creation routing held",issue.number));
+            }
             if let Some(report)=linked_claims::report(&error) {return Ok(report);}
             (false, String::new(), format!("{error:#}"))
         },
@@ -9755,24 +9847,24 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
-        let _ = run(&gh, &["pr", "comment", &pr_url, "--body",
-            &independent_findings_comment(&independent.notes)], repo_root).await;
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Pr,&independent_findings_comment(&independent.notes)).await? {
+            return Ok(RunReport::held(format!("issue #{}: publication notes routing held",issue.number)));
+        }
     }
     if let Some(reason) = &park {
         // The findings go where the next builder will read them: on the PR,
         // under a marker resume parses back (#1488 AC3).
-        let _ = run(&gh, &["pr", "comment", &pr_url, "--body", &reason.comment()], repo_root).await;
-        backoff_comment(
-            repo_root,
-            issue.number,
-            &format!(
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Pr,&reason.comment()).await? {
+            return Ok(RunReport::held(format!("issue #{}: parked publication notes routing held",issue.number)));
+        }
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Issue,&format!(
                 "Auto-fix parked its work as a draft PR instead of deleting it: {}. \
-                 The resume lane keeps revising it — {pr_url}",
-                reason.headline()
-            ),
-        )
-        .await
-        .ok();
+                 The resume lane keeps revising it — {pr_url}",reason.headline())).await? {
+            return Ok(RunReport::held(format!("issue #{}: parked source note routing held",issue.number)));
+        }
         notify_review(&format!(
             "📝 auto-PR parked as draft: {} — {pr_url}\n{}",
             issue.title,
@@ -9793,6 +9885,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     if independent.approved() && !repaired_after_review {
         if let Some(pr)=pr_number {
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue.number),automatic_routing,&mut workflow_guard).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
             if workflow_guard.published_pr_ready(pr,&independent).await? {
                 workflow_guard.finish()?;
                 return Ok(RunReport::built(format!("issue #{}: validated PR published; PR milestone complete — {pr_url}",issue.number)));
@@ -9849,69 +9944,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         None => String::new(),
     };
 
-    if pr_number.is_none() {
-        // Codex, system pass: with no parseable PR number the CodeRabbit read
-        // was skipped silently while the merge still went ahead on the branch
-        // name. The read genuinely cannot happen — the reviews endpoint needs
-        // a number — but the RECORD still can: `gh` takes a branch as a PR
-        // selector, which is how the merge below identifies it too. So the
-        // body says the state was unknown rather than keeping a placeholder
-        // that implies it was checked.
-        let unknown =
-            RabbitReview::unavailable("its state could not be read (no PR number to query)");
-        warn!(
-            issue = issue.number,
-            %pr_url,
-            "could not parse a PR number; merging on the double codex LGTM \
-             without reading CodeRabbit's state"
-        );
-        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&unknown));
-        if observed != pr_body {
-            let _ = write_optional_pr_note(repo_root, &branch, &observed).await;
-        }
-    }
-    if let Some(n) = pr_number {
-        // A failed head lookup is NOT silence. The owner directive is that a
-        // double codex LGTM is the bar and CodeRabbit is advisory, so a
-        // transient GitHub error must not strand a PR the gate and two
-        // independent reviewers approved — that is the sitting-draft problem
-        // this issue exists to end. But it is recorded rather than swallowed,
-        // so a merge taken without CodeRabbit's state is visible as such.
-        let rabbit = if head_sha.is_empty() {
-            warn!(
-                issue = issue.number,
-                pr = n,
-                "could not read the PR head; merging on the double codex LGTM \
-                 without CodeRabbit's state"
-            );
-            RabbitReview::unavailable("its state could not be read (head lookup failed)")
-        } else {
-            tokio::time::timeout(std::time::Duration::from_secs(5),
-                rabbit_review_now(repo_root, n, &head_sha)).await
-                .unwrap_or_else(|_| RabbitReview::unavailable("optional observation timed out"))
-        };
-        // Not blocking, so this merge is going ahead. Replace the placeholder
-        // policy line with what the read actually found, so the body records
-        // CodeRabbit's state AT MERGE TIME rather than the same sentence
-        // whether it was silent, rate-limited, or had reviewed and found
-        // nothing. Best-effort: a failed edit must never hold up a merge the
-        // gate and two reviewers already approved.
-        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
-        if observed != pr_body {
-            let edited = write_optional_pr_note(repo_root, &n.to_string(), &observed).await;
-            if !edited {
-                // Explicit, not swallowed: the body keeps the placeholder, so
-                // say in the log what the body could not. Still merging — the
-                // approval that matters already happened.
-                warn!(
-                    issue = issue.number,
-                    pr = n,
-                    "could not record CodeRabbit's merge-time state in the PR \
-                     body; it was: {}",
-                    rabbit_merge_note(&rabbit)
-                );
-            }
-        }
+    if !record_published_rabbit_observation(repo_root,&mut workflow_guard,pr_number,&head_sha,&pr_body,
+        &branch,&pr_url,issue.number,automatic_routing).await? {
+        return Ok(RunReport::held("fresh publication observation note held".into()));
     }
 
     // Persisted approval lets the free sweep finish when CI catches up.
@@ -9926,17 +9961,24 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             issue.number
         )));
     }
-    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false).await
+    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false, automatic_routing).await
         != source_reconcile::SourceAction::Continue {
         return Ok(RunReport::built(format!("issue #{}: source changed before merge; reconciliation retained — {pr_url}", issue.number)));
+    }
+    if !manual_routing::permit_mutation(repo_root,pr_number.unwrap(),Some(issue.number),automatic_routing,&mut workflow_guard).await? {
+        return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     workflow_guard.validate_binding(workflow_guard.binding()).await?;
     acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
-    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?).await;
+    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?,publication::MergeRouting {automatic:automatic_routing,source_issue:Some(issue.number)}).await;
     if let Ok(Some(receipt)) = &mutation {
         workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+    }
+    if mutation.as_ref().err().is_some_and(|error|error.downcast_ref::<manual_routing::Hold>().is_some()) {
+        workflow_guard.transition(crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+        return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     let ok = mutation.is_ok();
     let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
@@ -10013,6 +10055,7 @@ async fn record_hard_failure(
     what: &str,
     err: &str,
     rec: AttemptRecord,
+    automatic:bool,
 ) -> String {
     let attempts = record_attempt(repo_root, issue, Some(rec)).await.unwrap_or_else(|_| Tally::uncounted());
     warn!(issue, attempts = attempts.n, "self-improve: {what}: {err}");
@@ -10029,7 +10072,7 @@ async fn record_hard_failure(
         )
         .await
         .ok();
-        label_gave_up(repo_root, issue, attempts.reason()).await.ok();
+        label_gave_up(repo_root, issue, attempts.reason(), automatic, None).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
@@ -10527,7 +10570,7 @@ async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()>
     Ok(())
 }
 
-async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str) -> Result<()> {
+async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str, automatic:bool, pr:Option<u64>) -> Result<()> {
     let gh = gh_bin();
     // #1214 — the reason first: a labelled issue always says why, and a
     // reason comment on an issue whose label then failed is harmless.
@@ -10536,7 +10579,9 @@ async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str) -> Result<()>
          Remove the `{GAVE_UP_LABEL}` label, or run `augmentagent autopr readmit --reason <code>`, \
          to put it back in the pool."
     );
+    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before reason comment");
     let _ = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
+    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before label");
     // #1037 L1 — the exit status is the answer: a caller that closes a draft
     // only once the label is on has to know when it is not.
     let (ok, _out, err) = run(
@@ -17906,8 +17951,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let abort = body.find(r#""merge", "--abort""#).expect("abort call");
         let after = &body[abort..];
         let ret = after
-            .find("return Ok(RunReport::")
-            .expect("return after abort");
+            .find("return Ok(if builder_ran")
+            .expect("accounted return after abort");
         let arm = &after[..ret];
         assert!(
             arm.contains("record_attempt("),
@@ -18151,14 +18196,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // the head lookup failed, the GitHub call failed, or the PR number
         // could not be parsed at all.
         let src = include_str!("self_improve.rs");
-        let start = src.find("async fn run_selected(").expect("run_once");
+        let start = src.find("async fn record_published_rabbit_observation(").expect("production observation boundary");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        // The no-number path cannot READ CodeRabbit (the endpoint needs a
-        // number) but must still RECORD that, via the branch selector `gh`
-        // accepts — the same one the merge itself uses.
-        let no_num = body.find("no PR number to query").expect("state must be named");
-        let edit = body[no_num..].find("write_optional_pr_note(repo_root, &branch");
-        assert!(edit.is_some(), "record it on the PR by branch, not only in a log");
+        // An unknown PR identity cannot safely use a branch selector to write.
+        // It must hold before any review read or public note dispatch.
+        let no_num=body.find("let Some(n)=pr_number else").expect("identity check");
+        let read=body.find("rabbit_review_now(").expect("review read");
+        assert!(body[no_num..read].contains("return Ok(false)"));
+        assert!(!body.contains("write_optional_pr_note(repo_root, &branch"));
 
         for stated in [
             "could not be read (head lookup failed)",
@@ -18755,6 +18800,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 .args(["--exact", "self_improve::tests::give_up_happens_only_when_stuck_against_scripted_gh", "--nocapture"])
                 .env(CHILD, "1")
                 .env("JARVIS_1214_ROOT", root.path())
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
                 .env("HOME", root.path().join("home"))
                 .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.path().join("state"))
                 .env("GH_BIN", gh)
@@ -18800,7 +18846,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert_eq!(t.n, 2, "the infra failure was not counted");
             assert!(t.exhausted());
             assert_eq!(t.reason(), format!("stuck:gate-red:{fp}"));
-            label_gave_up(&repo, 71002, t.reason()).await.unwrap();
+            label_gave_up(&repo, 71002, t.reason(), false, None).await.unwrap();
             let log = calls();
             assert!(log.contains("--add-label"), "{log}");
             let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
@@ -18824,6 +18870,8 @@ def load(n):
     return json.loads(p.read_text()) if p.exists() else []
 if args[:2]==['issue','view'] and '--json' in args:
     print(json.dumps({'comments':[{'body':b} for b in load(args[2])]}))
+elif args[:2]==['repo','view']:
+    print('fixture-owner/repo')
 elif args[:2]==['issue','comment']:
     n = args[2]; body = args[args.index('--body')+1]
     store(n).write_text(json.dumps(load(n)+[body]))
@@ -19152,7 +19200,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         }
         let start = prod.find("async fn label_gave_up(").expect("label_gave_up");
         let body = &prod[start..start + prod[start..].find("\n}\n").unwrap()];
-        assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str)"), "{}", &body[..80]);
+        assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str,"), "{}", &body[..80]);
         let noted = body.find("GAVE_UP_REASON_MARKER_PREFIX").expect("records the reason");
         let labelled = body.find("\"--add-label\"").unwrap();
         assert!(noted < labelled, "the reason is recorded before the label goes on");
@@ -19612,13 +19660,13 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let at = body
             .find("if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {")
             .expect("blast-radius arm");
-        let ret = at + body[at..].find("return Ok(RunReport::").expect("arm return");
+        let ret = at + body[at..].find("return Ok(RunReport::triage(").expect("accounted arm return");
         let arm = &body[at..ret];
         assert!(arm.contains("record_attempt("), "the attempt must be recorded");
         assert!(arm.contains("label_gave_up("), "and the issue labelled out");
         assert!(!arm.contains("close_gave_up_pr("), "guard refusal must preserve the PR and branch");
         assert!(
-            body[ret..].starts_with("return Ok(RunReport::triage("),
+            body[ret..].starts_with("return Ok(RunReport::triage(") || body[ret..].starts_with("return Ok(RunReport::held("),
             "no builder ran, so the refusal must be unbilled"
         );
     }
@@ -20164,7 +20212,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find("workflow_guard.push(&branch)").expect("guarded compare-and-swap push");
+        let force = body.find("workflow_guard.push_fresh(repo_root,&branch,automatic_routing)").expect("guarded fresh compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
         let create = body.find(r#""pr", "create""#).expect("PR creation");
@@ -20189,16 +20237,33 @@ with (root/'gh-calls.jsonl').open('a') as log:
     log.write(json.dumps(args)+'\n')
 if args[:1]==['api'] and '/issues/' in args[1]:
     number=int(args[1].rsplit('/',1)[1])
+    completed=(root/'source-completed').exists()
+    if completed:(root/'manual-now').write_text('owner changed routing during source observation')
+    late=(root/'manual-now').exists() and not completed
+    if late and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text()=='unavailable-after-reason' and '{owner}' not in args[1]:sys.exit(1)
     print(json.dumps({'number':number,'title':'Synthetic casing rule','body':'Synthetic issue body.',
-        'state':'open','user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
+        'state':'closed' if completed else 'open','state_reason':'completed' if completed else None,
+        'labels':[{'name':'autoship-manual'}] if late else [],'user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
 elif args[:2]==['repo','view']:
     print('synthetic-owner/synthetic')
 elif args[:2]==['pr','view']:
-    print(json.dumps({'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
+    fields=args[args.index('--json')+1] if '--json' in args else ''
+    if fields=='body' and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text() in ('manual','unavailable'):
+        (root/'manual-now').write_text('owner changed routing after admission')
+    late=(root/'manual-now').exists() and 'labels' in fields
+    if late and (root/'inject-manual-after-entry').read_text() in ('unavailable','unavailable-after-label','unavailable-after-reason'):sys.exit(1)
+    print(json.dumps({'number':int(args[2]),'labels':[{'name':'autoship-manual'}] if late else [],'closingIssuesReferences':[],
+        'state':'CLOSED' if (root/'closed-pr').exists() else 'OPEN','headRefName':'agent-fix/issue-70994','isCrossRepository':False,
+        'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
 elif args[:2]==['issue','edit'] and (root/'fail-label').exists():
     sys.stderr.write('synthetic label failure\n')
     sys.exit(1)
-elif args[:2] in (['pr','comment'],['pr','close'],['issue','edit']):
+elif args[:2] in (['pr','comment'],['pr','close'],['issue','edit'],['issue','comment']):
+    if args[:2]==['issue','comment'] and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text().endswith('after-reason'):
+        (root/'manual-now').write_text('owner changed routing during reason comment')
+    if args[:2]==['pr','close'] and (root/'source-completed').exists():(root/'closed-pr').write_text('closed')
+    if args[:2]==['issue','edit'] and (root/'inject-manual-after-entry').exists() and (root/'inject-manual-after-entry').read_text().endswith('after-label'):
+        (root/'manual-now').write_text('owner changed routing after label dispatch')
     print('ok')
 else:
     sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n')
@@ -20218,6 +20283,7 @@ else:
             .env("JARVIS_1037_ROOT", root)
             .env("HOME", root.join("home"))
             .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.join("state"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("workflow.db"))
             .env("GH_BIN", fake_gh_1037(root))
             .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "synthetic-owner")
             .env("AUGMENTAGENT_GH_OWNER", "synthetic-owner")
@@ -20289,6 +20355,141 @@ else:
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn source_retirement_rechecks_automatic_routing_but_still_observes_external_closure() {
+        const NAME:&str="self_improve::tests::source_retirement_rechecks_automatic_routing_but_still_observes_external_closure";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            let fixture=tempfile::tempdir().unwrap();run_1037_child(NAME,fixture.path());return;
+        };
+        std::fs::write(root.join("inject-manual-after-entry"),"manual-source-close").unwrap();
+        std::fs::write(root.join("source-completed"),b"completed").unwrap();
+        let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
+        let remote=root.join("remote.git");
+        let head=std::process::Command::new("git").args(["--git-dir",remote.to_str().unwrap(),"rev-parse",&branch]).output().unwrap();
+        assert!(head.status.success());let head=String::from_utf8(head.stdout).unwrap();
+        record_opened_pr(&opened_prs_path(),70994,71000,head.trim(),None);
+        assert!(manual_routing::allowed(&repo,"synthetic-owner/synthetic",71000,Some(70994)).await);
+        let result=source_reconcile::reconcile(&repo,71000,70994,false,true).await;
+        assert!(matches!(result,source_reconcile::SourceAction::Hold(_)),
+            "automatic source retirement closed a newly manual PR: {result:?}");
+        assert!(!gh_calls_1037(&root).iter().any(|c|gh_call_is(c,&["pr","close"])));
+        let path=workflow::path();let mut store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        for id in ["synthetic-owner/synthetic#70994","synthetic-owner/synthetic/pr/71000"] {
+            store.register(id,&branch,crate::autoship_workflow::Binding {head:head.trim().into(),contract:"request".into(),evidence_hash:"evidence".into()},1).unwrap();
+            store.set_owner_pause(id,"github:synthetic-owner",0,true,2).unwrap();
+            assert!(matches!(source_reconcile::reconcile(&repo,71000,70994,false,false).await,source_reconcile::SourceAction::Hold(_)),
+                "explicit routing bypassed the existing owner pause");
+            assert!(!gh_calls_1037(&root).iter().any(|c|gh_call_is(c,&["pr","close"])));
+            store.set_owner_pause(id,"github:synthetic-owner",1,false,3).unwrap();
+        }
+        assert_eq!(source_reconcile::reconcile(&repo,71000,70994,false,false).await,source_reconcile::SourceAction::Retired,
+            "routing label revoked explicit source retirement");
+        let calls=gh_calls_1037(&root).iter().filter(|c|gh_call_is(c,&["pr","close"])).count();
+        assert_eq!(source_reconcile::reconcile(&repo,71000,70994,false,true).await,source_reconcile::SourceAction::Retired,
+            "manual routing prevented observation of an already-closed target");
+        assert_eq!(gh_calls_1037(&root).iter().filter(|c|gh_call_is(c,&["pr","close"])).count(),calls,
+            "terminal observation repeated an external close");
+    }
+
+    #[tokio::test]
+    async fn stand_down_preflight_honors_owner_pause_and_pending_effects_for_both_routes() {
+        const NAME:&str="self_improve::tests::stand_down_preflight_honors_owner_pause_and_pending_effects_for_both_routes";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            for target in ["issue","pr","alias"] {for fault in ["pause","push","merge"] {for automatic in [true,false] {
+                let fixture=tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("terminal-control.json"),serde_json::to_vec(&(target,fault,automatic)).unwrap()).unwrap();
+                run_1037_child(NAME,fixture.path());
+            }}}
+            return;
+        };
+        let (target,fault,automatic):(String,String,bool)=serde_json::from_slice(&std::fs::read(root.join("terminal-control.json")).unwrap()).unwrap();
+        let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
+        let head=std::process::Command::new("git").args(["--git-dir",root.join("remote.git").to_str().unwrap(),"rev-parse",&branch]).output().unwrap();
+        assert!(head.status.success());let head=String::from_utf8(head.stdout).unwrap();
+        let path=workflow::path();let mut store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        let id=match target.as_str() {"issue"=>"synthetic-owner/synthetic#70994","pr"=>"synthetic-owner/synthetic/pr/71000",_=>"synthetic-owner/synthetic#70993"};
+        let binding=crate::autoship_workflow::Binding {head:head.trim().into(),contract:"request".into(),evidence_hash:"evidence".into()};
+        store.register(id,&branch,binding.clone(),1).unwrap();let lease=store.claim(id,"retained-owner",2,1000).unwrap().unwrap();
+        if target=="alias" {store.attach_pr_in_repo(&lease,"synthetic-owner/synthetic",71000,3).unwrap();}
+        store.charge(&lease,"past-work",crate::autoship_workflow::ResourceCharge {model_calls:9,tokens:1234,wall_ms:700},4).unwrap();
+        if fault=="pause" {store.set_owner_pause(id,"github:synthetic-owner",0,true,5).unwrap();}
+        else {store.begin_operation(&lease,if fault=="push" {crate::autoship_workflow::OperationKind::Push}else{crate::autoship_workflow::OperationKind::MergePr},&binding,5).unwrap();}
+        store.release(&lease,6).unwrap();let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();let pending=store.pending_operations(id).unwrap();
+        let ledger_before=std::fs::read(attempt_ledger_path()).ok();
+        let reasoner=build_reasoner();
+        let result=resume_draft_pr(&repo,&reasoner,71000,70994,&branch,false,if automatic {None}else{Some(head.trim())}).await.unwrap();
+        assert_eq!(std::fs::read(attempt_ledger_path()).ok(),ledger_before,
+            "protected preflight changed the same-day attempt ledger: {target}/{fault}/automatic={automatic}");
+        let calls=gh_calls_1037(&root);
+        assert!(!calls.iter().any(|c|gh_call_is(c,&["issue","comment"]) || gh_call_is(c,&["issue","edit"]) || gh_call_is(c,&["pr","comment"]) || gh_call_is(c,&["pr","close"])),
+            "reviewer preflight dispatched stand-down despite {target}/{fault}/automatic={automatic}: {calls:?}");
+        assert!(result.is_idle() && !result.billed);assert_eq!(reasoner.calls(),0);
+        assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
+        assert_eq!(serde_json::to_vec(&store.pending_operations(id).unwrap()).unwrap(),serde_json::to_vec(&pending).unwrap(),"stand-down reconciled or erased an uncertain remote effect");
+    }
+
+    #[tokio::test]
+    async fn late_issue_routing_blocks_terminal_label_after_its_reason_comment() {
+        const NAME:&str="self_improve::tests::late_issue_routing_blocks_terminal_label_after_its_reason_comment";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            for mode in ["manual-after-reason","unavailable-after-reason"] {
+                let fixture=tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("inject-manual-after-entry"),mode).unwrap();
+                run_1037_child(NAME,fixture.path());
+            }
+            return;
+        };
+        let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
+        assert!(label_gave_up(&repo,70994,"held:synthetic",true,None).await.is_err());
+        let calls=gh_calls_1037(&root);
+        assert_eq!(calls.iter().filter(|c|gh_call_is(c,&["issue","comment"])).count(),1,
+            "actual reason comment did not precede the routing change");
+        assert!(!calls.iter().any(|c|gh_call_is(c,&["issue","edit"])),"terminal label ignored a late issue routing change");
+        let before=calls.len();
+        label_gave_up(&repo,70994,"held:synthetic",false,None).await.unwrap();
+        assert!(gh_calls_1037(&root)[before..].iter().any(|c|gh_call_is(c,&["issue","edit"])),
+            "automatic routing revoked explicit manual labeling");
+    }
+
+    #[tokio::test]
+    async fn late_manual_routing_blocks_stand_down_without_revoking_explicit_targeting() {
+        const NAME:&str="self_improve::tests::late_manual_routing_blocks_stand_down_without_revoking_explicit_targeting";
+        let Some(root)=std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            for mode in ["manual","unavailable","manual-after-label","unavailable-after-label","manual-after-reason","unavailable-after-reason"] {
+                let fixture=tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("inject-manual-after-entry"),mode).unwrap();
+                run_1037_child(NAME,fixture.path());
+            }
+            return;
+        };
+        let branch=format!("{BRANCH_PREFIX}70994");
+        let repo=fixture_repo_1037(&root,&[&branch]);
+        let reasoner=build_reasoner();
+        let held=resume_draft_pr(&repo,&reasoner,71000,70994,&branch,false,None).await.unwrap();
+        assert!(root.join("manual-now").exists(),"fixture never changed routing after entry");
+        let calls=gh_calls_1037(&root);
+        let after_label=std::fs::read_to_string(root.join("inject-manual-after-entry")).unwrap().ends_with("after-label");
+        assert!(!calls.iter().any(|c|gh_call_is(c,&["pr","close"]) || gh_call_is(c,&["pr","comment"])),
+            "automatic stand-down mutated a newly manual/unknown PR: {calls:?}");
+        assert_eq!(calls.iter().any(|c|gh_call_is(c,&["issue","edit"])),after_label,
+            "a label already dispatched must be preserved, without admitting the close");
+        assert!(held.is_idle() && !held.billed,"routing refusal must remain an unpaid hold");
+        assert_eq!(reasoner.calls(),0);
+        assert!(read_unreviewable(&root.join("unreviewable.json")).is_empty(),"manual routing created stand-down debt");
+        let before=calls.len();
+        let explicit_reasoner=build_reasoner();
+        let remote=root.join("remote.git");
+        let head=std::process::Command::new("git").args(["--git-dir",remote.to_str().unwrap(),"rev-parse",&branch]).output().unwrap();
+        assert!(head.status.success());let head=String::from_utf8(head.stdout).unwrap();
+        let explicit=resume_draft_pr(&repo,&explicit_reasoner,71000,70994,&branch,false,Some(head.trim())).await.unwrap();
+        assert!(!explicit.billed);
+        let calls=gh_calls_1037(&root);
+        assert!(calls[before..].iter().any(|c|gh_call_is(c,&["issue","edit"])),"explicit result: {}; calls: {:?}",explicit.message,&calls[before..]);
+        assert!(calls[before..].iter().any(|c|gh_call_is(c,&["pr","close"])),"automatic routing revoked explicit targeting");
+        assert_eq!(reasoner.calls(),0);
+        assert_eq!(explicit_reasoner.calls(),0);
     }
 
     /// C5 — the currently open pre-deploy draft, as a synthetic fixture: an
@@ -20385,7 +20586,7 @@ else:
         let when = until.format("%Y-%m-%d %H:%M UTC").to_string();
         assert!(why.headline().contains(&format!("reviewer latched until {when}")), "{}", why.headline());
 
-        let first = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        let first = hold_unreviewable(&root, 71001, 70995, &why, false, false, false).await;
         assert!(!first.billed && first.is_idle(), "{}", first.message);
         let calls = gh_calls_1037(&root);
         let wait = calls.iter().find(|c| gh_call_is(c, &["pr", "comment", "71001"])).expect("the wait is explained");
@@ -20399,7 +20600,7 @@ else:
         record.get_mut("71001").expect("today was counted").days = vec![today - 2, today - 1];
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 
-        let third = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        let third = hold_unreviewable(&root, 71001, 70995, &why, false, false, false).await;
         assert!(!third.billed, "{}", third.message);
         assert!(third.message.contains("still draft"), "{}", third.message);
         let calls = gh_calls_1037(&root);
@@ -20489,7 +20690,7 @@ else:
         };
         std::fs::write(root.join("fail-label"), b"").unwrap();
         let why = ReviewUnavailable::ProvenanceUnknown;
-        let first = hold_unreviewable(&root, 71007, 70997, &why, false, false).await;
+        let first = hold_unreviewable(&root, 71007, 70997, &why, false, false, false).await;
         let calls = gh_calls_1037(&root);
         assert!(calls.iter().any(|c| gh_call_is(c, &["issue", "edit", "70997"])), "the label was attempted");
         assert!(!calls.iter().any(|c| gh_call_is(c, &["pr", "close"])), "no close without the label: {calls:?}");
@@ -20498,7 +20699,7 @@ else:
 
         // The label works next time: now it stands down.
         std::fs::remove_file(root.join("fail-label")).unwrap();
-        let second = hold_unreviewable(&root, 71007, 70997, &why, false, false).await;
+        let second = hold_unreviewable(&root, 71007, 70997, &why, false, false, false).await;
         assert!(gh_calls_1037(&root).iter().any(|c| gh_call_is(c, &["pr", "close", "71007"])));
         assert!(!second.billed && !second.is_idle(), "{}", second.message);
     }
@@ -21126,7 +21327,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 let plan=vec![Slice{title:"Round small values".into(),body:"Cover small widget values.".into()},
                     Slice{title:"Round large values".into(),body:"Cover large widget values.".into()}];
                 let accounting=guard.capacity_accounting(false).unwrap();
-                let report=finish_scope_refusal(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting).await.unwrap();
+                let report=finish_scope_refusal(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting,false).await.unwrap();
                 assert!(report.is_idle());assert!(!report.billed);
                 assert_eq!(report.message,linked_claims::Hold::Claimed.to_string());
             }

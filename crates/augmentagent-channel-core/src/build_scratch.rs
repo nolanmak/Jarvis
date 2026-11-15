@@ -403,6 +403,41 @@ pub fn sweep_compute_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime
     sweep_matching(root, procs, now, COMPUTE_SESSION_PREFIX)
 }
 
+/// The private marker binds one command to a receipt outside guest-writable
+/// workspace/control mounts. Its absence differs from unreadable evidence.
+fn cleanup_hold_verified(dir:&Path)->Option<bool> {
+    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    use std::io::Read;
+    fn private_bytes(path:&Path,limit:u64)->Option<Vec<u8>> {
+        let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path).ok()?;
+        let meta=file.metadata().ok()?;
+        if !meta.is_file() || meta.uid()!=unsafe {libc::getuid()} || meta.nlink()!=1 || meta.mode()&0o077!=0 || meta.len()>limit {return None;}
+        let mut data=Vec::new();file.take(limit+1).read_to_end(&mut data).ok()?;
+        (data.len() as u64<=limit).then_some(data)
+    }
+    let marker=dir.join("cleanup-pending");
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return None,
+        Err(_)=>return Some(false),Ok(_)=>(),
+    }
+    let verified=(||->Option<bool>{
+        let record:serde_json::Value=serde_json::from_slice(&private_bytes(&marker,4096)?).ok()?;
+        if record["version"].as_u64()!=Some(1) {return None;}
+        let relative=Path::new(record["receipt"].as_str()?);
+        let parts=relative.components().collect::<Vec<_>>();
+        if parts.len()!=3 || parts[0]!=Component::Normal(std::ffi::OsStr::new("tmp"))
+            || !matches!(parts[1],Component::Normal(value) if value.to_str().is_some_and(|name|name.starts_with("jarvis-vm-build-")))
+            || parts[2]!=Component::Normal(std::ffi::OsStr::new("cleanup-complete")) {return None;}
+        let mut parent=dir.to_path_buf();
+        for part in &parts[..2] {
+            parent.push(part.as_os_str());let meta=std::fs::symlink_metadata(&parent).ok()?;
+            if !meta.is_dir() || meta.uid()!=unsafe {libc::getuid()} || meta.mode()&0o077!=0 {return None;}
+        }
+        Some(private_bytes(&parent.join("cleanup-complete"),64)?==b"all-descendants-reaped\n")
+    })().unwrap_or(false);
+    Some(verified)
+}
+
 fn sweep_matching(root: &Path, procs: &dyn ProcessTable, now: SystemTime, prefix: &str) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
     let mut report = SweepReport::default();
@@ -421,6 +456,15 @@ fn sweep_matching(root: &Path, procs: &dyn ProcessTable, now: SystemTime, prefix
         if owner_is_live(&dir, procs, now) {
             report.kept_live += 1;
             continue;
+        }
+        if let Some(verified)=cleanup_hold_verified(&dir) {
+            // Never kill the subreaper to manufacture cleanup. Only the bound
+            // supervisor receipt, with no conflicting live process, releases
+            // a retained session after its bridge owner has exited.
+            if !verified || procs.vm_processes_using(&dir).iter().any(|(pid,start)|procs.is_live(*pid,start)) {
+                report.cleanup_unverified+=1;
+                continue;
+            }
         }
         let compute = name.to_str().is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
         let mut verified = true;
@@ -461,7 +505,7 @@ pub fn sweep_and_log() {
     }
     let report = sweep_with(&root, &ProcFs, SystemTime::now());
     tracing::info!(removed = report.removed, kept_live = report.kept_live, killed = report.killed,
-        root = %root.display(), "build scratch sweep (#1036)");
+        cleanup_unverified = report.cleanup_unverified, root = %root.display(), "build scratch sweep (#1036)");
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -497,6 +541,43 @@ mod tests {
             std::fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn cleanup_pending_session_survives_dead_owner_and_sweep() {
+        let root=tempfile::tempdir().unwrap();let mut procs=FakeProcs::default();
+        for prefix in [SESSION_PREFIX,COMPUTE_SESSION_PREFIX] {
+            let dir=session(root.path(),&format!("{prefix}unknown-cleanup"),Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+            std::fs::write(dir.join("cleanup-pending"),"supervisor receipt required\n").unwrap();
+            procs.running.insert(100,"running".into());procs.vms.push((100,"running".into(),dir.clone()));
+            let report=sweep_with(root.path(),&procs,SystemTime::now());
+            assert!(dir.is_dir(),"sweeper deleted unverified VM control/workspace state");
+            assert_eq!(report.removed,0);assert!(report.cleanup_unverified>0);
+            assert!(procs.killed.borrow().is_empty(),"sweeper killed the subreaper instead of preserving unknown cleanup");
+        }
+    }
+
+    #[test]
+    fn cleanup_hold_requires_exact_private_bound_receipt_before_sweep() {
+        use std::os::unix::fs::{PermissionsExt,symlink};
+        for fault in ["missing","wrong-bytes","public","symlink","live-process","none"] {
+            let root=tempfile::tempdir().unwrap();let mut procs=FakeProcs::default();
+            let dir=session(root.path(),"jarvis-vm-session-held",Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+            let private=dir.join("tmp/jarvis-vm-build-held");std::fs::create_dir_all(&private).unwrap();
+            for path in [dir.join("tmp"),private.clone()] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+            let marker=dir.join("cleanup-pending");std::fs::write(&marker,serde_json::json!({"version":1,"receipt":"tmp/jarvis-vm-build-held/cleanup-complete"}).to_string()).unwrap();
+            std::fs::set_permissions(&marker,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let receipt=private.join("cleanup-complete");
+            if fault!="missing" {
+                std::fs::write(&receipt,if fault=="wrong-bytes" {b"all-descendants-reaped\r\n".as_slice()} else {b"all-descendants-reaped\n".as_slice()}).unwrap();
+                std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(if fault=="public" {0o644} else {0o600})).unwrap();
+                if fault=="symlink" {let other=private.join("other");std::fs::rename(&receipt,&other).unwrap();symlink(&other,&receipt).unwrap();}
+            }
+            if fault=="live-process" {procs.running.insert(100,"running".into());procs.vms.push((100,"running".into(),dir.clone()));}
+            let report=sweep_with(root.path(),&procs,SystemTime::now());
+            assert_eq!(dir.exists(),fault!="none","{fault}: cleanup proof boundary");
+            assert_eq!(report.removed,usize::from(fault=="none"));assert!(procs.killed.borrow().is_empty());
+        }
     }
 
     /// A session's age decides its grace, so pin the mtime instead of betting a
