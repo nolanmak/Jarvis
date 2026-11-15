@@ -340,3 +340,44 @@ async fn foreign_and_symlinked_checkouts_never_receive_workflow_authority() {
         );
     }
 }
+
+#[tokio::test]
+async fn preparation_hooks_cannot_copy_owner_files_into_candidates() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = repository();
+    std::fs::write(root.path().join("private-owner-note"), "owner bytes").unwrap();
+    let hook = root.path().join(".git/hooks/post-checkout");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncp '{}' injected-owner-note\n",
+            root.path().join("private-owner-note").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let controller = prepare(root.path(), "build").await.unwrap();
+    let candidate = candidate_parent(root.path())
+        .await
+        .unwrap()
+        .join("build-issue-991");
+    recovery::prepare(&controller.root, &candidate, "agent-fix/issue-991")
+        .await
+        .unwrap();
+    assert!(
+        !candidate.join("injected-owner-note").exists(),
+        "preparation executed the owner post-checkout hook"
+    );
+    git(root.path(), &["branch", "agent-fix/issue-992", "main"]);
+    let resumed = workflow::prepare_resume_worktree(root.path(), 992, "agent-fix/issue-992")
+        .await
+        .unwrap();
+    assert!(
+        !resumed.join("injected-owner-note").exists(),
+        "resume executed the owner post-checkout hook"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("private-owner-note")).unwrap(),
+        "owner bytes"
+    );
+}

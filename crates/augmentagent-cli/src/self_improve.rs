@@ -5294,7 +5294,7 @@ fn baseline_cache_path() -> PathBuf {
 /// Current `origin/main` after a fetch (a stale ref would keep the latch
 /// closed after a human fixed main). Falls back to the local ref offline.
 async fn origin_main_sha(repo_root: &Path) -> Option<String> {
-    let _ = run("git", &["fetch", "-q", "origin", "main"], repo_root).await;
+    let _ = workspace::preparation_git(repo_root, &["fetch", "--no-write-fetch-head", "-q", "origin", "main"]).await;
     let (ok, out, _) = run("git", &["rev-parse", "origin/main"], repo_root)
         .await
         .ok()?;

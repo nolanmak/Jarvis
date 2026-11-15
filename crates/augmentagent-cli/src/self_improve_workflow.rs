@@ -2541,7 +2541,7 @@ pub(super) async fn prepare_resume_worktree_at_head(
     }
     let (valid, _, _) = run("git", &["check-ref-format", "--branch", branch], repo_root).await?;
     anyhow::ensure!(valid, "invalid resumed PR branch");
-    let (ok, _, _) = run("git", &["fetch", "origin", branch], repo_root).await?;
+    let (ok, _, _) = workspace::preparation_git(repo_root, &["fetch", "--no-write-fetch-head", "origin", branch]).await?;
     anyhow::ensure!(ok, "cannot refresh resumed PR branch");
     let fetched=git_evidence(repo_root,&["rev-parse","--verify",&format!("origin/{branch}^{{commit}}")]).await?;
     if let Some(expected)=expected_head {
@@ -2557,8 +2557,8 @@ pub(super) async fn prepare_resume_worktree_at_head(
     if exists {
         return Ok(path);
     }
-    let (ok, _, error) = run(
-        "git",
+    let (ok, _, error) = workspace::preparation_git(
+        repo_root,
         &[
             "worktree",
             "add",
@@ -2566,7 +2566,6 @@ pub(super) async fn prepare_resume_worktree_at_head(
             &path.to_string_lossy(),
             &fetched,
         ],
-        repo_root,
     )
     .await?;
     anyhow::ensure!(ok, "cannot create resumed PR worktree: {error}");
