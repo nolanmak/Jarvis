@@ -266,7 +266,7 @@ pub(super) async fn resume(
     match result {
         Ok(report) => {
             guard.finish()?;
-            Ok(report)
+            capacity_accounting.settle_ci(Ok(report))
         }
         Err(error) => {
             let latest = WorkflowStore::open(&workflow::path())?

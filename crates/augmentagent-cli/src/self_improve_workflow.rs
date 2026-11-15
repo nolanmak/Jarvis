@@ -312,7 +312,13 @@ impl CapacityAccounting {
             store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?
         };
         if source_waiting {return self.report()?.context("source hold has no status report");}
-        let Err(error) = &outcome else { return outcome; };
+        let error=match &outcome {
+            // A routing hold is still idle, but it cannot erase admissions
+            // already made in this run. Historical spend never bills a retry.
+            Ok(report) if report.held=>return self.retry_report(report.message.clone()),
+            Ok(_)=>return outcome,
+            Err(error)=>error,
+        };
         let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
@@ -3936,6 +3942,34 @@ mod tests {
         assert!(!report.billed && report.is_idle() && report.resumed);
         guard.finish().unwrap();
         assert!(WorkflowStore::open(&path).unwrap().claim_productive(&before.workflow,"other",eligible-1,60_000).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_hold_settlement_reports_only_this_runs_actual_admissions() {
+        for resumed in [false,true] {
+            for admission in ["none","historical","current"] {
+                let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+                let guard=WorkflowGuard::acquire_at(&path,Start {
+                    repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,
+                    branch:"fixture",contract:"C1",environment:"test",
+                },millis()).await.unwrap().unwrap();
+                if admission=="historical" {scripted_independent_admission(&guard).await;}
+                let accounting=guard.capacity_accounting(resumed).unwrap();
+                if admission=="current" {scripted_independent_admission(&guard).await;}
+                let store=WorkflowStore::open(&path).unwrap();
+                let before=store.snapshot(guard.id()).unwrap();let events=store.events(guard.id()).unwrap();
+                let allowance=store.merge_allowance(millis(),5).unwrap();
+                let message="candidate retained after owner changed automatic routing";
+                let report=accounting.settle_ci(Ok(RunReport::held(message.into()))).unwrap();
+                assert_eq!(report.billed,admission=="current","late hold lost actual spend: {admission}/resumed={resumed}");
+                assert!(report.held && report.is_idle(),"a routing hold became productive work");
+                assert_eq!(report.resumed,resumed);assert_eq!(report.message,message);
+                assert_eq!(store.snapshot(guard.id()).unwrap(),before,"reporting changed workflow or original charges");
+                assert_eq!(store.events(guard.id()).unwrap(),events,"reporting fabricated progress");
+                assert_eq!(store.merge_allowance(millis(),5).unwrap(),allowance,"reporting changed merge allowance");
+                guard.finish().unwrap();
+            }
+        }
     }
 
     #[tokio::test]
