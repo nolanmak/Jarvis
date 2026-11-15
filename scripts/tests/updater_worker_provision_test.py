@@ -50,6 +50,8 @@ exit 0
 ''');cli.chmod(0o775)
             memory=release/'augmentagent-mcp-memory';memory.write_text('#!/bin/sh\nexit 0\n');memory.chmod(0o775)
             git=tools/'git';git.write_text('''#!/bin/sh
+# The updater's read-only clean-source inspection precedes provisioning.
+if [ "$1" = --no-optional-locks ]; then exit 0; fi
 case "$1" in
 rev-parse) if [ "$2" = HEAD ] && [ ! -f "$HOME/pulled" ]; then echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; else echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; fi ;;
 merge-base) [ "$3" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ] ;;
