@@ -75,6 +75,8 @@ mod policy_hold;
 mod legacy_readmission;
 #[path = "self_improve_closed_targets.rs"]
 mod closed_targets;
+#[path = "self_improve_readoption.rs"]
+pub(crate) mod readoption;
 #[path = "self_improve_qualification_reconcile.rs"]
 mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
