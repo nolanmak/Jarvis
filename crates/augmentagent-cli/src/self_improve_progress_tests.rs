@@ -248,9 +248,10 @@ if a[:2]==['pr','list']:
     print(json.dumps([dict(number=20,headRefName='agent-fix/issue-10',headRefOid=s['head'],isDraft=s['draft'],isCrossRepository=False,mergeable='MERGEABLE',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium')]))
 elif a[:2]==['repo','view']: print('WRITE' if 'viewerPermission' in a else 'fixture-owner/project')
 elif a[:2]==['api','user']: print('fixture-owner')
+elif a[:2]==['api','repos/fixture-owner/project/issues/10']: print(json.dumps(dict(number=10,state='open',labels=[])))
 elif a[:2]==['pr','view']:
     if '--jq' in a or '-q' in a: print(s['head'])
-    else: print(json.dumps(dict(id='PR_fixture20',number=20,url='https://github.com/fixture-owner/project/pull/20',baseRefName='main',headRefName='agent-fix/issue-10',isCrossRepository=False,headRepositoryOwner=dict(login='fixture-owner'),author=dict(login='fixture-owner'),title='Fix synthetic addition',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium',closingIssuesReferences=[],mergeable='MERGEABLE',isDraft=s['draft'],state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
+    else: print(json.dumps(dict(id='PR_fixture20',number=20,url='https://github.com/fixture-owner/project/pull/20',baseRefName='main',headRefName='agent-fix/issue-10',isCrossRepository=False,headRepositoryOwner=dict(login='fixture-owner'),author=dict(login='fixture-owner'),title='Fix synthetic addition',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium',closingIssuesReferences=[],labels=[],mergeable='MERGEABLE',isDraft=s['draft'],state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
@@ -483,7 +484,7 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(merge_sweep(&root, false).await, 0);
     let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
     assert!(calls.lines().any(|line| line.contains("--undo")), "failed draft merge restores draft state");
-    assert_eq!(ready_for_merge(&root, 20, None).await, None);
+    assert_eq!(ready_for_merge(&root, 20, None,||panic!("unknown draft state cannot dispatch")).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, false, &head);

@@ -185,6 +185,34 @@ A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
 call runs), passed as `build_timeout_secs` and capped at the tool maximum of
 900 s. Other commands default to 120 s. An explicit timeout is honoured.
 
+When the controller's VM deadline expires, the native tool returns
+`[runner=vm] JARVIS_EXECUTION:command_timeout` with a fixed diagnostic. This is
+an execution failure, separate from a profile denial or preflight readiness
+refusal. Guest-provided error text cannot assert this controller-owned category.
+That category requires the supervisor's descendant-cleanup receipt after exit.
+All post-launch exits require the exact `all-descendants-reaped\n` bytes;
+CRLF/CR endings are not equivalent cleanup evidence.
+Missing or invalid cleanup proof instead returns the fixed
+`[runner=vm] JARVIS_EXECUTION:cleanup_unverified` diagnostic. It remains distinct
+from both a verified deadline and a profile refusal, and requires cleanup proof
+before another build can start.
+The bridge records a private `cleanup-pending` marker before launch, bound to a
+fresh supervisor receipt outside the guest-writable workspace and control share.
+Unknown cleanup retains the VM's private control files, command workspace,
+dependency snapshots and session cache, including after bridge close or restart.
+The inherited storage descriptors continue to protect live descendants. The
+controller does not kill the subreaper on an arbitrary cleanup timeout, even
+when no optional global storage lease is configured.
+
+A later admission or managed scratch sweep can release the hold only after
+reading the exact bound, private, singly linked regular receipt; public files,
+links, malformed bytes and other commands' receipts do not qualify. A sweep
+also refuses deletion if a matching owned VM process is still live. Healthy
+in-flight commands report busy; missing cleanup proof remains an explicit hold.
+No unknown cleanup is treated as a completed command or an autonomous shipment.
+The existing deadline and process/storage cleanup remain in force; reporting the
+timeout does not automatically retry the command or grant further permissions.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
@@ -372,3 +400,9 @@ rebuild, denied direct networking and HTTP mutations, inaccessible signing keys,
 canonical lockfiles and a fresh npm-ci session. A clean worktree of this project
 passed installation, build and all 26 Node tests through the gateway, including
 compilation of its native SQLite addon.
+
+A nonzero supervisor exit after exact descendant-cleanup proof is reported as
+`[runner=vm] JARVIS_EXECUTION:supervisor_failure`, with fixed public text. It is
+separate from a controller deadline, unverified cleanup and a profile/readiness
+refusal. Guest nonzero exit codes remain ordinary command results; guest error
+prose cannot mint the supervisor-failure category.

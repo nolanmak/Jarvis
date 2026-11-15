@@ -314,7 +314,13 @@ impl CapacityAccounting {
             store.semantic_source_waiting(&self.workflow,&snapshot.checkpoint.binding)?
         };
         if source_waiting {return self.report()?.context("source hold has no status report");}
-        let Err(error) = &outcome else { return outcome; };
+        let error=match &outcome {
+            // A routing hold is still idle, but it cannot erase admissions
+            // already made in this run. Historical spend never bills a retry.
+            Ok(report) if report.held=>return self.retry_report(report.message.clone()),
+            Ok(_)=>return outcome,
+            Err(error)=>error,
+        };
         let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
@@ -803,6 +809,10 @@ impl SweepGuard {
         inner.validate_before_side_effect()
     }
 
+    pub(super) fn validate_note_dispatch(&self)->Result<()> {
+        self.inner.as_ref().context("released sweep lease")?.validate_note_dispatch()
+    }
+
     pub(super) fn merge_lease(&self) -> Result<Lease> {
         self.inner.as_ref().context("released sweep lease")?.merge_lease()
     }
@@ -857,6 +867,48 @@ impl Drop for SweepGuard {
             }
         }
     }
+}
+
+/// Recover a failed transport before selectors exclude its pending effect.
+/// Reuses protected execution context and the original bound Push; no model is
+/// bound or called, and no unrelated pending operation becomes selectable.
+pub(super) async fn recover_pending_push(repo:&Path,candidate:&adoption::AdoptedPr)->Result<()> {
+    let Some(store)=WorkflowStore::open_read_only(&path())? else {return Ok(())};
+    let Some(id)=store.resolve_pr(&candidate.repository,candidate.pr)? else {return Ok(())};
+    let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
+    let now=millis();
+    if snapshot.branch!=candidate.branch || snapshot.lease_until_ms>now
+        || snapshot.checkpoint.next.eligible_at_ms>now || snapshot.checkpoint.stage!=Stage::Publish
+        || store.require_owner_dispatch(&id).is_err() || !store.retryable_bound_push(&id)? {return Ok(());}
+    let source=id.rsplit_once('#').map(|(_,number)|number.parse::<u64>()).transpose()?;
+    if !(source==candidate.source_issue && source.is_some()
+        || durable::pr_workflow_id(&candidate.repository,candidate.pr)?==id) {return Ok(());}
+    if let Some(issue)=candidate.source_issue {
+        if source_reconcile::reconcile(repo,candidate.pr,issue,true,true).await!=source_reconcile::SourceAction::Continue {
+            return Ok(());
+        }
+    }
+    let Some(context)=store.recovery_context(&id,&snapshot.checkpoint.binding)? else {return Ok(())};
+    anyhow::ensure!(context.repository.eq_ignore_ascii_case(&candidate.repository),"Push recovery repository changed");
+    recovery::existing_checkout(repo,&context.worktree).await?;
+    let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
+    anyhow::ensure!(binding==snapshot.checkpoint.binding,"pending Push candidate changed");
+    drop(store);
+    let Some(mut guard)=WorkflowGuard::acquire(Start {repo_root:repo,worktree:&context.worktree,
+        repository:&candidate.repository,source_issue:source,pr:Some(candidate.pr),branch:&snapshot.branch,
+        contract:&context.source_request,environment:&context.environment}).await? else {return Ok(())};
+    let result=async {
+        anyhow::ensure!(guard.binding()==&binding && guard.store.lock().map_err(|_|anyhow::anyhow!("Push recovery store poisoned"))?
+            .retryable_bound_push(guard.id())?,"pending Push recovery changed");
+        // A failed routing observation leaves the original pending Push in
+        // Publish so a later inventory pass can retry it without a reset.
+        if !manual_routing::allowed(repo,&candidate.repository,candidate.pr,source).await {return Ok(());}
+        guard.push(&snapshot.branch).await?;
+        guard.transition(Stage::Publish,"bound_push_recovered","resume_preserved_work",0).await?;
+        Ok::<(),anyhow::Error>(())
+    }.await;
+    guard.finish()?;
+    result
 }
 
 impl WorkflowGuard {
@@ -917,7 +969,7 @@ impl WorkflowGuard {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
                 || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
-            if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
+            if relevant || store.retryable_bound_push(&id)? {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
         let context=context.filter(|context|recovery_context_matches(context,start.contract,start.worktree,start.environment,initial_wait));
@@ -974,6 +1026,13 @@ impl WorkflowGuard {
         }
         if let Err(error)=checkout_identity.enroll(&mut store,&lease,&binding,now) {
             store.release(&lease,now)?;return Err(error);
+        }
+        if mode==AcquireMode::Productive {
+            if let Some(pr)=start.pr {
+                if let Err(error)=store.record_adopted_publication(&lease,&binding,start.repository,pr,start.branch,now) {
+                    store.release(&lease,now)?;return Err(error);
+                }
+            }
         }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
@@ -1486,6 +1545,14 @@ impl WorkflowGuard {
             .validate_lease(&self.lease, &self.binding, millis())
     }
 
+    /// New notes and ready transitions must honor controls accepted after earlier reads or
+    /// Push dispatch. Completion receipts use the weaker lease/binding guard.
+    pub(super) fn validate_note_dispatch(&self)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_owner_dispatch(self.id())
+    }
+
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
         self.validate_before_side_effect()?;
         let operation = self
@@ -1497,6 +1564,14 @@ impl WorkflowGuard {
             "operation_intent",
             serde_json::json!({"operation_id":operation.id,"operation_kind":kind}),
         )?;
+        Ok(operation)
+    }
+
+    fn bound_push_intent(&self,destination:&str,reference:&str)->Result<Operation> {
+        self.validate_before_side_effect()?;
+        let operation=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .begin_bound_push(&self.lease,&self.binding,destination,reference,millis())?;
+        self.audit_event("operation_intent",serde_json::json!({"operation_id":operation.id,"operation_kind":operation.kind}))?;
         Ok(operation)
     }
 
@@ -2116,59 +2191,70 @@ impl WorkflowGuard {
     /// Publish detached resumed work with a remote-head precondition. A lost
     /// response is reconciled against ls-remote before any retry. No force push
     /// is needed; ancestry and the lease both protect intervening remote edits.
+    /// The actual fresh publication entry, separately callable by its
+    /// disposable-remote regression without invoking a model.
+    pub(super) async fn push_fresh(&mut self,repo:&Path,branch:&str,automatic:bool)->Result<String> {
+        self.push_checked(branch,Some((repo,automatic))).await
+    }
+
+    async fn require_fresh_publication_route(&mut self,repo:&Path,automatic:bool)->Result<()> {
+        self.require_fresh_issue(repo).await?;
+        let source=self.id().rsplit_once('#').map(|(_,number)|number.parse::<u64>()).transpose()?;
+        if let Some(pr)=self.pr()? {
+            if !manual_routing::permit_mutation(repo,pr,source,automatic,self).await? {return Err(manual_routing::Hold.into());}
+        }else {
+            let issue=source.context("fresh publication source unavailable")?;
+            if automatic && !manual_routing::issue_allowed(repo,self.repository(),issue).await {
+                self.transition(Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",millis()+300_000).await?;
+                return Err(manual_routing::Hold.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn push(&mut self, branch: &str) -> Result<String> {
+        self.push_checked(branch,None).await
+    }
+
+    async fn push_checked(&mut self,branch:&str,fresh:Option<(&Path,bool)>)->Result<String> {
+        if let Some((repo,automatic))=fresh {
+            let pending_push=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+                .pending_operations(self.id())?.iter().any(|operation|operation.kind==OperationKind::Push);
+            // Existing uncertain pushes may first observe their remote outcome.
+            // Every newly dispatched push still rechecks below.
+            if !pending_push {self.require_fresh_publication_route(repo,automatic).await?;}
+        }
         self.transition(Stage::Publish, "publishing_revision", "push", millis())
             .await?;
-        let operation = self.intent(OperationKind::Push)?;
-        let target = format!("refs/heads/{branch}");
-        let (ok, out, _) = run(
-            "git",
-            &["ls-remote", "--heads", "origin", &target],
-            &self.worktree,
-        )
-        .await?;
-        anyhow::ensure!(ok, "cannot reconcile remote revision before push");
-        // Empty expected SHA is a create-if-absent compare-and-swap.
-        let remote = out.split_whitespace().next().unwrap_or("");
-        if remote == operation.binding.head {
-            self.observe_remote(&operation, &format!("git-head:{remote}"), None)?;
-            return Ok(remote.to_string());
+        let destination=push_destination::Resolved::resolve(&self.worktree,&self.repository).await?;
+        let target=format!("refs/heads/{branch}");
+        let remote=destination.head(&self.worktree,&self.repository,&target).await?.unwrap_or_default();
+        if remote==self.binding.head {
+            let operation=self.bound_push_intent(destination.destination(),&target)?;
+            self.observe_remote(&operation,&format!("git-head:{remote}"),None)?;
+            return Ok(remote);
         }
         if !remote.is_empty() {
-            let (ancestor, _, _) = run(
-                "git",
-                &["merge-base", "--is-ancestor", remote, "HEAD"],
-                &self.worktree,
-            )
-            .await?;
-            anyhow::ensure!(
-                ancestor,
-                "remote PR changed; reconcile before publishing preserved work"
-            );
+            let (ancestor,_,_)=run("git",&["merge-base","--is-ancestor",&remote,&self.binding.head],&self.worktree).await?;
+            anyhow::ensure!(ancestor,"remote PR changed; reconcile before publishing preserved work");
         }
+        // The actual transport still uses origin, preserving its credentials,
+        // pushInsteadOf rules and installed CCAT hook. Its pre-push wrapper
+        // refuses a destination change before any pack can be sent.
+        let hook=destination.hook(&self.worktree,self.audit.path().parent().context("private push control unavailable")?).await?;
         self.validate_before_side_effect()?;
-        self.validate_binding(&operation.binding).await?;
-        let expected = format!("--force-with-lease={target}:{remote}");
-        let refspec = format!("HEAD:{target}");
-        let (pushed, _, _) = run(
-            "git",
-            &["push", &expected, "origin", &refspec],
-            &self.worktree,
-        )
-        .await?;
-        let (observed, out, _) = run(
-            "git",
-            &["ls-remote", "--heads", "origin", &target],
-            &self.worktree,
-        )
-        .await?;
-        let observed_head = out.split_whitespace().next().unwrap_or("");
-        anyhow::ensure!(
-            observed && observed_head == operation.binding.head,
-            "push outcome not verified; preserved pending intent (command success: {pushed})"
-        );
-        self.observe_remote(&operation, &format!("git-head:{observed_head}"), None)?;
-        Ok(observed_head.to_string())
+        self.validate_binding(&self.binding.clone()).await?;
+        if let Some((repo,automatic))=fresh {self.require_fresh_publication_route(repo,automatic).await?;}
+        let operation=self.bound_push_intent(destination.destination(),&target)?;
+        let expected=format!("--force-with-lease={target}:{remote}");
+        let refspec=format!("{}:{target}",operation.binding.head);
+        let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
+        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
+        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
+            "push outcome not verified; preserved pending intent (command success: {pushed})");
+        let head=observed.context("Push observation unavailable")?;
+        self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
+        Ok(head)
     }
 
     pub(super) async fn publish_round(
@@ -2180,18 +2266,25 @@ impl WorkflowGuard {
         kind: &str,
         findings: &str,
         dry_run: bool,
-    ) -> Result<()> {
+        automatic: bool,
+        source: Option<u64>,
+    ) -> Result<bool> {
         if dry_run {
-            return Ok(());
+            return Ok(true);
+        }
+        if !manual_routing::permit_mutation(repo_root,pr,source,automatic,self).await? {
+            return Ok(false);
         }
         let head = self.push(branch).await?;
+        if !manual_routing::permit_mutation(repo_root,pr,source,automatic,self).await? {return Ok(false);}
+        self.validate_note_dispatch()?;
         let _ = write_optional_pr_note(
             repo_root,
             &pr.to_string(),
             &round_comment(round, kind, findings, &head),
         )
         .await;
-        Ok(())
+        Ok(true)
     }
 
     /// Caller has waited for worker teardown. Stage/evidence must already be
@@ -3484,7 +3577,8 @@ mod tests {
             .transition(Stage::Publish, "next_candidate", "push", 0)
             .await
             .unwrap();
-        guard.intent(OperationKind::Push).unwrap();
+        let frozen=push_destination::Resolved::resolve(dir.path(),"owner/repo").await.unwrap();
+        guard.bound_push_intent(frozen.destination(),"refs/heads/fix/seven").unwrap();
         assert!(
             run(
                 "git",
@@ -3913,6 +4007,34 @@ mod tests {
         assert!(!report.billed && report.is_idle() && report.resumed);
         guard.finish().unwrap();
         assert!(WorkflowStore::open(&path).unwrap().claim_productive(&before.workflow,"other",eligible-1,60_000).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_hold_settlement_reports_only_this_runs_actual_admissions() {
+        for resumed in [false,true] {
+            for admission in ["none","historical","current"] {
+                let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+                let guard=WorkflowGuard::acquire_at(&path,Start {
+                    repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,
+                    branch:"fixture",contract:"C1",environment:"test",
+                },millis()).await.unwrap().unwrap();
+                if admission=="historical" {scripted_independent_admission(&guard).await;}
+                let accounting=guard.capacity_accounting(resumed).unwrap();
+                if admission=="current" {scripted_independent_admission(&guard).await;}
+                let store=WorkflowStore::open(&path).unwrap();
+                let before=store.snapshot(guard.id()).unwrap();let events=store.events(guard.id()).unwrap();
+                let allowance=store.merge_allowance(millis(),5).unwrap();
+                let message="candidate retained after owner changed automatic routing";
+                let report=accounting.settle_ci(Ok(RunReport::held(message.into()))).unwrap();
+                assert_eq!(report.billed,admission=="current","late hold lost actual spend: {admission}/resumed={resumed}");
+                assert!(report.held && report.is_idle(),"a routing hold became productive work");
+                assert_eq!(report.resumed,resumed);assert_eq!(report.message,message);
+                assert_eq!(store.snapshot(guard.id()).unwrap(),before,"reporting changed workflow or original charges");
+                assert_eq!(store.events(guard.id()).unwrap(),events,"reporting fabricated progress");
+                assert_eq!(store.merge_allowance(millis(),5).unwrap(),allowance,"reporting changed merge allowance");
+                guard.finish().unwrap();
+            }
+        }
     }
 
     #[tokio::test]

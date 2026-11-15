@@ -21,7 +21,7 @@ class SnapshotValidationTests(unittest.TestCase):
             (workspace/'build').mkdir();artifact=workspace/'build/addon.node';artifact.write_bytes(b'synthetic compiled addon')
             alias=workspace/'addon.node';os.link(artifact,alias)
             runtime=vm.Runtime();runtime.config={}
-            with patch.object(vm.tempfile,'TemporaryDirectory',side_effect=BoundaryReached),self.assertRaises(BoundaryReached):
+            with patch.object(vm.tempfile,'mkdtemp',side_effect=BoundaryReached),self.assertRaises(BoundaryReached):
                 vm.run(runtime,workspace,['true'],{})
             self.assertEqual(artifact.stat().st_ino,alias.stat().st_ino)
             self.assertEqual(alias.read_bytes(),b'synthetic compiled addon')
@@ -103,6 +103,129 @@ class BuildScratchPlacementTests(unittest.TestCase):
         runtime.config.update(modules=[str(artifact)], memory_mb=512)
         return runtime
 
+    def deadline_fixture(self, receipt, status, expired=True, with_storage=True):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
+            runtime = self.runtime(root)
+            process = Mock()
+            process.poll.return_value = None
+            storage = Mock(fd=123, fds=(123,)) if with_storage else None
+            seen = {}
+            def launch(command, **kwargs):
+                seen['cleanup'] = Path(command[3])
+                self.assertEqual(kwargs['pass_fds'], (123,) if with_storage else ())
+                self.assertEqual(kwargs['env'].get('JARVIS_STORAGE_LEASE_FDS'), '123' if with_storage else None)
+                return process
+            def wait(**kwargs):
+                if receipt is not None:
+                    seen['cleanup'].write_bytes(receipt.encode())
+                    seen['cleanup'].chmod(0o600)
+                process.poll.return_value = status
+                return status
+            process.wait.side_effect = wait
+            def certificate(command, **kwargs):
+                Path(command[command.index('-keyout') + 1]).write_bytes(b'fixture key')
+                Path(command[command.index('-out') + 1]).write_bytes(b'fixture certificate')
+            with patch.object(vm.subprocess, 'run', side_effect=certificate), \
+                    patch.object(vm, 'initrd', return_value=b'fixture'), \
+                    patch.object(vm, 'qemu_command', return_value=['synthetic-qemu']), \
+                    patch.object(vm.dependency_proxy, 'Broker'), \
+                    patch.object(vm.subprocess, 'Popen', side_effect=launch), \
+                    patch.object(vm.time, 'monotonic', side_effect=[0.0, 2.0 if expired else 0.0]):
+                with self.assertRaises(vm.Unavailable) as raised:
+                    vm.run(runtime, workspace, ['true'], {}, timeout=1, storage_lease=storage, scratch_dir=str(root))
+            if expired:
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with()
+            else:
+                process.terminate.assert_not_called()
+                self.assertEqual(process.wait.call_count, 1)
+            if with_storage:self.assertEqual(storage.check.call_count, 2)
+            return raised.exception
+
+    def test_termination_or_wait_error_cannot_skip_cleanup_proof(self):
+        from unittest.mock import Mock
+        for fault in ['permission','gone','wait']:
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary);workspace=root/'workspace';workspace.mkdir();runtime=self.runtime(root)
+                seen={};process=Mock();process.poll.return_value=None;process.wait.return_value=143
+                if fault=='permission':process.terminate.side_effect=PermissionError('synthetic termination failure')
+                if fault=='gone':process.terminate.side_effect=ProcessLookupError('synthetic signal race')
+                if fault=='wait':process.wait.side_effect=OSError('synthetic wait failure')
+                def launch(command,**kwargs):
+                    seen['control']=Path(command[3]).parent
+                    return process
+                def certificate(command,**kwargs):
+                    Path(command[command.index('-keyout')+1]).write_bytes(b'fixture key')
+                    Path(command[command.index('-out')+1]).write_bytes(b'fixture certificate')
+                error=None
+                with patch.object(vm.subprocess,'run',side_effect=certificate),patch.object(vm,'initrd',return_value=b'fixture'), \
+                        patch.object(vm,'qemu_command',return_value=['synthetic-qemu']),patch.object(vm.dependency_proxy,'Broker'), \
+                        patch.object(vm.subprocess,'Popen',side_effect=launch),patch.object(vm.time,'monotonic',side_effect=[0.0,2.0]):
+                    try:vm.run(runtime,workspace,['true'],{},timeout=1,scratch_dir=str(root))
+                    except BaseException as caught:error=caught
+                self.assertTrue(seen['control'].is_dir(),'termination/wait error erased control without cleanup proof')
+                self.assertIsInstance(error,vm.CleanupUnverified,'cleanup error bypassed the controller-owned category')
+
+    def test_cleanup_receipt_rejects_public_files_and_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);receipt=root/'cleanup-complete'
+            receipt.write_bytes(b'all-descendants-reaped\n');receipt.chmod(0o600)
+            self.assertTrue(vm.cleanup_verified(receipt))
+            receipt.chmod(0o644);self.assertFalse(vm.cleanup_verified(receipt),'public receipt accepted')
+            receipt.chmod(0o600);alias=root/'alias';os.link(receipt,alias)
+            self.assertFalse(vm.cleanup_verified(receipt),'multiply linked receipt accepted')
+            alias.unlink();receipt.rename(alias);receipt.symlink_to(alias)
+            self.assertFalse(vm.cleanup_verified(receipt),'symlink receipt accepted')
+
+    def test_unverified_cleanup_retains_control_directory(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);workspace=root/'workspace';workspace.mkdir();scratch=root/'scratch';scratch.mkdir()
+            runtime=self.runtime(root);seen={};process=Mock();process.poll.return_value=0;process.wait.return_value=0
+            def launch(command, **kwargs):
+                seen['control']=Path(command[3]).parent
+                return process
+            def certificate(command, **kwargs):
+                Path(command[command.index('-keyout')+1]).write_bytes(b'fixture key')
+                Path(command[command.index('-out')+1]).write_bytes(b'fixture certificate')
+            with patch.object(vm.subprocess,'run',side_effect=certificate),patch.object(vm,'initrd',return_value=b'fixture'), \
+                    patch.object(vm,'qemu_command',return_value=['synthetic-qemu']),patch.object(vm.dependency_proxy,'Broker'), \
+                    patch.object(vm.subprocess,'Popen',side_effect=launch):
+                with self.assertRaises(vm.CleanupUnverified):vm.run(runtime,workspace,['true'],{},scratch_dir=str(scratch))
+            self.assertTrue(seen['control'].is_dir(),'unverified cleanup deleted private VM control state')
+            self.assertTrue((seen['control']/'initrd.gz').is_file(),'retained directory lost its running VM resources')
+
+    def test_optional_storage_does_not_skip_subreaper_cleanup(self):
+        error=self.deadline_fixture('all-descendants-reaped\n',143,with_storage=False)
+        self.assertIsInstance(error,vm.CommandTimedOut)
+
+    def test_controller_deadline_has_a_distinct_type_after_process_cleanup(self):
+        error = self.deadline_fixture('all-descendants-reaped\n', 143)
+        self.assertIsInstance(error, vm.CommandTimedOut,
+                              'verified cleanup after SIGTERM must retain the deadline category')
+
+    def test_controller_deadline_without_cleanup_proof_is_not_a_verified_timeout(self):
+        for receipt, status in [(None, 143), ('incomplete\n', 143), (None, 125), (None, 0),
+                                ('all-descendants-reaped\r\n', 143), ('all-descendants-reaped\r', 143)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                error = self.deadline_fixture(receipt, status)
+                self.assertNotIsInstance(error, vm.CommandTimedOut,
+                                         'unverified descendant cleanup was reported as a timeout')
+                self.assertEqual(type(error).__name__, 'CleanupUnverified',
+                                 'cleanup failure needs a controller-owned category through the bridge')
+
+    def test_cleanup_failure_without_a_deadline_keeps_its_controller_category(self):
+        for receipt, status in [(None, 125), (None, 0), ('incomplete\n', 0),
+                                ('all-descendants-reaped\r\n', 125), ('all-descendants-reaped\r', 0)]:
+            with self.subTest(receipt=receipt, supervisor_status=status):
+                error = self.deadline_fixture(receipt, status, expired=False)
+                self.assertIsInstance(error, vm.CleanupUnverified)
+        error = self.deadline_fixture('all-descendants-reaped\n', 125, expired=False)
+        self.assertEqual(type(error).__name__, 'ExecutionFailed',
+                         'verified supervisor failure must survive bridge dispatch as execution failure')
+
     def test_explicit_ort_cache_is_read_only_and_pinned_in_guest_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
@@ -142,16 +265,16 @@ class BuildScratchPlacementTests(unittest.TestCase):
             root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
             scratch = root / 'scratch'; scratch.mkdir()
             seen = []
-            original = vm.tempfile.TemporaryDirectory
+            original = vm.tempfile.mkdtemp
             def record(*args, **kwargs):
                 seen.append(kwargs.get('dir'))
                 raise self.Stop()
-            vm.tempfile.TemporaryDirectory = record
+            vm.tempfile.mkdtemp = record
             try:
                 with self.assertRaises(self.Stop):
                     vm.run(self.runtime(root), workspace, ['true'], {}, scratch_dir=str(scratch))
             finally:
-                vm.tempfile.TemporaryDirectory = original
+                vm.tempfile.mkdtemp = original
             self.assertEqual(seen, [str(scratch)])
 
     def test_scratch_dir_and_build_cache_are_validated_before_a_vm_starts(self):
