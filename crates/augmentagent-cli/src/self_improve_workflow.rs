@@ -923,6 +923,12 @@ impl WorkflowGuard {
         Self::acquire_at(state, start, millis()).await
     }
 
+    /// Same acquisition path with an explicit fixture clock for crash/expiry tests.
+    #[cfg(test)]
+    pub(super) async fn acquire_fixture_at(state:&Path,start:Start<'_>,now:i64)->Result<Option<Self>> {
+        Self::acquire_at(state,start,now).await
+    }
+
     pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
         Self::acquire_mode_at(&path(),start,millis(),AcquireMode::OwnerTurn).await
     }

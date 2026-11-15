@@ -76,6 +76,10 @@ make_case() {
 echo build >> "$STUB_DIR/cargo.calls"
 exit 0
 STUB
+  # Dashboard builds are outside this fixture. Real npm would manufacture an
+  # untracked package-lock.json and correctly block the next clean-source tick.
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/npm"
+  chmod +x "$TMP/bin/npm"
   # systemctl answers `show -p <prop> --value` per property. ExecStart and
   # DropInPaths come from files the case writes; MainPID advances on every
   # restart and a fake /proc/<pid>/exe points at whatever `exe_target` says —
