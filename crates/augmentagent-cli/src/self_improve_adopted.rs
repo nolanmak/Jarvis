@@ -560,6 +560,7 @@ async fn execute(
             if readied {
                 let intent = guard.intent(OperationKind::ReadyPr)?;
                 guard.validate_binding(&binding).await?;
+                guard.validate_note_dispatch()?;
                 let (ok, _, error) =
                     run(&gh_bin(), &["pr", "ready", &pr.pr.to_string()], repo).await?;
                 anyhow::ensure!(ok, "cannot ready approved PR: {error}");
@@ -595,7 +596,7 @@ async fn execute(
             }
             let intent = guard.intent(OperationKind::MergePr)?;
             let mutation =
-                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?).await;
+                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?,publication::MergeRouting {automatic,source_issue:pr.source_issue}).await;
             if let Ok(Some(receipt)) = &mutation {
                 guard.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
             }
@@ -759,7 +760,7 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
         };
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
-        let Some(readied)=ready_for_merge(repo,pr.pr,row["isDraft"].as_bool()).await else {continue};
+        let Some(readied)=ready_for_merge(repo,pr.pr,row["isDraft"].as_bool(),||lease.validate_note_dispatch()).await else {continue};
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {
             if readied && lease.validate_remote(repo,pr.pr,&pr.head).await.is_ok() {
@@ -769,7 +770,7 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
         }
         let intent = lease.merge_intent()?;
         let mutation =
-            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;
+            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?,publication::MergeRouting {automatic,source_issue:pr.source_issue}).await;
         if let Ok(Some(receipt)) = &mutation {
             lease.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
         }

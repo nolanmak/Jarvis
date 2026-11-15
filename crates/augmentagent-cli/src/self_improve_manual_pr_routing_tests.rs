@@ -11,6 +11,64 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
+        if case.starts_with("create-manual-") {
+            let automatic=case=="create-manual-auto";
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:None,
+                branch:"feat/repair-9",contract:"Original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let head=guard.push_fresh(&root,"feat/repair-9",automatic).await.unwrap();
+            std::fs::write(root.join("actual-head"),&head).unwrap();
+            std::fs::write(root.join("manual-after-admission"),"owner routed source manually after the successful Push").unwrap();
+            let args=["pr","create","--head","feat/repair-9","--base","main"];
+            let result=publication::publish(&guard,&root,"feat/repair-9",&head,7,&args,automatic).await;
+            if automatic {
+                assert!(!root.join("create-writes").exists(),"source routed manually after Push still dispatched PR creation");
+                assert!(result.unwrap_err().downcast_ref::<manual_routing::Hold>().is_some());
+            }else {
+                assert_eq!(result.unwrap().number,9,"explicit authorized creation was blocked by routing alone");
+                let count=||std::fs::read_to_string(root.join("calls")).unwrap().lines()
+                    .filter(|line|serde_json::from_str::<Vec<String>>(line).unwrap().starts_with(&["pr".into(),"create".into()])).count();
+                assert_eq!(count(),1);
+                // Observing a known publication is allowed even after the
+                // source is manual; it must not grant a second creation.
+                assert_eq!(publication::publish(&guard,&root,"feat/repair-9",&head,7,&args,true).await.unwrap().number,9);
+                assert_eq!(count(),1,"known publication recovery created another PR");
+            }
+            guard.finish().unwrap();return;
+        }
+        if matches!(case.as_str(),"merge-label-during-policy"|"ready-pause-during-routing") {
+            let out=std::process::Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&root).output().unwrap();
+            assert!(out.status.success());let head=String::from_utf8(out.stdout).unwrap().trim().to_owned();
+            std::fs::write(root.join("actual-head"),&head).unwrap();
+            let guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:None,pr:Some(9),
+                branch:"feat/repair-9",contract:"Original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            if case=="ready-pause-during-routing" {
+                guard.validate_note_dispatch().unwrap();
+                assert!(manual_routing::allowed(&root,"owner/repo",9,None).await);
+                let result=ready_for_merge(&root,9,Some(true),||guard.validate_note_dispatch()).await;
+                assert!(!root.join("ready-writes").exists(),"owner pause accepted during routing still dispatched ready");
+                assert_eq!(result,None);guard.finish().unwrap();return;
+            }
+            assert!(manual_routing::allowed(&root,"owner/repo",9,None).await);
+            let operation=guard.intent(crate::autoship_workflow::OperationKind::MergePr).unwrap();
+            let before=initial.snapshot(guard.id()).unwrap();
+            let result=publication::merge_exact(&root,"owner/repo",9,&head,&operation,&guard.merge_lease().unwrap(),
+                publication::MergeRouting {automatic:true,source_issue:None}).await;
+            assert!(root.join("manual-after-admission").exists(),"fixture never changed routing during policy read");
+            assert!(!root.join("merge-writes").exists(),"late manual routing still dispatched a merge mutation");
+            assert!(result.unwrap_err().downcast_ref::<manual_routing::Hold>().is_some());
+            assert!(initial.merge_dispatch(&operation.id).unwrap().is_none(),"routing hold reserved merge allowance");
+            assert_eq!(initial.snapshot(guard.id()).unwrap(),before,"routing check changed original work accounting");
+            // Explicit authorized targeting bypasses only the routing label.
+            let _=publication::merge_exact(&root,"owner/repo",9,&head,&operation,&guard.merge_lease().unwrap(),
+                publication::MergeRouting {automatic:false,source_issue:None}).await;
+            assert!(root.join("merge-writes").exists(),"manual label blocked explicit authorized targeting");
+            assert_eq!(initial.merge_dispatch(&operation.id).unwrap().unwrap().state,"dispatched","lost mutation response must stay uncertain");
+            guard.finish().unwrap();return;
+        }
         if case=="source-reopened-during-close-routing" {
             let mut rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
             rows[0]["headRefName"]=format!("{BRANCH_PREFIX}7").into();
@@ -448,7 +506,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["create-manual-auto","create-manual-explicit","merge-label-during-policy","ready-pause-during-routing","source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
@@ -457,13 +515,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case.starts_with("post-control-") || case.starts_with("post-rabbit-") || case.starts_with("round-") || case.starts_with("push-") {
+                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-unbound"|"fresh-uncertain-other-fetch"|"fresh-uncertain-destination-changed"|"fresh-uncertain-branch-changed"|"fresh-uncertain-access-denied"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("create-") || case.starts_with("merge-") || case.starts_with("ready-") || case.starts_with("post-note-") || case.starts_with("post-control-") || case.starts_with("post-rabbit-") || case.starts_with("round-") || case.starts_with("push-") {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                     assert!(std::process::Command::new("/usr/bin/git").args(["update-ref","refs/remotes/origin/main","HEAD"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
-                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\npush-read-output\nhook-observation\n").unwrap();
+                    std::fs::write(root.join(".git/info/exclude"),"prs.json\nissues.json\ncalls\nmanual-after-admission\nactual-head\ndraft-restored\nfresh-claim-appeared\nfresh-observations\nnote-writes\npush-read-output\nhook-observation\nmerge-writes\nready-writes\ncreate-writes\n").unwrap();
                     let remote=dir.path().join("remote.git");
                     assert!(std::process::Command::new("/usr/bin/git").args(["init","--bare","--quiet"])
                         .arg(&remote).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
@@ -479,7 +537,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 if case=="changed-owned-source" {manual_refs=references(70);}
                 if case=="missing-owned-source" {manual_refs=serde_json::json!([]);}
                 if case=="malformed-reference" {manual_refs=serde_json::json!([{"number":7,"url":"https://github.com/owner/repo/issues/not-7"}]);}
-                let row=|number,refs,labels|serde_json::json!({"number":number,"isDraft":draft,
+                let row=|number,refs,labels|serde_json::json!({"id":format!("PR_fixture_{number}"),"number":number,"isDraft":draft,
                     "headRefName":format!("feat/repair-{number}"),"headRefOid":format!("{number:040x}"),
                     "state":"OPEN","url":format!("https://github.com/owner/repo/pull/{number}"),
                     "baseRefName":"main","isCrossRepository":false,"headRepositoryOwner":{"login":"owner"},
@@ -500,6 +558,7 @@ case=os.environ['MANUAL_PR_CASE']
 with (root/'calls').open('a') as out:out.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(('READ' if case=='explicit-revoked' else 'ADMIN') if 'viewerPermission' in a else 'owner/repo')
 elif a[:2]==['pr','list']:
+ if case.startswith('create-manual-'):print('[]');sys.exit(0)
  if case=='late-fresh-recheck':
   p=root/'fresh-observations';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));print(json.dumps([] if n<=2 else prs))
  else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
@@ -507,6 +566,8 @@ elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
  row=next(p for p in prs if p['number']==int(a[2]))
+ if case=='ready-pause-during-routing' and 'number,labels,closingIssuesReferences' in a:
+  c=sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']);c.execute("INSERT OR REPLACE INTO workflow_owner_control(workflow,revision,paused,principal,updated_at) VALUES('owner/repo/pr/9',1,1,'github:owner',1)");c.commit();c.close()
  if case=='source-reopened-during-close-routing' and 'number,labels,closingIssuesReferences' in a:
   issues['7']['state']='open';issues['7']['state_reason']=None;(root/'issues.json').write_text(json.dumps(issues))
  if row['number']==9 and case=='race':row['labels']=[dict(name='autoship-manual')]
@@ -516,6 +577,13 @@ elif a[:2]==['pr','view']:
  if row['number']==9 and case=='saturated-pr-labels':row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
  if row['number']==9 and case=='saturated-references':row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
  print(json.dumps(row))
+elif case=='merge-label-during-policy' and a[:2]==['api','graphql']:
+ if any('AutoshipDirectMergePolicy' in x for x in a):print(json.dumps(dict(data=dict(repository=dict(mergeQueue=None)))))
+ else:(root/'merge-writes').write_text('dispatched');print('synthetic lost response',file=sys.stderr);sys.exit(1)
+elif case=='merge-label-during-policy' and a[:1]==['api'] and a[1].endswith('/rules/branches/main'):print('[]')
+elif case=='merge-label-during-policy' and a[:1]==['api'] and a[1].endswith('/branches/main/protection'):
+ (root/'manual-after-admission').write_text('owner changed route during policy read');print(json.dumps(dict(required_status_checks=dict(strict=True,contexts=['privacy']),enforce_admins=dict(enabled=True))))
+elif case=='ready-pause-during-routing' and a[:2]==['pr','ready']:(root/'ready-writes').write_text('dispatched');print('ok')
 elif a[:1]==['api'] and '/pulls/9/' in a[1]:
  if case=='post-rabbit-label':(root/'manual-after-admission').write_text('owner changed route during review read')
  if case=='post-rabbit-pause':
@@ -532,10 +600,14 @@ elif a[:1]==['api'] and a[1].startswith('https://api.github.com/repos/') and '/g
  if '--include' in a:print('HTTP/2.0 '+('200 OK' if len(words)==2 else '404 Not Found')+'\nContent-Type: application/json\n')
  if len(words)!=2:print('{"message":"Not Found"}');sys.exit(1)
  print(words[0])
+elif case.startswith('create-manual-') and a[:2]==['issue','view']:print(json.dumps(dict(state='OPEN')))
+elif case.startswith('create-manual-') and a[:1]==['api'] and '/git/ref/heads/' in a[1]:print(json.dumps(dict(object=dict(sha=(root/'actual-head').read_text()))))
+elif case.startswith('create-manual-') and a[:2]==['pr','create']:(root/'create-writes').write_text('dispatched');print('https://github.com/owner/repo/pull/9')
 elif a[:1]==['api'] and '/issues/' in a[1]:
  n=a[1].split('/issues/',1)[1]
  if case=='unknown-source' and n=='7':sys.exit(1)
  row=issues[n]
+ if case.startswith('create-manual-') and (root/'manual-after-admission').exists():row['labels']=[dict(name='autoship-manual')]
  if case=='malformed-source' and n=='7':row.pop('labels')
  print(json.dumps(row))
 elif a[:2] in (['pr','comment'],['issue','comment']) and (case.startswith('post-note-') or case.startswith('post-control-') or case.startswith('post-rabbit-') or case.startswith('round-')):

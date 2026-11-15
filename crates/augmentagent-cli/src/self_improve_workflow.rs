@@ -797,6 +797,10 @@ impl SweepGuard {
         inner.validate_before_side_effect()
     }
 
+    pub(super) fn validate_note_dispatch(&self)->Result<()> {
+        self.inner.as_ref().context("released sweep lease")?.validate_note_dispatch()
+    }
+
     pub(super) fn merge_lease(&self) -> Result<Lease> {
         self.inner.as_ref().context("released sweep lease")?.merge_lease()
     }
@@ -1470,7 +1474,7 @@ impl WorkflowGuard {
             .validate_lease(&self.lease, &self.binding, millis())
     }
 
-    /// New public notes must honor controls accepted after earlier reads or
+    /// New notes and ready transitions must honor controls accepted after earlier reads or
     /// Push dispatch. Completion receipts use the weaker lease/binding guard.
     pub(super) fn validate_note_dispatch(&self)->Result<()> {
         self.validate_before_side_effect()?;

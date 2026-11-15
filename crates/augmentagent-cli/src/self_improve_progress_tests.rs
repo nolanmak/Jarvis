@@ -484,7 +484,7 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(merge_sweep(&root, false).await, 0);
     let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
     assert!(calls.lines().any(|line| line.contains("--undo")), "failed draft merge restores draft state");
-    assert_eq!(ready_for_merge(&root, 20, None).await, None);
+    assert_eq!(ready_for_merge(&root, 20, None,||panic!("unknown draft state cannot dispatch")).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, false, &head);

@@ -1823,7 +1823,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     continue;
                 }
                 let Some(readied) = ready_for_merge(repo_root, pr,
-                    row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
+                    row.get("isDraft").and_then(serde_json::Value::as_bool),||sweep_lease.validate_note_dispatch()).await else {
                     continue;
                 };
                 // Codex: a check can go green-to-red without a new commit —
@@ -1865,7 +1865,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                     Ok(lease) => lease,
                     Err(error) => { warn!(pr, "merge lease unavailable: {error:#}"); continue; }
                 };
-                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent,&lease).await;
+                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent,&lease,publication::MergeRouting {automatic:selected.is_none(),source_issue:Some(issue)}).await;
                 if let Ok(Some(receipt)) = &mutation {
                     if let Err(error) = sweep_lease.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt).expect("serializable mutation receipt")) {
                         warn!(pr,"merge response could not be recorded; retain intent: {error:#}");
@@ -1923,12 +1923,15 @@ async fn sweep_merged_exact(repo_root: &Path, pr: u64, expected: &str) -> bool {
 
 /// Return whether this attempt changed a draft to ready. Unknown state or a
 /// failed transition defers merging; an already-ready PR needs no mutation.
-async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Option<bool> {
+async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>, before_dispatch:impl FnOnce()->Result<()>) -> Option<bool> {
     match draft? {
         false => Some(false),
-        true => match run(&gh_bin(), &["pr", "ready", &pr.to_string()], repo_root).await {
-            Ok((true, ..)) => Some(true),
-            _ => None,
+        true => {
+            before_dispatch().ok()?;
+            match run(&gh_bin(), &["pr", "ready", &pr.to_string()], repo_root).await {
+                Ok((true, ..)) => Some(true),
+                _ => None,
+            }
         },
     }
 }
@@ -7681,7 +7684,7 @@ async fn resume_draft_pr(
             if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
                 return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
             }
-            let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
+            let Some(readied) = ready_for_merge(repo_root, pr, draft,||workflow.validate_note_dispatch()).await else {
                 workflow.transition(Stage::AwaitChecks, "ready_state_unavailable", "reconcile_checks", chrono::Utc::now().timestamp_millis()+60_000).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
@@ -7696,7 +7699,7 @@ async fn resume_draft_pr(
             }
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
-            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?).await;
+            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?,publication::MergeRouting {automatic:expected_head.is_none(),source_issue:Some(issue_no)}).await;
             if let Ok(Some(receipt)) = &mutation {
                 workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
             }
@@ -9795,10 +9798,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
     }
-    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args).await;
+    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args, automatic_routing).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
         Err(error) => {
+            if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                workflow_guard.transition(crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                workflow_guard.finish()?;
+                return capacity_accounting.retry_report(format!("issue #{}: fresh PR creation routing held",issue.number));
+            }
             if let Some(report)=linked_claims::report(&error) {return Ok(report);}
             (false, String::new(), format!("{error:#}"))
         },
@@ -9954,7 +9962,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
-    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?).await;
+    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?,publication::MergeRouting {automatic:automatic_routing,source_issue:Some(issue.number)}).await;
     if let Ok(Some(receipt)) = &mutation {
         workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
     }
