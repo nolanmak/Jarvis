@@ -11,6 +11,7 @@ pub mod archetype;
 pub mod audit_chain;
 pub mod autoship_scope;
 pub mod autoship_write_scope;
+pub mod autoship_workflow_contract;
 pub mod build_scratch;
 pub mod cerebras;
 pub mod cli_gate;
