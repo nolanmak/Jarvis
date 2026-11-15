@@ -175,14 +175,16 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             AttemptLedger::mark_persist(&attempt_ledger_path(),utc_day_now(),7);
             assert!(!AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(),70),"new source must remain unattempted");
         }
-        if case.starts_with("paused-") {
-            let id=if case=="paused-pr" {"owner/repo/pr/9"}else{"owner/repo#7"};
+        if case.starts_with("paused-") || case=="pending-pr-unlabelled" {
+            let id=if matches!(case.as_str(),"paused-pr"|"pending-pr-unlabelled") {"owner/repo/pr/9"}else{"owner/repo#7"};
             let binding=crate::autoship_workflow::Binding {head:format!("{:040x}",9),contract:"contract".into(),evidence_hash:"evidence".into()};
             initial.register(id,"feat/repair-9",binding,1).unwrap();
             let lease=initial.claim(id,"original",2,100).unwrap().unwrap();
             initial.attach_pr_in_repo(&lease,"owner/repo",9,3).unwrap();
             initial.charge(&lease,"original-work",crate::autoship_workflow::ResourceCharge {model_calls:4,tokens:1234,wall_ms:700},4).unwrap();
-            initial.release(&lease,5).unwrap();initial.set_owner_pause(id,"github:owner",0,true,6).unwrap();
+            if case=="pending-pr-unlabelled" {initial.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&initial.snapshot(id).unwrap().unwrap().checkpoint.binding,5).unwrap();}
+            initial.release(&lease,5).unwrap();
+            if case.starts_with("paused-") {initial.set_owner_pause(id,"github:owner",0,true,6).unwrap();}
             let rows:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("prs.json")).unwrap()).unwrap();
             let mut owned=adoption::authorized(&rows,"owner/repo",&["owner".into()]);owned.retain(|pr|pr.pr==9);
             owned[0].body="Previous retained owner request".into();adoption::persist(&path,&owned).unwrap();
@@ -223,7 +225,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");

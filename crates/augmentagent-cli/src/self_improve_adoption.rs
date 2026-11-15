@@ -139,12 +139,18 @@ pub(super) fn persist(path: &Path, candidates: &[AdoptedPr]) -> Result<()> {
 pub(super) fn filter_owned_sources(path:&Path,candidates:&mut Vec<AdoptedPr>)->Result<()> {
     let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(())};
     let mut eligible=Vec::with_capacity(candidates.len());
+    let now=chrono::Utc::now().timestamp_millis();
     for candidate in candidates.drain(..) {
         let allowed=match store.resolve_pr(&candidate.repository,candidate.pr)? {
-            Some(id)=>store.snapshot(&id)?.is_some() && candidate_source_matches(&id,&candidate),
+            Some(id)=>store.snapshot(&id)?.is_some_and(|snapshot|
+                    snapshot.branch==candidate.branch && snapshot.lease_until_ms<=now
+                    && snapshot.checkpoint.next.eligible_at_ms<=now
+                    && !matches!(snapshot.checkpoint.stage,crate::autoship_workflow::Stage::Merged|crate::autoship_workflow::Stage::Retired))
+                && candidate_source_matches(&id,&candidate) && store.require_owner_dispatch(&id).is_ok()
+                && store.pending_operations(&id)?.is_empty() && !store.merge_reconciliation_needed(&id)?,
             None=>true,
         };
-        if allowed {eligible.push(candidate);}else {info!(pr=candidate.pr,"owned PR source changed; leaving original workflow and adoption facts untouched");}
+        if allowed {eligible.push(candidate);}else {info!(pr=candidate.pr,"owned PR is unavailable for automatic selection; original workflow and adoption facts retained");}
     }
     *candidates=eligible;Ok(())
 }

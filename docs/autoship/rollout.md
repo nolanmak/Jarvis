@@ -342,3 +342,8 @@ controls without claiming a turn or changing attempts, charges or checkpoints.
 A missing/different remote head retains the original uncertain operation. This
 observer never creates a PR or pushes. Post-publication review, parked-PR and
 source notes each recheck routing and live owner controls before their write.
+
+That same automatic selection boundary also excludes protected owner pauses,
+follow-up waits, active leases, future eligibility and pending remote effects.
+Such candidates yield to eligible peers without changing the attempt ledger or
+rewriting adoption facts. Removing a routing label does not clear those controls.
