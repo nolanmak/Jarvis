@@ -476,17 +476,58 @@ fn capacity_return_wakes_the_same_durable_job_without_owner_action() {
             .count(),
         1
     );
+    // The existing executor checkpoints a reviewer outage before the unpaid
+    // reconciler runs. Validate against the last typed event, not merely that
+    // already-updated legacy checkpoint, and do not credit a stage start as
+    // meaningful review progress.
+    let worker = store
+        .claim(id, "review-executor", 70, 100)
+        .unwrap()
+        .unwrap();
+    let mut outage = snapshot.checkpoint.clone();
+    outage.stage = Stage::Held;
+    outage.next = NextAction {
+        reason: "no-reviewer-capacity".into(),
+        action: "resume_preserved_work".into(),
+        eligible_at_ms: 0,
+    };
+    store.checkpoint(&worker, &outage, 71).unwrap();
+    store.release(&worker, 72).unwrap();
+    assert_eq!(
+        store
+            .reconcile_review_recovery("owner/repo", 1604, branch, &head, CapacityWait, 73)
+            .unwrap(),
+        Some(false)
+    );
+    let outage_event: WorkflowEvent = serde_json::from_str(
+        &store
+            .events(id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.1 == "review_recovery_wait_changed")
+            .unwrap()
+            .2,
+    )
+    .unwrap();
+    outage_event
+        .validate_after(&wake)
+        .expect("executor outage must preserve the shared event chain");
+    assert_eq!(
+        outage_event.last_meaningful_progress_at_ms,
+        wake.last_meaningful_progress_at_ms
+    );
     // The same request can enter the named adoption dependency, but provider
     // restoration alone can never fabricate missing provenance.
     assert_eq!(
         store
-            .reconcile_review_recovery("owner/repo", 1604, branch, &head, AdoptionWait, 62)
+            .reconcile_review_recovery("owner/repo", 1604, branch, &head, AdoptionWait, 74)
             .unwrap(),
         Some(false)
     );
     assert_eq!(
         store
-            .reconcile_review_recovery("owner/repo", 1604, branch, &head, Ready, 63)
+            .reconcile_review_recovery("owner/repo", 1604, branch, &head, Ready, 75)
             .unwrap(),
         Some(false)
     );

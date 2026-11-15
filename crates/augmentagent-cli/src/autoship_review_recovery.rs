@@ -97,6 +97,26 @@ impl WorkflowStore {
         };
         let scheduled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='review_recovery_scheduled' AND json_extract(payload,'$.binding.head')=?2 AND json_extract(payload,'$.binding.contract_version')=?3 AND json_extract(payload,'$.binding.evidence_version')=?4)",
             params![id,checkpoint.binding.head,checkpoint.binding.contract,checkpoint.binding.evidence_hash],|r|r.get(0))?;
+        let previous: Option<String> = tx.query_row(
+            "SELECT payload FROM workflow_event WHERE workflow=?1 AND kind IN ('review_recovery_scheduled','review_recovery_wait_changed') ORDER BY seq DESC LIMIT 1",
+            [&id], |r|r.get(0)).optional()?;
+        let previous = previous
+            .map(|raw| serde_json::from_str::<contract::WorkflowEvent>(&raw))
+            .transpose()?;
+        let public_stage = if due {
+            contract::WorkflowStage::Review
+        } else {
+            contract::WorkflowStage::Held
+        };
+        // The executor may already have checkpointed an outage. Compare with
+        // the last emitted review event so that this real wait is not lost.
+        // A legacy stage-start clock cannot grant shared meaningful progress.
+        let state_changed = previous.as_ref().is_some_and(|prior| {
+            prior.stage != public_stage
+                || prior.outcome != outcome
+                || prior.reason_code != reason
+                || prior.next.action != action
+        });
         let previous_stage = checkpoint.stage;
         checkpoint.stage = stage;
         checkpoint.next = NextAction {
@@ -105,7 +125,7 @@ impl WorkflowStore {
             eligible_at_ms: 0,
         };
         let updated = serde_json::to_string(&checkpoint)?;
-        if !scheduled || updated != raw {
+        if !scheduled || updated != raw || state_changed {
             let sequence: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(seq),0)+1 FROM workflow_event WHERE workflow=?1",
                 [&id],
@@ -132,19 +152,20 @@ impl WorkflowStore {
                     contract_version: checkpoint.binding.contract.clone(),
                     evidence_version: checkpoint.binding.evidence_hash.clone(),
                 },
-                stage: if due {
-                    contract::WorkflowStage::Review
-                } else {
-                    contract::WorkflowStage::Held
-                },
+                stage: public_stage,
                 outcome,
-                transition: if stage == previous_stage {
+                transition: if previous
+                    .as_ref()
+                    .map_or(stage == previous_stage, |prior| prior.stage == public_stage)
+                {
                     contract::ProgressTransition::Observation
                 } else {
                     contract::ProgressTransition::StageChanged
                 },
                 reason_code: reason.into(),
-                last_meaningful_progress_at_ms: progress,
+                last_meaningful_progress_at_ms: previous
+                    .as_ref()
+                    .map_or(progress, |prior| prior.last_meaningful_progress_at_ms),
                 next: contract::NextAction {
                     action: action.into(),
                     eligible_at_ms: None,
@@ -163,7 +184,11 @@ impl WorkflowStore {
                     },
                 )?,
             };
-            event_record.validate()?;
+            if let Some(previous) = &previous {
+                event_record.validate_after(previous)?;
+            } else {
+                event_record.validate()?;
+            }
             // No progress credit for merely scheduling/rechecking a request.
             tx.execute(
                 "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
