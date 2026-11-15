@@ -20,6 +20,7 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `deploy-pinned`  | 2026-10-20→24: a drop-in pinned the unit to a frozen binary; 4 days of merges never ran (#1571) |
 //! | `snapshot-budget`| 2026-11-01: protected snapshots filled the budget; rollouts were refused, then bypassed the cap (#1815) |
+//! | `workflow-config-fault` | 2026-10-31: policy missing, five failed ticks/day, watchdog green (#1708) |
 //! | `no-progress`    | nothing auto-merged in N days; Alert when a provider hold persists (Oct 27–31, #1708) |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
@@ -111,6 +112,11 @@ pub struct HealthInputs {
     /// for the build preset was latched on quota. A pause, not an outage, and
     /// it must not be triaged as one.
     pub last_provider_hold: Option<DateTime<Utc>>,
+    /// #1708 — the latest build tick that failed on a typed admission or
+    /// configuration fault (missing native policy, no eligible role
+    /// provider), with its reason. Unlike a quota hold this is a fault: it
+    /// alerts on first observation and resolves only when it stops recurring.
+    pub last_config_fault: Option<(DateTime<Utc>, String)>,
     /// `(pr, reason, times seen)` for resume refusals in the scanned window.
     pub repeated_refusals: Vec<(u64, String, u32)>,
     /// Open PR numbers, when they could be listed. A refusal loop only
@@ -204,6 +210,10 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         Some(a) => a.last_merged_at_ms.and_then(DateTime::from_timestamp_millis),
         None => i.last_merge,
     };
+    // #1708 — a configuration fault recurs on every tick, so one older than
+    // the hold window has stopped recurring: that is the observed recovery.
+    let config_fault = i.last_config_fault.as_ref()
+        .filter(|(at, _)| (now - *at).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
     let stalled_days = last_autonomous
         .map(|last| (now - last).num_days())
         .filter(|days| *days >= t.no_merge_days);
@@ -268,7 +278,12 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         if age <= PROVIDER_HOLD_FRESH_MINS {
             // #1708 — a hold explains a pause, not days without shipping.
             // Oct 27–31 the hold was renewed every tick while nothing merged.
-            let detail = match stalled_days {
+            let detail = match stalled_days.filter(|_| config_fault.is_none()) {
+                None if config_fault.is_some() => format!(
+                    "the build lane is held on provider availability (last held \
+                     {age} min ago) while a configuration fault persists; see \
+                     workflow-config-fault."
+                ),
                 None => format!(
                     "the build lane is paused: every provider cleared for it is \
                      on a quota cooldown (last held {age} min ago). Nothing is \
@@ -290,6 +305,23 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                     .into(),
             });
         }
+    }
+
+    // #1708 — first observation alerts. Missing configuration spends no
+    // allowance or model calls, which is exactly why it must not look idle.
+    if let Some((at, reason)) = config_fault {
+        out.push(Finding {
+            severity: Severity::Alert,
+            code: "workflow-config-fault",
+            detail: format!(
+                "build ticks are failing on workflow configuration (last {}): {reason}",
+                at.format("%Y-%m-%d %H:%MZ")
+            ),
+            fix: "Select the shared native policy through the supported installer \
+                  and verify builder, reviewer and adjudicator readiness; no \
+                  shipping allowance or model call is spent while this persists."
+                .into(),
+        });
     }
 
     let disks = [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)]
@@ -471,7 +503,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     // recurring for days is the fault, so it escalates rather than excuses.
     if let (Some(last), Some(days)) = (last_autonomous, stalled_days) {
         out.push(Finding {
-            severity: if held_recently { Severity::Alert } else { Severity::Warn },
+            severity: if held_recently || config_fault.is_some() { Severity::Alert } else { Severity::Warn },
             code: "no-progress",
             detail: if held_recently {
                 format!(
@@ -685,6 +717,28 @@ pub fn last_timestamp_with(log: &str, needle: &str) -> Option<DateTime<Utc>> {
         .rev()
         .find(|l| l.contains(needle))
         .and_then(line_timestamp)
+}
+
+/// Typed admission/configuration reasons the worker reports when a build
+/// tick cannot start. Each names configuration, not a transient fault.
+const CONFIG_FAULT_MARKERS: [&str; 4] = [
+    "execution-readiness-blocked",
+    "workflow-role:",
+    "workflow-deployment:",
+    "workflow-resource:declaration-missing",
+];
+
+/// #1708 — the most recent `auto-PR tick failed:` line whose reason is a
+/// typed configuration fault, with that reason (bounded for display).
+pub fn last_config_fault(log: &str) -> Option<(DateTime<Utc>, String)> {
+    log.lines().rev().find_map(|raw| {
+        let line = strip_ansi(raw);
+        let (_, reason) = line.split_once("auto-PR tick failed: ")?;
+        if !CONFIG_FAULT_MARKERS.iter().any(|marker| reason.contains(marker)) {
+            return None;
+        }
+        Some((line_timestamp(&line)?, reason.trim().chars().take(300).collect()))
+    })
 }
 
 /// `(pr, reason, count)` for resume refusals — the signature of a loop that
@@ -1096,6 +1150,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         // #1030 — the loop logs this exact phrase when every provider cleared
         // for the build preset is on a quota cooldown.
         last_provider_hold: last_timestamp_with(&log, "auto-PR held: no provider can serve"),
+        last_config_fault: last_config_fault(&log),
         last_merge: merge_allowance.and_then(|a| a.last_merged_at_ms).and_then(DateTime::from_timestamp_millis),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
@@ -1464,6 +1519,7 @@ mod tests {
             now_or_epoch: Some(t0()),
             daemon_active: true,
             last_provider_hold: None,
+            last_config_fault: None,
             last_reasoner_poll: Some(t0() - Duration::minutes(4)),
             last_loop_line: Some(t0() - Duration::minutes(12)),
             last_merge: Some(t0() - Duration::hours(20)),

@@ -373,3 +373,58 @@ fn unknown_mergeability_is_not_reported_as_conflict() {
     assert!(!lower.contains("rebase"), "UNKNOWN routed to conflict repair: {unknown}");
     assert_ne!(unknown, conflict, "UNKNOWN and CONFLICTING must be distinguishable");
 }
+
+/// #1708 exact incident (00:07 EDT Oct 31): live worker, a manual main
+/// commit, five configuration failures today, zero workflow model calls and
+/// no autonomous merge. The watchdog must be unhealthy with a provider/config
+/// reason on first observation, not report healthy or a harmless pause.
+#[test]
+fn oct31_config_failures_with_manual_commit_are_unhealthy() {
+    let now = oct(31, 4); // 00:07 EDT is 04:07 UTC
+    let mut log = String::new();
+    for hour in [0, 1, 2, 3] {
+        log.push_str(&format!(
+            "2026-10-31T0{hour}:05:00.000Z  WARN augmentagent::self_improve: auto-PR tick failed: \
+             execution-readiness-blocked: native-runtime:policy-missing\n"
+        ));
+    }
+    log.push_str(
+        "2026-10-31T03:35:00.000Z  WARN augmentagent::self_improve: auto-PR tick failed: \
+         workflow-role:builder:no-eligible-provider: claude: native-provider:claude:policy-missing\n",
+    );
+    let mut inputs = watchdog_inputs(now);
+    inputs.last_loop_line = crate::autopr_health::last_timestamp_with(&log, "augmentagent::self_improve");
+    inputs.last_provider_hold = crate::autopr_health::last_timestamp_with(&log, "auto-PR held: no provider can serve");
+    inputs.last_config_fault = crate::autopr_health::last_config_fault(&log);
+    inputs.merge_allowance = Some(allowance_last_merged(None));
+    inputs.last_merge = Some(now - chrono::Duration::minutes(30)); // owner's manual commit
+    let findings = crate::autopr_health::analyze(&inputs, &crate::autopr_health::Thresholds::default());
+    let fault = findings
+        .iter()
+        .find(|f| f.severity == crate::autopr_health::Severity::Alert && f.detail.contains("policy-missing"))
+        .unwrap_or_else(|| panic!("config failures must alert with their reason: {findings:?}"));
+    assert_eq!(fault.code, "workflow-config-fault");
+    assert!(!findings.iter().any(|f| f.detail.contains("Nothing is broken")), "{findings:?}");
+
+    // Observed recovery resolves it: once the fault stops recurring (no
+    // failure for longer than the hold freshness window), it no longer fires.
+    inputs.now_or_epoch = Some(now + chrono::Duration::hours(3));
+    inputs.last_loop_line = Some(now + chrono::Duration::hours(3));
+    let later = crate::autopr_health::analyze(&inputs, &crate::autopr_health::Thresholds::default());
+    assert!(!later.iter().any(|f| f.code == "workflow-config-fault"), "{later:?}");
+}
+
+/// Transient tick failures stay warnings elsewhere; only typed configuration
+/// reasons are configuration faults. ANSI-coloured lines still parse.
+#[test]
+fn only_typed_configuration_failures_count_as_config_faults() {
+    let log = "\
+2026-10-31T01:00:00.000Z  WARN augmentagent::self_improve: auto-PR tick failed: connection reset by peer\n\
+\u{1b}[2m2026-10-31T02:00:00.000Z\u{1b}[0m  WARN augmentagent::self_improve: auto-PR tick failed: workflow-deployment:selection-missing\n\
+2026-10-31T03:00:00.000Z  WARN augmentagent::self_improve: auto-PR tick failed: git fetch timed out\n";
+    let (at, reason) = crate::autopr_health::last_config_fault(log).expect("typed fault is found past later transient failures");
+    assert_eq!(at, oct(31, 2));
+    assert_eq!(reason, "workflow-deployment:selection-missing");
+    assert_eq!(crate::autopr_health::last_config_fault(
+        "2026-10-31T03:00:00.000Z  WARN augmentagent::self_improve: auto-PR tick failed: git fetch timed out\n"), None);
+}
