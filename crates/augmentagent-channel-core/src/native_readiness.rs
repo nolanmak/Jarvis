@@ -49,11 +49,16 @@ pub fn credentials_at(path:Option<&Path>, provider:&str, now:i64,
     }};
     report.policy_sha256=Some(format!("{:x}",Sha256::digest(&bytes)));
     let policy=match serde_json::from_slice::<Policy>(&bytes) {
-        Ok(policy) if policy.version==1=>policy,
+        Ok(policy) if policy_readiness::limits(&policy).is_ok()=>policy,
         _=>{report.status=PolicyInvalid;return report}
     };
     let Some(profile)=policy.providers.get(provider) else{report.status=RouteUndeclared;return report};
     let key=match provider {"codex"=>"CODEX_API_KEY","claude"=>"ANTHROPIC_API_KEY",_=>{report.status=RouteUndeclared;return report}};
+    // Launch requires an imported controller credential for every refresh
+    // grant, even when an environment or file API key can authenticate.
+    if policy_readiness::refresh_grant(&policy, provider, profile).is_err() {
+        report.status=CredentialInvalid;return report;
+    }
     // Launch seeds every declared file, including environment-key routes.
     // Validate it before the environment shortcut using launch's 1 MiB bound.
     let declared=if let Some(auth)=&profile.auth_file {
@@ -82,7 +87,6 @@ pub fn credentials_at(path:Option<&Path>, provider:&str, now:i64,
     report.expires_at_ms=if provider=="claude" {value.pointer("/claudeAiOauth/expiresAt").and_then(|v|v.as_i64())}
         else {jwt_expiry_ms(value.pointer("/tokens/access_token").and_then(|v|v.as_str()).unwrap_or(""))};
     let imported=policy.state_root.canonicalize().ok().map(|root|root.join("credentials").join(format!("{provider}.json")));
-    if profile.refresh_auth && imported.as_ref()!=Some(auth) {report.status=CredentialInvalid;return report;}
     report.status=match report.expires_at_ms {
         None=>CredentialExpiryUnknown,
         Some(expiry) if expiry>now=>DeclaredUsable,
@@ -217,3 +221,7 @@ pub(crate) fn builder_resource_policy() -> Result<serde_json::Value> {
     ensure!((512..=4096).contains(&build_mb),"invalid build VM memory");
     crate::run_resources::composed_native_policy(u64::from(policy.memory_mb),build_mb)
 }
+
+#[cfg(test)]
+#[path = "native_credential_grant_tests.rs"]
+mod grant_tests;
