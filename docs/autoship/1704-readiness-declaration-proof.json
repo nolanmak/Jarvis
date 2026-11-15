@@ -1,0 +1,310 @@
+{
+  "schema_version": 1,
+  "issue": 1704,
+  "baseline_revision": "36dbc7f7a94ce84c699f952c650ed6646b9a1314",
+  "baseline_binary_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+  "baseline_build_stamp": "36dbc7f7a94ce84c699f952c650ed6646b9a1314",
+  "red": {
+    "command": "AUGMENTAGENT_TEST_BINARY=/home/nolan-makatche/AugmentAgent/target/release/augmentagent python3 scripts/tests/native_policy_readiness_cli.py",
+    "exit_code": 1,
+    "behavior_failures": 9,
+    "actual": [
+      "declared-usable",
+      "declared-available",
+      "policy-invalid"
+    ],
+    "expected": [
+      "credential-invalid",
+      "policy-invalid",
+      "no-eligible-provider",
+      "policy-missing"
+    ],
+    "cases": [
+      "refresh-file",
+      "refresh-environment",
+      "refresh-fileless",
+      "memory-low",
+      "memory-high",
+      "sessions-zero",
+      "bytes-low",
+      "routed-refresh",
+      "policy-file-missing"
+    ]
+  },
+  "production_readonly": {
+    "expected_active": true,
+    "expected_executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+    "live_verified": false,
+    "matches": true,
+    "selected_policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+    "services": {
+      "daemon": {
+        "birth": "687044258",
+        "configuration_sha256": "dc5c9d27a36b6a22c285c4088aaf6e07bd9b497b5d6001ceabf4e16422af3d07",
+        "executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+        "pid": 1658226,
+        "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+        "provider_executable_sha256": {
+          "claude": "604d29a6869409106b6a1110bdadcc8b72e8654a5a865d23258f938a696e348e",
+          "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+        },
+        "status": "configuration-observed"
+      },
+      "worker": {
+        "birth": "687044260",
+        "configuration_sha256": "dc5c9d27a36b6a22c285c4088aaf6e07bd9b497b5d6001ceabf4e16422af3d07",
+        "executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+        "pid": 1658227,
+        "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+        "provider_executable_sha256": {
+          "claude": "604d29a6869409106b6a1110bdadcc8b72e8654a5a865d23258f938a696e348e",
+          "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+        },
+        "status": "configuration-observed"
+      }
+    },
+    "status": "configuration-matched",
+    "worker_running": true,
+    "observed_utc": "2026-11-15T06:31:54.960622+00:00",
+    "scope": "Read-only configuration equality; no current-build live provider acceptance; no deployment or workflow mutation."
+  },
+  "production_acceptance": false,
+  "rollout_performed": false,
+  "model_calls": 0,
+  "shipping_accounting_changed": false,
+  "targeted_core": {
+    "command": "CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_vm::readiness::grant_tests -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 3,
+    "failed": 0,
+    "scope": "Initial shared declaration checks only, before routed-path and missing-file additions; current head validation remains pending."
+  },
+  "installed_parent_diagnostic": {
+    "observed_utc": "2026-11-15T06:56:33.923334+00:00",
+    "scope": "Installed parent binary read-only diagnostic in replayed non-secret worker config; resource admission describes observer scope, not live worker cgroup. Not current-branch live acceptance.",
+    "exit_code": 3,
+    "credentials_unchanged": true,
+    "ready": false,
+    "roles": {
+      "adjudicator": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "builder": {
+        "providers": [
+          "claude",
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "independent_reviewer": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "live_verified": false
+    },
+    "credentials": {
+      "claude": {
+        "status": "declared-usable",
+        "live_verified": false
+      },
+      "codex": {
+        "status": "declared-usable",
+        "live_verified": false
+      }
+    },
+    "runtime": {
+      "status": "native-guest-verified",
+      "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+      "guest_manifest_sha256": "9bdd3c8caa6f02ed63a362f34626fe0043849f7cc047769eb407ccb35e68fb08",
+      "build_status": "build-declaration-verified",
+      "build_config_sha256": "3e6d45adc4e3959249a07dbd3d751e37c658604d1d9e50a16658e1acf9003973"
+    },
+    "resources_status": "delegation-unavailable",
+    "native_state_status": "capacity-observed"
+  },
+  "validation_status": "complete; original signal-fixture failure retained and resolved by test-launcher SIGHUP normalization only",
+  "managed_cli_admission_deferrals": {
+    "attempts": 6,
+    "exit_code": 75,
+    "wait_seconds_each": 300,
+    "scope": "Initial turn before orchestrator released the shared lease; resumed validation acquired admission."
+  },
+  "current_head_cli": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --test autoship_commands_cli --test native_policy_readiness_cli readiness -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 9,
+    "failed": 0,
+    "packaged_fixture_cases": 9,
+    "binary_sha256": "c909495215bb345f7b2a6d32575d6e35f90f08a0a6f7ed0296804d56b4d1e32a",
+    "profile": "debug; behavior verification, not production deployment acceptance"
+  },
+  "core_library_initial_run": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core -- --test-threads=2",
+    "managed_exit_code": 1,
+    "cargo_exit_code": 101,
+    "passed": 750,
+    "failed": 1,
+    "ignored": 16,
+    "failure": "process_tree::tests::supervisor_forwards_a_child_signal_death_as_128_plus_n",
+    "actual": "kill -HUP $$ exited 0; expected 129",
+    "test_launcher_sighup_inherited_ignored": true,
+    "note": "The unchanged signal fixture passed when the test launcher restored SIGHUP=SIG_DFL. Remaining integration/doc targets run separately because Cargo stopped after the library failure; no second full library run."
+  },
+  "signal_fixture_recheck": {
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.signal-recheck.log test -p augmentagent-channel-core --lib process_tree::tests::supervisor_forwards_a_child_signal_death_as_128_plus_n -- --exact --test-threads=2",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0,
+    "test_launcher_sighup": "SIG_DFL",
+    "production_signal_dispositions_changed": false
+  },
+  "core_integration_continuation": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.core-integration.log test -p augmentagent-channel-core --test '*' -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 126,
+    "failed": 0,
+    "ignored": 24,
+    "targets": [
+      {
+        "target": "capability_inventory.rs",
+        "status": "ok",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "code_mode_compute.rs",
+        "status": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 6
+      },
+      {
+        "target": "code_mode_prompt_snapshot.rs",
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "code_mode_runner.rs",
+        "status": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "draft_context.rs",
+        "status": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "draft_context_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "governor_load.rs",
+        "status": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "live_optional_mcp.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "native_session.rs",
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "native_session_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "phone_agent.rs",
+        "status": "ok",
+        "passed": 24,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "phone_call_reliability.rs",
+        "status": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "phone_native_live.rs",
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "provider_output_contracts.rs",
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 10
+      },
+      {
+        "target": "revision_edit_first.rs",
+        "status": "ok",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "surface_turn.rs",
+        "status": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      }
+    ]
+  },
+  "core_doc_continuation": {
+    "source_revision": "11dbcd149828c56df0c6d653c6891fecc6790d4c",
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.core-doc.log test -p augmentagent-channel-core --doc -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 0,
+    "failed": 0,
+    "ignored": 1
+  },
+  "test_launcher_reproduction_prefix": "CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 python3 -c 'import os,signal,sys; signal.signal(signal.SIGHUP,signal.SIG_DFL); os.execvp(sys.argv[1],sys.argv[1:])' scripts/cargo-managed.sh",
+  "validation_log_sha256": {
+    "L2.packaged-red.log": "10c2dbfb2b8b7436d3fdb5f4f4539404d75e076a4f4e7e11a4ec1011e59ea7a1",
+    "L2.cli-green.log": "58136ba386dc312fe7259d2a1c7033734fa285d11f80e852e2f58dd43915325b",
+    "L2.core-suite.log": "37b1d3be0bf5c31a6cc93fb0578d941374eb0a87dc18e5cc6b84f8e2b4660848",
+    "L2.signal-recheck.log": "ec0c3948caa266a773c1e4039f031a9fdc487c301f1c20a1c0855288284493bb",
+    "L2.core-integration.log": "c2a36df6bc6c2e19b50911df921088bfda8ef070addf7419c5bcdeef28e93224",
+    "L2.core-doc.log": "47f6a05312f59f4cdb7779f66d7f458ddf931dde1528bb81c35c5347c04aa416"
+  }
+}
