@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "issue": 1704,
+  "baseline_revision": "36dbc7f7a94ce84c699f952c650ed6646b9a1314",
+  "baseline_binary_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+  "baseline_build_stamp": "36dbc7f7a94ce84c699f952c650ed6646b9a1314",
+  "red": {
+    "command": "AUGMENTAGENT_TEST_BINARY=/home/nolan-makatche/AugmentAgent/target/release/augmentagent python3 scripts/tests/native_policy_readiness_cli.py",
+    "exit_code": 1,
+    "behavior_failures": 9,
+    "actual": [
+      "declared-usable",
+      "declared-available",
+      "policy-invalid"
+    ],
+    "expected": [
+      "credential-invalid",
+      "policy-invalid",
+      "no-eligible-provider",
+      "policy-missing"
+    ],
+    "cases": [
+      "refresh-file",
+      "refresh-environment",
+      "refresh-fileless",
+      "memory-low",
+      "memory-high",
+      "sessions-zero",
+      "bytes-low",
+      "routed-refresh",
+      "policy-file-missing"
+    ]
+  },
+  "production_readonly": {
+    "expected_active": true,
+    "expected_executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+    "live_verified": false,
+    "matches": true,
+    "selected_policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+    "services": {
+      "daemon": {
+        "birth": "687044258",
+        "configuration_sha256": "dc5c9d27a36b6a22c285c4088aaf6e07bd9b497b5d6001ceabf4e16422af3d07",
+        "executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+        "pid": 1658226,
+        "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+        "provider_executable_sha256": {
+          "claude": "604d29a6869409106b6a1110bdadcc8b72e8654a5a865d23258f938a696e348e",
+          "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+        },
+        "status": "configuration-observed"
+      },
+      "worker": {
+        "birth": "687044260",
+        "configuration_sha256": "dc5c9d27a36b6a22c285c4088aaf6e07bd9b497b5d6001ceabf4e16422af3d07",
+        "executable_sha256": "367b2e6955c79e5bf5d6eccb532eb3dadcf24bc3ace65d519d63109b9bd6f1ad",
+        "pid": 1658227,
+        "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+        "provider_executable_sha256": {
+          "claude": "604d29a6869409106b6a1110bdadcc8b72e8654a5a865d23258f938a696e348e",
+          "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+        },
+        "status": "configuration-observed"
+      }
+    },
+    "status": "configuration-matched",
+    "worker_running": true,
+    "observed_utc": "2026-11-15T06:31:54.960622+00:00",
+    "scope": "Read-only configuration equality; no current-build live provider acceptance; no deployment or workflow mutation."
+  },
+  "production_acceptance": false,
+  "rollout_performed": false,
+  "model_calls": 0,
+  "shipping_accounting_changed": false,
+  "targeted_core": {
+    "command": "CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_vm::readiness::grant_tests -- --test-threads=2",
+    "exit_code": 0,
+    "passed": 3,
+    "failed": 0,
+    "scope": "Initial shared declaration checks only, before routed-path and missing-file additions; current head validation remains pending."
+  },
+  "installed_parent_diagnostic": {
+    "observed_utc": "2026-11-15T06:56:33.923334+00:00",
+    "scope": "Installed parent binary read-only diagnostic in replayed non-secret worker config; resource admission describes observer scope, not live worker cgroup. Not current-branch live acceptance.",
+    "exit_code": 3,
+    "credentials_unchanged": true,
+    "ready": false,
+    "roles": {
+      "adjudicator": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "builder": {
+        "providers": [
+          "claude",
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "independent_reviewer": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "live_verified": false
+    },
+    "credentials": {
+      "claude": {
+        "status": "declared-usable",
+        "live_verified": false
+      },
+      "codex": {
+        "status": "declared-usable",
+        "live_verified": false
+      }
+    },
+    "runtime": {
+      "status": "native-guest-verified",
+      "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+      "guest_manifest_sha256": "9bdd3c8caa6f02ed63a362f34626fe0043849f7cc047769eb407ccb35e68fb08",
+      "build_status": "build-declaration-verified",
+      "build_config_sha256": "3e6d45adc4e3959249a07dbd3d751e37c658604d1d9e50a16658e1acf9003973"
+    },
+    "resources_status": "delegation-unavailable",
+    "native_state_status": "capacity-observed"
+  },
+  "validation_status": "blocked-build-lease",
+  "managed_cli_admission_deferrals": {
+    "attempts": 6,
+    "exit_code": 75,
+    "wait_seconds_each": 300
+  }
+}
