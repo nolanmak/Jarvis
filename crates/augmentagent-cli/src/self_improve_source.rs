@@ -320,7 +320,6 @@ else: sys.exit(2)
                 .env(CHILD, &root).env("GH_BIN", &gh).env("HOME", root.join("home"))
                 .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.join("state"))
                 .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.join("workflow.db"))
-                .env("AUGMENTAGENT_AUTOPR_OPENED_FILE", root.join("opened-prs.json"))
                 .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner").env("AUGMENTAGENT_GH_OWNER", "owner")
                 .env_remove("AUGMENTAGENT_AUTOPR_LANE")
                 .output().unwrap();
