@@ -198,6 +198,7 @@ pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
     )
     .await?;
     if exists {
+        checkout_identity::controller_refresh(&path, &head).await?;
         git(&path, &["checkout", "--detach", &head]).await?;
     } else {
         git(
@@ -486,3 +487,7 @@ mod tests {
         assert_eq!(git(&path, &["rev-parse", "HEAD"]), head);
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_workspace_isolation_tests.rs"]
+mod isolation_tests;

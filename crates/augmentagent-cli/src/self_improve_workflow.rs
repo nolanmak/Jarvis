@@ -202,6 +202,8 @@ fn millis() -> i64 {
 /// renewal but does not delete work or declare subprocess teardown complete.
 /// Call finish only after child processes have stopped and artifacts are safe.
 pub(super) struct WorkflowGuard {
+    state: PathBuf,
+    checkout_identity: Arc<Mutex<Option<checkout_identity::Identity>>>,
     store: Arc<Mutex<WorkflowStore>>,
     lease: Lease,
     repository: String,
@@ -662,6 +664,7 @@ impl SweepGuard {
         }
         let audit = workflow_audit(path, &id, None)?;
         let inner = WorkflowGuard {
+            state: path.into(), checkout_identity: Arc::new(Mutex::new(None)),
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
@@ -741,6 +744,9 @@ impl SweepGuard {
             }
         }
         let worktree = prepare_resume_worktree_at_head(repo, pr, &self.branch,Some(&expected)).await?;
+        let identity=checkout_identity::Identity::observe(&inner.state,repo,&worktree,inner.id(),&inner.repository,&self.branch).await?;
+        identity.enroll(&mut *inner.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?,&inner.lease,&inner.binding,millis())?;
+        *inner.checkout_identity.lock().map_err(|_|anyhow::anyhow!("checkout identity lock poisoned"))?=Some(identity);
         let reference = {
             let store = inner
                 .store
@@ -900,6 +906,8 @@ impl WorkflowGuard {
                     .context("issue or PR identity required")?,
             )?
         };
+        let checkout_identity = checkout_identity::Identity::observe(state, start.repo_root, start.worktree,
+            &id, start.repository, start.branch).await?;
         let existing = store.snapshot(&id)?;
         let semantic=if let Some(snapshot)=&existing {store.semantic_reconsideration(&id,&snapshot.checkpoint.binding)?}else{None};
         let retained=if let Some(snapshot)=&existing {store.retained_qualification_history(&id,&snapshot.checkpoint.binding)?}else{None};
@@ -964,6 +972,9 @@ impl WorkflowGuard {
                 now,
             )?;
         }
+        if let Err(error)=checkout_identity.enroll(&mut store,&lease,&binding,now) {
+            store.release(&lease,now)?;return Err(error);
+        }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
         if mode!=AcquireMode::VerifierRecovery {
@@ -973,6 +984,7 @@ impl WorkflowGuard {
             store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         }
         let guard = Self {
+            state: state.into(), checkout_identity: Arc::new(Mutex::new(Some(checkout_identity))),
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
@@ -1069,7 +1081,9 @@ impl WorkflowGuard {
         self.audit.require_run_resources()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
+        let dispatch_identity=self.checkout_identity.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
+            checkout_identity::validate(&dispatch_identity)?;
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
             store.validate_dispatch(&dispatch_lease,&binding,millis())?;
@@ -1097,7 +1111,9 @@ impl WorkflowGuard {
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
         let acceptance_authority=self.acceptance_authority.clone();let worktree=self.worktree.clone();
+        let model_identity=self.checkout_identity.clone();
         self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
+            checkout_identity::validate(&model_identity)?;
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
@@ -1172,7 +1188,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
+        let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
@@ -1455,6 +1471,13 @@ impl WorkflowGuard {
     /// Check immediately before gh/git side effects. Also pass GitHub the
     /// exact expected SHA; this local check cannot fence an in-flight RPC.
     pub(super) fn validate_before_side_effect(&self) -> Result<()> {
+        self.validate_control_state()?;
+        checkout_identity::validate(&self.checkout_identity)
+    }
+
+    // A completed remote mutation must remain recordable if the checkout was
+    // replaced while its RPC was in flight. Preserve the old lease/audit gate.
+    fn validate_control_state(&self) -> Result<()> {
         self.healthy_lease()?;
         self.audit.protected_health()?;
         self.store
@@ -1517,7 +1540,7 @@ impl WorkflowGuard {
         operation: &Operation,
         receipt: &serde_json::Value,
     ) -> Result<()> {
-        self.validate_before_side_effect()?;
+        self.validate_control_state()?;
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
