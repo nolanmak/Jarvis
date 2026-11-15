@@ -116,6 +116,9 @@ pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>) 
     for candidate in candidates.drain(..) {
         if allowed(root,&candidate.repository,candidate.pr,candidate.source_issue).await {eligible.push(candidate);}
     }
+    if adoption::filter_owned_sources(&workflow::path(),&mut eligible).is_err() {
+        warn!("protected PR source identity unavailable; deferring automatic selection");eligible.clear();
+    }
     *candidates=eligible;
 }
 
@@ -143,4 +146,16 @@ pub(super) async fn restore_draft(root:&Path,pr:u64,readied:bool,workflow:&workf
         && workflow.validate_before_side_effect().is_ok() {
         let _=run(&gh_bin(),&["pr","ready",&pr.to_string(),"--undo","--repo",workflow.repository()],root).await;
     }
+}
+
+/// Actual post-publication notes share a single production entry point.
+#[derive(Clone,Copy)]
+pub(super) enum NoteTarget {Pr,Issue}
+pub(super) async fn published_note(root:&Path,workflow:&mut workflow::WorkflowGuard,pr:u64,issue:u64,
+    automatic:bool,target:NoteTarget,body:&str)->Result<bool> {
+    if !permit_mutation(root,pr,Some(issue),automatic,workflow).await? {return Ok(false);}
+    workflow.validate_before_side_effect()?;
+    let (kind,number)=match target {NoteTarget::Pr=>("pr",pr),NoteTarget::Issue=>("issue",issue)};
+    let _=run(&gh_bin(),&[kind,"comment",&number.to_string(),"--body",body],root).await;
+    Ok(true)
 }

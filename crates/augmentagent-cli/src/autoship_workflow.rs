@@ -10,6 +10,10 @@ use std::{path::Path, time::Duration};
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
 
+#[path = "autoship_push_observation.rs"]
+mod push_observation;
+pub(crate) use push_observation::PendingPush;
+
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
 #[path = "autoship_resource_refusal.rs"]

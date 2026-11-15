@@ -6805,8 +6805,8 @@ async fn resume_draft_pr(
     expected_head: Option<&str>,
 ) -> Result<RunReport> {
     let gh = gh_bin();
+    let repository=workflow::canonical_repository(repo_root).await?;
     if expected_head.is_none() {
-        let repository=workflow::canonical_repository(repo_root).await?;
         if !manual_routing::allowed(repo_root,&repository,pr,Some(issue_no)).await {
             return Ok(RunReport::held("automatic PR routing held".into()));
         }
@@ -6836,6 +6836,10 @@ async fn resume_draft_pr(
         return Ok(RunReport::triage(format!(
             "PR #{pr}: head branch `{branch}` is not on origin; skipped"
         )));
+    }
+
+    if manual_routing::require_terminal_controls(&repository,issue_no,Some(pr)).is_err() {
+        return Ok(RunReport::held(format!("PR #{pr}: resume controls require owner input or remote-effect reconciliation")));
     }
 
     // Whatever happens next counts as today's attempt on this issue, so a
@@ -8413,7 +8417,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         )));
     }
 
-    match has_open_agent_pr(repo_root,issue.number).await {
+    match publication::claimed_after_reconcile(repo_root,issue.number,dry_run).await {
         Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
         Err(_)=>return Err(linked_claims::Hold::Unknown.into()),
@@ -9817,24 +9821,24 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
-        let _ = run(&gh, &["pr", "comment", &pr_url, "--body",
-            &independent_findings_comment(&independent.notes)], repo_root).await;
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Pr,&independent_findings_comment(&independent.notes)).await? {
+            return Ok(RunReport::held(format!("issue #{}: publication notes routing held",issue.number)));
+        }
     }
     if let Some(reason) = &park {
         // The findings go where the next builder will read them: on the PR,
         // under a marker resume parses back (#1488 AC3).
-        let _ = run(&gh, &["pr", "comment", &pr_url, "--body", &reason.comment()], repo_root).await;
-        backoff_comment(
-            repo_root,
-            issue.number,
-            &format!(
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Pr,&reason.comment()).await? {
+            return Ok(RunReport::held(format!("issue #{}: parked publication notes routing held",issue.number)));
+        }
+        if !manual_routing::published_note(repo_root,&mut workflow_guard,pr_number.context("published PR identity unavailable")?,issue.number,
+            automatic_routing,manual_routing::NoteTarget::Issue,&format!(
                 "Auto-fix parked its work as a draft PR instead of deleting it: {}. \
-                 The resume lane keeps revising it — {pr_url}",
-                reason.headline()
-            ),
-        )
-        .await
-        .ok();
+                 The resume lane keeps revising it — {pr_url}",reason.headline())).await? {
+            return Ok(RunReport::held(format!("issue #{}: parked source note routing held",issue.number)));
+        }
         notify_review(&format!(
             "📝 auto-PR parked as draft: {} — {pr_url}\n{}",
             issue.title,
@@ -9855,12 +9859,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     if independent.approved() && !repaired_after_review {
         if let Some(pr)=pr_number {
-            if let Some(pr)=pr_number {
-        if !manual_routing::permit_mutation(repo_root,pr,Some(issue.number),automatic_routing,&mut workflow_guard).await? {
-            return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
-        }
-    }
-    if workflow_guard.published_pr_ready(pr,&independent).await? {
+            if !manual_routing::permit_mutation(repo_root,pr,Some(issue.number),automatic_routing,&mut workflow_guard).await? {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
+            if workflow_guard.published_pr_ready(pr,&independent).await? {
                 workflow_guard.finish()?;
                 return Ok(RunReport::built(format!("issue #{}: validated PR published; PR milestone complete — {pr_url}",issue.number)));
             }
@@ -20440,8 +20442,11 @@ else:
         if fault=="pause" {store.set_owner_pause(id,"github:synthetic-owner",0,true,5).unwrap();}
         else {store.begin_operation(&lease,if fault=="push" {crate::autoship_workflow::OperationKind::Push}else{crate::autoship_workflow::OperationKind::MergePr},&binding,5).unwrap();}
         store.release(&lease,6).unwrap();let before=store.snapshot(id).unwrap();let events=store.events(id).unwrap();let pending=store.pending_operations(id).unwrap();
+        let ledger_before=std::fs::read(attempt_ledger_path()).ok();
         let reasoner=build_reasoner();
         let result=resume_draft_pr(&repo,&reasoner,71000,70994,&branch,false,if automatic {None}else{Some(head.trim())}).await.unwrap();
+        assert_eq!(std::fs::read(attempt_ledger_path()).ok(),ledger_before,
+            "protected preflight changed the same-day attempt ledger: {target}/{fault}/automatic={automatic}");
         let calls=gh_calls_1037(&root);
         assert!(!calls.iter().any(|c|gh_call_is(c,&["issue","comment"]) || gh_call_is(c,&["issue","edit"]) || gh_call_is(c,&["pr","comment"]) || gh_call_is(c,&["pr","close"])),
             "reviewer preflight dispatched stand-down despite {target}/{fault}/automatic={automatic}: {calls:?}");

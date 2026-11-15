@@ -326,3 +326,19 @@ recheck linked claims before a new intent and again before dispatch. An existing
 uncertain push can still observe an already-published matching remote head;
 that observation neither sends another push nor starts model work. Retry hints
 also retain the workflow's source identity when closing references change.
+
+Automatic inventory is checked against its protected PR alias/source identity
+before persisting mutable metadata or selecting an unattempted linked issue.
+A changed or removed issue reference cannot redirect an existing issue workflow.
+Resume also checks owner/follow-up and remote-effect controls before recording
+its same-day attempt marker; a free hold cannot suppress later paid work.
+
+Fresh publication performs its final claim/routing and binding checks before
+creating a new Push intent. Known routing denials leave no new pending effect.
+The early fresh dedup path and normal publication reconciler can observe an
+existing idle Push whose exact head is already on its protected remote ref.
+That completion fences generation, active lease, branch, binding and owner
+controls without claiming a turn or changing attempts, charges or checkpoints.
+A missing/different remote head retains the original uncertain operation. This
+observer never creates a PR or pushes. Post-publication review, parked-PR and
+source notes each recheck routing and live owner controls before their write.

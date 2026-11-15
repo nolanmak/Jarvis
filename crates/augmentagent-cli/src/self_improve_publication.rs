@@ -115,14 +115,43 @@ struct PendingPublication {
     contract:String,environment:String,args:Vec<String>,
 }
 
+/// The fresh pipeline calls this before its linked-PR dedup return.
+pub(super) async fn claimed_after_reconcile(repo:&Path,issue:u64,dry_run:bool)->Result<bool> {
+    // Only observe already-dispatched pushes here. This early dedup boundary
+    // does not gain authority to create another PR for a different workflow.
+    if !dry_run && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?.is_some() {
+        let repository=workflow::canonical_repository(repo).await?;
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+        observe_pushes(repo,&repository,&mut store).await?;
+    }
+    has_open_agent_pr(repo,issue).await
+}
+
 /// This lane spends no model calls and runs independently of builder capacity.
 pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     if dry_run { return Ok(()); }
     let repository=workflow::canonical_repository(repo).await?;
     let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    observe_pushes(repo,&repository,&mut store).await?;
     for (id,raw) in store.pending_publications(&repository)? {
         if let Err(error)=reconcile_one(repo,&repository,&mut store,&id,&raw).await {
             warn!(workflow=%id,"pending publication reconciliation deferred: {error:#}");
+        }
+    }
+    Ok(())
+}
+async fn observe_pushes(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore)->Result<()> {
+    for pending in store.pending_push_observations(&repository,chrono::Utc::now().timestamp_millis(),32)? {
+        let reference=format!("refs/heads/{}",pending.branch());
+        let (valid,_,_)=run("git",&["check-ref-format",&reference],repo).await?;
+        if !valid {continue;}
+        let (ok,raw,_)=run("git",&["ls-remote","--heads","origin",&reference],repo).await?;
+        if !ok {break;} // One transport outage must not multiply across the batch.
+        let words=raw.split_whitespace().collect::<Vec<_>>();
+        if words.len()!=2 || words[1]!=reference || words[0]!=pending.head()
+            || !matches!(words[0].len(),40|64) || !words[0].bytes().all(|byte|byte.is_ascii_hexdigit()) {continue;}
+        if store.observe_idle_push(&pending,words[0],chrono::Utc::now().timestamp_millis())? {
+            info!(workflow=%pending.workflow(),"observed prior Push without dispatching or claiming a work turn");
         }
     }
     Ok(())

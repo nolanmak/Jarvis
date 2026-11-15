@@ -2135,7 +2135,6 @@ impl WorkflowGuard {
         }
         self.transition(Stage::Publish, "publishing_revision", "push", millis())
             .await?;
-        let operation = self.intent(OperationKind::Push)?;
         let target = format!("refs/heads/{branch}");
         let (ok, out, _) = run(
             "git",
@@ -2146,7 +2145,8 @@ impl WorkflowGuard {
         anyhow::ensure!(ok, "cannot reconcile remote revision before push");
         // Empty expected SHA is a create-if-absent compare-and-swap.
         let remote = out.split_whitespace().next().unwrap_or("");
-        if remote == operation.binding.head {
+        if remote == self.binding.head {
+            let operation=self.intent(OperationKind::Push)?;
             self.observe_remote(&operation, &format!("git-head:{remote}"), None)?;
             return Ok(remote.to_string());
         }
@@ -2162,9 +2162,12 @@ impl WorkflowGuard {
                 "remote PR changed; reconcile before publishing preserved work"
             );
         }
-        if let Some((repo,automatic))=fresh {self.require_fresh_publication_route(repo,automatic).await?;}
         self.validate_before_side_effect()?;
-        self.validate_binding(&operation.binding).await?;
+        self.validate_binding(&self.binding.clone()).await?;
+        if let Some((repo,automatic))=fresh {self.require_fresh_publication_route(repo,automatic).await?;}
+        // No await separates this new durable intent from starting its push.
+        // A denial above leaves no new effect requiring reconciliation.
+        let operation=self.intent(OperationKind::Push)?;
         let expected = format!("--force-with-lease={target}:{remote}");
         let refspec = format!("HEAD:{target}");
         let (pushed, _, _) = run(

@@ -133,6 +133,22 @@ pub(super) fn persist(path: &Path, candidates: &[AdoptedPr]) -> Result<()> {
     Ok(())
 }
 
+/// Screen fresh inventory against existing protected ownership before storing
+/// its mutable metadata or passing a new source to a selector. No alias means
+/// an unowned candidate, not permission to change an existing alias.
+pub(super) fn filter_owned_sources(path:&Path,candidates:&mut Vec<AdoptedPr>)->Result<()> {
+    let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(())};
+    let mut eligible=Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        let allowed=match store.resolve_pr(&candidate.repository,candidate.pr)? {
+            Some(id)=>store.snapshot(&id)?.is_some() && candidate_source_matches(&id,&candidate),
+            None=>true,
+        };
+        if allowed {eligible.push(candidate);}else {info!(pr=candidate.pr,"owned PR source changed; leaving original workflow and adoption facts untouched");}
+    }
+    *candidates=eligible;Ok(())
+}
+
 pub(super) fn lookup(path: &Path, repository: &str, pr: u64) -> Result<Option<AdoptedPr>> {
     WorkflowStore::open(path)?
         .adopted_pr(repository, pr)?
