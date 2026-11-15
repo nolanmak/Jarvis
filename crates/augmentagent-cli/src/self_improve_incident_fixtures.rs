@@ -15,8 +15,8 @@
 //! | No native VM policy selected; workflows spent nothing  | `missing_native_vm_policy_stops_before_any_state_or_spend` | #1704  | green guard    |
 //! | Five errors/day exhausted the old allowance (Oct 27–30)| `five_failures_a_day_for_four_days_spend_no_allowance`     | #1705  | green guard    |
 //! | Oct 29 was entirely dirty-checkout refusals            | `dirty_owner_checkout_never_refuses_controller_admission`  | #1707  | green guard    |
-//! | Watchdog healthy while provider faults persisted       | `persistent_provider_fault_without_progress_alerts`        | #1708  | RED (ignored)  |
-//! | Watchdog counted manual main commits as progress       | `manual_main_commit_is_not_autonomous_progress`            | #1708  | RED (ignored)  |
+//! | Watchdog healthy while provider faults persisted       | `persistent_provider_fault_without_progress_alerts`        | #1708  | green (#1708)  |
+//! | Watchdog counted manual main commits as progress       | `manual_main_commit_is_not_autonomous_progress`            | #1708  | green (#1708)  |
 //! | UNKNOWN mergeability never merges                      | `unknown_mergeability_never_merges`                        | #1711  | green guard    |
 //! | UNKNOWN mergeability logged as conflict (#1606)        | `unknown_mergeability_is_not_reported_as_conflict`         | #1711  | RED (ignored)  |
 use super::*;
@@ -286,7 +286,6 @@ fn watchdog_baseline_is_quiet_for_a_shipping_loop() {
 /// "nothing is broken": four days without a confirmed autonomous merge while
 /// the build lane is continuously held is an Alert.
 #[test]
-#[ignore = "RED until #1708 (H): a continuously renewed provider hold suppresses no-progress indefinitely"]
 fn persistent_provider_fault_without_progress_alerts() {
     let now = oct(31, 12);
     let mut inputs = watchdog_inputs(now);
@@ -309,7 +308,6 @@ fn persistent_provider_fault_without_progress_alerts() {
 /// A manual commit on main this morning cannot cover four days without an
 /// autonomous merge, whatever `last_merge` was populated from.
 #[test]
-#[ignore = "RED until #1708 (H): analyze() trusts last_merge over the allowance's confirmed autonomous merge"]
 fn manual_main_commit_is_not_autonomous_progress() {
     let now = oct(31, 12);
     let mut inputs = watchdog_inputs(now);

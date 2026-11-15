@@ -20,7 +20,7 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `deploy-pinned`  | 2026-10-20→24: a drop-in pinned the unit to a frozen binary; 4 days of merges never ran (#1571) |
 //! | `snapshot-budget`| 2026-11-01: protected snapshots filled the budget; rollouts were refused, then bypassed the cap (#1815) |
-//! | `no-progress`    | the catch-all: nothing merged in N days             |
+//! | `no-progress`    | nothing auto-merged in N days; Alert when a provider hold persists (Oct 27–31, #1708) |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
 //!
@@ -196,6 +196,17 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     let held_recently = i
         .last_provider_hold
         .is_some_and(|held| (now - held).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
+    // #1708 — autonomous progress is the confirmed-merge ledger, never the
+    // latest main commit. When the ledger is readable it is authoritative; a
+    // manual commit fed through `last_merge` cannot reset it. `last_merge`
+    // stands in only where no allowance was read (older collectors/tests).
+    let last_autonomous = match i.merge_allowance {
+        Some(a) => a.last_merged_at_ms.and_then(DateTime::from_timestamp_millis),
+        None => i.last_merge,
+    };
+    let stalled_days = last_autonomous
+        .map(|last| (now - last).num_days())
+        .filter(|days| *days >= t.no_merge_days);
 
     if !i.daemon_active {
         out.push(Finding {
@@ -255,14 +266,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     if let Some(held) = i.last_provider_hold {
         let age = (now - held).num_minutes().max(0);
         if age <= PROVIDER_HOLD_FRESH_MINS {
-            out.push(Finding {
-                severity: Severity::Warn,
-                code: "provider-hold",
-                detail: format!(
+            // #1708 — a hold explains a pause, not days without shipping.
+            // Oct 27–31 the hold was renewed every tick while nothing merged.
+            let detail = match stalled_days {
+                None => format!(
                     "the build lane is paused: every provider cleared for it is \
                      on a quota cooldown (last held {age} min ago). Nothing is \
                      broken and nothing was spent."
                 ),
+                Some(days) => format!(
+                    "the build lane is held on provider availability (last held \
+                     {age} min ago) and no autonomous merge has been confirmed for \
+                     {days} days: this is a persistent provider fault, not a pause."
+                ),
+            };
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "provider-hold",
+                detail,
                 fix: "Wait for the cooldown, or widen the chain for this \
                       preset. `augmentagent reasoner-selftest` shows which \
                       providers are latched and until when."
@@ -446,22 +467,28 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    // A quota pause stops merges too, so it explains this one as well.
-    if let Some(last) = i.last_merge.filter(|_| !held_recently) {
-        let days = (now - last).num_days();
-        if days >= t.no_merge_days {
-            out.push(Finding {
-                severity: Severity::Warn,
-                code: "no-progress",
-                detail: format!(
+    // #1708 — a fresh provider hold no longer masks this: a hold that keeps
+    // recurring for days is the fault, so it escalates rather than excuses.
+    if let (Some(last), Some(days)) = (last_autonomous, stalled_days) {
+        out.push(Finding {
+            severity: if held_recently { Severity::Alert } else { Severity::Warn },
+            code: "no-progress",
+            detail: if held_recently {
+                format!(
+                    "no confirmed autonomous merge for {days} days (last {}) while \
+                     the build lane keeps being held on provider availability",
+                    last.format("%Y-%m-%d")
+                )
+            } else {
+                format!(
                     "no confirmed autonomous merge for {days} days (last {})",
                     last.format("%Y-%m-%d")
-                ),
-                fix: "Read the last few `auto-PR:` lines in stderr.log — the loop \
-                      records why each run ended."
-                    .into(),
-            });
-        }
+                )
+            },
+            fix: "Read the last few `auto-PR:` lines in stderr.log — the loop \
+                  records why each run ended."
+                .into(),
+        });
     }
 
     // #1037 — drafts held because no independent review is possible. From
@@ -1900,14 +1927,17 @@ mod tests {
             ..healthy()
         };
         let quiet = analyze(&wedged_looking, &Thresholds::default());
-        for masked in ["loop-silent", "no-progress"] {
-            assert!(
-                !quiet.iter().any(|f| f.code == masked),
-                "{masked} must not fire while a fresh hold explains the quiet: {:?}",
-                quiet.iter().map(|f| f.code).collect::<Vec<_>>()
-            );
-        }
+        assert!(
+            !quiet.iter().any(|f| f.code == "loop-silent"),
+            "loop-silent must not fire while a fresh hold explains the quiet: {:?}",
+            quiet.iter().map(|f| f.code).collect::<Vec<_>>()
+        );
         assert!(quiet.iter().any(|f| f.code == "provider-hold"));
+        // #1708 supersedes the old C5 masking of no-progress: a hold explains
+        // a quiet tick, not nine days without an autonomous merge.
+        let stalled = quiet.iter().find(|f| f.code == "no-progress")
+            .expect("a fresh hold must not hide days without autonomous progress");
+        assert_eq!(stalled.severity, Severity::Alert);
 
         // Without the hold, the same evidence IS an outage.
         let no_hold = analyze(
