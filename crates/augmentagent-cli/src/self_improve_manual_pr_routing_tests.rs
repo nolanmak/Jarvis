@@ -11,18 +11,71 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let root=PathBuf::from(root);
         let case=std::env::var("MANUAL_PR_CASE").unwrap();
         let path=workflow::path();let mut initial=WorkflowStore::open(&path).unwrap();
-        if case=="round-label-during-push" {
+        if case.starts_with("post-rabbit-") {
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
+                branch:"feat/repair-9",contract:"Published original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let automatic=std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked";
+            let number=(case!="post-rabbit-unknown").then_some(9);
+            let result=record_published_rabbit_observation(&root,&mut guard,number,&"a".repeat(40),
+                RABBIT_NOT_WAITED_FOR,"feat/repair-9","https://github.com/owner/repo/pull/9",7,automatic).await;
+            let allowed=case=="post-rabbit-ordinary" || (case=="post-rabbit-label" && !automatic);
+            assert_eq!(result.unwrap_or(false),allowed,"late observation control did not fence publication: {case}/automatic={automatic}");
+            assert_eq!(root.join("note-writes").exists(),allowed,"late observation wrote a note without current authority");
+            if case!="post-rabbit-unknown" {assert!(std::fs::read_to_string(root.join("calls")).unwrap().contains("/pulls/9/"),"fixture never read actual review metadata");}
+            guard.finish().unwrap();return;
+        }
+        if case.starts_with("post-control-") {
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
+                branch:"feat/repair-9",contract:"Published original request",environment:"fixture",
+            }).await.unwrap().unwrap();
+            let now=chrono::Utc::now().timestamp_millis();
+            if case=="post-control-pause" {
+                initial.set_owner_pause(guard.id(),"github:owner",0,true,now).unwrap();
+            }else {
+                let origin=crate::autoship_workflow::discord_ingress::DiscordOrigin {bot:1,owner:2,channel:3,message:4};
+                let request=crate::autoship_workflow::submission::Request {repository:"owner/repo".into(),
+                    target:crate::autoship_workflow::submission::Target::Pr(9),provider:None,
+                    until:crate::autoship_workflow::submission::Milestone::Merged};
+                let admitted=initial.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap();
+                assert_eq!(admitted.admission.workflow,guard.id());
+                let message=crate::autoship_workflow::discord_ingress::DiscordOrigin {message:5,..origin};
+                assert!(initial.enqueue_owner_message(&message,guard.id(),"Please reconsider this proposal",None,now+1).unwrap().accepted);
+                // Isolate the inbox fence from the pause fence in this disposable
+                // fixture only. Production never clears pauses behind input.
+                rusqlite::Connection::open(&path).unwrap().execute("UPDATE workflow_owner_control SET paused=0 WHERE workflow=?1",[guard.id()]).unwrap();
+                assert_eq!(initial.pending_owner_messages(guard.id()).unwrap(),1);
+            }
+            let snapshot=initial.snapshot(guard.id()).unwrap();let events=initial.events(guard.id()).unwrap();
+            let automatic=std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked";
+            for target in [manual_routing::NoteTarget::Pr,manual_routing::NoteTarget::Issue] {
+                let result=manual_routing::published_note(&root,&mut guard,9,7,automatic,target,"Synthetic controlled-work note").await;
+                assert!(!result.unwrap_or(false),"late owner control permitted a note: {case}/automatic={automatic}");
+            }
+            assert!(!root.join("note-writes").exists(),"late owner control sent a PR/source note");
+            assert_eq!(initial.snapshot(guard.id()).unwrap(),snapshot);assert_eq!(initial.events(guard.id()).unwrap(),events);
+            guard.finish().unwrap();return;
+        }
+        if case.starts_with("round-") {
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&root,worktree:&root,repository:"owner/repo",source_issue:Some(7),pr:Some(9),
                 branch:"feat/repair-9",contract:"Retained original request",environment:"fixture",
             }).await.unwrap().unwrap();
             let hook=root.join(".git/hooks/pre-push");
-            std::fs::write(&hook,format!("#!/usr/bin/python3\nfrom pathlib import Path\nPath({:?}).write_text('owner changed routing during actual push')\n",root.join("manual-after-admission"))).unwrap();
+            let script=if case=="round-pause-during-push" {
+                // The actual Git hook fault-injects a late pause into this
+                // disposable fixture DB only; production state is untouched.
+                format!("#!/usr/bin/python3\nimport sqlite3\nc=sqlite3.connect({:?})\nc.execute(\"INSERT OR REPLACE INTO workflow_owner_control(workflow,revision,paused,principal,updated_at) VALUES(?,1,1,'github:owner',1)\",({:?},))\nc.commit()\n",path.to_str().unwrap(),guard.id())
+            }else {format!("#!/usr/bin/python3\nfrom pathlib import Path\nPath({:?}).write_text('owner changed routing during actual push')\n",root.join("manual-after-admission"))};
+            std::fs::write(&hook,script).unwrap();
             std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
-            let result=guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Synthetic verified findings",false,true,Some(7)).await.unwrap();
-            assert!(root.join("manual-after-admission").exists(),"hook never changed routing during the push");
+            let result=guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Synthetic verified findings",false,true,Some(7)).await;
+            if case=="round-label-during-push" {assert!(root.join("manual-after-admission").exists(),"hook never changed routing during the push");}
+            else {assert!(initial.owner_control(guard.id()).unwrap().unwrap().paused,"hook never paused the workflow during actual Push");}
             assert!(!root.join("note-writes").exists(),"a successful Push was followed by a note despite the new manual route");
-            assert!(!result,"round publication continued after late manual routing");
+            assert!(!result.unwrap_or(false),"round publication continued after late routing or owner control");
             let remote=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"]).current_dir(&root).output().unwrap();
             assert!(remote.status.success() && !remote.stdout.is_empty(),"fixture never made a successful real Push");
             assert!(initial.pending_operations(guard.id()).unwrap().is_empty(),"routing denial lost the already-observed Push outcome");
@@ -263,7 +316,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         return;
     }
     for route in ["linked","source-less"] {
-        for case in ["fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-wrong-push","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
+        for case in ["post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-wrong-push","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
                 let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
@@ -272,7 +325,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
                         .env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
                 }
-                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case=="round-label-during-push" {
+                if matches!(case,"late-mutation"|"late-adopted-retry"|"late-fresh-claim"|"fresh-uncertain"|"fresh-uncertain-unobserved"|"fresh-uncertain-wrong-push"|"fresh-uncertain-other-fetch"|"fresh-uncertain-missing-peer"|"late-fresh-recheck") || case.starts_with("post-note-") || case.starts_with("post-control-") || case.starts_with("post-rabbit-") || case.starts_with("round-") {
                     assert!(std::process::Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
                         "-c","commit.gpgsign=false","commit","--quiet","--allow-empty","-m","Original fixture"])
                         .current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").status().unwrap().success());
@@ -308,7 +361,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
                 let gh=dir.path().join("github.py");
                 std::fs::write(&gh,r#"#!/usr/bin/python3
-import json,os,pathlib,sys,subprocess,urllib.parse
+import json,os,pathlib,sys,subprocess,urllib.parse,sqlite3
 a=sys.argv[1:];root=pathlib.Path(os.environ['AUTOSHIP_MANUAL_PR_FIXTURE'])
 prs=json.loads((root/'prs.json').read_text());issues=json.loads((root/'issues.json').read_text())
 case=os.environ['MANUAL_PR_CASE']
@@ -329,6 +382,12 @@ elif a[:2]==['pr','view']:
  if row['number']==9 and case=='saturated-pr-labels':row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
  if row['number']==9 and case=='saturated-references':row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
  print(json.dumps(row))
+elif a[:1]==['api'] and '/pulls/9/' in a[1]:
+ if case=='post-rabbit-label':(root/'manual-after-admission').write_text('owner changed route during review read')
+ if case=='post-rabbit-pause':
+  # Late-control fault injection is restricted to the disposable fixture DB.
+  c=sqlite3.connect(os.environ['AUGMENTAGENT_AUTOPR_WORKFLOW_DB']);c.execute("INSERT OR REPLACE INTO workflow_owner_control(workflow,revision,paused,principal,updated_at) VALUES('owner/repo/pr/9',1,1,'github:owner',1)");c.commit();c.close()
+ print('[]')
 elif a[:1]==['api'] and a[1].startswith('https://api.github.com/repos/') and '/git/ref/heads/' in a[1]:
  branch=urllib.parse.unquote(a[1].split('/git/ref/heads/',1)[1])
  remote=root.parent/('other.git' if '/owner/other/' in a[1] else 'remote.git')
@@ -345,7 +404,7 @@ elif a[:1]==['api'] and '/issues/' in a[1]:
  row=issues[n]
  if case=='malformed-source' and n=='7':row.pop('labels')
  print(json.dumps(row))
-elif a[:2] in (['pr','comment'],['issue','comment']) and (case.startswith('post-note-') or case=='round-label-during-push'):
+elif a[:2] in (['pr','comment'],['issue','comment']) and (case.startswith('post-note-') or case.startswith('post-control-') or case.startswith('post-rabbit-') or case.startswith('round-')):
  with (root/'note-writes').open('a') as out:out.write(json.dumps(a)+'\n')
  (root/'manual-after-admission').write_text('owner changed routing during publication note');print('ok')
 elif a[:2]==['api','user']:print('owner')

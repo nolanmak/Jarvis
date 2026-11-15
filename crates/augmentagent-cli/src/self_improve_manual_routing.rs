@@ -154,7 +154,7 @@ pub(super) enum NoteTarget {Pr,Issue}
 pub(super) async fn published_note(root:&Path,workflow:&mut workflow::WorkflowGuard,pr:u64,issue:u64,
     automatic:bool,target:NoteTarget,body:&str)->Result<bool> {
     if !permit_mutation(root,pr,Some(issue),automatic,workflow).await? {return Ok(false);}
-    workflow.validate_before_side_effect()?;
+    workflow.validate_note_dispatch()?;
     let (kind,number)=match target {NoteTarget::Pr=>("pr",pr),NoteTarget::Issue=>("issue",issue)};
     let _=run(&gh_bin(),&[kind,"comment",&number.to_string(),"--body",body],root).await;
     Ok(true)

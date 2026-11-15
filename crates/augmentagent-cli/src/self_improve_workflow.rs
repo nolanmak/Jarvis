@@ -1470,6 +1470,14 @@ impl WorkflowGuard {
             .validate_lease(&self.lease, &self.binding, millis())
     }
 
+    /// New public notes must honor controls accepted after earlier reads or
+    /// Push dispatch. Completion receipts use the weaker lease/binding guard.
+    pub(super) fn validate_note_dispatch(&self)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_owner_dispatch(self.id())
+    }
+
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
         self.validate_before_side_effect()?;
         let operation = self
@@ -2211,7 +2219,7 @@ impl WorkflowGuard {
         }
         let head = self.push(branch).await?;
         if !manual_routing::permit_mutation(repo_root,pr,source,automatic,self).await? {return Ok(false);}
-        self.validate_before_side_effect()?;
+        self.validate_note_dispatch()?;
         let _ = write_optional_pr_note(
             repo_root,
             &pr.to_string(),

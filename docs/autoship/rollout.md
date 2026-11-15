@@ -365,3 +365,11 @@ when rows are paused, malformed or have a different head. Later retained effects
 therefore receive observation without claiming a workflow, resetting accounting,
 erasing an uncertain operation or clearing owner controls. Receipt completion
 still rechecks the original protected workflow facts atomically.
+
+New note dispatches check the protected owner pause and pending-input controls
+immediately before the write, after any preceding GitHub read or Push. This is
+separate from the lease/binding guard used to retain genuine completion receipts:
+a completed Push stays observable after a pause even though its next note is
+refused. The fresh CodeRabbit observation uses the same note control boundary.
+An unresolved PR number holds for reconciliation without writing by branch
+selector. Optional comment timeouts/failures remain advisory after authorization.

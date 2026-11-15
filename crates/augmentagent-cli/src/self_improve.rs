@@ -6725,6 +6725,37 @@ async fn rabbit_review_now(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitR
     rabbit_findings_for_head(&reviews, &comments, head_sha)
 }
 
+/// The production fresh-publication observation boundary, independently
+/// callable with an existing workflow and scripted GitHub reads.
+async fn record_published_rabbit_observation(repo_root:&Path,workflow_guard:&mut workflow::WorkflowGuard,
+    pr_number:Option<u64>,head_sha:&str,pr_body:&str,_branch:&str,pr_url:&str,issue:u64,
+    automatic_routing:bool)->Result<bool> {
+    let Some(n)=pr_number else {
+        warn!(issue,%pr_url,"could not parse a PR number (no PR number to query); preserving publication for reconciliation");
+        return Ok(false);
+    };
+    let rabbit=if head_sha.is_empty() {
+        warn!(issue,pr=n,"could not read the PR head; CodeRabbit state unavailable");
+        RabbitReview::unavailable("its state could not be read (head lookup failed)")
+    }else {
+        tokio::time::timeout(std::time::Duration::from_secs(5),rabbit_review_now(repo_root,n,head_sha))
+            .await.unwrap_or_else(|_|RabbitReview::unavailable("optional observation timed out"))
+    };
+    let observed=pr_body.replace(RABBIT_NOT_WAITED_FOR,&rabbit_merge_note(&rabbit));
+    if observed!=pr_body {
+        // A read may outlive the authority that permitted it. Recheck after
+        // the read, immediately before this independently optional mutation.
+        if !manual_routing::permit_mutation(repo_root,n,Some(issue),automatic_routing,workflow_guard).await? {
+            return Ok(false);
+        }
+        workflow_guard.validate_note_dispatch()?;
+        if !write_optional_pr_note(repo_root,&n.to_string(),&observed).await {
+            warn!(issue,pr=n,"could not record CodeRabbit's merge-time state in the PR body; it was: {}",rabbit_merge_note(&rabbit));
+        }
+    }
+    Ok(true)
+}
+
 /// #1032 — what the PR body says about CodeRabbit on an auto-merged fresh PR.
 ///
 /// It states the POLICY, not a review state. Codex caught an earlier draft
@@ -9897,69 +9928,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         None => String::new(),
     };
 
-    if pr_number.is_none() {
-        // Codex, system pass: with no parseable PR number the CodeRabbit read
-        // was skipped silently while the merge still went ahead on the branch
-        // name. The read genuinely cannot happen — the reviews endpoint needs
-        // a number — but the RECORD still can: `gh` takes a branch as a PR
-        // selector, which is how the merge below identifies it too. So the
-        // body says the state was unknown rather than keeping a placeholder
-        // that implies it was checked.
-        let unknown =
-            RabbitReview::unavailable("its state could not be read (no PR number to query)");
-        warn!(
-            issue = issue.number,
-            %pr_url,
-            "could not parse a PR number; merging on the double codex LGTM \
-             without reading CodeRabbit's state"
-        );
-        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&unknown));
-        if observed != pr_body {
-            let _ = write_optional_pr_note(repo_root, &branch, &observed).await;
-        }
-    }
-    if let Some(n) = pr_number {
-        // A failed head lookup is NOT silence. The owner directive is that a
-        // double codex LGTM is the bar and CodeRabbit is advisory, so a
-        // transient GitHub error must not strand a PR the gate and two
-        // independent reviewers approved — that is the sitting-draft problem
-        // this issue exists to end. But it is recorded rather than swallowed,
-        // so a merge taken without CodeRabbit's state is visible as such.
-        let rabbit = if head_sha.is_empty() {
-            warn!(
-                issue = issue.number,
-                pr = n,
-                "could not read the PR head; merging on the double codex LGTM \
-                 without CodeRabbit's state"
-            );
-            RabbitReview::unavailable("its state could not be read (head lookup failed)")
-        } else {
-            tokio::time::timeout(std::time::Duration::from_secs(5),
-                rabbit_review_now(repo_root, n, &head_sha)).await
-                .unwrap_or_else(|_| RabbitReview::unavailable("optional observation timed out"))
-        };
-        // Not blocking, so this merge is going ahead. Replace the placeholder
-        // policy line with what the read actually found, so the body records
-        // CodeRabbit's state AT MERGE TIME rather than the same sentence
-        // whether it was silent, rate-limited, or had reviewed and found
-        // nothing. Best-effort: a failed edit must never hold up a merge the
-        // gate and two reviewers already approved.
-        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
-        if observed != pr_body {
-            let edited = write_optional_pr_note(repo_root, &n.to_string(), &observed).await;
-            if !edited {
-                // Explicit, not swallowed: the body keeps the placeholder, so
-                // say in the log what the body could not. Still merging — the
-                // approval that matters already happened.
-                warn!(
-                    issue = issue.number,
-                    pr = n,
-                    "could not record CodeRabbit's merge-time state in the PR \
-                     body; it was: {}",
-                    rabbit_merge_note(&rabbit)
-                );
-            }
-        }
+    if !record_published_rabbit_observation(repo_root,&mut workflow_guard,pr_number,&head_sha,&pr_body,
+        &branch,&pr_url,issue.number,automatic_routing).await? {
+        return Ok(RunReport::held("fresh publication observation note held".into()));
     }
 
     // Persisted approval lets the free sweep finish when CI catches up.
@@ -18200,14 +18171,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // the head lookup failed, the GitHub call failed, or the PR number
         // could not be parsed at all.
         let src = include_str!("self_improve.rs");
-        let start = src.find("async fn run_selected(").expect("run_once");
+        let start = src.find("async fn record_published_rabbit_observation(").expect("production observation boundary");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        // The no-number path cannot READ CodeRabbit (the endpoint needs a
-        // number) but must still RECORD that, via the branch selector `gh`
-        // accepts — the same one the merge itself uses.
-        let no_num = body.find("no PR number to query").expect("state must be named");
-        let edit = body[no_num..].find("write_optional_pr_note(repo_root, &branch");
-        assert!(edit.is_some(), "record it on the PR by branch, not only in a log");
+        // An unknown PR identity cannot safely use a branch selector to write.
+        // It must hold before any review read or public note dispatch.
+        let no_num=body.find("let Some(n)=pr_number else").expect("identity check");
+        let read=body.find("rabbit_review_now(").expect("review read");
+        assert!(body[no_num..read].contains("return Ok(false)"));
+        assert!(!body.contains("write_optional_pr_note(repo_root, &branch"));
 
         for stated in [
             "could not be read (head lookup failed)",
