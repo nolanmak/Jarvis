@@ -148,6 +148,9 @@ pub struct HealthInputs {
     /// #1708 — S's latest durable event per nonterminal workflow and whether
     /// that inventory is complete. `None` means it could not be read.
     pub workflow_progress: Option<WorkflowProgress>,
+    /// Set when the worker store resolved but its events could not be read.
+    /// Distinct from `None` progress with no error (not collected: quiet).
+    pub workflow_progress_error: Option<String>,
 }
 
 /// #1708 — S runtime events as the watchdog reads them.
@@ -546,6 +549,21 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         });
     }
 
+    // #1708 — unknown inventory is never green. Complete only proves every
+    // nonterminal workflow has a durable S event; it says nothing about
+    // eligible issues not yet admitted, so it never suppresses other rules.
+    match &i.workflow_progress {
+        None if i.workflow_progress_error.is_none() => {}
+        None => out.push(Finding { severity: Severity::Warn, code: "workflow-inventory-unknown",
+            detail: format!("Workflow runtime events could not be read ({}); active work and idleness are unknown.",
+                i.workflow_progress_error.as_deref().unwrap_or_default()),
+            fix: "Check the worker's workflow store and effective configuration; do not treat silence as idle.".into() }),
+        Some(p) if !p.inventory_complete => out.push(Finding { severity: Severity::Warn, code: "workflow-inventory-unknown",
+            detail: format!("Workflow inventory is incomplete: {} workflow(s) have durable runtime events, but at least one nonterminal workflow has none (legacy or unprojected). Idleness and stalls cannot be proven for it.", p.events.len()),
+            fix: "Inspect nonterminal workflows with `augmentagent autopr status`; their next real transition records an event.".into() }),
+        Some(_) => {}
+    }
+
     // #1708 — liveness is S's durable meaningful progress, not heartbeats or
     // log lines. Waiting workflows (owner pause, quota, capacity, dependency,
     // configuration) are reported by their own blockers, not as stalls.
@@ -682,6 +700,13 @@ pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     } else if let Some(error) = &i.merge_allowance_error {
         out.push_str(&format!("\nmerge allowance unavailable: {error}"));
     }
+    out.push_str(&match &i.workflow_progress {
+        None if i.workflow_progress_error.is_none() => String::new(),
+        None => "\nworkflows: unknown (inventory unreadable)".to_string(),
+        Some(p) if !p.inventory_complete => format!("\nworkflows: {} with events; inventory incomplete", p.events.len()),
+        Some(p) if p.events.is_empty() => "\nworkflows: idle (0 active; inventory complete)".to_string(),
+        Some(p) => format!("\nworkflows: {} active; inventory complete", p.events.len()),
+    });
     if let Some(groups) = &i.gave_up_by_reason {
         let total: u32 = groups.iter().map(|(_, n)| n).sum();
         out.push_str(&format!("\ngave-up by reason ({total}):"));
@@ -1178,11 +1203,13 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     crate::disk::save_readings(&filesystems, now);
     let mut merge_store_path=None;
     let mut workflow_progress=None;
+    let mut workflow_progress_error=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
             merge_store_path=Some(config.path.clone());
             workflow_progress=workflow_progress_at(&config.path,now.timestamp_millis());
+            if workflow_progress.is_none() {workflow_progress_error=Some("worker workflow events unavailable".into());}
             let native=config.native_policy.as_deref().map(|path| {
                 serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect_at(Some(path)))
                     .expect("native capacity report serializes")
@@ -1235,6 +1262,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         resource_capacity_wait_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
         workflow_progress,
+        workflow_progress_error,
     }
 }
 
@@ -1599,7 +1627,8 @@ mod tests {
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
             gave_up_by_reason: None,
-            workflow_progress: None,
+            workflow_progress: Some(WorkflowProgress { events: vec![], inventory_complete: true }),
+            workflow_progress_error: None,
         }
     }
 
