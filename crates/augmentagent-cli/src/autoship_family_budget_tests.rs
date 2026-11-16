@@ -481,17 +481,22 @@ fn root_pause_fences_delegated_child_but_keeps_receipt_and_late_usage_recoverabl
     store
         .set_owner_pause(&root.workflow, "verified-test-owner", 0, true, 18)
         .unwrap();
-    assert!(store
-        .charge_admitted_model(
-            &child,
-            "paused-parent",
-            19,
-            None,
-            None,
-            Some(submission::Provider::Codex),
-            false
-        )
-        .is_err());
+    assert!(
+        store
+            .charge_admitted_model(
+                &child,
+                "paused-parent",
+                19,
+                None,
+                None,
+                Some(submission::Provider::Codex),
+                false
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owner_paused"),
+        "a paused ancestor must be explained as owner_paused"
+    );
     store
         .charge_admitted_model(
             &child,
@@ -796,4 +801,45 @@ fn orphan_native_proof_is_unknown_instead_of_inventing_a_paid_admission() {
             false
         )
         .is_err());
+}
+
+#[test]
+fn every_family_membership_writer_revalidates_the_current_root_binding() {
+    let (_dir, mut store, root, child, _other, _intent) = funded(false);
+    let raw: String = store
+        .conn
+        .query_row(
+            "SELECT payload FROM workflow_family_budget WHERE family='family'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let input: family_budget::store::PendingFamily = serde_json::from_str(&raw).unwrap();
+    let mut checkpoint = store.snapshot(&root.workflow).unwrap().unwrap().checkpoint;
+    checkpoint.binding.head = "b".repeat(40);
+    store.checkpoint(&root, &checkpoint, 18).unwrap();
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let refusals = [
+        family_budget::store::begin(&tx, &root, &input, 19).is_err(),
+        family_budget::store::stage_member(
+            &tx,
+            &root,
+            "family",
+            1,
+            &child.workflow,
+            "publication-one",
+            None,
+            19,
+        )
+        .is_err(),
+        family_budget::store::finalize(&tx, &root, "family", "manifest", 19).is_err(),
+    ];
+    assert_eq!(
+        refusals,
+        [true, true, true],
+        "stale root binding accepted by begin replay, member staging or finalization"
+    );
 }
