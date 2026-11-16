@@ -512,3 +512,6 @@ async fn integration_provider_failure_preserves_harness_classification() {
     )
     .await;
 }
+
+#[path = "self_improve_integration_restart_tests.rs"]
+mod restart;
