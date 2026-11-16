@@ -11828,6 +11828,8 @@ impl QueryHandler for WikiQuerier {
     fn autoship_progress_claim(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {autoship_discord_command::progress_claim(&autoship_workflow::default_path(),delivery)}
     fn autoship_progress_confirm(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->anyhow::Result<()> {autoship_discord_command::progress_confirm(&autoship_workflow::default_path(),delivery,message)}
     fn autoship_progress_defer(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->anyhow::Result<()> {autoship_discord_command::progress_defer(&autoship_workflow::default_path(),delivery,retry_after_ms)}
+    fn autoship_progress_edit_target(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<u64>> {autoship_discord_command::progress_edit_target(&autoship_workflow::default_path(),delivery)}
+    fn autoship_progress_status_lost(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<()> {autoship_discord_command::progress_status_lost(&autoship_workflow::default_path(),delivery)}
     fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
         autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
     }
