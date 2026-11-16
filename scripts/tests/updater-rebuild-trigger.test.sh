@@ -39,6 +39,8 @@ make_case() {
   TMP=$(mktemp -d)
   git init -q --bare "$TMP/origin.git"
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
+  # Match the production checkout: build output is ignored, owner source is not.
+  cp "$REPO_ROOT/.gitignore" "$TMP/work/.gitignore"
   mkdir -p "$TMP/work/scripts/lib" "$(dirname "$TMP/work/$path")"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   cp "$REPO_ROOT/scripts/recover-autopr-worker.py" "$TMP/work/scripts/"
@@ -93,6 +95,18 @@ STUB
 }
 
 # Exit 0 when the updater invoked `cargo build`, 1 otherwise.
+# Late-installed test setup programs must be approved remote source. Keep the
+# deploy checkout at its original base so the real updater still performs the pull.
+publish_fixture_setup() {
+  local original
+  original=$(git -C "$TMP/work" rev-parse HEAD)
+  git -C "$TMP/work" merge -q --ff-only origin/main
+  git -C "$TMP/work" add sidecars
+  git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm 'approved fixture setup'
+  git -C "$TMP/work" push -q origin main
+  git -C "$TMP/work" reset -q --hard "$original"
+}
+
 updater_rebuilt() {
   ( cd "$TMP/work" \
     && env -u DISCORD_WEBHOOK_URL PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" \
@@ -212,6 +226,7 @@ case "$1" in
 esac
 STUB
   chmod +x "$TMP/bin/launchctl"
+  publish_fixture_setup
   updater_rebuilt || true
   if grep -q "sidecars/$sidecar" "$TMP/sidecar-build-calls" 2>/dev/null &&
       grep -q "kickstart -k gui/.*/com.nolanmak.augmentagent.$label" "$TMP/sidecar-launchctl-calls" 2>/dev/null; then
@@ -239,6 +254,7 @@ echo "$PWD" >> "$STUB_DIR/sidecar-build-calls"
 exit 0
 STUB
 chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+publish_fixture_setup
 updater_rebuilt || true
 if grep -q 'sidecars/fetch' "$TMP/sidecar-build-calls" 2>/dev/null &&
     grep -q 'restart augmentagent-fetch.service' "$TMP/service-calls" 2>/dev/null; then
@@ -274,6 +290,7 @@ esac
 STUB
 chmod +x "$TMP/work/sidecars/browser/setup.sh" "$TMP/work/target/release/augmentagent" "$TMP/bin/launchctl"
 cp "$TMP/work/target/release/augmentagent" "$TMP/work/target/release/augmentagent-mcp-memory"
+publish_fixture_setup
 updater_rebuilt || true
 if grep -q '^install browser-sidecar$' "$TMP/browser-install-calls" 2>/dev/null; then
   ok "refreshes installed macOS browser plists when the installer changes"

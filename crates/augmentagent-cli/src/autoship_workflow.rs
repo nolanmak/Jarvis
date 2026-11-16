@@ -27,6 +27,9 @@ pub(crate) mod delivery;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_review_recovery.rs"]
+mod review_recovery;
+pub(crate) use review_recovery::ReviewRecoveryReadiness;
 #[path = "autoship_review_epoch.rs"]
 mod review_epoch;
 #[path = "autoship_conversations.rs"]

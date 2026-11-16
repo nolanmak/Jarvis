@@ -65,6 +65,11 @@ mod linked_claim_boundaries;
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
 #[cfg(test)]
+#[path = "self_improve_review_recovery_tests.rs"]
+mod review_recovery_tests;
+#[path = "self_improve_review_recovery.rs"]
+mod review_recovery;
+#[cfg(test)]
 #[path = "self_improve_manual_pr_routing_tests.rs"]
 mod manual_pr_routing_tests;
 #[path = "self_improve_manual_routing.rs"]
@@ -98,6 +103,8 @@ pub(crate) mod ownership;
 mod workflow;
 #[path = "self_improve_recovery.rs"]
 mod recovery;
+#[path = "self_improve_checkout_identity.rs"]
+mod checkout_identity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
 #[path = "self_improve_targeted.rs"]
@@ -122,6 +129,9 @@ mod native_acceptance;
 #[cfg(test)]
 #[path = "self_improve_native_route_acceptance.rs"]
 mod native_route_acceptance;
+#[cfg(test)]
+#[path = "self_improve_incident_fixtures.rs"]
+mod incident_fixtures;
 
 pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
     let canary = review_canary::run_if_due().await;
@@ -1740,6 +1750,14 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // the half that binds to a specific pull request rather than a shape.
         let record = opened_prs::get(issue);
         let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
+        if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
+            if let Some(head) = head_sha.as_deref() {
+                if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
+                    record.as_ref(), chrono::Utc::now().timestamp_millis()) {
+                    warn!(pr, "review recovery scheduling unavailable: {error:#}");
+                }
+            }
+        }
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -4043,7 +4061,11 @@ async fn find_resumable_draft(
     policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let now=chrono::Utc::now().timestamp_millis();
-    let mut retries = adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default();
+    let mut retries = match review_recovery::filter(&workflow::path(), &mut adopted, now, dry_run) {
+        Ok(retries) => retries,
+        Err(error) => { warn!("review recovery scheduling unavailable: {error:#}"); return None; }
+    };
+    retries.extend(adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
     let select = |cursor| {
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
@@ -5296,7 +5318,7 @@ fn baseline_cache_path() -> PathBuf {
 /// Current `origin/main` after a fetch (a stale ref would keep the latch
 /// closed after a human fixed main). Falls back to the local ref offline.
 async fn origin_main_sha(repo_root: &Path) -> Option<String> {
-    let _ = run("git", &["fetch", "-q", "origin", "main"], repo_root).await;
+    let _ = workspace::preparation_git(repo_root, &["fetch", "--no-write-fetch-head", "-q", "origin", "main"]).await;
     let (ok, out, _) = run("git", &["rev-parse", "origin/main"], repo_root)
         .await
         .ok()?;
@@ -6976,6 +6998,12 @@ async fn resume_draft_pr(
     let reviewer = if imported && authors.is_ok() { adoption::imported_reviewer() }
         else { select_session_isolated_reviewer(&reviewer_pool(), authors, reviewer_status) };
     if let Err(why) = reviewer {
+        if !dry_run {
+            let repository = workflow::canonical_repository(repo_root).await?;
+            if review_recovery::unavailable(&workflow::path(), &repository, pr, branch, &why, chrono::Utc::now().timestamp_millis())? {
+                return Ok(RunReport::held(format!("PR #{pr}: independent review waiting: {}", why.code())));
+            }
+        }
         return Ok(hold_unreviewable(
             repo_root,
             pr,
@@ -8264,11 +8292,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // subsequent execution uses a clean controller pinned to fetched main;
     // the controller lock lives until this whole attempt returns. Candidate
     // locations remain stable through the shared Git repository.
-    let controller = if dry_run { None } else {
-        let lane = if lane_from_env() == Lane::Resume { "resume" } else { "build" };
-        Some(workspace::prepare(repo_root, lane).await?)
-    };
-    let repo_root = controller.as_ref().map_or(repo_root, |controller| controller.root.as_path());
+    // Dry runs still execute models, tools and gates; only publication is
+    // suppressed. They need the same trusted controller as productive runs.
+    let lane = if lane_from_env() == Lane::Resume { "resume" } else { "build" };
+    let controller = workspace::prepare(repo_root, lane).await?;
+    let repo_root = controller.root.as_path();
 
     let selected_issue=match selected {
         Some(targeted::Resolved::Pr(pr))=>return targeted::execute_pr(repo_root,pr,dry_run).await,
@@ -12430,13 +12458,11 @@ impl AutoPrLoop {
                 if let Err(error) = publication::reconcile_merge_dispatches(&root, dry_run).await {
                     warn!("merge dispatch reconciliation unavailable: {error:#}");
                 }
-                let controller = if dry_run { None } else {
-                    match workspace::prepare(&root, "sweep").await {
-                        Ok(controller) => Some(controller),
-                        Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
-                    }
+                let controller = match workspace::prepare(&root, "sweep").await {
+                    Ok(controller) => controller,
+                    Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
                 };
-                let root = controller.as_ref().map_or(root.as_path(), |controller| controller.root.as_path());
+                let root = controller.root.as_path();
                 let merged=merge_sweep(root,dry_run).await;
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 // Waiting workflows never re-check their target, so one whose
