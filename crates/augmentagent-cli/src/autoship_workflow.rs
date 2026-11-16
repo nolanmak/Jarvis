@@ -51,6 +51,8 @@ pub(crate) mod progress;
 pub(crate) mod progress_retry;
 #[path = "autoship_progress_status.rs"]
 pub(crate) mod progress_status;
+#[path = "autoship_progress_resolution.rs"]
+pub(crate) mod progress_resolution;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]
@@ -829,6 +831,9 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_progress_edit (
                 workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 sequence INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_resend (
+                request_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, sequence INTEGER NOT NULL,
+                principal TEXT NOT NULL, superseded_marker TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_progress_retry (
                 workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 sequence INTEGER NOT NULL, attempts INTEGER NOT NULL, eligible_at INTEGER NOT NULL,
