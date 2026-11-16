@@ -481,7 +481,7 @@ fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: 
     refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
-        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
+        .is_some_and(|snapshot| integration::requires_reverification(&snapshot.checkpoint) || snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
@@ -1691,6 +1691,12 @@ impl WorkflowGuard {
             serde_json::json!({"operation_id":operation.id,
             "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes())), "pr":pr}),
         )
+    }
+
+    pub(super) fn require_independent_native_session(&self,provider:&str,session:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .require_independent_native_session(provider,session)
     }
 
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
@@ -4470,3 +4476,7 @@ mod initial_acceptance_hold_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_hold_outcome_tests.rs"]
+mod hold_outcome_tests;
