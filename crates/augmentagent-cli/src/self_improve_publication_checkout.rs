@@ -43,6 +43,7 @@ fn absent_path(path: &Path) -> Result<()> {
 
 pub(super) async fn recover(
     repo: &Path,
+    state: &Path,
     store: &mut WorkflowStore,
     id: &str,
     request: &PendingPublication,
@@ -67,7 +68,7 @@ pub(super) async fn recover(
     // mutation is fenced; no lease is held across a model or verifier call.
     let outcome = tokio::time::timeout(
         Duration::from_secs(90),
-        restore(repo, store, &lease, request),
+        restore(repo, state, store, &lease, request),
     )
     .await;
     let result = match outcome {
@@ -89,6 +90,7 @@ pub(super) async fn recover(
 
 async fn restore(
     repo: &Path,
+    state: &Path,
     store: &mut WorkflowStore,
     lease: &Lease,
     request: &PendingPublication,
@@ -99,6 +101,8 @@ async fn restore(
         .checkpoint
         .binding;
     absent_path(&request.worktree)?;
+    store.validate_dispatch(lease,&binding,now())?;
+    let identity_restore=checkout_identity::MissingRestore::begin(state,&request.worktree,&lease.workflow)?;
     git(repo, &["check-ref-format", "--branch", &request.branch]).await?;
     anyhow::ensure!(
         matches!(request.head.len(), 40 | 64)
@@ -165,6 +169,7 @@ async fn restore(
         "restored publication checkout is not clean"
     );
     store.validate_dispatch(lease, &binding, now())?;
+    identity_restore.complete(state,repo,&request.worktree,&request.repository,&request.branch,store,lease,&binding).await?;
     Ok(())
 }
 
@@ -277,3 +282,7 @@ mod tests {
         assert!(absent_path(&root.path().join("new/missing")).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_publication_checkout_recovery_tests.rs"]
+mod identity_tests;
