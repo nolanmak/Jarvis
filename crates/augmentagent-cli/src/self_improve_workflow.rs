@@ -4474,3 +4474,9 @@ mod initial_acceptance_hold_tests {
 #[cfg(test)]
 #[path = "self_improve_hold_outcome_tests.rs"]
 mod hold_outcome_tests;
+
+#[path = "self_improve_provider_holds.rs"]
+mod provider_holds;
+#[cfg(test)]
+#[path = "self_improve_provider_hold_tests.rs"]
+mod provider_hold_tests;
