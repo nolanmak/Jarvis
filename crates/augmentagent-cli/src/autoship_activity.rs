@@ -122,7 +122,7 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn read(conn: &Connection, workflow: &str) -> Result<Option<Activity>> {
+pub(super) fn read(conn: &Connection, workflow: &str) -> Result<Option<Activity>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT payload FROM workflow_activity WHERE workflow=?1",

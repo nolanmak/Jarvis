@@ -20,6 +20,7 @@ pub(crate) struct ProcessGroup {
     release_attempted: AtomicBool,
     fresh_native_session: Option<crate::native_vm::FreshUnreleasedRuntime>,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
+    owned_run: std::sync::Mutex<Option<crate::tool_audit::cancellation::Registration>>,
     resource_admission: std::sync::Mutex<Option<serde_json::Value>>,
     _directory: Option<tempfile::TempDir>,
 }
@@ -29,7 +30,11 @@ impl ProcessGroup {
         self.fresh_native_session=fresh;self
     }
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
+        if let Some(logger)=logger {
+            let mut registration=self.owned_run.lock().map_err(|_|anyhow::anyhow!("owned-run registration poisoned"))?;
+            if registration.is_none() {*registration=logger.register_owned_run(&self.receipt)?;}
+            *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone()));
+        }
         Ok(())
     }
     pub(crate) async fn admit_model(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
@@ -190,6 +195,9 @@ impl Drop for ProcessGroup {
         let mut clean=processes_settled;
         if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
         self.clean.store(clean,Ordering::SeqCst);
+        if let Ok(mut registration)=self.owned_run.lock() {
+            if let Some(registration)=registration.take() {registration.complete(clean);}
+        }
         if clean && !self.release_attempted.load(Ordering::SeqCst) {
             let absent=|name:&str|self.receipt.with_file_name(name).symlink_metadata()
                 .is_err_and(|error|error.kind()==std::io::ErrorKind::NotFound);
@@ -721,7 +729,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -751,7 +759,7 @@ mod tests {
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,
-                resource_audit:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+                owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
         }
@@ -780,7 +788,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),b"ready").unwrap();
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
-            resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,resource_audit:std::sync::Mutex::new(None),
+            resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None),
             resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
