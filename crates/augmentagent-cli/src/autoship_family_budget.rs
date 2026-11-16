@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 pub(crate) mod control;
 #[path = "autoship_family_budget_store.rs"]
 pub(crate) mod store;
+#[path = "autoship_family_wait_selection.rs"]
+mod selection;
 #[path = "autoship_family_budget_usage.rs"]
 mod usage;
 

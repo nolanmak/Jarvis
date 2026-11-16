@@ -1054,12 +1054,12 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         }
         // An open GitHub issue can outlive its completed workflow. Do not
         // spend another selection turn on work the claim gate cannot restart.
-        match owner_controls.terminal(&repository,iss.number) {
-            Ok(true)=> {
-                info!(issue=iss.number,"skip: workflow already merged or retired; preserve completed history");
+        match owner_controls.fresh_blocker(&repository,iss.number) {
+            Ok(Some(reason))=> {
+                info!(issue=iss.number,reason,"skip: protected workflow state blocks fresh intake; consider eligible peers");
                 continue;
             }
-            Ok(false)=>{},
+            Ok(None)=>{},
             Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
             Err(error)=> {
                 warn!(issue=iss.number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
@@ -10830,12 +10830,12 @@ async fn pick_issue_for_repo(
             info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
-        match owner_controls.terminal(&repo.full_name,number) {
-            Ok(true)=> {
-                info!(repo=%repo.full_name,issue=number,"skip: workflow already merged or retired; preserve completed history");
+        match owner_controls.fresh_blocker(&repo.full_name,number) {
+            Ok(Some(reason))=> {
+                info!(repo=%repo.full_name,issue=number,reason,"skip: protected workflow state blocks fresh intake; consider eligible peers");
                 continue;
             }
-            Ok(false)=>{},
+            Ok(None)=>{},
             Err(error)=> {
                 warn!(repo=%repo.full_name,issue=number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
                 if unavailable_history.is_none() {unavailable_history=Some(error);}

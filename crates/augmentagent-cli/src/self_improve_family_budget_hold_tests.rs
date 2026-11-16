@@ -397,6 +397,14 @@ async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection
         .unwrap()
         .expect("family compute budget blocked unpaid reconciliation");
     store.release(&lease, now + 1).unwrap();
+    let selected_before = store.snapshot(&id).unwrap();
+    let selection_events = store.events(&id).unwrap();
+    assert_eq!(store.family_wait_blocker(&id).unwrap(),
+        Some(family_budget::observation::Reason::FamilyResourceExhausted),
+        "free generation rollover made an unchanged family wait selectable");
+    assert_eq!(store.snapshot(&id).unwrap(), selected_before);
+    assert_eq!(store.events(&id).unwrap(), selection_events);
+
     assert!(
         store
             .claim_productive(&id, "paid-retry", now + 2, LEASE_MS)
@@ -458,6 +466,8 @@ async fn trusted_revised_funding_unblocks_selection_without_granting_native_disp
             )
         })
         .unwrap();
+    assert!(store.family_wait_blocker(&id).unwrap().is_some(),
+        "a displayed policy revision upgraded the stale funding frame");
     assert!(
         store
             .claim_productive(&id, "stale-frame", now, LEASE_MS)
@@ -486,6 +496,13 @@ async fn trusted_revised_funding_unblocks_selection_without_granting_native_disp
         })
         .unwrap();
     store.release(&recovery, now + 1).unwrap();
+    let ready_before = store.snapshot(&id).unwrap();
+    let ready_events = store.events(&id).unwrap();
+    assert!(store.family_wait_blocker(&id).unwrap().is_none(),
+        "trusted ready replacement frame remained hidden from fresh selection");
+    assert_eq!(store.snapshot(&id).unwrap(), ready_before);
+    assert_eq!(store.events(&id).unwrap(), ready_events);
+
     let productive = store
         .claim_productive(&id, "ready-work", now + 2, LEASE_MS)
         .unwrap()

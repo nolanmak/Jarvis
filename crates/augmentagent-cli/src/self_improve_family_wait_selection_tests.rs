@@ -17,7 +17,7 @@ pub(super) async fn prepare_wait(guard: &mut workflow::WorkflowGuard, database: 
     // Retained actual-admission facts through S's native accounting writer.
     // These are fixture history; selection itself must add no charges.
     for member in [&root_lease, &other_lease, &lease] {
-        store.charge_admitted_model(member, "retained-fixture-native-admission", now,
+        store.charge_admitted_model(member, &format!("retained-fixture-native-admission:{}", member.workflow), now,
             None, None, Some(durable::submission::Provider::Codex), false).unwrap();
     }
     let policy = store.with_family_transaction(|tx| {
