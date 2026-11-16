@@ -12986,6 +12986,8 @@ else:raise Exception('unexpected fixture call '+repr(args))
                 store.release(&lease, 0).unwrap();
                 if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
                 assert!(!store.has_command_jobs().unwrap());
+                assert_eq!(store.has_due_main_reconciliation(Some("owner/repo"),1_000).unwrap(),
+                    case=="ready", "the dedicated main gate must still reject {case}");
                 tokio::time::sleep(std::time::Duration::from_secs(26)).await;
                 timer_stop.cancel();
             };
@@ -12995,7 +12997,10 @@ else:raise Exception('unexpected fixture call '+repr(args))
             }, || async {0});
             let (result, ()) = tokio::join!(run, submitted);
             result.unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+            // Eligible generic reconciliation now has its independent S activity
+            // wake; it must not masquerade as a main-dependency signal above.
+            assert_eq!(calls.load(Ordering::SeqCst),
+                usize::from(matches!(case,"ready"|"generic-reconcile")), "{case}");
         }
     }
 
