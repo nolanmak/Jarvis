@@ -39,8 +39,7 @@ impl Bounds {
 pub(super) fn verifier_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix("augmentagent-verifier-"))
-        .is_some_and(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        .is_some_and(|n| n.starts_with("augmentagent-verifier-"))
 }
 
 /// Called under the prune/build exclusion. Ownership discovery deliberately
@@ -412,12 +411,14 @@ mod tests {
 
     #[test]
     fn name_only_verifiers_are_never_automatically_adopted() {
-        let unknown = crate::build_storage::UnmanagedCache {
-            path: PathBuf::from(format!("/build/augmentagent-verifier-{}", "a".repeat(64))),
-            bytes: 1024,
-            idle_days: Some(90.0),
-        };
-        assert!(stale_unmanaged(&[unknown], 7.0, |_| false).is_empty());
+        for key in ["a".repeat(64), "unknown-format".into(), String::new()] {
+            let unknown = crate::build_storage::UnmanagedCache {
+                path: PathBuf::from(format!("/build/augmentagent-verifier-{key}")),
+                bytes: 1024,
+                idle_days: Some(90.0),
+            };
+            assert!(stale_unmanaged(&[unknown], 7.0, |_| false).is_empty());
+        }
     }
 
     #[test]
