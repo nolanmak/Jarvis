@@ -20,7 +20,7 @@ pub(super) async fn prepare_wait(guard: &mut workflow::WorkflowGuard, database: 
         store.charge_admitted_model(member, "retained-fixture-native-admission", now,
             None, None, Some(durable::submission::Provider::Codex), false).unwrap();
     }
-    store.with_family_transaction(|tx| {
+    let policy = store.with_family_transaction(|tx| {
         family::store::begin(tx, &root_lease, &family::store::PendingFamily {
             family:"selection-family".into(), repository:"fixture-owner/repo".into(),
             original_request_ref:"protected-original-request".into(), source_ref:"source".into(),
@@ -33,17 +33,14 @@ pub(super) async fn prepare_wait(guard: &mut workflow::WorkflowGuard, database: 
         family::store::finalize(tx, &root_lease, &binding, "selection-family", "manifest", now)?;
         family::store::activate_policy(tx, &root_lease, &binding, "selection-family", None,
             "verified-owner-budget", &family::Limits {schema_version:1, max_model_admissions:4,
-                max_wall_ms:1_000_000}, now)?;
-        Ok(())
+                max_wall_ms:1_000_000}, now)
     }).unwrap();
     store.defer_family_context_wait(&lease, &binding,
         family::observation::Reason::FamilyExecutionScopeUnknown, now).unwrap();
     if restored {
         store.with_family_transaction(|tx| {
-            let policy:String=tx.query_row("SELECT active_policy_ref FROM workflow_family_budget WHERE family='selection-family'",
-                [], |r|r.get(0))?;
             family::store::record_intent(tx, &lease, &family::Intent::Delegated {
-                family:"selection-family".into(), manifest_ref:"manifest".into(), policy_ref:policy,
+                family:"selection-family".into(), manifest_ref:"manifest".into(), policy_ref:policy.clone(),
                 request_ref:"protected-original-request".into(),
             }, "verified-current-controller-authority", now)
         }).unwrap();
