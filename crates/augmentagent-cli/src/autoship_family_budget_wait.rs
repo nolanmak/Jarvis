@@ -205,18 +205,69 @@ pub(crate) fn prepare_productive_claim(
             |r| r.get(0),
         )
         .optional()?;
-    let intent = if let Some(raw) = raw {
+    // Reconciliation alone may have advanced the generation. Historical scope
+    // is only an observation input; it never authorizes a new native dispatch.
+    let raw = if raw.is_none() && generation != wait.generation {
+        tx.query_row(
+            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+            params![workflow, wait.generation],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        raw
+    };
+    let observation = if let Some(raw) = raw {
         let scope: Scope = serde_json::from_str(&raw)?;
         ensure!(
             scope.schema_version == 1 && !scope.verified_authority_ref.is_empty(),
             "family_execution_scope_unknown"
         );
-        scope.intent
+        observe_scope(tx, workflow, &scope, 1)?
     } else {
-        wait.observation.intent.clone()
+        let mut status = observe(tx, workflow, &wait.observation.intent, 1)?;
+        status.block(observation::Reason::FamilyExecutionScopeUnknown);
+        status
     };
-    let observation = observe(tx, workflow, &intent, 1)?;
     if !observation.ready() {
+        if serde_json::to_value(&observation)? != serde_json::to_value(&wait.observation)? {
+            let blocker = observation
+                .blockers
+                .first()
+                .context("missing family budget blocker")?;
+            cp.next = NextAction {
+                reason: blocker.reason_code.as_str().into(),
+                action: blocker.next.action.clone(),
+                eligible_at_ms: now.saturating_add(OBSERVATION_MS),
+            };
+            let refreshed = Wait {
+                schema_version: 1,
+                generation,
+                binding: cp.binding.clone(),
+                prior_next: wait.prior_next.clone(),
+                observation,
+            };
+            validate(&refreshed, workflow)?;
+            let payload = serde_json::to_string(&refreshed)?;
+            ensure!(
+                payload.len() <= MAX_RECORD,
+                "family budget wait evidence exceeds bound"
+            );
+            let checkpoint = serde_json::to_string(cp)?;
+            tx.execute(
+                "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+                params![workflow, checkpoint],
+            )?;
+            event(tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+            event(
+                tx,
+                workflow,
+                generation,
+                "family_budget_wait",
+                &payload,
+                now,
+            )?;
+        }
         return Ok(false);
     }
     cp.next = wait.prior_next;

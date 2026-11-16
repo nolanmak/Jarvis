@@ -517,25 +517,47 @@ async fn assert_ancestor_control_refusal_is_durable(resume: bool) {
     let (_checkout, control, guard) = funded_guard(10).await;
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
     let before = store.snapshot(guard.id()).unwrap().unwrap();
-    store.set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis()).unwrap();
+    store
+        .set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis())
+        .unwrap();
     if resume {
-        store.set_owner_pause("owner/repo#1725", "verified-test-owner", 1, false, millis()).unwrap();
+        store
+            .set_owner_pause("owner/repo#1725", "verified-test-owner", 1, false, millis())
+            .unwrap();
     }
-    let reason = if resume {"family_execution_scope_unknown"} else {"owner_paused"};
-    let action = if resume {"await_protected_execution_scope"} else {"await_owner_resume"};
+    let reason = if resume {
+        "family_execution_scope_unknown"
+    } else {
+        "owner_paused"
+    };
+    let action = if resume {
+        "await_protected_execution_scope"
+    } else {
+        "await_owner_resume"
+    };
     let error = denied_native_call(&guard).await;
-    assert!(error.to_string().contains(reason), "unexpected refusal: {error:#}");
+    assert!(
+        error.to_string().contains(reason),
+        "unexpected refusal: {error:#}"
+    );
     let after = store.snapshot(guard.id()).unwrap().unwrap();
-    assert_eq!(after.checkpoint.next.reason,reason,"ancestor-control refusal was lost before durable wait handling");
-    assert_eq!(after.checkpoint.next.action,action);
-    assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
-    assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
-    assert_eq!(after.model_calls,before.model_calls);
-    assert_eq!(after.progress_at_ms,before.progress_at_ms);
-    let wait=store.family_budget_wait(guard.id()).unwrap().unwrap();
-    assert_eq!(wait.observation.model_admissions,Some(2));
+    assert_eq!(
+        after.checkpoint.next.reason, reason,
+        "ancestor-control refusal was lost before durable wait handling"
+    );
+    assert_eq!(after.checkpoint.next.action, action);
+    assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    let wait = store.family_budget_wait(guard.id()).unwrap().unwrap();
+    assert_eq!(wait.observation.model_admissions, Some(2));
     assert!(guard.validate_before_side_effect().is_err());
-    let report=guard.capacity_accounting(false).unwrap().settle_ci(Err(error)).unwrap();
+    let report = guard
+        .capacity_accounting(false)
+        .unwrap()
+        .settle_ci(Err(error))
+        .unwrap();
     assert!(report.held && !report.billed);
 }
 
@@ -553,26 +575,55 @@ async fn ancestor_resume_requires_a_fresh_frame_and_persists_its_specific_wait()
 async fn resumed_ancestor_cannot_reclaim_child_until_its_control_frame_is_refreshed() {
     let (_checkout, control, guard) = funded_guard(10).await;
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
-    store.set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis()).unwrap();
-    assert!(denied_native_call(&guard).await.to_string().contains("owner_paused"));
-    let id=guard.id().to_owned();
-    store.release(&guard.lease,millis()).unwrap();
+    store
+        .set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis())
+        .unwrap();
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("owner_paused"));
+    let id = guard.id().to_owned();
+    store.release(&guard.lease, millis()).unwrap();
     drop(guard);
-    let before=store.snapshot(&id).unwrap().unwrap();
-    let now=before.checkpoint.next.eligible_at_ms+1;
-    let free=store.claim_reconciliation(&id,"free-reconcile",now,LEASE_MS).unwrap().unwrap();
-    store.release(&free,now+1).unwrap();
-    store.set_owner_pause("owner/repo#1725", "verified-test-owner", 1, false, now+2).unwrap();
-    let released=store.snapshot(&id).unwrap().unwrap();
-    assert!(store.claim_productive(&id,"stale-control",now+3,LEASE_MS).unwrap().is_none(),
-        "ancestor resume selected the child using a stale control frame");
-    let after=store.snapshot(&id).unwrap().unwrap();
-    assert_eq!(after.checkpoint.next.reason,"family_execution_scope_unknown");
-    assert_eq!(after.checkpoint.next.action,"await_protected_execution_scope");
-    assert_eq!(after.attempts,released.attempts);
-    assert_eq!(after.model_calls,before.model_calls);
-    assert_eq!(after.progress_at_ms,before.progress_at_ms);
-    let events=store.events(&id).unwrap();
-    assert!(store.claim_productive(&id,"same-input",now+4,LEASE_MS).unwrap().is_none());
-    assert_eq!(store.events(&id).unwrap(),events);
+    let before = store.snapshot(&id).unwrap().unwrap();
+    let now = before.checkpoint.next.eligible_at_ms + 1;
+    let free = store
+        .claim_reconciliation(&id, "free-reconcile", now, LEASE_MS)
+        .unwrap()
+        .unwrap();
+    store.release(&free, now + 1).unwrap();
+    store
+        .set_owner_pause("owner/repo#1725", "verified-test-owner", 1, false, now + 2)
+        .unwrap();
+    let released = store.snapshot(&id).unwrap().unwrap();
+    assert!(
+        store
+            .claim_productive(&id, "stale-control", now + 3, LEASE_MS)
+            .unwrap()
+            .is_none(),
+        "ancestor resume selected the child using a stale control frame"
+    );
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(
+        after.checkpoint.next.reason,
+        "family_execution_scope_unknown"
+    );
+    assert_eq!(
+        after.checkpoint.next.action,
+        "await_protected_execution_scope"
+    );
+    assert_eq!(after.attempts, released.attempts);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    let events = store.events(&id).unwrap();
+    assert!(store
+        .claim_productive(
+            &id,
+            "same-input",
+            after.checkpoint.next.eligible_at_ms + 1,
+            LEASE_MS
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(store.events(&id).unwrap(), events);
 }
