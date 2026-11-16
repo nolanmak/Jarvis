@@ -165,6 +165,10 @@ pub(super) fn project(
     payload: &str,
     now: i64,
 ) -> Result<()> {
+    // Wake reservation updates only next_observation_at in its own transaction;
+    // it is not a fresh dependency check, stage change, or progress receipt.
+    if kind=="activity_observation_scheduled" {return Ok(());}
+
     if !matches!(
         kind,
         "registered"
