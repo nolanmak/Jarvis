@@ -205,7 +205,7 @@ async fn actual_model_observer_persists_family_budget_hold_without_billing_a_ret
     assert_eq!(payload["observation"]["blockers"][0]["limit"], 2);
     let report = accounting.settle_ci(Err(error)).unwrap();
     assert!(report.held && report.is_idle() && !report.billed && report.resumed);
-    assert!(report.message.contains("model_admissions"));
+    assert!(report.message.contains("family model admissions"));
     assert!(
         !guard.audit_logger().resource_capacity_seen(),
         "family budget is not physical capacity"
@@ -251,4 +251,99 @@ async fn family_budget_hold_retains_actual_admissions_from_this_run() {
     assert!(report.held && report.billed && !report.resumed);
     assert_eq!(after.model_calls, 2);
     assert_eq!(store.merge_allowance(millis(), 5).unwrap().available, 5);
+}
+
+#[tokio::test]
+async fn repeated_family_wait_keeps_original_action_and_observation_deadline() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    let error = denied_native_call(&guard).await;
+    assert!(error.to_string().contains("family_resource_exhausted"));
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    let events = store.events(guard.id()).unwrap();
+    let wait = store.family_budget_wait(guard.id()).unwrap().unwrap();
+    assert_eq!(wait.prior_next.reason, "fixture-ready");
+    assert_eq!(wait.prior_next.action, "scope");
+    store
+        .defer_family_budget_wait(
+            &guard.lease,
+            &before.checkpoint.binding,
+            &wait.observation,
+            millis() + 100,
+        )
+        .unwrap();
+    assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(), before);
+    assert_eq!(
+        store.events(guard.id()).unwrap(),
+        events,
+        "same refusal fabricated another transition"
+    );
+}
+
+#[tokio::test]
+async fn failed_family_hold_persistence_rolls_back_and_stops_the_controller() {
+    let (_checkout, control, mut guard) = funded_guard(2).await;
+    let path = control.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    let accounting = guard.capacity_accounting(true).unwrap();
+    store.with_family_transaction(|tx| {
+        tx.execute_batch("CREATE TRIGGER reject_family_wait BEFORE INSERT ON workflow_event WHEN NEW.kind='family_budget_wait'
+            BEGIN SELECT RAISE(ABORT,'synthetic family wait storage failure'); END;")?;Ok(())
+    }).unwrap();
+    let error = denied_native_call(&guard).await;
+    assert!(
+        error
+            .to_string()
+            .contains("synthetic family wait storage failure"),
+        "fixture did not reach the actual wait write: {error:#}"
+    );
+    assert_eq!(
+        store.snapshot(guard.id()).unwrap().unwrap(),
+        before,
+        "partial checkpoint survived the failed evidence transaction"
+    );
+    assert!(guard.validate_before_side_effect().is_err());
+    assert!(guard
+        .checkpoint(Stage::Build, "generic_failure", "retry_builder", 0, &[])
+        .await
+        .is_err());
+    assert!(
+        accounting.settle_ci(Err(error)).is_err(),
+        "unconfirmed persistence became a successful held report"
+    );
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().available, 5);
+}
+
+#[tokio::test]
+async fn unknown_family_usage_produces_a_specific_hold_without_inventing_zero() {
+    let (_checkout, control, guard) = funded_guard(3).await;
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    store.with_family_transaction(|tx| {
+        tx.execute("DELETE FROM workflow_event WHERE workflow='owner/repo#1725' AND kind='native_model_admitted'",[])?;Ok(())
+    }).unwrap();
+    let accounting = guard.capacity_accounting(true).unwrap();
+    let error = denied_native_call(&guard).await;
+    assert!(error.to_string().contains("family_spend_unknown"));
+    let held = store.family_budget_wait(guard.id()).unwrap().unwrap();
+    assert_eq!(held.observation.model_admissions, None);
+    assert_eq!(
+        held.observation
+            .retained
+            .iter()
+            .map(|u| u.model_admissions)
+            .sum::<u64>(),
+        2
+    );
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(
+        after.checkpoint.next.action,
+        "await_authoritative_usage_evidence"
+    );
+    assert_eq!(after.model_calls, 1);
+    let report = accounting.settle_ci(Err(error)).unwrap();
+    assert!(report.held && !report.billed);
+    assert!(report
+        .message
+        .contains("authoritative family usage evidence"));
 }

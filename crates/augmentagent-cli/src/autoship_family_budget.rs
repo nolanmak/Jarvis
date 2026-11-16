@@ -40,7 +40,7 @@ pub(crate) enum Intent {
         request_ref: String,
     },
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RetainedUsage {
     pub workflow: String,
     pub model_admissions: u64,
@@ -49,6 +49,25 @@ pub(crate) struct RetainedUsage {
 #[path = "autoship_family_budget_observation.rs"]
 pub(crate) mod observation;
 pub(crate) use observation::Observation;
+#[path = "autoship_family_budget_wait.rs"]
+pub(crate) mod wait;
+
+/// A valid protected funding frame reached the atomic budget predicate and was
+/// refused. The controller may persist its facts; it cannot treat it as spend.
+#[derive(Debug)]
+pub(crate) struct AdmissionRefused {
+    pub observation: Observation,
+}
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            self.observation
+                .reason_code()
+                .unwrap_or("family_authority_unknown"),
+        )
+    }
+}
+impl std::error::Error for AdmissionRefused {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -158,10 +177,11 @@ pub(super) fn require_new_admission(
         );
     }
     let status = observe(tx, &lease.workflow, &scope.intent, incoming)?;
-    ensure!(
-        status.ready(),
-        "{}",
-        status.reason_code().unwrap_or("family_authority_unknown")
-    );
+    if !status.ready() {
+        return Err(AdmissionRefused {
+            observation: status,
+        }
+        .into());
+    }
     Ok(Some(format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))))
 }
