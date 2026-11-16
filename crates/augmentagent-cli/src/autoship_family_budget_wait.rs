@@ -238,7 +238,7 @@ pub(crate) fn prepare_productive_claim(
             cp.next = NextAction {
                 reason: blocker.reason_code.as_str().into(),
                 action: blocker.next.action.clone(),
-                eligible_at_ms: now.saturating_add(OBSERVATION_MS),
+                eligible_at_ms: cp.next.eligible_at_ms,
             };
             let refreshed = Wait {
                 schema_version: 1,

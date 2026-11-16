@@ -620,7 +620,7 @@ async fn resumed_ancestor_cannot_reclaim_child_until_its_control_frame_is_refres
         .claim_productive(
             &id,
             "same-input",
-            after.checkpoint.next.eligible_at_ms + 1,
+            (after.checkpoint.next.eligible_at_ms + 1).max(now + 4),
             LEASE_MS
         )
         .unwrap()
