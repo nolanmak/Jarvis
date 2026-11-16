@@ -15,6 +15,8 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_activity_observation.rs"]
+mod activity_observation;
 #[path = "autoship_outcome_classification.rs"]
 mod outcome_classification;
 
