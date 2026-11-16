@@ -170,3 +170,69 @@ impl WorkflowStore {
             .then_some(wait))
     }
 }
+
+/// Budget-only scheduling. A free reconciliation may rotate the lease without
+/// resolving the wait, so match its checkpoint rather than only its generation.
+/// Final native dispatch still requires a fresh, fully verified execution frame.
+pub(crate) fn prepare_productive_claim(
+    tx: &Transaction<'_>,
+    workflow: &str,
+    generation: i64,
+    cp: &mut Checkpoint,
+    now: i64,
+) -> Result<bool> {
+    let Some(wait) = latest(tx, workflow)? else {
+        return Ok(true);
+    };
+    let blocker = wait
+        .observation
+        .blockers
+        .first()
+        .context("missing family budget blocker")?;
+    if !active(cp.stage)
+        || wait.binding != cp.binding
+        || cp.next.reason != blocker.reason_code.as_str()
+        || cp.next.action != blocker.next.action
+    {
+        return Ok(true);
+    }
+    // Use a replacement only when a trusted service already published it for
+    // this generation. Never substitute a newly displayed policy for old intent.
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+            params![workflow, generation],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let intent = if let Some(raw) = raw {
+        let scope: Scope = serde_json::from_str(&raw)?;
+        ensure!(
+            scope.schema_version == 1 && !scope.verified_authority_ref.is_empty(),
+            "family_execution_scope_unknown"
+        );
+        scope.intent
+    } else {
+        wait.observation.intent.clone()
+    };
+    let observation = observe(tx, workflow, &intent, 1)?;
+    if !observation.ready() {
+        return Ok(false);
+    }
+    cp.next = wait.prior_next;
+    let checkpoint = serde_json::to_string(cp)?;
+    tx.execute(
+        "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+        params![workflow, checkpoint],
+    )?;
+    event(tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+    event(
+        tx,
+        workflow,
+        generation,
+        "family_budget_wait_recovered",
+        &serde_json::to_string(&observation)?,
+        now,
+    )?;
+    Ok(true)
+}

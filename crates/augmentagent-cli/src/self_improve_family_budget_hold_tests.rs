@@ -351,7 +351,10 @@ async fn unknown_family_usage_produces_a_specific_hold_without_inventing_zero() 
 #[tokio::test]
 async fn unchanged_family_wait_does_not_reclaim_paid_work_after_observation_deadline() {
     let (_checkout, control, guard) = funded_guard(2).await;
-    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_resource_exhausted"));
     let id = guard.id().to_owned();
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
     // All fixture sessions are pre-submission/settled; retire the old lease
@@ -361,8 +364,13 @@ async fn unchanged_family_wait_does_not_reclaim_paid_work_after_observation_dead
     let before = store.snapshot(&id).unwrap().unwrap();
     let now = before.checkpoint.next.eligible_at_ms + 1;
     let events = store.events(&id).unwrap();
-    assert!(store.claim_productive(&id, "paid-retry", now, LEASE_MS).unwrap().is_none(),
-        "unchanged exhausted family was reclaimed for productive work");
+    assert!(
+        store
+            .claim_productive(&id, "paid-retry", now, LEASE_MS)
+            .unwrap()
+            .is_none(),
+        "unchanged exhausted family was reclaimed for productive work"
+    );
     assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
     assert_eq!(store.events(&id).unwrap(), events);
 }
@@ -370,7 +378,10 @@ async fn unchanged_family_wait_does_not_reclaim_paid_work_after_observation_dead
 #[tokio::test]
 async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection() {
     let (_checkout, control, guard) = funded_guard(2).await;
-    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_resource_exhausted"));
     let id = guard.id().to_owned();
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
     // All fixture sessions are pre-submission/settled; retire the old lease
@@ -379,13 +390,125 @@ async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection
     drop(guard);
     let before = store.snapshot(&id).unwrap().unwrap();
     let now = before.checkpoint.next.eligible_at_ms + 1;
-    let lease = store.claim_reconciliation(&id, "free-reconcile", now, LEASE_MS)
-        .unwrap().expect("family compute budget blocked unpaid reconciliation");
+    let lease = store
+        .claim_reconciliation(&id, "free-reconcile", now, LEASE_MS)
+        .unwrap()
+        .expect("family compute budget blocked unpaid reconciliation");
     store.release(&lease, now + 1).unwrap();
-    assert!(store.claim_productive(&id, "paid-retry", now + 2, LEASE_MS).unwrap().is_none(),
-        "free reconciliation's new generation erased the unchanged family wait");
+    assert!(
+        store
+            .claim_productive(&id, "paid-retry", now + 2, LEASE_MS)
+            .unwrap()
+            .is_none(),
+        "free reconciliation's new generation erased the unchanged family wait"
+    );
     let after = store.snapshot(&id).unwrap().unwrap();
     assert_eq!(after.checkpoint, before.checkpoint);
     assert_eq!(after.model_calls, before.model_calls);
     assert_eq!(after.progress_at_ms, before.progress_at_ms);
+}
+
+#[tokio::test]
+async fn trusted_revised_funding_unblocks_selection_without_granting_native_dispatch() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_resource_exhausted"));
+    let id = guard.id().to_owned();
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    store.release(&guard.lease, millis()).unwrap();
+    drop(guard);
+    let before = store.snapshot(&id).unwrap().unwrap();
+    let wait = store.family_budget_wait(&id).unwrap().unwrap();
+    let family_budget::Intent::Delegated {
+        family,
+        manifest_ref,
+        policy_ref,
+        request_ref,
+    } = wait.observation.intent
+    else {
+        panic!("fixture delegation missing")
+    };
+    let now = before.checkpoint.next.eligible_at_ms + 1;
+    let root = "owner/repo#1725";
+    let root_snapshot = store.snapshot(root).unwrap().unwrap();
+    let root_lease = durable::Lease {
+        workflow: root.into(),
+        owner: "trusted-fixture-root".into(),
+        generation: root_snapshot.generation,
+    };
+    let revision = store
+        .with_family_transaction(|tx| {
+            family_store::activate_policy(
+                tx,
+                &root_lease,
+                &root_snapshot.checkpoint.binding,
+                &family,
+                Some(&policy_ref),
+                "verified-owner-fixture-revision",
+                &family_budget::Limits {
+                    schema_version: 1,
+                    max_model_admissions: 3,
+                    max_wall_ms: 1_000_000,
+                },
+                now,
+            )
+        })
+        .unwrap();
+    assert!(
+        store
+            .claim_productive(&id, "stale-frame", now, LEASE_MS)
+            .unwrap()
+            .is_none(),
+        "new policy alone silently expanded the old funding frame"
+    );
+    let recovery = store
+        .claim(&id, "trusted-funding-recovery", now, LEASE_MS)
+        .unwrap()
+        .unwrap();
+    store
+        .with_family_transaction(|tx| {
+            family_store::record_intent(
+                tx,
+                &recovery,
+                &family_budget::Intent::Delegated {
+                    family,
+                    manifest_ref,
+                    policy_ref: revision,
+                    request_ref,
+                },
+                "verified-owner-fixture-new-frame",
+                now,
+            )
+        })
+        .unwrap();
+    store.release(&recovery, now + 1).unwrap();
+    let productive = store
+        .claim_productive(&id, "ready-work", now + 2, LEASE_MS)
+        .unwrap()
+        .expect("trusted revised funding remained permanently parked");
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.checkpoint.next.reason, "fixture-ready");
+    assert_eq!(after.checkpoint.next.action, "scope");
+    assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert!(store.family_budget_wait(&id).unwrap().is_none());
+    let error = store
+        .charge_admitted_model(
+            &productive,
+            "new-generation-needs-its-own-frame",
+            now + 3,
+            None,
+            None,
+            Some(durable::submission::Provider::Codex),
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("family_execution_scope_unknown"),
+        "selection created dispatch authority: {error:#}"
+    );
 }
