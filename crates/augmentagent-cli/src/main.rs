@@ -1146,6 +1146,8 @@ enum AutoprOp {
     Pause(autoship_commands::control_command::Args),
     /// Clear only the explicit owner pause after access and readiness checks.
     Resume(autoship_commands::control_command::Args),
+    /// Retire one idle workflow as owner-canceled (exit 6); refuses active work and merges.
+    Cancel(autoship_commands::cancel_command::Args),
     /// Observe an externally merged/closed target without starting model work.
     ReconcileTarget(autoship_commands::target_reconcile::Args),
     /// Owner readoption of one legacy automatic hold; records new authority.
@@ -3203,6 +3205,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::work_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Cancel(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::cancel_command::run(args).await);
     }
     if let Cmd::Autopr { op: AutoprOp::ReconcileTarget(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::target_reconcile::run(args).await);
@@ -5862,6 +5867,7 @@ async fn main() -> Result<()> {
         Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ReconcileTarget(..) } => unreachable!("target reconciliation precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Cancel(..) } => unreachable!("owner cancel precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readopt(..) } => unreachable!("readoption precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),

@@ -76,7 +76,10 @@ async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Ac
         refusal=Some("execution-readiness-blocked".into());
     }
     let status=if action==Action::Status && refusal.is_none() {
-        let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),0);
+        // The configured daily cap, as every other status caller uses. Cap 0
+        // is not a valid allowance and failed every registered workflow.
+        let cap=std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().and_then(|v|v.parse::<u32>().ok()).unwrap_or(5).max(1);
+        let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),cap);
         if code==2 || code==4 {refusal=Some("workflow-state-unavailable".into());None}
         else {
             // Only bounded shared status fields, never raw provider or auth errors.
@@ -148,6 +151,14 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
     let plain=|content:&str|Some(GatewayReply {content:content.into(),nonce:None});
     if !augmentagent_approval_discord::autoship::recognizes(text) {
         ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
+        // #1713 — several workflows bound and none selected: ask, never guess.
+        if let Some(store)=WorkflowStore::open_read_only(path)? {
+            if store.discord_workflow(&origin,None).is_err_and(|e|e.to_string()=="workflow-selection-required") {
+                let bound=store.discord_bound_workflows(&origin)?;
+                return Ok(plain(&format!("Several autoship workflows are bound to this DM: {}. Select one with `!autoship use ID` (or add `--workflow ID`). This message was not queued and changed nothing.",
+                    bound.iter().take(10).map(|id|format!("`{id}`")).collect::<Vec<_>>().join(", "))));
+            }
+        }
         return Ok(plain("Autoship coding sessions are unavailable in this build. This message was not queued and did not pause the workflow. Use `!autoship status`, `pause`, or `resume` to control the PR."));
     }
     match parse_control(text) {
@@ -223,6 +234,26 @@ pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discor
 #[cfg(test)]
 mod tests {
     use super::*;
+    // #1713 — ordinary text in a DM bound to several workflows asks for an
+    // explicit selection by ID and performs no coding mutation.
+    #[tokio::test]
+    async fn ambiguous_plain_text_asks_for_selection_naming_bound_workflows() {
+        use crate::autoship_workflow::submission::{Milestone,Provider,Request,Target};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let origin=|message|DiscordOrigin {bot:11,owner:22,channel:33,message};
+        let request=|pr|Request {repository:"owner/repo".into(),target:Target::Pr(pr),provider:Some(Provider::Codex),until:Milestone::Merged};
+        let first=store.submit_discord_authorized(&origin(44),&request(42),&"a".repeat(64),1).unwrap().admission.workflow;
+        let second=store.submit_discord_authorized(&origin(45),&request(43),&"b".repeat(64),2).unwrap().admission.workflow;
+        drop(store);
+        let before=std::fs::read(&path).unwrap();
+        let context=GatewayContext {bot:11,owner:Some(22),author:22,channel:33,message:46,guild:None};
+        let reply=gateway_command(dir.path(),&path,&context,"Please fix the failing test").await.unwrap().unwrap();
+        assert!(reply.content.contains(&first) && reply.content.contains(&second),"{}",reply.content);
+        assert!(reply.content.contains("!autoship use"),"{}",reply.content);
+        assert!(!reply.content.contains("unavailable in this build"),"{}",reply.content);
+        assert_eq!(std::fs::read(&path).unwrap(),before,"selection prompt performs no write");
+    }
     #[test]
     fn discord_control_grammar_requires_exact_selection_and_options() {
         assert_eq!(parse_control("!autoship pause").unwrap(),Some((Action::Pause,None)));

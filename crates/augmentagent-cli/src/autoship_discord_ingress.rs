@@ -114,6 +114,17 @@ impl WorkflowStore {
         bound_workflow(&self.conn,origin,explicit)
     }
 
+    /// Read-only: the workflows bound to this exact owner conversation, for an
+    /// explicit selection prompt. Never selects or authorizes anything.
+    pub fn discord_bound_workflows(&self,origin:&DiscordOrigin)->Result<Vec<String>> {
+        origin.validate()?;
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_workflow_binding')",[],|r|r.get(0))?;
+        if !exists {return Ok(vec![]);}
+        let mut statement=self.conn.prepare("SELECT workflow FROM discord_workflow_binding WHERE bot=?1 AND owner=?2 AND channel=?3 ORDER BY workflow")?;
+        let rows=statement.query_map(params![origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string()],|r|r.get::<_,String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Persist uncertainty BEFORE the remote send. A process death can never
     /// turn an attempted send back into safely queued work or authorize replay.
     pub fn claim_discord_ack(&mut self,origin:&DiscordOrigin,now:i64)->Result<Option<DiscordReply>> {

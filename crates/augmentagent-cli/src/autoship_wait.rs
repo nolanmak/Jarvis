@@ -38,6 +38,10 @@ pub(crate) async fn observe(repo:&Path, path:&Path, admission:Value, until:Miles
             body["observation"]=json!({"state":"complete","detached":true});
             return (0,body);
         }
+        if code==super::cancel_command::CANCELED_EXIT {
+            body["observation"]=json!({"state":"canceled","detached":true});
+            return (code,body);
+        }
         let held=matches!(body["stage"].as_str(),Some("held"|"retired"|"merged"));
         let queued_blocker=body["stage"]=="queued" && matches!(body["last_attempt"]["outcome"].as_str(),Some("deferred"|"rejected"|"failed"));
         if code==2 || code==4 || held || queued_blocker || body["owner_control"]["paused"]==true {

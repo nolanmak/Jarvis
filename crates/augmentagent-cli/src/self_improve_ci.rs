@@ -5,6 +5,8 @@ use super::*;
 #[cfg(test)]
 #[path = "self_improve_ci_fixture.rs"]
 pub(in crate::self_improve) mod fixture;
+#[path = "self_improve_ci_comparison.rs"]
+pub(super) mod comparison;
 #[path = "self_improve_ci_vm.rs"]
 mod vm;
 use anyhow::ensure;
