@@ -39,6 +39,8 @@ pub(crate) mod merge_escalation;
 pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_progress_retry.rs"]
+pub(crate) mod progress_retry;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]
@@ -811,6 +813,10 @@ impl WorkflowStore {
                 sequence INTEGER NOT NULL, nonce TEXT NOT NULL, content TEXT NOT NULL,
                 state TEXT NOT NULL, dispatched_at INTEGER NOT NULL, message TEXT,
                 confirmed_at INTEGER, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_retry (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, attempts INTEGER NOT NULL, eligible_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,bot,owner,channel,sequence));
             CREATE TABLE IF NOT EXISTS workflow_progress_state (
                 workflow TEXT PRIMARY KEY, sequence INTEGER NOT NULL, fingerprint TEXT NOT NULL,
                 terminal INTEGER NOT NULL, payload TEXT NOT NULL);
