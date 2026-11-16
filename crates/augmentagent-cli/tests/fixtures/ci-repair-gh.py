@@ -25,7 +25,11 @@ endpoint = args[1]
 if '/actions/jobs/' in endpoint and endpoint.endswith('/logs'):
     if state.get('missing_logs'): sys.exit(1)
     print(state['log']); sys.exit(0)
-if endpoint.endswith('/pulls/1669'):
+if '/actions/jobs/' in endpoint:
+    job = int(endpoint.rsplit('/', 1)[1]); run = job // 100; path = paths[run - 100]
+    name = sorted(expected[path])[job % 100]
+    value = {'id': job, 'run_id': run, 'run_attempt': 1, 'head_sha': head, 'name': name, 'status': 'completed', 'conclusion': 'failure'}
+elif endpoint.endswith('/pulls/1669'):
     value = {'head': {'sha': head}, 'base': {'sha': state['base'], 'ref': 'main', 'repo': {'full_name': repository}}, 'state': 'open', 'changed_files': 1}
 elif '/pulls/1669/files' in endpoint:
     value = [{'filename': 'crates/augmentagent-cli/src/fixture.rs'}]
