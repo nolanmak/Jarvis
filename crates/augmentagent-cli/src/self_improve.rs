@@ -107,6 +107,9 @@ mod recovery;
 mod checkout_identity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
+#[path = "self_improve_observation_wake.rs"]
+mod observation_wake;
+
 #[path = "self_improve_targeted.rs"]
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
@@ -12587,7 +12590,8 @@ impl AutoPrLoop {
                                 .and_then(|store| store.map(|s| -> Result<bool> {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
-                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12613,7 +12617,12 @@ impl AutoPrLoop {
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
-                            Ok(false) => {},
+                            Ok(false) => match observation_wake::reserve(&self.workflow_path,
+                                self.command_repository.as_deref().unwrap(),(self.clock)().timestamp_millis()) {
+                                Ok(true)=>break,
+                                Ok(false)=>{},
+                                Err(error)=>warn!("activity observation wake-up unavailable: {error:#}"),
+                            },
                             Err(error) => warn!("command queue wake-up unavailable: {error:#}"),
                         }
                     }
