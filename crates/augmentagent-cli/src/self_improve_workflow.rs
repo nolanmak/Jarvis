@@ -5,6 +5,11 @@ use super::*;
 mod stage_activity;
 #[path = "self_improve_family_dispatch_control.rs"]
 mod family_dispatch_control;
+#[path = "self_improve_family_wait_settlement.rs"]
+mod family_wait_settlement;
+#[cfg(test)]
+#[path = "self_improve_family_wait_settlement_tests.rs"]
+mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
 #[cfg(test)]

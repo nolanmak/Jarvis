@@ -250,6 +250,7 @@ pub(super) async fn resume(
         automatic,
     )
     .await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     if result.as_ref().is_err_and(|error| error.is::<CiInfrastructureDeferred>()) {
         let report = capacity_accounting.settle_ci(result)?;
