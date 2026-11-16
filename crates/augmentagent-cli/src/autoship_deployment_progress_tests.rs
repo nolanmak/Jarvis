@@ -157,3 +157,14 @@ fn undelivered_progress_degrades_then_dead_letters_without_discarding_events() {
     store.confirm_progress(&origin,&id,pending[0].2,99,created+DAY+3).unwrap();
     assert_eq!(store.progress_delivery_at(&id,created+2*DAY).unwrap().state,"delivery-confirmed");
 }
+
+#[test]
+fn durable_route_owns_updates_so_legacy_notice_is_not_sent_twice() {
+    let root=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&root.path().join("state.db")).unwrap();
+    let request=submission::Request{repository:"owner/repo".into(),target:submission::Target::Pr(42),provider:None,until:submission::Milestone::Merged};
+    let id=store.submit_authorized("cli-request","github:owner",&request,1).unwrap().workflow;
+    assert!(!store.durable_route_owns_updates(&id).unwrap(),"unbound work still needs the legacy owner notice");
+    assert!(!store.durable_route_owns_updates("owner/repo#999").unwrap());
+    assert!(store.bind_delivery(&id,"github:owner",super::super::delivery::Destination{bot:11,owner:22,channel:33},2).unwrap());
+    assert!(store.durable_route_owns_updates(&id).unwrap(),"bound work must not also go through legacy notify_review");
+}

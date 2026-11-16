@@ -31,6 +31,10 @@ pub struct DeliveryStatus {
     pub oldest_pending_at_ms:Option<i64>,
     pub latest_sequence:Option<i64>,
 }
+/// #1714: undelivered for 15 minutes is degraded; after 24 hours it is a
+/// visible dead letter that stays retryable.
+pub const DEGRADED_AFTER_MS:i64=15*60_000;
+pub const DEAD_LETTER_AFTER_MS:i64=24*60*60_000;
 fn exists(conn:&Connection)->Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_event')",[],|r|r.get(0))?)
 }
@@ -85,7 +89,15 @@ impl WorkflowStore {
     }
     /// Delivery state at `now`: long-pending events surface as degraded, then
     /// as a visible dead letter; neither discards the retained events.
-    pub fn progress_delivery_at(&self,workflow:&str,_now:i64)->Result<DeliveryStatus> {self.progress_delivery(workflow)}
+    pub fn progress_delivery_at(&self,workflow:&str,now:i64)->Result<DeliveryStatus> {
+        let mut status=self.progress_delivery(workflow)?;
+        if status.state=="delivery-pending" {
+            let age=status.oldest_pending_at_ms.map_or(0,|at|now.saturating_sub(at));
+            if age>=DEAD_LETTER_AFTER_MS {status.state="delivery-dead-letter".into();}
+            else if age>=DEGRADED_AFTER_MS {status.state="delivery-degraded".into();}
+        }
+        Ok(status)
+    }
     pub fn progress_delivery(&self,workflow:&str)->Result<DeliveryStatus> {
         if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None});}
         let delivery_table:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_delivery')",[],|r|r.get(0))?;
@@ -227,7 +239,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
-        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now,resource_refusal,tool_capacity_refusal};
+        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:if confirmed {super::deployment_progress::merged_state(tx,workflow)?} else {"unknown"}.into(),evidence_digest,observed_at_ms:now,resource_refusal,tool_capacity_refusal};
     let payload=serde_json::to_string(&progress)?;
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;

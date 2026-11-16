@@ -523,6 +523,9 @@ pub(super) struct SweepGuard {
     worktree_lock: Mutex<Option<RunLock>>,
 }
 impl SweepGuard {
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.inner.as_ref().is_some_and(WorkflowGuard::legacy_notice_suppressed)
+    }
     pub(super) async fn acquire(
         repository: &str,
         issue: u64,
@@ -1386,6 +1389,11 @@ impl WorkflowGuard {
 
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
+    }
+    /// #1714: when the durable outbox routes this workflow, legacy
+    /// `notify_review` must stay silent so the owner is not told twice.
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.store.lock().ok().and_then(|store|store.durable_route_owns_updates(self.id()).ok()).unwrap_or(false)
     }
     pub(super) fn binding(&self) -> &Binding {
         &self.binding
