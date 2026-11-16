@@ -18,7 +18,7 @@
 //! | Watchdog healthy while provider faults persisted       | `persistent_provider_fault_without_progress_alerts`        | #1708  | green (#1708)  |
 //! | Watchdog counted manual main commits as progress       | `manual_main_commit_is_not_autonomous_progress`            | #1708  | green (#1708)  |
 //! | UNKNOWN mergeability never merges                      | `unknown_mergeability_never_merges`                        | #1711  | green guard    |
-//! | UNKNOWN mergeability logged as conflict (#1606)        | `unknown_mergeability_is_not_reported_as_conflict`         | #1711  | RED (ignored)  |
+//! | UNKNOWN mergeability logged as conflict (#1606)        | `unknown_mergeability_is_not_reported_as_conflict`         | #1711  | green (#1708)  |
 use super::*;
 
 fn oct(day: u32, hour: u32) -> chrono::DateTime<chrono::Utc> {
@@ -360,7 +360,6 @@ fn unknown_mergeability_never_merges() {
 /// Reporting half: an UNKNOWN head is a mergeability recompute, not proof of
 /// conflict, and must not route to rebase/conflict repair.
 #[test]
-#[ignore = "RED until #1711 (I): the sweep reports UNKNOWN mergeability as 'conflict with main ... a rebase is the resume lane's job'"]
 fn unknown_mergeability_is_not_reported_as_conflict() {
     let SweepVerdict::Skip(unknown) = sweep_verdict(&sweep_candidate(None)) else {
         panic!("UNKNOWN must not merge");
