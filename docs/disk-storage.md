@@ -14,7 +14,9 @@ reconciles storage, then holds the build/prune lease until COMMAND exits.
 Without overrides, the wrapper enrolls a dedicated session-cache parent and
 chooses a stable child per worktree. On this Linux host it prefers the writable
 `/mnt/build` volume, falling back to the user cache directory when unavailable.
-Set `AUGMENTAGENT_BUILD_PARENT` to place that
+Set `AUGMENTAGENT_BUILD_VOLUME` to place gate, session, verifier and VM scratch
+output on one owned volume; see [relocation and production rollout](build-volume.md).
+`AUGMENTAGENT_BUILD_PARENT` can independently place that
 parent on a build volume, `CARGO_TARGET_DIR` for a specific cache, or
 `AUGMENTAGENT_STORAGE_BIN` for a supporting binary during bootstrap.
 Do not start an external `CARGO_TARGET_DIR=... cargo ...` build outside this
