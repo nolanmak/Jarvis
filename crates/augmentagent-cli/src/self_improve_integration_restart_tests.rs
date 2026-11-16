@@ -14,7 +14,19 @@ async fn crashed_resume_of_mergeable_base_change_reuses_durable_job() {
     exercise("mergeable", "self_improve::integration_tests::restart::crashed_resume_of_mergeable_base_change_reuses_durable_job").await;
 }
 
+#[tokio::test]
+async fn crashed_resume_keeps_recorded_unpublished_integration_head() {
+    exercise("retained", "self_improve::integration_tests::restart::crashed_resume_keeps_recorded_unpublished_integration_head").await;
+}
+
+#[tokio::test]
+async fn retained_integration_without_publication_custody_waits_for_adoption() {
+    exercise("retained-missing-custody", "self_improve::integration_tests::restart::retained_integration_without_publication_custody_waits_for_adoption").await;
+}
+
 async fn exercise(kind: &str, test: &str) {
+    let retained = kind.starts_with("retained");
+    let has_custody = kind == "retained";
     let expected_reason = if kind == "conflict" {
         "integration_conflict"
     } else {
@@ -80,10 +92,24 @@ async fn exercise(kind: &str, test: &str) {
                         };
                         store.checkpoint(&lease, &cp, 5).unwrap();
                     }
-                    store.release(&lease, 6).unwrap();
+                    if has_custody && issue == 1 {
+                        let binding = store.snapshot(&id).unwrap().unwrap().checkpoint.binding;
+                        let pushed = store
+                            .begin_operation(
+                                &lease,
+                                crate::autoship_workflow::OperationKind::Push,
+                                &binding,
+                                5,
+                            )
+                            .unwrap();
+                        store
+                            .complete_operation(&lease, &pushed.id, &format!("git-head:{head}"), 6)
+                            .unwrap();
+                    }
+                    store.release(&lease, 7).unwrap();
                     opened_prs::record(issue, pr, head, None);
                 }
-                if kind == "mergeable" {
+                if kind != "conflict" {
                     // A prior controller observation left this durable
                     // changed-base request before the worker was admitted.
                     let row = &rows[0];
@@ -132,6 +158,26 @@ async fn exercise(kind: &str, test: &str) {
                     action: "reconcile_main".into(),
                     eligible_at_ms: 0,
                 };
+                if retained {
+                    let old = rows[0]["headRefOid"].as_str().unwrap();
+                    let candidate = workflow::prepare_resume_worktree_at_head(
+                        &repo,
+                        1606,
+                        "agent-fix/issue-1",
+                        Some(old),
+                    )
+                    .await
+                    .unwrap();
+                    git(&candidate, &["merge", "--no-edit", "origin/main"]);
+                    cp.binding.head = git(&candidate, &["rev-parse", "HEAD"]);
+                    assert_ne!(cp.binding.head, old);
+                    cp.stage = Stage::Verify;
+                    cp.next = NextAction {
+                        reason: integration::CHECKS_REQUIRED.into(),
+                        action: "verify_integrated_head".into(),
+                        eligible_at_ms: 0,
+                    };
+                }
                 store.checkpoint(&lease, &cp, 101).unwrap();
                 AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), 1);
                 std::process::exit(86);
@@ -148,9 +194,30 @@ async fn exercise(kind: &str, test: &str) {
                         .checkpoint
                         .next
                         .reason,
-                    "resume_started"
+                    if retained {
+                        integration::CHECKS_REQUIRED
+                    } else {
+                        "resume_started"
+                    }
                 );
-                assert_eq!(find_resumable_draft(&repo,Some(1),false).await,Some((1606,1,"agent-fix/issue-1".into())),
+                if retained {
+                    let snapshot = store.snapshot("owner/repo#1").unwrap().unwrap();
+                    let old = rows[0]["headRefOid"].as_str().unwrap();
+                    assert_eq!(
+                        store
+                            .retained_candidate_head(
+                                "owner/repo",
+                                1606,
+                                "agent-fix/issue-1",
+                                old,
+                                &snapshot.checkpoint.binding.head,
+                                201
+                            )
+                            .unwrap(),
+                        has_custody.then_some(snapshot.checkpoint.binding.head)
+                    );
+                }
+                assert_eq!(find_resumable_draft(&repo,Some(1),false).await,if retained && !has_custody {None}else{Some((1606,1,"agent-fix/issue-1".into()))},
                     "a crashed resume lost its durable integration retry behind today's attempt ledger");
                 assert_eq!(
                     find_resumable_draft(&repo, None, false).await,
@@ -158,7 +225,67 @@ async fn exercise(kind: &str, test: &str) {
                     "the recovered integration job must not monopolize normal rotation"
                 );
                 let snapshot = store.snapshot("owner/repo#1").unwrap().unwrap();
-                assert_eq!(snapshot.checkpoint.next.reason, expected_reason);
+                assert_eq!(
+                    snapshot.checkpoint.next.reason,
+                    if retained {
+                        integration::CHECKS_REQUIRED
+                    } else {
+                        expected_reason
+                    }
+                );
+                if has_custody {
+                    let old = rows[0]["headRefOid"].as_str().unwrap();
+                    assert!(store
+                        .retained_candidate_head(
+                            "owner/repo",
+                            1606,
+                            "agent-fix/issue-1",
+                            old,
+                            &snapshot.checkpoint.binding.head,
+                            201
+                        )
+                        .unwrap()
+                        .is_some());
+                    let candidate = workflow::prepare_resume_candidate(
+                        &repo,
+                        "owner/repo",
+                        1606,
+                        "agent-fix/issue-1",
+                        Some(old),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        git(&candidate, &["rev-parse", "HEAD"]),
+                        snapshot.checkpoint.binding.head
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(candidate.join("candidate")).unwrap(),
+                        "preserved candidate\n"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(candidate.join("source")).unwrap(),
+                        "upstream\n"
+                    );
+                }
+                if retained && !has_custody {
+                    let old = rows[0]["headRefOid"].as_str().unwrap();
+                    let candidate = workflow::resume_worktree_path(&repo, 1606).await.unwrap();
+                    assert!(workflow::prepare_resume_candidate(
+                        &repo,
+                        "owner/repo",
+                        1606,
+                        "agent-fix/issue-1",
+                        Some(old)
+                    )
+                    .await
+                    .is_err());
+                    assert_eq!(
+                        git(&candidate, &["rev-parse", "HEAD"]),
+                        snapshot.checkpoint.binding.head,
+                        "missing custody must preserve the retained candidate"
+                    );
+                }
                 assert_eq!(snapshot.model_calls, 0);
                 assert!(store.current_reviews("owner/repo#1").unwrap().is_empty());
                 assert_eq!(
@@ -241,6 +368,26 @@ async fn exercise(kind: &str, test: &str) {
         &["merge-tree", "--write-tree", "main", "agent-fix/issue-2"],
     );
     std::fs::write(root.join("rows.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+    if retained {
+        let remote = root.join("remote.git");
+        git(&repo, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "main",
+                "agent-fix/issue-1",
+                "agent-fix/issue-2",
+            ],
+        );
+        git(&repo, &["fetch", "-q", "origin"]);
+    }
     let gh = root.join("gh");
     std::fs::write(
         &gh,
