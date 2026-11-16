@@ -481,7 +481,7 @@ fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: 
     refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
-        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
+        .is_some_and(|snapshot| integration::requires_reverification(&snapshot.checkpoint) || snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
@@ -525,6 +525,9 @@ pub(super) struct SweepGuard {
     worktree_lock: Mutex<Option<RunLock>>,
 }
 impl SweepGuard {
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.inner.as_ref().is_some_and(WorkflowGuard::legacy_notice_suppressed)
+    }
     pub(super) async fn acquire(
         repository: &str,
         issue: u64,
@@ -1390,6 +1393,11 @@ impl WorkflowGuard {
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
     }
+    /// #1714: when the durable outbox routes this workflow, legacy
+    /// `notify_review` must stay silent so the owner is not told twice.
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.store.lock().ok().and_then(|store|store.durable_route_owns_updates(self.id()).ok()).unwrap_or(false)
+    }
     pub(super) fn binding(&self) -> &Binding {
         &self.binding
     }
@@ -1683,6 +1691,12 @@ impl WorkflowGuard {
             serde_json::json!({"operation_id":operation.id,
             "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes())), "pr":pr}),
         )
+    }
+
+    pub(super) fn require_independent_native_session(&self,provider:&str,session:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .require_independent_native_session(provider,session)
     }
 
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
