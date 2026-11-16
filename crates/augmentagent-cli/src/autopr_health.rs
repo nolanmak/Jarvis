@@ -1270,13 +1270,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     // of the rotated one keeps the last hours in view.
     let log = crate::log_rotate::tail_with_rotated(&dir.join("stderr.log"), 4 * 1024 * 1024)
         .unwrap_or_default();
-    let gate_dir = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".cache/augmentagent-gate-target"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+    let gate_dir = crate::disk::gate_target_dir();
 
     let deploy = deploy_state(repo_root, &dir);
     let (running_binary, unit_dropins) = running_binary(repo_root);
