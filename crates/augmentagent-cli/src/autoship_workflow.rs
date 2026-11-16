@@ -15,6 +15,10 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[cfg(test)]
+#[path = "autoship_family_budget_tests.rs"]
+mod family_budget_tests;
+
 #[path = "autoship_activity.rs"]
 pub(crate) mod activity;
 #[path = "autoship_runtime_events.rs"]
