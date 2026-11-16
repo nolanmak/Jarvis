@@ -27,6 +27,7 @@ TEST_ONLY_EMBEDS=(
   eval/autopr-cases.json
   eval/last-run.json
   scripts/tests/fixtures/scoped-document.pdf
+  scripts/tests/fixtures/grep_timeout_observer.py
   scripts/tests/fixtures/code-mode-compute/numbers.xlsx
   scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
   skills/email-triage/SKILL.md
@@ -185,6 +186,7 @@ expect_no_rebuild scripts/check-no-personal-data.sh
 expect_no_rebuild eval/last-run.json
 expect_no_rebuild scripts/tests/fixtures/code-mode-compute/numbers.xlsx
 expect_no_rebuild scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
+expect_no_rebuild scripts/tests/fixtures/grep_timeout_observer.py
 expect_no_rebuild sidecars/code-mode-runner/runner_test.ts
 
 # Drift guard: every include_str!/include_bytes! target outside crates/ in the
