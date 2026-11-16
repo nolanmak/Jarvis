@@ -627,3 +627,49 @@ async fn resumed_ancestor_cannot_reclaim_child_until_its_control_frame_is_refres
         .is_none());
     assert_eq!(store.events(&id).unwrap(), events);
 }
+
+async fn assert_missing_frame_refusal_is_durable(malformed: bool) {
+    let (_checkout, control, guard) = funded_guard(10).await;
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before=store.snapshot(guard.id()).unwrap().unwrap();
+    store.with_family_transaction(|tx| {
+        if malformed {
+            tx.execute("UPDATE workflow_family_scope SET payload='not-json' WHERE workflow=?1 AND generation=?2",
+                rusqlite::params![guard.id(),guard.lease.generation])?;
+        } else {
+            tx.execute("DELETE FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+                rusqlite::params![guard.id(),guard.lease.generation])?;
+        }
+        Ok(())
+    }).unwrap();
+    let accounting=guard.capacity_accounting(false).unwrap();
+    let error=denied_native_call(&guard).await;
+    assert!(error.to_string().contains("family_execution_scope_unknown"),"unexpected refusal: {error:#}");
+    let after=store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(after.checkpoint.next.reason,"family_execution_scope_unknown",
+        "early unknown-frame refusal escaped durable wait handling");
+    assert_eq!(after.checkpoint.next.action,"await_protected_execution_scope");
+    assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+    assert_eq!(after.model_calls,before.model_calls);
+    assert_eq!(after.progress_at_ms,before.progress_at_ms);
+    let event=store.events(guard.id()).unwrap().into_iter().find(|e|e.1=="family_budget_wait").unwrap();
+    let record:serde_json::Value=serde_json::from_str(&event.2).unwrap();
+    assert_eq!(record["schema_version"],2);
+    assert!(record["observation"].is_null(),"unknown funding frame fabricated a budget observation");
+    assert_eq!(record["context_reason"],"family_execution_scope_unknown");
+    assert!(guard.validate_before_side_effect().is_err());
+    let report=accounting.settle_ci(Err(error)).unwrap();
+    assert!(report.held && !report.billed);
+    assert!(report.message.contains("verified execution scope"));
+}
+
+#[tokio::test]
+async fn missing_funding_frame_becomes_an_unknown_context_wait_without_inventing_intent() {
+    assert_missing_frame_refusal_is_durable(false).await;
+}
+
+#[tokio::test]
+async fn malformed_funding_frame_becomes_an_unknown_context_wait_without_inventing_intent() {
+    assert_missing_frame_refusal_is_durable(true).await;
+}
