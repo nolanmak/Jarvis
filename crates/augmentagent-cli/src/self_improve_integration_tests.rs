@@ -515,3 +515,6 @@ async fn integration_provider_failure_preserves_harness_classification() {
 
 #[path = "self_improve_integration_restart_tests.rs"]
 mod restart;
+
+#[path = "self_improve_integration_owner_tests.rs"]
+mod owner;

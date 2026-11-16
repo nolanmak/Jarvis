@@ -206,11 +206,14 @@ impl WorkflowStore {
             && !interrupted
             && (reason != IntegrationReason::Unknown || old.as_ref().unwrap().5 > now)
         {
-            return Ok(if reason == IntegrationReason::Resolved {
+            let result = if reason == IntegrationReason::Resolved {
                 None
             } else {
                 Some(reason.due() && cp.next.eligible_at_ms <= now)
-            });
+            };
+            integration_source::capture(&tx, &id, head, false)?;
+            tx.commit()?;
+            return Ok(result);
         }
         if !ours && cp.next.eligible_at_ms > now {
             return Ok(None);
@@ -282,6 +285,7 @@ impl WorkflowStore {
             tx.execute("DELETE FROM review_fragment WHERE workflow=?1", [&id])?;
             tx.execute("DELETE FROM pr_ready_receipt WHERE workflow=?1", [&id])?;
         }
+        integration_source::capture(&tx, &id, head, true)?;
         tx.execute("INSERT INTO integration_recovery VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(workflow) DO UPDATE SET binding=excluded.binding,base=excluded.base,fingerprint=excluded.fingerprint,kind=excluded.kind,attempts=excluded.attempts,next_at=excluded.next_at,original=excluded.original",
             params![id,binding,base,fingerprint,reason.code(),attempts,next_at,original])?;
         tx.execute(

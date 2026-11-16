@@ -2251,6 +2251,8 @@ impl WorkflowGuard {
             self.observe_remote(&operation,&format!("git-head:{remote}"),None)?;
             return Ok(remote);
         }
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_integration_push_source(self.id(),branch,&remote)?;
         if !remote.is_empty() {
             let (ancestor,_,_)=run("git",&["merge-base","--is-ancestor",&remote,&self.binding.head],&self.worktree).await?;
             anyhow::ensure!(ancestor,"remote PR changed; reconcile before publishing preserved work");
