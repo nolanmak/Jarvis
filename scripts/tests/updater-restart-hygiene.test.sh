@@ -21,6 +21,8 @@ make_case() {
   TMP=$(mktemp -d); export TMP
   git init -q --bare "$TMP/origin.git"
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
+  # Match the production checkout: build output is ignored, owner source is not.
+  cp "$REPO_ROOT/.gitignore" "$TMP/work/.gitignore"
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   cp "$REPO_ROOT/scripts/recover-autopr-worker.py" "$TMP/work/scripts/"

@@ -825,7 +825,7 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     let Some(merge) = parents[0]["mergeCommit"]["oid"].as_str() else {
         return Ok(false);
     };
-    let (ok, _, _) = run("git", &["fetch", "origin", "main"], repo).await?;
+    let (ok, _, _) = workspace::preparation_git(repo, &["fetch", "--no-write-fetch-head", "origin", "main"]).await?;
     if !ok
         || !run(
             "git",
