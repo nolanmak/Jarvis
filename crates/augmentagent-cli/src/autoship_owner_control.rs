@@ -172,6 +172,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             }
         }
         super::progress::project(tx,workflow,"owner_control_changed",now)?;
+        super::activity::project(tx,workflow,"owner_control_changed","",now)?;
         Ok(control)
 }
 

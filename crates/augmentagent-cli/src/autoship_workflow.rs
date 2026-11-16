@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_native_tool_progress.rs"]
+mod native_tool_progress;
+
+#[path = "autoship_guarded_progress.rs"]
+mod guarded_progress;
+
+#[path = "autoship_activity.rs"]
+pub(crate) mod activity;
+
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
 
@@ -790,6 +799,7 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        activity::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -2348,6 +2358,7 @@ fn event(
         params![workflow, generation, kind, payload, now_ms],
     )?;
     progress::project(tx,workflow,kind,now_ms)?;
+    activity::project(tx,workflow,kind,payload,now_ms)?;
     Ok(())
 }
 
