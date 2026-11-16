@@ -103,8 +103,6 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
         connection.execute("insert into fixture values ('synthetic')")
 
     idle_during_build = parent / "idle-during-build"
-    cache(idle_during_build)
-    age_tree(idle_during_build)
 
     first_started = base / "first-started"
     release_first = base / "release-first"
@@ -123,6 +121,11 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
             assert first.poll() is None, first.communicate()
             assert time.monotonic() < deadline, "first managed build did not start"
             time.sleep(0.05)
+        # Admission itself prunes idle owned targets. Create this fixture only
+        # after admission has completed, so the following live-build pass (not
+        # the writer's preflight) must discover and retire the whole target.
+        cache(idle_during_build)
+        age_tree(idle_during_build)
         # QA invocations may isolate XDG state while sharing a target. The
         # target lease must still exclude their pruning, even while the live
         # writer is a Python/test process rather than cargo itself.

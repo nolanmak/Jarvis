@@ -142,3 +142,61 @@ fn global_writer_still_requires_compiler_evidence() {
     f.prune(vec![f.b.clone()], false, Some(0), Some(vec![BuildProc { target_env: Some(f.b.clone()), ..Default::default() }]));
     assert_eq!(tree(&f.b), before);
 }
+
+#[test]
+fn global_writer_preserves_whole_root_retirement() {
+    let isolated = tempfile::tempdir().unwrap();
+    let scratch = isolated.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "disk::prune_tests::whole_root_retirement_child", "--ignored", "--nocapture"])
+        .env("XDG_STATE_HOME", isolated.path().join("state"))
+        .env("TMPDIR", &scratch)
+        .env("AUGMENTAGENT_GATE_TARGET_DIR", isolated.path().join("gate"))
+        .env("AUGMENTAGENT_PRUNE_TARGET_DIRS", "")
+        .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0")
+        .env("AUGMENTAGENT_BUILD_GROWTH_GB", "0")
+        .output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[ignore = "isolated environment helper invoked by the parent regression"]
+fn whole_root_retirement_child() {
+    let mut f = Fixture::new();
+    // Discover through actual registration records in the child's isolated
+    // state directory, keeping the parent's process environment untouched.
+    f.state = crate::build_storage::state_dir().unwrap();
+    crate::build_storage::register(&f.repo, &f.a, None, &f.state).unwrap();
+    crate::build_storage::register_abandoned(&f.repo, &f.b, &f.state).unwrap();
+    fn age_tree(path: &Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { age_tree(&path); }
+            else { age(&path); }
+        }
+        age(path);
+    }
+    fn age(path: &Path) {
+        let old = SystemTime::now() - Duration::from_secs(5 * 86400);
+        std::fs::File::open(path).unwrap().set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+    }
+    age_tree(&f.b);
+    let _global = crate::build_storage::Lease::try_at(&f.state).unwrap().unwrap();
+    let mut writer = child_lease(&f.a);
+    let before_a = tree(&f.a);
+    let before_b = tree(&f.b);
+    for dry_run in [true, false] {
+        let reports = f.prune(vec![], dry_run, None, Some(vec![]));
+        let report = reports.as_array().unwrap().iter()
+            .find(|r| r["path"] == f.b.display().to_string()).expect("owned orphan was not discovered");
+        assert_eq!(report["full_drop"], true, "whole-root selection lost: {reports}");
+        assert_eq!(report["outcome"], "pruned");
+        assert!(report["freed_bytes"].as_u64().unwrap() > 0);
+        if dry_run { assert_eq!(tree(&f.b), before_b); }
+        else { assert!(!f.b.exists(), "whole orphan target must be removed"); }
+        assert_eq!(tree(&f.a), before_a);
+        assert!(writer.0.try_wait().unwrap().is_none());
+        assert!(crate::build_storage::Lease::try_at(&f.state).unwrap().is_none());
+    }
+}
