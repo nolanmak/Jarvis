@@ -365,7 +365,7 @@ async fn execute(
             let current=&*guard;
             async move { adoption::revise(reasoner,current,&opts,&prompt).await }
         }).await?;
-        guard.transition(Stage::Verify,integration::CHECK_CLASSIFICATION_WAIT,"verify_integrated_head",0).await?;
+        guard.transition(Stage::Verify,integration::CHECKS_REQUIRED,"verify_integrated_head",0).await?;
     }
     let mut criteria: Vec<String> = prepared
         .proposal
@@ -513,11 +513,14 @@ async fn execute(
                 repo_owner: merge_policy_owner(repo).await,
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             });
-            if !allowed || checks_green(repo, pr.pr).await != Some(true) {
+            let check_wait = if allowed {
+                integration_checks::wait_reason(repo, pr.pr, &guard.binding().head).await
+            } else { None };
+            if !allowed || check_wait.is_some() {
                 guard
                     .transition(
                         if allowed { Stage::AwaitChecks } else { Stage::Held },
-                        if allowed { "adopted_ci_pending" } else { "adopted_merge_policy_blocked" },
+                        check_wait.unwrap_or("adopted_merge_policy_blocked"),
                         if allowed { "reconcile_approved_pr" } else { "await_merge_authorization" },
                         chrono::Utc::now().timestamp_millis() + 300_000,
                     )

@@ -533,6 +533,10 @@ pub trait QueryHandler: Send + Sync {
     fn autoship_progress_confirm(&self,_delivery:&autoship::ProgressDelivery,_message:u64)->anyhow::Result<()> {Ok(())}
     /// Park a definitely rejected progress send for a persisted retry.
     fn autoship_progress_defer(&self,_delivery:&autoship::ProgressDelivery,_retry_after_ms:Option<i64>)->anyhow::Result<()> {Ok(())}
+    /// Status message a claimed progress send must edit, if any.
+    fn autoship_progress_edit_target(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<u64>> {Ok(None)}
+    /// The status message no longer exists remotely.
+    fn autoship_progress_status_lost(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<()> {Ok(())}
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
     /// Attach the private voice-tool endpoint after the Discord gateway has

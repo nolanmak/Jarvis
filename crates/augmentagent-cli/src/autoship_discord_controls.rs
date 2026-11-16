@@ -90,6 +90,32 @@ impl WorkflowStore {
     }
 }
 
+impl WorkflowStore {
+    /// #1713 — a readopt request is recorded in the same durable Discord
+    /// request table with kind=readopt, no workflow and its explicit target
+    /// (schema CHECKs enforce both), before any acknowledgement is claimed.
+    /// Replay is keyed by the Discord request id; a changed payload rejects.
+    pub fn commit_discord_readopt(&mut self,origin:&DiscordOrigin,digest:&str,target:&serde_json::Value,
+        refusal:Option<&str>,content:&str,now:i64)->Result<ControlReply> {
+        origin.validate()?;
+        ensure!(digest.len()==64 && digest.bytes().all(|b|b.is_ascii_hexdigit()),"invalid Discord message digest");
+        if let Some(reason)=refusal {ensure!(reason.len()<=128 && reason.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_".contains(&b)),"invalid bounded readopt refusal");}
+        ensure!(content.chars().count()<=1500,"Discord readopt response exceeds bound");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(prior)=replay(&tx,origin,digest)? {return Ok(prior);}
+        let admission:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_request WHERE request_id=?1)",[origin.request_id()],|r|r.get(0))?;
+        ensure!(!admission,"Discord message already belongs to admission");
+        let request_id=origin.request_id();
+        let label=format!("{}#{}",target["repository"].as_str().unwrap_or("unknown"),target["number"].as_u64().unwrap_or(0));
+        let response=ControlReply {workflow:label,accepted:refusal.is_none(),
+            reason:refusal.unwrap_or("owner-readopted").into(),reply:format!("{content} Request: {request_id}"),
+            nonce:format!("{:x}",Sha256::digest(request_id.as_bytes()))[..24].into(),request_id:request_id.clone()};
+        tx.execute("INSERT INTO discord_control_request(request_id,principal,origin,message_sha256,workflow,response,state,created_at,kind,target) VALUES(?1,?2,?3,?4,NULL,?5,'queued',?6,'readopt',?7)",
+            params![request_id,origin.principal(),serde_json::to_string(origin)?,digest,serde_json::to_string(&response)?,now,target.to_string()])?;
+        tx.commit()?;Ok(response)
+    }
+}
+
 pub(super) fn replay(conn:&Connection,origin:&DiscordOrigin,digest:&str)->Result<Option<ControlReply>> {
     origin.validate()?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_control_request')",[],|r|r.get(0))?;
