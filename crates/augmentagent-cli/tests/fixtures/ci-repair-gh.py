@@ -16,7 +16,7 @@ with (fixture / 'calls.jsonl').open('a') as log:
 if args[:2] == ['repo', 'view']:
     print(repository); sys.exit(0)
 if args[:2] == ['pr', 'checks']:
-    print(json.dumps([{'name': 'privacy', 'state': 'SUCCESS'}, {'name': 'node-release', 'state': 'FAILURE'}])); sys.exit(0)
+    print(json.dumps([{'name': 'privacy', 'state': 'SUCCESS'}, {'name': 'node-release', 'state': state.get('required_state', 'FAILURE')}])); sys.exit(0)
 if args and args[0] == 'run':
     if state.get('missing_logs'): sys.exit(1)
     print(state['log']); sys.exit(0)
@@ -38,6 +38,7 @@ elif '/contents/' in endpoint:
     value = {'type': 'file', 'encoding': 'base64', 'content': base64.b64encode((root / path).read_bytes()).decode()}
 elif '/actions/runs?' in endpoint:
     runs = [{'id': 100 + i, 'run_attempt': 1, 'head_sha': head, 'event': 'pull_request', 'path': path, 'repository': {'full_name': repository}, 'pull_requests': [{'number': 1669}]} for i, path in enumerate(paths)]
+    if state.get('pending'): runs = []
     value = {'total_count': len(runs), 'workflow_runs': runs}
 elif '/actions/runs/' in endpoint and '/jobs?' in endpoint:
     run = int(endpoint.split('/actions/runs/')[1].split('/')[0]); path = paths[run - 100]
