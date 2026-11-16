@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_review_custody.rs"]
+mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -36,10 +38,15 @@ pub(crate) mod resource_refusal;
 pub(crate) mod progress;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
+#[path = "autoship_deployment_progress.rs"]
+pub(crate) mod deployment_progress;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_integration.rs"]
+mod integration;
+pub(crate) use integration::IntegrationReason;
 #[path = "autoship_review_recovery.rs"]
 mod review_recovery;
 pub(crate) use review_recovery::ReviewRecoveryReadiness;
@@ -79,6 +86,7 @@ pub use verification_retry::VerificationDomain;
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
 pub use merge_escalation::UnresolvedMergeHold;
+pub use deployment_progress::{DeploymentOutcome, DeploymentReceipt};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,6 +778,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
+            CREATE TABLE IF NOT EXISTS integration_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS integration_recovery (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,
