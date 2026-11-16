@@ -2,7 +2,7 @@
 use super::*;
 use augmentagent_channel_core::autoship_workflow_contract::WorkflowOutcome;
 
-async fn held(lane: augmentagent_channel_core::LaneAvailability, reason: &str, expected: WorkflowOutcome) {
+async fn held(lane: augmentagent_channel_core::LaneAvailability, reason: &str, expected: WorkflowOutcome, stage: Stage, deadline: Option<i64>) {
     let repo = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir_in("/tmp").unwrap();
     for args in [vec!["init", "-q"], vec!["-c", "user.name=Fixture", "-c",
@@ -20,6 +20,8 @@ async fn held(lane: augmentagent_channel_core::LaneAvailability, reason: &str, e
         source_issue: Some(7), pr: None, branch: "fixture", contract: "owner criteria",
         environment: "fixture",
     }, millis()).await.unwrap().unwrap();
+    guard.checkpoint(stage, "provider_boundary", "build", 0, &["original-evidence".into()]).await.unwrap();
+    let before = guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
     guard.hold_provider(&lane).await.unwrap();
     let id = guard.id().to_owned();
     guard.finish().unwrap();
@@ -28,6 +30,14 @@ async fn held(lane: augmentagent_channel_core::LaneAvailability, reason: &str, e
     let (events, complete) = store.latest_workflow_events(millis()).unwrap();
     assert!(complete);
     let exported = events.iter().find(|event| event.workflow_id == id).unwrap();
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.checkpoint.stage, stage);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(activity.last_meaningful_progress_at, 0);
+    assert_eq!(after.checkpoint.next.action, if expected == WorkflowOutcome::QuotaWait { "await_quota" } else { "await_provider_configuration" });
+    if let Some(deadline) = deadline { assert_eq!(after.checkpoint.next.eligible_at_ms, deadline); }
     assert_eq!(activity.reason_code, reason);
     assert_eq!(exported.reason_code, reason);
     assert_eq!(activity.outcome, expected, "native hold was collapsed into a generic dependency wait");
@@ -53,11 +63,23 @@ async fn held(lane: augmentagent_channel_core::LaneAvailability, reason: &str, e
 #[tokio::test]
 async fn native_all_latched_provider_hold_persists_quota_wait() {
     held(augmentagent_channel_core::LaneAvailability::AllLatched(vec![("claude".into(), None)]),
-        "provider_quota_wait", WorkflowOutcome::QuotaWait).await;
+        "provider_quota_wait", WorkflowOutcome::QuotaWait, Stage::Scope, None).await;
 }
 
 #[tokio::test]
 async fn native_unconfigured_provider_hold_persists_configuration_fault() {
-    held(augmentagent_channel_core::LaneAvailability::NoEligibleProvider,
-        "provider_configuration_unavailable", WorkflowOutcome::ConfigurationFault).await;
+    for stage in [Stage::Scope, Stage::Build] {
+        held(augmentagent_channel_core::LaneAvailability::NoEligibleProvider,
+            "provider_configuration_unavailable", WorkflowOutcome::ConfigurationFault, stage, None).await;
+    }
+}
+
+#[tokio::test]
+async fn build_time_quota_hold_keeps_stage_evidence_and_earliest_known_lane_reset() {
+    let first = millis()+900_000;
+    let second = first+600_000;
+    held(augmentagent_channel_core::LaneAvailability::AllLatched(vec![
+        ("claude".into(), chrono::DateTime::from_timestamp_millis(second)),
+        ("codex".into(), chrono::DateTime::from_timestamp_millis(first)),
+    ]), "provider_quota_wait", WorkflowOutcome::QuotaWait, Stage::Build, Some(first)).await;
 }

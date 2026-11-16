@@ -13,7 +13,7 @@ pub(super) fn classify(cp: &Checkpoint, paused: bool, waiting: bool) -> Workflow
         "retry_verification" | "await_verifier_infrastructure_recovery" | "await_inactivity_retry" =>
             WorkflowOutcome::RetryableInfrastructure,
         _ if matches!(cp.next.reason.as_str(),
-            "acceptance_contract_invalid" | "readiness_assessment_invalid") =>
+            "acceptance_contract_invalid" | "readiness_assessment_invalid" | "provider_configuration_unavailable") =>
             WorkflowOutcome::ConfigurationFault,
         _ if matches!(cp.next.reason.as_str(),
             "ci_failed" | "review_changes_requested" | "review_failed") =>

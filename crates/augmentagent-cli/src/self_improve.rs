@@ -8563,7 +8563,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
                 let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
                 info!(issue = issue.number, "auto-PR held: {why}");
-                workflow_guard.hold_provider(&reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic)).await?;
+                workflow_guard.hold_provider(&augmentagent_channel_core::LaneAvailability::AllLatched(latched)).await?;
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::held(why));
@@ -8571,7 +8571,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             augmentagent_channel_core::LaneAvailability::NoEligibleProvider => {
                 // No configured provider can serve this preset. Waiting cannot
                 // fix that configuration fault.
-                workflow_guard.hold_provider(&reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic)).await?;
+                workflow_guard.hold_provider(&augmentagent_channel_core::LaneAvailability::NoEligibleProvider).await?;
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 bail!(
@@ -8715,9 +8715,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic);
                 if let Some(report) = build_failure_hold(&err, &lane) {
                     info!(issue = issue.number, "auto-PR held: {report}");
+                    workflow_guard.hold_provider(&lane).await?;
                     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(report);
+                }
+                if matches!(lane, augmentagent_channel_core::LaneAvailability::NoEligibleProvider) {
+                    workflow_guard.hold_provider(&lane).await?;
                 }
             }
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
