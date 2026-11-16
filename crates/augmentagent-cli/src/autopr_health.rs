@@ -158,13 +158,27 @@ pub struct HealthInputs {
 pub struct WorkflowProgress {
     pub events: Vec<augmentagent_channel_core::autoship_workflow_contract::WorkflowEvent>,
     pub inventory_complete: bool,
+    /// S's persisted stage activity (effective inactivity deadline) for each
+    /// workflow above that has one. Missing legacy activity is simply absent.
+    pub activities: Vec<(String, crate::autoship_workflow::activity::Activity)>,
+}
+
+impl WorkflowProgress {
+    /// A complete, empty inventory: the known idle state.
+    pub fn default_complete() -> Self { Self { inventory_complete: true, ..Default::default() } }
 }
 
 /// Read S's latest workflow events from the worker's store, read-only.
 pub fn workflow_progress_at(path: &Path, now_ms: i64) -> Option<WorkflowProgress> {
     let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
     let (events, inventory_complete) = store.latest_workflow_events(now_ms).ok()?;
-    Some(WorkflowProgress { events, inventory_complete })
+    let mut activities = Vec::new();
+    for event in &events {
+        if let Some(activity) = store.activity_status(&event.workflow_id).ok()? {
+            activities.push((event.workflow_id.clone(), activity));
+        }
+    }
+    Some(WorkflowProgress { events, inventory_complete, activities })
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -562,6 +576,30 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             detail: format!("Workflow inventory is incomplete: {} workflow(s) have durable runtime events, but at least one nonterminal workflow has none (legacy or unprojected). Idleness and stalls cannot be proven for it.", p.events.len()),
             fix: "Inspect nonterminal workflows with `augmentagent autopr status`; their next real transition records an event.".into() }),
         Some(_) => {}
+    }
+
+    // #1708 — S's persisted per-stage inactivity deadline is the primary
+    // stall signal. Waits suspend S's clock (no deadline), heartbeats never
+    // extend it; health only reads the effective persisted threshold.
+    if let Some(progress) = &i.workflow_progress {
+        let late: Vec<String> = progress.activities.iter()
+            .filter(|(_, a)| a.expired(now.timestamp_millis()))
+            .map(|(id, a)| {
+                let stage = serde_json::to_value(a.stage).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                let budget = a.inactivity_budget_ms.map_or("unknown".into(), |ms| format!("{} min", ms / 60_000));
+                let deadline = a.inactivity_deadline_at.and_then(DateTime::from_timestamp_millis)
+                    .map_or("unknown".into(), |at| at.format("%Y-%m-%d %H:%MZ").to_string());
+                format!("{id} ({stage}: {budget} budget passed at {deadline}; reason {})", a.reason_code)
+            })
+            .collect();
+        if !late.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "stage-inactivity-deadline",
+                detail: format!("{} workflow(s) passed their stage inactivity deadline: {}", late.len(), late.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
+                fix: "Inspect with `augmentagent autopr status --workflow ID`. The stage made no meaningful progress within its budget; heartbeats do not extend it.".into(),
+            });
+        }
     }
 
     // #1708 — liveness is S's durable meaningful progress, not heartbeats or
@@ -1174,13 +1212,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     // of the rotated one keeps the last hours in view.
     let log = crate::log_rotate::tail_with_rotated(&dir.join("stderr.log"), 4 * 1024 * 1024)
         .unwrap_or_default();
-    let gate_dir = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".cache/augmentagent-gate-target"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+    let gate_dir = crate::disk::gate_target_dir();
 
     let deploy = deploy_state(repo_root, &dir);
     let (running_binary, unit_dropins) = running_binary(repo_root);
@@ -1627,7 +1659,7 @@ mod tests {
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
             gave_up_by_reason: None,
-            workflow_progress: Some(WorkflowProgress { events: vec![], inventory_complete: true }),
+            workflow_progress: Some(WorkflowProgress::default_complete()),
             workflow_progress_error: None,
         }
     }

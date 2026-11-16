@@ -129,3 +129,28 @@ fn unknown_inventory_is_never_reported_healthy_and_complete_empty_is_idle() {
     assert!(findings.iter().any(|f| f.code == "workflow-inventory-unknown"), "{findings:?}");
     assert!(render_text(&findings, &unreadable).contains("workflows: unknown (inventory unreadable)"));
 }
+
+/// Slice 3: S persists a per-stage inactivity deadline (verify: 90 min).
+/// Heartbeats cannot extend it, and once it passes health alerts with the
+/// stage, its budget and the persisted reason.
+#[test]
+fn passed_stage_inactivity_deadline_alerts_and_heartbeats_cannot_extend_it() {
+    let t0 = 1_800_000_000_000;
+    let mut f = verifying_workflow(t0);
+    for minutes in [30, 60, 90] {
+        f.store.heartbeat(&f.lease, t0 + minutes * 60_000, 24 * HOUR_MS).unwrap();
+    }
+    let before = t0 + 80 * 60_000;
+    let early = workflow_progress_at(&f.path, before).unwrap();
+    let (_, activity) = early.activities.iter().find(|(id, _)| id == "owner/repo#7").expect("S activity for the workflow");
+    assert_eq!(activity.inactivity_budget_ms, Some(5_400_000), "fixture: S verify budget");
+    assert!(!analyze(&inputs(before, Some(early)), &Thresholds::default()).iter().any(|f| f.code == "stage-inactivity-deadline"));
+
+    let now = t0 + 2 * HOUR_MS;
+    let progress = workflow_progress_at(&f.path, now).unwrap();
+    let findings = analyze(&inputs(now, Some(progress)), &Thresholds::default());
+    let late = findings.iter().find(|f| f.code == "stage-inactivity-deadline")
+        .unwrap_or_else(|| panic!("a passed S inactivity deadline must alert: {findings:?}"));
+    assert_eq!(late.severity, Severity::Alert);
+    assert!(late.detail.contains("owner/repo#7") && late.detail.contains("verify") && late.detail.contains("90 min"), "{}", late.detail);
+}
