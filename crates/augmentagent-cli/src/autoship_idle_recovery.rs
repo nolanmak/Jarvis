@@ -44,7 +44,7 @@ impl WorkflowStore {
             workflow_id: lease.workflow.clone(),
             lease_generation: lease.generation,
             stage: cp.stage,
-            binding: cp.binding,
+            binding: cp.binding.clone(),
             deadline_at_ms: activity
                 .inactivity_deadline_at
                 .context("expired activity lacks deadline")?,
@@ -52,12 +52,32 @@ impl WorkflowStore {
             last_meaningful_progress_at_ms: activity.last_meaningful_progress_at,
             policy: activity.policy,
         };
+        let mut waiting = cp.clone();
+        waiting.next = NextAction {
+            reason: "inactivity_expired".into(),
+            action: "await_inactivity_teardown".into(),
+            eligible_at_ms: now
+                .checked_add(300_000)
+                .context("teardown observation time overflow")?,
+        };
+        tx.execute(
+            "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+            params![lease.workflow, serde_json::to_string(&waiting)?],
+        )?;
         event(
             &tx,
             &lease.workflow,
             lease.generation,
             "inactivity_recovery_requested",
             &serde_json::to_string(&request)?,
+            now,
+        )?;
+        event(
+            &tx,
+            &lease.workflow,
+            lease.generation,
+            "checkpoint",
+            &serde_json::to_string(&waiting)?,
             now,
         )?;
         tx.commit()?;
@@ -118,10 +138,6 @@ impl WorkflowStore {
             |r| r.get(0),
         )?;
         let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
-        ensure!(
-            !matches!(checkpoint.stage, Stage::Merged | Stage::Retired),
-            "terminal workflow cannot schedule inactivity retry"
-        );
         // Retry debt follows the failed dependency, not a new head/heartbeat.
         let dependency_sha256 = format!(
             "{:x}",
@@ -150,13 +166,15 @@ impl WorkflowStore {
         let delay = 300_000_i64
             .saturating_mul(1_i64 << (failures - 1).min(4))
             .min(3_600_000);
-        checkpoint.next = NextAction {
-            reason: "inactivity_expired".into(),
-            action: "await_inactivity_retry".into(),
-            eligible_at_ms: now
-                .checked_add(delay)
-                .context("inactivity retry time overflow")?,
-        };
+        if !independent_wait(&checkpoint, now) {
+            checkpoint.next = NextAction {
+                reason: "inactivity_expired".into(),
+                action: "await_inactivity_retry".into(),
+                eligible_at_ms: now
+                    .checked_add(delay)
+                    .context("inactivity retry time overflow")?,
+            };
+        }
         tx.execute(
             "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
             params![lease.workflow, serde_json::to_string(&checkpoint)?],
@@ -189,6 +207,36 @@ pub(super) fn require_dispatch(conn: &Connection, workflow: &str) -> Result<()> 
     ensure!(
         read(conn, workflow)?.is_none(),
         "inactivity_recovery_pending: await_descendant_teardown"
+    );
+    Ok(())
+}
+
+/// Cleanup may replace active work with a retry, never erase an independent
+/// input/CI/quota/capacity/owner hold or shorten its eligibility.
+pub(super) fn independent_wait(cp: &Checkpoint, now: i64) -> bool {
+    matches!(cp.stage, Stage::Held | Stage::Merged | Stage::Retired)
+        || (cp.next.action != "await_inactivity_teardown"
+            && (cp.next.action.starts_with("await_")
+                || matches!(
+                    cp.next.action.as_str(),
+                    "retry_verification" | "reconcile_main"
+                )
+                || cp.next.eligible_at_ms > now))
+}
+/// A successor that never acquired native/model custody may release only its
+/// observation lease. The original request and native owner remain fenced.
+pub(super) fn require_release(conn: &Connection, lease: &Lease) -> Result<()> {
+    let Some(request) = read(conn, &lease.workflow)? else {
+        return Ok(());
+    };
+    ensure!(
+        lease.generation > request.lease_generation,
+        "pending native recovery cannot release custody before teardown"
+    );
+    let paid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2) OR EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='native_model_admitted')",params![lease.workflow,lease.generation],|row|row.get(0))?;
+    ensure!(
+        !paid,
+        "native/model owner cannot release pending teardown as an observer"
     );
     Ok(())
 }
@@ -243,7 +291,9 @@ mod tests {
             Some(request.clone())
         );
         let after = store.snapshot(&lease.workflow).unwrap().unwrap();
-        assert_eq!(after.checkpoint, before.checkpoint);
+        assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+        assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
         assert_eq!(after.generation, before.generation);
         store.validate_lease(&lease, &binding, 900_006).unwrap();
         assert_eq!(after.model_calls, before.model_calls);
@@ -589,5 +639,136 @@ mod tests {
             .complete_idle_recovery(&successor, &request, &recovered, now + 3)
             .unwrap());
         store.release(&successor, now + 4).unwrap();
+    }
+    #[test]
+    fn request_preserves_work_but_exports_the_actual_teardown_next_action() {
+        let (_root, mut store, lease, binding) = setup();
+        store
+            .request_idle_recovery(&lease, 900_003)
+            .unwrap()
+            .unwrap();
+        let checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        assert_eq!(checkpoint.binding, binding);
+        assert_eq!(checkpoint.stage, Stage::Scope);
+        assert_eq!(checkpoint.next.reason, "inactivity_expired");
+        assert_eq!(checkpoint.next.action, "await_inactivity_teardown");
+    }
+    #[tokio::test]
+    async fn completed_terminal_work_is_not_revived_by_teardown_completion() {
+        let (root, mut store, lease, _) = setup();
+        let audit = proof_logger(root.path(), &lease, "terminal");
+        store
+            .register_native_owner(&lease, audit.path().to_str().unwrap(), 5)
+            .unwrap();
+        let request = store
+            .request_idle_recovery(&lease, 900_003)
+            .unwrap()
+            .unwrap();
+        let mut cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Retired;
+        cp.next = NextAction {
+            reason: "superseded".into(),
+            action: "none".into(),
+            eligible_at_ms: 0,
+        };
+        store.checkpoint(&lease, &cp, 900_004).unwrap();
+        let owner = audit.native_runtime_owner().unwrap().unwrap();
+        audit.cancel_owned_runs(&owner).unwrap();
+        let proof = audit.owned_runs_quiescent(&owner).await.unwrap();
+        assert!(
+            store
+                .complete_idle_recovery(&lease, &request, &proof, 900_005)
+                .unwrap(),
+            "terminal cleanup could not settle pending recovery"
+        );
+        assert_eq!(
+            store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,
+            cp
+        );
+        store.release(&lease, 900_006).unwrap();
+    }
+    #[tokio::test]
+    async fn teardown_completion_preserves_independent_input_change_hold() {
+        let (root, mut store, lease, _) = setup();
+        let audit = proof_logger(root.path(), &lease, "input-hold");
+        store
+            .register_native_owner(&lease, audit.path().to_str().unwrap(), 5)
+            .unwrap();
+        let request = store
+            .request_idle_recovery(&lease, 900_003)
+            .unwrap()
+            .unwrap();
+        let mut cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        cp.next = NextAction {
+            reason: "acceptance_contract_invalid".into(),
+            action: "await_acceptance_input_change".into(),
+            eligible_at_ms: 0,
+        };
+        store.checkpoint(&lease, &cp, 900_004).unwrap();
+        let owner = audit.native_runtime_owner().unwrap().unwrap();
+        audit.cancel_owned_runs(&owner).unwrap();
+        let proof = audit.owned_runs_quiescent(&owner).await.unwrap();
+        store
+            .complete_idle_recovery(&lease, &request, &proof, 900_005)
+            .unwrap();
+        assert_eq!(
+            store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,
+            cp,
+            "teardown completion erased an independent input-change hold"
+        );
+    }
+    #[tokio::test]
+    async fn interrupted_active_repair_still_gets_idle_backoff() {
+        let (root, mut store, lease, _) = setup();
+        let audit = proof_logger(root.path(), &lease, "active-repair");
+        store
+            .register_native_owner(&lease, audit.path().to_str().unwrap(), 5)
+            .unwrap();
+        let request = store
+            .request_idle_recovery(&lease, 900_003)
+            .unwrap()
+            .unwrap();
+        let mut cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        cp.next = NextAction {
+            reason: "native_call_interrupted".into(),
+            action: "repair".into(),
+            eligible_at_ms: 0,
+        };
+        store.checkpoint(&lease, &cp, 900_004).unwrap();
+        let owner = audit.native_runtime_owner().unwrap().unwrap();
+        audit.cancel_owned_runs(&owner).unwrap();
+        let proof = audit.owned_runs_quiescent(&owner).await.unwrap();
+        store
+            .complete_idle_recovery(&lease, &request, &proof, 900_005)
+            .unwrap();
+        let cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        assert_eq!(
+            cp.next.action, "await_inactivity_retry",
+            "active repair bypassed idle recovery backoff"
+        );
+        assert_eq!(cp.next.eligible_at_ms, 1_200_005);
+    }
+    #[test]
+    fn unpaid_successor_observation_can_release_without_clearing_original_custody() {
+        let (_root, mut store, old, _) = setup();
+        store.register_native_owner(&old, "/audit/old", 5).unwrap();
+        let request = store.request_idle_recovery(&old, 900_003).unwrap().unwrap();
+        let observer = store
+            .claim_reconciliation(&old.workflow, "merge-observer", 20_000_003, 1000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store.release(&observer, 20_000_004).is_ok(),
+            "unpaid reconciliation was blocked behind predecessor teardown"
+        );
+        assert_eq!(
+            store.idle_recovery_request(&old.workflow).unwrap(),
+            Some(request)
+        );
+        assert_eq!(
+            store.snapshot(&old.workflow).unwrap().unwrap().model_calls,
+            0
+        );
+        assert_eq!(store.merge_allowance(20_000_005, 5).unwrap().available, 5);
     }
 }
