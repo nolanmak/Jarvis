@@ -800,6 +800,12 @@ impl WorkflowStore {
                 sequence INTEGER NOT NULL, nonce TEXT NOT NULL, content TEXT NOT NULL,
                 state TEXT NOT NULL, dispatched_at INTEGER NOT NULL, message TEXT,
                 confirmed_at INTEGER, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_status (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                message TEXT NOT NULL, edited_at INTEGER NOT NULL, PRIMARY KEY(workflow,bot,owner,channel));
+            CREATE TABLE IF NOT EXISTS workflow_progress_edit (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY(workflow,bot,owner,channel,sequence));
             CREATE TABLE IF NOT EXISTS workflow_progress_retry (
                 workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 sequence INTEGER NOT NULL, attempts INTEGER NOT NULL, eligible_at INTEGER NOT NULL,
