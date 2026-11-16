@@ -12,7 +12,9 @@ if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
   case "$cache_home" in /*) ;; *) cache_home="$HOME/.cache" ;; esac
   default_parent="$cache_home/augmentagent-session-targets"
-  if [ -d /mnt/build ] && [ -w /mnt/build ]; then
+  if [ -n "${AUGMENTAGENT_BUILD_VOLUME:-}" ]; then
+    default_parent="$AUGMENTAGENT_BUILD_VOLUME/augmentagent-session-targets"
+  elif [ -d /mnt/build ] && [ -w /mnt/build ]; then
     default_parent=/mnt/build/augmentagent-session-targets
   fi
   parent="${AUGMENTAGENT_BUILD_PARENT:-$default_parent}"
