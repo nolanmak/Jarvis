@@ -42,6 +42,8 @@ mod milestone;
 pub(crate) mod discord_ingress;
 #[path = "autoship_integration.rs"]
 mod integration;
+#[path = "autoship_integration_source.rs"]
+mod integration_source;
 pub(crate) use integration::IntegrationReason;
 #[path = "autoship_review_recovery.rs"]
 mod review_recovery;
@@ -776,6 +778,8 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS integration_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS integration_publication_source (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), head TEXT NOT NULL, after_push INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS integration_recovery (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
