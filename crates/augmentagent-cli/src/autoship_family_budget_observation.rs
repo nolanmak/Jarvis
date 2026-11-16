@@ -131,7 +131,7 @@ impl Observation {
     pub(crate) fn reason_code(&self) -> Option<&'static str> {
         self.blockers.first().map(|b| b.reason_code.as_str())
     }
-    fn block(&mut self, reason: Reason) {
+    pub(super) fn block(&mut self, reason: Reason) {
         self.exhausted_or_block(reason, None, None, None, None);
     }
     fn exhausted_or_block(

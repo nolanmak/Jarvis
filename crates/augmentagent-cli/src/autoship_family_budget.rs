@@ -159,24 +159,7 @@ pub(super) fn require_new_admission(
         "family_execution_scope_unknown"
     );
     ensure!(native, "family_native_attribution_required");
-    if let Intent::Delegated { family, .. } = &scope.intent {
-        let root: String = tx.query_row(
-            "SELECT root_workflow FROM workflow_family_budget WHERE family=?1",
-            [family],
-            |r| r.get(0),
-        )?;
-        // A known active pause is more useful than the stale-frame reason it
-        // also creates. Resuming still requires a newly verified generation.
-        ensure!(
-            root == lease.workflow || !owner_control::read(tx, &root)?.is_some_and(|c| c.paused),
-            "owner_paused"
-        );
-        ensure!(
-            scope.root_control_revision == Some(revision(tx, &root)?),
-            "family_execution_scope_unknown"
-        );
-    }
-    let status = observe(tx, &lease.workflow, &scope.intent, incoming)?;
+    let status = observe_scope(tx, &lease.workflow, &scope, incoming)?;
     if !status.ready() {
         return Err(AdmissionRefused {
             observation: status,
@@ -184,4 +167,22 @@ pub(super) fn require_new_admission(
         .into());
     }
     Ok(Some(format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))))
+}
+
+/// A decoded funding frame can be observed without granting a lease or charge.
+/// Keep ancestor control revision diagnostics identical at selection/admission.
+fn observe_scope(conn: &Connection, workflow: &str, scope: &Scope, incoming: u64) -> Result<Observation> {
+    let mut status = observe(conn, workflow, &scope.intent, incoming)?;
+    if let Intent::Delegated { family, .. } = &scope.intent {
+        let root: Option<String> = conn.query_row(
+            "SELECT root_workflow FROM workflow_family_budget WHERE family=?1",
+            [family], |row| row.get(0)).optional()?;
+        match root {
+            Some(root) if scope.root_control_revision != Some(revision(conn, &root)?) =>
+                status.block(observation::Reason::FamilyExecutionScopeUnknown),
+            None => status.block(observation::Reason::FamilyAuthorityUnknown),
+            _ => {},
+        }
+    }
+    Ok(status)
 }
