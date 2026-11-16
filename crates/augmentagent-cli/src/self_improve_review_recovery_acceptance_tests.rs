@@ -61,3 +61,45 @@ pub(crate) fn binding_ruling_finishes_without_unanimity(
         "old final ruling approved a new head"
     );
 }
+
+#[test]
+fn isolated_claude_capacity_survives_both_writer_brands() {
+    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    let selected = select_session_isolated_reviewer(
+        &[Codex, Claude],
+        Ok(Some(vec![Codex, Claude])),
+        |provider| {
+            if provider == Claude {
+                ReviewerStatus::Ready
+            } else {
+                ReviewerStatus::NotConfigured("scripted Codex outage".into())
+            }
+        },
+    );
+    assert_eq!(
+        selected,
+        Ok(Claude),
+        "isolated native capacity was permanently exhausted by two writer brand names"
+    );
+}
+#[test]
+fn isolated_review_reports_recoverable_capacity_after_both_brands_write() {
+    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    let missing =
+        select_session_isolated_reviewer(&[Codex, Claude], Ok(Some(vec![Codex, Claude])), |_| {
+            ReviewerStatus::NotConfigured("scripted outage".into())
+        });
+    assert!(
+        matches!(missing, Err(ReviewUnavailable::NoCapacity { .. })),
+        "provider recovery was mislabeled permanent writer exhaustion: {missing:?}"
+    );
+    let reset = chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap();
+    let latched =
+        select_session_isolated_reviewer(&[Codex, Claude], Ok(Some(vec![Codex, Claude])), |_| {
+            ReviewerStatus::Latched(Some(reset))
+        });
+    assert!(
+        matches!(latched, Err(ReviewUnavailable::Latched { .. })),
+        "cooldown cannot wake a permanent writer-exhaustion verdict: {latched:?}"
+    );
+}

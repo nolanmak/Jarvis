@@ -153,6 +153,14 @@ fn protected_writer_histories_cannot_approve_as_fresh_reviewers() {
         review_authority_with_origin(&binding, &[], &passes, None, &origin).unwrap(),
         MergeAuthority::IndependentApproval
     );
+    let mut fresh_claude = passes.clone();
+    for pass in &mut fresh_claude {
+        pass.actor.provider = "claude".into();
+    }
+    assert_eq!(
+        review_authority_with_origin(&binding, &[], &fresh_claude, None, &origin).unwrap(),
+        MergeAuthority::IndependentApproval
+    );
     for (provider, id) in [
         ("codex", "codex-writer"),
         ("claude", "claude-writer"),
