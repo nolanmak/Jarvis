@@ -126,6 +126,11 @@ mod alignment;
 mod push_destination;
 #[path = "self_improve_publication.rs"]
 mod publication;
+#[cfg(test)]
+#[path="self_improve_review_recovery_acceptance_tests.rs"]
+pub(crate) mod review_recovery_acceptance_tests;
+#[path="self_improve_review_capacity.rs"]
+mod review_capacity;
 #[path = "self_improve_review.rs"]
 mod aligned_review;
 #[path = "self_improve_review_canary.rs"]
@@ -4505,49 +4510,18 @@ fn select_reviewer(
     if candidates.is_empty() {
         return Err(ReviewUnavailable::AllReviewersBuiltIt);
     }
-    let mut latched = Vec::new();
-    let mut missing = Vec::new();
-    for candidate in &candidates {
-        match status(*candidate) {
-            ReviewerStatus::Ready => return Ok(*candidate),
-            ReviewerStatus::Latched(until) => latched.push((candidate.name().to_string(), until)),
-            ReviewerStatus::NotConfigured(why) => missing.push(format!("{}: {why}", candidate.name())),
-        }
-    }
-    // A latch names when the draft can move again, so it outranks a reviewer
-    // that is merely not set up: waiting fixes the first, not the second.
-    if latched.is_empty() {
-        Err(ReviewUnavailable::NoCapacity {
-            reviewers: candidates,
-            detail: missing.join("; "),
-        })
-    } else {
-        Err(ReviewUnavailable::Latched { until: latched })
-    }
+    review_capacity::available(candidates,status)
 }
 
 /// Provider diversity is preferred, while a protected fresh-session origin
-/// permits native Codex to review work whose provider history includes Codex.
+/// permits admitted native sessions to review work by the same provider family.
 /// This selects capacity only; approval still requires the controller receipt.
 fn select_session_isolated_reviewer(
     pool: &[augmentagent_channel_core::ProviderKind],
     authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
     status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
 ) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
-    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
-    let authors = match authors {
-        Ok(Some(authors)) if !authors.is_empty() => authors,
-        Ok(_) => return Err(ReviewUnavailable::ProvenanceUnknown),
-        Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
-    };
-    let native: Vec<_> = pool.iter().copied().filter(|provider| matches!(provider, Claude | Codex)).collect();
-    match select_reviewer(&native, Ok(Some(authors)), &status) {
-        Ok(provider) => Ok(provider),
-        Err(prior) => {
-            if native.contains(&Codex) && matches!(status(Codex), ReviewerStatus::Ready) { Ok(Codex) }
-            else { Err(prior) }
-        }
-    }
+    review_capacity::isolated(pool,authors,status)
 }
 
 /// Select only providers of `pool` outside every recorded builder attempt.

@@ -1693,6 +1693,12 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) fn require_independent_native_session(&self,provider:&str,session:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .require_independent_native_session(provider,session)
+    }
+
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
