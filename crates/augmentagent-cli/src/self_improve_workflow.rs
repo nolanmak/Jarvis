@@ -3,6 +3,8 @@
 use super::*;
 #[path = "self_improve_stage_activity.rs"]
 mod stage_activity;
+#[path = "self_improve_family_dispatch_control.rs"]
+mod family_dispatch_control;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
 #[cfg(test)]
@@ -1168,11 +1170,12 @@ impl WorkflowGuard {
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         let dispatch_identity=self.checkout_identity.clone();
+        let dispatch_family=self.family_budget_wait.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
             checkout_identity::validate(&dispatch_identity)?;
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
-            store.validate_dispatch(&dispatch_lease,&binding,millis())?;
+            family_dispatch_control::validate_native(&mut store,&dispatch_lease,&binding,&dispatch_family)?;
             semantic_preparation_source(&mut store,&dispatch_lease,&dispatch_root,&dispatch_repository)?;
             Ok(())
         }))?;
@@ -1571,6 +1574,11 @@ impl WorkflowGuard {
         checkout_identity::validate(&self.checkout_identity)
     }
 
+    fn validate_mutation_dispatch(&self)->Result<()> {
+        self.validate_before_side_effect()?;
+        family_dispatch_control::validate_mutation(self)
+    }
+
     // A completed remote mutation must remain recordable if the checkout was
     // replaced while its RPC was in flight. Preserve the old lease/audit gate.
     fn validate_control_state(&self) -> Result<()> {
@@ -1585,13 +1593,13 @@ impl WorkflowGuard {
     /// New notes and ready transitions must honor controls accepted after earlier reads or
     /// Push dispatch. Completion receipts use the weaker lease/binding guard.
     pub(super) fn validate_note_dispatch(&self)->Result<()> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
             .require_owner_dispatch(self.id())
     }
 
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         let operation = self
             .store
             .lock()
@@ -1605,7 +1613,7 @@ impl WorkflowGuard {
     }
 
     fn bound_push_intent(&self,destination:&str,reference:&str)->Result<Operation> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         let operation=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
             .begin_bound_push(&self.lease,&self.binding,destination,reference,millis())?;
         self.audit_event("operation_intent",serde_json::json!({"operation_id":operation.id,"operation_kind":operation.kind}))?;
@@ -1625,7 +1633,7 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.publication_dispatch(&operation.id)
     }
     pub(super) fn reserve_publication_dispatch(&self,operation:&Operation)->Result<i64> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.reserve_publication_dispatch(&self.lease,operation,millis())
     }
     pub(super) fn record_publication_identity(&self,operation:&Operation,pr:u64)->Result<()> {

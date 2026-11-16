@@ -733,6 +733,13 @@ fn independently_authorized_existing_child_keeps_its_original_authority() {
             .model_calls,
         2
     );
+    // Passive membership must not replace the original child's control grant.
+    store
+        .validate_family_control(&lease, &fixture_binding(), 22)
+        .unwrap();
+    store
+        .begin_operation(&lease, OperationKind::ReadyPr, &fixture_binding(), 22)
+        .unwrap();
 }
 
 #[test]
@@ -1270,4 +1277,85 @@ fn ordinary_independent_work_does_not_acquire_a_family_policy_requirement() {
             .model_calls,
         0
     );
+}
+
+#[test]
+fn family_control_fences_mutation_but_keeps_lease_bound_metadata_readable() {
+    let (_dir, mut store, root, child, _other, _intent) = funded(false);
+    let binding = fixture_binding();
+    store
+        .begin_operation(&child, OperationKind::Push, &binding, 18)
+        .unwrap();
+    store
+        .set_owner_pause(&root.workflow, "verified-test-owner", 0, true, 19)
+        .unwrap();
+    store
+        .validate_lease(&child, &binding, 20)
+        .expect("ancestor pause blocked metadata lease validation");
+    store
+        .validate_dispatch(&child, &binding, 20)
+        .expect("shared metadata recovery guard became a mutation gate");
+    let error = store
+        .begin_operation(&child, OperationKind::ReadyPr, &binding, 20)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("owner_paused"),
+        "wrong mutation refusal: {error:#}"
+    );
+    assert_eq!(store.pending_operations(&child.workflow).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        1
+    );
+}
+
+#[test]
+fn free_control_does_not_turn_unknown_spending_into_a_paid_grant() {
+    let (_dir, mut store, root, child, _other, intent) = funded(false);
+    store
+        .with_family_transaction(|tx| {
+            tx.execute(
+                "DELETE FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted'",
+                [&root.workflow],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let status = store
+        .family_budget_observation(&child.workflow, &intent, 1)
+        .unwrap();
+    assert!(!status.ready());
+    assert_eq!(status.model_admissions, None);
+    assert_eq!(status.reason_code(), Some("family_spend_unknown"));
+    store
+        .validate_family_control(&child, &fixture_binding(), 20)
+        .unwrap();
+    store
+        .begin_operation(&child, OperationKind::Push, &fixture_binding(), 20)
+        .unwrap();
+    let error = store
+        .charge_admitted_model(
+            &child,
+            "unknown-spend-still-not-a-grant",
+            21,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("family_spend_unknown"));
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        1
+    );
+    assert_eq!(store.merge_allowance(21, 5).unwrap().available, 5);
 }

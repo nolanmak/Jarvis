@@ -792,53 +792,87 @@ async fn verified_replacement_frame_recovers_unknown_context_without_inheriting_
 
 #[tokio::test]
 async fn ancestor_pause_fences_publication_before_any_model_refusal() {
-    let (_checkout,control,guard)=funded_guard(10).await;
-    guard.intent(durable::OperationKind::Push).expect("publication fixture was not ready before ancestor pause");
-    let mut store=WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
-    let before=store.snapshot(guard.id()).unwrap().unwrap();
-    store.set_owner_pause("owner/repo#1725","verified-test-owner",0,true,millis()).unwrap();
-    let error=guard.intent(durable::OperationKind::ReadyPr)
-        .expect_err("paused ancestor still allowed a fresh publication intent without another model call");
-    assert!(error.to_string().contains("owner_paused"),"unexpected fence: {error:#}");
-    let after=store.snapshot(guard.id()).unwrap().unwrap();
-    assert_eq!(after.model_calls,before.model_calls);
-    assert_eq!(after.progress_at_ms,before.progress_at_ms);
-    assert_eq!(after.checkpoint.next.action,"await_owner_resume");
-    assert_eq!(store.pending_operations(guard.id()).unwrap().len(),1);
+    let (_checkout, control, guard) = funded_guard(10).await;
+    guard
+        .intent(durable::OperationKind::Push)
+        .expect("publication fixture was not ready before ancestor pause");
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    store
+        .set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis())
+        .unwrap();
+    let error = guard.intent(durable::OperationKind::ReadyPr).expect_err(
+        "paused ancestor still allowed a fresh publication intent without another model call",
+    );
+    assert!(
+        error.to_string().contains("owner_paused"),
+        "unexpected fence: {error:#}"
+    );
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    assert_eq!(after.checkpoint.next.action, "await_owner_resume");
+    assert_eq!(store.pending_operations(guard.id()).unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn ancestor_pause_fences_the_installed_native_dispatch_observer_before_model_charge() {
-    let (_checkout,control,guard)=funded_guard(10).await;
-    guard.audit_logger().dispatch_allowed().expect("native dispatch fixture was not ready before ancestor pause");
-    let mut store=WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
-    let before=store.snapshot(guard.id()).unwrap().unwrap();
-    store.set_owner_pause("owner/repo#1725","verified-test-owner",0,true,millis()).unwrap();
-    let error=guard.audit_logger().dispatch_allowed()
+    let (_checkout, control, guard) = funded_guard(10).await;
+    guard
+        .audit_logger()
+        .dispatch_allowed()
+        .expect("native dispatch fixture was not ready before ancestor pause");
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    store
+        .set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis())
+        .unwrap();
+    let error = guard
+        .audit_logger()
+        .dispatch_allowed()
         .expect_err("paused ancestor passed the installed native dispatch observer");
-    assert!(error.to_string().contains("owner_paused"),"unexpected fence: {error:#}");
-    let after=store.snapshot(guard.id()).unwrap().unwrap();
-    assert_eq!(after.model_calls,before.model_calls);
-    assert_eq!(after.progress_at_ms,before.progress_at_ms);
-    assert_eq!(after.checkpoint.next.action,"await_owner_resume");
+    assert!(
+        error.to_string().contains("owner_paused"),
+        "unexpected fence: {error:#}"
+    );
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    assert_eq!(after.checkpoint.next.action, "await_owner_resume");
 }
 
 #[tokio::test]
 async fn compute_exhaustion_does_not_replace_the_free_publication_control_gate() {
-    let (_checkout,control,guard)=funded_guard(2).await;
-    guard.intent(durable::OperationKind::Push).expect("compute exhaustion blocked unpaid publication control");
-    guard.audit_logger().dispatch_allowed().expect("compute exhaustion blocked the control-only native preflight");
-    let store=WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
-    assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
-    assert_eq!(store.merge_allowance(millis(),5).unwrap().available,5);
-    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    let (_checkout, control, guard) = funded_guard(2).await;
+    guard
+        .intent(durable::OperationKind::Push)
+        .expect("compute exhaustion blocked unpaid publication control");
+    guard
+        .audit_logger()
+        .dispatch_allowed()
+        .expect("compute exhaustion blocked the control-only native preflight");
+    let store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().available, 5);
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_resource_exhausted"));
 }
 
 #[tokio::test]
 async fn compute_refusal_fences_installed_native_dispatch_even_when_control_is_ready() {
-    let (_checkout,_control,guard)=funded_guard(2).await;
-    guard.audit_logger().dispatch_allowed().expect("control-only dispatch fixture was not ready");
-    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
-    guard.audit_logger().dispatch_allowed().expect_err(
-        "the same controller admitted native dispatch after its paid call was held");
+    let (_checkout, _control, guard) = funded_guard(2).await;
+    guard
+        .audit_logger()
+        .dispatch_allowed()
+        .expect("control-only dispatch fixture was not ready");
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_resource_exhausted"));
+    guard
+        .audit_logger()
+        .dispatch_allowed()
+        .expect_err("the same controller admitted native dispatch after its paid call was held");
 }
