@@ -21718,3 +21718,7 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_ci_repair_tests.rs"]
+mod ci_repair_tests;
