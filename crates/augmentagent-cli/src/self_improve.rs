@@ -1922,7 +1922,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                         issue = candidate.issue,
                         "merge sweep: merged an already-approved draft"
                     );
-                    notify_review(&format!(
+                    notify_review_unless(sweep_lease.legacy_notice_suppressed(), &format!(
                         "✅ auto-PR merged (sweep): #{} for issue #{}",
                         candidate.pr, candidate.issue
                     ))
@@ -3983,6 +3983,15 @@ fn automerge_receipt_ok(gated: Option<&str>, independent_approved: bool, flag: O
 /// `AUGMENTAGENT_NOTIFY_SURFACES[_REVIEW]`. A failed delivery must never
 /// fail the run — the PR already exists; the router logs it.
 async fn notify_review(text: &str) {
+    notify_review_unless(false, text).await
+}
+
+/// #1714: one sink. Workflows routed through the durable progress outbox get
+/// their merge/review updates there; the legacy notice would duplicate them.
+async fn notify_review_unless(durable_route: bool, text: &str) {
+    if durable_route {
+        return;
+    }
     let _ = crate::notify::notify_owner(crate::notify::Notice::new(
         "self_improve",
         truncate(text, 1800),
@@ -7699,7 +7708,7 @@ async fn resume_draft_pr(
             }
             if !policy_allows {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                notify_review(&format!(
+                notify_review_unless(workflow.legacy_notice_suppressed(), &format!(
                     "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
                     issue.title
                 ))
@@ -7758,9 +7767,10 @@ async fn resume_draft_pr(
             }
             workflow.observe_remote(&merge_intent, &format!("github:pr:{pr}:merged:{}", reviewed_head), Some(pr))?;
             workflow.transition(Stage::Merged, "remote_merge_observed", "complete", 0).await?;
+            let legacy_quiet = workflow.legacy_notice_suppressed();
             workflow.finish()?;
             let _ = run("git", &["worktree", "remove", &worktree.to_string_lossy()], repo_root).await;
-            notify_review(&format!(
+            notify_review_unless(legacy_quiet, &format!(
                 "✅ resumed draft merged: {} — PR #{pr}",
                 issue.title
             ))
@@ -7800,7 +7810,7 @@ async fn resume_draft_pr(
                 label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
                 // Preserve this PR for the durable adjudication/recovery path.
             }
-            notify_review(&format!(
+            notify_review_unless(workflow.legacy_notice_suppressed(), &format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
                 issue.title
             ))
@@ -9898,7 +9908,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                  The resume lane keeps revising it — {pr_url}",reason.headline())).await? {
             return Ok(RunReport::held(format!("issue #{}: parked source note routing held",issue.number)));
         }
-        notify_review(&format!(
+        notify_review_unless(workflow_guard.legacy_notice_suppressed(), &format!(
             "📝 auto-PR parked as draft: {} — {pr_url}\n{}",
             issue.title,
             reason.headline()
@@ -9929,7 +9939,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     if !automerge {
         // Visibility (#851): drafts sat unseen for three days. Tell the owner.
-        notify_review(&format!(
+        notify_review_unless(workflow_guard.legacy_notice_suppressed(), &format!(
             "📝 auto-PR needs review: {} — {pr_url}\n{}",
             issue.title,
             truncate(&merge_note, 300)
@@ -10025,8 +10035,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     workflow_guard.observe_remote(&merge_intent, &format!("github:pr:{}:merged:{}", pr_number.unwrap(), published_head), pr_number)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Merged, "merge_observed", "complete", chrono::Utc::now().timestamp_millis()).await?;
+    let legacy_quiet = workflow_guard.legacy_notice_suppressed();
     workflow_guard.finish()?;
-    notify_review(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
+    notify_review_unless(legacy_quiet, &format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
