@@ -3871,6 +3871,81 @@ pub(super) fn persist_fixture_registration(
     write_manifest(control, &WorkflowManifest::from_prepared(source, prepared))
 }
 
+/// Test handoff fixtures supply observations measured by their trusted host
+/// harness. The production receipt/binding and private artifact writer still
+/// validate the exact registered command and source. No runtime/VM claim is made.
+#[cfg(test)]
+pub(super) fn register_observed_fixture(
+    root: &Path,
+    proposal: ContractProposal,
+    base: &str,
+    observations: &[Observation],
+) -> Result<PreparedAcceptance> {
+    let registration = RegisteredContract::register(
+        root,
+        proposal.contract.clone(),
+        base.into(),
+        environment_id(root)?,
+    )?;
+    ensure!(
+        observations.len() == proposal.contract.verifiers.len(),
+        "fixture observation count mismatch"
+    );
+    let binding = registration.binding(base)?;
+    let receipts = proposal
+        .contract
+        .verifiers
+        .iter()
+        .zip(observations)
+        .map(|(v, o)| registration.observe(root, &v.id, binding.clone(), o))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedAcceptance {
+        proposal,
+        baseline: BaselineEvidence {
+            registration,
+            receipts,
+        },
+    })
+}
+#[cfg(test)]
+pub(super) async fn persist_observed_fixture(
+    root: &Path,
+    prepared: &PreparedAcceptance,
+    control: &Path,
+    observations: &[Observation],
+) -> Result<CandidateReceiptReference> {
+    ensure!(
+        observations.len() == prepared.proposal.contract.verifiers.len(),
+        "fixture observation count mismatch"
+    );
+    let binding = prepared
+        .baseline
+        .registration
+        .binding(&actual_head(root).await?)?;
+    let receipts = prepared
+        .proposal
+        .contract
+        .verifiers
+        .iter()
+        .zip(observations)
+        .map(|(v, o)| {
+            prepared
+                .baseline
+                .registration
+                .observe(root, &v.id, binding.clone(), o)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    persist_candidate_artifact(
+        control,
+        &[root.to_path_buf()],
+        CandidateArtifact {
+            schema_version: 1,
+            binding,
+            receipts,
+        },
+    )
+}
+
 #[cfg(test)]
 pub(super) fn historical_fixture(root:&Path, modern:&PreparedAcceptance)->Result<PreparedAcceptance> {
     let mut proposal=modern.proposal.clone();
