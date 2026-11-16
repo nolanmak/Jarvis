@@ -249,7 +249,7 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
         let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
         let now=chrono::Utc::now().timestamp_millis();
         if snapshot.lease_until_ms>now || snapshot.checkpoint.next.eligible_at_ms>now {return Ok(());}
-        if !checkout::recover(repo,store,id,&request).await? {return Ok(());}
+        if !checkout::recover(repo,&workflow::path(),store,id,&request).await? {return Ok(());}
         let acquired=workflow::WorkflowGuard::acquire(workflow::Start {
             repo_root:repo,worktree:&request.worktree,repository:&repository,source_issue:Some(request.issue),pr:snapshot.pr,
             branch:&request.branch,contract:&request.contract,environment:&request.environment,

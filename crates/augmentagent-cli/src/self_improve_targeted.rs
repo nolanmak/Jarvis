@@ -363,17 +363,34 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
     let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
     let before=store.snapshot(id)?.context(CommandFailure {code:2,reason:"workflow-not-found"})?;
     let target=before.pr.map(Target::Pr).unwrap_or(target);
-    if before.lease_until_ms>chrono::Utc::now().timestamp_millis()
-        || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)? {
-        return Err(anyhow::anyhow!("active lease or unresolved operation; original evidence retained")
+    let held=before.lease_until_ms>chrono::Utc::now().timestamp_millis()
+        || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)?;
+    drop(store);
+    if held {
+        // #1531: retirement waits for quiescence, but a terminal target must
+        // fence NEW admissions now; work already in flight drains untouched.
+        let fenced=match target_lifecycle(repo,repository,target).await {
+            Ok(Lifecycle::Open)=>{crate::autoship_workflow::WorkflowStore::open(path)?.lift_target_fence(id)?;false},
+            Ok(Lifecycle::Closed|Lifecycle::Merged(_))=>{
+                let evidence=match target {Target::Pr(n)=>format!("github:pr:{n}:terminal"),Target::Issue(n)=>format!("github:issue:{n}:closed")};
+                crate::autoship_workflow::WorkflowStore::open(path)?.fence_closed_target(id,&evidence,chrono::Utc::now().timestamp_millis())?;
+                info!(workflow=id,"target closed outside autoship; new admissions fenced until quiescent retirement");
+                true
+            },
+            Err(_)=>false,
+        };
+        return Err(anyhow::anyhow!(if fenced {"active lease or unresolved operation; new admissions fenced, original evidence retained"}
+            else {"active lease or unresolved operation; original evidence retained"})
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
-    drop(store);
     let lifecycle=target_lifecycle(repo,repository,target).await
         .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
     let (stage,reason,evidence)=match lifecycle {
-        Lifecycle::Open=>return Err(anyhow::anyhow!("target is still open; no work was dispatched")
-            .context(CommandFailure {code:3,reason:"target-still-open"})),
+        Lifecycle::Open=>{
+            crate::autoship_workflow::WorkflowStore::open(path)?.lift_target_fence(id)?;
+            return Err(anyhow::anyhow!("target is still open; no work was dispatched")
+                .context(CommandFailure {code:3,reason:"target-still-open"}))
+        },
         Lifecycle::Closed=>(Stage::Retired,"target_closed",match target {
             Target::Pr(n)=>format!("github:pr:{n}:closed-unmerged"),
             Target::Issue(n)=>format!("github:issue:{n}:closed"),

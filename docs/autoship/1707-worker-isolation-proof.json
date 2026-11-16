@@ -1,0 +1,160 @@
+{
+  "issue": 1707,
+  "parent_red": {
+    "issue": 1707,
+    "baseline_revision": "b4100b5ac6dc72187fb1165c61fb4a2bc46f1f8d",
+    "command": "python3 ~/lanes/L2.run-managed.py ~/lanes/L2.1707-red.log test -p augmentagent-cli --bin augmentagent self_improve::workspace::isolation_tests -- --test-threads=2",
+    "managed_exit_code": 1,
+    "cargo_exit_code": 101,
+    "expected_behavior_failures": [
+      "unmerged_controller_commit_is_preserved_before_refresh",
+      "replaced_checkout_cannot_reuse_live_publication_or_model_authority",
+      "checkout_identity_survives_release_and_restart"
+    ],
+    "note": "Candidate fixtures place protected control storage outside writable managed Cargo cache; initial setup failures are excluded from RED evidence."
+  },
+  "artifacts": [
+    {
+      "file": "L2.1707-red.log",
+      "sha256": "2c6cc4bb6418ebf0a656ca537159d115d5ec162358a9265471af013a976eb1d7",
+      "results": [
+        "test self_improve::workspace::isolation_tests::replaced_checkout_cannot_reuse_live_publication_or_model_authority ... FAILED",
+        "test self_improve::workspace::isolation_tests::unmerged_controller_commit_is_preserved_before_refresh ... FAILED",
+        "test self_improve::workspace::isolation_tests::checkout_identity_survives_release_and_restart ... FAILED",
+        "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2166 filtered out; finished in 0.41s"
+      ]
+    },
+    {
+      "file": "L2.1707-entry-red.log",
+      "sha256": "9440f0fa8d363885d4c96f998a08131d6d1e97a797dc460757513f2059f62797",
+      "results": [
+        "test self_improve::workspace::isolation_tests::entry_tests::dry_run_helpers_use_trusted_controller_and_preserve_owner_bytes ... FAILED",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2169 filtered out; finished in 0.11s"
+      ]
+    },
+    {
+      "file": "L2.1707-updater-red.log",
+      "sha256": "259257a376c21358056184fb042487c0a9b4a3b249c7b061b56df03d5c9552cb",
+      "results": [
+        "Ran 1 test in 0.498s",
+        "FAILED (failures=4)"
+      ]
+    },
+    {
+      "file": "L2.1707-restoration-red.log",
+      "sha256": "43019ba87148fcb75887f1650fcf14a15463aed07741162243c867f8f492f1bd",
+      "results": [
+        "test self_improve::publication::checkout::identity_tests::missing_publication_checkout_reconstruction_preserves_workflow_authority ... FAILED",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2189 filtered out; finished in 0.26s"
+      ]
+    },
+    {
+      "file": "L2.1707-crash.log",
+      "sha256": "9e9dfd135a8bc38d5423af0e73e1b070597217a4bd5849f538cfcd7ac7617ea1",
+      "results": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2189 filtered out; finished in 0.55s"
+      ]
+    },
+    {
+      "file": "L2.1707-final-targeted.log",
+      "sha256": "c40a5608c17ebe99ef74ff740fcc937383b0f9d28266cafac8e5450f67bc2215",
+      "results": [
+        "test result: ok. 72 passed; 0 failed; 1 ignored; 0 measured; 2125 filtered out; finished in 57.13s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s"
+      ]
+    },
+    {
+      "file": "L2.1707-hooks-red.log",
+      "sha256": "d9fc91d15108cd76f9ca5d174d02c4e745fe3c51b2d0cbf9ed4bb77372cbc5f7",
+      "results": [
+        "test self_improve::workspace::isolation_tests::preparation_hooks_cannot_copy_owner_files_into_candidates ... FAILED",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2198 filtered out; finished in 0.06s"
+      ]
+    },
+    {
+      "file": "L2.1707-restoration-green.log",
+      "sha256": "c5ec451d1ba372ccceefe033fa2abc5aa6286c34972c03057ec48342bcabe624",
+      "results": [
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 2175 filtered out; finished in 1.24s"
+      ]
+    },
+    {
+      "file": "L2.1707-updater-green.log",
+      "sha256": "034ab84330daf023b27fd186506d9777862f61f99b549444dd5d058a09d33191",
+      "results": [
+        "Ran 1 test in 0.183s"
+      ]
+    },
+    {
+      "file": "L2.1707-updater-stamp.log",
+      "sha256": "b9de782d8d149ef15092bb2f20a526dc747cd502d9fa32b2d5057c9114086cfb",
+      "results": []
+    },
+    {
+      "file": "L2.1707-updater-restart-hygiene.log",
+      "sha256": "a84f73d17eb0a555aad8703c2230acb5b620db82d69df735aa6e8916095c2c54",
+      "results": []
+    },
+    {
+      "file": "L2.1707-updater-pinned.log",
+      "sha256": "96cd60938db635b69657ea98141b25e35c889250dd7859a1f2af870f8b15250f",
+      "results": []
+    },
+    {
+      "file": "L2.1707-updater-rebuild.log",
+      "sha256": "1f8953fd5b59efa8b6ffb89fe68bf41990b7ecf965774a5028b4a8ac6756cce4",
+      "results": []
+    },
+    {
+      "file": "L2.1707-updater-sync.log",
+      "sha256": "bbd702c3dc3d2e70ab3154c5b573d6e31f9966dc6b7233e376b0f6e9745d1cb4",
+      "results": []
+    },
+    {
+      "file": "L2.1707-updater-worker-provision.log",
+      "sha256": "497191caf10603a7af39e28c168ea94c4e7411bd94cc6fdae7918acfdce1f363",
+      "results": [
+        "Ran 4 tests in 1.962s"
+      ]
+    },
+    {
+      "file": "L2.1707-updater-native-runtime.log",
+      "sha256": "8c01189b3404f0b090a0cb18a445310f895e032878435d262fc3113ba358e9ce",
+      "results": [
+        "Ran 1 test in 0.416s"
+      ]
+    },
+    {
+      "file": "L2.1707-updater-policy.log",
+      "sha256": "ac68ced8012b35c5d79d212eac39f915687c14b17bc9f697f6b3e9c76e402ec4",
+      "results": [
+        "Ran 1 test in 0.101s"
+      ]
+    },
+    {
+      "file": "L2.1707-hooks-green.log",
+      "sha256": "f121a9db68d4f59a21807cc2f1c96d5912459575834d93b1eae3f798ed4d7f7b",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2199 filtered out; finished in 0.07s"
+      ],
+      "managed_admission_deferrals": 2
+    }
+  ],
+  "boundary": "Temporary Git repositories, private fixture state, fake clocks, scripted GitHub/service boundaries. No production rollout or live acceptance.",
+  "launcher": "All Rust checks use scripts/cargo-managed.sh via L2.run-managed.py; CARGO_TARGET_DIR=/mnt/store/lane-targets/L2, CARGO_BUILD_JOBS=2, dev/test debug=0, --test-threads=2. Launcher resets inherited ignored SIGHUP to SIG_DFL and retries exit 75 admission up to 45 min.",
+  "green_source_revision": "054d36bc75957c2a40f48e8e78567490a3ca1a34",
+  "hook_red_source_revision": "376831b64bc1806557c2f664356b2633815ff2a6",
+  "hook_green_exit_code": 0,
+  "full_suite": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- --test-threads=2",
+    "source_revision": "054d36bc75957c2a40f48e8e78567490a3ca1a34",
+    "managed_exit_code": 0,
+    "cargo_exit_code": 0,
+    "passed": 2156,
+    "failed": 0,
+    "ignored": 44,
+    "seconds": 1656.73,
+    "file": "L2.1707-full.log",
+    "sha256": "f39c897ab224aef71ebfaf4fc95b47a0bcc97f12ee3b63de54bfea2b26355a9b"
+  }
+}

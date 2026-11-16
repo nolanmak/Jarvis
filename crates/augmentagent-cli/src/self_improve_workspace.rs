@@ -6,12 +6,18 @@ pub(super) struct Controller {
     _lock: RunLock,
 }
 
-async fn git(repo: &Path, args: &[&str]) -> Result<String> {
+/// Preparation must not execute hooks inherited from an interactive checkout.
+/// Candidate commits and publication retain their existing required hooks.
+pub(super) async fn preparation_git(repo: &Path, args: &[&str]) -> Result<(bool, String, String)> {
     let mut options = vec!["-c", "core.hooksPath=/dev/null"];
     options.extend_from_slice(args);
+    run("git", &options, repo).await
+}
+
+async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let (ok, output, error) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run("git", &options, repo),
+        preparation_git(repo, args),
     )
     .await
     .context("controller Git operation timed out")??;
@@ -153,7 +159,10 @@ pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
             .open(&receipt)
             .context("existing controller has no ownership receipt; preserved")?;
         let meta = file.metadata()?;
-        anyhow::ensure!(meta.is_file() && meta.len() <= 16384, "invalid controller receipt");
+        anyhow::ensure!(
+            meta.is_file() && meta.len() <= 16384,
+            "invalid controller receipt"
+        );
         let recorded: Ownership = serde_json::from_reader(file)?;
         anyhow::ensure!(
             recorded == fingerprint(&path, primary.clone(), &origin)?,
@@ -198,6 +207,7 @@ pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
     )
     .await?;
     if exists {
+        checkout_identity::controller_refresh(&path, &head).await?;
         git(&path, &["checkout", "--detach", &head]).await?;
     } else {
         git(
@@ -486,3 +496,7 @@ mod tests {
         assert_eq!(git(&path, &["rev-parse", "HEAD"]), head);
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_workspace_isolation_tests.rs"]
+mod isolation_tests;
