@@ -21735,3 +21735,7 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_preflight_retry_tests.rs"]
+mod preflight_retry_tests;
