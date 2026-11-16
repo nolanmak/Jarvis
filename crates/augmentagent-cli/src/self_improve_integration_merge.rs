@@ -2,6 +2,17 @@
 //! remain the responsibility of the existing resumed-workflow pipeline.
 use super::*;
 
+/// Preserve the existing harness accounting distinction from semantic or Git
+/// failures, even though both return through the same integration boundary.
+#[derive(Debug)]
+pub(super) struct ResolverFailure;
+impl std::fmt::Display for ResolverFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("integration resolver failed")
+    }
+}
+impl std::error::Error for ResolverFailure {}
+
 /// Resolve the ref once so an advancing tracking ref cannot change the tree
 /// during a paid resolution. The resolver runs only for a proven Git conflict.
 pub(super) async fn integrate<F, Fut>(
@@ -55,7 +66,7 @@ where
     }
     let (_, hunks, _) = run("git", &["diff"], worktree).await?;
     guard.validate_before_side_effect()?;
-    let summary = resolve(files, hunks).await?;
+    let summary = resolve(files, hunks).await.context(ResolverFailure)?;
     guard.validate_before_side_effect()?;
     let (ok, actual, _) = run("git", &["rev-parse", "HEAD"], worktree).await?;
     anyhow::ensure!(

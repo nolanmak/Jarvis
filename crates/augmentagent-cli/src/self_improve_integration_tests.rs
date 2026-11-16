@@ -350,16 +350,27 @@ async fn exercise_merge(case: &str, name: &str) {
                     )
                     .unwrap();
                 }
-                std::future::ready(Ok("scripted conflict resolution".into()))
+                std::future::ready(if case == "provider" {
+                    Err(anyhow::anyhow!("scripted provider failure"))
+                } else {
+                    Ok("scripted conflict resolution".into())
+                })
             })
             .await;
         if case != "success" {
-            let error = resolved.unwrap_err().to_string();
+            let error = resolved.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<integration_merge::ResolverFailure>()
+                    .is_some(),
+                case == "provider"
+            );
+            let error = error.to_string();
             assert!(
-                error.contains(if case == "markers" {
-                    "conflict markers remain"
-                } else {
-                    "cannot commit integration"
+                error.contains(match case {
+                    "markers" => "conflict markers remain",
+                    "provider" => "integration resolver failed",
+                    _ => "cannot commit integration",
                 }),
                 "{error}"
             );
@@ -489,6 +500,15 @@ async fn integration_resolved_metadata_does_not_drop_queued_reverification() {
     exercise(
         "resolved",
         "integration_resolved_metadata_does_not_drop_queued_reverification",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn integration_provider_failure_preserves_harness_classification() {
+    exercise_merge(
+        "provider",
+        "integration_provider_failure_preserves_harness_classification",
     )
     .await;
 }

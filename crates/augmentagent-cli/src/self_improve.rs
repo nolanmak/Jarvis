@@ -7153,9 +7153,9 @@ async fn resume_draft_pr(
             workflow.transition(Stage::Held, "integration_resolution_deferred", "inspect_integration_conflict",
                 chrono::Utc::now().timestamp_millis()+3_600_000).await?;
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            if builder_ran {
+            if error.downcast_ref::<integration_merge::ResolverFailure>().is_some() {
                 record_reasoner_error(issue.number,
-                    failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why));
+                    failure_record(reasoner, FailureKind::ReasonerError, "resume:conflict", &why));
             }
             return Ok(if builder_ran { RunReport::built(format!("PR #{pr}: integration deferred ({why})")) }
                 else { RunReport::triage(format!("PR #{pr}: integration deferred ({why})")) });
@@ -15721,12 +15721,12 @@ CODEX-REVIEW: lgtm").0);
             .count();
         let publishes = body.matches("publish_round(").count();
         assert_eq!(
-            commits, 5,
-            "expected conflict-resolution, shrink, gate-repair, CI-repair and revise commits"
+            commits, 4,
+            "expected inline shrink, gate-repair, CI-repair and revise commits; conflict commits use the tested integration executor"
         );
         assert_eq!(
-            publishes, commits,
-            "every round commit must be pushed + commented (#895)"
+            publishes, commits + 1,
+            "every inline round plus the delegated integration commit must be pushed + commented (#895)"
         );
     }
 
@@ -16175,7 +16175,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         refuse(|c| c.loop_authored = false, "signature");
         // C4 — conflicts and red checks.
         refuse(|c| c.mergeable = Some(false), "conflict");
-        refuse(|c| c.mergeable = None, "conflict");
+        refuse(|c| c.mergeable = None, "unknown");
         refuse(|c| c.checks_green = Some(false), "checks");
         refuse(|c| c.checks_green = None, "checks");
         // C3 — an incomplete approval record.
