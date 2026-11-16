@@ -870,6 +870,19 @@ mod tests {
             assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),0,"unavailable native consumer must not queue messages or strand a workflow");
             assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),13);
+            drop(store);
+            // #1713 — status must also work once a worker has registered the
+            // workflow (a snapshot exists), not only while it is queued.
+            let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            store.register(&discord.admission.workflow,"agent-fix/issue-7",crate::autoship_workflow::Binding {
+                head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()},300).unwrap();
+            drop(store);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(107),"!autoship status").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let claimed=store.replay_discord_control(&origin(107),&digest("!autoship status")).unwrap().unwrap();
+            assert_eq!(claimed.reason,"status-observed","registered workflow status: {}",claimed.reply);
+            assert!(claimed.reply.contains("stage ") && !claimed.reply.contains("stage unknown"),"{}",claimed.reply);
+            assert!(claimed.reply.contains("owner-pause-requested"),"{}",claimed.reply);
 
 
 
