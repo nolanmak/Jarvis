@@ -951,3 +951,63 @@ fn trusted_family_batch_error_rolls_back_policy_and_keeps_observation_readable()
         "failed all-child batch leaked a policy revision"
     );
 }
+
+#[test]
+fn exhausted_family_observation_exports_each_metric_and_machine_next_action() {
+    let (_dir, mut store, _root, child, _other, intent) = funded(false);
+    store
+        .charge_admitted_model(
+            &child,
+            "last-before-status",
+            18,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false,
+        )
+        .unwrap();
+    store
+        .charge(
+            &child,
+            "wall-before-status",
+            ResourceCharge {
+                wall_ms: 1000,
+                ..Default::default()
+            },
+            19,
+        )
+        .unwrap();
+    let observed = store
+        .family_budget_observation(&child.workflow, &intent, 1)
+        .unwrap();
+    let wire = serde_json::to_value(observed).unwrap();
+    let blockers = wire
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .expect("family budget status omitted typed blockers and actionable exhausted metrics");
+    let metrics: std::collections::BTreeSet<_> = blockers
+        .iter()
+        .filter(|b| b["reason_code"] == "family_resource_exhausted")
+        .map(|b| b["metric"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        metrics,
+        std::collections::BTreeSet::from(["model_admissions", "wall_ms"])
+    );
+    for blocker in blockers {
+        assert_eq!(blocker["next"]["action"], "await_owner_budget_revision");
+        assert_eq!(blocker["next"]["eligible_at_ms"], serde_json::Value::Null);
+        assert_eq!(blocker["workflow"], child.workflow);
+        assert_eq!(blocker["family"], "family");
+        assert!(blocker["observed"].is_u64() && blocker["limit"].is_u64());
+    }
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        2
+    );
+    assert_eq!(store.merge_allowance(20, 5).unwrap().available, 5);
+}
