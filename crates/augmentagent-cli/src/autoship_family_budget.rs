@@ -46,33 +46,10 @@ pub(crate) struct RetainedUsage {
     pub model_admissions: u64,
     pub wall_ms: u64,
 }
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Observation {
-    pub schema_version: u32,
-    pub reason_code: Option<String>,
-    pub model_admissions: Option<u64>,
-    pub wall_ms: Option<u64>,
-    // Native admission and elapsed records do not prove token completeness.
-    pub tokens: Option<u64>,
-    pub retained: Vec<RetainedUsage>,
-    pub limits: Option<Limits>,
-}
-impl Observation {
-    fn unknown(reason: &str) -> Self {
-        Self {
-            schema_version: 1,
-            reason_code: Some(reason.into()),
-            model_admissions: None,
-            wall_ms: None,
-            tokens: None,
-            retained: vec![],
-            limits: None,
-        }
-    }
-    pub(crate) fn ready(&self) -> bool {
-        self.reason_code.is_none()
-    }
-}
+#[path = "autoship_family_budget_observation.rs"]
+mod observation;
+pub(crate) use observation::Observation;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Scope {
@@ -117,114 +94,8 @@ fn revision(conn: &Connection, root: &str) -> Result<i64> {
         .unwrap_or(0))
 }
 
-/// Shared read-only budget predicate. Callers must also enforce actual authority,
-/// manifest/dependencies, child holds and capacity. incoming=0 observes/explains;
-/// it does not authorize publication/merge or block unpaid reconciliation.
-pub(crate) fn observe(
-    conn: &Connection,
-    workflow: &str,
-    intent: &Intent,
-    incoming: u64,
-) -> Result<Observation> {
-    match intent {
-        Intent::Independent { request_ref } => {
-            ensure!(
-                table(conn, "workflow_family_budget")?,
-                "family_authority_unknown"
-            );
-            let root: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_family_budget WHERE root_workflow=?1)",
-                [workflow],
-                |r| r.get(0),
-            )?;
-            let allowed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member m JOIN command_request r ON r.request_id=m.independent_ref WHERE m.workflow=?1 AND m.independent_ref=?2 AND json_extract(r.admission,'$.workflow')=?1)",params![workflow,request_ref],|r|r.get(0))?;
-            ensure!(!root && allowed, "family_execution_scope_unknown");
-            Ok(Observation {
-                schema_version: 1,
-                reason_code: None,
-                model_admissions: None,
-                wall_ms: None,
-                tokens: None,
-                retained: vec![],
-                limits: None,
-            })
-        }
-        Intent::Delegated {
-            family,
-            manifest_ref,
-            policy_ref,
-            request_ref,
-        } => {
-            let group:Option<(String,String,Option<String>,Option<String>,String,u64)>=conn.query_row(
-                "SELECT root_workflow,state,manifest_ref,policy_ref,original_request_ref,expected_children FROM workflow_family_budget WHERE family=?1",[family],
-                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-            let Some((root, state, manifest, active, request, count)) = group else {
-                return Ok(Observation::unknown("family_authority_unknown"));
-            };
-            let blocked = |reason: &str| -> Result<Observation> {
-                let mut result = Observation::unknown(reason);
-                result.retained = usage::reported(conn, family)?;
-                Ok(result)
-            };
-            let member:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member WHERE family=?1 AND workflow=?2)",params![family,workflow],|r|r.get(0))?;
-            if !member || &request != request_ref {
-                return blocked("family_execution_scope_unknown");
-            }
-            if root != workflow && owner_control::read(conn, &root)?.is_some_and(|c| c.paused) {
-                return blocked("owner_paused");
-            }
-            // Membership comes first: pending policy must not vanish in an
-            // active-policy-only lookup.
-            if state != "bound" {
-                return blocked("family_membership_pending");
-            }
-            let members: u64 = conn.query_row(
-                "SELECT count(*) FROM workflow_family_member WHERE family=?1",
-                [family],
-                |r| r.get(0),
-            )?;
-            if !(2..=6).contains(&count)
-                || members != count + 1
-                || manifest.as_deref() != Some(manifest_ref)
-            {
-                return blocked("family_authority_unknown");
-            }
-            let Some(active) = active else {
-                return blocked("family_budget_policy_missing");
-            };
-            if &active != policy_ref {
-                return blocked("family_execution_scope_unknown");
-            }
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT payload FROM workflow_family_policy WHERE reference=?1 AND family=?2",
-                    params![active, family],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(raw) = raw else {
-                return blocked("family_budget_policy_missing");
-            };
-            let limits: Limits = match serde_json::from_str::<Limits>(&raw) {
-                Ok(p) if p.validate().is_ok() => p,
-                _ => return blocked("family_budget_policy_unsupported"),
-            };
-            let mut result = usage::aggregate(conn, family)?;
-            result.limits = Some(limits.clone());
-            if result.ready()
-                && incoming > 0
-                && (result
-                    .model_admissions
-                    .and_then(|n| n.checked_add(incoming))
-                    .is_none_or(|n| n > limits.max_model_admissions)
-                    || result.wall_ms.is_none_or(|n| n >= limits.max_wall_ms))
-            {
-                result.reason_code = Some("family_resource_exhausted".into());
-            }
-            Ok(result)
-        }
-    }
-}
+/// Shared budget-only predicate; actual authority and custody remain separate.
+pub(crate) use observation::observe;
 
 /// Called only for a NEW positive charge, after existing receipt verification.
 /// Existing receipt replay and late wall/token accounting never enter this gate.
@@ -290,10 +161,7 @@ pub(super) fn require_new_admission(
     ensure!(
         status.ready(),
         "{}",
-        status
-            .reason_code
-            .as_deref()
-            .unwrap_or("family_authority_unknown")
+        status.reason_code().unwrap_or("family_authority_unknown")
     );
     Ok(Some(format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))))
 }
