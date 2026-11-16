@@ -18,7 +18,7 @@
 //! | Watchdog healthy while provider faults persisted       | `persistent_provider_fault_without_progress_alerts`        | #1708  | RED (ignored)  |
 //! | Watchdog counted manual main commits as progress       | `manual_main_commit_is_not_autonomous_progress`            | #1708  | RED (ignored)  |
 //! | UNKNOWN mergeability never merges                      | `unknown_mergeability_never_merges`                        | #1711  | green guard    |
-//! | UNKNOWN mergeability logged as conflict (#1606)        | `unknown_mergeability_is_not_reported_as_conflict`         | #1711  | RED (ignored)  |
+//! | UNKNOWN mergeability logged as conflict (#1606)        | `unknown_mergeability_is_not_reported_as_conflict`         | #1711  | green guard  |
 use super::*;
 
 fn oct(day: u32, hour: u32) -> chrono::DateTime<chrono::Utc> {

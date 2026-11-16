@@ -61,9 +61,41 @@ async fn exercise(case: &str, name: &str) {
             opened_prs::record(issue, pr, head, None);
         }
         let before = git(&root, &["rev-parse", "HEAD"]);
+        if case == "resolved" {
+            assert!(find_resumable_draft(&root, None, false).await.is_some());
+            let mut rows = rows.clone();
+            rows[0]["mergeable"] = "MERGEABLE".into();
+            std::fs::write(
+                root.parent().unwrap().join("rows.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+        }
+
+        if matches!(case, "capacity" | "provenance") {
+            assert!(find_resumable_draft(&root, None, false).await.is_some());
+            let why = if case == "capacity" {
+                ReviewUnavailable::NoCapacity {
+                    reviewers: vec![augmentagent_channel_core::ProviderKind::Codex],
+                    detail: "scripted capacity outage".into(),
+                }
+            } else {
+                ReviewUnavailable::ProvenanceUnknown
+            };
+            assert!(integration::unavailable(
+                &workflow::path(),
+                "owner/repo",
+                1606,
+                "agent-fix/issue-1",
+                &why,
+                chrono::Utc::now().timestamp_millis()
+            )
+            .unwrap());
+        }
+
         for _ in 0..3 {
             let selected = find_resumable_draft(&root, None, false).await;
-            if matches!(case, "conflict" | "parent") {
+            if matches!(case, "conflict" | "parent" | "resolved") {
                 assert_eq!(
                     selected,
                     Some((1606, 1, "agent-fix/issue-1".into())),
@@ -78,6 +110,9 @@ async fn exercise(case: &str, name: &str) {
             "unknown" => "mergeability_unknown",
             "conflict" | "parent" => "integration_conflict",
             "unavailable" => "integration_parent_unavailable",
+            "resolved" => "integration_base_changed",
+            "capacity" => "integration_reviewer_capacity",
+            "provenance" => "dependency-adoption-provenance",
             _ => "integration_dependency_cycle",
         };
         if case == "parent" {
@@ -120,14 +155,18 @@ async fn exercise(case: &str, name: &str) {
     let base = git(&repo, &["rev-parse", "HEAD"]);
     let mut rows = Vec::new();
     for (pr, issue, content) in [(1606, 1, "first\n"), (1607, 2, "second\n")] {
-        if matches!(case, "unknown" | "conflict" | "unavailable") && issue == 2 {
+        if matches!(
+            case,
+            "unknown" | "conflict" | "unavailable" | "capacity" | "provenance" | "resolved"
+        ) && issue == 2
+        {
             break;
         }
         let branch = format!("agent-fix/issue-{issue}");
         git(&repo, &["checkout", "-qb", &branch, &base]);
         std::fs::write(repo.join("source.txt"), content).unwrap();
         git(&repo, &["commit", "-am", "candidate"]);
-        rows.push(serde_json::json!({"number":pr,"isDraft":true,"headRefName":branch,"headRefOid":git(&repo,&["rev-parse","HEAD"]),"baseRefName":if case=="unavailable" {"missing-parent".into()}else if matches!(case,"unknown"|"conflict") || (case=="parent" && issue==1) {"main".into()}else{format!("agent-fix/issue-{}",if issue==1{2}else{1})},"baseRefOid":base,"isCrossRepository":false,"author":{"login":"owner"},"title":"Integrate candidate","body":"Preserve candidate edits","mergeable":if matches!(case,"conflict"|"parent") {"CONFLICTING"}else{"UNKNOWN"},"closingIssuesReferences":[{"number":issue,"url":format!("https://github.com/owner/repo/issues/{issue}") }]}));
+        rows.push(serde_json::json!({"number":pr,"isDraft":true,"headRefName":branch,"headRefOid":git(&repo,&["rev-parse","HEAD"]),"baseRefName":if case=="unavailable" {"missing-parent".into()}else if matches!(case,"unknown"|"conflict"|"capacity"|"provenance"|"resolved") || (case=="parent" && issue==1) {"main".into()}else{format!("agent-fix/issue-{}",if issue==1{2}else{1})},"baseRefOid":base,"isCrossRepository":false,"author":{"login":"owner"},"title":"Integrate candidate","body":"Preserve candidate edits","mergeable":if matches!(case,"conflict"|"parent"|"capacity"|"provenance"|"resolved") {"CONFLICTING"}else{"UNKNOWN"},"closingIssuesReferences":[{"number":issue,"url":format!("https://github.com/owner/repo/issues/{issue}") }]}));
     }
     for index in 0..rows.len() {
         let base_ref = rows[index]["baseRefName"].as_str().unwrap();
@@ -424,6 +463,32 @@ async fn integration_rejected_commit_never_creates_publishable_head() {
     exercise_merge(
         "hook",
         "integration_rejected_commit_never_creates_publishable_head",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn integration_preflight_capacity_wait_survives_normal_polls() {
+    exercise(
+        "capacity",
+        "integration_preflight_capacity_wait_survives_normal_polls",
+    )
+    .await;
+}
+#[tokio::test]
+async fn integration_preflight_unknown_provenance_waits_for_adoption() {
+    exercise(
+        "provenance",
+        "integration_preflight_unknown_provenance_waits_for_adoption",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn integration_resolved_metadata_does_not_drop_queued_reverification() {
+    exercise(
+        "resolved",
+        "integration_resolved_metadata_does_not_drop_queued_reverification",
     )
     .await;
 }

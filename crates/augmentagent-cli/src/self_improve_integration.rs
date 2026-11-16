@@ -57,6 +57,9 @@ pub(super) async fn filter(
             retained.push(candidate);
             continue;
         };
+        if snapshot.checkpoint.next.reason == "dependency-adoption-provenance" {
+            continue;
+        }
         let row = rows
             .iter()
             .find(|row| row["number"].as_u64() == Some(candidate.pr))
@@ -85,7 +88,8 @@ pub(super) async fn filter(
                 }
                 Some(value) if value.as_str() == Some("MERGEABLE") => {
                     if !base.is_empty()
-                        && (reviewed_base.as_ref().is_some_and(|old| old != base)
+                        && (snapshot.checkpoint.next.reason.starts_with("integration_")
+                            || reviewed_base.as_ref().is_some_and(|old| old != base)
                             || snapshot.checkpoint.next.reason == "parent_merged_child_retargeted"
                             || matches!(
                                 snapshot.checkpoint.next.reason.as_str(),
@@ -104,10 +108,21 @@ pub(super) async fn filter(
                 Some(_) => Some(IntegrationReason::Unknown),
             }
         };
-        let Some(reason) = reason else {
+        let Some(mut reason) = reason else {
             retained.push(candidate);
             continue;
         };
+        if matches!(
+            reason,
+            IntegrationReason::Conflict | IntegrationReason::BaseChanged
+        ) && snapshot.checkpoint.next.reason == "integration_reviewer_capacity"
+            && !matches!(
+                review_recovery::readiness(),
+                crate::autoship_workflow::ReviewRecoveryReadiness::Ready
+            )
+        {
+            reason = IntegrationReason::ReviewerCapacity;
+        }
         let mut graph = BTreeMap::new();
         let mut pending = vec![&candidate];
         while let Some(node) = pending.pop() {
@@ -158,7 +173,8 @@ pub(super) async fn filter(
 /// New integration work cannot reuse an approving publication receipt while
 /// waiting for C's exact-candidate verification and the existing review path.
 pub(super) fn requires_reverification(cp: &crate::autoship_workflow::Checkpoint) -> bool {
-    cp.next.reason.starts_with("integration_") || cp.next.reason == "dependency-check-classification"
+    cp.next.reason.starts_with("integration_")
+        || cp.next.reason == "dependency-check-classification"
 }
 
 /// C/#1710 owns classification. Until its typed adapter is available, an
@@ -166,3 +182,25 @@ pub(super) fn requires_reverification(cp: &crate::autoship_workflow::Checkpoint)
 /// checks. The existing resume pipeline must discharge it through its actual
 /// verification/CI and independent review gates before M can merge.
 pub(super) const CHECK_CLASSIFICATION_WAIT: &str = "dependency-check-classification";
+
+/// Preflight has not acquired a productive lease or spent a builder call yet.
+/// Preserve integration's request instead of entering legacy stand-down logic.
+pub(super) fn unavailable(
+    path: &Path,
+    repository: &str,
+    pr: u64,
+    branch: &str,
+    why: &ReviewUnavailable,
+    now: i64,
+) -> Result<bool> {
+    let reason = match why {
+        ReviewUnavailable::NoCapacity { .. }
+        | ReviewUnavailable::Latched { .. }
+        | ReviewUnavailable::AllReviewersBuiltIt => IntegrationReason::ReviewerCapacity,
+        ReviewUnavailable::ProvenanceUnknown | ReviewUnavailable::ProvenanceUnverifiable { .. } => {
+            IntegrationReason::Provenance
+        }
+        _ => return Ok(false),
+    };
+    WorkflowStore::open(path)?.defer_integration_review(repository, pr, branch, reason, now)
+}

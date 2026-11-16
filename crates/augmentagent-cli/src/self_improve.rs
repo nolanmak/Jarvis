@@ -7012,7 +7012,8 @@ async fn resume_draft_pr(
     if let Err(why) = reviewer {
         if !dry_run {
             let repository = workflow::canonical_repository(repo_root).await?;
-            if review_recovery::unavailable(&workflow::path(), &repository, pr, branch, &why, chrono::Utc::now().timestamp_millis())? {
+            if integration::unavailable(&workflow::path(), &repository, pr, branch, &why, chrono::Utc::now().timestamp_millis())?
+                || review_recovery::unavailable(&workflow::path(), &repository, pr, branch, &why, chrono::Utc::now().timestamp_millis())? {
                 return Ok(RunReport::held(format!("PR #{pr}: independent review waiting: {}", why.code())));
             }
         }

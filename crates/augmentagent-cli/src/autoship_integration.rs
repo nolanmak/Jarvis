@@ -12,6 +12,8 @@ pub(crate) enum IntegrationReason {
     Cycle,
     Unavailable,
     Resolved,
+    ReviewerCapacity,
+    Provenance,
 }
 impl IntegrationReason {
     fn code(self) -> &'static str {
@@ -23,6 +25,8 @@ impl IntegrationReason {
             Self::Cycle => "integration_dependency_cycle",
             Self::Unavailable => "integration_parent_unavailable",
             Self::Resolved => "integration_metadata_resolved",
+            Self::ReviewerCapacity => "integration_reviewer_capacity",
+            Self::Provenance => "dependency-adoption-provenance",
         }
     }
     fn due(self) -> bool {
@@ -30,6 +34,58 @@ impl IntegrationReason {
     }
 }
 impl WorkflowStore {
+    pub(crate) fn defer_integration_review(
+        &mut self,
+        repository: &str,
+        pr: u64,
+        branch: &str,
+        reason: IntegrationReason,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(
+            matches!(
+                reason,
+                IntegrationReason::ReviewerCapacity | IntegrationReason::Provenance
+            ),
+            "invalid integration review wait"
+        );
+        let Some(id) = self.resolve_pr(repository, pr)? else {
+            return Ok(false);
+        };
+        let Some(snapshot) = self.snapshot(&id)? else {
+            return Ok(false);
+        };
+        if !matches!(
+            snapshot.checkpoint.next.reason.as_str(),
+            "integration_conflict" | "integration_base_changed" | "integration_reviewer_capacity"
+        ) {
+            return Ok(false);
+        }
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT base,fingerprint FROM integration_recovery WHERE workflow=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((base, fingerprint)) = row else {
+            return Ok(false);
+        };
+        let _ = self.reconcile_integration(
+            repository,
+            pr,
+            branch,
+            &snapshot.checkpoint.binding.head,
+            &base,
+            &fingerprint,
+            reason,
+            now,
+        )?;
+        // A concurrent lease or owner hold keeps its stronger authority. The
+        // caller must still return a wait, never legacy stand-down/closure.
+        Ok(true)
+    }
     /// Exact current ownership, controls and in-flight effects are checked in
     /// the same transaction as the request/event/checkpoint. No lease is stolen.
     pub(crate) fn reconcile_integration(
@@ -115,7 +171,11 @@ impl WorkflowStore {
         }
         let original = old
             .as_ref()
-            .filter(|o| o.0 == binding && o.3 != "integration_metadata_resolved")
+            .filter(|o| {
+                o.0 == binding
+                    && (reason == IntegrationReason::Resolved
+                        || (reason == IntegrationReason::Unknown && o.3 == "mergeability_unknown"))
+            })
             .map_or(raw.clone(), |o| o.6.clone());
         let attempts = if reason == IntegrationReason::Unknown {
             if unchanged {
@@ -153,6 +213,8 @@ impl WorkflowStore {
                     IntegrationReason::Conflict | IntegrationReason::BaseChanged => {
                         "reconcile_main"
                     }
+                    IntegrationReason::ReviewerCapacity => "await_independent_reviewer",
+                    IntegrationReason::Provenance => "await_provenance_adoption",
                     _ => "await_integration_parent",
                 }
                 .into(),
@@ -162,6 +224,7 @@ impl WorkflowStore {
         if reason.due() && !unchanged {
             // Old approvals/CI-ready milestones depend on the integrated base.
             // Append-only findings remain available; ownership/usage is retained.
+            cp.evidence.clear();
             let floor: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(seq),0) FROM workflow_event WHERE workflow=?1",
                 [&id],
@@ -212,6 +275,8 @@ impl WorkflowStore {
             stage,
             outcome: if reason.due() || reason == IntegrationReason::Resolved {
                 public::WorkflowOutcome::Progressed
+            } else if reason == IntegrationReason::ReviewerCapacity {
+                public::WorkflowOutcome::CapacityWait
             } else if reason == IntegrationReason::Unknown {
                 public::WorkflowOutcome::RetryableInfrastructure
             } else {
@@ -263,7 +328,8 @@ impl WorkflowStore {
         )?;
         tx.commit()?;
         Ok(if reason == IntegrationReason::Resolved {
-            None
+            (cp.stage == Stage::Reconcile && cp.next.reason.starts_with("integration_"))
+                .then_some(true)
         } else {
             Some(reason.due())
         })
@@ -415,6 +481,70 @@ mod tests {
         assert_eq!(
             observe(&mut store, IntegrationReason::Conflict, "base", 3_600_020),
             Some(true)
+        );
+    }
+    #[test]
+    fn integration_unknown_after_conflict_keeps_reverification_and_capacity_can_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = fixture(&dir.path().join("workflow.db"));
+        assert_eq!(
+            observe(&mut store, IntegrationReason::Conflict, "base", 10),
+            Some(true)
+        );
+        assert_eq!(
+            observe(&mut store, IntegrationReason::Unknown, "base", 11),
+            Some(false)
+        );
+        assert_eq!(
+            observe(&mut store, IntegrationReason::Resolved, "base", 12),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .snapshot("owner/repo#1")
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .next
+                .reason,
+            "integration_conflict"
+        );
+        assert!(store
+            .current_review_history("owner/repo#1")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .defer_integration_review(
+                "owner/repo",
+                1606,
+                "candidate",
+                IntegrationReason::ReviewerCapacity,
+                13
+            )
+            .unwrap());
+        assert_eq!(
+            observe(&mut store, IntegrationReason::ReviewerCapacity, "base", 14),
+            Some(false)
+        );
+        let events = store.events("owner/repo#1").unwrap();
+        assert_eq!(
+            observe(&mut store, IntegrationReason::ReviewerCapacity, "base", 15),
+            Some(false)
+        );
+        assert_eq!(store.events("owner/repo#1").unwrap(), events);
+        assert_eq!(
+            observe(&mut store, IntegrationReason::Conflict, "base", 16),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .snapshot("owner/repo#1")
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .next
+                .reason,
+            "integration_conflict"
         );
     }
     #[test]
