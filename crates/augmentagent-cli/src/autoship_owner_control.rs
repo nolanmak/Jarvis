@@ -172,6 +172,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             }
         }
         super::progress::project(tx,workflow,"owner_control_changed",now)?;
+        super::activity::project(tx,workflow,"owner_control_changed","",now)?;
         Ok(control)
 }
 
@@ -243,6 +244,7 @@ pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>>
 pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
     ensure!(!read(conn,workflow)?.is_some_and(|c|c.paused),"owner-paused");
     ensure!(super::owner_inbox::pending(conn,workflow)?==0,"owner-followup-pending");
+    ensure!(!super::target_fence::fenced(conn,workflow)?,"target-closed-fenced");
     Ok(())
 }
 
