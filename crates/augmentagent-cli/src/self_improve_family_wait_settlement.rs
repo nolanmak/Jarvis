@@ -2,7 +2,7 @@
 use super::*;
 
 impl CapacityAccounting {
-    pub(super) async fn settle_family_wait(&self) -> Result<Option<RunReport>> {
+    pub(in crate::self_improve) async fn settle_family_wait(&self) -> Result<Option<RunReport>> {
         family_budget_hold::report(self)
     }
 }
