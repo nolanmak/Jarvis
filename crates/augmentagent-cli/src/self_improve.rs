@@ -104,6 +104,8 @@ pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
 }
 #[path = "self_improve_source.rs"]
 mod source_reconcile;
+#[path = "self_improve_ownership.rs"]
+pub(crate) mod ownership;
 #[path = "self_improve_workflow.rs"]
 mod workflow;
 #[path = "self_improve_recovery.rs"]
@@ -2524,6 +2526,8 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
         // watching, so it needs the loop's own signature on the body.
         return skip("no matching local publication record, reviewed head, or self-improve body signature");
     }
+    // GitHub UNKNOWN is a pending recompute, not proof of conflict.
+    // Both states withhold merging; the integration scheduler owns recovery.
     match c.mergeable {
         None => return skip("mergeability unknown; retry remote metadata computation"),
         Some(false) => return skip("confirmed conflict with main; exact-head integration required"),
