@@ -141,11 +141,24 @@ fn fingerprint(db: &Connection) -> Result<Fingerprint> {
         integrity(db, Some(&table))
             .with_context(|| format!("authority table {table} is damaged"))?;
         let mut hash = Sha256::new();
+        // Keep the existing rowid-table digest unchanged. Compact authority
+        // tables (including workflow_activity) instead use their declared key.
+        let compact: bool = db.query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+            [&table], |r| r.get(0))?;
+        let sql = if compact {
+            let keys: Vec<String> = db.prepare(
+                "SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+                .query_map([&table], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            ensure!(!keys.is_empty(), "compact authority has no primary key: {table}");
+            format!("SELECT * FROM {} ORDER BY {}", quoted(&table),
+                keys.iter().map(|key| quoted(key)).collect::<Vec<_>>().join(","))
+        } else {
+            format!("SELECT rowid,* FROM {} ORDER BY rowid", quoted(&table))
+        };
         let mut query = db
-            .prepare(&format!(
-                "SELECT rowid,* FROM {} ORDER BY rowid",
-                quoted(&table)
-            ))
+            .prepare(&sql)
             .with_context(|| format!("unsupported authority layout: {table}"))?;
         let columns = query.column_count();
         hash.update((columns as u64).to_le_bytes());
@@ -497,6 +510,32 @@ mod tests {
         file.write_all(&[0]).unwrap();
         file.sync_all().unwrap();
     }
+    #[test]
+    fn adoption_recovery_preserves_populated_without_rowid_authority() {
+        let (temp, path) = fixture();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE compact_authority (
+            workflow TEXT NOT NULL, sequence INTEGER NOT NULL, payload BLOB NOT NULL,
+            PRIMARY KEY(workflow,sequence)) WITHOUT ROWID;
+            INSERT INTO compact_authority VALUES('original',2,x'00ff');
+            INSERT INTO compact_authority VALUES('original',1,x'0102');").unwrap();
+        let before = fingerprint(&db).expect("compact workflow authority must be fingerprintable");
+        db.execute("UPDATE compact_authority SET payload=x'0304' WHERE sequence=1", []).unwrap();
+        assert_ne!(fingerprint(&db).unwrap(), before, "compact authority mutation was invisible");
+        db.execute("UPDATE compact_authority SET payload=x'0102' WHERE sequence=1", []).unwrap();
+        drop(db);
+        damage(&path, "adopted_pr");
+        let result = recover(&path, &temp.path().join("snapshots"), true, None).unwrap();
+        assert_eq!(result["state"], "repaired");
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(fingerprint(&db).unwrap(), before);
+        let rows: Vec<(i64,Vec<u8>)> = db.prepare(
+            "SELECT sequence,payload FROM compact_authority ORDER BY sequence").unwrap()
+            .query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows, vec![(1,vec![1,2]),(2,vec![0,255])]);
+    }
+
     #[test]
     fn adoption_recovery_inspect_is_read_only_and_healthy_apply_is_noop() {
         let (temp, path) = fixture();
