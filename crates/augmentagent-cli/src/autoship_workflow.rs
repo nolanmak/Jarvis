@@ -34,6 +34,8 @@ pub(crate) mod resource_refusal;
 pub(crate) mod progress;
 #[path = "autoship_progress_retry.rs"]
 pub(crate) mod progress_retry;
+#[path = "autoship_progress_status.rs"]
+pub(crate) mod progress_status;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]

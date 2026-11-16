@@ -42,6 +42,8 @@ pub trait Transport: Send + Sync {
     async fn find_progress(&self,_context:&Context,_nonce:&str,_content:&str)->Result<Option<u64>> {Ok(None)}
     /// One progress send attempt. A definite rejection is a `SendRejected` error.
     async fn send_progress(&self,context:&Context,reply:&Reply)->Result<u64> {self.send(context,reply).await}
+    /// Replace the content of the workflow's status message. Idempotent.
+    async fn edit_progress(&self,_context:&Context,_message:u64,_reply:&Reply)->Result<()> {anyhow::bail!("progress edits unsupported")}
 }
 
 pub fn recognizes(text: &str) -> bool {
@@ -232,6 +234,9 @@ impl Transport for DiscordTransport {
 #[cfg(test)]
 #[path="autoship_progress_send_tests.rs"]
 mod progress_send_tests;
+#[cfg(test)]
+#[path="autoship_progress_edit_tests.rs"]
+mod progress_edit_tests;
 
 #[cfg(test)]
 mod tests {
