@@ -26,11 +26,12 @@ async fn family_wait_settlement_releases_confirmed_wait_without_erasing_usage() 
     assert!(after.wall_ms >= held.wall_ms);
     assert_eq!(serde_json::to_value(store.family_budget_wait(&id).unwrap()).unwrap(), wait);
     assert!(guard.validate_before_side_effect().is_err());
-    drop(guard);
+    guard.finish().unwrap();
     let events = store.events(&id).unwrap();
     accounting.settle_family_wait().await.unwrap().unwrap();
     assert_eq!(store.events(&id).unwrap(), events, "settlement replay wrote another release");
-    let now = millis();
+    let now = held.checkpoint.next.eligible_at_ms + 1;
+    assert!(now < held.lease_until_ms, "fixture must observe before the abandoned lease would expire");
     let free = store.claim_reconciliation(&id, "free-observer", now, LEASE_MS)
         .unwrap().expect("held productive lease blocked free reconciliation");
     store.release(&free, now + 1).unwrap();
@@ -54,4 +55,37 @@ async fn family_wait_settlement_never_releases_an_unpersisted_refusal() {
     assert!(accounting.settle_family_wait().await.is_err());
     assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(), before);
     assert!(guard.validate_before_side_effect().is_err());
+}
+
+#[tokio::test]
+async fn family_wait_settlement_survives_normal_pipeline_guard_drop() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    let id = guard.id().to_owned();
+    let accounting = guard.capacity_accounting(false).unwrap();
+    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    drop(guard); // Ordinary issue/resume futures consume their guard before settlement.
+    let store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(&id).unwrap().unwrap();
+    assert!(before.lease_until_ms > millis());
+    accounting.settle_family_wait().await.unwrap().unwrap();
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.lease_until_ms, 0);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert!(after.wall_ms >= before.wall_ms);
+    assert_eq!(after.checkpoint, before.checkpoint);
+}
+
+#[tokio::test]
+async fn family_wait_settlement_rejects_another_registered_audits_cleanup_proof() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    let (_other_checkout, _other_control, other) = funded_guard(2).await;
+    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    let owner = other.audit.native_runtime_owner().unwrap().unwrap();
+    other.audit.cancel_owned_runs(&owner).unwrap();
+    let proof = other.audit.owned_runs_quiescent(&owner).await.unwrap();
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    let error = store.release_family_wait(&guard.lease, &proof, millis()).unwrap_err();
+    assert!(error.to_string().contains("does not match registered native audit"));
+    assert_eq!(store.snapshot(guard.id()).unwrap().unwrap(), before);
 }
