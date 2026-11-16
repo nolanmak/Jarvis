@@ -15783,7 +15783,8 @@ CODEX-REVIEW: lgtm").0);
         let body = &src[start..end];
         let commits = body
             .matches(r#""commit", "--allow-empty", "-m", &msg"#)
-            .count();
+            .count()
+            + body.matches(r#""commit", "-m", &msg"#).count();
         let publishes = body.matches("publish_round(").count();
         assert_eq!(
             commits, 5,
