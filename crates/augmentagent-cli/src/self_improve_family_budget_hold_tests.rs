@@ -347,3 +347,39 @@ async fn unknown_family_usage_produces_a_specific_hold_without_inventing_zero() 
         .message
         .contains("authoritative family usage evidence"));
 }
+
+#[tokio::test]
+async fn unchanged_family_wait_does_not_reclaim_paid_work_after_observation_deadline() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    let id = guard.id().to_owned();
+    drop(guard);
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(&id).unwrap().unwrap();
+    let now = before.checkpoint.next.eligible_at_ms + 1;
+    let events = store.events(&id).unwrap();
+    assert!(store.claim_productive(&id, "paid-retry", now, LEASE_MS).unwrap().is_none(),
+        "unchanged exhausted family was reclaimed for productive work");
+    assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
+    assert_eq!(store.events(&id).unwrap(), events);
+}
+
+#[tokio::test]
+async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection() {
+    let (_checkout, control, guard) = funded_guard(2).await;
+    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    let id = guard.id().to_owned();
+    drop(guard);
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(&id).unwrap().unwrap();
+    let now = before.checkpoint.next.eligible_at_ms + 1;
+    let lease = store.claim_merge_reconciliation(&id, "free-reconcile", now, LEASE_MS)
+        .unwrap().expect("family compute budget blocked unpaid reconciliation");
+    store.release(&lease, now + 1).unwrap();
+    assert!(store.claim_productive(&id, "paid-retry", now + 2, LEASE_MS).unwrap().is_none(),
+        "free reconciliation's new generation erased the unchanged family wait");
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.checkpoint, before.checkpoint);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+}
