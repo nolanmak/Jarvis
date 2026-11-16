@@ -41,6 +41,52 @@ fn parse(text:&str)->Result<Request> {
 
 use crate::autoship_workflow::discord_controls::{Action,PreparedControl};
 
+/// `!autoship readopt <issue-or-PR URL> --reason TEXT` → (repository, target, reason).
+fn parse_readopt(text:&str)->Result<Option<(String,Target,String)>> {
+    ensure!(text.len()<=1024,"autoship-command-too-large");
+    let words:Vec<_>=text.split_whitespace().collect();
+    if words.first()!=Some(&"!autoship") || words.get(1)!=Some(&"readopt") {return Ok(None);}
+    ensure!(words.len()>=5 && words[3]=="--reason","expected !autoship readopt <issue-or-PR URL> --reason TEXT");
+    let url=words[2].strip_prefix('<').and_then(|s|s.strip_suffix('>')).unwrap_or(words[2]);
+    let path=url.strip_prefix("https://github.com/").ok_or_else(||anyhow::anyhow!("expected a GitHub HTTPS issue or PR URL"))?;
+    let parts:Vec<_>=path.split('/').collect();
+    ensure!(parts.len()==4,"expected an exact GitHub issue or PR URL");
+    let number:u64=parts[3].parse()?;ensure!(number>0,"positive target required");
+    let target=match parts[2] {"issues"=>Target::Issue(number),"pull"=>Target::Pr(number),_=>anyhow::bail!("expected an issue or PR URL")};
+    let repository=crate::autoship_workflow::submission::normalized_repository(&format!("{}/{}",parts[0],parts[1]))?.to_ascii_lowercase();
+    Ok(Some((repository,target,words[4..].join(" "))))
+}
+
+/// #1713 — readopt through L's readoption service. The service is idempotent
+/// by request id, so a crash before the reply commit re-runs harmlessly.
+async fn readopt(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,repository:&str,target:Target,reason:&str)->Result<()> {
+    let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+    if let Some(store)=WorkflowStore::open_read_only(path)? {
+        if store.replay_discord_control(origin,&digest)?.is_some() {
+            crate::self_improve::targeted::authorize_repository(repo,repository).await?;
+            return Ok(());
+        }
+    }
+    let (kind,number)=match target {Target::Issue(n)=>("issue",n),Target::Pr(n)=>("pr",n)};
+    let label=format!("{repository}#{number}");
+    let (refusal,content)=match target {
+        Target::Pr(_)=>(Some("pr-readoption-unsupported"),format!("Autoship readopt {label}: pr-readoption-unsupported. PR readoption ships with explicit PR adoption (#1537); no hold was changed.")),
+        Target::Issue(issue)=>{
+            let request=crate::self_improve::readoption::Request {repository:repository.into(),issue,reason:reason.into(),request_id:origin.request_id()};
+            match crate::self_improve::readoption::apply(repo,&request).await {
+                Ok(_)=>(None,format!("Autoship readopted {label}: the held issue returns to the pool for fresh scope and review; hold history is preserved and nothing was dispatched.")),
+                Err(error)=>{
+                    let code=error.downcast_ref::<crate::self_improve::readoption::Refusal>().map_or("workflow-state-unavailable",|r|r.reason());
+                    (Some(code),format!("Autoship readopt {label}: {code}. No hold was changed."))
+                }
+            }
+        }
+    };
+    let target=serde_json::json!({"repository":repository,"kind":kind,"number":number});
+    WorkflowStore::open(path)?.commit_discord_readopt(origin,&digest,&target,refusal,&content,chrono::Utc::now().timestamp_millis())?;
+    Ok(())
+}
+
 fn parse_control(text:&str)->Result<Option<(Action,Option<String>)>> {
     ensure!(text.len()<=1024,"autoship-command-too-large");
     let words:Vec<_>=text.split_whitespace().collect();
@@ -175,6 +221,16 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
         }
         return Ok(plain("Autoship coding sessions are unavailable in this build. This message was not queued and did not pause the workflow. Use `!autoship status`, `pause`, or `resume` to control the PR."));
     }
+    match parse_readopt(text) {
+        Ok(Some((repository,target,reason)))=>{
+            if readopt(repo,path,&origin,text,&repository,target,&reason).await.is_err() {
+                return Ok(plain("Autoship readopt could not be recorded. Check the message is the original request (a request ID cannot be reused for another target) and current GitHub access. No hold change is confirmed."));
+            }
+            return gateway_claim_ack(path,context);
+        }
+        Err(_)=>return Ok(plain("Autoship command not recognized. Use `!autoship readopt <issue URL> --reason TEXT`.")),
+        Ok(None)=>{},
+    }
     match parse_control(text) {
         Ok(Some((action,explicit)))=> {
             if control(repo,path,&origin,text,action,explicit.as_deref()).await.is_err() {
@@ -239,6 +295,14 @@ pub(crate) fn progress_claim(path:&Path,delivery:&augmentagent_approval_discord:
 pub(crate) fn progress_defer(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->Result<()> {
     let origin=gateway_origin(&delivery.context)?;
     WorkflowStore::open(path)?.defer_progress(&origin,&delivery.workflow,delivery.sequence,retry_after_ms,chrono::Utc::now().timestamp_millis()).map(|_|())
+}
+pub(crate) fn progress_edit_target(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<Option<u64>> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.progress_edit_target(&origin,&delivery.workflow,delivery.sequence)
+}
+pub(crate) fn progress_status_lost(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.forget_status_message(&origin,&delivery.workflow,delivery.sequence)
 }
 pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->Result<()> {
     let origin=gateway_origin(&delivery.context)?;
