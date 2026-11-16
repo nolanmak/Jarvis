@@ -16,6 +16,7 @@ impl WorkflowStore {
         let Some(snapshot)=self.snapshot(workflow)? else {return Ok(Vec::new());};
         let has_floor:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_review_floor')",[],|r|r.get(0))?;
         let floor=if has_floor {self.conn.query_row("SELECT after_seq FROM workflow_review_floor WHERE workflow=?1",[workflow],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(0)} else {0};
+        let floor=floor.max(integration::review_floor(&self.conn,workflow)?);
         let mut stmt=self.conn.prepare("SELECT kind,payload FROM workflow_event WHERE workflow=?1 AND seq>?2 ORDER BY seq DESC")?;
         let rows=stmt.query_map(params![workflow,floor],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
         let mut reviews=Vec::new();
