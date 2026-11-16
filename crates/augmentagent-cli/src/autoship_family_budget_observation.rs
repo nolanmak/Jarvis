@@ -298,8 +298,16 @@ pub(crate) fn observe(
                 result.block(Reason::FamilyBudgetPolicyMissing);
             }
             let usage = usage::aggregate(conn, family)?;
-            result.model_admissions = usage.model_admissions;
-            result.wall_ms = usage.wall_ms;
+            let membership_complete = state == "bound"
+                && (2..=6).contains(&count)
+                && members == count + 1
+                && manifest.as_deref() == Some(manifest_ref);
+            // A partial/empty member set is not a complete family ledger.
+            // Preserve its reported facts, but never certify its SUM as zero.
+            if membership_complete {
+                result.model_admissions = usage.model_admissions;
+                result.wall_ms = usage.wall_ms;
+            }
             result.retained = usage.retained;
             if result.model_admissions.is_none() || result.wall_ms.is_none() {
                 result.block(Reason::FamilySpendUnknown);

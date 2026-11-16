@@ -114,6 +114,29 @@ fn pending_family_without_policy_fences_new_admission_and_retains_original_spend
             .sum::<u64>(),
         13
     );
+    let pending_wire = serde_json::to_value(&pending).unwrap();
+    let reasons: Vec<_> = pending_wire["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["reason_code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "family_membership_pending",
+            "family_budget_policy_missing",
+            "family_spend_unknown"
+        ]
+    );
+    assert_eq!(
+        pending_wire["blockers"][0]["next"]["action"],
+        "await_verified_lineage"
+    );
+    assert_eq!(
+        pending_wire["blockers"][1]["next"]["action"],
+        "await_owner_budget_policy"
+    );
     let admission = store.charge_admitted_model(
         &child,
         "new-after-pending-family",
@@ -1161,5 +1184,90 @@ fn missing_bound_members_never_report_a_verified_zero_family_total() {
             .unwrap()
             .model_calls,
         1
+    );
+}
+
+#[test]
+fn unknown_family_authority_and_wrong_funding_request_have_named_next_actions() {
+    let (_dir, store, _root, child, _other, mut intent) = funded(false);
+    let family_budget::Intent::Delegated { request_ref, .. } = &mut intent else {
+        panic!()
+    };
+    *request_ref = "another-request-cannot-choose-this-grant".into();
+    let scope = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        scope["blockers"][0]["reason_code"],
+        "family_execution_scope_unknown"
+    );
+    assert_eq!(
+        scope["blockers"][0]["next"]["action"],
+        "await_protected_execution_scope"
+    );
+    store
+        .conn
+        .execute(
+            "ALTER TABLE workflow_family_member RENAME TO missing_family_members",
+            [],
+        )
+        .unwrap();
+    let authority = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        authority["blockers"][0]["reason_code"],
+        "family_authority_unknown"
+    );
+    assert_eq!(
+        authority["blockers"][0]["next"]["action"],
+        "await_authoritative_family_state"
+    );
+    assert_eq!(
+        authority["verified_model_admissions"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        1
+    );
+}
+
+#[test]
+fn ordinary_independent_work_does_not_acquire_a_family_policy_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    store
+        .register("owner/repo#1829", "ordinary-issue", fixture_binding(), 0)
+        .unwrap();
+    let observed = store
+        .family_budget_observation(
+            "owner/repo#1829",
+            &family_budget::Intent::Independent {
+                request_ref: "existing-ordinary-command".into(),
+            },
+            1,
+        )
+        .unwrap();
+    assert!(observed.ready());
+    assert!(observed.limits.is_none() && observed.remaining.is_none());
+    assert!(observed.blockers.is_empty());
+    assert_eq!(
+        store
+            .snapshot("owner/repo#1829")
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        0
     );
 }

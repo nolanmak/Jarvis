@@ -47,7 +47,7 @@ pub(crate) struct RetainedUsage {
     pub wall_ms: u64,
 }
 #[path = "autoship_family_budget_observation.rs"]
-mod observation;
+pub(crate) mod observation;
 pub(crate) use observation::Observation;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
