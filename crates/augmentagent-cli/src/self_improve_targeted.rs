@@ -2,6 +2,8 @@
 //! policy as unattended execution. Resolution is read-only and spends no models.
 use super::*;
 use crate::autoship_workflow::submission::{Request, Target};
+#[path = "self_improve_target_routing.rs"]
+mod routing;
 
 pub(super) enum Resolved {
     Issue(Issue),
@@ -528,11 +530,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             RunReport::held("Selected PR awaits current CI, review or merge admission".into())
         });
     }
-    COMMAND_LANE
-        .scope(
-            Lane::Combined,
-            run_selected(repo, false, Some(selected), mode),
-        )
+    routing::dispatch(selected, |selected| run_selected(repo, false, Some(selected), mode))
         .await.map_err(linked_claims::command_error)
 }
 
