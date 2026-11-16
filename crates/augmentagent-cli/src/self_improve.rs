@@ -21576,7 +21576,7 @@ raise AssertionError(args)
             }
         }
         let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let ready_id="fixture-owner/repo#1830";
-        if !case.starts_with("preview-") && !matches!(case.as_str(),"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
+        if !case.starts_with("preview-") && !matches!(case.as_str(),"worker-peer"|"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
             let controls=workflow::FreshIssueControls::open().unwrap();
             let issue=Issue {number:1830,title:"Correct retained widget rounding".into(),body:"Preserve exact rounding behavior.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
             let in_flight_preview=controls.unchanged_initial_hold(&repo,"fixture-owner/repo",&issue);

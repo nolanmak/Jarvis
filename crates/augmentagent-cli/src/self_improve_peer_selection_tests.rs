@@ -6,6 +6,12 @@ pub(super) async fn worker_selects_real_ready_peer(repo: &Path, database: &Path)
     let mut store = crate::autoship_workflow::WorkflowStore::open(database).unwrap();
     let ids = ["fixture-owner/repo#1833", "fixture-owner/repo#1830"];
     let before = ids.iter().map(|id| (store.snapshot(id).unwrap(), store.events(id).unwrap())).collect::<Vec<_>>();
+    assert!(!store.has_due_qualification_recovery(Some("fixture-owner/repo"), chrono::Utc::now().timestamp_millis()).unwrap(),
+        "fixture accidentally enabled the separate qualification-recovery wake");
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(before[index].0.as_ref().unwrap().checkpoint.next.action,
+            if id.ends_with("1833") { "await_readiness_input_change" } else { "await_acceptance_input_change" });
+    }
     let state = tempfile::tempdir().unwrap();
     let mut worker = AutoPrLoop::for_tests(repo.to_owned(), 5, state.path());
     worker.dry_run = false;
