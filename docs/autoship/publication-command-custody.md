@@ -23,7 +23,10 @@ model call, claim a lease, or change resource or merge accounting. Native VM
 ownership and publication command custody remain separate facts. In runtime
 integration, a publication-only audit must reject model admission before its
 accounting callback and reject native-owner installation. A native-owned audit
-cannot be converted into a publication-only audit.
+cannot be converted into a publication-only audit. Integration must extend the
+supervisor registration/cancellation/proof owner lookup to recognize publication
+custody while leaving `native_runtime_owner()` absent. The current native-only
+cancellation check cannot be reused unchanged for free publication.
 
 S/L1 owns this contract and its timer/cleanup integration. R continues to own
 capacity evidence and kernel resource admission. Reuse those APIs; coordinate
@@ -61,8 +64,9 @@ fences later dispatch. Heartbeats and duplicate output do not extend the clock;
 waiting/paused states have observation eligibility instead. The existing
 fifteen-minute per-command watchdog remains independent of the inactivity timer.
 
-D6. Live completion uses the original logger's sealed Rust quiescence capability,
-covering descendants and audit writers. Match its workflow, generation and audit
+D6. Live completion uses the original logger's opaque Rust quiescence capability,
+covering descendants and drained audit writers. Live completion does not revoke
+the audit: successor recovery seals the predecessor audit against further writes. Match its workflow, generation and audit
 path to the protected registration. Persist
 `publication_command_custody_completed` with schema version 1, original owner,
 and original audit path before releasing publication custody. Repeating it has
@@ -77,8 +81,10 @@ request. Resolve predecessor command custody before installing new command
 custody. Complete an existing matching idle request through the ordinary fenced
 recovery API; do not invent or clear another owner's request.
 
-Unknown cleanup preserves custody, evidence, spend and independent holds. S
-reconciles it without model calls or builder admission at five-minute observation
+Unknown cleanup preserves custody, evidence, spend and independent holds. Its
+reason is `publication_command_custody_unverified`, action
+`await_publication_command_teardown`, unless an independent owner/terminal/input
+hold must remain visible. S reconciles it without model calls or builder admission at five-minute observation
 eligibility, including after restart. Only verified original teardown/writer proof
 clears the blocker. A free observer may inspect a predecessor's native recovery;
 its own command cleanup must never claim to settle that predecessor's native
@@ -104,7 +110,9 @@ custody retained for unpaid observation, owner/wait/terminal preservation, and
 remote lost-response reconciliation without duplicate mutation.
 
 Use the registered managed cache, targeted tests, then one full relevant suite
-with `CARGO_BUILD_JOBS=4` and `--test-threads=4`. Required hosted checks and
+with `CARGO_BUILD_JOBS=4` and `--test-threads=4`. For the contract-only slice use
+`test -p augmentagent-channel-core --features test-isolation`; runtime CLI wiring
+also requires the full CLI suite from #2164. Required hosted checks and
 independent exact-head engineering review precede the serial train's merge.
 No benchmark, production state edit, repair-PR autoship test, allowance reset,
 legacy custody migration, other-role expansion or autonomous-shipping acceptance
