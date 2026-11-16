@@ -36,6 +36,8 @@ pub(crate) mod progress;
 pub(crate) mod progress_retry;
 #[path = "autoship_progress_status.rs"]
 pub(crate) mod progress_status;
+#[path = "autoship_progress_resolution.rs"]
+pub(crate) mod progress_resolution;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]
