@@ -55,11 +55,11 @@ impl WorkflowStore {
         self.pending_progress_at(bot,owner,chrono::Utc::now().timestamp_millis())
     }
     /// Pending sends at `now`; a deferred send reappears once its retry is due.
-    pub fn pending_progress_at(&self,bot:u64,owner:u64,_now:i64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
+    pub fn pending_progress_at(&self,bot:u64,owner:u64,now:i64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
         if !exists(&self.conn)? {return Ok(Vec::new());}
-        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM workflow_delivery_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR d.sequence>=s.sequence)) ORDER BY s.workflow,b.channel LIMIT 128")?;
-        let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?;
+        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM workflow_delivery_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR (d.sequence>=s.sequence AND NOT (d.state='retry' AND d.sequence=s.sequence AND EXISTS(SELECT 1 FROM workflow_progress_retry r WHERE r.workflow=d.workflow AND r.bot=d.bot AND r.owner=d.owner AND r.channel=d.channel AND r.sequence=d.sequence AND r.eligible_at<=?3))))) ORDER BY s.workflow,b.channel LIMIT 128")?;
+        let rows=stmt.query_map(params![bot.to_string(),owner.to_string(),now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?;
         rows.map(|row| {let (channel,workflow,sequence)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence))}).collect()
     }
     pub fn claim_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,now:i64)->Result<Option<(String,String)>> {
@@ -69,6 +69,13 @@ impl WorkflowStore {
         let raw:Option<(i64,String)>=tx.query_row("SELECT sequence,payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let Some((current,raw))=raw else {return Ok(None);};
         if current!=sequence {return Ok(None);}
+        // A definitely rejected send (#1714) is retried with its original marker once due.
+        let retry:Option<(String,String,i64)>=tx.query_row("SELECT d.nonce,d.content,r.eligible_at FROM workflow_progress_delivery d JOIN workflow_progress_retry r USING(workflow,bot,owner,channel,sequence) WHERE d.workflow=?1 AND d.bot=?2 AND d.owner=?3 AND d.channel=?4 AND d.sequence=?5 AND d.state='retry'",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((nonce,content,eligible_at))=retry {
+            if eligible_at>now {return Ok(None);}
+            tx.execute("UPDATE workflow_progress_delivery SET state='uncertain',dispatched_at=?6 WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5 AND state='retry'",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,now])?;
+            tx.commit()?;return Ok(Some((nonce,content)));
+        }
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND (state='uncertain' OR sequence>=?5))",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|r.get(0))?;
         if blocked {return Ok(None);}
         let progress:Progress=serde_json::from_str(&raw)?;
@@ -78,6 +85,8 @@ impl WorkflowStore {
         let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}.{resource}{tool_capacity} [autoship:{nonce}]",
             progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
+        // A newer update replaces a parked older one; it is never sent afterwards.
+        tx.execute("UPDATE workflow_progress_delivery SET state='superseded' WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence<?5 AND state='retry'",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence])?;
         tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
         tx.commit()?;Ok(Some((nonce,content)))
     }
