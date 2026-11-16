@@ -117,6 +117,9 @@ mod alignment;
 mod push_destination;
 #[path = "self_improve_publication.rs"]
 mod publication;
+#[cfg(test)]
+#[path="self_improve_review_recovery_acceptance_tests.rs"]
+pub(crate) mod review_recovery_acceptance_tests;
 #[path = "self_improve_review.rs"]
 mod aligned_review;
 #[path = "self_improve_review_canary.rs"]
