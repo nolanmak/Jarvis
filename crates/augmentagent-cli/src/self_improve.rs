@@ -21690,3 +21690,7 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_observation_wake_tests.rs"]
+mod observation_wake_tests;
