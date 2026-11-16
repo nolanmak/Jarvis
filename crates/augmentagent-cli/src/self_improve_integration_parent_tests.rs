@@ -517,7 +517,18 @@ async fn exercise_parent(test: &str, contenders: bool) {
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let target = std::env::var_os("CARGO_TARGET_DIR").unwrap();
+    // Hosted CI may invoke Cargo without an exported target override. Reuse
+    // the existing target containing this test executable; never create one.
+    // Cargo does not promise CARGO_TARGET_DIR in the test's runtime env.
+    // Reuse the existing target containing this profile/deps test binary.
+    // This is a read-only path observation, never a new build/cache root.
+    let executable = std::env::current_exe().unwrap();
+    let target = executable
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env_clear()
