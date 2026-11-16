@@ -373,7 +373,7 @@ async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
     let before = store.snapshot(&id).unwrap().unwrap();
     let now = before.checkpoint.next.eligible_at_ms + 1;
-    let lease = store.claim_merge_reconciliation(&id, "free-reconcile", now, LEASE_MS)
+    let lease = store.claim_reconciliation(&id, "free-reconcile", now, LEASE_MS)
         .unwrap().expect("family compute budget blocked unpaid reconciliation");
     store.release(&lease, now + 1).unwrap();
     assert!(store.claim_productive(&id, "paid-retry", now + 2, LEASE_MS).unwrap().is_none(),
