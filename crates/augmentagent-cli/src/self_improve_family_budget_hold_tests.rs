@@ -353,8 +353,11 @@ async fn unchanged_family_wait_does_not_reclaim_paid_work_after_observation_dead
     let (_checkout, control, guard) = funded_guard(2).await;
     assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
     let id = guard.id().to_owned();
-    drop(guard);
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    // All fixture sessions are pre-submission/settled; retire the old lease
+    // explicitly so custody exclusion cannot masquerade as a budget hold.
+    store.release(&guard.lease, millis()).unwrap();
+    drop(guard);
     let before = store.snapshot(&id).unwrap().unwrap();
     let now = before.checkpoint.next.eligible_at_ms + 1;
     let events = store.events(&id).unwrap();
@@ -369,8 +372,11 @@ async fn free_reconciliation_does_not_erase_family_wait_for_later_paid_selection
     let (_checkout, control, guard) = funded_guard(2).await;
     assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
     let id = guard.id().to_owned();
-    drop(guard);
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    // All fixture sessions are pre-submission/settled; retire the old lease
+    // explicitly so custody exclusion cannot masquerade as a budget hold.
+    store.release(&guard.lease, millis()).unwrap();
+    drop(guard);
     let before = store.snapshot(&id).unwrap().unwrap();
     let now = before.checkpoint.next.eligible_at_ms + 1;
     let lease = store.claim_reconciliation(&id, "free-reconcile", now, LEASE_MS)
