@@ -34,6 +34,8 @@ pub(crate) mod resource_refusal;
 pub(crate) mod progress;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
+#[path = "autoship_deployment_progress.rs"]
+pub(crate) mod deployment_progress;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
@@ -80,6 +82,7 @@ pub use verification_retry::VerificationDomain;
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
 pub use merge_escalation::UnresolvedMergeHold;
+pub use deployment_progress::{DeploymentOutcome, DeploymentReceipt};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
