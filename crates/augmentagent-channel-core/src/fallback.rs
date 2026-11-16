@@ -2446,3 +2446,7 @@ exit 1
         assert!(latch.active().is_empty(), "success clears the stale entry");
     }
 }
+
+#[cfg(test)]
+#[path="fallback_review_recovery_tests.rs"]
+mod review_recovery_tests;
