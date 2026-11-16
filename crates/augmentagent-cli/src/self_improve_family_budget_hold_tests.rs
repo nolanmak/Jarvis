@@ -833,3 +833,12 @@ async fn compute_exhaustion_does_not_replace_the_free_publication_control_gate()
     assert_eq!(store.merge_allowance(millis(),5).unwrap().available,5);
     assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
 }
+
+#[tokio::test]
+async fn compute_refusal_fences_installed_native_dispatch_even_when_control_is_ready() {
+    let (_checkout,_control,guard)=funded_guard(2).await;
+    guard.audit_logger().dispatch_allowed().expect("control-only dispatch fixture was not ready");
+    assert!(denied_native_call(&guard).await.to_string().contains("family_resource_exhausted"));
+    guard.audit_logger().dispatch_allowed().expect_err(
+        "the same controller admitted native dispatch after its paid call was held");
+}
