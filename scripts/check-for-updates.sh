@@ -53,6 +53,22 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 
+# Worker execution is isolated elsewhere. Deployment still requires the real
+# checkout to be clean, before sourcing or invoking any repository helper.
+# Avoid optional index refresh writes while observing owner changes.
+update_source_clean() {
+  local source_status=""
+  if ! source_status=$(git --no-optional-locks -c core.fsmonitor=false status --porcelain=v1 --untracked-files=all); then
+    log "DEPLOY CHECKOUT UNVERIFIED — cannot inspect source; leaving services and stamp unchanged"
+    return 1
+  fi
+  if [ -n "$source_status" ]; then
+    log "DEPLOY CHECKOUT DIRTY — preserving owner work; no helpers, builds or restarts"
+    return 1
+  fi
+}
+update_source_clean || exit 0
+
 reconcile_native_runtime() {
   if [ "$(uname -s)" = Linux ] && [ -f "$REPO_ROOT/scripts/ensure-native-runtime.py" ]; then
     if ! /usr/bin/python3 "$REPO_ROOT/scripts/ensure-native-runtime.py" >> "$LOG" 2>&1; then
@@ -189,6 +205,8 @@ reconcile_native_selection() {
 # stamp is advanced to $TARGET so a subsequent tick is a true no-op.
 apply_update() {
   local TARGET="$1"
+  # A fetch/pull can span an owner's interactive edit. Recheck before builds.
+  update_source_clean || return 1
   # #826 — how many restarts that were REQUIRED did not verifiably happen.
   local RESTART_FAILURES=0
 
