@@ -90,6 +90,14 @@ clears the blocker. A free observer may inspect a predecessor's native recovery;
 its own command cleanup must never claim to settle that predecessor's native
 custody. Existing terminal and owner-pause controls remain authoritative.
 
+The S completion adapter must extend the existing native-only registration check:
+for publication custody, verify the opaque proof against its exact protected
+`publication_command_custody_registered` owner/path rather than inserting a
+`workflow_native_owner` row. Native recovery retains its existing native-row
+check. Conflicting native/publication registration is refused. The release guard
+also checks publication completion when there is no idle request; absence of a
+native-owner row is not permission to release unverified command custody.
+
 D7. Local cancellation does not prove a GitHub mutation did not happen. Preserve
 publication/merge intents and reconcile the actual remote result through the
 existing services before repeating a mutation. Retry debt remains the existing
