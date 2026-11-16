@@ -152,7 +152,7 @@ pub(super) async fn evaluate(
 }
 
 async fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let (ok, out, error) = run("git", args, root).await?;
+    let (ok, out, error) = workspace::preparation_git(root, args).await?;
     anyhow::ensure!(ok, "episode Git operation failed: {error}");
     Ok(out.trim().to_string())
 }
