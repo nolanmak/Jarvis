@@ -145,15 +145,21 @@ fn global_writer_still_requires_compiler_evidence() {
 
 #[test]
 fn global_writer_preserves_whole_root_retirement() {
+    isolated_retention_test("disk::prune_tests::whole_root_retirement_child");
+}
+
+fn isolated_retention_test(test_name: &str) {
     let isolated = tempfile::tempdir().unwrap();
     let scratch = isolated.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "disk::prune_tests::whole_root_retirement_child", "--ignored", "--nocapture"])
+        .args(["--exact", test_name, "--ignored", "--nocapture"])
         .env("XDG_STATE_HOME", isolated.path().join("state"))
         .env("TMPDIR", &scratch)
         .env("AUGMENTAGENT_GATE_TARGET_DIR", isolated.path().join("gate"))
         .env("AUGMENTAGENT_PRUNE_TARGET_DIRS", "")
+        .env("AUGMENTAGENT_PRUNE_VERIFIER_KEEP", "3")
+        .env("AUGMENTAGENT_PRUNE_VERIFIER_MAX_GB", "20")
         .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0")
         .env("AUGMENTAGENT_BUILD_GROWTH_GB", "0")
         .output().unwrap();
@@ -196,6 +202,60 @@ fn whole_root_retirement_child() {
         if dry_run { assert_eq!(tree(&f.b), before_b); }
         else { assert!(!f.b.exists(), "whole orphan target must be removed"); }
         assert_eq!(tree(&f.a), before_a);
+        assert!(writer.0.try_wait().unwrap().is_none());
+        assert!(crate::build_storage::Lease::try_at(&f.state).unwrap().is_none());
+    }
+}
+
+
+#[test]
+fn global_writer_runs_verifier_retention_and_defers_busy_verifier() {
+    isolated_retention_test("disk::prune_tests::verifier_retention_child");
+}
+
+#[test]
+#[ignore = "isolated environment helper invoked by the parent regression"]
+fn verifier_retention_child() {
+    let mut f = Fixture::new();
+    f.state = crate::build_storage::state_dir().unwrap();
+    fn age_tree(path: &Path, time: SystemTime) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                age_tree(&entry.unwrap().path(), time);
+            }
+        }
+        std::fs::File::open(path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(time)).unwrap();
+    }
+    let caches: Vec<_> = (0..5).map(|i| {
+        let path = f._tmp.path().join(format!("augmentagent-verifier-{i:064x}"));
+        crate::build_storage::register(&f.repo, &path, Some(&f.repo), &f.state).unwrap();
+        std::fs::create_dir_all(path.join("debug/deps")).unwrap();
+        std::fs::write(path.join("debug/deps/warm.rlib"), vec![7; 8192]).unwrap();
+        age_tree(&path, SystemTime::now() - Duration::from_secs(3500 - i * 300));
+        path
+    }).collect();
+    let _global = crate::build_storage::Lease::try_at(&f.state).unwrap().unwrap();
+    let mut writer = child_lease(&caches[0]);
+    let before: Vec<_> = caches.iter().map(|p| tree(p)).collect();
+    for dry in [true, false] {
+        let reports = f.prune(vec![], dry, None, Some(vec![]));
+        let reports = reports.as_array().unwrap();
+        let busy = reports.iter().find(|r| r["path"] == caches[0].display().to_string())
+            .expect("leased verifier must be named");
+        assert_eq!(busy["outcome"], "deferred", "busy verifier must not report pruned: {busy}");
+        assert_eq!(busy["removed"], 0);
+        for i in [1, 2] {
+            let retired = reports.iter().find(|r| r["path"] == caches[i].display().to_string())
+                .expect("verifier retention must run inside the busy-global path");
+            assert_eq!(retired["outcome"], "pruned");
+            assert_eq!(retired["full_drop"], true);
+            assert!(retired["freed_bytes"].as_u64().unwrap() > 0);
+        }
+        for (i, path) in caches.iter().enumerate() {
+            if dry || i == 0 || i >= 3 { assert_eq!(tree(path), before[i]); }
+            else { assert!(!path.exists(), "older idle verifier must be retired regardless of age"); }
+        }
         assert!(writer.0.try_wait().unwrap().is_none());
         assert!(crate::build_storage::Lease::try_at(&f.state).unwrap().is_none());
     }
