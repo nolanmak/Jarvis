@@ -13,8 +13,13 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_activity_observation.rs"]
+mod activity_observation;
+
 #[path = "autoship_activity.rs"]
 pub(crate) mod activity;
+#[path = "autoship_runtime_events.rs"]
+pub(crate) mod runtime_events;
 
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
@@ -800,6 +805,7 @@ impl WorkflowStore {
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
         activity::initialize(&conn)?;
+        runtime_events::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -2359,6 +2365,7 @@ fn event(
     )?;
     progress::project(tx,workflow,kind,now_ms)?;
     activity::project(tx,workflow,kind,payload,now_ms)?;
+    runtime_events::project(tx,workflow,kind,payload,now_ms)?;
     Ok(())
 }
 
