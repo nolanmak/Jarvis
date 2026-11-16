@@ -384,7 +384,7 @@ impl CodexCliReasoner {
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &mut native_vm {
             Some(vm) => vm.spawn_admitted(clean, opts.handoff_path.as_deref()),
-            None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref(), launch_audit.as_ref()),
         };
         let (mut child, process_group) = spawned.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {

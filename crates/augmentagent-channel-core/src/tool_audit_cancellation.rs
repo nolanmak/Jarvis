@@ -1,7 +1,7 @@
 //! Controller-owned cancellation of supervised descendants. Model output is not proof.
 use super::AuditLogger;
 use crate::native_vm::RuntimeOwner;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -28,9 +28,14 @@ pub(crate) struct Registration {
     registry: Arc<Registry>,
     run: Arc<Run>,
     settled: bool,
+    audit: AuditLogger,
+    owner: RuntimeOwner,
+    run_id: String,
 }
 impl Registration {
     pub(crate) fn complete(mut self, clean: bool) {
+        let clean=clean && self.audit.record_controller(serde_json::json!({"actor":"controller",
+            "kind":"owned_supervisor_completed","version":1,"owner":self.owner,"run_id":self.run_id,"clean":clean})).is_ok();
         if let Ok(mut slot) = self.run.completed.lock() {
             *slot = Some(clean);
         }
@@ -60,7 +65,12 @@ impl Registry {
         );
         Ok(())
     }
-    fn register(self: &Arc<Self>, receipt: &Path) -> Result<Registration> {
+    fn register(
+        self: &Arc<Self>,
+        receipt: &Path,
+        audit: &AuditLogger,
+        owner: RuntimeOwner,
+    ) -> Result<Registration> {
         let mut state = self
             .state
             .lock()
@@ -73,11 +83,23 @@ impl Registry {
             cancel: receipt.with_file_name("cancel-requested"),
             completed: Mutex::new(None),
         });
+        use sha2::{Digest, Sha256};
+        let run_id = format!(
+            "{:x}",
+            Sha256::digest(receipt.as_os_str().as_encoded_bytes())
+        );
+        audit.record_controller(
+            serde_json::json!({"actor":"controller","kind":"owned_supervisor_registered",
+            "version":1,"owner":owner,"run_id":run_id,"receipt":receipt}),
+        )?;
         state.runs.push(run.clone());
         Ok(Registration {
             registry: self.clone(),
             run,
             settled: false,
+            audit: audit.clone(),
+            owner,
+            run_id,
         })
     }
     fn cancel(&self) -> Result<()> {
@@ -151,8 +173,12 @@ pub struct OwnedRunsQuiescence {
     owner: RuntimeOwner,
     audit_path: PathBuf,
     runs: usize,
+    recovered_for_generation: Option<i64>,
 }
 impl OwnedRunsQuiescence {
+    pub fn recovered_for_generation(&self) -> Option<i64> {
+        self.recovered_for_generation
+    }
     pub fn owner(&self) -> &RuntimeOwner {
         &self.owner
     }
@@ -172,10 +198,92 @@ impl AuditLogger {
         Ok(())
     }
     pub(crate) fn register_owned_run(&self, receipt: &Path) -> Result<Option<Registration>> {
-        if self.is_protected() && self.native_runtime_owner()?.is_some() {
-            return Ok(Some(self.owned_runs.register(receipt)?));
+        if self.is_protected() {
+            if let Some(owner) = self.native_runtime_owner()? {
+                return Ok(Some(self.owned_runs.register(receipt, self, owner)?));
+            }
         }
         Ok(None)
+    }
+    /// For a newer fenced controller only. Inspect the durable supervisor
+    /// inventory and kernel scopes, then seal the old audit against new writers.
+    /// The store must separately validate the successor lease before and after.
+    pub fn recover_owned_runs(
+        &self,
+        owner: &RuntimeOwner,
+        successor_generation: i64,
+    ) -> Result<OwnedRunsQuiescence> {
+        ensure!(
+            self.is_protected() && owner.lease_generation > 0 && !owner.workflow_id.is_empty(),
+            "restart custody requires a protected audit and valid owner"
+        );
+        ensure!(
+            successor_generation > owner.lease_generation,
+            "restart custody requires a newer fenced generation"
+        );
+        let sink = self.anchored.as_ref().unwrap();
+        if let Some(sealed) = sink.sealed_custody_proof()? {
+            let validation = &sealed["validation"];
+            ensure!(
+                validation["kind"] == "supervised_idle_recovery"
+                    && validation["version"] == 1
+                    && validation["owner"] == serde_json::to_value(owner)?,
+                "sealed audit does not prove this supervised owner"
+            );
+            let runs = usize::try_from(
+                validation["supervised_runs"]
+                    .as_u64()
+                    .context("sealed supervisor count missing")?,
+            )?;
+            return Ok(OwnedRunsQuiescence {
+                owner: owner.clone(),
+                audit_path: self.path.clone(),
+                runs,
+                recovered_for_generation: Some(successor_generation),
+            });
+        }
+        // Refuse an incomplete committed prefix before attempting a seal.
+        self.owned_run_inventory(owner)?;
+        let mut runs = 0;
+        self.anchored.as_ref().unwrap().seal_for_recovery(|rows| {
+            ensure!(
+                self.pending_writers
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0,
+                "audit writers still active"
+            );
+            if let Some(dir) = &self.pending_dir {
+                ensure!(
+                    std::fs::read_dir(dir)?.next().is_none(),
+                    "audit inventory has unresolved writer custody"
+                );
+            }
+            let inventory = super::run_inventory::inspect_rows(owner, rows)?;
+            ensure!(
+                inventory.inventory_complete
+                    && inventory.registered_runs == inventory.quiescent_runs,
+                "old supervised custody is live or incomplete"
+            );
+            let mut resources = Vec::new();
+            for row in rows {
+                if row["actor"] == "controller" && row["kind"] == "run_resource_admitted" {
+                    resources.push(crate::run_resources::verify_quiescent(
+                        &row["observation"]["identity"],
+                    )?);
+                }
+            }
+            runs = inventory.registered_runs;
+            Ok(
+                serde_json::json!({"kind":"supervised_idle_recovery","version":1,"owner":owner,"successor_generation":successor_generation,
+                "supervised_runs":runs,"quiescent_resources":resources}),
+            )
+        })?;
+        Ok(OwnedRunsQuiescence {
+            owner: owner.clone(),
+            audit_path: self.path.clone(),
+            runs,
+            recovered_for_generation: Some(successor_generation),
+        })
     }
     /// Request supervisor teardown, never signal an unrelated PID or release custody.
     pub fn cancel_owned_runs(&self, owner: &RuntimeOwner) -> Result<()> {
@@ -191,6 +299,7 @@ impl AuditLogger {
             owner: owner.clone(),
             audit_path: self.path.clone(),
             runs,
+            recovered_for_generation: None,
         })
     }
 }
@@ -233,14 +342,12 @@ mod tests {
             crate::run_resources::spawn_command(&command, Some(logger)).unwrap();
         guard.admit("fixture", Some(logger)).await.unwrap();
         drop(child.stdin.take());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !pidfile.exists() {
+        let pid=tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                if let Some(pid)=std::fs::read_to_string(&pidfile).ok().and_then(|raw|raw.parse::<i32>().ok()) {break pid;}
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        })
-        .await
-        .unwrap();
-        let pid = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+        }).await.unwrap();
         (child, guard, pid)
     }
     #[tokio::test]
