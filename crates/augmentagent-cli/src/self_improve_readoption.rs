@@ -46,6 +46,10 @@ impl std::fmt::Display for Refusal {
     }
 }
 impl std::error::Error for Refusal {}
+impl Refusal {
+    /// Bounded, stable reason code for adapters (Discord) that echo it.
+    pub(crate) fn reason(&self) -> &'static str { self.reason }
+}
 fn refuse(code: i32, reason: &'static str, detail: impl Into<String>) -> anyhow::Error {
     Refusal { code, reason, detail: detail.into() }.into()
 }
@@ -375,6 +379,83 @@ else: sys.exit(2)
         drop(store);
         assert_eq!(refusal(apply(&root, &request("r4")).await.unwrap_err()), "explicit-owner-hold");
         assert_eq!(edits(), "7\n7\n");
+    }
+
+    /// #1713 D — Discord readopt goes through the same readoption service and
+    /// the one durable Discord request table (kind=readopt, workflow NULL),
+    /// persisted before the ack and idempotent per Discord request id.
+    #[tokio::test]
+    async fn discord_readopt_is_durable_idempotent_and_owner_only() {
+        const DISCORD_CHILD: &str = "AUTOSHIP_DISCORD_READOPT_CHILD";
+        if std::env::var_os(DISCORD_CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::Builder::new().prefix("discord-readopt-").tempdir_in("/tmp").unwrap();
+            let root_path = root.path().canonicalize().unwrap();
+            let gh = root_path.join("gh.py");
+            std::fs::write(&gh, GH).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::readoption::tests::discord_readopt_is_durable_idempotent_and_owner_only", "--nocapture"])
+                .env(DISCORD_CHILD, "1").env(CHILD, &root_path).env("GH_BIN", gh).env("AUGMENTAGENT_GH_OWNER", "controller")
+                .env("XDG_STATE_HOME", root_path.join("state"))
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root_path.join("state/workflow.db"))
+                .output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let write = |name: &str, value: &Value| std::fs::write(root.join(name), serde_json::to_vec(value).unwrap()).unwrap();
+        let edits = || std::fs::read_to_string(root.join("edits")).unwrap_or_default();
+        let path = workflow::path();
+        std::fs::write(root.join("permission"), "ADMIN").unwrap();
+        write("issue.json", &issue(true));
+        write("timeline.json", &json!(history(GIVE_UP_SCOPER_PREDICTS_REFUSAL, 1)));
+        let context = |message: u64, author: u64| augmentagent_approval_discord::autoship::Context {
+            bot: 11, owner: Some(22), author, channel: 33, message, guild: None };
+        let text = "!autoship readopt https://github.com/controller/repo/issues/7 --reason legacy hold from the October audit";
+        let readopt_rows = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut q = conn.prepare("SELECT request_id,kind,workflow IS NULL,target,json_extract(response,'$.accepted'),json_extract(response,'$.reason') FROM discord_control_request WHERE kind='readopt' ORDER BY request_id").unwrap();
+            q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?, r.get::<_, String>(5)?)))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+
+        let reply = crate::autoship_discord_command::gateway_command(&root, &path, &context(101, 22), text).await.unwrap().unwrap();
+        assert!(reply.content.starts_with("Autoship") && reply.content.contains("readopted"), "{}", reply.content);
+        assert_eq!(edits(), "7\n");
+        assert_eq!(rows(&path), vec![("discord:11:101".into(), "applied".into())], "the readoption service recorded the owner authority");
+        let recorded = readopt_rows();
+        assert_eq!(recorded.len(), 1);
+        let (id, kind, workflow_null, target, accepted, reason) = &recorded[0];
+        assert_eq!((id.as_str(), kind.as_str(), *workflow_null, *accepted, reason.as_str()), ("discord:11:101", "readopt", true, true, "owner-readopted"));
+        assert_eq!(serde_json::from_str::<Value>(target).unwrap(), json!({"repository":"controller/repo","kind":"issue","number":7}));
+
+        // Redelivery replays the recorded reply; nothing is applied twice.
+        let again = crate::autoship_discord_command::gateway_command(&root, &path, &context(101, 22), text).await.unwrap();
+        assert!(again.is_none_or(|r| r.content == reply.content));
+        assert_eq!(edits(), "7\n");
+        assert_eq!(readopt_rows().len(), 1);
+
+        // The same Discord request id cannot be reused for another target.
+        let other = "!autoship readopt https://github.com/controller/repo/issues/8 --reason legacy hold from the October audit";
+        let changed = crate::autoship_discord_command::gateway_command(&root, &path, &context(101, 22), other).await.unwrap().unwrap();
+        assert!(changed.content.contains("could not be recorded"), "{}", changed.content);
+        assert_eq!(readopt_rows().len(), 1);
+        assert_eq!(edits(), "7\n");
+
+        // PR readoption is refused through the same record, without writes.
+        let pr = "!autoship readopt https://github.com/controller/repo/pull/42 --reason adopt it";
+        let refused = crate::autoship_discord_command::gateway_command(&root, &path, &context(102, 22), pr).await.unwrap().unwrap();
+        assert!(refused.content.contains("pr-readoption-unsupported"), "{}", refused.content);
+        let recorded = readopt_rows();
+        assert_eq!((recorded.len(), recorded[1].4, recorded[1].5.as_str()), (2, false, "pr-readoption-unsupported"));
+        assert_eq!(edits(), "7\n");
+
+        // Only the configured owner may issue it: no record, no call.
+        let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+        assert!(crate::autoship_discord_command::gateway_command(&root, &path, &context(103, 99), text).await.is_err());
+        assert_eq!(readopt_rows().len(), 2);
+        assert_eq!(std::fs::read_to_string(root.join("calls")).unwrap(), calls, "an unauthorized author reaches no GitHub boundary");
     }
 
     #[test]

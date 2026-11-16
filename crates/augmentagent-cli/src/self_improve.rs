@@ -118,6 +118,9 @@ mod recovery;
 mod checkout_identity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
+#[path = "self_improve_observation_wake.rs"]
+mod observation_wake;
+
 #[path = "self_improve_targeted.rs"]
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
@@ -12497,7 +12500,8 @@ impl AutoPrLoop {
                                 .and_then(|store| store.map(|s| -> Result<bool> {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
-                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12523,7 +12527,12 @@ impl AutoPrLoop {
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
-                            Ok(false) => {},
+                            Ok(false) => match observation_wake::reserve(&self.workflow_path,
+                                self.command_repository.as_deref().unwrap(),(self.clock)().timestamp_millis()) {
+                                Ok(true)=>break,
+                                Ok(false)=>{},
+                                Err(error)=>warn!("activity observation wake-up unavailable: {error:#}"),
+                            },
                             Err(error) => warn!("command queue wake-up unavailable: {error:#}"),
                         }
                     }
@@ -12887,6 +12896,8 @@ else:raise Exception('unexpected fixture call '+repr(args))
                 store.release(&lease, 0).unwrap();
                 if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
                 assert!(!store.has_command_jobs().unwrap());
+                assert_eq!(store.has_due_main_reconciliation(Some("owner/repo"),1_000).unwrap(),
+                    case=="ready", "the dedicated main gate must still reject {case}");
                 tokio::time::sleep(std::time::Duration::from_secs(26)).await;
                 timer_stop.cancel();
             };
@@ -12896,7 +12907,10 @@ else:raise Exception('unexpected fixture call '+repr(args))
             }, || async {0});
             let (result, ()) = tokio::join!(run, submitted);
             result.unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+            // Eligible generic reconciliation now has its independent S activity
+            // wake; it must not masquerade as a main-dependency signal above.
+            assert_eq!(calls.load(Ordering::SeqCst),
+                usize::from(matches!(case,"ready"|"generic-reconcile")), "{case}");
         }
     }
 
@@ -21559,6 +21573,10 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_observation_wake_tests.rs"]
+mod observation_wake_tests;
 
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]
