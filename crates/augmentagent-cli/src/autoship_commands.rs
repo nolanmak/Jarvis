@@ -12,6 +12,8 @@ pub(crate) mod run_command;
 pub(crate) mod merge_recovery;
 #[path = "autoship_delivery_command.rs"]
 pub(crate) mod delivery_command;
+#[path = "autoship_deployment_command.rs"]
+pub(crate) mod deployment_command;
 // Shared command projections. Read paths never create state or launch work.
 use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 use anyhow::{ensure, Result};
@@ -74,11 +76,14 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
         let command = store.command_request(workflow)?;
         let attempt = store.command_attempt(workflow)?;
         let owner_control=store.owner_control(workflow)?;
-        let delivery=store.progress_delivery(workflow)?;
+        let delivery=store.progress_delivery_at(workflow,chrono::Utc::now().timestamp_millis())?;
         let owner_messages_pending=store.pending_owner_messages(workflow)?;
         let paused=owner_control.as_ref().is_some_and(|c|c.paused);
         let Some(snapshot) = store.snapshot(workflow)? else {
             let Some(command) = command else { return Ok(None); };
+            // The ledger is readable before any claim; queued is not unknown.
+            // cap 0 means the caller asked for no allowance (Discord status).
+            let allowance = if cap > 0 { Some(store.merge_allowance(now, cap)?) } else { None };
             // Admission is durable before a worker claims the job. There is no
             // execution/head/worker-liveness evidence at this point.
             // A failed attempt is still retryable. Only authoritative workflow
@@ -95,7 +100,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
                 "resource_refusal":if paused {None} else {attempt.as_ref().and_then(|a|a.resource_observation())},"last_attempt":attempt,
                 "provider":command.provider,"workflow_until":command.until,"pr_url":null,
                 "worker":{"state":"unknown"},"merge":{"state":"not-confirmed"},
-                "deployment":{"state":"unknown"},"allowance":null,
+                "deployment":{"state":"unknown"},"allowance":allowance,
                 "pending_merge_operations":[],"pending_merge_evidence":[],
                 "resources":null,"lease":{"active":false},"progress_at_ms":null}))));
         };

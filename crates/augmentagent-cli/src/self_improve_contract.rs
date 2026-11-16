@@ -829,7 +829,9 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
     }
     if let Some((context,verifier))=original {
-        return context.captured_observation(verifier)?.context(initial_repair::Hold::EvidenceUnknown);
+        let observation=context.captured_observation(verifier)?.context(initial_repair::Hold::EvidenceUnknown)?;
+        context.record_completed_progress(verifier).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+        return Ok(observation);
     }
     match result {
         Ok((status, stdout, stderr)) => Ok(Observation {

@@ -1,6 +1,8 @@
 //! Production bridge between the autoship lanes and durable workflow state.
 //! Included beneath self_improve so Git commands use the same sanitized runner.
 use super::*;
+#[path = "self_improve_stage_activity.rs"]
+mod stage_activity;
 use crate::autoship_workflow::{
     self as durable, Binding, Checkpoint, Lease, NextAction, Operation, OperationKind,
     ResourceCharge, Review, Stage, WorkflowStore,
@@ -523,6 +525,9 @@ pub(super) struct SweepGuard {
     worktree_lock: Mutex<Option<RunLock>>,
 }
 impl SweepGuard {
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.inner.as_ref().is_some_and(WorkflowGuard::legacy_notice_suppressed)
+    }
     pub(super) async fn acquire(
         repository: &str,
         issue: u64,
@@ -1144,6 +1149,7 @@ impl WorkflowGuard {
     }
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
+        self.install_native_tool_progress()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         let dispatch_identity=self.checkout_identity.clone();
@@ -1386,6 +1392,11 @@ impl WorkflowGuard {
 
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
+    }
+    /// #1714: when the durable outbox routes this workflow, legacy
+    /// `notify_review` must stay silent so the owner is not told twice.
+    pub(super) fn legacy_notice_suppressed(&self) -> bool {
+        self.store.lock().ok().and_then(|store|store.durable_route_owns_updates(self.id()).ok()).unwrap_or(false)
     }
     pub(super) fn binding(&self) -> &Binding {
         &self.binding

@@ -1156,6 +1156,8 @@ enum AutoprOp {
     Run(autoship_commands::run_command::RunArgs),
     /// Bind durable progress delivery to the configured owner's private DM.
     Delivery(autoship_commands::delivery_command::Args),
+    /// Record updater deployment receipts; merged is never deployed by itself.
+    Deployment(autoship_commands::deployment_command::Args),
     /// Inspect native credential declarations; no provider calls or refresh.
     Readiness { #[arg(long)] json: bool },
     /// Resolve a pending merge using bound controller and GitHub evidence.
@@ -3219,6 +3221,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::Delivery(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::delivery_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Deployment(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::deployment_command::run(args));
     }
     if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
         let root=match tokio::process::Command::new("git").args(["rev-parse","--show-toplevel"]).output().await {
@@ -5862,6 +5867,7 @@ async fn main() -> Result<()> {
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Delivery(..) } => unreachable!("delivery administration precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Deployment(..) } => unreachable!("deployment receipts precede application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
