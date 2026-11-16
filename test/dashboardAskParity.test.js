@@ -53,7 +53,11 @@ test("closing a dashboard ask stops its Jarvis CLI process", async () => {
   const cli = path.join(root, "fake-augmentagent");
   const pidFile = path.join(root, "pid");
   fs.writeFileSync(cli, `#!/usr/bin/env node
-require("node:fs").writeFileSync(process.env.SYNTHETIC_PID_FILE, String(process.pid));
+const fs = require("node:fs");
+const pidFile = process.env.SYNTHETIC_PID_FILE;
+// Existence is the reader's ready signal: publish only the complete PID.
+fs.writeFileSync(pidFile + ".tmp", String(process.pid));
+fs.renameSync(pidFile + ".tmp", pidFile);
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });
   process.env.AUGMENTAGENT_BIN = cli;
@@ -77,6 +81,7 @@ setInterval(() => {}, 1000);
     }
     assert(fs.existsSync(pidFile), "the shared CLI should have started");
     const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    assert(Number.isSafeInteger(pid) && pid > 0, "readiness must name a positive CLI PID, never process group 0");
     controller.abort();
     assert(await request instanceof Error);
     let gone = false;
@@ -89,6 +94,45 @@ setInterval(() => {}, 1000);
     controller.abort();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dashboard cancellation never observes a partially published fixture PID", { timeout: 15000 }, async () => {
+  if (process.platform === "win32") return;
+  const { spawnSync } = require("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-dashboard-pid-race-"));
+  const gate = path.join(root, "gate");
+  const trace = path.join(root, "trace.jsonl");
+  try {
+    const fifo = spawnSync("mkfifo", [gate], { encoding: "utf8" });
+    assert.equal(fifo.status, 0, fifo.stderr);
+    const preload = path.join(__dirname, "fixtures/dashboardPidPublication.cjs");
+    const { promisify } = require("node:util");
+    const { execFile } = require("node:child_process");
+    const env = { ...process.env, L5_PID_GATE: gate, L5_PID_TRACE: trace,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${JSON.stringify(preload)}` };
+    delete env.NODE_TEST_CONTEXT; // A separate runner, not recursion in this worker.
+    let output;
+    try {
+      output = await promisify(execFile)(process.execPath, ["--test",
+        "--test-name-pattern=^closing a dashboard ask stops its Jarvis CLI process$", __filename], {
+        env,
+        timeout: 10000,
+      });
+    } catch (error) {
+      assert.fail(`${error.stdout || ""}\n${error.stderr || ""}\n${fs.existsSync(trace) ? fs.readFileSync(trace, "utf8") : "no lifecycle trace"}`);
+    }
+    assert(fs.existsSync(trace), JSON.stringify(output));
+    const events = fs.readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse);
+    assert(events.some((event) => event.event === "pid-file-created"));
+    assert(events.some((event) => event.event === "pid-not-published"),
+      "the reader must encounter the paused writer before its PID is published");
+    const read = events.find((event) => event.event === "pid-read");
+    const spawned = events.find((event) => event.event === "spawn");
+    assert.equal(read.parsed, spawned.child, "the readiness file must name the actual child");
+    assert(events.some((event) => event.event === "child-exit" && event.signal === "SIGTERM"));
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
