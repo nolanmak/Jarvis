@@ -23,6 +23,8 @@ pub(crate) mod family_budget;
 mod family_budget_tests;
 #[path = "autoship_activity_observation.rs"]
 mod activity_observation;
+#[path = "autoship_idle_recovery.rs"]
+pub(crate) mod idle_recovery;
 #[path = "autoship_outcome_classification.rs"]
 mod outcome_classification;
 
@@ -1270,6 +1272,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -1757,7 +1760,7 @@ impl WorkflowStore {
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
             // late usage/accounting for the original call remains recordable.
-            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
+            if admission.is_some() {idle_recovery::require_dispatch(&tx,&lease.workflow)?;baseline_native_custody(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -2018,6 +2021,7 @@ impl WorkflowStore {
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         require_binding(&tx,lease,binding,now)?;
         owner_turn::require_native_dispatch(&tx,lease,now)?;
         tx.commit()?;Ok(())
