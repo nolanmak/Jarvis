@@ -3,6 +3,8 @@
 //! Callers own durable state and provider construction. Model text cannot grant
 //! deterministic merge permission, invent file coverage, or rewrite an earlier
 //! decision. All receipts must be stored with the binding that produced them.
+#[path="autoship_review_session_policy.rs"]
+mod session_policy;
 use anyhow::{bail, ensure, Context, Result};
 use augmentagent_channel_core::{Reasoner, ReasonerOpts};
 use serde::{Deserialize, Serialize};
@@ -826,6 +828,7 @@ async fn adjudicate_with_origin<R: Reasoner + ?Sized>(
                 augmentagent_channel_core::ProviderKind::Codex,call).await?;
             actor.session_id=native_session;
             actor.independent_for(builders,origin)?;
+            session_policy::actor(origin,&actor)?;
             if let Some(logger)=&opts.audit_logger {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"adjudicator_native_conversation",
                     "correction":correction,"binding":binding,"native_session":actor.session_id,"request_hash":digest(request.as_bytes())}))?;
@@ -969,7 +972,9 @@ pub fn review_authority_with_origin(
     origin: &ReviewOrigin,
 ) -> Result<MergeAuthority> {
     origin.validate(&binding.head)?;
-    review_authority_checked(binding, builders, passes, adjudication, origin)
+    let authority=review_authority_checked(binding, builders, passes, adjudication, origin)?;
+    session_policy::review(origin,passes,adjudication)?;
+    Ok(authority)
 }
 
 fn review_authority_checked(
@@ -1113,3 +1118,7 @@ pub fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "autoship_review_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "autoship_review_recovery_policy_tests.rs"]
+mod recovery_policy_tests;

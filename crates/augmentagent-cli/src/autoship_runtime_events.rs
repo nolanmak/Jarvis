@@ -63,34 +63,9 @@ fn reference(value: &str) -> String {
     }
 }
 fn outcome(cp: &Checkpoint) -> WorkflowOutcome {
-    match cp.next.action.as_str() {
-        "await_capacity" => WorkflowOutcome::CapacityWait,
-        "await_quota" => WorkflowOutcome::QuotaWait,
-        "retry_verification" | "await_verifier_infrastructure_recovery" => {
-            WorkflowOutcome::RetryableInfrastructure
-        }
-        _ if matches!(
-            cp.next.reason.as_str(),
-            "acceptance_contract_invalid" | "readiness_assessment_invalid"
-        ) =>
-        {
-            WorkflowOutcome::ConfigurationFault
-        }
-        _ if matches!(
-            cp.next.reason.as_str(),
-            "ci_failed" | "review_changes_requested" | "review_failed"
-        ) =>
-        {
-            WorkflowOutcome::CodeOrReviewFailure
-        }
-        action
-            if action.starts_with("await_")
-                || matches!(cp.stage, Stage::Intake | Stage::AwaitChecks | Stage::Held) =>
-        {
-            WorkflowOutcome::DependencyWait
-        }
-        _ => WorkflowOutcome::Progressed,
-    }
+    super::outcome_classification::classify(cp, false,
+        cp.next.action.starts_with("await_") || matches!(cp.stage,
+            Stage::Intake | Stage::AwaitChecks | Stage::Held))
 }
 
 pub(super) fn project(

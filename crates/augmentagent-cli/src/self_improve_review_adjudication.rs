@@ -78,6 +78,7 @@ impl Input<'_> {
                 &self.review.origin,
                 &sessions(self.review),
             )?;
+            if let Some(guard)=self.guard {guard.require_independent_native_session(&receipt.actor.provider,&receipt.actor.session_id)?;}
             return Ok(receipt);
         }
         if let Some(guard) = self.guard {
@@ -120,6 +121,7 @@ impl Input<'_> {
             &sessions(self.review),
         )?;
         if let Some(guard) = cache {
+            guard.require_independent_native_session(&receipt.actor.provider,&receipt.actor.session_id)?;
             guard.audit_health().await?;
             guard.record_review_fragment(&key, &serde_json::to_string(&receipt)?)?;
         }
