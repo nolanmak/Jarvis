@@ -27,6 +27,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
+#[path = "disk_maintenance.rs"]
+mod maintenance;
+
 const DAY: f64 = 86_400.0;
 
 /// Free bytes below which a gate refuses to start (#1407):
@@ -1218,14 +1221,19 @@ fn fmt_gb(bytes: u64) -> String {
 
 pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Result<()> {
     let state = crate::build_storage::state_dir()?;
-    let Some(_lease) = crate::build_storage::Lease::try_at(&state)? else {
+    run_prune_at(repo_root, opts, out, &state, build_procs)
+}
+
+fn run_prune_at(repo_root: &Path, opts: &Options, out: &mut dyn Write, state: &Path,
+    probe: impl FnOnce() -> Option<Vec<BuildProc>>) -> Result<()> {
+    let Some(_lease) = maintenance::Lease::try_at(state)? else {
         if opts.json { writeln!(out, "{}", serde_json::json!([{
-            "outcome": "deferred: a managed build holds the storage lease", "freed_bytes": 0
-        }]))?; } else { writeln!(out, "deferred: a managed build holds the storage lease; retry next pass")?; }
+            "outcome": "deferred: another maintenance pass holds the prune lease", "freed_bytes": 0
+        }]))?; } else { writeln!(out, "deferred: another maintenance pass holds the prune lease; retry next pass")?; }
         return Ok(());
     };
     let mut cleanup = Vec::new();
-    let result = run_prune_locked(repo_root, opts, &mut cleanup, false);
+    let result = run_prune_probed(repo_root, opts, &mut cleanup, false, None, probe());
     out.write_all(&cleanup)?;
     if !opts.dry_run {
         let payload = serde_json::json!({"at": chrono::Utc::now(),
@@ -1238,8 +1246,8 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
     result
 }
 
-/// Caller holds the shared storage lease. Admission may run inside its own
-/// lane lock; other upgraded writers cannot start until this lease drops.
+/// Admission callers hold their writer lease. All cleanup independently takes
+/// physical target leases so unrelated writers may continue during maintenance.
 pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool) -> Result<()> {
     run_prune_with_leases(repo_root, opts, out, admission, None)
 }
@@ -1280,6 +1288,10 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
             tracing::info!(path = %path.display(), days, "would adopt stale unmanaged cache");
             continue;
         }
+        // Adoption changes ownership metadata too: do not enroll a live writer
+        // while the periodic pass runs alongside unrelated managed builds.
+        let Ok(Some(_target)) = crate::storage_leases::TargetLeases::try_cache_roots(
+            std::slice::from_ref(&path), None, &profile_dirs) else { continue };
         match crate::build_storage::register_abandoned(repo_root, &path, &state) {
             Ok(_) => tracing::info!(path = %path.display(), days, "adopted stale unmanaged cache as abandoned"),
             Err(error) => tracing::warn!(path = %path.display(), "could not adopt unmanaged cache: {error:#}"),
@@ -1289,7 +1301,11 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
 
 pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
     held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
-    let procs = build_procs();
+    run_prune_probed(repo_root, opts, out, admission, held, build_procs())
+}
+
+fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
+    held: Option<&crate::storage_leases::TargetLeases>, procs: Option<Vec<BuildProc>>) -> Result<()> {
     if opts.roots.is_empty() && !admission {
         adopt_stale_unmanaged(repo_root, procs.as_deref(), opts.dry_run);
     }
@@ -1387,6 +1403,42 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_reclaims_idle_target_while_unrelated_managed_build_stays_leased() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let idle = tmp.path().join("idle");
+        let busy = tmp.path().join("busy");
+        let repo = tmp.path().join("repo");
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+        crate::build_storage::register(&repo, &idle, None, &state).unwrap();
+        crate::build_storage::register(&repo, &busy, None, &state).unwrap();
+        let idle_profile = synthetic_profile(&idle);
+        let busy_profile = synthetic_profile(&busy);
+        let _build = crate::build_storage::Lease::try_at(&state).unwrap().unwrap();
+        let _target = crate::storage_leases::TargetLeases::try_cache_roots(
+            std::slice::from_ref(&busy), None, &profile_dirs).unwrap().unwrap();
+        let opts = Options { roots: vec![idle.clone(), busy.clone()], json: true, ..Default::default() };
+        let mut out = Vec::new();
+        run_prune_at(&repo, &Options { dry_run: true, ..opts.clone() }, &mut out, &state, || Some(vec![])).unwrap();
+        assert!(idle_profile.join("incremental/old-sess").exists(), "dry run removed cache");
+        out.clear();
+        run_prune_at(&repo, &opts, &mut out, &state, || None).unwrap();
+        assert!(idle_profile.join("incremental/old-sess").exists(), "missing process evidence allowed deletion");
+        out.clear();
+        run_prune_at(&repo, &opts, &mut out, &state, || Some(vec![BuildProc { target_env: Some(idle.clone()), ..Default::default() }])).unwrap();
+        assert!(idle_profile.join("incremental/old-sess").exists(), "active compiler allowed deletion");
+        out.clear();
+        run_prune_at(&repo, &opts, &mut out, &state, || Some(vec![])).unwrap();
+        assert!(!idle_profile.join("incremental/old-sess").exists(),
+            "global lease starved idle target pruning: {}", String::from_utf8_lossy(&out));
+        assert!(busy_profile.join("incremental/old-sess").exists(), "busy cache was pruned");
+        assert!(idle_profile.join("augmentagent").exists());
+        assert!(crate::build_storage::Lease::try_at(&state).unwrap().is_none(), "prune released writer lease");
+        let reports: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(reports.as_array().unwrap().iter().any(|r| r["path"] == busy.display().to_string() && r["outcome"].as_str().unwrap().contains("target lease")));
+    }
 
     #[test]
     fn only_measured_idle_caches_nobody_is_using_are_adopted() {
