@@ -88,3 +88,44 @@ fn waiting_workflows_are_not_reported_as_stale() {
     let findings = analyze(&inputs(now, Some(progress)), &Thresholds::default());
     assert!(!findings.iter().any(|f| f.code == "workflow-progress-stale"), "{findings:?}");
 }
+
+/// Slice 2: an incomplete or unreadable workflow inventory is unknown, never
+/// healthy; a complete, empty inventory is idle without a false finding.
+#[test]
+fn unknown_inventory_is_never_reported_healthy_and_complete_empty_is_idle() {
+    let now = 1_800_000_000_000;
+    // Complete and empty: a fresh store with no workflows.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    drop(WorkflowStore::open(&path).unwrap());
+    let empty = workflow_progress_at(&path, now).unwrap();
+    assert!(empty.inventory_complete && empty.events.is_empty(), "fixture: fresh store is a complete empty inventory");
+    let idle = inputs(now, Some(empty));
+    let findings = analyze(&idle, &Thresholds::default());
+    assert!(!findings.iter().any(|f| f.code == "workflow-inventory-unknown"), "{findings:?}");
+    assert!(render_text(&findings, &idle).contains("workflows: idle (0 active; inventory complete)"), "{}", render_text(&findings, &idle));
+
+    // A legacy nonterminal workflow with no S event: coverage is unknown.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let cp = serde_json::json!({"stage":"build","binding":{"head":"a".repeat(40),"contract":"c","evidence_hash":"e"},
+        "evidence":[],"next":{"reason":"legacy","action":"build","eligible_at_ms":0}});
+    conn.execute("INSERT INTO workflow(id,branch,pr,checkpoint,heartbeat_at,progress_at) VALUES('owner/repo#9','legacy',NULL,?1,1,1)", [cp.to_string()]).unwrap();
+    drop(conn);
+    let partial = workflow_progress_at(&path, now).unwrap();
+    assert!(!partial.inventory_complete, "fixture: legacy workflow lacks events");
+    let unknown = inputs(now, Some(partial));
+    let findings = analyze(&unknown, &Thresholds::default());
+    let finding = findings.iter().find(|f| f.code == "workflow-inventory-unknown")
+        .unwrap_or_else(|| panic!("incomplete inventory must be visible: {findings:?}"));
+    assert_eq!(finding.severity, Severity::Warn);
+    let text = render_text(&findings, &unknown);
+    assert!(!text.contains("healthy") && text.contains("inventory incomplete"), "{text}");
+
+    // Unreadable inventory is unknown too (not collected at all stays quiet).
+    assert!(!analyze(&inputs(now, None), &Thresholds::default()).iter().any(|f| f.code == "workflow-inventory-unknown"));
+    let mut unreadable = inputs(now, None);
+    unreadable.workflow_progress_error = Some("worker workflow events unavailable".into());
+    let findings = analyze(&unreadable, &Thresholds::default());
+    assert!(findings.iter().any(|f| f.code == "workflow-inventory-unknown"), "{findings:?}");
+    assert!(render_text(&findings, &unreadable).contains("workflows: unknown (inventory unreadable)"));
+}
