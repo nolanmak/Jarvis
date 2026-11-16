@@ -281,13 +281,7 @@ pub(super) fn project(
     } else {
         checkpoint.next.reason.clone()
     };
-    state.outcome = match checkpoint.next.action.as_str() {
-        "await_capacity" => WorkflowOutcome::CapacityWait,
-        "await_quota" => WorkflowOutcome::QuotaWait,
-        "retry_verification" => WorkflowOutcome::RetryableInfrastructure,
-        _ if waiting => WorkflowOutcome::DependencyWait,
-        _ => WorkflowOutcome::Progressed,
-    };
+    state.outcome = super::outcome_classification::classify(&checkpoint, paused, waiting);
     tx.execute("INSERT INTO workflow_activity(workflow,payload) VALUES(?1,?2) ON CONFLICT(workflow) DO UPDATE SET payload=excluded.payload", params![workflow,serde_json::to_string(&state)?])?;
     Ok(())
 }

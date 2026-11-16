@@ -236,6 +236,10 @@ pub(crate) fn progress_claim(path:&Path,delivery:&augmentagent_approval_discord:
     let origin=gateway_origin(&delivery.context)?;
     Ok(WorkflowStore::open(path)?.claim_progress(&origin,&delivery.workflow,delivery.sequence,chrono::Utc::now().timestamp_millis())?.map(|(nonce,content)|GatewayReply {content,nonce:Some(nonce)}))
 }
+pub(crate) fn progress_defer(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.defer_progress(&origin,&delivery.workflow,delivery.sequence,retry_after_ms,chrono::Utc::now().timestamp_millis()).map(|_|())
+}
 pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->Result<()> {
     let origin=gateway_origin(&delivery.context)?;
     WorkflowStore::open(path)?.confirm_progress(&origin,&delivery.workflow,delivery.sequence,message,chrono::Utc::now().timestamp_millis())
