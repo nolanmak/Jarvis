@@ -42,6 +42,8 @@ pub trait Transport: Send + Sync {
     async fn find_progress(&self,_context:&Context,_nonce:&str,_content:&str)->Result<Option<u64>> {Ok(None)}
     /// One progress send attempt. A definite rejection is a `SendRejected` error.
     async fn send_progress(&self,context:&Context,reply:&Reply)->Result<u64> {self.send(context,reply).await}
+    /// Replace the content of the workflow's status message. Idempotent.
+    async fn edit_progress(&self,_context:&Context,_message:u64,_reply:&Reply)->Result<()> {anyhow::bail!("progress edits unsupported")}
 }
 
 pub fn recognizes(text: &str) -> bool {
@@ -98,7 +100,11 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
         if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 {continue;}
         let attempt=async {
             if !transport.verify_owner_dm(context).await? {return Ok(false);}
-            let Some(message)=transport.find_progress(context,&uncertain.nonce,&uncertain.content).await? else {return Ok(false);};
+            let Some(message)=transport.find_progress(context,&uncertain.nonce,&uncertain.content).await? else {
+                // An edit leaves no new message to find; re-applying it is safe.
+                if handler.autoship_progress_edit_target(delivery)?.is_some() {handler.autoship_progress_defer(delivery,None)?;}
+                return Ok(false);
+            };
             if !transport.verify_owner_dm(context).await? {return Ok(false);}
             handler.autoship_progress_confirm(delivery,message)?;
             Ok::<_,anyhow::Error>(true)
@@ -132,6 +138,19 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
             let Some(reply)=handler.autoship_progress_claim(&delivery)? else {return Ok(false);};
             anyhow::ensure!(reply.nonce.is_some(),"progress requires durable dispatch claim");
             if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            if let Some(status)=handler.autoship_progress_edit_target(&delivery)? {
+                // Edits are idempotent: any failure is safely retried later.
+                match transport.edit_progress(context,status,&reply).await {
+                    Ok(())=>{handler.autoship_progress_confirm(&delivery,status)?;return Ok(true);}
+                    Err(error)=>{
+                        let rejected=error.downcast_ref::<SendRejected>();
+                        if rejected.is_some_and(|r|r.status==404) {handler.autoship_progress_status_lost(&delivery)?;}
+                        rate_limited=rejected.is_some_and(|r|r.status==429);
+                        handler.autoship_progress_defer(&delivery,rejected.and_then(|r|r.retry_after_ms))?;
+                        return Ok(false);
+                    }
+                }
+            }
             let message=match transport.send_progress(context,&reply).await {
                 Ok(message)=>message,
                 // Definitely not created: park it durably for a later retry
@@ -157,6 +176,31 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
 }
 
 impl DiscordTransport {
+    async fn progress_request(&self,method:reqwest::Method,path:&str,body:&serde_json::Value,context:&Context,expected:Option<u64>)->Result<u64> {
+        use anyhow::Context as _;
+        let base=self.0.proxy.as_deref().unwrap_or("https://discord.com").trim_end_matches('/');
+        let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20)).build()?;
+        let response=client.request(method,format!("{base}{path}"))
+            .header(reqwest::header::AUTHORIZATION,self.0.token()).json(body)
+            .send().await.context("Discord progress delivery outcome unknown")?;
+        let status=response.status();
+        if status.as_u16()==429 {
+            let header=response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v|v.to_str().ok()).and_then(|v|v.trim().parse::<f64>().ok());
+            let body=response.json::<serde_json::Value>().await.ok().and_then(|v|v["retry_after"].as_f64());
+            let retry_after_ms=header.or(body).filter(|s|s.is_finite() && *s>=0.0).map(|s|(s*1000.0).ceil() as i64);
+            return Err(SendRejected {status:429,retry_after_ms}.into());
+        }
+        if status.is_client_error() {return Err(SendRejected {status:status.as_u16(),retry_after_ms:None}.into());}
+        anyhow::ensure!(status.is_success(),"Discord progress delivery outcome unknown (HTTP {})",status.as_u16());
+        let sent:serde_json::Value=response.json().await.context("Discord progress receipt unreadable")?;
+        let id=|value:&serde_json::Value|value.as_str().and_then(|v|v.parse::<u64>().ok()).filter(|v|*v>0);
+        anyhow::ensure!(id(&sent["channel_id"])==Some(context.channel) && id(&sent["author"]["id"])==Some(context.bot),
+            "Discord progress receipt identity mismatch");
+        let message=id(&sent["id"]).context("Discord progress receipt missing message id")?;
+        anyhow::ensure!(expected.is_none_or(|want|want==message),"Discord edited a different message");
+        Ok(message)
+    }
     async fn find_exact_message(&self,context:&Context,content:&str)->Result<Option<u64>> {
         let messages=tokio::time::timeout(std::time::Duration::from_secs(15),
             serenity::all::ChannelId::new(context.channel).messages(&self.0,serenity::all::GetMessages::new().limit(100))).await??;
@@ -193,27 +237,13 @@ impl Transport for DiscordTransport {
     async fn send_progress(&self,context:&Context,reply:&Reply)->Result<u64> {
         use anyhow::Context as _;
         let nonce=reply.nonce.as_deref().context("progress requires a durable marker")?;
-        let base=self.0.proxy.as_deref().unwrap_or("https://discord.com").trim_end_matches('/');
-        let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(20)).build()?;
-        let response=client.post(format!("{base}/api/v10/channels/{}/messages",context.channel))
-            .header(reqwest::header::AUTHORIZATION,self.0.token())
-            .json(&serde_json::json!({"content":reply.content,"nonce":nonce,"enforce_nonce":true,"allowed_mentions":{"parse":[]}}))
-            .send().await.context("Discord progress send outcome unknown")?;
-        let status=response.status();
-        if status.as_u16()==429 {
-            let header=response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v|v.to_str().ok()).and_then(|v|v.trim().parse::<f64>().ok());
-            let body=response.json::<serde_json::Value>().await.ok().and_then(|v|v["retry_after"].as_f64());
-            let retry_after_ms=header.or(body).filter(|s|s.is_finite() && *s>=0.0).map(|s|(s*1000.0).ceil() as i64);
-            return Err(SendRejected {status:429,retry_after_ms}.into());
-        }
-        if status.is_client_error() {return Err(SendRejected {status:status.as_u16(),retry_after_ms:None}.into());}
-        anyhow::ensure!(status.is_success(),"Discord progress send outcome unknown (HTTP {})",status.as_u16());
-        let sent:serde_json::Value=response.json().await.context("Discord progress receipt unreadable")?;
-        let id=|value:&serde_json::Value|value.as_str().and_then(|v|v.parse::<u64>().ok()).filter(|v|*v>0);
-        anyhow::ensure!(id(&sent["channel_id"])==Some(context.channel) && id(&sent["author"]["id"])==Some(context.bot),
-            "Discord progress receipt identity mismatch");
-        id(&sent["id"]).context("Discord progress receipt missing message id")
+        let body=serde_json::json!({"content":reply.content,"nonce":nonce,"enforce_nonce":true,"allowed_mentions":{"parse":[]}});
+        self.progress_request(reqwest::Method::POST,&format!("/api/v10/channels/{}/messages",context.channel),&body,context,None).await
+    }
+    async fn edit_progress(&self,context:&Context,message:u64,reply:&Reply)->Result<()> {
+        anyhow::ensure!(message>0,"status message missing");
+        let body=serde_json::json!({"content":reply.content,"allowed_mentions":{"parse":[]}});
+        self.progress_request(reqwest::Method::PATCH,&format!("/api/v10/channels/{}/messages/{message}",context.channel),&body,context,Some(message)).await.map(|_|())
     }
 
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64> {
@@ -232,6 +262,9 @@ impl Transport for DiscordTransport {
 #[cfg(test)]
 #[path="autoship_progress_send_tests.rs"]
 mod progress_send_tests;
+#[cfg(test)]
+#[path="autoship_progress_edit_tests.rs"]
+mod progress_edit_tests;
 
 #[cfg(test)]
 mod tests {
