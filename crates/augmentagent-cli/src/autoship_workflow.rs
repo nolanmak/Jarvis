@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_native_tool_progress.rs"]
+mod native_tool_progress;
+
+#[path = "autoship_guarded_progress.rs"]
+mod guarded_progress;
+
+#[path = "autoship_activity.rs"]
+pub(crate) mod activity;
+
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
 
@@ -44,6 +53,8 @@ pub(crate) mod owner_inbox;
 pub(crate) mod discord_controls;
 #[path = "autoship_owner_control.rs"]
 pub(crate) mod owner_control;
+#[path = "autoship_target_fence.rs"]
+pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
 #[path = "autoship_tool_capacity.rs"]
@@ -788,6 +799,7 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        activity::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1053,6 +1065,7 @@ impl WorkflowStore {
         if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
             return Ok(None);
         }
+        if purpose == ClaimPurpose::Productive && target_fence::fenced(&tx,workflow)? {return Ok(None);}
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
@@ -2345,6 +2358,7 @@ fn event(
         params![workflow, generation, kind, payload, now_ms],
     )?;
     progress::project(tx,workflow,kind,now_ms)?;
+    activity::project(tx,workflow,kind,payload,now_ms)?;
     Ok(())
 }
 

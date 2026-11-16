@@ -1,4 +1,7 @@
 //! Original verifier execution custody. Evidence data never grants a witness.
+#[path = "self_improve_guarded_progress.rs"]
+mod stage_progress;
+
 use super::*;
 #[path="self_improve_verifier_capture.rs"]
 mod capture;
@@ -1495,4 +1498,9 @@ os.execv(sys.argv[1],sys.argv[1:])
             assert!(!executed.get());drop(original);guard.finish().unwrap();
         }
     }
+    #[cfg(target_os = "linux")]
+    mod stage_activity_tests {
+        include!("self_improve_guarded_progress_tests.rs");
+    }
+
 }

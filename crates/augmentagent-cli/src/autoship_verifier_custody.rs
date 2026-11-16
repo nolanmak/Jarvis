@@ -89,7 +89,7 @@ pub(super) fn original_hold_matches(conn:&Connection,workflow:&str,checkpoint:&C
         && saved.failed_generation==generation && saved.plan.as_ref().is_some_and(|key|key.len()==64 && key.bytes().all(|c|c.is_ascii_hexdigit())))
 }
 
-fn protected_record(tx:&Transaction<'_>,workflow:&str,key:&str,kind:&str)->Result<String> {
+pub(super) fn protected_record(tx:&Transaction<'_>,workflow:&str,key:&str,kind:&str)->Result<String> {
     let hash:String=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![workflow,key,kind],|r|r.get(0))?;
     let body:String=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,key],|r|r.get(0))?;
     ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");
