@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_review_custody.rs"]
+mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -13,10 +15,15 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_outcome_classification.rs"]
+mod outcome_classification;
+
 #[path = "autoship_activity.rs"]
 pub(crate) mod activity;
 #[path = "autoship_runtime_events.rs"]
 pub(crate) mod runtime_events;
+#[path = "autoship_discord_request_schema.rs"]
+mod discord_request_schema;
 
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
@@ -40,6 +47,9 @@ pub(crate) mod deployment_progress;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_integration.rs"]
+mod integration;
+pub(crate) use integration::IntegrationReason;
 #[path = "autoship_review_recovery.rs"]
 mod review_recovery;
 pub(crate) use review_recovery::ReviewRecoveryReadiness;
@@ -771,6 +781,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
+            CREATE TABLE IF NOT EXISTS integration_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS integration_recovery (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,
@@ -804,6 +819,7 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
         Ok(Self { conn })
