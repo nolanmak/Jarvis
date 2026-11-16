@@ -87,6 +87,9 @@ mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
+#[path = "self_improve_preflight_retry.rs"]
+mod preflight_retry;
+
 #[path = "self_improve_provider_readiness.rs"]
 pub(crate) mod provider_readiness;
 
@@ -11464,6 +11467,9 @@ struct DailyCounter {
     history: std::collections::BTreeMap<u64, u32>,
     #[serde(default)]
     reservations: std::collections::BTreeMap<String, u64>,
+    /// Unpaid readiness observation; never shipping authority.
+    #[serde(default)]
+    preflight_observation: Option<preflight_retry::Observation>,
 }
 
 impl DailyCounter {
@@ -12581,6 +12587,7 @@ impl AutoPrLoop {
             } else {
                 self.interval
             };
+            let wait = preflight_retry::delay(&counter_path, (self.clock)().timestamp_millis(), wait)?;
             let next_tick = tokio::time::Instant::now() + wait;
             loop {
                 self.upgrade_boundary()?;
@@ -12660,9 +12667,11 @@ impl AutoPrLoop {
                     r = tick() => r,
                 };
                 let completed_day = utc_day_of((self.clock)());
-                let billed = outcome.as_ref().map_or(true, |r| r.billed);
+                let billed = outcome.as_ref().map(|r| r.billed)
+                    .unwrap_or_else(|error| !preflight_retry::is_blocked(error));
                 let runs_today = DailyCounter::update(&counter_path, |counter| {
                     counter.settle_reservation(&reservation, completed_day, billed);
+                    preflight_retry::record(counter, outcome.as_ref().err(), (self.clock)().timestamp_millis());
                     Ok(counter.runs_today(completed_day))
                 })?;
                 // A durable retry may be both paid and held. Settle its

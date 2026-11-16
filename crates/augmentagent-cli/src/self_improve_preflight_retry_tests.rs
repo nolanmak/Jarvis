@@ -73,4 +73,25 @@ async fn preflight_reconciliation_deadline_survives_worker_restart() {
     }
     assert_eq!(calls.load(SeqCst), 1, "restart discarded the preflight observation deadline");
     assert_eq!(restarted_at.elapsed().as_secs(), 150);
+    let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+    assert!(counter.preflight_observation.is_none(), "recovery kept the old readiness schedule");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unrelated_error_text_does_not_enable_preflight_retries_or_refund_attempts() {
+    let state = tempfile::tempdir().unwrap();
+    let start = tokio::time::Instant::now(); let base = chrono::Utc::now();
+    let calls = Arc::new(AtomicUsize::new(0)); let observed = calls.clone();
+    let run = worker(state.path(), start, base).run_builds(tokio_util::sync::CancellationToken::new(), move || {
+        observed.fetch_add(1, SeqCst);
+        async { anyhow::bail!("execution-readiness-blocked: untyped error after paid work") }
+    });
+    tokio::select! {
+        result = run => result.unwrap(),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(2200)) => {},
+    }
+    assert_eq!(calls.load(SeqCst), 1, "prose accidentally authorized fast retry");
+    let mut counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+    assert_eq!(counter.runs_today(utc_day_of(base)), 1);
+    assert!(counter.preflight_observation.is_none());
 }
