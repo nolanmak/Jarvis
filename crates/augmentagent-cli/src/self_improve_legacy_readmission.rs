@@ -53,6 +53,89 @@ fn proof(events: &[Value], controller: &str) -> Option<Value> {
         serde_json::json!({"reason":reason,"comment":comment["id"].as_u64()?,"label_event":label["id"].as_u64()?,"controller":controller,"created_at":label["created_at"]}),
     )
 }
+/// Security verdicts are never readopted from the legacy sweep's advice.
+const PROTECTED_REASONS: [&str; 2] = [GIVE_UP_BLAST_RADIUS_NAMED, GIVE_UP_UNTRUSTED_AUTHOR];
+
+/// The reason code of the current `agent-gave-up` label when the controller
+/// itself applied it right after its reason comment, and the reason is not a
+/// security verdict. A label without that controller pair is an explicit
+/// owner hold: no readoption is offered for it. Rows without a GitHub
+/// identity never count as that evidence.
+pub(crate) fn readoptable_reason(events: &[Value], controller: &str) -> Option<String> {
+    readoptable_hold(events, controller).map(|hold| hold["reason"].as_str().unwrap_or_default().to_owned())
+}
+
+/// [`readoptable_reason`] with the GitHub identities that prove it.
+pub(crate) fn readoptable_hold(events: &[Value], controller: &str) -> Option<Value> {
+    if controller.is_empty() {
+        return None;
+    }
+    let (index, label) = events.iter().enumerate().rev().find(|(_, event)| {
+        matches!(event["event"].as_str(), Some("labeled" | "unlabeled"))
+            && event["label"]["name"] == GAVE_UP_LABEL
+    })?;
+    if label["event"] != "labeled" || label["actor"]["login"] != controller || label["id"].as_u64().is_none() {
+        return None;
+    }
+    let comment = events.get(index.checked_sub(1)?)?;
+    if comment["event"] != "commented" || comment["user"]["login"] != controller || comment["id"].as_u64().is_none() {
+        return None;
+    }
+    let reason = comment["body"]
+        .as_str()?
+        .strip_prefix(GAVE_UP_REASON_MARKER_PREFIX)?
+        .split_once(" -->")?
+        .0;
+    let valid = !reason.is_empty()
+        && reason.len() <= 128
+        && reason.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b));
+    (valid && !PROTECTED_REASONS.contains(&reason)).then(|| {
+        serde_json::json!({"reason":reason,"comment":comment["id"],"label_event":label["id"],"labeled_at":label["created_at"]})
+    })
+}
+
+/// The owner command that readopts `issue`; placeholders are the owner's own.
+pub(crate) fn readopt_action(repository: &str, issue: u64) -> String {
+    format!("augmentagent autopr readopt --repo {repository} --issue {issue} --reason <why> --request-id <unique-id>")
+}
+
+const READOPTION_TABLE: &str = "CREATE TABLE IF NOT EXISTS legacy_hold_readoption(repository TEXT NOT NULL,issue INTEGER NOT NULL,hold_reason TEXT NOT NULL,action TEXT NOT NULL,observed_ms INTEGER NOT NULL,PRIMARY KEY(repository,issue))";
+
+/// Record (or clear) that a held issue needs explicit owner readoption, so
+/// D/T can list it. Advice only: nothing here changes the hold.
+pub(super) fn note_readoption(path: &Path, repository: &str, issue: u64, reason: Option<&str>) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(READOPTION_TABLE)?;
+    match reason {
+        Some(reason) => conn.execute(
+            "INSERT INTO legacy_hold_readoption VALUES(?1,?2,?3,?4,?5) ON CONFLICT(repository,issue) DO UPDATE SET hold_reason=excluded.hold_reason,action=excluded.action,observed_ms=excluded.observed_ms",
+            rusqlite::params![repository, issue, reason, readopt_action(repository, issue), chrono::Utc::now().timestamp_millis()],
+        )?,
+        None => conn.execute(
+            "DELETE FROM legacy_hold_readoption WHERE repository=?1 AND issue=?2",
+            rusqlite::params![repository, issue],
+        )?,
+    };
+    Ok(())
+}
+
+/// Held issues awaiting owner readoption: (repository, issue, reason, action).
+pub(crate) fn readoption_required(path: &Path) -> Result<Vec<(String, u64, String, String)>> {
+    let Some(store) = crate::autoship_workflow::WorkflowStore::open_read_only(path)? else {
+        return Ok(vec![]);
+    };
+    store.query_connection(|conn| {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_hold_readoption')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(vec![]);
+        }
+        let mut query = conn.prepare("SELECT repository,issue,hold_reason,action FROM legacy_hold_readoption ORDER BY repository,issue")?;
+        let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+}
+
 fn eligible_issue(row: &Value, allowlist: &[String]) -> bool {
     row.get("pull_request").is_none()
         && row["state"] == "open"
@@ -111,7 +194,7 @@ fn reserve(path: &Path, repository: &str, numbers: &[u64]) -> Result<Vec<u64>> {
     tx.commit()?;
     Ok(ordered)
 }
-async fn timeline(repo: &Path, repository: &str, issue: u64) -> Result<Vec<Value>> {
+pub(super) async fn timeline(repo: &Path, repository: &str, issue: u64) -> Result<Vec<Value>> {
     let mut events = vec![];
     let mut identities = std::collections::BTreeSet::new();
     for page in 1..=MAX_ISSUE_PAGES {
@@ -133,14 +216,18 @@ async fn timeline(repo: &Path, repository: &str, issue: u64) -> Result<Vec<Value
         anyhow::ensure!(rows.len() <= 100, "invalid timeline page");
         let complete = rows.len() < 100;
         for row in rows {
-            let key = (
-                row["event"]
-                    .as_str()
-                    .context("timeline event missing")?
-                    .to_owned(),
-                row["id"].as_u64().context("timeline identity missing")?,
-            );
-            anyhow::ensure!(identities.insert(key), "timeline changed while paging");
+            let event = row["event"].as_str().context("timeline event missing")?;
+            match row["id"].as_u64() {
+                Some(id) => anyhow::ensure!(
+                    identities.insert((event.to_owned(), id)),
+                    "timeline changed while paging"
+                ),
+                // GitHub never assigns an id to cross-references. They carry
+                // no hold authority, so they are kept as non-substantive
+                // history instead of being given a manufactured identity.
+                None if event == "cross-referenced" => {}
+                None => anyhow::bail!("timeline identity missing"),
+            }
             events.push(row);
         }
         if complete {
@@ -209,7 +296,14 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
     let path = workflow::path();
     for number in reserve(&path, &repository, &candidates)? {
         let outcome:Result<()>=async {
-            let Some(evidence)=proof(&timeline(repo,&repository,number).await?,controller) else{return Ok(());};
+            let events=timeline(repo,&repository,number).await?;
+            let Some(evidence)=proof(&events,controller) else{
+                let reason=readoptable_reason(&events,controller);
+                if let Some(reason)=&reason {
+                    warn!(issue=number,hold=%reason,action=%readopt_action(&repository,number),"automatic hold is not obsolete; owner readoption required");
+                }
+                return note_readoption(&path,&repository,number,reason.as_deref());
+            };
             // Re-read immediately before mutation. GitHub offers no label CAS;
             // this narrows but does not claim to eliminate that external race.
             anyhow::ensure!(proof(&timeline(repo,&repository,number).await?,controller).as_ref()==Some(&evidence),"hold authority changed during migration");
@@ -258,6 +352,7 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
             let (ok,_,error)=run(&gh_bin(),&["issue","edit",&number.to_string(),"--remove-label",GAVE_UP_LABEL],repo).await?;
             anyhow::ensure!(ok,"legacy readmission failed: {}",truncate(&error,200));
             rusqlite::Connection::open(&path)?.execute("UPDATE legacy_readmission_receipt SET status='readmitted' WHERE repository=?1 AND issue=?2",rusqlite::params![repository,number])?;
+            note_readoption(&path,&repository,number,None)?;
             info!(issue=number,"readmitted obsolete automatic scope hold; current independent readiness decides next action");Ok(())
         }.await;
         if let Err(error) = outcome {
@@ -303,6 +398,25 @@ mod tests {
     async fn terminal_late_owner_control_error_reports_degraded_and_advances_peer() {
         migration_fixture("owner-corrupt-late-peer","terminal_late_owner_control_error_reports_degraded_and_advances_peer").await;
     }
+    #[tokio::test]
+    async fn id_less_cross_references_do_not_block_obsolete_hold_readmission() {
+        migration_fixture("cross-referenced","id_less_cross_references_do_not_block_obsolete_hold_readmission").await;
+    }
+    #[tokio::test]
+    async fn unmigratable_automatic_hold_records_owner_readoption_action() {
+        migration_fixture("readoption-required","unmigratable_automatic_hold_records_owner_readoption_action").await;
+    }
+    fn cross_reference() -> Value {
+        // GitHub omits `id` on cross-referenced timeline rows (#1550/#1595/#1596).
+        serde_json::json!({"event":"cross-referenced","actor":{"login":"controller"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","source":{"type":"issue","issue":{"number":9}}})
+    }
+    fn readoption_rows(path:&Path)->Vec<(u64,String,String)> {
+        let conn=rusqlite::Connection::open(path).unwrap();
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_hold_readoption')",[],|r|r.get(0)).unwrap();
+        if !exists {return vec![];}
+        let mut q=conn.prepare("SELECT issue,hold_reason,action FROM legacy_hold_readoption ORDER BY issue").unwrap();
+        q.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
     async fn migration_fixture(case:&str,test:&str) {
         const CHILD: &str = "AUTOSHIP_LEGACY_READMISSION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
@@ -311,7 +425,9 @@ mod tests {
                 .prefix("legacy-readmission-")
                 .tempdir_in("/tmp")
                 .unwrap();
-            let gh = root.path().join("gh.py");
+            // macOS /tmp is a symlink; the protected store refuses symlinked paths.
+            let root_path = root.path().canonicalize().unwrap();
+            let gh = root_path.join("gh.py");
             std::fs::write(
                 &gh,
                 r#"#!/usr/bin/env python3
@@ -349,8 +465,8 @@ else:sys.exit(2)
             .unwrap();
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
             let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&format!("self_improve::legacy_readmission::tests::{test}"),"--nocapture"])
-                .env("AUTOSHIP_LEGACY_READMISSION_CASE",case).env(CHILD,root.path()).env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","controller")
-                .env("XDG_STATE_HOME",root.path().join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
+                .env("AUTOSHIP_LEGACY_READMISSION_CASE",case).env(CHILD,&root_path).env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","controller")
+                .env("XDG_STATE_HOME",root_path.join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root_path.join("state/workflow.db"))
                 .output().unwrap();
             assert!(
                 result.status.success(),
@@ -372,6 +488,42 @@ else:sys.exit(2)
             serde_json::to_vec(&history(GIVE_UP_OVERTAKEN)).unwrap(),
         )
         .unwrap();
+        if case=="cross-referenced" {
+            let mut events=history(GIVE_UP_OVERTAKEN);
+            events.insert(0,cross_reference());
+            events.push(cross_reference());
+            std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();
+            sweep(&root,Some(&inventory),false).await.unwrap();
+            assert_eq!(std::fs::read_to_string(root.join("edits")).unwrap_or_default(),"7\n","id-less cross-reference blocked obsolete hold readmission");
+            assert!(readoption_rows(&workflow::path()).is_empty());
+            // Authority-bearing rows never receive a manufactured identity.
+            std::fs::remove_file(root.join("edits")).unwrap();
+            let mut events=history(GIVE_UP_OVERTAKEN);
+            events[1].as_object_mut().unwrap().remove("id");
+            std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();
+            sweep(&root,Some(&inventory),false).await.unwrap();
+            assert!(!root.join("edits").exists(),"label event without identity was treated as automatic proof");
+            return;
+        }
+        if case=="readoption-required" {
+            let mut events=history(GIVE_UP_SCOPER_PREDICTS_REFUSAL);
+            events.push(cross_reference());
+            std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();
+            sweep(&root,Some(&inventory),false).await.unwrap();
+            assert!(!root.join("edits").exists(),"a current automatic hold was readmitted without owner authority");
+            let rows=readoption_rows(&workflow::path());
+            assert_eq!(rows.len(),1,"unmigratable automatic hold was not surfaced");
+            assert_eq!((rows[0].0,rows[0].1.as_str()),(7,GIVE_UP_SCOPER_PREDICTS_REFUSAL));
+            assert!(rows[0].2.starts_with("augmentagent autopr readopt --repo controller/repo --issue 7 --reason "),"{}",rows[0].2);
+            // Security holds and manual owner holds offer no readoption action.
+            for events in [history(GIVE_UP_BLAST_RADIUS_NAMED),vec![history(GIVE_UP_OVERTAKEN)[1].clone()]] {
+                std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();
+                sweep(&root,Some(&inventory),false).await.unwrap();
+                assert!(!root.join("edits").exists());
+                assert!(readoption_rows(&workflow::path()).is_empty(),"protected hold advertised readoption");
+            }
+            return;
+        }
         if case!="normal" {
             use crate::autoship_workflow::{Binding,Checkpoint,NextAction,ResourceCharge,Stage,WorkflowStore,workflow_id};
             let path=workflow::path();let mut store=WorkflowStore::open(&path).unwrap();
