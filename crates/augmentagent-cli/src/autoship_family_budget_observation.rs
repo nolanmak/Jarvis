@@ -40,7 +40,7 @@ impl Reason {
             Self::FamilyResourceExhausted => 7,
         }
     }
-    fn next(self) -> WorkflowNextAction {
+    pub(super) fn next(self) -> WorkflowNextAction {
         let action = match self {
             Self::OwnerPaused => "await_owner_resume",
             Self::FamilyAuthorityUnknown => "await_authoritative_family_state",

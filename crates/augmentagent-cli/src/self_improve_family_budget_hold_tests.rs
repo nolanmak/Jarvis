@@ -268,7 +268,7 @@ async fn repeated_family_wait_keeps_original_action_and_observation_deadline() {
         .defer_family_budget_wait(
             &guard.lease,
             &before.checkpoint.binding,
-            &wait.observation,
+            wait.observation.as_ref().unwrap(),
             millis() + 100,
         )
         .unwrap();
@@ -326,9 +326,11 @@ async fn unknown_family_usage_produces_a_specific_hold_without_inventing_zero() 
     let error = denied_native_call(&guard).await;
     assert!(error.to_string().contains("family_spend_unknown"));
     let held = store.family_budget_wait(guard.id()).unwrap().unwrap();
-    assert_eq!(held.observation.model_admissions, None);
+    assert_eq!(held.observation.as_ref().unwrap().model_admissions, None);
     assert_eq!(
         held.observation
+            .as_ref()
+            .unwrap()
             .retained
             .iter()
             .map(|u| u.model_admissions)
@@ -426,7 +428,7 @@ async fn trusted_revised_funding_unblocks_selection_without_granting_native_disp
         manifest_ref,
         policy_ref,
         request_ref,
-    } = wait.observation.intent
+    } = wait.observation.unwrap().intent
     else {
         panic!("fixture delegation missing")
     };
@@ -551,7 +553,7 @@ async fn assert_ancestor_control_refusal_is_durable(resume: bool) {
     assert_eq!(after.model_calls, before.model_calls);
     assert_eq!(after.progress_at_ms, before.progress_at_ms);
     let wait = store.family_budget_wait(guard.id()).unwrap().unwrap();
-    assert_eq!(wait.observation.model_admissions, Some(2));
+    assert_eq!(wait.observation.as_ref().unwrap().model_admissions, Some(2));
     assert!(guard.validate_before_side_effect().is_err());
     let report = guard
         .capacity_accounting(false)
@@ -631,7 +633,7 @@ async fn resumed_ancestor_cannot_reclaim_child_until_its_control_frame_is_refres
 async fn assert_missing_frame_refusal_is_durable(malformed: bool) {
     let (_checkout, control, guard) = funded_guard(10).await;
     let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
-    let before=store.snapshot(guard.id()).unwrap().unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
     store.with_family_transaction(|tx| {
         if malformed {
             tx.execute("UPDATE workflow_family_scope SET payload='not-json' WHERE workflow=?1 AND generation=?2",
@@ -642,26 +644,65 @@ async fn assert_missing_frame_refusal_is_durable(malformed: bool) {
         }
         Ok(())
     }).unwrap();
-    let accounting=guard.capacity_accounting(false).unwrap();
-    let error=denied_native_call(&guard).await;
-    assert!(error.to_string().contains("family_execution_scope_unknown"),"unexpected refusal: {error:#}");
-    let after=store.snapshot(guard.id()).unwrap().unwrap();
-    assert_eq!(after.checkpoint.next.reason,"family_execution_scope_unknown",
-        "early unknown-frame refusal escaped durable wait handling");
-    assert_eq!(after.checkpoint.next.action,"await_protected_execution_scope");
-    assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
-    assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
-    assert_eq!(after.model_calls,before.model_calls);
-    assert_eq!(after.progress_at_ms,before.progress_at_ms);
-    let event=store.events(guard.id()).unwrap().into_iter().find(|e|e.1=="family_budget_wait").unwrap();
-    let record:serde_json::Value=serde_json::from_str(&event.2).unwrap();
-    assert_eq!(record["schema_version"],2);
-    assert!(record["observation"].is_null(),"unknown funding frame fabricated a budget observation");
-    assert_eq!(record["context_reason"],"family_execution_scope_unknown");
+    let accounting = guard.capacity_accounting(false).unwrap();
+    let error = denied_native_call(&guard).await;
+    assert!(
+        error.to_string().contains("family_execution_scope_unknown"),
+        "unexpected refusal: {error:#}"
+    );
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(
+        after.checkpoint.next.reason, "family_execution_scope_unknown",
+        "early unknown-frame refusal escaped durable wait handling"
+    );
+    assert_eq!(
+        after.checkpoint.next.action,
+        "await_protected_execution_scope"
+    );
+    assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    let event = store
+        .events(guard.id())
+        .unwrap()
+        .into_iter()
+        .find(|e| e.1 == "family_budget_wait")
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_str(&event.2).unwrap();
+    assert_eq!(record["schema_version"], 2);
+    assert!(
+        record["observation"].is_null(),
+        "unknown funding frame fabricated a budget observation"
+    );
+    assert_eq!(record["context_reason"], "family_execution_scope_unknown");
     assert!(guard.validate_before_side_effect().is_err());
-    let report=accounting.settle_ci(Err(error)).unwrap();
+    let report = accounting.settle_ci(Err(error)).unwrap();
     assert!(report.held && !report.billed);
     assert!(report.message.contains("verified execution scope"));
+    let id = guard.id().to_owned();
+    store.release(&guard.lease, millis()).unwrap();
+    drop(guard);
+    let now = after.checkpoint.next.eligible_at_ms + 1;
+    let released = store.snapshot(&id).unwrap().unwrap();
+    let events = store.events(&id).unwrap();
+    assert!(store
+        .claim_productive(&id, "unchanged-context", now, LEASE_MS)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.snapshot(&id).unwrap().unwrap(), released);
+    assert_eq!(store.events(&id).unwrap(), events);
+    let free = store
+        .claim_reconciliation(&id, "free-reconciliation", now, LEASE_MS)
+        .unwrap()
+        .expect("unknown funding context blocked unpaid reconciliation");
+    store.release(&free, now + 1).unwrap();
+    let events = store.events(&id).unwrap();
+    assert!(store
+        .claim_productive(&id, "still-unknown", now + 2, LEASE_MS)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.events(&id).unwrap(), events);
 }
 
 #[tokio::test]
@@ -672,4 +713,79 @@ async fn missing_funding_frame_becomes_an_unknown_context_wait_without_inventing
 #[tokio::test]
 async fn malformed_funding_frame_becomes_an_unknown_context_wait_without_inventing_intent() {
     assert_missing_frame_refusal_is_durable(true).await;
+}
+
+#[tokio::test]
+async fn verified_replacement_frame_recovers_unknown_context_without_inheriting_dispatch_authority()
+{
+    let (_checkout, control, guard) = funded_guard(10).await;
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    let intent: family_budget::Intent = store
+        .with_family_transaction(|tx| {
+            let raw: String = tx.query_row(
+                "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+                rusqlite::params![guard.id(), guard.lease.generation],
+                |r| r.get(0),
+            )?;
+            let scope: serde_json::Value = serde_json::from_str(&raw)?;
+            tx.execute(
+                "DELETE FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+                rusqlite::params![guard.id(), guard.lease.generation],
+            )?;
+            Ok(serde_json::from_value(scope["intent"].clone())?)
+        })
+        .unwrap();
+    assert!(denied_native_call(&guard)
+        .await
+        .to_string()
+        .contains("family_execution_scope_unknown"));
+    let id = guard.id().to_owned();
+    store.release(&guard.lease, millis()).unwrap();
+    drop(guard);
+    let held = store.snapshot(&id).unwrap().unwrap();
+    let now = held.checkpoint.next.eligible_at_ms + 1;
+    let recovery = store
+        .claim(&id, "trusted-frame-recovery", now, LEASE_MS)
+        .unwrap()
+        .unwrap();
+    store
+        .with_family_transaction(|tx| {
+            family_store::record_intent(
+                tx,
+                &recovery,
+                &intent,
+                "verified-owner-fixture-restored-frame",
+                now,
+            )
+        })
+        .unwrap();
+    store.release(&recovery, now + 1).unwrap();
+    let productive = store
+        .claim_productive(&id, "ready-work", now + 2, LEASE_MS)
+        .unwrap()
+        .expect("fresh verified frame left unknown-context workflow parked");
+    let after = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.checkpoint.next, before.checkpoint.next);
+    assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    assert_eq!(after.model_calls, before.model_calls);
+    assert!(store.family_budget_wait(&id).unwrap().is_none());
+    let error = store
+        .charge_admitted_model(
+            &productive,
+            "selection-is-not-native-authority",
+            now + 3,
+            None,
+            None,
+            Some(durable::submission::Provider::Codex),
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("family_execution_scope_unknown"));
+    assert_eq!(
+        store.snapshot(&id).unwrap().unwrap().model_calls,
+        before.model_calls
+    );
 }

@@ -26,6 +26,11 @@ pub(super) fn settle_admission(
                 // controller keep dispatching or overwrite the wait checkpoint.
                 blocked.store(true, Ordering::SeqCst);
                 store.defer_family_budget_wait(lease, binding, &refused.observation, now)?;
+            } else if let Some(refused) =
+                error.downcast_ref::<durable::family_budget::wait::ContextRefused>()
+            {
+                blocked.store(true, Ordering::SeqCst);
+                store.defer_family_context_wait(lease, binding, refused.reason, now)?;
             }
             Err(error)
         }
@@ -59,15 +64,11 @@ pub(super) fn report(accounting: &CapacityAccounting) -> Result<Option<RunReport
         .model_calls
         .checked_sub(accounting.calls_before)
         .context("durable admissions decreased")?;
-    let blocker = wait
-        .observation
-        .blockers
-        .first()
-        .context("family budget blocker missing")?;
+    let reason_code = wait.reason()?;
     let metrics = wait
         .observation
-        .blockers
         .iter()
+        .flat_map(|observation| observation.blockers.iter())
         .filter_map(|b| {
             b.metric.map(|metric| {
                 let name = match metric {
@@ -86,7 +87,7 @@ pub(super) fn report(accounting: &CapacityAccounting) -> Result<Option<RunReport
         })
         .collect::<Vec<_>>()
         .join("; ");
-    let reason = match blocker.reason_code {
+    let reason = match reason_code {
         durable::family_budget::observation::Reason::FamilyResourceExhausted => {
             "an owner-approved family budget revision"
         }

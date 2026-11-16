@@ -127,20 +127,19 @@ pub(super) fn require_new_admission(
     if !required(tx, &lease.workflow)? {
         return Ok(None);
     }
-    ensure!(
-        table(tx, "workflow_family_budget")? && table(tx, "workflow_family_member")?,
-        "family_authority_unknown"
-    );
+    use observation::Reason;
+    if !table(tx, "workflow_family_budget")? || !table(tx, "workflow_family_member")? {
+        return Err(wait::refusal(Reason::FamilyAuthorityUnknown));
+    }
     let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member m JOIN workflow_family_budget f ON f.family=m.family WHERE m.workflow=?1 AND f.state='pending')",[&lease.workflow],|r|r.get(0))?;
-    // No legacy/unscoped caller can implicitly declare independently funded work.
-    ensure!(
-        table(tx, "workflow_family_scope")?,
-        if pending {
-            "family_membership_pending"
-        } else {
-            "family_execution_scope_unknown"
-        }
-    );
+    let missing = if pending {
+        Reason::FamilyMembershipPending
+    } else {
+        Reason::FamilyExecutionScopeUnknown
+    };
+    if !table(tx, "workflow_family_scope")? {
+        return Err(wait::refusal(missing));
+    }
     let raw: Option<String> = tx
         .query_row(
             "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
@@ -148,16 +147,12 @@ pub(super) fn require_new_admission(
             |r| r.get(0),
         )
         .optional()?;
-    let raw = raw.context(if pending {
-        "family_membership_pending"
-    } else {
-        "family_execution_scope_unknown"
-    })?;
-    let scope: Scope = serde_json::from_str(&raw).context("family_execution_scope_unknown")?;
-    ensure!(
-        scope.schema_version == 1 && !scope.verified_authority_ref.is_empty(),
-        "family_execution_scope_unknown"
-    );
+    let raw = raw.ok_or_else(|| wait::refusal(missing))?;
+    let scope: Scope = serde_json::from_str(&raw)
+        .map_err(|_| wait::refusal(Reason::FamilyExecutionScopeUnknown))?;
+    if scope.schema_version != 1 || scope.verified_authority_ref.is_empty() {
+        return Err(wait::refusal(Reason::FamilyExecutionScopeUnknown));
+    }
     ensure!(native, "family_native_attribution_required");
     let status = observe_scope(tx, &lease.workflow, &scope, incoming)?;
     if !status.ready() {
