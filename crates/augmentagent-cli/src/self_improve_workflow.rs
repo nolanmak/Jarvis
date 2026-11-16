@@ -481,7 +481,7 @@ fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: 
     refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
-        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
+        .is_some_and(|snapshot| integration::requires_reverification(&snapshot.checkpoint) || snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
