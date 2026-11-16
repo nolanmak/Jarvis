@@ -811,32 +811,11 @@ async fn run_impl(
         loop {
         for original_request in &batch_requests {
             let i=group_index; group_index+=1;
-            let fragment_key=aligned::digest(&serde_json::to_vec(&("review-source-ranges-v1",&binding,role,&actor.provider,&actor.model,&opts.system_prompt,&original_request.coverage.prompt_hash))?);
-            let cached=cache_guard.map(|guard|guard.review_fragment(&fragment_key)).transpose()?.flatten();
-            let group=if let Some(raw)=cached {
-                anyhow::ensure!(raw.len()<=group_execution::MAX_COMPLETED_GROUP_BYTES,"cached review exceeds encoded bound");
-                let cached:CompletedGroup=serde_json::from_str(&raw)?;
-                anyhow::ensure!(cached.native_sessions.len()<=2,"cached group exceeds observation bound");
-                anyhow::ensure!(cached.binding==binding && cached.original_hash==original_request.coverage.prompt_hash && cached.role==role,
-                    "review fragment binding mismatch");
-                for native_id in &cached.native_sessions {
-                    anyhow::ensure!(!native_id.is_empty() && native_id.len()<=512 && native_id.bytes().all(|b|b.is_ascii_graphic()),"invalid cached native identity");
-                    let mut actual=actor.clone(); actual.session_id=native_id.clone(); actual.independent_for(&builders,&origin)?;
-                }
-                anyhow::ensure!(!cached.native_sessions.is_empty(),"cached review lacks native observation");
-                cached
-            } else {
-            let completed=group_execution::execute_evidence_group(group_execution::EvidenceGroupInput {
+            let group=group_execution::execute_cached_evidence_group(group_execution::EvidenceGroupInput {
                 root:&worktree,inputs:&inputs,original_request,evidence_shards:&evidence_shards,
                 actor:&actor,builders:&builders,origin:&origin,role,provider,opts:&opts,
                 group_index:i,workflow:context.workflow,
-            },&group_execution::NativeGroupTransport {reasoner:reasoner.as_ref()}).await?;
-            if let Some(guard)=cache_guard {
-                guard.audit_health().await?;
-                guard.record_review_fragment(&fragment_key,&serde_json::to_string(&completed)?)?;
-            }
-            completed
-            };
+            },&group_execution::NativeGroupTransport {reasoner:reasoner.as_ref()},cache_guard).await?;
             request_hashes.extend(group.request_hashes);
             native_sessions.extend(group.native_sessions);
             for (path,body) in group.recovered_files {

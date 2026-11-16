@@ -41,16 +41,66 @@ fn parse(text:&str)->Result<Request> {
 
 use crate::autoship_workflow::discord_controls::{Action,PreparedControl};
 
+/// `!autoship readopt <issue-or-PR URL> --reason TEXT` → (repository, target, reason).
+fn parse_readopt(text:&str)->Result<Option<(String,Target,String)>> {
+    ensure!(text.len()<=1024,"autoship-command-too-large");
+    let words:Vec<_>=text.split_whitespace().collect();
+    if words.first()!=Some(&"!autoship") || words.get(1)!=Some(&"readopt") {return Ok(None);}
+    ensure!(words.len()>=5 && words[3]=="--reason","expected !autoship readopt <issue-or-PR URL> --reason TEXT");
+    let url=words[2].strip_prefix('<').and_then(|s|s.strip_suffix('>')).unwrap_or(words[2]);
+    let path=url.strip_prefix("https://github.com/").ok_or_else(||anyhow::anyhow!("expected a GitHub HTTPS issue or PR URL"))?;
+    let parts:Vec<_>=path.split('/').collect();
+    ensure!(parts.len()==4,"expected an exact GitHub issue or PR URL");
+    let number:u64=parts[3].parse()?;ensure!(number>0,"positive target required");
+    let target=match parts[2] {"issues"=>Target::Issue(number),"pull"=>Target::Pr(number),_=>anyhow::bail!("expected an issue or PR URL")};
+    let repository=crate::autoship_workflow::submission::normalized_repository(&format!("{}/{}",parts[0],parts[1]))?.to_ascii_lowercase();
+    Ok(Some((repository,target,words[4..].join(" "))))
+}
+
+/// #1713 — readopt through L's readoption service. The service is idempotent
+/// by request id, so a crash before the reply commit re-runs harmlessly.
+async fn readopt(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,repository:&str,target:Target,reason:&str)->Result<()> {
+    let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+    if let Some(store)=WorkflowStore::open_read_only(path)? {
+        if store.replay_discord_control(origin,&digest)?.is_some() {
+            crate::self_improve::targeted::authorize_repository(repo,repository).await?;
+            return Ok(());
+        }
+    }
+    let (kind,number)=match target {Target::Issue(n)=>("issue",n),Target::Pr(n)=>("pr",n)};
+    let label=format!("{repository}#{number}");
+    let (refusal,content)=match target {
+        Target::Pr(_)=>(Some("pr-readoption-unsupported"),format!("Autoship readopt {label}: pr-readoption-unsupported. PR readoption ships with explicit PR adoption (#1537); no hold was changed.")),
+        Target::Issue(issue)=>{
+            let request=crate::self_improve::readoption::Request {repository:repository.into(),issue,reason:reason.into(),request_id:origin.request_id()};
+            match crate::self_improve::readoption::apply(repo,&request).await {
+                Ok(_)=>(None,format!("Autoship readopted {label}: the held issue returns to the pool for fresh scope and review; hold history is preserved and nothing was dispatched.")),
+                Err(error)=>{
+                    let code=error.downcast_ref::<crate::self_improve::readoption::Refusal>().map_or("workflow-state-unavailable",|r|r.reason());
+                    (Some(code),format!("Autoship readopt {label}: {code}. No hold was changed."))
+                }
+            }
+        }
+    };
+    let target=serde_json::json!({"repository":repository,"kind":kind,"number":number});
+    WorkflowStore::open(path)?.commit_discord_readopt(origin,&digest,&target,refusal,&content,chrono::Utc::now().timestamp_millis())?;
+    Ok(())
+}
+
 fn parse_control(text:&str)->Result<Option<(Action,Option<String>)>> {
     ensure!(text.len()<=1024,"autoship-command-too-large");
     let words:Vec<_>=text.split_whitespace().collect();
     if words.first()!=Some(&"!autoship") {return Ok(None);}
     let action=match words.get(1).copied() {
         Some("status")=>Action::Status,Some("pause")=>Action::Pause,
-        Some("resume")=>Action::Resume,Some("use")=>Action::Use,_=>return Ok(None),
+        Some("resume")=>Action::Resume,Some("use")=>Action::Use,Some("cancel")=>Action::Cancel,_=>return Ok(None),
     };
     let workflow=if action==Action::Use {
         ensure!(words.len()==3,"expected !autoship use ID");Some(words[2].to_string())
+    } else if action==Action::Cancel {
+        // Terminal: never act on an implicit or concurrently changed selection.
+        ensure!(words.len()==4 && words[2]=="--workflow","expected !autoship cancel --workflow ID");
+        Some(words[3].to_string())
     } else {
         ensure!(words.len()==2 || (words.len()==4 && words[2]=="--workflow"),"expected !autoship status|pause|resume [--workflow ID]");
         words.get(3).map(|id|id.to_string())
@@ -75,8 +125,21 @@ async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Ac
     if refusal.is_none() && action==Action::Resume && crate::self_improve::targeted::command_readiness(repo,&request).await.is_err() {
         refusal=Some("execution-readiness-blocked".into());
     }
-    let status=if action==Action::Status && refusal.is_none() {
-        let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),0);
+    // #1713 — cancel runs T's idempotent fenced retirement before the reply is
+    // committed; a crash in between re-runs it harmlessly on redelivery.
+    let mut canceled=None;
+    if action==Action::Cancel && refusal.is_none() {
+        match crate::self_improve::targeted::cancel_workflow(repo,path,&workflow,&request.repository).await {
+            Ok(())=>canceled=Some(format!("Autoship {workflow} canceled: stage retired, reason owner_canceled. Native teardown is unverified.")),
+            Err(error)=>refusal=Some(error.downcast_ref::<crate::self_improve::targeted::CommandFailure>()
+                .map_or("workflow-state-unavailable",|failure|failure.reason).into()),
+        }
+    }
+    let status=if action==Action::Cancel {canceled} else if action==Action::Status && refusal.is_none() {
+        // The configured daily cap, as every other status caller uses. Cap 0
+        // is not a valid allowance and failed every registered workflow.
+        let cap=std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().and_then(|v|v.parse::<u32>().ok()).unwrap_or(5).max(1);
+        let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),cap);
         if code==2 || code==4 {refusal=Some("workflow-state-unavailable".into());None}
         else {
             // Only bounded shared status fields, never raw provider or auth errors.
@@ -148,7 +211,25 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
     let plain=|content:&str|Some(GatewayReply {content:content.into(),nonce:None});
     if !augmentagent_approval_discord::autoship::recognizes(text) {
         ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
+        // #1713 — several workflows bound and none selected: ask, never guess.
+        if let Some(store)=WorkflowStore::open_read_only(path)? {
+            if store.discord_workflow(&origin,None).is_err_and(|e|e.to_string()=="workflow-selection-required") {
+                let bound=store.discord_bound_workflows(&origin)?;
+                return Ok(plain(&format!("Several autoship workflows are bound to this DM: {}. Select one with `!autoship use ID` (or add `--workflow ID`). This message was not queued and changed nothing.",
+                    bound.iter().take(10).map(|id|format!("`{id}`")).collect::<Vec<_>>().join(", "))));
+            }
+        }
         return Ok(plain("Autoship coding sessions are unavailable in this build. This message was not queued and did not pause the workflow. Use `!autoship status`, `pause`, or `resume` to control the PR."));
+    }
+    match parse_readopt(text) {
+        Ok(Some((repository,target,reason)))=>{
+            if readopt(repo,path,&origin,text,&repository,target,&reason).await.is_err() {
+                return Ok(plain("Autoship readopt could not be recorded. Check the message is the original request (a request ID cannot be reused for another target) and current GitHub access. No hold change is confirmed."));
+            }
+            return gateway_claim_ack(path,context);
+        }
+        Err(_)=>return Ok(plain("Autoship command not recognized. Use `!autoship readopt <issue URL> --reason TEXT`.")),
+        Ok(None)=>{},
     }
     match parse_control(text) {
         Ok(Some((action,explicit)))=> {
@@ -157,7 +238,7 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
             }
             return gateway_claim_ack(path,context);
         }
-        Err(_)=>return Ok(plain("Use `!autoship status|pause|resume [--workflow ID]` or `!autoship use ID`. Extra options are not supported.")),
+        Err(_)=>return Ok(plain("Autoship command not recognized. Use `!autoship status|pause|resume [--workflow ID]`, `!autoship cancel --workflow ID` or `!autoship use ID`. Extra options are not supported.")),
         Ok(None)=>{},
     }
     if parse(text).is_err() {
@@ -211,6 +292,18 @@ pub(crate) fn progress_claim(path:&Path,delivery:&augmentagent_approval_discord:
     let origin=gateway_origin(&delivery.context)?;
     Ok(WorkflowStore::open(path)?.claim_progress(&origin,&delivery.workflow,delivery.sequence,chrono::Utc::now().timestamp_millis())?.map(|(nonce,content)|GatewayReply {content,nonce:Some(nonce)}))
 }
+pub(crate) fn progress_defer(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.defer_progress(&origin,&delivery.workflow,delivery.sequence,retry_after_ms,chrono::Utc::now().timestamp_millis()).map(|_|())
+}
+pub(crate) fn progress_edit_target(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<Option<u64>> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.progress_edit_target(&origin,&delivery.workflow,delivery.sequence)
+}
+pub(crate) fn progress_status_lost(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.forget_status_message(&origin,&delivery.workflow,delivery.sequence)
+}
 pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->Result<()> {
     let origin=gateway_origin(&delivery.context)?;
     WorkflowStore::open(path)?.confirm_progress(&origin,&delivery.workflow,delivery.sequence,message,chrono::Utc::now().timestamp_millis())
@@ -219,12 +312,35 @@ pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discor
 #[cfg(test)]
 mod tests {
     use super::*;
+    // #1713 — ordinary text in a DM bound to several workflows asks for an
+    // explicit selection by ID and performs no coding mutation.
+    #[tokio::test]
+    async fn ambiguous_plain_text_asks_for_selection_naming_bound_workflows() {
+        use crate::autoship_workflow::submission::{Milestone,Provider,Request,Target};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let origin=|message|DiscordOrigin {bot:11,owner:22,channel:33,message};
+        let request=|pr|Request {repository:"owner/repo".into(),target:Target::Pr(pr),provider:Some(Provider::Codex),until:Milestone::Merged};
+        let first=store.submit_discord_authorized(&origin(44),&request(42),&"a".repeat(64),1).unwrap().admission.workflow;
+        let second=store.submit_discord_authorized(&origin(45),&request(43),&"b".repeat(64),2).unwrap().admission.workflow;
+        drop(store);
+        let before=std::fs::read(&path).unwrap();
+        let context=GatewayContext {bot:11,owner:Some(22),author:22,channel:33,message:46,guild:None};
+        let reply=gateway_command(dir.path(),&path,&context,"Please fix the failing test").await.unwrap().unwrap();
+        assert!(reply.content.contains(&first) && reply.content.contains(&second),"{}",reply.content);
+        assert!(reply.content.contains("!autoship use"),"{}",reply.content);
+        assert!(!reply.content.contains("unavailable in this build"),"{}",reply.content);
+        assert_eq!(std::fs::read(&path).unwrap(),before,"selection prompt performs no write");
+    }
     #[test]
     fn discord_control_grammar_requires_exact_selection_and_options() {
         assert_eq!(parse_control("!autoship pause").unwrap(),Some((Action::Pause,None)));
         assert_eq!(parse_control("!autoship use owner/repo#42").unwrap(),Some((Action::Use,Some("owner/repo#42".into()))));
         assert_eq!(parse_control("!autoship resume --workflow owner/repo#42").unwrap(),Some((Action::Resume,Some("owner/repo#42".into()))));
         for text in ["!autoship use","!autoship use a b","!autoship pause --until merged","!autoship resume --workflow", "!autoship status extra"] {assert!(parse_control(text).is_err());}
+        // #1713 — cancel is terminal, so it never acts on an implicit selection.
+        assert_eq!(parse_control("!autoship cancel --workflow owner/repo#42").unwrap(),Some((Action::Cancel,Some("owner/repo#42".into()))));
+        for text in ["!autoship cancel","!autoship cancel owner/repo#42","!autoship cancel --workflow"] {assert!(parse_control(text).is_err(),"{text}");}
     }
     #[test]
     fn discord_target_grammar_cannot_turn_prose_or_extra_flags_into_authority() {

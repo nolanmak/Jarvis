@@ -298,7 +298,13 @@ fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
         assert_eq!(output.status.code(),Some(3));
         let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(body["roles"]["builder"]["status"],if matches!(phase,3|7|8) {"no-eligible-provider"} else if phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
-        assert_eq!(body["roles"]["independent_reviewer"]["status"],if matches!(phase,0|2|5) {"independent-reviewer-unavailable"} else if matches!(phase,3|6|7|8) {"builder-unavailable"} else {"declared-available"},"{body}");
+        // Fresh native sessions may use the writer's provider family. Role
+        // capacity is declarative; adjudication and live proof remain separate.
+        assert_eq!(body["roles"]["independent_reviewer"]["status"],if matches!(phase,3|6|7|8) {"builder-unavailable"} else {"declared-available"},"{body}");
+        if matches!(phase,0|2|5) {
+            assert_eq!(body["roles"]["independent_reviewer"]["providers"],serde_json::json!(["claude"]));
+            assert_eq!(body["roles"]["live_verified"],false);
+        }
         assert_eq!(body["roles"]["adjudicator"]["status"],if phase==0 {"provider-unavailable"} else if phase==5 || phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
         if phase==4 {
             assert_eq!(body["roles"]["builder"]["providers"],serde_json::json!(["codex"]));
