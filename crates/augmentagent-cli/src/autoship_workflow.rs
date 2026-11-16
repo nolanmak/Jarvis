@@ -15,6 +15,9 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_family_budget.rs"]
+pub(crate) mod family_budget;
+
 #[cfg(test)]
 #[path = "autoship_family_budget_tests.rs"]
 mod family_budget_tests;
@@ -1681,7 +1684,7 @@ impl WorkflowStore {
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
         let actual_native_reviewer=admission.is_some_and(|(provider,reviewer)|provider.is_some() && reviewer);
-        let admission=admission.map(|(provider,reviewer)| {
+        let mut admission=admission.map(|(provider,reviewer)| {
             let mut attribution=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
             // Keep the actual charge and its exact bounded input in one fact.
             // Recovery must not infer this link from adjacent event times, and
@@ -1710,11 +1713,27 @@ impl WorkflowStore {
             ensure!(prior == values, "charge receipt conflict");
             if let Some(expected)=&admission {
                 let recorded:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_extract(payload,'$.receipt')=?2",params![lease.workflow,receipt_id],|r|r.get(0)).optional()?;
+                // Budget funding is controller-owned evidence, not a caller
+                // argument or another dispatch grant. Preserve its original
+                // reference while validating an identical receipt replay.
+                let recorded=recorded.map(|raw| -> Result<String> {
+                    let mut value:serde_json::Value=serde_json::from_str(&raw)?;
+                    value.as_object_mut().context("invalid native attribution")?.remove("budget_scope_ref");
+                    Ok(value.to_string())
+                }).transpose()?;
                 ensure!(recorded.as_ref()==Some(expected),"model admission attribution conflict");
             }
         } else {
             ensure!(!(recovery_inspection && charge.model_calls>0),"qualification recovery cannot spend a model call");
-            if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
+            if charge.model_calls>0 {
+                owner_turn::require_native_dispatch(&tx,lease,now_ms)?;
+                if let Some(scope)=family_budget::require_new_admission(&tx,lease,charge.model_calls,admission.is_some())? {
+                    let raw=admission.as_mut().context("family native attribution required")?;
+                    let mut value:serde_json::Value=serde_json::from_str(raw)?;
+                    value["budget_scope_ref"]=scope.into();
+                    *raw=value.to_string();
+                }
+            }
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
             // late usage/accounting for the original call remains recordable.
