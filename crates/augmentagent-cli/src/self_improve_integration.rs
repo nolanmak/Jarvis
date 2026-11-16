@@ -177,11 +177,9 @@ pub(super) fn requires_reverification(cp: &crate::autoship_workflow::Checkpoint)
         || cp.next.reason == "dependency-check-classification"
 }
 
-/// C/#1710 owns classification. Until its typed adapter is available, an
-/// integrated candidate starts with a named dependency, never inferred green
-/// checks. The existing resume pipeline must discharge it through its actual
-/// verification/CI and independent review gates before M can merge.
-pub(super) const CHECK_CLASSIFICATION_WAIT: &str = "dependency-check-classification";
+/// Rebind the integrated tree before verification and independent review.
+/// After publication, integration_checks hands the exact head to C's reader.
+pub(super) const CHECKS_REQUIRED: &str = "integration_checks_required";
 
 /// Preflight has not acquired a productive lease or spent a builder call yet.
 /// Preserve integration's request instead of entering legacy stand-down logic.
