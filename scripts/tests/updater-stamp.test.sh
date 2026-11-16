@@ -20,6 +20,8 @@ make_case() {
   export TMP
   git init -q --bare "$TMP/origin.git"
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
+  # Match the production checkout: build output is ignored, owner source is not.
+  cp "$REPO_ROOT/.gitignore" "$TMP/work/.gitignore"
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   cp "$REPO_ROOT/scripts/recover-autopr-worker.py" "$TMP/work/scripts/"
@@ -27,6 +29,9 @@ make_case() {
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/secure-release-executables.py" "$TMP/work/scripts/"
+  # Provisioning is approved fixture source, not an untracked owner script.
+  printf '#!/bin/sh\nexit "${RESOURCE_CODE:-0}"\n' > "$TMP/work/scripts/configure-run-resources.sh"
+  chmod +x "$TMP/work/scripts/configure-run-resources.sh"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -173,9 +178,7 @@ rm -rf "$TMP"
 # failures still retain the running daemon and withhold the build stamp.
 for resource_code in 3 1; do
   make_case
-  printf '#!/bin/sh\nexit %s\n' "$resource_code" > "$TMP/work/scripts/configure-run-resources.sh"
-  chmod +x "$TMP/work/scripts/configure-run-resources.sh"
-  run_updater 1; rc=$?
+  RESOURCE_CODE="$resource_code" run_updater 1; rc=$?
   if [ "$resource_code" -eq 3 ]; then
     [ "$rc" -eq 0 ] && [ -s "$STAMP_FILE" ] && ok "unsupported delegation allows unrelated daemon update" || bad "unsupported delegation allows unrelated daemon update"
   else

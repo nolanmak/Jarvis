@@ -106,7 +106,7 @@ pub(super) async fn check(repo: &Path, source: &str) -> std::result::Result<(), 
 /// retains its separate existing policy.
 pub(super) async fn fresh_source(repo: &Path) -> std::result::Result<String, Deferred> {
     let read = async {
-        let (ok, _, _) = run("git", &["fetch", "-q", "origin", "main"], repo).await?;
+        let (ok, _, _) = workspace::preparation_git(repo, &["fetch", "--no-write-fetch-head", "-q", "origin", "main"]).await?;
         anyhow::ensure!(ok, "optional baseline source refresh failed");
         let (ok, out, _) = run(
             "git",

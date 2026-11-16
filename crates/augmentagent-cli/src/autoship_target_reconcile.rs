@@ -143,4 +143,63 @@ else:raise Exception('unexpected GitHub call '+repr(a))
             .output().unwrap();
         assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
     }
+
+    /// #1531 (#2054 incident): a source closed while its scope worker still
+    /// holds the lease must fence NEW model/publication admissions at once,
+    /// preserve the paid charges, and retire only after quiescence.
+    #[tokio::test]
+    async fn closed_source_fences_new_admissions_while_the_active_lease_drains() {
+        const CHILD:&str="AUTOSHIP_CLOSED_FENCE_FIXTURE";
+        if let Some(root)=std::env::var_os(CHILD).map(std::path::PathBuf::from) {
+            let path=root.join("workflow.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let now=chrono::Utc::now().timestamp_millis();
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(&id,"fixture",binding.clone(),now).unwrap();
+            let lease=store.claim(&id,"scope-worker",now,600_000).unwrap().unwrap();
+            store.charge(&lease,"scope-call-1",ResourceCharge {model_calls:17,tokens:900,wall_ms:5},now).unwrap();
+            assert!(store.require_owner_dispatch(&id).is_ok());
+            let state=|open:bool| std::fs::write(root.join("scenario.json"),json!({"permission":"ADMIN",
+                "issue":{"number":7,"state":if open {"open"} else {"closed"},"html_url":"https://github.com/owner/repo/issues/7"}}).to_string()).unwrap();
+            state(false);
+            // Still leased: retirement is held, but new admissions are fenced.
+            assert!(apply(&root,&path,"owner/repo#7").await.is_err(),"leased workflow retired before quiescence");
+            let held=store.snapshot(&id).unwrap().unwrap();
+            assert_ne!(held.checkpoint.stage,Stage::Retired);
+            assert_eq!((held.model_calls,held.tokens),(17,900),"fencing changed paid history");
+            assert!(store.require_owner_dispatch(&id).is_err(),"closed source left future dispatch unfenced");
+            assert!(store.begin_operation(&lease,OperationKind::Push,&binding,now+1).is_err(),"closed source admitted a new publication");
+            // A reopened source lifts only this fence.
+            state(true);
+            assert!(apply(&root,&path,"owner/repo#7").await.is_err());
+            assert!(store.require_owner_dispatch(&id).is_ok(),"reopened source stayed fenced");
+            state(false);
+            assert!(apply(&root,&path,"owner/repo#7").await.is_err());
+            assert!(store.require_owner_dispatch(&id).is_err());
+            // After the worker drains, the same supported command retires it.
+            store.release(&lease,now+2).unwrap();
+            apply(&root,&path,"owner/repo#7").await.unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage,Stage::Retired);
+            assert_eq!((after.model_calls,after.tokens),(17,900));
+            return;
+        }
+        let dir=tempfile::tempdir().unwrap();let root=dir.path().canonicalize().unwrap();let gh=root.join("gh.py");
+        std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['AUTOSHIP_CLOSED_FENCE_FIXTURE']);s=json.loads((root/'scenario.json').read_text());a=sys.argv[1:]
+if a[:2]==['repo','view']:print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
+elif a[:2]==['api','graphql']:print(json.dumps({'data':{'viewer':{'login':'owner'}}}))
+elif a[:1]==['api'] and a[1]=='repos/owner/repo/issues/7':print(json.dumps(s['issue']))
+else:raise Exception('unexpected GitHub call '+repr(a))
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","autoship_commands::target_reconcile::tests::closed_source_fences_new_admissions_while_the_active_lease_drains","--nocapture"])
+            .env(CHILD,&root).env("GH_BIN",gh).env("XDG_STATE_HOME",root.join("state"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",root.join("must-not-be-opened-policy"))
+            .output().unwrap();
+        assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+    }
 }
