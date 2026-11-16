@@ -17,6 +17,8 @@ mod guarded_progress;
 pub(crate) mod activity;
 #[path = "autoship_runtime_events.rs"]
 pub(crate) mod runtime_events;
+#[path = "autoship_discord_request_schema.rs"]
+mod discord_request_schema;
 
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
@@ -801,6 +803,7 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
         Ok(Self { conn })
