@@ -4434,3 +4434,7 @@ mod initial_acceptance_hold_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_hold_outcome_tests.rs"]
+mod hold_outcome_tests;
