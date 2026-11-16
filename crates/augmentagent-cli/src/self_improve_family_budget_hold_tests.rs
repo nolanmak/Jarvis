@@ -512,3 +512,39 @@ async fn trusted_revised_funding_unblocks_selection_without_granting_native_disp
         "selection created dispatch authority: {error:#}"
     );
 }
+
+async fn assert_ancestor_control_refusal_is_durable(resume: bool) {
+    let (_checkout, control, guard) = funded_guard(10).await;
+    let mut store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    store.set_owner_pause("owner/repo#1725", "verified-test-owner", 0, true, millis()).unwrap();
+    if resume {
+        store.set_owner_pause("owner/repo#1725", "verified-test-owner", 1, false, millis()).unwrap();
+    }
+    let reason = if resume {"family_execution_scope_unknown"} else {"owner_paused"};
+    let action = if resume {"await_protected_execution_scope"} else {"await_owner_resume"};
+    let error = denied_native_call(&guard).await;
+    assert!(error.to_string().contains(reason), "unexpected refusal: {error:#}");
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(after.checkpoint.next.reason,reason,"ancestor-control refusal was lost before durable wait handling");
+    assert_eq!(after.checkpoint.next.action,action);
+    assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+    assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+    assert_eq!(after.model_calls,before.model_calls);
+    assert_eq!(after.progress_at_ms,before.progress_at_ms);
+    let wait=store.family_budget_wait(guard.id()).unwrap().unwrap();
+    assert_eq!(wait.observation.model_admissions,Some(2));
+    assert!(guard.validate_before_side_effect().is_err());
+    let report=guard.capacity_accounting(false).unwrap().settle_ci(Err(error)).unwrap();
+    assert!(report.held && !report.billed);
+}
+
+#[tokio::test]
+async fn ancestor_pause_becomes_a_durable_child_wait_through_actual_callback() {
+    assert_ancestor_control_refusal_is_durable(false).await;
+}
+
+#[tokio::test]
+async fn ancestor_resume_requires_a_fresh_frame_and_persists_its_specific_wait() {
+    assert_ancestor_control_refusal_is_durable(true).await;
+}
