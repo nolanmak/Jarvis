@@ -40,13 +40,14 @@ pub const IMAGE_NAME: &str = "build-cache.img";
 /// starting; leave it for the next sweep.
 const OWNERLESS_GRACE: Duration = Duration::from_secs(10 * 60);
 
+#[cfg(test)]
 fn configured_scratch_dir(value: Option<std::ffi::OsString>) -> PathBuf {
     value.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_SCRATCH_DIR))
 }
 
 /// The scratch root from the daemon's own environment.
 pub fn scratch_dir() -> PathBuf {
-    configured_scratch_dir(std::env::var_os(SCRATCH_ENV))
+    crate::build_volume::paths().scratch
 }
 
 fn configured_timeout(value: Option<String>) -> u64 {

@@ -52,6 +52,7 @@ pub mod state_dir;
 // fence instead of each starting its own.
 #[path = "storage_ci_holds.rs"]
 pub mod build_storage_ci_holds;
+pub mod build_volume;
 pub mod storage_checkout;
 pub mod storage_coordination;
 pub mod storage_reservations;
