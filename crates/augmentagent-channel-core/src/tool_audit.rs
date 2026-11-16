@@ -36,6 +36,9 @@
 //! landed standalone with full tests; a follow-up issue tracks the
 //! reasoner-side hookup so the two diffs don't collide.
 
+#[path = "tool_audit_cancellation.rs"]
+pub(crate) mod cancellation;
+pub use cancellation::OwnedRunsQuiescence;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -305,6 +308,7 @@ pub fn default_audit_log_path() -> PathBuf {
 /// the caller can hand it to spawned tasks.
 #[derive(Clone)]
 pub struct AuditLogger {
+    owned_runs: Arc<cancellation::Registry>,
     path: PathBuf,
     native_progress_observer: Arc<std::sync::Mutex<Option<Arc<native_progress::Observer>>>>,
     model_call_observer:
@@ -444,6 +448,7 @@ impl AuditLogger {
         Ok(())
     }
     pub fn dispatch_allowed(&self)->anyhow::Result<()> {
+        self.owned_runs.require_dispatch()?;
         let observer=self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?.clone();
         if let Some(observer)=observer {observer()?;}
         Ok(())
@@ -528,6 +533,7 @@ impl AuditLogger {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            owned_runs: Arc::new(cancellation::Registry::default()),
             native_progress_observer: Arc::new(std::sync::Mutex::new(None)),
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             dispatch_observer: Arc::new(std::sync::Mutex::new(None)),

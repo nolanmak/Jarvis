@@ -284,7 +284,7 @@ pub(super) fn project(
     state.outcome = match checkpoint.next.action.as_str() {
         "await_capacity" => WorkflowOutcome::CapacityWait,
         "await_quota" => WorkflowOutcome::QuotaWait,
-        "retry_verification" => WorkflowOutcome::RetryableInfrastructure,
+        "retry_verification" | "await_inactivity_retry" => WorkflowOutcome::RetryableInfrastructure,
         _ if waiting => WorkflowOutcome::DependencyWait,
         _ => WorkflowOutcome::Progressed,
     };
