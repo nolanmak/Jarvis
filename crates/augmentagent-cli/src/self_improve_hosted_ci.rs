@@ -210,7 +210,7 @@ async fn observe_with(
     serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")
 }
 
-fn job_diagnostics(log: &str) -> String {
+pub(super) fn job_diagnostics(log: &str) -> String {
     let mut previous_step=None;
     let mut output=String::new();
     for line in log.split_inclusive('\n') {
@@ -270,7 +270,7 @@ async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String>
         String::from_utf8_lossy(&head),String::from_utf8_lossy(&tail[start..])))
 }
 
-async fn failed_step_logs(root:&Path,gh:&str,repository:&str,job:u64)->Result<String> {
+pub(super) async fn failed_step_logs(root:&Path,gh:&str,repository:&str,job:u64)->Result<String> {
     let mut child=Command::new(gh)
         .args(["run","view","--repo",repository,"--job",&job.to_string(),"--log-failed"])
         .current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
@@ -287,7 +287,7 @@ async fn failed_step_logs(root:&Path,gh:&str,repository:&str,job:u64)->Result<St
 
 // Preserve both ends of an oversized failed step, never a whole-job success
 // prelude. The marker counts towards the same byte budget as the evidence.
-fn diagnostic_excerpt(text:&str,budget:usize)->String {
+pub(super) fn diagnostic_excerpt(text:&str,budget:usize)->String {
     if text.len()<=budget {return text.to_owned();}
     const MARKER:&str="\n[diagnostics truncated; see job URL]\n";
     if budget<MARKER.len() {
