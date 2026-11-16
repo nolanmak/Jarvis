@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_review_custody.rs"]
+mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -15,9 +17,15 @@ mod guarded_progress;
 
 #[path = "autoship_idle_recovery.rs"]
 pub(crate) mod idle_recovery;
+#[path = "autoship_outcome_classification.rs"]
+mod outcome_classification;
 
 #[path = "autoship_activity.rs"]
 pub(crate) mod activity;
+#[path = "autoship_runtime_events.rs"]
+pub(crate) mod runtime_events;
+#[path = "autoship_discord_request_schema.rs"]
+mod discord_request_schema;
 
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
@@ -33,12 +41,19 @@ pub(crate) mod merge_escalation;
 pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_progress_retry.rs"]
+pub(crate) mod progress_retry;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
+#[path = "autoship_deployment_progress.rs"]
+pub(crate) mod deployment_progress;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_integration.rs"]
+mod integration;
+pub(crate) use integration::IntegrationReason;
 #[path = "autoship_review_recovery.rs"]
 mod review_recovery;
 pub(crate) use review_recovery::ReviewRecoveryReadiness;
@@ -78,6 +93,7 @@ pub use verification_retry::VerificationDomain;
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
 pub use merge_escalation::UnresolvedMergeHold;
+pub use deployment_progress::{DeploymentOutcome, DeploymentReceipt};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -769,6 +785,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
+            CREATE TABLE IF NOT EXISTS integration_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS integration_recovery (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,
@@ -794,6 +815,10 @@ impl WorkflowStore {
                 sequence INTEGER NOT NULL, nonce TEXT NOT NULL, content TEXT NOT NULL,
                 state TEXT NOT NULL, dispatched_at INTEGER NOT NULL, message TEXT,
                 confirmed_at INTEGER, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_retry (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, attempts INTEGER NOT NULL, eligible_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,bot,owner,channel,sequence));
             CREATE TABLE IF NOT EXISTS workflow_progress_state (
                 workflow TEXT PRIMARY KEY, sequence INTEGER NOT NULL, fingerprint TEXT NOT NULL,
                 terminal INTEGER NOT NULL, payload TEXT NOT NULL);
@@ -802,7 +827,9 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
+        runtime_events::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -2364,6 +2391,7 @@ fn event(
     )?;
     progress::project(tx,workflow,kind,now_ms)?;
     activity::project(tx,workflow,kind,payload,now_ms)?;
+    runtime_events::project(tx,workflow,kind,payload,now_ms)?;
     Ok(())
 }
 

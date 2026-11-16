@@ -1146,6 +1146,8 @@ enum AutoprOp {
     Pause(autoship_commands::control_command::Args),
     /// Clear only the explicit owner pause after access and readiness checks.
     Resume(autoship_commands::control_command::Args),
+    /// Retire one idle workflow as owner-canceled (exit 6); refuses active work and merges.
+    Cancel(autoship_commands::cancel_command::Args),
     /// Observe an externally merged/closed target without starting model work.
     ReconcileTarget(autoship_commands::target_reconcile::Args),
     /// Owner readoption of one legacy automatic hold; records new authority.
@@ -1156,6 +1158,8 @@ enum AutoprOp {
     Run(autoship_commands::run_command::RunArgs),
     /// Bind durable progress delivery to the configured owner's private DM.
     Delivery(autoship_commands::delivery_command::Args),
+    /// Record updater deployment receipts; merged is never deployed by itself.
+    Deployment(autoship_commands::deployment_command::Args),
     /// Inspect native credential declarations; no provider calls or refresh.
     Readiness { #[arg(long)] json: bool },
     /// Resolve a pending merge using bound controller and GitHub evidence.
@@ -3202,6 +3206,9 @@ async fn main() -> Result<()> {
     if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::work_command::run(args).await);
     }
+    if let Cmd::Autopr { op: AutoprOp::Cancel(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::cancel_command::run(args).await);
+    }
     if let Cmd::Autopr { op: AutoprOp::ReconcileTarget(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::target_reconcile::run(args).await);
     }
@@ -3219,6 +3226,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::Delivery(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::delivery_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Deployment(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::deployment_command::run(args));
     }
     if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
         let root=match tokio::process::Command::new("git").args(["rev-parse","--show-toplevel"]).output().await {
@@ -5857,11 +5867,13 @@ async fn main() -> Result<()> {
         Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ReconcileTarget(..) } => unreachable!("target reconciliation precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Cancel(..) } => unreachable!("owner cancel precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readopt(..) } => unreachable!("readoption precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Delivery(..) } => unreachable!("delivery administration precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Deployment(..) } => unreachable!("deployment receipts precede application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
@@ -11815,6 +11827,7 @@ impl QueryHandler for WikiQuerier {
     fn autoship_progress_pending(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {autoship_discord_command::progress_pending(&autoship_workflow::default_path(),bot,owner)}
     fn autoship_progress_claim(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {autoship_discord_command::progress_claim(&autoship_workflow::default_path(),delivery)}
     fn autoship_progress_confirm(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->anyhow::Result<()> {autoship_discord_command::progress_confirm(&autoship_workflow::default_path(),delivery,message)}
+    fn autoship_progress_defer(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->anyhow::Result<()> {autoship_discord_command::progress_defer(&autoship_workflow::default_path(),delivery,retry_after_ms)}
     fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
         autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
     }

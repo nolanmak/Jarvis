@@ -7,27 +7,20 @@ use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>> {
     let repository = workflow::canonical_repository(repo).await?;
     let raw = complete_repository_inventory(repo, "pr", None,
-        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences")
+        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,author,title,body,closingIssuesReferences")
         .await.context("source-less PR inventory must be complete before fair selection")?;
     let mut allowed = trusted_authors(repo).await;
     if let Some(owner) = repository.split('/').next() {
         allowed.push(owner.into());
     }
-    let mut candidates = adoption::authorized(&serde_json::from_str(&raw)?, &repository, &allowed);
+    let inventory = serde_json::from_str(&raw)?;
+    let mut candidates = adoption::authorized(&inventory, &repository, &allowed);
     manual_routing::filter(repo, &mut candidates).await;
     if !dry_run {
         adoption::persist(&workflow::path(), &candidates)?;
     }
-    for candidate in &candidates {
-        if !candidate.ready_for_review() {
-            if let Err(error) = reconcile_parent(repo, candidate, dry_run).await {
-                warn!(
-                    pr = candidate.pr,
-                    "parent reconciliation deferred: {error:#}"
-                );
-            }
-        }
-    }
+    integration::filter(repo, &workflow::path(), &mut candidates, &inventory,
+        chrono::Utc::now().timestamp_millis(), dry_run).await?;
     Ok(candidates)
 }
 
@@ -366,12 +359,13 @@ async fn execute(
     )
     .await?;
     for upstream in [format!("origin/{}", pr.branch), "origin/main".into()] {
-        let (ok, _, error) = run("git", &["merge", "--no-edit", &upstream], worktree).await?;
-        if !ok {
-            let (_, diff, _) = run("git", &["diff"], worktree).await?;
-            adoption::revise(reasoner,guard,&fix_opts(worktree.to_path_buf()),&format!("Resolve this merge while preserving the PR contract. Do not weaken any verifier.\n{request}\n{error}\n{diff}")).await?;
-            recovery::commit_candidate_named(worktree, "autoship: reconcile PR upstream").await?;
-        }
+        integration_merge::integrate(worktree,guard,&upstream,|files,diff| {
+            let prompt=format!("Resolve this merge while preserving the PR contract. Do not weaken any verifier.\n{request}\nConflicting files: {}\n{diff}",files.join(", "));
+            let opts=fix_opts(worktree.to_path_buf());
+            let current=&*guard;
+            async move { adoption::revise(reasoner,current,&opts,&prompt).await }
+        }).await?;
+        guard.transition(Stage::Verify,integration::CHECKS_REQUIRED,"verify_integrated_head",0).await?;
     }
     let mut criteria: Vec<String> = prepared
         .proposal
@@ -519,11 +513,14 @@ async fn execute(
                 repo_owner: merge_policy_owner(repo).await,
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             });
-            if !allowed || checks_green(repo, pr.pr).await != Some(true) {
+            let check_wait = if allowed {
+                integration_checks::wait_reason(repo, pr.pr, &guard.binding().head).await
+            } else { None };
+            if !allowed || check_wait.is_some() {
                 guard
                     .transition(
                         if allowed { Stage::AwaitChecks } else { Stage::Held },
-                        if allowed { "adopted_ci_pending" } else { "adopted_merge_policy_blocked" },
+                        check_wait.unwrap_or("adopted_merge_policy_blocked"),
                         if allowed { "reconcile_approved_pr" } else { "await_merge_authorization" },
                         chrono::Utc::now().timestamp_millis() + 300_000,
                     )
@@ -788,7 +785,7 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
 /// A merged parent no longer blocks the child. Retarget only after Git proves
 /// that the parent's merge commit is reachable from main, under the child's
 /// own workflow lease. Full child verification runs after rediscovery.
-async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) -> Result<bool> {
+pub(super) async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) -> Result<bool> {
     if pr.ready_for_review() {
         return Ok(false);
     }
@@ -838,6 +835,12 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     {
         return Ok(false);
     }
+    let observed_main=run("git", &["rev-parse","origin/main"],repo).await?;
+    anyhow::ensure!(observed_main.0,"parent main identity unavailable");
+    let mut store=WorkflowStore::open(&workflow::path())?;
+    let fingerprint=crate::autoship_review::digest(format!("{}:{}",pr.head,observed_main.1.trim()).as_bytes());
+    let _=store.reconcile_integration(&pr.repository,pr.pr,&pr.branch,&pr.head,observed_main.1.trim(),&fingerprint,
+        crate::autoship_workflow::IntegrationReason::BaseChanged,chrono::Utc::now().timestamp_millis())?;
     let lock_path = run_lock_path().with_file_name(format!("self-improve-pr-{}.lock", pr.pr));
     let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
         return Ok(false);

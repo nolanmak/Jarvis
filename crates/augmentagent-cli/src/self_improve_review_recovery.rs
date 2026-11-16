@@ -4,7 +4,7 @@ use super::*;
 use crate::autoship_workflow::{ReviewRecoveryReadiness, WorkflowStore};
 use std::collections::BTreeSet;
 
-fn readiness() -> ReviewRecoveryReadiness {
+pub(super) fn readiness() -> ReviewRecoveryReadiness {
     use augmentagent_channel_core::ProviderKind::{Claude, Codex};
     let reviewer = reviewer_pool()
         .into_iter()
