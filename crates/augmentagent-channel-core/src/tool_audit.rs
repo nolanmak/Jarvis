@@ -54,6 +54,9 @@ use crate::providers::ProviderKind;
 /// reviewers know the buffer was cut.
 const MAX_STREAM_BYTES: usize = 4 * 1024;
 
+#[path = "native_tool_progress.rs"]
+pub mod native_progress;
+
 /// One row in `tool-audit.log`. Serialized as a single line of NDJSON.
 ///
 /// Field naming and order matter: this is an append-only on-disk format
@@ -73,6 +76,9 @@ pub struct AuditRecord {
     /// code would not compile. Read it with [`AuditRecord::provider`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    /// Controller-produced completion; cannot be restored from audit JSON.
+    #[serde(skip)]
+    native_step: Option<native_progress::CompletedToolStep>,
     /// Model requested for this tool-bearing turn. Absent on historical rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -300,6 +306,7 @@ pub fn default_audit_log_path() -> PathBuf {
 #[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
+    native_progress_observer: Arc<std::sync::Mutex<Option<Arc<native_progress::Observer>>>>,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<Option<String>> + Send + Sync>>>>,
     dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
@@ -521,6 +528,7 @@ impl AuditLogger {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            native_progress_observer: Arc::new(std::sync::Mutex::new(None)),
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
@@ -573,7 +581,7 @@ impl AuditLogger {
     /// Autoship must propagate this failure into workflow evidence rather than
     /// issuing LGTM when its audit cannot be persisted or verified.
     pub async fn record_checked(&self, record: &AuditRecord) -> anyhow::Result<()> {
-        self.record_value_checked(serde_json::to_value(record)?)
+        self.record_value_checked(serde_json::to_value(record)?, record.native_step.clone())
             .await
     }
 
@@ -592,7 +600,7 @@ impl AuditLogger {
         result
     }
 
-    async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
+    async fn record_value_checked(&self, value: serde_json::Value, step: Option<native_progress::CompletedToolStep>) -> anyhow::Result<()> {
         let sink = self
             .anchored
             .clone()
@@ -600,7 +608,7 @@ impl AuditLogger {
         let ticket = self.begin_write()?;
         let logger = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let result = sink.append(value);
+            let result = sink.append(value).and_then(|()| logger.publish_native_progress(step.as_ref()));
             if result.is_err() {
                 logger.mark_failed();
             }
@@ -937,6 +945,7 @@ pub fn build_audit_record(
     });
     AuditRecord {
         provider: Some(provider.name().to_string()),
+        native_step: if private_compose { None } else { native_progress::completed(provider, &tool, &args, result_content, is_error) },
         model: None,
         ts,
         session_id,
@@ -1117,6 +1126,7 @@ mod tests {
     fn format_notice_prefers_file_path_over_blob() {
         let rec = AuditRecord {
             provider: Some("claude".into()),
+            native_step: None,
             model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
@@ -1163,6 +1173,7 @@ mod tests {
     fn format_notice_includes_bash_exit_code() {
         let rec = AuditRecord {
             provider: Some("claude".into()),
+            native_step: None,
             model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
@@ -1363,6 +1374,7 @@ mod tests {
         let logger = AuditLogger::new(path.clone());
         let rec1 = AuditRecord {
             provider: Some("claude".into()),
+            native_step: None,
             model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:1".into(),
@@ -1375,6 +1387,7 @@ mod tests {
         };
         let rec2 = AuditRecord {
             provider: Some("codex".into()),
+            native_step: None,
             model: None,
             ts: "2026-05-27T00:00:01Z".into(),
             session_id: "ch:2".into(),

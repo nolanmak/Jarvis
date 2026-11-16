@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_native_tool_progress.rs"]
+mod native_tool_progress;
+
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 

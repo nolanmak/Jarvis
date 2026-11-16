@@ -12,6 +12,18 @@ command or identical artifact cannot renew activity. Command progress does not
 create a verification-gate success or reset unresolved verification backoff.
 Read-only capture inspection never records progress.
 
+Native Codex/Claude tool completions publish through the protected audit logger
+only after the tool row commits and before its writer ticket drains. Completion
+markers cannot be restored from audit JSON or fabricated by controller prose.
+The digest excludes SDK sessions, descriptions, timestamps and elapsed time;
+Codex Bash uses the actual VM exit/stdout/stderr instead of its envelope.
+Refused, host, interrupted and incomplete Codex commands do not count. A matching
+provider admission in the current workflow generation is required. Progress
+publication failures retain the tool audit row and fail audit health closed.
+Tool observations never bill another model call or confer verification/merge
+credit. The seven-hour fixture advances a fake clock through native store
+admissions and completions; it is not a live seven-hour inference claim.
+
 Owner pause/resume updates the same projection in its control transaction.
 Explicit lease release suspends active time; reclaim after release starts a new
 active interval. Reclaiming an unreleased crashed generation preserves its old
@@ -38,8 +50,8 @@ compute accounting remain independent of these clocks.
 
 This implementation milestone provides durable observations. It does not yet
 enable inactivity cancellation, recover a running generation, release a lease,
-or grant execution/review/merge authority. Those paths must also cover model tools (in addition to original-verifier
-commands) and prove descendant cleanup before lease release. A long-running process is not proof of progress. Existing command
+or grant execution/review/merge authority. Those paths must prove descendant cleanup before lease release and preserve
+the separate per-operation watchdogs. A long-running process is not proof of progress. Existing command
 watchdogs, review requirements, retry backoff, and merge accounting still apply.
 
 Tests use the native workflow store, a real temporary Git repository, injected

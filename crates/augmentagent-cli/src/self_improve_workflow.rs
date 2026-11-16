@@ -1128,6 +1128,7 @@ impl WorkflowGuard {
     }
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
+        self.install_native_tool_progress()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
