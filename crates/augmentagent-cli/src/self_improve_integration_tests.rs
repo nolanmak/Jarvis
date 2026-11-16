@@ -518,3 +518,6 @@ mod restart;
 
 #[path = "self_improve_integration_owner_tests.rs"]
 mod owner;
+
+#[path = "self_improve_integration_parent_tests.rs"]
+mod parent;
