@@ -1,0 +1,254 @@
+//! Component proof through the installed production accounting observer. All
+//! stores/Git repositories are temporary; no SDK/provider process is launched.
+use super::tests::{control_dir, repo, scripted_independent_admission};
+use super::*;
+use crate::autoship_workflow::family_budget::{self, store as family_store};
+
+async fn funded_guard(limit: u64) -> (tempfile::TempDir, tempfile::TempDir, WorkflowGuard) {
+    let checkout = repo();
+    let control = control_dir();
+    let path = control.path().join("workflow.db");
+    let mut guard = WorkflowGuard::acquire_at(
+        &path,
+        Start {
+            repo_root: checkout.path(),
+            worktree: checkout.path(),
+            repository: "owner/repo",
+            source_issue: Some(77),
+            pr: None,
+            branch: "fixture",
+            contract: "C1",
+            environment: "test",
+        },
+        millis(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    guard
+        .checkpoint(
+            Stage::Scope,
+            "fixture-ready",
+            "scope",
+            0,
+            &["protected-controller-artifact".into()],
+        )
+        .await
+        .unwrap();
+    assert!(guard.validate_before_side_effect().is_ok());
+    // This positive control reaches the very same installed accounting callback
+    // before family registration. Qualification/identity failure is not our RED.
+    scripted_independent_admission(&guard).await;
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let binding = store
+        .snapshot(guard.id())
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .binding;
+    let root = "owner/repo#1725";
+    let other = "owner/repo#1797";
+    for workflow in [root, other] {
+        store
+            .register(workflow, "fixture", binding.clone(), millis())
+            .unwrap();
+    }
+    let root_lease = store
+        .claim(root, "trusted-fixture-root", millis(), LEASE_MS)
+        .unwrap()
+        .unwrap();
+    store
+        .charge_admitted_model(
+            &root_lease,
+            "retained-root-call",
+            millis(),
+            None,
+            None,
+            Some(durable::submission::Provider::Codex),
+            false,
+        )
+        .unwrap();
+    store
+        .with_family_transaction(|tx| {
+            family_store::begin(
+                tx,
+                &root_lease,
+                &family_store::PendingFamily {
+                    family: "controller-family".into(),
+                    repository: "owner/repo".into(),
+                    original_request_ref: "protected-root-request".into(),
+                    source_ref: "source".into(),
+                    plan_ref: "plan".into(),
+                    expected_children: 2,
+                    binding: binding.clone(),
+                },
+                millis(),
+            )?;
+            family_store::stage_member(
+                tx,
+                &root_lease,
+                &binding,
+                "controller-family",
+                1,
+                guard.id(),
+                "protected-child-publication",
+                None,
+                millis(),
+            )?;
+            family_store::stage_member(
+                tx,
+                &root_lease,
+                &binding,
+                "controller-family",
+                2,
+                other,
+                "protected-other-publication",
+                None,
+                millis(),
+            )?;
+            family_store::finalize(
+                tx,
+                &root_lease,
+                &binding,
+                "controller-family",
+                "manifest",
+                millis(),
+            )?;
+            let policy_ref = family_store::activate_policy(
+                tx,
+                &root_lease,
+                &binding,
+                "controller-family",
+                None,
+                "verified-owner-fixture-policy",
+                &family_budget::Limits {
+                    schema_version: 1,
+                    max_model_admissions: limit,
+                    max_wall_ms: 1_000_000,
+                },
+                millis(),
+            )?;
+            family_store::record_intent(
+                tx,
+                &guard.lease,
+                &family_budget::Intent::Delegated {
+                    family: "controller-family".into(),
+                    manifest_ref: "manifest".into(),
+                    policy_ref,
+                    request_ref: "protected-root-request".into(),
+                },
+                "verified-owner-fixture-delegation",
+                millis(),
+            )
+        })
+        .unwrap();
+    assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+    assert_eq!(store.snapshot(root).unwrap().unwrap().model_calls, 1);
+    (checkout, control, guard)
+}
+
+async fn denied_native_call(guard: &WorkflowGuard) -> anyhow::Error {
+    use augmentagent_channel_core::{native_session, ProviderKind};
+    native_session::fresh_review_scope(ProviderKind::Codex, async {
+        let session = native_session::current_for(ProviderKind::Codex)?.unwrap();
+        let _native = session.begin(ProviderKind::Codex)?;
+        // A declined pre-submission lease drops cleanly: no conversation,
+        // output, teardown or provider success is fabricated by this fixture.
+        guard.audit_logger().model_call_admitted("codex")
+    })
+    .await
+    .unwrap_err()
+}
+
+#[tokio::test]
+async fn actual_model_observer_persists_family_budget_hold_without_billing_a_retry() {
+    let (_checkout, control, mut guard) = funded_guard(2).await;
+    let path = control.path().join("workflow.db");
+    let store = WorkflowStore::open(&path).unwrap();
+    let before = store.snapshot(guard.id()).unwrap().unwrap();
+    let activity = store.activity_status(guard.id()).unwrap().unwrap();
+    let accounting = guard.capacity_accounting(true).unwrap();
+    let error = denied_native_call(&guard).await;
+    assert!(
+        error.to_string().contains("family_resource_exhausted"),
+        "fixture did not reach family admission: {error:#}"
+    );
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(
+        after.checkpoint.next.reason, "family_resource_exhausted",
+        "installed model observer lost its specific durable budget hold"
+    );
+    assert_eq!(after.checkpoint.next.action, "await_owner_budget_revision");
+    assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
+    assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+    assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+    assert_eq!(after.progress_at_ms, before.progress_at_ms);
+    assert_eq!(after.model_calls, before.model_calls);
+    let held_activity = store.activity_status(guard.id()).unwrap().unwrap();
+    assert_eq!(
+        held_activity.last_meaningful_progress_at,
+        activity.last_meaningful_progress_at
+    );
+    assert_eq!(held_activity.inactivity_deadline_at, None);
+    let held_event = store
+        .events(guard.id())
+        .unwrap()
+        .into_iter()
+        .find(|e| e.1 == "family_budget_wait")
+        .expect("durable metric evidence missing");
+    let payload: serde_json::Value = serde_json::from_str(&held_event.2).unwrap();
+    assert_eq!(
+        payload["observation"]["blockers"][0]["metric"],
+        "model_admissions"
+    );
+    assert_eq!(payload["observation"]["blockers"][0]["observed"], 2);
+    assert_eq!(payload["observation"]["blockers"][0]["limit"], 2);
+    let report = accounting.settle_ci(Err(error)).unwrap();
+    assert!(report.held && report.is_idle() && !report.billed && report.resumed);
+    assert!(report.message.contains("model_admissions"));
+    assert!(
+        !guard.audit_logger().resource_capacity_seen(),
+        "family budget is not physical capacity"
+    );
+    assert!(guard.validate_before_side_effect().is_err());
+    assert!(guard
+        .checkpoint(Stage::Build, "generic_failure", "retry_builder", 0, &[])
+        .await
+        .is_err());
+    assert_eq!(
+        store.snapshot(guard.id()).unwrap().unwrap().checkpoint,
+        after.checkpoint
+    );
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().available, 5);
+    drop(guard);
+    assert_eq!(
+        WorkflowStore::open(&path)
+            .unwrap()
+            .snapshot(&after.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .next
+            .reason,
+        "family_resource_exhausted"
+    );
+}
+
+#[tokio::test]
+async fn family_budget_hold_retains_actual_admissions_from_this_run() {
+    let (_checkout, control, guard) = funded_guard(3).await;
+    let accounting = guard.capacity_accounting(false).unwrap();
+    scripted_independent_admission(&guard).await;
+    let error = denied_native_call(&guard).await;
+    assert!(error.to_string().contains("family_resource_exhausted"));
+    let store = WorkflowStore::open(&control.path().join("workflow.db")).unwrap();
+    let after = store.snapshot(guard.id()).unwrap().unwrap();
+    assert_eq!(
+        after.checkpoint.next.action, "await_owner_budget_revision",
+        "actual callback failure became a generic run error"
+    );
+    let report = accounting.settle_ci(Err(error)).unwrap();
+    assert!(report.held && report.billed && !report.resumed);
+    assert_eq!(after.model_calls, 2);
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().available, 5);
+}

@@ -3,6 +3,9 @@
 use super::*;
 #[path = "self_improve_stage_activity.rs"]
 mod stage_activity;
+#[cfg(test)]
+#[path = "self_improve_family_budget_hold_tests.rs"]
+mod family_budget_hold_tests;
 use crate::autoship_workflow::{
     self as durable, Binding, Checkpoint, Lease, NextAction, Operation, OperationKind,
     ResourceCharge, Review, Stage, WorkflowStore,
@@ -2774,7 +2777,7 @@ mod tests {
         assert_eq!(source_from_workflow("autoship-observation/probe"),None);
         assert_eq!(source_from_workflow("owner/repo#0"),None);
     }
-    async fn scripted_independent_admission(guard:&WorkflowGuard) {
+    pub(super) async fn scripted_independent_admission(guard:&WorkflowGuard) {
         use augmentagent_channel_core::{native_session,ProviderKind};
         native_session::fresh_review_scope(ProviderKind::Codex,async {
             let session=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut native=session.begin(ProviderKind::Codex)?;
@@ -2782,7 +2785,7 @@ mod tests {
             Ok::<_,anyhow::Error>(())
         }).await.unwrap();
     }
-    fn control_dir() -> tempfile::TempDir {
+    pub(super) fn control_dir() -> tempfile::TempDir {
         // Managed Cargo puts TMPDIR inside the writable build cache. Control
         // evidence must live outside every worker write root even in fixtures.
         let dir = tempfile::Builder::new()
@@ -2794,7 +2797,7 @@ mod tests {
         dir
     }
 
-    fn repo() -> tempfile::TempDir {
+    pub(super) fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             assert!(std::process::Command::new("git")
