@@ -96,6 +96,8 @@ mod source_reconcile;
 mod workflow;
 #[path = "self_improve_recovery.rs"]
 mod recovery;
+#[path = "self_improve_checkout_identity.rs"]
+mod checkout_identity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
 #[path = "self_improve_targeted.rs"]
@@ -5297,7 +5299,7 @@ fn baseline_cache_path() -> PathBuf {
 /// Current `origin/main` after a fetch (a stale ref would keep the latch
 /// closed after a human fixed main). Falls back to the local ref offline.
 async fn origin_main_sha(repo_root: &Path) -> Option<String> {
-    let _ = run("git", &["fetch", "-q", "origin", "main"], repo_root).await;
+    let _ = workspace::preparation_git(repo_root, &["fetch", "--no-write-fetch-head", "-q", "origin", "main"]).await;
     let (ok, out, _) = run("git", &["rev-parse", "origin/main"], repo_root)
         .await
         .ok()?;
@@ -8265,11 +8267,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // subsequent execution uses a clean controller pinned to fetched main;
     // the controller lock lives until this whole attempt returns. Candidate
     // locations remain stable through the shared Git repository.
-    let controller = if dry_run { None } else {
-        let lane = if lane_from_env() == Lane::Resume { "resume" } else { "build" };
-        Some(workspace::prepare(repo_root, lane).await?)
-    };
-    let repo_root = controller.as_ref().map_or(repo_root, |controller| controller.root.as_path());
+    // Dry runs still execute models, tools and gates; only publication is
+    // suppressed. They need the same trusted controller as productive runs.
+    let lane = if lane_from_env() == Lane::Resume { "resume" } else { "build" };
+    let controller = workspace::prepare(repo_root, lane).await?;
+    let repo_root = controller.root.as_path();
 
     let selected_issue=match selected {
         Some(targeted::Resolved::Pr(pr))=>return targeted::execute_pr(repo_root,pr,dry_run).await,
@@ -12431,13 +12433,11 @@ impl AutoPrLoop {
                 if let Err(error) = publication::reconcile_merge_dispatches(&root, dry_run).await {
                     warn!("merge dispatch reconciliation unavailable: {error:#}");
                 }
-                let controller = if dry_run { None } else {
-                    match workspace::prepare(&root, "sweep").await {
-                        Ok(controller) => Some(controller),
-                        Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
-                    }
+                let controller = match workspace::prepare(&root, "sweep").await {
+                    Ok(controller) => controller,
+                    Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
                 };
-                let root = controller.as_ref().map_or(root.as_path(), |controller| controller.root.as_path());
+                let root = controller.root.as_path();
                 let merged=merge_sweep(root,dry_run).await;
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 // Waiting workflows never re-check their target, so one whose

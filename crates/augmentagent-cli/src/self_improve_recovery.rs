@@ -123,7 +123,7 @@ pub(super) async fn prepare(root: &Path, worktree: &Path, branch: &str) -> Resul
             "origin/main",
         ]
     };
-    let (ok, _, error) = run("git", &args, root).await?;
+    let (ok, _, error) = workspace::preparation_git(root, &args).await?;
     anyhow::ensure!(ok, "recovery checkout preparation failed: {error}");
     Ok(())
 }
