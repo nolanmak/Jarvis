@@ -18,6 +18,16 @@ pub struct UncertainProgress {pub delivery:ProgressDelivery,pub nonce:String,pub
 
 pub struct ProgressDelivery {pub context:Context,pub workflow:String,pub sequence:i64}
 
+/// Discord answered a send with a 4xx status (429 included): no message was
+/// created, so the event may be retried with the same marker. Any other send
+/// failure is ambiguous and must stay uncertain.
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct SendRejected {pub status:u16,pub retry_after_ms:Option<i64>}
+impl std::fmt::Display for SendRejected {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Discord rejected the send with HTTP {}",self.status)}
+}
+impl std::error::Error for SendRejected {}
+
 pub struct Reply {
     pub content: String,
     /// Present only after a durable, single-use acknowledgement claim.
@@ -30,6 +40,8 @@ pub trait Transport: Send + Sync {
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64>;
     async fn find_acknowledgement(&self,_context:&Context,_reply:&Reply)->Result<Option<u64>> {Ok(None)}
     async fn find_progress(&self,_context:&Context,_nonce:&str,_content:&str)->Result<Option<u64>> {Ok(None)}
+    /// One progress send attempt. A definite rejection is a `SendRejected` error.
+    async fn send_progress(&self,context:&Context,reply:&Reply)->Result<u64> {self.send(context,reply).await}
 }
 
 pub fn recognizes(text: &str) -> bool {
@@ -171,6 +183,10 @@ impl Transport for DiscordTransport {
         Ok(sent.id.get())
     }
 }
+
+#[cfg(test)]
+#[path="autoship_progress_send_tests.rs"]
+mod progress_send_tests;
 
 #[cfg(test)]
 mod tests {

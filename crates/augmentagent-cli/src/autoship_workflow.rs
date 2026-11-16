@@ -32,6 +32,8 @@ pub(crate) mod merge_escalation;
 pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_progress_retry.rs"]
+pub(crate) mod progress_retry;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]
