@@ -79,6 +79,7 @@ fn pending_family_without_policy_fences_new_admission_and_retains_original_spend
         family_budget::store::stage_member(
             &tx,
             &root,
+            &fixture_binding(),
             "fixture-family",
             position as u8 + 1,
             id,
@@ -209,6 +210,7 @@ fn funded(
     family_budget::store::stage_member(
         &tx,
         &root,
+        &fixture_binding(),
         "family",
         1,
         &child.workflow,
@@ -220,6 +222,7 @@ fn funded(
     family_budget::store::stage_member(
         &tx,
         &root,
+        &fixture_binding(),
         "family",
         2,
         &other.workflow,
@@ -228,10 +231,12 @@ fn funded(
         17,
     )
     .unwrap();
-    family_budget::store::finalize(&tx, &root, "family", "manifest", 17).unwrap();
+    family_budget::store::finalize(&tx, &root, &fixture_binding(), "family", "manifest", 17)
+        .unwrap();
     let policy_ref = family_budget::store::activate_policy(
         &tx,
         &root,
+        &fixture_binding(),
         "family",
         None,
         "verified-explicit-owner-policy",
@@ -477,7 +482,7 @@ fn unknown_legacy_spend_keeps_reported_totals_and_never_becomes_zero() {
 
 #[test]
 fn root_pause_fences_delegated_child_but_keeps_receipt_and_late_usage_recoverable() {
-    let (_dir, mut store, root, child, _other, _intent) = funded(false);
+    let (_dir, mut store, root, child, _other, intent) = funded(false);
     store
         .set_owner_pause(&root.workflow, "verified-test-owner", 0, true, 18)
         .unwrap();
@@ -527,6 +532,52 @@ fn root_pause_fences_delegated_child_but_keeps_receipt_and_late_usage_recoverabl
             .model_calls,
         1
     );
+
+    store
+        .set_owner_pause(&root.workflow, "verified-test-owner", 1, false, 20)
+        .unwrap();
+    assert!(store
+        .charge_admitted_model(
+            &child,
+            "stale-after-resume",
+            21,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("family_execution_scope_unknown"));
+    store.release(&child, 22).unwrap();
+    let resumed = store
+        .claim(&child.workflow, "verified-resume-worker", 23, 1000)
+        .unwrap()
+        .unwrap();
+    store
+        .with_family_transaction(|tx| {
+            family_budget::store::record_intent(tx, &resumed, &intent, "verified-resume-scope", 23)
+        })
+        .unwrap();
+    store
+        .charge_admitted_model(
+            &resumed,
+            "resumed-final-admission",
+            24,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        2
+    );
 }
 
 #[test]
@@ -542,6 +593,7 @@ fn policy_revision_is_explicit_cas_and_cannot_reset_spend_or_expand_old_frame() 
     assert!(family_budget::store::activate_policy(
         &tx,
         &root,
+        &fixture_binding(),
         "family",
         None,
         "new-owner-grant",
@@ -556,6 +608,7 @@ fn policy_revision_is_explicit_cas_and_cannot_reset_spend_or_expand_old_frame() 
     let next = family_budget::store::activate_policy(
         &tx,
         &root,
+        &fixture_binding(),
         "family",
         Some(policy_ref),
         "new-owner-grant",
@@ -827,6 +880,7 @@ fn every_family_membership_writer_revalidates_the_current_root_binding() {
         family_budget::store::stage_member(
             &tx,
             &root,
+            &fixture_binding(),
             "family",
             1,
             &child.workflow,
@@ -835,11 +889,65 @@ fn every_family_membership_writer_revalidates_the_current_root_binding() {
             19,
         )
         .is_err(),
-        family_budget::store::finalize(&tx, &root, "family", "manifest", 19).is_err(),
+        family_budget::store::finalize(&tx, &root, &fixture_binding(), "family", "manifest", 19)
+            .is_err(),
     ];
     assert_eq!(
         refusals,
         [true, true, true],
         "stale root binding accepted by begin replay, member staging or finalization"
+    );
+}
+
+fn fixture_binding() -> Binding {
+    Binding {
+        head: "a".repeat(40),
+        contract: "c".repeat(64),
+        evidence_hash: "e".repeat(64),
+    }
+}
+
+#[test]
+fn trusted_family_batch_error_rolls_back_policy_and_keeps_observation_readable() {
+    let (_dir, mut store, root, child, _other, intent) = funded(false);
+    let family_budget::Intent::Delegated { policy_ref, .. } = &intent else {
+        panic!()
+    };
+    let result: Result<()> = store.with_family_transaction(|tx| {
+        family_budget::store::activate_policy(
+            tx,
+            &root,
+            &fixture_binding(),
+            "family",
+            Some(policy_ref),
+            "verified-explicit-revision",
+            &family_budget::Limits {
+                schema_version: 1,
+                max_model_admissions: 20,
+                max_wall_ms: 1000,
+            },
+            18,
+        )?;
+        bail!("synthetic subsequent child admission failure");
+    });
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("synthetic subsequent child admission failure"));
+    let observed = store
+        .family_budget_observation(&child.workflow, &intent, 1)
+        .unwrap();
+    assert!(observed.ready());
+    assert_eq!(observed.model_admissions, Some(13));
+    assert_eq!(observed.limits.unwrap().max_model_admissions, 14);
+    let policies: u64 = store
+        .conn
+        .query_row("SELECT count(*) FROM workflow_family_policy", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        policies, 1,
+        "failed all-child batch leaked a policy revision"
     );
 }

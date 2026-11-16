@@ -80,10 +80,11 @@ fn initialize(tx: &Transaction<'_>) -> Result<()> {
 fn root(
     tx: &Transaction<'_>,
     lease: &Lease,
+    binding: &Binding,
     family: &str,
     now: i64,
 ) -> Result<(String, u8, String)> {
-    require_lease(tx, lease, now)?;
+    require_binding(tx, lease, binding, now)?;
     let row:(String,String,u8,String)=tx.query_row("SELECT root_workflow,repository,expected_children,state FROM workflow_family_budget WHERE family=?1",[family],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     ensure!(row.0 == lease.workflow, "family root lease mismatch");
     Ok((row.1, row.2, row.3))
@@ -95,7 +96,7 @@ pub(crate) fn begin(
     input: &PendingFamily,
     now: i64,
 ) -> Result<()> {
-    require_lease(tx, lease, now)?;
+    require_binding(tx, lease, &input.binding, now)?;
     let repository = submission::normalized_repository(&input.repository)?;
     ensure!(
         repository == input.repository
@@ -131,7 +132,6 @@ pub(crate) fn begin(
         );
         return Ok(());
     }
-    require_binding(tx, lease, &input.binding, now)?;
     ensure!(
         !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_family_member WHERE workflow=?1 AND position>0)",
@@ -166,6 +166,7 @@ pub(crate) fn begin(
 pub(crate) fn stage_member(
     tx: &Transaction<'_>,
     lease: &Lease,
+    binding: &Binding,
     family: &str,
     position: u8,
     workflow: &str,
@@ -173,7 +174,7 @@ pub(crate) fn stage_member(
     independent_ref: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    let (repository, count, state) = root(tx, lease, family, now)?;
+    let (repository, count, state) = root(tx, lease, binding, family, now)?;
     ensure!(
         (1..=count).contains(&position) && canonical(&repository, workflow),
         "invalid family member"
@@ -226,11 +227,12 @@ pub(crate) fn stage_member(
 pub(crate) fn finalize(
     tx: &Transaction<'_>,
     lease: &Lease,
+    binding: &Binding,
     family: &str,
     manifest_ref: &str,
     now: i64,
 ) -> Result<()> {
-    let (_, count, _) = root(tx, lease, family, now)?;
+    let (_, count, _) = root(tx, lease, binding, family, now)?;
     reference(manifest_ref)?;
     let actual: u8 = tx.query_row(
         "SELECT count(*) FROM workflow_family_member WHERE family=?1",
@@ -258,13 +260,14 @@ pub(crate) fn finalize(
 pub(crate) fn activate_policy(
     tx: &Transaction<'_>,
     lease: &Lease,
+    binding: &Binding,
     family: &str,
     expected: Option<&str>,
     verified_owner_ref: &str,
     limits: &Limits,
     now: i64,
 ) -> Result<String> {
-    root(tx, lease, family, now)?;
+    root(tx, lease, binding, family, now)?;
     reference(verified_owner_ref)?;
     limits.validate()?;
     let payload = serde_json::to_string(limits)?;
@@ -357,4 +360,33 @@ pub(crate) fn record_intent(
         params![lease.workflow, lease.generation, payload],
     )?;
     Ok(())
+}
+
+impl WorkflowStore {
+    /// Internal T service boundary: keep lineage, policy and child admissions in
+    /// one IMMEDIATE transaction. This does not authenticate the caller. Any
+    /// returned error rolls back the complete batch, including newly staged
+    /// family records; only a successful trusted operation commits.
+    pub(crate) fn with_family_transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = operation(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Budget-only read for trusted command scheduling/status. A positive
+    /// result does not grant authority, capacity or an execution lease.
+    pub(crate) fn family_budget_observation(
+        &self,
+        workflow: &str,
+        intent: &Intent,
+        incoming: u64,
+    ) -> Result<Observation> {
+        observe(&self.conn, workflow, intent, incoming)
+    }
 }

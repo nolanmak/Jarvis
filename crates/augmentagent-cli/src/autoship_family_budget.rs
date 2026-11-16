@@ -275,6 +275,12 @@ pub(super) fn require_new_admission(
             [family],
             |r| r.get(0),
         )?;
+        // A known active pause is more useful than the stale-frame reason it
+        // also creates. Resuming still requires a newly verified generation.
+        ensure!(
+            root == lease.workflow || !owner_control::read(tx, &root)?.is_some_and(|c| c.paused),
+            "owner_paused"
+        );
         ensure!(
             scope.root_control_revision == Some(revision(tx, &root)?),
             "family_execution_scope_unknown"
