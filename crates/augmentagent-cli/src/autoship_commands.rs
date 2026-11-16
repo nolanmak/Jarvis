@@ -14,6 +14,8 @@ pub(crate) mod run_command;
 pub(crate) mod merge_recovery;
 #[path = "autoship_delivery_command.rs"]
 pub(crate) mod delivery_command;
+#[path = "autoship_deployment_command.rs"]
+pub(crate) mod deployment_command;
 // Shared command projections. Read paths never create state or launch work.
 use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 use anyhow::{ensure, Result};
@@ -76,7 +78,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
         let command = store.command_request(workflow)?;
         let attempt = store.command_attempt(workflow)?;
         let owner_control=store.owner_control(workflow)?;
-        let delivery=store.progress_delivery(workflow)?;
+        let delivery=store.progress_delivery_at(workflow,chrono::Utc::now().timestamp_millis())?;
         let owner_messages_pending=store.pending_owner_messages(workflow)?;
         let paused=owner_control.as_ref().is_some_and(|c|c.paused);
         let Some(snapshot) = store.snapshot(workflow)? else {
