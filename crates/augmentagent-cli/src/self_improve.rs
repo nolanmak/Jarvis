@@ -2519,8 +2519,12 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
         // watching, so it needs the loop's own signature on the body.
         return skip("no matching local publication record, reviewed head, or self-improve body signature");
     }
-    if c.mergeable != Some(true) {
-        return skip("conflict with main, or mergeability unknown; a rebase is the resume lane's job");
+    // #1708/#1711 — GitHub UNKNOWN is a pending recompute, not proof of
+    // conflict (#1606). Both still refuse; only the stated reason differs.
+    match c.mergeable {
+        Some(true) => {}
+        Some(false) => return skip("conflict with main; a rebase is the resume lane's job"),
+        None => return skip("mergeability not yet computed by GitHub (UNKNOWN); re-read on the next sweep"),
     }
     if c.checks_green != Some(true) {
         return skip("checks are not green, or their state is unknown");
@@ -16246,7 +16250,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         refuse(|c| c.loop_authored = false, "signature");
         // C4 — conflicts and red checks.
         refuse(|c| c.mergeable = Some(false), "conflict");
-        refuse(|c| c.mergeable = None, "conflict");
+        refuse(|c| c.mergeable = None, "unknown");
         refuse(|c| c.checks_green = Some(false), "checks");
         refuse(|c| c.checks_green = None, "checks");
         // C3 — an incomplete approval record.
