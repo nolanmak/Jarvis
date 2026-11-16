@@ -296,6 +296,14 @@ pub(crate) fn progress_defer(path:&Path,delivery:&augmentagent_approval_discord:
     let origin=gateway_origin(&delivery.context)?;
     WorkflowStore::open(path)?.defer_progress(&origin,&delivery.workflow,delivery.sequence,retry_after_ms,chrono::Utc::now().timestamp_millis()).map(|_|())
 }
+pub(crate) fn progress_edit_target(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<Option<u64>> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.progress_edit_target(&origin,&delivery.workflow,delivery.sequence)
+}
+pub(crate) fn progress_status_lost(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.forget_status_message(&origin,&delivery.workflow,delivery.sequence)
+}
 pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->Result<()> {
     let origin=gateway_origin(&delivery.context)?;
     WorkflowStore::open(path)?.confirm_progress(&origin,&delivery.workflow,delivery.sequence,message,chrono::Utc::now().timestamp_millis())

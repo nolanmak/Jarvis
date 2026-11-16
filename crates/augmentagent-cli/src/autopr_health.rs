@@ -145,6 +145,23 @@ pub struct HealthInputs {
     pub resource_capacity_wait_error: bool,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
+    /// #1708 — S's latest durable event per nonterminal workflow and whether
+    /// that inventory is complete. `None` means it could not be read.
+    pub workflow_progress: Option<WorkflowProgress>,
+}
+
+/// #1708 — S runtime events as the watchdog reads them.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowProgress {
+    pub events: Vec<augmentagent_channel_core::autoship_workflow_contract::WorkflowEvent>,
+    pub inventory_complete: bool,
+}
+
+/// Read S's latest workflow events from the worker's store, read-only.
+pub fn workflow_progress_at(path: &Path, now_ms: i64) -> Option<WorkflowProgress> {
+    let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
+    let (events, inventory_complete) = store.latest_workflow_events(now_ms).ok()?;
+    Some(WorkflowProgress { events, inventory_complete })
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -159,6 +176,9 @@ pub struct Thresholds {
     pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
     pub draft_stale_days: i64,
+    /// #1708 — minutes an active, non-waiting workflow may go without S
+    /// recording meaningful progress. Above every S stage budget.
+    pub workflow_progress_stale_mins: i64,
 }
 
 impl Default for Thresholds {
@@ -179,6 +199,9 @@ impl Default for Thresholds {
             deploy_lag_mins: 60,
             red_main_hours: 6,
             draft_stale_days: 5,
+            // S's largest stage budget is 90 min (verify); six hours without a
+            // recorded gate or guarded step is not slow work.
+            workflow_progress_stale_mins: 360,
         }
     }
 }
@@ -521,6 +544,33 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                   records why each run ended."
                 .into(),
         });
+    }
+
+    // #1708 — liveness is S's durable meaningful progress, not heartbeats or
+    // log lines. Waiting workflows (owner pause, quota, capacity, dependency,
+    // configuration) are reported by their own blockers, not as stalls.
+    if let Some(progress) = &i.workflow_progress {
+        use augmentagent_channel_core::autoship_workflow_contract::WorkflowOutcome as O;
+        let stale: Vec<String> = progress.events.iter()
+            .filter(|e| !matches!(e.outcome, O::DependencyWait | O::QuotaWait | O::CapacityWait | O::ConfigurationFault))
+            .filter(|e| e.last_meaningful_progress_at_ms > 0)
+            .filter_map(|e| {
+                let mins = (now.timestamp_millis() - e.last_meaningful_progress_at_ms) / 60_000;
+                (mins >= t.workflow_progress_stale_mins).then(|| {
+                    let stage = serde_json::to_value(e.stage).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                    format!("{} ({stage}: {}; last useful progress {} min ago)", e.workflow_id, e.reason_code, mins)
+                })
+            })
+            .collect();
+        if !stale.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "workflow-progress-stale",
+                detail: format!("{} active workflow(s) without useful progress: {}. Heartbeats and log activity do not count.",
+                    stale.len(), stale.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
+                fix: "Inspect each with `augmentagent autopr status --workflow ID`; a live lease without a recorded gate or guarded step is stuck, not slow.".into(),
+            });
+        }
     }
 
     // #1037 — drafts held because no independent review is possible. From
@@ -1127,10 +1177,12 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     );
     crate::disk::save_readings(&filesystems, now);
     let mut merge_store_path=None;
+    let mut workflow_progress=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
             merge_store_path=Some(config.path.clone());
+            workflow_progress=workflow_progress_at(&config.path,now.timestamp_millis());
             let native=config.native_policy.as_deref().map(|path| {
                 serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect_at(Some(path)))
                     .expect("native capacity report serializes")
@@ -1182,6 +1234,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         resource_capacity_waits,
         resource_capacity_wait_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
+        workflow_progress,
     }
 }
 
@@ -1546,6 +1599,7 @@ mod tests {
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
             gave_up_by_reason: None,
+            workflow_progress: None,
         }
     }
 
@@ -2237,6 +2291,10 @@ fn deployment_finding(report: &crate::autoship_deployment::Report) -> Option<Fin
         fix: "Use the supported installer to select the shared native policy and the normal updater to deploy both services; verify autoship readiness afterward.".into(),
     })
 }
+
+#[cfg(test)]
+#[path = "autopr_health_progress_tests.rs"]
+mod progress_tests;
 
 #[cfg(test)]
 mod deployment_tests {
