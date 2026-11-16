@@ -27,6 +27,9 @@ pub(crate) mod delivery;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_integration.rs"]
+mod integration;
+pub(crate) use integration::IntegrationReason;
 #[path = "autoship_review_recovery.rs"]
 mod review_recovery;
 pub(crate) use review_recovery::ReviewRecoveryReadiness;
@@ -755,6 +758,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
+            CREATE TABLE IF NOT EXISTS integration_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS integration_recovery (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,

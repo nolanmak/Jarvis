@@ -362,7 +362,6 @@ fn unknown_mergeability_never_merges() {
 /// Reporting half: an UNKNOWN head is a mergeability recompute, not proof of
 /// conflict, and must not route to rebase/conflict repair.
 #[test]
-#[ignore = "RED until #1711 (I): the sweep reports UNKNOWN mergeability as 'conflict with main ... a rebase is the resume lane's job'"]
 fn unknown_mergeability_is_not_reported_as_conflict() {
     let SweepVerdict::Skip(unknown) = sweep_verdict(&sweep_candidate(None)) else {
         panic!("UNKNOWN must not merge");
