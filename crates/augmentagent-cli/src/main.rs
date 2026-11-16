@@ -127,6 +127,7 @@ mod deploy_snapshot;
 mod snapshot_refs;
 mod disk;
 mod build_storage;
+mod build_relocation;
 // #1930 — the storage admission authority, its growth ledger and its
 // directory leases belong to channel-core. This binary consumes those exact
 // types, so its build gate and the Autoship capacity paths outside it admit
@@ -1058,6 +1059,8 @@ enum DeployOp {
 
 #[derive(Subcommand, Debug)]
 enum DiskOp {
+    /// Select a new owned build volume; retire old caches without copying.
+    Relocate { #[arg(long)] to: PathBuf, #[arg(long)] dry_run: bool },
     /// Opt a dedicated parent into discovery of future Cargo cache children.
     ManageParent { #[arg(long)] root: PathBuf },
     /// Register an external Cargo target for automatic housekeeping.
@@ -3349,6 +3352,7 @@ async fn main() -> Result<()> {
     if let Cmd::Disk { ref op } = cli.cmd {
         let repo_root = std::env::current_dir().context("current_dir")?;
         return match op {
+            DiskOp::Relocate { to, dry_run } => build_relocation::run(&repo_root, to, *dry_run, &mut std::io::stdout()),
             DiskOp::ManageParent { root } => {
                 let mut lease = build_storage::acquire().await?;
                 std::fs::create_dir_all(root)?;
@@ -24501,3 +24505,7 @@ async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_l
 #[cfg(test)]
 mod linkedin_read_dispatch_tests;
 
+
+#[cfg(test)]
+#[path = "build_volume_cli_tests.rs"]
+mod build_volume_cli_tests;
