@@ -46,6 +46,8 @@ mod shared_ci;
 mod ci_repair;
 #[path = "self_improve_hosted_ci.rs"]
 mod hosted_ci;
+#[path = "self_improve_integration_checks.rs"]
+mod integration_checks;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 
@@ -7137,7 +7139,7 @@ async fn resume_draft_pr(
         Ok(Some(summary)) => {
             // Rebind to the actual merge tree before publication, validation
             // or independent review. Existing M gates own the eventual merge.
-            workflow.transition(Stage::Verify, integration::CHECK_CLASSIFICATION_WAIT, "verify_integrated_head", 0).await?;
+            workflow.transition(Stage::Verify, integration::CHECKS_REQUIRED, "verify_integrated_head", 0).await?;
             if !workflow.publish_round(branch,repo_root,pr,0,"conflict resolution",&summary,dry_run,
                 expected_head.is_none(),Some(issue_no)).await? {
                 return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
@@ -7145,7 +7147,7 @@ async fn resume_draft_pr(
             Some(format!("Conflict resolution: {}", truncate(&summary, 200)))
         }
         Ok(None) => {
-            workflow.transition(Stage::Verify, integration::CHECK_CLASSIFICATION_WAIT, "verify_integrated_head", 0).await?;
+            workflow.transition(Stage::Verify, integration::CHECKS_REQUIRED, "verify_integrated_head", 0).await?;
             None
         }
         Err(error) => {
@@ -7640,8 +7642,8 @@ async fn resume_draft_pr(
                     "PR #{pr}: double LGTM, left for human merge (policy)"
                 )));
             }
-            if checks_green(repo_root, pr).await != Some(true) {
-                workflow.transition(Stage::AwaitChecks, "ci_pending", "reconcile_checks", chrono::Utc::now().timestamp_millis()).await?;
+            if let Some(reason) = integration_checks::wait_reason(repo_root, pr, reviewed_head).await {
+                workflow.transition(Stage::AwaitChecks, reason, "reconcile_checks", chrono::Utc::now().timestamp_millis()).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; awaiting CI, merge sweep will retry"
                 )));
