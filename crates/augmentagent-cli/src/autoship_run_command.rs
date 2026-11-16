@@ -58,6 +58,22 @@ fn response(id: &str, request: &Request, admission: Admission) -> (i32, Value) {
     value["allowance"] = Value::Null;
     (code, value)
 }
+/// #1712 — an accepted admission reports the workflow's current, read-only
+/// status evidence instead of placeholders. Admission facts (`reason`,
+/// `accepted`, `complete`, request and milestone policy) are never replaced:
+/// acceptance is not completion. A failed status read leaves the placeholders.
+fn with_current_status(path: &Path, mut admission: Value) -> Value {
+    let Some(workflow) = admission["workflow"].as_str().map(str::to_owned) else { return admission };
+    let cap = std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok()
+        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(5).max(1);
+    let (_, status) = super::status_for_milestone(path, &workflow, chrono::Utc::now().timestamp_millis(), cap, None);
+    if status["accepted"] != true { return admission; }
+    for field in ["head", "stage", "pr_url", "next_action", "eligible_at_ms", "merge", "deployment", "worker", "allowance"] {
+        if let Some(value) = status.get(field) { admission[field] = value.clone(); }
+    }
+    admission["status_reason"] = status["reason"].clone();
+    admission
+}
 async fn submit(repo: &Path, path: &Path, args: &RunArgs) -> (i32, Value) {
     let request = Request {
         repository: args.repo.clone(),
@@ -173,6 +189,9 @@ pub(crate) async fn run(args: &RunArgs) -> i32 {
         Ok(repo) => submit(repo, &crate::autoship_workflow::default_path(), args).await,
         Err(e) => failure(4, "checkout-unavailable", e),
     };
+    if !args.wait && !args.dry_run && code==0 && body["accepted"]==true {
+        body=with_current_status(&crate::autoship_workflow::default_path(),body);
+    }
     if args.wait && code==0 && body["accepted"]==true {
         (code,body)=super::wait::observe(repo.as_deref().expect("accepted submission has checkout"),&crate::autoship_workflow::default_path(),body,
             if args.until=="pr" {Milestone::Pr} else {Milestone::Merged},
