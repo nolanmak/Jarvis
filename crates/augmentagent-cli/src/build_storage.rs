@@ -699,7 +699,20 @@ fn verify_parent_lease(_target: &Path, _proof: &str) -> Result<()> {
 /// Launch a managed command with original storage descriptions, committing
 /// worker ownership at OS spawn while retaining pressure/cancellation watches.
 pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease>, update: bool) -> Result<()> {
+    run_command_with_cache(target, command, lease, update, compiler_cache_wrapper().as_deref()).await
+}
+
+async fn run_command_with_cache(
+    target: &Path,
+    command: &[String],
+    lease: Option<&Lease>,
+    update: bool,
+    wrapper: Option<&Path>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    if lease.is_some() {
+        prestart_compiler_cache(wrapper);
+    }
     let scratch = std::fs::canonicalize(target)?.join(if update { ".augmentagent-update-tmp" } else { "tmp" });
     std::fs::create_dir_all(&scratch)?;
     let mut process = std::process::Command::new(&command[0]);
@@ -772,6 +785,46 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
         bail!("managed build failed: {result}");
     }
     Ok(())
+}
+
+/// sccache's first client call daemonizes a long-lived server in its own
+/// session. Started from inside a managed command, that server inherits the
+/// exported lease descriptors and holds machine-wide build admission until it
+/// idles out, stalling every later managed build. Start it here instead, while
+/// the lease descriptors are still close-on-exec, so cargo's wrapped calls
+/// reuse a server that never held the lease. Best effort: a missing or failing
+/// cache must not block the build.
+fn prestart_compiler_cache(wrapper: Option<&Path>) {
+    let Some(wrapper) = wrapper else { return };
+    if wrapper.file_stem().and_then(|stem| stem.to_str()) != Some("sccache") {
+        return;
+    }
+    let _ = std::process::Command::new(wrapper)
+        .arg("--start-server")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The rustc wrapper cargo will use for managed commands, if any: the
+/// environment overrides first, then the user's cargo configuration.
+fn compiler_cache_wrapper() -> Option<PathBuf> {
+    for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+        if let Ok(value) = std::env::var(key) {
+            return (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+    }
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    ["config.toml", "config"].iter().find_map(|name| {
+        let text = std::fs::read_to_string(home.join(name)).ok()?;
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "rustc-wrapper").then(|| PathBuf::from(value.trim().trim_matches('"')))
+        })
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1792,6 +1845,51 @@ mod inherited_ci_storage_tests {
     use std::io::{BufRead, Write};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    /// sccache's first client call daemonizes a long-lived server. A server
+    /// spawned from inside a managed command inherits the exported lease
+    /// descriptors and holds machine-wide build admission until it idles out
+    /// (10 minutes by default), stalling every later managed build.
+    #[tokio::test]
+    async fn compiler_cache_server_started_by_managed_build_does_not_hold_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let wrapper = tools.path().join("sccache");
+        std::fs::write(&wrapper, r#"#!/bin/sh
+pidfile="$(dirname "$0")/server.pid"
+if [ "$1" = "--start-server" ]; then
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi
+  # Like sccache, detach into a new session so the managed command's
+  # process-group cleanup does not reach the server.
+  # Like sccache, wait until the server is up before the client returns.
+  /usr/bin/python3 -I -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(30)' "$pidfile" </dev/null >/dev/null 2>&1 &
+  while [ ! -s "$pidfile" ]; do sleep 0.05; done
+fi
+exit 0
+"#).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct KillServer(PathBuf);
+        impl Drop for KillServer {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() { unsafe { libc::kill(pid, libc::SIGKILL) }; }
+                }
+            }
+        }
+        let _server = KillServer(tools.path().join("server.pid"));
+        let mut lease = Lease::try_at(state.path()).unwrap().unwrap();
+        lease.protect_targets(&[target.path().to_owned()]).await.unwrap();
+        // Stands in for cargo's first wrapped rustc call, which starts the server.
+        let command = vec![wrapper.display().to_string(), "--start-server".to_owned()];
+        run_command_with_cache(target.path(), &command, Some(&lease), false, Some(&wrapper)).await.unwrap();
+        drop(lease);
+        assert!(
+            Lease::try_at(state.path()).unwrap().is_some(),
+            "a long-lived compiler cache server must not keep build admission held",
+        );
+    }
 
     #[test]
     fn incidental_descriptors_do_not_extend_private_build_or_ci_exclusion() {
