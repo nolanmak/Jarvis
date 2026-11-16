@@ -183,7 +183,10 @@ target must independently yield its physical target/profile leases and pass
 the existing compiler checks before cleanup; busy targets are reported and
 skipped while unrelated idle targets can be reclaimed. Pressure-triggered
 health reconciliation retains the same physical target exclusions and
-per-filesystem reservation accounting. The updater uses
+per-filesystem reservation accounting. Public `disk prune --json` reports a
+`pruned` or `deferred` outcome per root, the explanatory verdict in `detail`,
+and `freed_bytes`. A mixed pass completes successfully while naming busy roots.
+The updater uses
 `disk build` for release builds once the deployed binary
 supports it, and never falls back to deleting a cache outside the pruner's lease.
 

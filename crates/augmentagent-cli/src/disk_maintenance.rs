@@ -45,3 +45,12 @@ mod tests {
         assert!(crate::build_storage::Lease::try_at(state.path()).unwrap().is_none());
     }
 }
+
+/// Stable public status; retain the explanatory verdict separately as detail.
+pub(super) fn outcome(report: &super::RootReport) -> &'static str {
+    if report.outcome.starts_with("skipped:")
+        || report.outcome.starts_with("pressure skipped:")
+        || report.outcome.starts_with("kept:")
+        || report.outcome.starts_with("failed")
+    { "deferred" } else { "pruned" }
+}

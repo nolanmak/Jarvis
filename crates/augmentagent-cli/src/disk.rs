@@ -29,6 +29,9 @@ use anyhow::Result;
 
 #[path = "disk_maintenance.rs"]
 mod maintenance;
+#[cfg(test)]
+#[path = "disk_prune_tests.rs"]
+mod prune_tests;
 
 const DAY: f64 = 86_400.0;
 
@@ -1228,12 +1231,12 @@ fn run_prune_at(repo_root: &Path, opts: &Options, out: &mut dyn Write, state: &P
     probe: impl FnOnce() -> Option<Vec<BuildProc>>) -> Result<()> {
     let Some(_lease) = maintenance::Lease::try_at(state)? else {
         if opts.json { writeln!(out, "{}", serde_json::json!([{
-            "outcome": "deferred: another maintenance pass holds the prune lease", "freed_bytes": 0
+            "outcome": "deferred", "detail": "another maintenance pass holds the prune lease", "freed_bytes": 0
         }]))?; } else { writeln!(out, "deferred: another maintenance pass holds the prune lease; retry next pass")?; }
         return Ok(());
     };
     let mut cleanup = Vec::new();
-    let result = run_prune_probed(repo_root, opts, &mut cleanup, false, None, probe());
+    let result = run_prune_probed(repo_root, opts, &mut cleanup, false, None, probe(), true);
     out.write_all(&cleanup)?;
     if !opts.dry_run {
         let payload = serde_json::json!({"at": chrono::Utc::now(),
@@ -1301,11 +1304,11 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
 
 pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
     held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
-    run_prune_probed(repo_root, opts, out, admission, held, build_procs())
+    run_prune_probed(repo_root, opts, out, admission, held, build_procs(), false)
 }
 
 fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
-    held: Option<&crate::storage_leases::TargetLeases>, procs: Option<Vec<BuildProc>>) -> Result<()> {
+    held: Option<&crate::storage_leases::TargetLeases>, procs: Option<Vec<BuildProc>>, public_outcomes: bool) -> Result<()> {
     if opts.roots.is_empty() && !admission {
         adopt_stale_unmanaged(repo_root, procs.as_deref(), opts.dry_run);
     }
@@ -1374,7 +1377,14 @@ fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admis
     }
 
     if opts.json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&reports)?)?;
+        let mut payload = serde_json::to_value(&reports)?;
+        if public_outcomes {
+            for (value, report) in payload.as_array_mut().unwrap().iter_mut().zip(&reports) {
+                value["detail"] = value["outcome"].take();
+                value["outcome"] = maintenance::outcome(report).into();
+            }
+        }
+        writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?;
     } else {
         for r in &reports {
             writeln!(
@@ -1382,7 +1392,7 @@ fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admis
                 "{:<22} {:>9}  {}  [{}]",
                 r.label,
                 fmt_gb(r.freed_bytes),
-                r.outcome,
+                if public_outcomes { format!("{}: {}", maintenance::outcome(r), r.outcome) } else { r.outcome.clone() },
                 r.path
             )?;
         }
@@ -1403,42 +1413,6 @@ fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admis
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prune_reclaims_idle_target_while_unrelated_managed_build_stays_leased() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = tmp.path().join("state");
-        let idle = tmp.path().join("idle");
-        let busy = tmp.path().join("busy");
-        let repo = tmp.path().join("repo");
-        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
-        crate::build_storage::register(&repo, &idle, None, &state).unwrap();
-        crate::build_storage::register(&repo, &busy, None, &state).unwrap();
-        let idle_profile = synthetic_profile(&idle);
-        let busy_profile = synthetic_profile(&busy);
-        let _build = crate::build_storage::Lease::try_at(&state).unwrap().unwrap();
-        let _target = crate::storage_leases::TargetLeases::try_cache_roots(
-            std::slice::from_ref(&busy), None, &profile_dirs).unwrap().unwrap();
-        let opts = Options { roots: vec![idle.clone(), busy.clone()], json: true, ..Default::default() };
-        let mut out = Vec::new();
-        run_prune_at(&repo, &Options { dry_run: true, ..opts.clone() }, &mut out, &state, || Some(vec![])).unwrap();
-        assert!(idle_profile.join("incremental/old-sess").exists(), "dry run removed cache");
-        out.clear();
-        run_prune_at(&repo, &opts, &mut out, &state, || None).unwrap();
-        assert!(idle_profile.join("incremental/old-sess").exists(), "missing process evidence allowed deletion");
-        out.clear();
-        run_prune_at(&repo, &opts, &mut out, &state, || Some(vec![BuildProc { target_env: Some(idle.clone()), ..Default::default() }])).unwrap();
-        assert!(idle_profile.join("incremental/old-sess").exists(), "active compiler allowed deletion");
-        out.clear();
-        run_prune_at(&repo, &opts, &mut out, &state, || Some(vec![])).unwrap();
-        assert!(!idle_profile.join("incremental/old-sess").exists(),
-            "global lease starved idle target pruning: {}", String::from_utf8_lossy(&out));
-        assert!(busy_profile.join("incremental/old-sess").exists(), "busy cache was pruned");
-        assert!(idle_profile.join("augmentagent").exists());
-        assert!(crate::build_storage::Lease::try_at(&state).unwrap().is_none(), "prune released writer lease");
-        let reports: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert!(reports.as_array().unwrap().iter().any(|r| r["path"] == busy.display().to_string() && r["outcome"].as_str().unwrap().contains("target lease")));
-    }
 
     #[test]
     fn only_measured_idle_caches_nobody_is_using_are_adopted() {

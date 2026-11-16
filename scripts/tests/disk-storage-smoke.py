@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
         isolated = subprocess.run([CLI, "disk", "prune", "--root", str(base / "first-target"), "--cap-mb", "0", "--json"],
                                   cwd=repo, env=isolated_env, capture_output=True, text=True, check=True)
         isolated_report = json.loads(isolated.stdout)
-        assert "lease" in isolated_report[0]["outcome"], isolated_report
+        assert isolated_report[0]["outcome"] == "deferred" and "lease" in isolated_report[0]["detail"], isolated_report
         assert (base / "first-target" / "tmp" / "leftover").exists(), "isolated state pruned a live writer"
         snapshot_waiter = subprocess.Popen([CLI, "--db", str(database), "deploy", "snapshot", "--label", "waiting-build"],
                                            cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
         assert not idle_during_build.exists(), "unrelated writer starved idle owned target cleanup"
         assert first.poll() is None and not release_first.exists(), "build must stay leased throughout pruning"
         assert (base / "first-target" / "tmp" / "leftover").read_bytes() == b"scratch", "busy target changed"
-        assert any(r.get("path") == str(base / "first-target") and "target lease" in r["outcome"] for r in pruned), pruned
+        assert any(r.get("path") == str(base / "first-target") and r["outcome"] == "deferred" and "target lease" in r["detail"] for r in pruned), pruned
         second = subprocess.Popen([CLI, "disk", "build", "--target-dir", str(base / "second-target"),
                                    "--", sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
                                    str(second_started)], cwd=repo, env=env,
