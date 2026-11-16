@@ -872,6 +872,25 @@ mod tests {
             assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),0,"unavailable native consumer must not queue messages or strand a workflow");
             assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),13);
+            drop(store);
+            // #1713 — Discord cancel requires an explicit workflow, retires it
+            // through T's fenced cancel, and later controls are terminal.
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(109),"!autoship cancel").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert!(store.replay_discord_control(&origin(109),&digest("!autoship cancel")).unwrap().is_none(),"bare cancel changes nothing");
+            assert!(store.snapshot(&discord.admission.workflow).unwrap().is_none());drop(store);
+            let cancel=format!("!autoship cancel --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap(),"redelivery replays");
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let canceled=store.replay_discord_control(&origin(110),&digest(&cancel)).unwrap().unwrap();
+            assert_eq!(canceled.reason,"owner-canceled","{}",canceled.reply);
+            assert_eq!(store.snapshot(&discord.admission.workflow).unwrap().unwrap().checkpoint.stage,crate::autoship_workflow::Stage::Retired);
+            drop(store);
+            let pause=format!("!autoship pause --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(111),&pause).await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.replay_discord_control(&origin(111),&digest(&pause)).unwrap().unwrap().reason,"workflow-terminal");
 
 
 

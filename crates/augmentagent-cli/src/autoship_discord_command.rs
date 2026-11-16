@@ -47,10 +47,14 @@ fn parse_control(text:&str)->Result<Option<(Action,Option<String>)>> {
     if words.first()!=Some(&"!autoship") {return Ok(None);}
     let action=match words.get(1).copied() {
         Some("status")=>Action::Status,Some("pause")=>Action::Pause,
-        Some("resume")=>Action::Resume,Some("use")=>Action::Use,_=>return Ok(None),
+        Some("resume")=>Action::Resume,Some("use")=>Action::Use,Some("cancel")=>Action::Cancel,_=>return Ok(None),
     };
     let workflow=if action==Action::Use {
         ensure!(words.len()==3,"expected !autoship use ID");Some(words[2].to_string())
+    } else if action==Action::Cancel {
+        // Terminal: never act on an implicit or concurrently changed selection.
+        ensure!(words.len()==4 && words[2]=="--workflow","expected !autoship cancel --workflow ID");
+        Some(words[3].to_string())
     } else {
         ensure!(words.len()==2 || (words.len()==4 && words[2]=="--workflow"),"expected !autoship status|pause|resume [--workflow ID]");
         words.get(3).map(|id|id.to_string())
@@ -75,7 +79,17 @@ async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Ac
     if refusal.is_none() && action==Action::Resume && crate::self_improve::targeted::command_readiness(repo,&request).await.is_err() {
         refusal=Some("execution-readiness-blocked".into());
     }
-    let status=if action==Action::Status && refusal.is_none() {
+    // #1713 — cancel runs T's idempotent fenced retirement before the reply is
+    // committed; a crash in between re-runs it harmlessly on redelivery.
+    let mut canceled=None;
+    if action==Action::Cancel && refusal.is_none() {
+        match crate::self_improve::targeted::cancel_workflow(repo,path,&workflow,&request.repository).await {
+            Ok(())=>canceled=Some(format!("Autoship {workflow} canceled: stage retired, reason owner_canceled. Native teardown is unverified.")),
+            Err(error)=>refusal=Some(error.downcast_ref::<crate::self_improve::targeted::CommandFailure>()
+                .map_or("workflow-state-unavailable",|failure|failure.reason).into()),
+        }
+    }
+    let status=if action==Action::Cancel {canceled} else if action==Action::Status && refusal.is_none() {
         let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),0);
         if code==2 || code==4 {refusal=Some("workflow-state-unavailable".into());None}
         else {
@@ -157,7 +171,7 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
             }
             return gateway_claim_ack(path,context);
         }
-        Err(_)=>return Ok(plain("Use `!autoship status|pause|resume [--workflow ID]` or `!autoship use ID`. Extra options are not supported.")),
+        Err(_)=>return Ok(plain("Autoship command not recognized. Use `!autoship status|pause|resume [--workflow ID]`, `!autoship cancel --workflow ID` or `!autoship use ID`. Extra options are not supported.")),
         Ok(None)=>{},
     }
     if parse(text).is_err() {
@@ -225,6 +239,9 @@ mod tests {
         assert_eq!(parse_control("!autoship use owner/repo#42").unwrap(),Some((Action::Use,Some("owner/repo#42".into()))));
         assert_eq!(parse_control("!autoship resume --workflow owner/repo#42").unwrap(),Some((Action::Resume,Some("owner/repo#42".into()))));
         for text in ["!autoship use","!autoship use a b","!autoship pause --until merged","!autoship resume --workflow", "!autoship status extra"] {assert!(parse_control(text).is_err());}
+        // #1713 — cancel is terminal, so it never acts on an implicit selection.
+        assert_eq!(parse_control("!autoship cancel --workflow owner/repo#42").unwrap(),Some((Action::Cancel,Some("owner/repo#42".into()))));
+        for text in ["!autoship cancel","!autoship cancel owner/repo#42","!autoship cancel --workflow"] {assert!(parse_control(text).is_err(),"{text}");}
     }
     #[test]
     fn discord_target_grammar_cannot_turn_prose_or_extra_flags_into_authority() {
