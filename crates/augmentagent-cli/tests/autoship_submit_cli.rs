@@ -680,3 +680,93 @@ fn waiting_timeout_bounds_final_remote_head_observation_without_touching_the_job
     assert_eq!(observed["complete"],false);assert_eq!(observed["reason"],"wait-timeout");
     assert_eq!(body(status(root.path(),id),0)["milestones"]["pr"]["head"],"a".repeat(40));
 }
+
+// #1712 T — the run response carries the workflow's real status fields; it
+// never fabricates nulls/"unknown" for evidence that status can read.
+#[test]
+fn run_response_reports_current_workflow_state_while_staying_accepted_not_complete() {
+    let root=fixture();
+    let queued=body(run(root.path(),&["--request-id","first"]),0);
+    assert_eq!(queued["reason"],"queued");
+    assert_eq!(queued["next_action"],"claim_workflow","queued work waits for a worker claim");
+    assert_eq!(queued["allowance"]["cap"],5,"allowance is readable at admission: {queued}");
+    assert_eq!(body(status(root.path(),"owner/repo#7"),0)["allowance"]["cap"],5,"queued status reads the allowance too");
+    let id=queued["workflow"].as_str().unwrap();
+    seed_pr_milestone(root.path(),id,false);
+    let joined=body(run(root.path(),&["--request-id","second"]),0);
+    assert_eq!(joined["reason"],"joined");
+    assert_eq!(joined["accepted"],true);
+    assert_eq!(joined["complete"],false,"acceptance is not completion");
+    assert_eq!(joined["head"],"a".repeat(40));
+    assert_eq!(joined["stage"],"await_checks");
+    assert_eq!(joined["pr_url"],"https://github.com/owner/repo/pull/42");
+    assert_eq!(joined["next_action"],"await_merge_authorization");
+    assert_eq!(joined["eligible_at_ms"],0);
+    assert_eq!(joined["merge"]["state"],"not-confirmed");
+    assert_eq!(joined["allowance"]["confirmed"],0);
+}
+
+// #1712 T — a differing provider pin on active work is a conflict that
+// reports the current values and changes nothing.
+#[test]
+fn differing_provider_pin_on_active_workflow_conflicts_with_current_values() {
+    let root=fixture();
+    let first=body(run(root.path(),&["--provider","codex","--request-id","codex-pin"]),0);
+    assert_eq!(first["provider"],"codex");
+    let conflict=body(run(root.path(),&["--provider","claude","--request-id","claude-pin"]),2);
+    assert_eq!(conflict["accepted"],false);
+    assert_eq!(conflict["reason"],"provider-change-required");
+    assert_eq!(conflict["provider"],"codex","the conflict reports the current pin");
+    assert_eq!(conflict["workflow_until"],"merged");
+    assert_eq!(body(status(root.path(),"owner/repo#7"),0)["provider"],"codex");
+    assert_eq!(body(run(root.path(),&["--provider","codex","--request-id","codex-join"]),0)["reason"],"joined");
+}
+
+// #1712 T — cancel is a durable owner retirement through the fenced settle
+// path: exit 6, idempotent, never dispatches again, never undoes a merge and
+// never races active work.
+#[test]
+fn cancel_retires_idle_work_with_exit_six_and_never_dispatches_again() {
+    let root=fixture();
+    let admitted=body(run(root.path(),&["--request-id","to-cancel"]),0);
+    let id=admitted["workflow"].as_str().unwrap();
+    let canceled=body(control(root.path(),"cancel",id),6);
+    assert_eq!(canceled["reason"],"owner_canceled");
+    assert_eq!(canceled["stage"],"retired");
+    assert_eq!(canceled["canceled"],true);
+    let observed=body(status(root.path(),id),6);
+    assert_eq!(observed["reason"],"owner_canceled");
+    assert_eq!(body(control(root.path(),"cancel",id),6)["reason"],"owner_canceled","cancel is idempotent");
+    let waiting=body(run(root.path(),&["--request-id","to-cancel","--wait","--timeout-secs","5"]),6);
+    assert_eq!(waiting["observation"]["state"],"canceled");
+    let attempt=body(work(root.path(),id),6); // canceled, and nothing dispatched
+    assert_eq!(attempt["attempt"]["builder_ran"],false);
+    assert_eq!(attempt["resources"]["model_calls"],0);
+    assert!(!root.path().join(".self-improve-worktrees").exists());
+}
+
+#[test]
+fn cancel_refuses_active_work_completed_merges_and_unauthorized_owners() {
+    // Active lease: no teardown is claimed and nothing changes.
+    let root=fixture();
+    let id=body(run(root.path(),&["--request-id","leased"]),0)["workflow"].as_str().unwrap().to_owned();
+    seed_pr_milestone(root.path(),&id,false);
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    conn.execute("UPDATE workflow SET lease_until=?2,owner='worker' WHERE id=?1",rusqlite::params![id,i64::MAX]).unwrap();
+    let before:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
+    let held=body(control(root.path(),"cancel",&id),3);
+    assert_eq!(held["reason"],"cancel-held-active-work");
+    assert_eq!(held["accepted"],false);
+    assert_eq!(conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),before);
+    // Completed merge: cancel cannot undo it.
+    conn.execute("UPDATE workflow SET lease_until=0,owner=NULL,checkpoint=json_set(checkpoint,'$.stage','merged') WHERE id=?1",[&id]).unwrap();
+    assert_eq!(body(control(root.path(),"cancel",&id),3)["reason"],"workflow-already-merged");
+    // Unauthorized owner: no change.
+    let other=fixture();
+    let id=body(run(other.path(),&["--request-id","denied"]),0)["workflow"].as_str().unwrap().to_owned();
+    std::fs::write(other.path().join("scenario.json"),r#"{"permission":"READ"}"#).unwrap();
+    assert_eq!(body(control(other.path(),"cancel",&id),2)["reason"],"target-authorization-failed");
+    std::fs::write(other.path().join("scenario.json"),"{}").unwrap();
+    assert_eq!(body(status(other.path(),&id),0)["stage"],"queued");
+    assert_eq!(body(control(other.path(),"cancel","owner/repo#999"),2)["reason"],"workflow-not-found");
+}

@@ -20,7 +20,8 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `deploy-pinned`  | 2026-10-20→24: a drop-in pinned the unit to a frozen binary; 4 days of merges never ran (#1571) |
 //! | `snapshot-budget`| 2026-11-01: protected snapshots filled the budget; rollouts were refused, then bypassed the cap (#1815) |
-//! | `no-progress`    | the catch-all: nothing merged in N days             |
+//! | `workflow-config-fault` | 2026-10-31: policy missing, five failed ticks/day, watchdog green (#1708) |
+//! | `no-progress`    | nothing auto-merged in N days; Alert when a provider hold persists (Oct 27–31, #1708) |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
 //!
@@ -111,6 +112,11 @@ pub struct HealthInputs {
     /// for the build preset was latched on quota. A pause, not an outage, and
     /// it must not be triaged as one.
     pub last_provider_hold: Option<DateTime<Utc>>,
+    /// #1708 — the latest build tick that failed on a typed admission or
+    /// configuration fault (missing native policy, no eligible role
+    /// provider), with its reason. Unlike a quota hold this is a fault: it
+    /// alerts on first observation and resolves only when it stops recurring.
+    pub last_config_fault: Option<(DateTime<Utc>, String)>,
     /// `(pr, reason, times seen)` for resume refusals in the scanned window.
     pub repeated_refusals: Vec<(u64, String, u32)>,
     /// Open PR numbers, when they could be listed. A refusal loop only
@@ -139,6 +145,23 @@ pub struct HealthInputs {
     pub resource_capacity_wait_error: bool,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
+    /// #1708 — S's latest durable event per nonterminal workflow and whether
+    /// that inventory is complete. `None` means it could not be read.
+    pub workflow_progress: Option<WorkflowProgress>,
+}
+
+/// #1708 — S runtime events as the watchdog reads them.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowProgress {
+    pub events: Vec<augmentagent_channel_core::autoship_workflow_contract::WorkflowEvent>,
+    pub inventory_complete: bool,
+}
+
+/// Read S's latest workflow events from the worker's store, read-only.
+pub fn workflow_progress_at(path: &Path, now_ms: i64) -> Option<WorkflowProgress> {
+    let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
+    let (events, inventory_complete) = store.latest_workflow_events(now_ms).ok()?;
+    Some(WorkflowProgress { events, inventory_complete })
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -153,6 +176,9 @@ pub struct Thresholds {
     pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
     pub draft_stale_days: i64,
+    /// #1708 — minutes an active, non-waiting workflow may go without S
+    /// recording meaningful progress. Above every S stage budget.
+    pub workflow_progress_stale_mins: i64,
 }
 
 impl Default for Thresholds {
@@ -173,6 +199,9 @@ impl Default for Thresholds {
             deploy_lag_mins: 60,
             red_main_hours: 6,
             draft_stale_days: 5,
+            // S's largest stage budget is 90 min (verify); six hours without a
+            // recorded gate or guarded step is not slow work.
+            workflow_progress_stale_mins: 360,
         }
     }
 }
@@ -196,6 +225,21 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     let held_recently = i
         .last_provider_hold
         .is_some_and(|held| (now - held).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
+    // #1708 — autonomous progress is the confirmed-merge ledger, never the
+    // latest main commit. When the ledger is readable it is authoritative; a
+    // manual commit fed through `last_merge` cannot reset it. `last_merge`
+    // stands in only where no allowance was read (older collectors/tests).
+    let last_autonomous = match i.merge_allowance {
+        Some(a) => a.last_merged_at_ms.and_then(DateTime::from_timestamp_millis),
+        None => i.last_merge,
+    };
+    // #1708 — a configuration fault recurs on every tick, so one older than
+    // the hold window has stopped recurring: that is the observed recovery.
+    let config_fault = i.last_config_fault.as_ref()
+        .filter(|(at, _)| (now - *at).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
+    let stalled_days = last_autonomous
+        .map(|last| (now - last).num_days())
+        .filter(|days| *days >= t.no_merge_days);
 
     if !i.daemon_active {
         out.push(Finding {
@@ -255,20 +299,52 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     if let Some(held) = i.last_provider_hold {
         let age = (now - held).num_minutes().max(0);
         if age <= PROVIDER_HOLD_FRESH_MINS {
-            out.push(Finding {
-                severity: Severity::Warn,
-                code: "provider-hold",
-                detail: format!(
+            // #1708 — a hold explains a pause, not days without shipping.
+            // Oct 27–31 the hold was renewed every tick while nothing merged.
+            let detail = match stalled_days.filter(|_| config_fault.is_none()) {
+                None if config_fault.is_some() => format!(
+                    "the build lane is held on provider availability (last held \
+                     {age} min ago) while a configuration fault persists; see \
+                     workflow-config-fault."
+                ),
+                None => format!(
                     "the build lane is paused: every provider cleared for it is \
                      on a quota cooldown (last held {age} min ago). Nothing is \
                      broken and nothing was spent."
                 ),
+                Some(days) => format!(
+                    "the build lane is held on provider availability (last held \
+                     {age} min ago) and no autonomous merge has been confirmed for \
+                     {days} days: this is a persistent provider fault, not a pause."
+                ),
+            };
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "provider-hold",
+                detail,
                 fix: "Wait for the cooldown, or widen the chain for this \
                       preset. `augmentagent reasoner-selftest` shows which \
                       providers are latched and until when."
                     .into(),
             });
         }
+    }
+
+    // #1708 — first observation alerts. Missing configuration spends no
+    // allowance or model calls, which is exactly why it must not look idle.
+    if let Some((at, reason)) = config_fault {
+        out.push(Finding {
+            severity: Severity::Alert,
+            code: "workflow-config-fault",
+            detail: format!(
+                "build ticks are failing on workflow configuration (last {}): {reason}",
+                at.format("%Y-%m-%d %H:%MZ")
+            ),
+            fix: "Select the shared native policy through the supported installer \
+                  and verify builder, reviewer and adjudicator readiness; no \
+                  shipping allowance or model call is spent while this persists."
+                .into(),
+        });
     }
 
     let disks = [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)]
@@ -446,20 +522,53 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    // A quota pause stops merges too, so it explains this one as well.
-    if let Some(last) = i.last_merge.filter(|_| !held_recently) {
-        let days = (now - last).num_days();
-        if days >= t.no_merge_days {
-            out.push(Finding {
-                severity: Severity::Warn,
-                code: "no-progress",
-                detail: format!(
+    // #1708 — a fresh provider hold no longer masks this: a hold that keeps
+    // recurring for days is the fault, so it escalates rather than excuses.
+    if let (Some(last), Some(days)) = (last_autonomous, stalled_days) {
+        out.push(Finding {
+            severity: if held_recently || config_fault.is_some() { Severity::Alert } else { Severity::Warn },
+            code: "no-progress",
+            detail: if held_recently {
+                format!(
+                    "no confirmed autonomous merge for {days} days (last {}) while \
+                     the build lane keeps being held on provider availability",
+                    last.format("%Y-%m-%d")
+                )
+            } else {
+                format!(
                     "no confirmed autonomous merge for {days} days (last {})",
                     last.format("%Y-%m-%d")
-                ),
-                fix: "Read the last few `auto-PR:` lines in stderr.log — the loop \
-                      records why each run ended."
-                    .into(),
+                )
+            },
+            fix: "Read the last few `auto-PR:` lines in stderr.log — the loop \
+                  records why each run ended."
+                .into(),
+        });
+    }
+
+    // #1708 — liveness is S's durable meaningful progress, not heartbeats or
+    // log lines. Waiting workflows (owner pause, quota, capacity, dependency,
+    // configuration) are reported by their own blockers, not as stalls.
+    if let Some(progress) = &i.workflow_progress {
+        use augmentagent_channel_core::autoship_workflow_contract::WorkflowOutcome as O;
+        let stale: Vec<String> = progress.events.iter()
+            .filter(|e| !matches!(e.outcome, O::DependencyWait | O::QuotaWait | O::CapacityWait | O::ConfigurationFault))
+            .filter(|e| e.last_meaningful_progress_at_ms > 0)
+            .filter_map(|e| {
+                let mins = (now.timestamp_millis() - e.last_meaningful_progress_at_ms) / 60_000;
+                (mins >= t.workflow_progress_stale_mins).then(|| {
+                    let stage = serde_json::to_value(e.stage).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                    format!("{} ({stage}: {}; last useful progress {} min ago)", e.workflow_id, e.reason_code, mins)
+                })
+            })
+            .collect();
+        if !stale.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "workflow-progress-stale",
+                detail: format!("{} active workflow(s) without useful progress: {}. Heartbeats and log activity do not count.",
+                    stale.len(), stale.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
+                fix: "Inspect each with `augmentagent autopr status --workflow ID`; a live lease without a recorded gate or guarded step is stuck, not slow.".into(),
             });
         }
     }
@@ -658,6 +767,28 @@ pub fn last_timestamp_with(log: &str, needle: &str) -> Option<DateTime<Utc>> {
         .rev()
         .find(|l| l.contains(needle))
         .and_then(line_timestamp)
+}
+
+/// Typed admission/configuration reasons the worker reports when a build
+/// tick cannot start. Each names configuration, not a transient fault.
+const CONFIG_FAULT_MARKERS: [&str; 4] = [
+    "execution-readiness-blocked",
+    "workflow-role:",
+    "workflow-deployment:",
+    "workflow-resource:declaration-missing",
+];
+
+/// #1708 — the most recent `auto-PR tick failed:` line whose reason is a
+/// typed configuration fault, with that reason (bounded for display).
+pub fn last_config_fault(log: &str) -> Option<(DateTime<Utc>, String)> {
+    log.lines().rev().find_map(|raw| {
+        let line = strip_ansi(raw);
+        let (_, reason) = line.split_once("auto-PR tick failed: ")?;
+        if !CONFIG_FAULT_MARKERS.iter().any(|marker| reason.contains(marker)) {
+            return None;
+        }
+        Some((line_timestamp(&line)?, reason.trim().chars().take(300).collect()))
+    })
 }
 
 /// `(pr, reason, count)` for resume refusals — the signature of a loop that
@@ -1046,10 +1177,12 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     );
     crate::disk::save_readings(&filesystems, now);
     let mut merge_store_path=None;
+    let mut workflow_progress=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
             merge_store_path=Some(config.path.clone());
+            workflow_progress=workflow_progress_at(&config.path,now.timestamp_millis());
             let native=config.native_policy.as_deref().map(|path| {
                 serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect_at(Some(path)))
                     .expect("native capacity report serializes")
@@ -1069,6 +1202,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         // #1030 — the loop logs this exact phrase when every provider cleared
         // for the build preset is on a quota cooldown.
         last_provider_hold: last_timestamp_with(&log, "auto-PR held: no provider can serve"),
+        last_config_fault: last_config_fault(&log),
         last_merge: merge_allowance.and_then(|a| a.last_merged_at_ms).and_then(DateTime::from_timestamp_millis),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
@@ -1100,6 +1234,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         resource_capacity_waits,
         resource_capacity_wait_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
+        workflow_progress,
     }
 }
 
@@ -1437,6 +1572,7 @@ mod tests {
             now_or_epoch: Some(t0()),
             daemon_active: true,
             last_provider_hold: None,
+            last_config_fault: None,
             last_reasoner_poll: Some(t0() - Duration::minutes(4)),
             last_loop_line: Some(t0() - Duration::minutes(12)),
             last_merge: Some(t0() - Duration::hours(20)),
@@ -1463,6 +1599,7 @@ mod tests {
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
             gave_up_by_reason: None,
+            workflow_progress: None,
         }
     }
 
@@ -1900,14 +2037,17 @@ mod tests {
             ..healthy()
         };
         let quiet = analyze(&wedged_looking, &Thresholds::default());
-        for masked in ["loop-silent", "no-progress"] {
-            assert!(
-                !quiet.iter().any(|f| f.code == masked),
-                "{masked} must not fire while a fresh hold explains the quiet: {:?}",
-                quiet.iter().map(|f| f.code).collect::<Vec<_>>()
-            );
-        }
+        assert!(
+            !quiet.iter().any(|f| f.code == "loop-silent"),
+            "loop-silent must not fire while a fresh hold explains the quiet: {:?}",
+            quiet.iter().map(|f| f.code).collect::<Vec<_>>()
+        );
         assert!(quiet.iter().any(|f| f.code == "provider-hold"));
+        // #1708 supersedes the old C5 masking of no-progress: a hold explains
+        // a quiet tick, not nine days without an autonomous merge.
+        let stalled = quiet.iter().find(|f| f.code == "no-progress")
+            .expect("a fresh hold must not hide days without autonomous progress");
+        assert_eq!(stalled.severity, Severity::Alert);
 
         // Without the hold, the same evidence IS an outage.
         let no_hold = analyze(
@@ -2151,6 +2291,10 @@ fn deployment_finding(report: &crate::autoship_deployment::Report) -> Option<Fin
         fix: "Use the supported installer to select the shared native policy and the normal updater to deploy both services; verify autoship readiness afterward.".into(),
     })
 }
+
+#[cfg(test)]
+#[path = "autopr_health_progress_tests.rs"]
+mod progress_tests;
 
 #[cfg(test)]
 mod deployment_tests {
