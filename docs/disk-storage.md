@@ -180,8 +180,15 @@ final floor, before consuming the remaining reserve.
 A refused admission remains an infrastructure failure. `disk-reconcile.json`
 records the last admission's measured before/after space and cleanup results.
 `disk-prune-last.json` records periodic cleanup outcomes and fresh filesystem readings.
-The daily pruner and pressure-triggered health reconciliation use the same
-exclusion and report deferral when a build owns the lease. The updater uses
+Periodic pruning serializes maintenance passes with `disk-prune.lock`. Each
+target must independently yield its physical target/profile leases and pass
+the existing compiler checks before cleanup; busy targets are reported and
+skipped while unrelated idle targets can be reclaimed. Pressure-triggered
+health reconciliation retains the same physical target exclusions and
+per-filesystem reservation accounting. Public `disk prune --json` reports a
+`pruned` or `deferred` outcome per root, the explanatory verdict in `detail`,
+and `freed_bytes`. A mixed pass completes successfully while naming busy roots.
+The updater uses
 `disk build` for release builds once the deployed binary
 supports it, and never falls back to deleting a cache outside the pruner's lease.
 

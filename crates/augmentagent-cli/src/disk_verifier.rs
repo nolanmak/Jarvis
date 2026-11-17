@@ -42,7 +42,8 @@ pub(super) fn verifier_name(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with("augmentagent-verifier-"))
 }
 
-/// Called under the prune/build exclusion. Ownership discovery deliberately
+/// Called inside maintenance or writer coordination; each cache still needs
+/// its independent physical target/profile leases. Ownership discovery deliberately
 /// excludes name-only matches and replaced roots; no sibling glob grants
 /// authority. Explicit --root trims retain their existing per-target meaning.
 pub(super) fn prune_discovered(

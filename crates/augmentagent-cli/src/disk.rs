@@ -27,6 +27,11 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
+#[path = "disk_maintenance.rs"]
+mod maintenance;
+#[cfg(test)]
+#[path = "disk_prune_tests.rs"]
+mod prune_tests;
 #[path = "disk_verifier.rs"]
 mod verifier;
 
@@ -1216,14 +1221,19 @@ fn fmt_gb(bytes: u64) -> String {
 
 pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Result<()> {
     let state = crate::build_storage::state_dir()?;
-    let Some(_lease) = crate::build_storage::Lease::try_at(&state)? else {
+    run_prune_at(repo_root, opts, out, &state, build_procs)
+}
+
+fn run_prune_at(repo_root: &Path, opts: &Options, out: &mut dyn Write, state: &Path,
+    probe: impl FnOnce() -> Option<Vec<BuildProc>>) -> Result<()> {
+    let Some(_lease) = maintenance::Lease::try_at(state)? else {
         if opts.json { writeln!(out, "{}", serde_json::json!([{
-            "outcome": "deferred: a managed build holds the storage lease", "freed_bytes": 0
-        }]))?; } else { writeln!(out, "deferred: a managed build holds the storage lease; retry next pass")?; }
+            "outcome": "deferred", "detail": "another maintenance pass holds the prune lease", "freed_bytes": 0
+        }]))?; } else { writeln!(out, "deferred: another maintenance pass holds the prune lease; retry next pass")?; }
         return Ok(());
     };
     let mut cleanup = Vec::new();
-    let result = run_prune_locked(repo_root, opts, &mut cleanup, false);
+    let result = run_prune_probed(repo_root, opts, &mut cleanup, false, None, probe(), true);
     out.write_all(&cleanup)?;
     if !opts.dry_run {
         let payload = serde_json::json!({"at": chrono::Utc::now(),
@@ -1236,8 +1246,8 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
     result
 }
 
-/// Caller holds the shared storage lease. Admission may run inside its own
-/// lane lock; other upgraded writers cannot start until this lease drops.
+/// Admission callers hold their writer lease. All cleanup independently takes
+/// physical target leases so unrelated writers may continue during maintenance.
 pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool) -> Result<()> {
     run_prune_with_leases(repo_root, opts, out, admission, None)
 }
@@ -1279,6 +1289,10 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
             tracing::info!(path = %path.display(), days, "would adopt stale unmanaged cache");
             continue;
         }
+        // Adoption changes ownership metadata too: do not enroll a live writer
+        // while the periodic pass runs alongside unrelated managed builds.
+        let Ok(Some(_target)) = crate::storage_leases::TargetLeases::try_cache_roots(
+            std::slice::from_ref(&path), None, &profile_dirs) else { continue };
         match crate::build_storage::register_abandoned(repo_root, &path, &state) {
             Ok(_) => tracing::info!(path = %path.display(), days, "adopted stale unmanaged cache as abandoned"),
             Err(error) => tracing::warn!(path = %path.display(), "could not adopt unmanaged cache: {error:#}"),
@@ -1288,7 +1302,11 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
 
 pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
     held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
-    let procs = build_procs();
+    run_prune_probed(repo_root, opts, out, admission, held, build_procs(), false)
+}
+
+fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
+    held: Option<&crate::storage_leases::TargetLeases>, procs: Option<Vec<BuildProc>>, public_outcomes: bool) -> Result<()> {
     if opts.roots.is_empty() && !admission {
         adopt_stale_unmanaged(repo_root, procs.as_deref(), opts.dry_run);
     }
@@ -1362,7 +1380,14 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
     }
 
     if opts.json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&reports)?)?;
+        let mut payload = serde_json::to_value(&reports)?;
+        if public_outcomes {
+            for (value, report) in payload.as_array_mut().unwrap().iter_mut().zip(&reports) {
+                value["detail"] = value["outcome"].take();
+                value["outcome"] = maintenance::outcome(report).into();
+            }
+        }
+        writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?;
     } else {
         for r in &reports {
             writeln!(
@@ -1370,7 +1395,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
                 "{:<22} {:>9}  {}  [{}]",
                 r.label,
                 fmt_gb(r.freed_bytes),
-                r.outcome,
+                if public_outcomes { format!("{}: {}", maintenance::outcome(r), r.outcome) } else { r.outcome.clone() },
                 r.path
             )?;
         }
