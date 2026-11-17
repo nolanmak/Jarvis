@@ -796,8 +796,8 @@ MAX_REQUEST_BYTES = 24 * 1024 * 1024
 #    bytes, or MAX_WALK_ENTRIES entries, whichever comes first. Running out
 #    returns the hits so far with a note telling the model to narrow the path.
 # 2. Match: Python's re has no timeout, so matching runs in a disposable child
-#    that is killed after GREP_MATCH_SECONDS of wall clock (1.5 s plus kill and
-#    reap keeps a pathological match under 2 s). The wall clock includes child
+#    that is killed when its GREP_MATCH_SECONDS wait expires. Startup, kill and
+#    reap add scheduling overhead to the reply. The wait includes child
 #    startup and time spent waiting for a CPU, so the error is worded by the
 #    child's CPU time. If it used at least GREP_CPU_BOUND_SHARE of the wall time,
 #    the pattern is at fault. Otherwise the host was busy: retry or narrow the path.
