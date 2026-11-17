@@ -611,14 +611,14 @@ fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> 
     verifier_cache_sibling(root, &crate::build_storage::effective_target(root), &key)
 }
 fn verifier_cache_sibling(root: &Path, builder: &Path, key: &str) -> Result<PathBuf> {
-    let parent = builder
-        .parent()
-        .context("builder cache has no parent")?
-        .canonicalize()?;
+    let verifier_parent = augmentagent_channel_core::build_volume::verifier_parent(builder);
+    std::fs::create_dir_all(&verifier_parent)?;
+    let parent = verifier_parent.canonicalize()?;
     let builder = if builder.exists() {
         builder.canonicalize()?
     } else {
-        parent.join(builder.file_name().context("builder cache has no name")?)
+        builder.parent().context("builder cache has no parent")?.canonicalize()?
+            .join(builder.file_name().context("builder cache has no name")?)
     };
     ensure!(
         key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -3904,3 +3904,7 @@ pub(super) async fn persist_historical_fixture_receipt(root:&Path, prepared:&Pre
 }
 #[cfg(test)]
 pub(super) use amendment::migrate_fixture as migrate_historical_fixture;
+
+#[cfg(test)]
+#[path = "build_volume_resolution_tests.rs"]
+mod build_volume_resolution_tests;

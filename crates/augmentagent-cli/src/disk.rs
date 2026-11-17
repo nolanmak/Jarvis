@@ -27,6 +27,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
+#[path = "disk_verifier.rs"]
+mod verifier;
+
 const DAY: f64 = 86_400.0;
 
 /// Free bytes below which a gate refuses to start (#1407):
@@ -576,13 +579,7 @@ impl Root {
 }
 
 pub fn gate_target_dir() -> PathBuf {
-    let path = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".cache/augmentagent-gate-target")
-        });
-    if path.is_absolute() { path } else { std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path) }
+    augmentagent_channel_core::build_volume::paths().gate
 }
 
 /// Extra target dirs to prune, colon-separated, from the local `.env`.
@@ -729,6 +726,7 @@ pub fn watched_paths(repo_root: &Path) -> Vec<(String, PathBuf)> {
         out.push(("the state dir".into(), dir));
     }
     out.push(("the temp dir".into(), std::env::temp_dir()));
+    out.extend(augmentagent_channel_core::build_volume::watched_paths());
     let gate = resolved(gate_target_dir());
     out.push(("the gate target".into(), gate.clone()));
     let mut gate_devices: Vec<u64> = device_id(&gate).into_iter().collect();
@@ -1259,7 +1257,8 @@ fn adopt_unmanaged_days() -> f64 {
 fn stale_unmanaged(caches: &[crate::build_storage::UnmanagedCache], days: f64,
     in_use: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     caches.iter()
-        .filter(|c| c.idle_days.is_some_and(|idle| idle >= days) && !in_use(&c.path))
+        .filter(|c| !verifier::verifier_name(&c.path)
+            && c.idle_days.is_some_and(|idle| idle >= days) && !in_use(&c.path))
         .map(|c| c.path.clone())
         .collect()
 }
@@ -1315,8 +1314,12 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
     let policy = Policy::from_env();
     let now = SystemTime::now();
 
-    let mut reports = Vec::new();
+    let mut reports = if opts.roots.is_empty() {
+        verifier::prune_discovered(repo_root, opts.dry_run, procs.as_deref(), held)?
+    } else { Vec::new() };
     for root in &roots {
+        // Verifier retention replaces ordinary age pruning for these roots.
+        if reports.iter().any(|r| r.path == root.path.to_string_lossy()) { continue; }
         let target_lease = crate::storage_leases::TargetLeases::try_cache_roots(std::slice::from_ref(&root.path), held, &profile_dirs);
         let lease_error = target_lease.as_ref().err().map(|error| format!("cannot verify target lease: {error:#}"));
         let busy = if lease_error.is_some() {
@@ -1342,6 +1345,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
             let reserve = (crate::build_storage::admission_floor_gb() * GIB) as u64;
             root_opts.cap_mb = Some(crate::build_storage::cap_for_free_space(root.bytes(), cap, free, reserve) / (1024 * 1024));
         }
+        crate::build_relocation::retired_options(repo_root, &root, &mut root_opts)?;
         reports.push(prune_root(root, busy, &root_opts, &policy, now));
     }
 

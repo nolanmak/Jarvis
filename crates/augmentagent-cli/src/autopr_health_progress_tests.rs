@@ -129,3 +129,71 @@ fn unknown_inventory_is_never_reported_healthy_and_complete_empty_is_idle() {
     assert!(findings.iter().any(|f| f.code == "workflow-inventory-unknown"), "{findings:?}");
     assert!(render_text(&findings, &unreadable).contains("workflows: unknown (inventory unreadable)"));
 }
+
+/// Slice 3: S persists a per-stage inactivity deadline (verify: 90 min).
+/// Heartbeats cannot extend it, and once it passes health alerts with the
+/// stage, its budget and the persisted reason.
+#[test]
+fn passed_stage_inactivity_deadline_alerts_and_heartbeats_cannot_extend_it() {
+    let t0 = 1_800_000_000_000;
+    let mut f = verifying_workflow(t0);
+    for minutes in [30, 60, 90] {
+        f.store.heartbeat(&f.lease, t0 + minutes * 60_000, 24 * HOUR_MS).unwrap();
+    }
+    let before = t0 + 80 * 60_000;
+    let early = workflow_progress_at(&f.path, before).unwrap();
+    let (_, activity) = early.activities.iter().find(|(id, _)| id == "owner/repo#7").expect("S activity for the workflow");
+    assert_eq!(activity.inactivity_budget_ms, Some(5_400_000), "fixture: S verify budget");
+    assert!(!analyze(&inputs(before, Some(early)), &Thresholds::default()).iter().any(|f| f.code == "stage-inactivity-deadline"));
+
+    let now = t0 + 2 * HOUR_MS;
+    let progress = workflow_progress_at(&f.path, now).unwrap();
+    let findings = analyze(&inputs(now, Some(progress)), &Thresholds::default());
+    let late = findings.iter().find(|f| f.code == "stage-inactivity-deadline")
+        .unwrap_or_else(|| panic!("a passed S inactivity deadline must alert: {findings:?}"));
+    assert_eq!(late.severity, Severity::Alert);
+    assert!(late.detail.contains("owner/repo#7") && late.detail.contains("verify") && late.detail.contains("90 min"), "{}", late.detail);
+}
+
+/// Slice 4: each blocked workflow states why it cannot advance and what wakes
+/// it; failed/unknown CI and invalidated review are separate warnings, while
+/// ordinary pending CI is only reported.
+#[test]
+fn blocked_workflows_report_separate_review_and_ci_reasons_and_what_wakes_them() {
+    let t0 = 1_800_000_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    for (issue, stage, reason, action) in [
+        (7, Stage::AwaitChecks, "ci_pending", "reconcile_checks"),
+        (8, Stage::AwaitChecks, "ci_failed", "repair_ci"),
+        (9, Stage::AwaitChecks, "ci_main_unavailable", "recover_ci_evidence"),
+        (10, Stage::Review, "review_main_changed", "rereview_current_head"),
+    ] {
+        let id = format!("owner/repo#{issue}");
+        let binding = Binding { head: "a".repeat(40), contract: "contract-v1".into(), evidence_hash: "evidence-v1".into() };
+        store.register(&id, "fixture", binding, t0).unwrap();
+        let lease = store.claim(&id, "fixture", t0, HOUR_MS).unwrap().unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.stage = stage;
+        cp.next = NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: t0 + 300_000 };
+        store.checkpoint(&lease, &cp, t0 + 1).unwrap();
+        store.release(&lease, t0 + 2).unwrap();
+    }
+    drop(store);
+    let now = t0 + 60_000;
+    let progress = workflow_progress_at(&path, now).unwrap();
+    assert_eq!(progress.events.len(), 4, "fixture: four blocked workflows");
+    let health = inputs(now, Some(progress));
+    let findings = analyze(&health, &Thresholds::default());
+    let codes: Vec<_> = findings.iter().map(|f| f.code).collect();
+    for (code, id) in [("blocked-ci-failed", "owner/repo#8"), ("blocked-ci-unknown", "owner/repo#9"), ("blocked-review-expired", "owner/repo#10")] {
+        let finding = findings.iter().find(|f| f.code == code).unwrap_or_else(|| panic!("{code} missing: {codes:?}"));
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.detail.contains(id) && !finding.detail.contains("owner/repo#7"), "{code}: {}", finding.detail);
+    }
+    assert!(!codes.iter().any(|c| c.starts_with("blocked-ci-pending")), "pending CI is waiting, not a warning: {codes:?}");
+    let text = render_text(&findings, &health);
+    assert!(text.contains("owner/repo#7 (await_checks): CI pending; wakes: reconcile_checks"), "{text}");
+    assert!(text.contains("owner/repo#10 (review): review invalidated by a main change; wakes: rereview_current_head"), "{text}");
+}
