@@ -7,7 +7,11 @@ pub const MAX_NONCE_CHARS:usize=25;
 /// 25-character hex digest: the same input (a retry) yields the same nonce,
 /// distinct inputs stay distinct, and a digest never contains the `-` that
 /// every literal prefixed nonce has.
-pub fn bounded_nonce(raw:&str)->String {raw.to_string()}
+pub fn bounded_nonce(raw:&str)->String {
+    if raw.chars().count()<=MAX_NONCE_CHARS {return raw.to_string();}
+    use sha2::{Digest,Sha256};
+    format!("{:x}",Sha256::digest(raw.as_bytes()))[..MAX_NONCE_CHARS].to_string()
+}
 
 #[cfg(test)]
 mod tests {

@@ -99,7 +99,7 @@ pub fn message(
                 ))),
         )
         .components(controls(a))
-        .nonce(Nonce::String(format!("owner-alert-{}", notice.id)))
+        .nonce(Nonce::String(crate::nonce::bounded_nonce(&format!("owner-alert-{}", notice.id))))
         .enforce_nonce(true)
 }
 

@@ -63,9 +63,9 @@ pub fn health_message(id: i64, status: &str) -> serenity::all::CreateMessage {
                 .description(health_description(id, status))
                 .footer(serenity::all::CreateEmbedFooter::new(HEALTH_FOOTER)),
         )
-        .nonce(serenity::all::Nonce::String(format!(
+        .nonce(serenity::all::Nonce::String(crate::nonce::bounded_nonce(&format!(
             "owner-imessage-health-{id}"
-        )))
+        ))))
         .enforce_nonce(true)
         .allowed_mentions(serenity::all::CreateAllowedMentions::new())
 }
