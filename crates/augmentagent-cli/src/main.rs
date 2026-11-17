@@ -12328,7 +12328,7 @@ mod query_delivery_contract_tests {
         // The scope guard sources aa-wiki-protected-names.sh from its own dir
         // (#1078); copy both or the guard aborts under `set -euo pipefail`.
         for script in ["aa-wiki-scope-guard.sh", "aa-wiki-protected-names.sh"] {
-            std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script),
+            augmentagent_test_support::copy_executable(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script),
                 repo.join("scripts").join(script)).unwrap();
         }
         std::os::unix::fs::symlink(memory, repo.join("target/release/augmentagent-mcp-memory")).unwrap();

@@ -622,7 +622,7 @@
       ]
     },
     "rust/agents/12": {
-      "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked",
+      "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store -p augmentagent-test-support --locked",
       "shell": "bash"
     },
     "rust/agents/3": {

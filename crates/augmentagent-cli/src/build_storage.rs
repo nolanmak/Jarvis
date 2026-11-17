@@ -1869,7 +1869,7 @@ mod inherited_ci_storage_tests {
         let target = tempfile::tempdir().unwrap();
         let tools = tempfile::tempdir().unwrap();
         let wrapper = tools.path().join("sccache");
-        std::fs::write(&wrapper, r#"#!/bin/sh
+        augmentagent_test_support::write_executable(&wrapper, r#"#!/bin/sh
 pidfile="$(dirname "$0")/server.pid"
 if [ "$1" = "--start-server" ]; then
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi

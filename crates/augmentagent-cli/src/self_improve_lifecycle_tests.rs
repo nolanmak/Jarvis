@@ -21,7 +21,7 @@ async fn pipeline(recover: bool) {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
         let gh = root.join("fixture-gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 root = pathlib.Path(os.environ['JARVIS_LIFECYCLE_ROOT'])
 args = sys.argv[1:]

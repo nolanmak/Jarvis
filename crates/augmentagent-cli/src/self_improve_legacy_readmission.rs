@@ -428,7 +428,7 @@ mod tests {
             // macOS /tmp is a symlink; the protected store refuses symlinked paths.
             let root_path = root.path().canonicalize().unwrap();
             let gh = root_path.join("gh.py");
-            std::fs::write(
+            augmentagent_test_support::write_executable(
                 &gh,
                 r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
