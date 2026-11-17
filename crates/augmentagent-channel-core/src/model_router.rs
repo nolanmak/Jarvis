@@ -247,10 +247,80 @@ pub(crate) mod tests {
     use super::*;
     use crate::providers::{ModelTier, ProviderKind};
     pub(crate) fn fixture() -> serde_json::Value {
-        serde_json::json!({"version":1,"mode":"auto","base_url":"http://127.0.0.1:20128/v1",
+        serde_json::json!({"version":1,"gateway":"omniroute","mode":"auto","base_url":"http://127.0.0.1:20128/v1",
           "api_key":"router-secret","models":{"claude":{"quality":"cc/claude-opus-4-6","fast":"cc/claude-haiku-4-5"},
           "codex":{"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}}})
     }
+    #[test]
+    fn gateway_kinds_select_their_claude_and_codex_wire_contracts() {
+        for (gateway,name,header) in [
+            ("omniroute","OmniRoute","x-omniroute-compression"),
+            ("9router","9Router","X-9Router-Token-Saver"),
+        ] {
+            let mut value=fixture();value["gateway"]=gateway.into();
+            let config=parse(&value.to_string()).unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],gateway);
+            let overrides=config.codex_overrides();
+            assert!(overrides.contains(&format!("model_providers.augmentagent_router.name=\"{name}\"")));
+            assert!(overrides.contains(&format!("model_providers.augmentagent_router.http_headers={{ \"{header}\" = \"off\" }}")));
+            assert!(overrides.contains(&"model_providers.augmentagent_router.base_url=\"http://127.0.0.1:20128/v1\"".into()));
+            assert!(overrides.contains(&"model_providers.augmentagent_router.requires_openai_auth=false".into()));
+            assert!(!overrides.join(" ").contains("router-secret"));
+            let mut cmd=tokio::process::Command::new("claude");
+            config.configure_claude(&mut cmd);
+            let env=cmd.as_std().get_envs().map(|(k,v)|(k.to_string_lossy().into_owned(),v.map(|v|v.to_string_lossy().into_owned()))).collect::<std::collections::BTreeMap<_,_>>();
+            assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"],Some(format!("{header}: off")));
+            assert_eq!(env["ANTHROPIC_BASE_URL"].as_deref(),Some("http://127.0.0.1:20128"));
+            assert_eq!(env["ANTHROPIC_AUTH_TOKEN"].as_deref(),Some("router-secret"));
+            assert_eq!(env["CLAUDE_CODE_MAX_RETRIES"].as_deref(),Some("2"));
+            assert_eq!(env["ANTHROPIC_API_KEY"],None);
+            assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"],None);
+        }
+    }
+
+    #[test]
+    fn missing_gateway_defaults_to_omniroute_and_missing_mode_stays_direct() {
+        let mut value=fixture();
+        value.as_object_mut().unwrap().remove("gateway");
+        let config=parse(&value.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],"omniroute");
+        assert!(config.codex_overrides().iter().any(|arg|arg.contains("OmniRoute")));
+        value.as_object_mut().unwrap().remove("mode");
+        let direct=parse(&value.to_string()).unwrap();
+        assert_eq!(direct.mode,"direct");
+        assert!(!direct.enabled());
+        for provider in [ProviderKind::Claude,ProviderKind::Codex,ProviderKind::Gemini] {
+            assert!(direct.allows(provider));
+            assert!(direct.model(provider,ModelTier::Quality).is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_gateway_is_rejected_without_echoing_secrets() {
+        for gateway in [serde_json::json!("other"),serde_json::json!(null),serde_json::json!(7)] {
+            let mut value=fixture();value["gateway"]=gateway;
+            let error=parse(&value.to_string()).err().expect("unsupported gateway must fail closed");
+            assert!(!error.to_string().contains("router-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mode_and_native_review_do_not_depend_on_gateway_kind() {
+        for gateway in ["omniroute","9router"] {
+            let mut value=fixture();value["gateway"]=gateway.into();value["mode"]="direct".into();
+            let direct=parse(&value.to_string()).unwrap();
+            assert!(!direct.enabled());
+            assert!(direct.model(ProviderKind::Claude,ModelTier::Quality).is_none());
+            assert!(direct.model(ProviderKind::Codex,ModelTier::Fast).is_none());
+            value["mode"]="auto".into();
+            let config=Some(parse(&value.to_string()).unwrap());
+            let native=native_reviewer_scope(ProviderKind::Codex,async {
+                select_profile_with_auth(config,Some(ProviderKind::Codex),true)
+            }).await.unwrap().unwrap();
+            assert_eq!(native.mode,"direct");
+        }
+    }
+
     #[test]
     fn account_profiles_respect_enabled_router_and_direct_mode() {
         let original = parse(&fixture().to_string()).unwrap();
