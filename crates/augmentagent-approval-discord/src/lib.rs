@@ -61,7 +61,7 @@ pub use layout::{
 };
 // #785: the drafter emits the assumed-facts marker; the channel splits it off
 // the Gmail body and the card renders it as the "⚠ Assumes" field.
-pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send, unwrap_code_fence};
+pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send, unwrap_code_fence, unwrap_fenced_draft};
 // #2014: the DM compose paths attach the register warning via
 // `register::attach_dm_register_warning`; the card renders it as "⚠️ Register".
 pub use layout::{append_register_warning, split_register};

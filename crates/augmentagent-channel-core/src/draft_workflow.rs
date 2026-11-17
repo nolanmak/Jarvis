@@ -32,8 +32,9 @@ impl PreparedDraftContext {
         // #2177 — every messaging drafter passes through here: a reply the
         // model wrapped whole in a code fence is unwrapped before it is
         // carded, so the owner approves the text the recipient will get.
-        let unwrapped = augmentagent_approval_discord::unwrap_code_fence(draft);
-        let draft = unwrapped.as_deref().unwrap_or(draft);
+        // Metadata a drafter already attached is kept around the reply.
+        let unwrapped = augmentagent_approval_discord::unwrap_fenced_draft(draft);
+        let draft = unwrapped.as_str();
         if self.evidence.gaps.is_empty() {
             return draft.to_string();
         }

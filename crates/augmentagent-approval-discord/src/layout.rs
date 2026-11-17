@@ -260,6 +260,28 @@ pub fn unwrap_code_fence(text: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// [`unwrap_code_fence`] for a stored draft, which may carry card metadata
+/// after the reply (needs-input asks, assumptions, the register warning).
+/// The metadata is set aside, the visible reply unwrapped, and the metadata
+/// reattached, so the card shows the same text [`strip_assumes_for_send`]
+/// delivers (review of #2177: the email adapter appends asks before
+/// `guard_draft`, so the fence survived on the card). Unchanged when the
+/// reply is not wrapped whole in a fence.
+pub fn unwrap_fenced_draft(draft: &str) -> String {
+    let (human, needs) = split_needs_input(draft);
+    let (human, register) = split_register(&human);
+    let (prose, assumes) = split_assumes(&human);
+    let Some(reply) = unwrap_code_fence(&prose) else {
+        return draft.to_string();
+    };
+    let mut out = append_assumes_marker(&reply, &assumes);
+    if let Some(warning) = register {
+        out = append_register_warning(&out, &warning);
+    }
+    let asks: Vec<(String, String)> = needs.into_iter().map(|n| (n.kind, n.text)).collect();
+    append_needs_input_marker(&out, &asks)
+}
+
 fn strip_markers_for_send(body: &str) -> String {
     let (mut clean, _) = split_assumes(body);
     let mut touched = false;
@@ -309,6 +331,31 @@ mod unwrap_code_fence_tests {
         // Card metadata is scrubbed first, then the fence.
         let carded = append_assumes_marker("```\nSee you at 7.\n```", &["they said 7".to_string()]);
         assert_eq!(strip_assumes_for_send(&carded), "See you at 7.");
+    }
+
+    /// Review of #2177: a fenced reply that already carries card metadata
+    /// (the email adapter appends asks before `guard_draft`) is unwrapped on
+    /// the card too, with every marker kept, so the owner approves exactly
+    /// what is delivered.
+    #[test]
+    fn a_fenced_reply_with_card_metadata_is_unwrapped_and_keeps_the_metadata() {
+        let fenced = "```\nSee you at 7.\n```";
+        let asks = [("scheduling".to_string(), "which day?".to_string())];
+        let with_assumes = append_assumes_marker(fenced, &["they said 7".to_string()]);
+        let with_register = append_register_warning(&with_assumes, "register mismatch: example");
+        let carded = append_needs_input_marker(&with_register, &asks);
+        let unwrapped = unwrap_fenced_draft(&carded);
+        let (human, needs) = split_needs_input(&unwrapped);
+        let (human, register) = split_register(&human);
+        let (prose, assumes) = split_assumes(&human);
+        assert_eq!(prose, "See you at 7.", "{unwrapped}");
+        assert_eq!(assumes, ["they said 7"]);
+        assert_eq!(register.as_deref(), Some("register mismatch: example"));
+        assert_eq!(needs.iter().map(|n| (n.kind.as_str(), n.text.as_str())).collect::<Vec<_>>(), [("scheduling", "which day?")]);
+        assert_eq!(strip_assumes_for_send(&unwrapped), strip_assumes_for_send(&carded));
+        // Not fenced: the stored draft is untouched, metadata and all.
+        let plain = append_needs_input_marker("See you at 7.", &asks);
+        assert_eq!(unwrap_fenced_draft(&plain), plain);
     }
 }
 
