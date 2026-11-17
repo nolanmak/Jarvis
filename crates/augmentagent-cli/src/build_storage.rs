@@ -375,11 +375,11 @@ pub fn manage_parent(repo: &Path, path: &Path, state: &Path) -> Result<()> {
     Ok(())
 }
 
-fn parent_targets(repo: &Path, state: &Path) -> Vec<Target> {
+fn parent_records(repo: &Path, state: &Path) -> Vec<Parent> {
     let Ok(entries) = std::fs::read_dir(state.join("build-parents")) else {
         return vec![];
     };
-    let mut targets = Vec::new();
+    let mut parents = Vec::new();
     for entry in entries.flatten() {
         let Some(parent) = std::fs::read(entry.path())
             .ok()
@@ -405,6 +405,18 @@ fn parent_targets(repo: &Path, state: &Path) -> Vec<Target> {
         {
             continue;
         }
+        parents.push(parent);
+    }
+    parents
+}
+
+pub fn managed_parents(repo: &Path, state: &Path) -> Vec<PathBuf> {
+    repo_id(repo).map(|repo| parent_records(&repo, state).into_iter().map(|p| p.path).collect()).unwrap_or_default()
+}
+
+fn parent_targets(repo: &Path, state: &Path) -> Vec<Target> {
+    let mut targets = Vec::new();
+    for parent in parent_records(repo, state) {
         let Ok(children) = std::fs::read_dir(&parent.path) else {
             continue;
         };
@@ -2216,3 +2228,7 @@ os._exit(0)
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "build_volume_relocation_tests.rs"]
+mod build_volume_relocation_tests;

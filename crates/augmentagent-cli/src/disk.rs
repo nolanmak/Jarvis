@@ -27,6 +27,14 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
+#[path = "disk_maintenance.rs"]
+mod maintenance;
+#[cfg(test)]
+#[path = "disk_prune_tests.rs"]
+mod prune_tests;
+#[path = "disk_verifier.rs"]
+mod verifier;
+
 const DAY: f64 = 86_400.0;
 
 /// Free bytes below which a gate refuses to start (#1407):
@@ -576,13 +584,7 @@ impl Root {
 }
 
 pub fn gate_target_dir() -> PathBuf {
-    let path = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".cache/augmentagent-gate-target")
-        });
-    if path.is_absolute() { path } else { std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path) }
+    augmentagent_channel_core::build_volume::paths().gate
 }
 
 /// Extra target dirs to prune, colon-separated, from the local `.env`.
@@ -729,6 +731,7 @@ pub fn watched_paths(repo_root: &Path) -> Vec<(String, PathBuf)> {
         out.push(("the state dir".into(), dir));
     }
     out.push(("the temp dir".into(), std::env::temp_dir()));
+    out.extend(augmentagent_channel_core::build_volume::watched_paths());
     let gate = resolved(gate_target_dir());
     out.push(("the gate target".into(), gate.clone()));
     let mut gate_devices: Vec<u64> = device_id(&gate).into_iter().collect();
@@ -1218,14 +1221,19 @@ fn fmt_gb(bytes: u64) -> String {
 
 pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Result<()> {
     let state = crate::build_storage::state_dir()?;
-    let Some(_lease) = crate::build_storage::Lease::try_at(&state)? else {
+    run_prune_at(repo_root, opts, out, &state, build_procs)
+}
+
+fn run_prune_at(repo_root: &Path, opts: &Options, out: &mut dyn Write, state: &Path,
+    probe: impl FnOnce() -> Option<Vec<BuildProc>>) -> Result<()> {
+    let Some(_lease) = maintenance::Lease::try_at(state)? else {
         if opts.json { writeln!(out, "{}", serde_json::json!([{
-            "outcome": "deferred: a managed build holds the storage lease", "freed_bytes": 0
-        }]))?; } else { writeln!(out, "deferred: a managed build holds the storage lease; retry next pass")?; }
+            "outcome": "deferred", "detail": "another maintenance pass holds the prune lease", "freed_bytes": 0
+        }]))?; } else { writeln!(out, "deferred: another maintenance pass holds the prune lease; retry next pass")?; }
         return Ok(());
     };
     let mut cleanup = Vec::new();
-    let result = run_prune_locked(repo_root, opts, &mut cleanup, false);
+    let result = run_prune_probed(repo_root, opts, &mut cleanup, false, None, probe(), true);
     out.write_all(&cleanup)?;
     if !opts.dry_run {
         let payload = serde_json::json!({"at": chrono::Utc::now(),
@@ -1238,8 +1246,8 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
     result
 }
 
-/// Caller holds the shared storage lease. Admission may run inside its own
-/// lane lock; other upgraded writers cannot start until this lease drops.
+/// Admission callers hold their writer lease. All cleanup independently takes
+/// physical target leases so unrelated writers may continue during maintenance.
 pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool) -> Result<()> {
     run_prune_with_leases(repo_root, opts, out, admission, None)
 }
@@ -1259,7 +1267,8 @@ fn adopt_unmanaged_days() -> f64 {
 fn stale_unmanaged(caches: &[crate::build_storage::UnmanagedCache], days: f64,
     in_use: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     caches.iter()
-        .filter(|c| c.idle_days.is_some_and(|idle| idle >= days) && !in_use(&c.path))
+        .filter(|c| !verifier::verifier_name(&c.path)
+            && c.idle_days.is_some_and(|idle| idle >= days) && !in_use(&c.path))
         .map(|c| c.path.clone())
         .collect()
 }
@@ -1280,6 +1289,10 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
             tracing::info!(path = %path.display(), days, "would adopt stale unmanaged cache");
             continue;
         }
+        // Adoption changes ownership metadata too: do not enroll a live writer
+        // while the periodic pass runs alongside unrelated managed builds.
+        let Ok(Some(_target)) = crate::storage_leases::TargetLeases::try_cache_roots(
+            std::slice::from_ref(&path), None, &profile_dirs) else { continue };
         match crate::build_storage::register_abandoned(repo_root, &path, &state) {
             Ok(_) => tracing::info!(path = %path.display(), days, "adopted stale unmanaged cache as abandoned"),
             Err(error) => tracing::warn!(path = %path.display(), "could not adopt unmanaged cache: {error:#}"),
@@ -1289,7 +1302,11 @@ fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run:
 
 pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
     held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
-    let procs = build_procs();
+    run_prune_probed(repo_root, opts, out, admission, held, build_procs(), false)
+}
+
+fn run_prune_probed(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
+    held: Option<&crate::storage_leases::TargetLeases>, procs: Option<Vec<BuildProc>>, public_outcomes: bool) -> Result<()> {
     if opts.roots.is_empty() && !admission {
         adopt_stale_unmanaged(repo_root, procs.as_deref(), opts.dry_run);
     }
@@ -1315,8 +1332,12 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
     let policy = Policy::from_env();
     let now = SystemTime::now();
 
-    let mut reports = Vec::new();
+    let mut reports = if opts.roots.is_empty() {
+        verifier::prune_discovered(repo_root, opts.dry_run, procs.as_deref(), held)?
+    } else { Vec::new() };
     for root in &roots {
+        // Verifier retention replaces ordinary age pruning for these roots.
+        if reports.iter().any(|r| r.path == root.path.to_string_lossy()) { continue; }
         let target_lease = crate::storage_leases::TargetLeases::try_cache_roots(std::slice::from_ref(&root.path), held, &profile_dirs);
         let lease_error = target_lease.as_ref().err().map(|error| format!("cannot verify target lease: {error:#}"));
         let busy = if lease_error.is_some() {
@@ -1342,6 +1363,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
             let reserve = (crate::build_storage::admission_floor_gb() * GIB) as u64;
             root_opts.cap_mb = Some(crate::build_storage::cap_for_free_space(root.bytes(), cap, free, reserve) / (1024 * 1024));
         }
+        crate::build_relocation::retired_options(repo_root, &root, &mut root_opts)?;
         reports.push(prune_root(root, busy, &root_opts, &policy, now));
     }
 
@@ -1358,7 +1380,14 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
     }
 
     if opts.json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&reports)?)?;
+        let mut payload = serde_json::to_value(&reports)?;
+        if public_outcomes {
+            for (value, report) in payload.as_array_mut().unwrap().iter_mut().zip(&reports) {
+                value["detail"] = value["outcome"].take();
+                value["outcome"] = maintenance::outcome(report).into();
+            }
+        }
+        writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?;
     } else {
         for r in &reports {
             writeln!(
@@ -1366,7 +1395,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
                 "{:<22} {:>9}  {}  [{}]",
                 r.label,
                 fmt_gb(r.freed_bytes),
-                r.outcome,
+                if public_outcomes { format!("{}: {}", maintenance::outcome(r), r.outcome) } else { r.outcome.clone() },
                 r.path
             )?;
         }
