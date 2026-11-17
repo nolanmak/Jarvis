@@ -4,6 +4,8 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "autoship_family_controls.rs"]
+pub(crate) mod control;
 #[path = "autoship_family_budget_store.rs"]
 pub(crate) mod store;
 #[path = "autoship_family_budget_usage.rs"]
@@ -124,35 +126,9 @@ pub(super) fn require_new_admission(
     incoming: u64,
     native: bool,
 ) -> Result<Option<String>> {
-    if !required(tx, &lease.workflow)? {
+    let Some((raw, scope)) = control::frame(tx, lease)? else {
         return Ok(None);
-    }
-    use observation::Reason;
-    if !table(tx, "workflow_family_budget")? || !table(tx, "workflow_family_member")? {
-        return Err(wait::refusal(Reason::FamilyAuthorityUnknown));
-    }
-    let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member m JOIN workflow_family_budget f ON f.family=m.family WHERE m.workflow=?1 AND f.state='pending')",[&lease.workflow],|r|r.get(0))?;
-    let missing = if pending {
-        Reason::FamilyMembershipPending
-    } else {
-        Reason::FamilyExecutionScopeUnknown
     };
-    if !table(tx, "workflow_family_scope")? {
-        return Err(wait::refusal(missing));
-    }
-    let raw: Option<String> = tx
-        .query_row(
-            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
-            params![lease.workflow, lease.generation],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let raw = raw.ok_or_else(|| wait::refusal(missing))?;
-    let scope: Scope = serde_json::from_str(&raw)
-        .map_err(|_| wait::refusal(Reason::FamilyExecutionScopeUnknown))?;
-    if scope.schema_version != 1 || scope.verified_authority_ref.is_empty() {
-        return Err(wait::refusal(Reason::FamilyExecutionScopeUnknown));
-    }
     ensure!(native, "family_native_attribution_required");
     let status = observe_scope(tx, &lease.workflow, &scope, incoming)?;
     if !status.ready() {
