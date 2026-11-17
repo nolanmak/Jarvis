@@ -260,6 +260,26 @@ pub async fn run(store: Arc<Store>, broker: Arc<dyn ApprovalBroker>, shutdown: C
 mod tests {
     use super::*;
     #[test]
+    fn notice_nonce_fits_discord_limit_for_any_notice_id() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path().join("test.db")).unwrap();
+        store.insert_owner_alert(&augmentagent_store::owner_alerts::NewOwnerAlert {
+            id: "sample", sender: "s", action: "a", reason: "r", urgency: Urgency::Critical,
+            source_url: "https://example.test/1", due_at_ms: None, timezone: "UTC", meeting_id: None,
+            expires_at_ms: 10000, text_after_ms: 1 }, 1).unwrap();
+        let mut notice = store.claim_owner_alert_notice(2).unwrap().unwrap();
+        let nonce = |notice: &AlertNotice| serde_json::to_value(message(notice, UserId::new(123), 2, None)).unwrap()["nonce"].as_str().unwrap().to_string();
+        notice.id = 7;
+        assert_eq!(nonce(&notice), "owner-alert-7", "small ids keep their deployed nonce");
+        notice.id = i64::MAX;
+        let large = nonce(&notice);
+        assert!(large.chars().count() <= crate::nonce::MAX_NONCE_CHARS, "{large}");
+        assert_eq!(large, nonce(&notice), "a retried notice reuses its nonce");
+        notice.id = i64::MAX - 1;
+        assert_ne!(nonce(&notice), large);
+    }
+
+    #[test]
     fn notice_mentions_only_the_owner_and_has_distinct_controls() {
         let d = tempfile::tempdir().unwrap();
         let store = Store::open(d.path().join("test.db")).unwrap();

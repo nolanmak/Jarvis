@@ -29,6 +29,7 @@ pub mod owner_alerts;
 pub mod owner_commands;
 pub mod phone;
 pub mod autoship;
+pub mod nonce;
 pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
