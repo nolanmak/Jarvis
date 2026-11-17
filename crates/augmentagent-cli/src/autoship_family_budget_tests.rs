@@ -90,6 +90,53 @@ fn pending_family_without_policy_fences_new_admission_and_retains_original_spend
         .unwrap();
     }
     tx.commit().unwrap();
+    let pending = store
+        .family_budget_observation(
+            child_id,
+            &family_budget::Intent::Delegated {
+                family: "fixture-family".into(),
+                manifest_ref: "not-bound".into(),
+                policy_ref: "not-published".into(),
+                request_ref: "protected-original-request".into(),
+            },
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        pending.model_admissions, None,
+        "pending membership cannot certify a complete family total"
+    );
+    assert_eq!(
+        pending
+            .retained
+            .iter()
+            .map(|u| u.model_admissions)
+            .sum::<u64>(),
+        13
+    );
+    let pending_wire = serde_json::to_value(&pending).unwrap();
+    let reasons: Vec<_> = pending_wire["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["reason_code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "family_membership_pending",
+            "family_budget_policy_missing",
+            "family_spend_unknown"
+        ]
+    );
+    assert_eq!(
+        pending_wire["blockers"][0]["next"]["action"],
+        "await_verified_lineage"
+    );
+    assert_eq!(
+        pending_wire["blockers"][1]["next"]["action"],
+        "await_owner_budget_policy"
+    );
     let admission = store.charge_admitted_model(
         &child,
         "new-after-pending-family",
@@ -448,7 +495,7 @@ fn unknown_legacy_spend_keeps_reported_totals_and_never_becomes_zero() {
     let (_dir, mut store, _root, child, _other, intent) = funded(false);
     store.conn.execute("DELETE FROM workflow_event WHERE workflow='owner/repo#1725' AND kind='native_model_admitted'",[]).unwrap();
     let status = family_budget::observe(&store.conn, &child.workflow, &intent, 1).unwrap();
-    assert_eq!(status.reason_code.as_deref(), Some("family_spend_unknown"));
+    assert_eq!(status.reason_code(), Some("family_spend_unknown"));
     assert_eq!(status.model_admissions, None);
     assert_eq!(
         status
@@ -763,10 +810,7 @@ fn competing_children_cannot_both_spend_the_last_family_admission() {
     let store = WorkflowStore::open(&path).unwrap();
     let observed = family_budget::observe(&store.conn, "owner/repo#1796", &intent, 1).unwrap();
     assert_eq!(observed.model_admissions, Some(14));
-    assert_eq!(
-        observed.reason_code.as_deref(),
-        Some("family_resource_exhausted")
-    );
+    assert_eq!(observed.reason_code(), Some("family_resource_exhausted"));
     assert_eq!(store.merge_allowance(20, 5).unwrap().available, 5);
 }
 
@@ -784,7 +828,7 @@ fn unsupported_policy_fields_cannot_silently_create_an_unbounded_token_grant() {
         .unwrap();
     let observed = family_budget::observe(&store.conn, &child.workflow, &intent, 1).unwrap();
     assert_eq!(
-        observed.reason_code.as_deref(),
+        observed.reason_code(),
         Some("family_budget_policy_unsupported")
     );
     assert_eq!(
@@ -830,10 +874,7 @@ fn orphan_native_proof_is_unknown_instead_of_inventing_a_paid_admission() {
         )
         .unwrap();
     let observed = family_budget::observe(&store.conn, &child.workflow, &intent, 1).unwrap();
-    assert_eq!(
-        observed.reason_code.as_deref(),
-        Some("family_spend_unknown")
-    );
+    assert_eq!(observed.reason_code(), Some("family_spend_unknown"));
     assert_eq!(observed.model_admissions, None);
     assert_eq!(
         observed
@@ -949,5 +990,284 @@ fn trusted_family_batch_error_rolls_back_policy_and_keeps_observation_readable()
     assert_eq!(
         policies, 1,
         "failed all-child batch leaked a policy revision"
+    );
+}
+
+#[test]
+fn exhausted_family_observation_exports_each_metric_and_machine_next_action() {
+    let (_dir, mut store, _root, child, _other, intent) = funded(false);
+    store
+        .charge_admitted_model(
+            &child,
+            "last-before-status",
+            18,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false,
+        )
+        .unwrap();
+    store
+        .charge(
+            &child,
+            "wall-before-status",
+            ResourceCharge {
+                wall_ms: 1000,
+                ..Default::default()
+            },
+            19,
+        )
+        .unwrap();
+    let observed = store
+        .family_budget_observation(&child.workflow, &intent, 1)
+        .unwrap();
+    let wire = serde_json::to_value(observed).unwrap();
+    let blockers = wire
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .expect("family budget status omitted typed blockers and actionable exhausted metrics");
+    let metrics: std::collections::BTreeSet<_> = blockers
+        .iter()
+        .filter(|b| b["reason_code"] == "family_resource_exhausted")
+        .map(|b| b["metric"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        metrics,
+        std::collections::BTreeSet::from(["model_admissions", "wall_ms"])
+    );
+    for blocker in blockers {
+        assert_eq!(blocker["next"]["action"], "await_owner_budget_revision");
+        assert_eq!(blocker["next"]["eligible_at_ms"], serde_json::Value::Null);
+        assert_eq!(blocker["workflow"], child.workflow);
+        assert_eq!(blocker["family"], "family");
+        assert!(blocker["observed"].is_u64() && blocker["limit"].is_u64());
+    }
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        2
+    );
+    assert_eq!(store.merge_allowance(20, 5).unwrap().available, 5);
+}
+
+#[test]
+fn simultaneous_pause_and_resource_blockers_are_complete_ordered_and_read_only() {
+    let (_dir, mut store, root, child, _other, intent) = funded(false);
+    store
+        .charge_admitted_model(
+            &child,
+            "final-before-pause",
+            18,
+            None,
+            None,
+            Some(submission::Provider::Codex),
+            false,
+        )
+        .unwrap();
+    store
+        .charge(
+            &child,
+            "wall-before-pause",
+            ResourceCharge {
+                wall_ms: 1000,
+                ..Default::default()
+            },
+            19,
+        )
+        .unwrap();
+    store
+        .set_owner_pause(&root.workflow, "verified-test-owner", 0, true, 20)
+        .unwrap();
+    let before = store.snapshot(&child.workflow).unwrap();
+    let events = store.events(&child.workflow).unwrap();
+    let first = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    let second = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let codes: Vec<_> = first["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["reason_code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "owner_paused",
+            "family_resource_exhausted",
+            "family_resource_exhausted"
+        ]
+    );
+    assert_eq!(first["blockers"][0]["next"]["action"], "await_owner_resume");
+    assert_eq!(first["blockers"][1]["metric"], "model_admissions");
+    assert_eq!(first["blockers"][2]["metric"], "wall_ms");
+    assert_eq!(first["remaining"]["model_admissions"], 0);
+    assert_eq!(first["remaining"]["wall_ms"], 0);
+    assert_eq!(store.snapshot(&child.workflow).unwrap(), before);
+    assert_eq!(store.events(&child.workflow).unwrap(), events);
+}
+
+#[test]
+fn unknown_model_history_keeps_verified_committed_wall_and_never_fabricates_tokens() {
+    let (_dir, mut store, _root, child, _other, intent) = funded(false);
+    store
+        .charge(
+            &child,
+            "actual-known-wall",
+            ResourceCharge {
+                wall_ms: 5,
+                ..Default::default()
+            },
+            18,
+        )
+        .unwrap();
+    store.conn.execute("DELETE FROM workflow_event WHERE workflow='owner/repo#1725' AND kind='native_model_admitted'",[]).unwrap();
+    let value = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["verified_model_admissions"], serde_json::Value::Null);
+    assert_eq!(value["committed_wall_ms"], 5);
+    assert_eq!(value["verified_tokens"], serde_json::Value::Null);
+    assert_eq!(value["token_completeness"], "unknown");
+    assert_eq!(
+        value["remaining"]["model_admissions"],
+        serde_json::Value::Null
+    );
+    assert_eq!(value["remaining"]["wall_ms"], 995);
+    assert_eq!(value["blockers"][0]["reason_code"], "family_spend_unknown");
+    assert_eq!(
+        value["blockers"][0]["next"]["action"],
+        "await_authoritative_usage_evidence"
+    );
+}
+
+#[test]
+fn missing_bound_members_never_report_a_verified_zero_family_total() {
+    let (_dir, store, _root, child, _other, intent) = funded(false);
+    // Fault injection only: a lost authority set must not make an empty SUM a
+    // verified zero. Actual charge history remains in the real temporary store.
+    store
+        .conn
+        .execute(
+            "DELETE FROM workflow_family_member WHERE family='family'",
+            [],
+        )
+        .unwrap();
+    let observed = store
+        .family_budget_observation(&child.workflow, &intent, 1)
+        .unwrap();
+    assert!(!observed.ready());
+    assert_eq!(
+        observed.model_admissions, None,
+        "missing members became a verified zero"
+    );
+    assert_eq!(observed.wall_ms, None);
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        1
+    );
+}
+
+#[test]
+fn unknown_family_authority_and_wrong_funding_request_have_named_next_actions() {
+    let (_dir, store, _root, child, _other, mut intent) = funded(false);
+    let family_budget::Intent::Delegated { request_ref, .. } = &mut intent else {
+        panic!()
+    };
+    *request_ref = "another-request-cannot-choose-this-grant".into();
+    let scope = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        scope["blockers"][0]["reason_code"],
+        "family_execution_scope_unknown"
+    );
+    assert_eq!(
+        scope["blockers"][0]["next"]["action"],
+        "await_protected_execution_scope"
+    );
+    store
+        .conn
+        .execute(
+            "ALTER TABLE workflow_family_member RENAME TO missing_family_members",
+            [],
+        )
+        .unwrap();
+    let authority = serde_json::to_value(
+        store
+            .family_budget_observation(&child.workflow, &intent, 1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        authority["blockers"][0]["reason_code"],
+        "family_authority_unknown"
+    );
+    assert_eq!(
+        authority["blockers"][0]["next"]["action"],
+        "await_authoritative_family_state"
+    );
+    assert_eq!(
+        authority["verified_model_admissions"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        store
+            .snapshot(&child.workflow)
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        1
+    );
+}
+
+#[test]
+fn ordinary_independent_work_does_not_acquire_a_family_policy_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    store
+        .register("owner/repo#1829", "ordinary-issue", fixture_binding(), 0)
+        .unwrap();
+    let observed = store
+        .family_budget_observation(
+            "owner/repo#1829",
+            &family_budget::Intent::Independent {
+                request_ref: "existing-ordinary-command".into(),
+            },
+            1,
+        )
+        .unwrap();
+    assert!(observed.ready());
+    assert!(observed.limits.is_none() && observed.remaining.is_none());
+    assert!(observed.blockers.is_empty());
+    assert_eq!(
+        store
+            .snapshot("owner/repo#1829")
+            .unwrap()
+            .unwrap()
+            .model_calls,
+        0
     );
 }

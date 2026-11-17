@@ -321,10 +321,7 @@ pub(crate) fn record_intent(
     ensure!(
         status.ready(),
         "{}",
-        status
-            .reason_code
-            .as_deref()
-            .unwrap_or("family_authority_unknown")
+        status.reason_code().unwrap_or("family_authority_unknown")
     );
     let revision = match intent {
         Intent::Independent { .. } => None,
