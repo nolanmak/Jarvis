@@ -14,11 +14,43 @@ pub struct ProviderModels {
     pub claude: Models,
     pub codex: Models,
 }
+/// Wire contract for an optional model gateway. Routing remains off unless
+/// the separate mode setting explicitly enables it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayKind {
+    #[default]
+    OmniRoute,
+    #[serde(rename = "9router")]
+    NineRouter,
+}
+
+impl GatewayKind {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::OmniRoute => "OmniRoute",
+            Self::NineRouter => "9Router",
+        }
+    }
+
+    fn compression_header(self) -> &'static str {
+        match self {
+            Self::OmniRoute => "x-omniroute-compression",
+            Self::NineRouter => "X-9Router-Token-Saver",
+        }
+    }
+}
+
+fn direct_mode() -> String { "direct".into() }
+
 // Deliberately no Debug: the gateway key is a secret. Dashboard administration
 // credentials are ignored during deserialization and never reach subprocesses.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct RouterConfig {
     pub version: u32,
+    #[serde(default)]
+    pub gateway: GatewayKind,
+    #[serde(default = "direct_mode")]
     pub mode: String,
     pub base_url: String,
     pub api_key: String,
@@ -119,7 +151,7 @@ fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<P
             };
         } else {
             anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
-                "Selected Runpod model requires a configured 9Router endpoint");
+                "Selected Runpod model requires a configured model gateway endpoint");
         }
     }
     Ok(config)
@@ -218,12 +250,12 @@ impl RouterConfig {
     pub fn codex_overrides(&self) -> Vec<String> {
         vec![
             "model_provider=\"augmentagent_router\"".into(),
-            "model_providers.augmentagent_router.name=\"9Router\"".into(),
+            format!("model_providers.augmentagent_router.name=\"{}\"", self.gateway.display_name()),
             format!("model_providers.augmentagent_router.base_url={}", serde_json::to_string(&self.base_url).expect("string")),
             "model_providers.augmentagent_router.wire_api=\"responses\"".into(),
             "model_providers.augmentagent_router.env_key=\"AUGMENTAGENT_ROUTER_API_KEY\"".into(),
             "model_providers.augmentagent_router.requires_openai_auth=false".into(),
-            "model_providers.augmentagent_router.http_headers={ \"X-9Router-Token-Saver\" = \"off\" }".into(),
+            format!("model_providers.augmentagent_router.http_headers={{ \"{}\" = \"off\" }}", self.gateway.compression_header()),
         ]
     }
     pub fn configure_codex(&self, cmd: &mut tokio::process::Command) {
@@ -233,7 +265,7 @@ impl RouterConfig {
     pub fn configure_claude(&self, cmd: &mut tokio::process::Command) {
         cmd.env("ANTHROPIC_BASE_URL", self.base_url.trim_end_matches("/v1"))
             .env("ANTHROPIC_AUTH_TOKEN", &self.api_key)
-            .env("ANTHROPIC_CUSTOM_HEADERS", "X-9Router-Token-Saver: off")
+            .env("ANTHROPIC_CUSTOM_HEADERS", format!("{}: off", self.gateway.compression_header()))
             // #1404 — a dead route should fail in seconds, not sit in the
             // CLI's own retry loop; the caller has the direct CLI to fall to.
             .env("CLAUDE_CODE_MAX_RETRIES", "2")
@@ -484,7 +516,7 @@ pub(crate) mod tests {
         let lost_login = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), false)
         }).await;
-        assert!(lost_login.is_err(), "a lost native login must not fall through to 9Router");
+        assert!(lost_login.is_err(), "a lost native login must not fall through to a model gateway");
         let native_codex = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), true)
         }).await.unwrap().unwrap();
