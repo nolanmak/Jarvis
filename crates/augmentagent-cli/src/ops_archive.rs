@@ -421,7 +421,7 @@ mod tests {
         assert!(Command::new("git").args(["init", "-q", "-b", "main"]).arg(&repo).status().unwrap().success());
         sh(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
         let gh = root.join("gh");
-        std::fs::write(&gh, format!("#!/bin/sh\necho {visibility}\n")).unwrap();
+        augmentagent_test_support::write_executable(&gh, format!("#!/bin/sh\necho {visibility}\n")).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cfg = Config {
             remote: "me/ops-archive".into(),

@@ -127,6 +127,7 @@ mod deploy_snapshot;
 mod snapshot_refs;
 mod disk;
 mod build_storage;
+mod build_relocation;
 // #1930 — the storage admission authority, its growth ledger and its
 // directory leases belong to channel-core. This binary consumes those exact
 // types, so its build gate and the Autoship capacity paths outside it admit
@@ -1058,6 +1059,8 @@ enum DeployOp {
 
 #[derive(Subcommand, Debug)]
 enum DiskOp {
+    /// Select a new owned build volume; retire old caches without copying.
+    Relocate { #[arg(long)] to: PathBuf, #[arg(long)] dry_run: bool },
     /// Opt a dedicated parent into discovery of future Cargo cache children.
     ManageParent { #[arg(long)] root: PathBuf },
     /// Register an external Cargo target for automatic housekeeping.
@@ -3349,6 +3352,7 @@ async fn main() -> Result<()> {
     if let Cmd::Disk { ref op } = cli.cmd {
         let repo_root = std::env::current_dir().context("current_dir")?;
         return match op {
+            DiskOp::Relocate { to, dry_run } => build_relocation::run(&repo_root, to, *dry_run, &mut std::io::stdout()),
             DiskOp::ManageParent { root } => {
                 let mut lease = build_storage::acquire().await?;
                 std::fs::create_dir_all(root)?;
@@ -11827,6 +11831,9 @@ impl QueryHandler for WikiQuerier {
     fn autoship_progress_pending(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {autoship_discord_command::progress_pending(&autoship_workflow::default_path(),bot,owner)}
     fn autoship_progress_claim(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {autoship_discord_command::progress_claim(&autoship_workflow::default_path(),delivery)}
     fn autoship_progress_confirm(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->anyhow::Result<()> {autoship_discord_command::progress_confirm(&autoship_workflow::default_path(),delivery,message)}
+    fn autoship_progress_defer(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,retry_after_ms:Option<i64>)->anyhow::Result<()> {autoship_discord_command::progress_defer(&autoship_workflow::default_path(),delivery,retry_after_ms)}
+    fn autoship_progress_edit_target(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<u64>> {autoship_discord_command::progress_edit_target(&autoship_workflow::default_path(),delivery)}
+    fn autoship_progress_status_lost(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<()> {autoship_discord_command::progress_status_lost(&autoship_workflow::default_path(),delivery)}
     fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
         autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
     }
@@ -12321,7 +12328,7 @@ mod query_delivery_contract_tests {
         // The scope guard sources aa-wiki-protected-names.sh from its own dir
         // (#1078); copy both or the guard aborts under `set -euo pipefail`.
         for script in ["aa-wiki-scope-guard.sh", "aa-wiki-protected-names.sh"] {
-            std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script),
+            augmentagent_test_support::copy_executable(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script),
                 repo.join("scripts").join(script)).unwrap();
         }
         std::os::unix::fs::symlink(memory, repo.join("target/release/augmentagent-mcp-memory")).unwrap();
@@ -24498,3 +24505,7 @@ async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_l
 #[cfg(test)]
 mod linkedin_read_dispatch_tests;
 
+
+#[cfg(test)]
+#[path = "build_volume_cli_tests.rs"]
+mod build_volume_cli_tests;

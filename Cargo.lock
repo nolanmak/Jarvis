@@ -481,6 +481,7 @@ dependencies = [
  "augmentagent-messages",
  "augmentagent-phone",
  "augmentagent-store",
+ "augmentagent-test-support",
  "augmentagent-wiki",
  "base64 0.22.1",
  "chrono",
@@ -560,6 +561,7 @@ dependencies = [
  "augmentagent-auth",
  "augmentagent-channel-core",
  "augmentagent-store",
+ "augmentagent-test-support",
  "augmentagent-wiki",
  "base64 0.22.1",
  "chrono",
@@ -856,6 +858,7 @@ dependencies = [
  "augmentagent-messages",
  "augmentagent-phone",
  "augmentagent-store",
+ "augmentagent-test-support",
  "augmentagent-wiki",
  "chrono",
  "chrono-tz",
@@ -1066,6 +1069,7 @@ dependencies = [
  "augmentagent-proactive",
  "augmentagent-renderer-client",
  "augmentagent-store",
+ "augmentagent-test-support",
  "augmentagent-wiki",
  "base64 0.22.1",
  "chrono",
@@ -1331,6 +1335,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-test-support"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

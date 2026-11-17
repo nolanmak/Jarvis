@@ -265,7 +265,7 @@ fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
     std::fs::write(guest.join("artifact"),b"fixture").unwrap();
     std::fs::write(guest.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"artifact","sha256":format!("{:x}",Sha256::digest(b"fixture"))}]}).to_string()).unwrap();
     let executable=root.path().join("provider-fixture");
-    std::fs::write(&executable,"#!/bin/sh\ntouch \"$HOME/provider-called\"\nexit 1\n").unwrap();
+    augmentagent_test_support::write_executable(&executable,"#!/bin/sh\ntouch \"$HOME/provider-called\"\nexit 1\n").unwrap();
     std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
     let policy=root.path().join("policy.json");
     let mut value=serde_json::json!({"version":1,"runtime_config":"/missing/runtime.json","guest_runtime":guest,
@@ -298,7 +298,13 @@ fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
         assert_eq!(output.status.code(),Some(3));
         let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(body["roles"]["builder"]["status"],if matches!(phase,3|7|8) {"no-eligible-provider"} else if phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
-        assert_eq!(body["roles"]["independent_reviewer"]["status"],if matches!(phase,0|2|5) {"independent-reviewer-unavailable"} else if matches!(phase,3|6|7|8) {"builder-unavailable"} else {"declared-available"},"{body}");
+        // Fresh native sessions may use the writer's provider family. Role
+        // capacity is declarative; adjudication and live proof remain separate.
+        assert_eq!(body["roles"]["independent_reviewer"]["status"],if matches!(phase,3|6|7|8) {"builder-unavailable"} else {"declared-available"},"{body}");
+        if matches!(phase,0|2|5) {
+            assert_eq!(body["roles"]["independent_reviewer"]["providers"],serde_json::json!(["claude"]));
+            assert_eq!(body["roles"]["live_verified"],false);
+        }
         assert_eq!(body["roles"]["adjudicator"]["status"],if phase==0 {"provider-unavailable"} else if phase==5 || phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
         if phase==4 {
             assert_eq!(body["roles"]["builder"]["providers"],serde_json::json!(["codex"]));
@@ -445,7 +451,7 @@ fn readiness_from_a_subdirectory_inspects_the_repository_deployment_without_writ
     assert!(Command::new("git").args(["init","-q"]).current_dir(root.path()).status().unwrap().success());
     let nested=root.path().join("src/nested");std::fs::create_dir_all(&nested).unwrap();
     let binary=root.path().join("target/release/augmentagent");std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    std::fs::copy("/usr/bin/true",&binary).unwrap();std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    augmentagent_test_support::copy_executable("/usr/bin/true",&binary).unwrap();std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
     let config=root.path().join("config/augmentagent");std::fs::create_dir_all(&config).unwrap();
     let policy=root.path().join("policy.json");std::fs::write(&policy,r#"{"version":1,"providers":{"claude":{}}}"#).unwrap();
     std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();

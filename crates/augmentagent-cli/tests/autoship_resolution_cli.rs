@@ -57,7 +57,7 @@ fn fixture(response: Option<Value>, merged: bool, remote_head: &str) -> tempfile
     std::fs::write(root.join("remote.json"),json!({"number":34,"node_id":"PR_34","merged":merged,"head":{"sha":remote_head},
         "merge_commit_sha":"c".repeat(40),"merged_at":if merged {Some("2026-10-31T00:00:00Z")} else {None},
         "merged_by":{"login":"owner"},"base":{"repo":{"full_name":"owner/repo"}}}).to_string()).unwrap();
-    std::fs::write(root.join("gh"),r#"#!/usr/bin/env python3
+    augmentagent_test_support::write_executable(root.join("gh"),r#"#!/usr/bin/env python3
 import json,pathlib,sys
 root=pathlib.Path(__file__).parent
 a=sys.argv[1:]

@@ -883,6 +883,25 @@ mod tests {
             assert_eq!(claimed.reason,"status-observed","registered workflow status: {}",claimed.reply);
             assert!(claimed.reply.contains("stage ") && !claimed.reply.contains("stage unknown"),"{}",claimed.reply);
             assert!(claimed.reply.contains("owner-pause-requested"),"{}",claimed.reply);
+            drop(store);
+            // #1713 — Discord cancel requires an explicit workflow, retires it
+            // through T's fenced cancel, and later controls are terminal.
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(109),"!autoship cancel").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert!(store.replay_discord_control(&origin(109),&digest("!autoship cancel")).unwrap().is_none(),"bare cancel changes nothing");
+            assert_ne!(store.snapshot(&discord.admission.workflow).unwrap().unwrap().checkpoint.stage,crate::autoship_workflow::Stage::Retired);drop(store);
+            let cancel=format!("!autoship cancel --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap(),"redelivery replays");
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let canceled=store.replay_discord_control(&origin(110),&digest(&cancel)).unwrap().unwrap();
+            assert_eq!(canceled.reason,"owner-canceled","{}",canceled.reply);
+            assert_eq!(store.snapshot(&discord.admission.workflow).unwrap().unwrap().checkpoint.stage,crate::autoship_workflow::Stage::Retired);
+            drop(store);
+            let pause=format!("!autoship pause --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(111),&pause).await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.replay_discord_control(&origin(111),&digest(&pause)).unwrap().unwrap().reason,"workflow-terminal");
 
 
 
@@ -909,7 +928,7 @@ mod tests {
             "https://github.com/owner/repo.git",
         ]);
         let gh = root.join("gh.py");
-        std::fs::write(
+        augmentagent_test_support::write_executable(
             &gh,
             r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -1036,7 +1055,7 @@ else:raise Exception('unexpected request '+repr(a))
             assert!(std::process::Command::new("git").args(args).current_dir(root).output().unwrap().status.success());
         }
         let gh = root.join("gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())

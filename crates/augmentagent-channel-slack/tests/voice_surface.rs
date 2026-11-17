@@ -165,7 +165,7 @@ impl Harness {
         let tools = dir.path().join("tools");
         std::fs::create_dir_all(&tools).unwrap();
         let ffmpeg = tools.join("ffmpeg");
-        std::fs::write(&ffmpeg, format!("#!/bin/sh\n{FAKE_FFMPEG}\n")).unwrap();
+        augmentagent_test_support::write_executable(&ffmpeg, format!("#!/bin/sh\n{FAKE_FFMPEG}\n")).unwrap();
         std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = Arc::new(Store::open(dir.path().join("data.db")).unwrap());
         let ws = workspace();

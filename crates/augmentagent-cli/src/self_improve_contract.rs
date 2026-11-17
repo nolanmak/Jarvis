@@ -611,14 +611,14 @@ fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> 
     verifier_cache_sibling(root, &crate::build_storage::effective_target(root), &key)
 }
 fn verifier_cache_sibling(root: &Path, builder: &Path, key: &str) -> Result<PathBuf> {
-    let parent = builder
-        .parent()
-        .context("builder cache has no parent")?
-        .canonicalize()?;
+    let verifier_parent = augmentagent_channel_core::build_volume::verifier_parent(builder);
+    std::fs::create_dir_all(&verifier_parent)?;
+    let parent = verifier_parent.canonicalize()?;
     let builder = if builder.exists() {
         builder.canonicalize()?
     } else {
-        parent.join(builder.file_name().context("builder cache has no name")?)
+        builder.parent().context("builder cache has no parent")?.canonicalize()?
+            .join(builder.file_name().context("builder cache has no name")?)
     };
     ensure!(
         key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -906,7 +906,7 @@ mod tests {
         let private=home.join("credentials.json");std::fs::write(&private,"SYNTHETIC_PRIVATE").unwrap();
         let compiler=format!("#!/usr/bin/python3\nimport json,socket\nfrom pathlib import Path\nr={{'compiler':'operator','private':'denied','write':'denied','network':'denied'}}\ntry:r['private']=Path({}).read_text()\nexcept PermissionError:pass\ntry:Path('protected.txt').write_text('changed');r['write']='allowed'\nexcept PermissionError:pass\ntry:socket.socket();r['network']='allowed'\nexcept PermissionError:pass\nprint(json.dumps(r))\n",serde_json::to_string(&private).unwrap());
         for (path,bytes) in [(bin.join("cargo"),"#!/usr/bin/python3\nimport subprocess,sys\np=subprocess.run(['rustc','-vV'],capture_output=True,text=True)\nsys.stdout.write(p.stdout);sys.stderr.write(p.stderr);sys.exit(p.returncode)\n".to_owned()),(bin.join("rustc"),compiler),(source.join("rustc"),"#!/usr/bin/python3\nprint('candidate compiler must not run')\n".to_owned())] {
-            std::fs::write(&path,bytes).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            augmentagent_test_support::write_executable(&path,bytes).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let invocation=crate::autoship_contract::VerifierCommand::BlackBox {
             invocation:crate::autoship_contract::BehaviorInvocation::CargoBinary {package:"fixture".into(),bin:"autoship_probe".into(),args:vec![]},
@@ -3045,7 +3045,7 @@ mod repair_gate_tests {
             // this repair fixture has no authority to query a real repository.
             use std::os::unix::fs::PermissionsExt;
             let github = isolated.path().join("github.py");
-            std::fs::write(&github, r#"#!/usr/bin/python3
+            augmentagent_test_support::write_executable(&github, r#"#!/usr/bin/python3
 import sys
 args=sys.argv[1:]
 assert args[:2]==['pr','list'] and args[args.index('--repo')+1]=='owner/repo', args
@@ -3904,3 +3904,7 @@ pub(super) async fn persist_historical_fixture_receipt(root:&Path, prepared:&Pre
 }
 #[cfg(test)]
 pub(super) use amendment::migrate_fixture as migrate_historical_fixture;
+
+#[cfg(test)]
+#[path = "build_volume_resolution_tests.rs"]
+mod build_volume_resolution_tests;

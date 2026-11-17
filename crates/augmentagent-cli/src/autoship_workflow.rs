@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_review_custody.rs"]
+mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -13,10 +15,25 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_family_budget.rs"]
+pub(crate) mod family_budget;
+
+#[cfg(test)]
+#[path = "autoship_family_budget_tests.rs"]
+mod family_budget_tests;
+#[path = "autoship_activity_observation.rs"]
+mod activity_observation;
+#[path = "autoship_idle_recovery.rs"]
+pub(crate) mod idle_recovery;
+#[path = "autoship_outcome_classification.rs"]
+mod outcome_classification;
+
 #[path = "autoship_activity.rs"]
 pub(crate) mod activity;
 #[path = "autoship_runtime_events.rs"]
 pub(crate) mod runtime_events;
+#[path = "autoship_discord_request_schema.rs"]
+mod discord_request_schema;
 
 #[path = "autoship_adopted_publication.rs"]
 mod adopted_publication;
@@ -32,6 +49,14 @@ pub(crate) mod merge_escalation;
 pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_progress_retry.rs"]
+pub(crate) mod progress_retry;
+#[path = "autoship_progress_status.rs"]
+pub(crate) mod progress_status;
+#[path = "autoship_progress_resolution.rs"]
+pub(crate) mod progress_resolution;
+#[path = "autoship_delivery_actions.rs"]
+mod delivery_actions;
 #[path = "autoship_delivery.rs"]
 pub(crate) mod delivery;
 #[path = "autoship_deployment_progress.rs"]
@@ -804,6 +829,19 @@ impl WorkflowStore {
                 sequence INTEGER NOT NULL, nonce TEXT NOT NULL, content TEXT NOT NULL,
                 state TEXT NOT NULL, dispatched_at INTEGER NOT NULL, message TEXT,
                 confirmed_at INTEGER, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_status (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                message TEXT NOT NULL, edited_at INTEGER NOT NULL, PRIMARY KEY(workflow,bot,owner,channel));
+            CREATE TABLE IF NOT EXISTS workflow_progress_edit (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_resend (
+                request_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, sequence INTEGER NOT NULL,
+                principal TEXT NOT NULL, superseded_marker TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_progress_retry (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, attempts INTEGER NOT NULL, eligible_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,bot,owner,channel,sequence));
             CREATE TABLE IF NOT EXISTS workflow_progress_state (
                 workflow TEXT PRIMARY KEY, sequence INTEGER NOT NULL, fingerprint TEXT NOT NULL,
                 terminal INTEGER NOT NULL, payload TEXT NOT NULL);
@@ -812,6 +850,7 @@ impl WorkflowStore {
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
+        discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
         Ok(Self { conn })
@@ -1116,6 +1155,7 @@ impl WorkflowStore {
             tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![workflow,serde_json::to_string(&cp)?])?;
             event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation}).to_string(),now_ms)?;
         }
+        if purpose==ClaimPurpose::Productive && !family_budget::wait::prepare_productive_claim(&tx,workflow,generation,&mut cp,now_ms)? {tx.commit()?;return Ok(None);}
         if purpose==ClaimPurpose::Productive && owner_control::dispatch_resume_blocked(&tx,workflow)? {return Ok(None);}
         let generation = generation.checked_add(1).context("generation overflow")?;
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+?6 WHERE id=?1",
@@ -1239,6 +1279,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -1279,6 +1320,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        family_budget::control::require_dispatch(&tx,lease)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let inserted=tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
@@ -1672,7 +1714,7 @@ impl WorkflowStore {
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
         let actual_native_reviewer=admission.is_some_and(|(provider,reviewer)|provider.is_some() && reviewer);
-        let admission=admission.map(|(provider,reviewer)| {
+        let mut admission=admission.map(|(provider,reviewer)| {
             let mut attribution=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
             // Keep the actual charge and its exact bounded input in one fact.
             // Recovery must not infer this link from adjacent event times, and
@@ -1701,15 +1743,31 @@ impl WorkflowStore {
             ensure!(prior == values, "charge receipt conflict");
             if let Some(expected)=&admission {
                 let recorded:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_extract(payload,'$.receipt')=?2",params![lease.workflow,receipt_id],|r|r.get(0)).optional()?;
+                // Budget funding is controller-owned evidence, not a caller
+                // argument or another dispatch grant. Preserve its original
+                // reference while validating an identical receipt replay.
+                let recorded=recorded.map(|raw| -> Result<String> {
+                    let mut value:serde_json::Value=serde_json::from_str(&raw)?;
+                    value.as_object_mut().context("invalid native attribution")?.remove("budget_scope_ref");
+                    Ok(value.to_string())
+                }).transpose()?;
                 ensure!(recorded.as_ref()==Some(expected),"model admission attribution conflict");
             }
         } else {
             ensure!(!(recovery_inspection && charge.model_calls>0),"qualification recovery cannot spend a model call");
-            if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
+            if charge.model_calls>0 {
+                owner_turn::require_native_dispatch(&tx,lease,now_ms)?;
+                if let Some(scope)=family_budget::require_new_admission(&tx,lease,charge.model_calls,admission.is_some())? {
+                    let raw=admission.as_mut().context("family native attribution required")?;
+                    let mut value:serde_json::Value=serde_json::from_str(raw)?;
+                    value["budget_scope_ref"]=scope.into();
+                    *raw=value.to_string();
+                }
+            }
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
             // late usage/accounting for the original call remains recordable.
-            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
+            if admission.is_some() {idle_recovery::require_dispatch(&tx,&lease.workflow)?;baseline_native_custody(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -1970,6 +2028,7 @@ impl WorkflowStore {
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         require_binding(&tx,lease,binding,now)?;
         owner_turn::require_native_dispatch(&tx,lease,now)?;
         tx.commit()?;Ok(())
@@ -2202,6 +2261,7 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,&operation.binding,now)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        family_budget::control::require_dispatch(&tx,lease)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
         ensure!(owner==lease.workflow,"publication operation ownership mismatch");

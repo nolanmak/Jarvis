@@ -184,7 +184,7 @@ async fn exercise(case: &str, name: &str) {
     )
     .unwrap();
     let gh = root.path().join("gh");
-    std::fs::write(&gh,r#"#!/usr/bin/python3
+    augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json,pathlib,os,sys
 rows=json.load(open(pathlib.Path(os.environ['AUTOSHIP_INTEGRATION_FIXTURE']).parent/'rows.json'));a=sys.argv[1:]
 if a[:2]==['repo','view']: print('owner/repo')
@@ -327,7 +327,7 @@ async fn exercise_merge(case: &str, name: &str) {
             let hooks = root.path().join("hooks");
             std::fs::create_dir(&hooks).unwrap();
             let hook = hooks.join("pre-commit");
-            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            augmentagent_test_support::write_executable(&hook, "#!/bin/sh\nexit 1\n").unwrap();
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
             git(
                 &worktree,

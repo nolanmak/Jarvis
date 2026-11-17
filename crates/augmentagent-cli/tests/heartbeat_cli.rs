@@ -43,7 +43,7 @@ impl Rig {
             calls = self.path("claude-calls").display(),
         );
         let path = self.path("fake-claude.sh");
-        std::fs::write(&path, script).unwrap();
+        augmentagent_test_support::write_executable(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
