@@ -234,6 +234,33 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
+    let clean = strip_markers_for_send(body);
+    // #2177 — a reply the drafter wrapped whole in a code fence must not
+    // reach the recipient as literal backticks.
+    unwrap_code_fence(&clean).unwrap_or(clean)
+}
+
+/// A draft the model returned wrapped whole in one markdown code fence
+/// (```` ``` ```` or ```` ```text ````), unwrapped: a message reply is prose,
+/// and the fence reached recipients as literal backticks (#2177). `None`
+/// unless the fence opens the body, closes it, and has no other fence inside,
+/// so a draft that merely contains a code block is left alone.
+pub fn unwrap_code_fence(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix("```")?;
+    let (info, body) = rest.split_once('\n')?;
+    let info = info.trim();
+    if info.len() > 16 || !info.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let inner = body.trim_end().strip_suffix("```")?;
+    if inner.contains("```") {
+        return None;
+    }
+    let inner = inner.trim();
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+fn strip_markers_for_send(body: &str) -> String {
     let (mut clean, _) = split_assumes(body);
     let mut touched = false;
     // A complete marker comment anywhere (the model sometimes writes a
@@ -250,6 +277,39 @@ pub fn strip_assumes_for_send(body: &str) -> String {
     }
     // A marker-free draft goes out byte-identical (Gmail keeps its CRLFs).
     if touched { clean.trim().to_string() } else { clean }
+}
+
+#[cfg(test)]
+mod unwrap_code_fence_tests {
+    use super::*;
+
+    /// #2177: a reply wrapped whole in a fence is unwrapped at send time on
+    /// every channel; anything else ships unchanged.
+    #[test]
+    fn only_a_fence_around_the_whole_reply_is_removed() {
+        for (fenced, clean) in [
+            ("```\nSounds good, 5 works.\n```", "Sounds good, 5 works."),
+            ("```text\nSounds good.\n```\n", "Sounds good."),
+            ("  ```\r\nline one\r\nline two\r\n```  ", "line one\r\nline two"),
+        ] {
+            assert_eq!(unwrap_code_fence(fenced).as_deref(), Some(clean), "{fenced:?}");
+            assert_eq!(strip_assumes_for_send(fenced), clean, "{fenced:?}");
+        }
+        for kept in [
+            "Sounds good, 5 works.",
+            "Run this:\n```\ncargo test\n```",
+            "```\nfirst\n```\nand\n```\nsecond\n```",
+            "```this is not an info string\nx\n```",
+            "```\n```",
+            "Hi\r\nthere",
+        ] {
+            assert_eq!(unwrap_code_fence(kept), None, "{kept:?}");
+            assert_eq!(strip_assumes_for_send(kept), kept, "byte-identical: {kept:?}");
+        }
+        // Card metadata is scrubbed first, then the fence.
+        let carded = append_assumes_marker("```\nSee you at 7.\n```", &["they said 7".to_string()]);
+        assert_eq!(strip_assumes_for_send(&carded), "See you at 7.");
+    }
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
