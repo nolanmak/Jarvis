@@ -3,7 +3,7 @@
 use super::*;
 use augmentagent_channel_core::autoship_workflow_contract::NextAction as WorkflowNextAction;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Reason {
     OwnerPaused,
@@ -40,7 +40,7 @@ impl Reason {
             Self::FamilyResourceExhausted => 7,
         }
     }
-    fn next(self) -> WorkflowNextAction {
+    pub(super) fn next(self) -> WorkflowNextAction {
         let action = match self {
             Self::OwnerPaused => "await_owner_resume",
             Self::FamilyAuthorityUnknown => "await_authoritative_family_state",
@@ -58,14 +58,14 @@ impl Reason {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Metric {
     ModelAdmissions,
     WallMs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Blocker {
     pub family: Option<String>,
     pub workflow: String,
@@ -78,7 +78,7 @@ pub(crate) struct Blocker {
     pub requested: Option<u64>,
     pub next: WorkflowNextAction,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TokenCompleteness {
     Unknown,
@@ -86,12 +86,12 @@ pub(crate) enum TokenCompleteness {
 
 /// Status values may be zero. They are not owner policy Limits, whose bounds
 /// must be positive. An unknown dimension stays None rather than becoming zero.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Remaining {
     pub model_admissions: Option<u64>,
     pub wall_ms: Option<u64>,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Observation {
     pub schema_version: u32,
     pub workflow: String,
@@ -131,7 +131,7 @@ impl Observation {
     pub(crate) fn reason_code(&self) -> Option<&'static str> {
         self.blockers.first().map(|b| b.reason_code.as_str())
     }
-    fn block(&mut self, reason: Reason) {
+    pub(super) fn block(&mut self, reason: Reason) {
         self.exhausted_or_block(reason, None, None, None, None);
     }
     fn exhausted_or_block(
