@@ -153,7 +153,7 @@ fn pdf_cli_never_publishes_failed_invalid_or_oversized_renderer_output() {
         "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'not a PDF'\n",
         "#!/bin/sh\n/bin/cat >/dev/null\n/usr/bin/head -c 8388609 /dev/zero\n",
     ] {
-        std::fs::write(&worker, script).unwrap();
+        augmentagent_test_support::write_executable(&worker, script).unwrap();
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
             .env("WIKI_ROOT", root.path())
@@ -177,7 +177,7 @@ fn pdf_cli_preserves_dependency_error_when_worker_exits_before_reading_input() {
     let bin = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("source.md"), "Paragraph. ".repeat(50_000)).unwrap();
     let worker = bin.path().join("python3");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &worker,
         "#!/bin/sh\necho 'No module named reportlab' >&2\nexit 1\n",
     )

@@ -12,7 +12,7 @@ async fn exercise(case:&str,test:&str) {
     for &route in routes {
         let root=tempfile::tempdir_in("/tmp").unwrap();
         let gh=root.path().join("github.py");
-        std::fs::write(&gh,r#"#!/usr/bin/python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json, os, sys, subprocess
 args = sys.argv[1:]
 with open(os.environ['AUTOSHIP_PAUSED_CALLS'], 'a') as out:

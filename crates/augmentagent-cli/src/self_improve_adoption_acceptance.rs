@@ -84,7 +84,7 @@ async fn live_native_source_less_adoption_repairs_reviews_and_merges() -> Result
             .tempdir_in("/tmp")?
             .keep();
         let gh = root.join("github-fixture.py");
-        std::fs::write(&gh, GH_FIXTURE)?;
+        augmentagent_test_support::write_executable(&gh, GH_FIXTURE)?;
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))?;
         println!(
             "Retained source-less acceptance fixture: {}",

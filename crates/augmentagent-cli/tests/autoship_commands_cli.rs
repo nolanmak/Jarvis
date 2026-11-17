@@ -265,7 +265,7 @@ fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
     std::fs::write(guest.join("artifact"),b"fixture").unwrap();
     std::fs::write(guest.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"artifact","sha256":format!("{:x}",Sha256::digest(b"fixture"))}]}).to_string()).unwrap();
     let executable=root.path().join("provider-fixture");
-    std::fs::write(&executable,"#!/bin/sh\ntouch \"$HOME/provider-called\"\nexit 1\n").unwrap();
+    augmentagent_test_support::write_executable(&executable,"#!/bin/sh\ntouch \"$HOME/provider-called\"\nexit 1\n").unwrap();
     std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
     let policy=root.path().join("policy.json");
     let mut value=serde_json::json!({"version":1,"runtime_config":"/missing/runtime.json","guest_runtime":guest,
@@ -451,7 +451,7 @@ fn readiness_from_a_subdirectory_inspects_the_repository_deployment_without_writ
     assert!(Command::new("git").args(["init","-q"]).current_dir(root.path()).status().unwrap().success());
     let nested=root.path().join("src/nested");std::fs::create_dir_all(&nested).unwrap();
     let binary=root.path().join("target/release/augmentagent");std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    std::fs::copy("/usr/bin/true",&binary).unwrap();std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    augmentagent_test_support::copy_executable("/usr/bin/true",&binary).unwrap();std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
     let config=root.path().join("config/augmentagent");std::fs::create_dir_all(&config).unwrap();
     let policy=root.path().join("policy.json");std::fs::write(&policy,r#"{"version":1,"providers":{"claude":{}}}"#).unwrap();
     std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
