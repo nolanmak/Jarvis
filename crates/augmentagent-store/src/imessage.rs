@@ -117,6 +117,16 @@ pub enum ImessageSendOutcome {
 }
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
+    // #2064 — one "you texted this person since composing" note per compose
+    // draft revision. Without it every manual text to the recipient re-sent
+    // the note for as long as the compose stayed pending.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS compose_activity_notes (\
+             action_id  TEXT NOT NULL,\
+             revision   TEXT NOT NULL,\
+             noted_at_ms INTEGER NOT NULL,\
+             PRIMARY KEY (action_id, revision));",
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS imessage_outbox (\
              id              INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -329,6 +339,32 @@ impl Store {
             let rows = stmt.query_map([], row_to_item)?;
             rows.collect()
         })
+    }
+
+    /// #2064 — was the manual-activity note already posted for this
+    /// revision of the compose draft?
+    pub fn compose_activity_noted(&self, action_id: &str, revision: &str) -> StoreResult<bool> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM compose_activity_notes \
+                  WHERE action_id = ?1 AND revision = ?2)",
+                params![action_id, revision],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    /// Record that the manual-activity note was posted for this revision.
+    /// A revised draft is a new revision and may be noted once more.
+    pub fn mark_compose_activity_noted(&self, action_id: &str, revision: &str) -> StoreResult<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO compose_activity_notes(action_id, revision, noted_at_ms) \
+                 VALUES (?1, ?2, ?3)",
+                params![action_id, revision, now_millis()],
+            )
+        })?;
+        Ok(())
     }
 
     pub fn mark_imessage_outbox_notified(&self, id: i64) -> StoreResult<bool> {

@@ -4,6 +4,8 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "autoship_family_controls.rs"]
+pub(crate) mod control;
 #[path = "autoship_family_budget_store.rs"]
 pub(crate) mod store;
 #[path = "autoship_family_budget_usage.rs"]
@@ -40,39 +42,35 @@ pub(crate) enum Intent {
         request_ref: String,
     },
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RetainedUsage {
     pub workflow: String,
     pub model_admissions: u64,
     pub wall_ms: u64,
 }
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Observation {
-    pub schema_version: u32,
-    pub reason_code: Option<String>,
-    pub model_admissions: Option<u64>,
-    pub wall_ms: Option<u64>,
-    // Native admission and elapsed records do not prove token completeness.
-    pub tokens: Option<u64>,
-    pub retained: Vec<RetainedUsage>,
-    pub limits: Option<Limits>,
+#[path = "autoship_family_budget_observation.rs"]
+pub(crate) mod observation;
+pub(crate) use observation::Observation;
+#[path = "autoship_family_budget_wait.rs"]
+pub(crate) mod wait;
+
+/// A valid protected funding frame reached the atomic budget predicate and was
+/// refused. The controller may persist its facts; it cannot treat it as spend.
+#[derive(Debug)]
+pub(crate) struct AdmissionRefused {
+    pub observation: Observation,
 }
-impl Observation {
-    fn unknown(reason: &str) -> Self {
-        Self {
-            schema_version: 1,
-            reason_code: Some(reason.into()),
-            model_admissions: None,
-            wall_ms: None,
-            tokens: None,
-            retained: vec![],
-            limits: None,
-        }
-    }
-    pub(crate) fn ready(&self) -> bool {
-        self.reason_code.is_none()
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            self.observation
+                .reason_code()
+                .unwrap_or("family_authority_unknown"),
+        )
     }
 }
+impl std::error::Error for AdmissionRefused {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Scope {
@@ -117,114 +115,8 @@ fn revision(conn: &Connection, root: &str) -> Result<i64> {
         .unwrap_or(0))
 }
 
-/// Shared read-only budget predicate. Callers must also enforce actual authority,
-/// manifest/dependencies, child holds and capacity. incoming=0 observes/explains;
-/// it does not authorize publication/merge or block unpaid reconciliation.
-pub(crate) fn observe(
-    conn: &Connection,
-    workflow: &str,
-    intent: &Intent,
-    incoming: u64,
-) -> Result<Observation> {
-    match intent {
-        Intent::Independent { request_ref } => {
-            ensure!(
-                table(conn, "workflow_family_budget")?,
-                "family_authority_unknown"
-            );
-            let root: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_family_budget WHERE root_workflow=?1)",
-                [workflow],
-                |r| r.get(0),
-            )?;
-            let allowed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member m JOIN command_request r ON r.request_id=m.independent_ref WHERE m.workflow=?1 AND m.independent_ref=?2 AND json_extract(r.admission,'$.workflow')=?1)",params![workflow,request_ref],|r|r.get(0))?;
-            ensure!(!root && allowed, "family_execution_scope_unknown");
-            Ok(Observation {
-                schema_version: 1,
-                reason_code: None,
-                model_admissions: None,
-                wall_ms: None,
-                tokens: None,
-                retained: vec![],
-                limits: None,
-            })
-        }
-        Intent::Delegated {
-            family,
-            manifest_ref,
-            policy_ref,
-            request_ref,
-        } => {
-            let group:Option<(String,String,Option<String>,Option<String>,String,u64)>=conn.query_row(
-                "SELECT root_workflow,state,manifest_ref,policy_ref,original_request_ref,expected_children FROM workflow_family_budget WHERE family=?1",[family],
-                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-            let Some((root, state, manifest, active, request, count)) = group else {
-                return Ok(Observation::unknown("family_authority_unknown"));
-            };
-            let blocked = |reason: &str| -> Result<Observation> {
-                let mut result = Observation::unknown(reason);
-                result.retained = usage::reported(conn, family)?;
-                Ok(result)
-            };
-            let member:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member WHERE family=?1 AND workflow=?2)",params![family,workflow],|r|r.get(0))?;
-            if !member || &request != request_ref {
-                return blocked("family_execution_scope_unknown");
-            }
-            if root != workflow && owner_control::read(conn, &root)?.is_some_and(|c| c.paused) {
-                return blocked("owner_paused");
-            }
-            // Membership comes first: pending policy must not vanish in an
-            // active-policy-only lookup.
-            if state != "bound" {
-                return blocked("family_membership_pending");
-            }
-            let members: u64 = conn.query_row(
-                "SELECT count(*) FROM workflow_family_member WHERE family=?1",
-                [family],
-                |r| r.get(0),
-            )?;
-            if !(2..=6).contains(&count)
-                || members != count + 1
-                || manifest.as_deref() != Some(manifest_ref)
-            {
-                return blocked("family_authority_unknown");
-            }
-            let Some(active) = active else {
-                return blocked("family_budget_policy_missing");
-            };
-            if &active != policy_ref {
-                return blocked("family_execution_scope_unknown");
-            }
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT payload FROM workflow_family_policy WHERE reference=?1 AND family=?2",
-                    params![active, family],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(raw) = raw else {
-                return blocked("family_budget_policy_missing");
-            };
-            let limits: Limits = match serde_json::from_str::<Limits>(&raw) {
-                Ok(p) if p.validate().is_ok() => p,
-                _ => return blocked("family_budget_policy_unsupported"),
-            };
-            let mut result = usage::aggregate(conn, family)?;
-            result.limits = Some(limits.clone());
-            if result.ready()
-                && incoming > 0
-                && (result
-                    .model_admissions
-                    .and_then(|n| n.checked_add(incoming))
-                    .is_none_or(|n| n > limits.max_model_admissions)
-                    || result.wall_ms.is_none_or(|n| n >= limits.max_wall_ms))
-            {
-                result.reason_code = Some("family_resource_exhausted".into());
-            }
-            Ok(result)
-        }
-    }
-}
+/// Shared budget-only predicate; actual authority and custody remain separate.
+pub(crate) use observation::observe;
 
 /// Called only for a NEW positive charge, after existing receipt verification.
 /// Existing receipt replay and late wall/token accounting never enter this gate.
@@ -234,66 +126,44 @@ pub(super) fn require_new_admission(
     incoming: u64,
     native: bool,
 ) -> Result<Option<String>> {
-    if !required(tx, &lease.workflow)? {
+    let Some((raw, scope)) = control::frame(tx, lease)? else {
         return Ok(None);
-    }
-    ensure!(
-        table(tx, "workflow_family_budget")? && table(tx, "workflow_family_member")?,
-        "family_authority_unknown"
-    );
-    let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_family_member m JOIN workflow_family_budget f ON f.family=m.family WHERE m.workflow=?1 AND f.state='pending')",[&lease.workflow],|r|r.get(0))?;
-    // No legacy/unscoped caller can implicitly declare independently funded work.
-    ensure!(
-        table(tx, "workflow_family_scope")?,
-        if pending {
-            "family_membership_pending"
-        } else {
-            "family_execution_scope_unknown"
-        }
-    );
-    let raw: Option<String> = tx
-        .query_row(
-            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
-            params![lease.workflow, lease.generation],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let raw = raw.context(if pending {
-        "family_membership_pending"
-    } else {
-        "family_execution_scope_unknown"
-    })?;
-    let scope: Scope = serde_json::from_str(&raw).context("family_execution_scope_unknown")?;
-    ensure!(
-        scope.schema_version == 1 && !scope.verified_authority_ref.is_empty(),
-        "family_execution_scope_unknown"
-    );
+    };
     ensure!(native, "family_native_attribution_required");
-    if let Intent::Delegated { family, .. } = &scope.intent {
-        let root: String = tx.query_row(
-            "SELECT root_workflow FROM workflow_family_budget WHERE family=?1",
-            [family],
-            |r| r.get(0),
-        )?;
-        // A known active pause is more useful than the stale-frame reason it
-        // also creates. Resuming still requires a newly verified generation.
-        ensure!(
-            root == lease.workflow || !owner_control::read(tx, &root)?.is_some_and(|c| c.paused),
-            "owner_paused"
-        );
-        ensure!(
-            scope.root_control_revision == Some(revision(tx, &root)?),
-            "family_execution_scope_unknown"
-        );
+    let status = observe_scope(tx, &lease.workflow, &scope, incoming)?;
+    if !status.ready() {
+        return Err(AdmissionRefused {
+            observation: status,
+        }
+        .into());
     }
-    let status = observe(tx, &lease.workflow, &scope.intent, incoming)?;
-    ensure!(
-        status.ready(),
-        "{}",
-        status
-            .reason_code
-            .as_deref()
-            .unwrap_or("family_authority_unknown")
-    );
     Ok(Some(format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))))
+}
+
+/// A decoded funding frame can be observed without granting a lease or charge.
+/// Keep ancestor control revision diagnostics identical at selection/admission.
+fn observe_scope(
+    conn: &Connection,
+    workflow: &str,
+    scope: &Scope,
+    incoming: u64,
+) -> Result<Observation> {
+    let mut status = observe(conn, workflow, &scope.intent, incoming)?;
+    if let Intent::Delegated { family, .. } = &scope.intent {
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT root_workflow FROM workflow_family_budget WHERE family=?1",
+                [family],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match root {
+            Some(root) if scope.root_control_revision != Some(revision(conn, &root)?) => {
+                status.block(observation::Reason::FamilyExecutionScopeUnknown)
+            }
+            None => status.block(observation::Reason::FamilyAuthorityUnknown),
+            _ => {}
+        }
+    }
+    Ok(status)
 }

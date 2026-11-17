@@ -23,6 +23,8 @@ pub(crate) mod family_budget;
 mod family_budget_tests;
 #[path = "autoship_activity_observation.rs"]
 mod activity_observation;
+#[path = "autoship_idle_recovery.rs"]
+pub(crate) mod idle_recovery;
 #[path = "autoship_outcome_classification.rs"]
 mod outcome_classification;
 
@@ -1153,6 +1155,7 @@ impl WorkflowStore {
             tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![workflow,serde_json::to_string(&cp)?])?;
             event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation}).to_string(),now_ms)?;
         }
+        if purpose==ClaimPurpose::Productive && !family_budget::wait::prepare_productive_claim(&tx,workflow,generation,&mut cp,now_ms)? {tx.commit()?;return Ok(None);}
         if purpose==ClaimPurpose::Productive && owner_control::dispatch_resume_blocked(&tx,workflow)? {return Ok(None);}
         let generation = generation.checked_add(1).context("generation overflow")?;
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+?6 WHERE id=?1",
@@ -1276,6 +1279,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -1316,6 +1320,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        family_budget::control::require_dispatch(&tx,lease)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let inserted=tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
@@ -1762,7 +1767,7 @@ impl WorkflowStore {
             // Changing to a builder, amendment or another provider is not
             // original-outcome recovery. Fence every new actual admission;
             // late usage/accounting for the original call remains recordable.
-            if admission.is_some() {baseline_native_custody(&tx,&lease.workflow)?;}
+            if admission.is_some() {idle_recovery::require_dispatch(&tx,&lease.workflow)?;baseline_native_custody(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -2023,6 +2028,7 @@ impl WorkflowStore {
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         require_binding(&tx,lease,binding,now)?;
         owner_turn::require_native_dispatch(&tx,lease,now)?;
         tx.commit()?;Ok(())
@@ -2255,6 +2261,7 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,&operation.binding,now)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        family_budget::control::require_dispatch(&tx,lease)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
         ensure!(owner==lease.workflow,"publication operation ownership mismatch");

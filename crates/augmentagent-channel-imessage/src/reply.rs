@@ -255,9 +255,21 @@ impl ImessageReplier {
                             if let Ok(Some(row)) = self.store.get_action_with_email(&id) {
                                 let Ok(created) = chrono::DateTime::parse_from_rfc3339(&row.action.created_at) else { continue; };
                                 if split_own_entries_since(&self.store, delta, Some(created.timestamp_millis())).1 == 0 { continue; }
-                                if let Err(error) = self.approvals.note_compose_activity(&id, &row.email).await {
-                                    warn!(action_id=%id, "compose manual-activity note failed: {error}");
-                                    stats.errors += 1;
+                                // #2064 — once per draft revision. The note says
+                                // Approve still sends the composed text; repeating
+                                // it on every later manual text was 46 identical
+                                // alerts for one compose left pending for days.
+                                let revision = augmentagent_approval_discord::interaction::draft_revision(
+                                    row.action.draft_body.as_deref().unwrap_or_default());
+                                if self.store.compose_activity_noted(&id, &revision).unwrap_or(false) { continue; }
+                                match self.approvals.note_compose_activity(&id, &row.email).await {
+                                    Ok(()) => if let Err(error) = self.store.mark_compose_activity_noted(&id, &revision) {
+                                        warn!(action_id=%id, "compose manual-activity note not recorded: {error}");
+                                    },
+                                    Err(error) => {
+                                        warn!(action_id=%id, "compose manual-activity note failed: {error}");
+                                        stats.errors += 1;
+                                    }
                                 }
                             }
                         },
@@ -1005,6 +1017,34 @@ mod tests {
         let c = f.store.get_action_with_email(&compose).unwrap().unwrap();
         assert_eq!(c.action.status, "pending");
         assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose]);
+    }
+
+    /// #2064: a compose left pending for days drew the note again on every
+    /// later manual text to the same person (46 identical alerts). It is
+    /// noted once per draft revision; a revised draft is noted once more.
+    #[tokio::test]
+    async fn manual_texts_note_a_pending_compose_once_per_revision() {
+        let f = fx();
+        let compose = pending_compose(&f.store, "here's the address");
+        let rep = replier(&f, Scripted::new(&[]));
+        let by_hand = |secs: i64, body: &str| {
+            let mut d = one_to_one(&[("me", body)]);
+            d.new_entries[0].1.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339();
+            d
+        };
+        for (n, body) in ["first by hand", "second by hand", "third by hand"].iter().enumerate() {
+            let stats = rep.handle_deltas(&[by_hand(n as i64 + 1, body)]).await;
+            assert_eq!(stats.manual_replies, 1);
+        }
+        assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose.clone()], "noted once, not per text");
+
+        // Revising the compose makes a new draft revision: one more note.
+        f.store
+            .update_action_status(&compose, ActionStatus::Pending, Some("here's the new address"), None)
+            .unwrap();
+        rep.handle_deltas(&[by_hand(10, "fourth by hand")]).await;
+        rep.handle_deltas(&[by_hand(11, "fifth by hand")]).await;
+        assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose.clone(), compose]);
     }
 
     #[tokio::test]
