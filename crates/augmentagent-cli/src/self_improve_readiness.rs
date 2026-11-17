@@ -473,6 +473,50 @@ mod tests {
         let error=super::validate(&assessment,"request",&BTreeMap::from([("src/main.rs".into(),source)])).unwrap_err();
         assert!(!format!("{error:#}").contains("not audited"),"private source must not leak into public diagnostics");
     }
+    #[tokio::test]
+    async fn production_1547_reports_all_wrapped_quotes_in_one_correction_and_replays() {
+        let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/readiness-1547.json")).unwrap();
+        let raw=fixture["response"].as_str().unwrap().to_owned();
+        let owner=fixture["owner"].as_str().unwrap().to_owned();
+        let files:BTreeMap<String,String>=serde_json::from_value(fixture["files"].clone()).unwrap();
+        let assessment=decode(&raw).unwrap();
+        assert!(validate(&assessment,&owner,&files).unwrap_err().downcast_ref::<QuoteMismatch>().is_some());
+        let responses=std::sync::Mutex::new(BTreeMap::from([(0,raw.clone())]));
+        let read=|attempt|Ok(responses.lock().unwrap().get(&attempt).cloned());
+        let write=|attempt,raw:&str|{responses.lock().unwrap().insert(attempt,raw.into());Ok(())};
+        let check=|raw:String|{let owner=owner.clone();let files=files.clone();async move {
+            let assessment=decode(&raw)?;let gaps=validate(&assessment,&owner,&files)?;Ok((assessment,gaps))
+        }};
+        let (_,gaps)=recover_assessment("request",read,write,|prompt| {
+            let mut corrected=decode(&raw).unwrap();let files=&files;
+            async move {
+                // The captured response has three independent wrapped citations.
+                // Expose them together, including directly copyable literal lines.
+                for slot in ["failure","persistence","rollout"] {
+                    assert!(prompt.contains(&format!("\"slot\":\"{slot}\"")),"missing {slot} feedback: {prompt}");
+                }
+                assert!(prompt.contains("literal_lines"));
+                for (slot,path,literal) in [
+                    ("failure","docs/phone/runtime.md","Provider validation error 64107 is logged by numeric code and leaves"),
+                    ("persistence","crates/augmentagent-phone/src/relay.rs","whole streamed answer, never an individual chunk."),
+                    ("rollout","docs/phone/runtime.md","these tests does not establish those live results."),
+                ] {
+                    assert!(files[path].contains(literal));
+                    let Slot::Resolved{evidence,..}=corrected.slots.get_mut(slot).unwrap() else {
+                        let Slot::ExternalDecision{evidence,..}=corrected.slots.get_mut(slot).unwrap() else {unreachable!()};
+                        evidence.iter_mut().find(|e|e.path.as_deref()==Some(path)).unwrap().quote=literal.into();continue;
+                    };
+                    evidence.iter_mut().find(|e|e.path.as_deref()==Some(path)).unwrap().quote=literal.into();
+                }
+                Ok(serde_json::to_string(&corrected).unwrap())
+            }
+        },check).await.unwrap();
+        assert_eq!(gaps.len(),1,"a valid assessment still holds on the real external owner decision");
+        assert_eq!(responses.lock().unwrap().len(),2);
+        assert_eq!(responses.lock().unwrap()[&0],raw,"original evidence stays immutable");
+        recover_assessment("request",read,write,|_|async {panic!("restart cannot spend another admission")},check).await.unwrap();
+    }
+
     #[test]
     fn correction_diagnostics_are_bounded_utf8_and_private() {
         let source=format!("{}literal_anchor\n//! private source", "é".repeat(3000));
