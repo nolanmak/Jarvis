@@ -4,7 +4,7 @@ use super::tests::{control_dir, repo, scripted_independent_admission};
 use super::*;
 use crate::autoship_workflow::family_budget::{self, store as family_store};
 
-async fn funded_guard(limit: u64) -> (tempfile::TempDir, tempfile::TempDir, WorkflowGuard) {
+pub(super) async fn funded_guard(limit: u64) -> (tempfile::TempDir, tempfile::TempDir, WorkflowGuard) {
     let checkout = repo();
     let control = control_dir();
     let path = control.path().join("workflow.db");
@@ -147,7 +147,7 @@ async fn funded_guard(limit: u64) -> (tempfile::TempDir, tempfile::TempDir, Work
     (checkout, control, guard)
 }
 
-async fn denied_native_call(guard: &WorkflowGuard) -> anyhow::Error {
+pub(super) async fn denied_native_call(guard: &WorkflowGuard) -> anyhow::Error {
     use augmentagent_channel_core::{native_session, ProviderKind};
     native_session::fresh_review_scope(ProviderKind::Codex, async {
         let session = native_session::current_for(ProviderKind::Codex)?.unwrap();
