@@ -47,6 +47,49 @@ class AptInstallTests(unittest.TestCase):
             self.assertTrue(all(not path.exists() for path in source_paths), 'temporary APT source survived installation')
         return code, calls, sources
 
+    def test_unrelated_microsoft_429_recovers_with_signed_ubuntu_sources(self):
+        output = ('E: Failed to fetch https://packages.microsoft.com/ubuntu/26.04/prod/dists/resolute/InRelease '
+                  '429 Too Many Requests [IP: 13.107.246.40 443]\n'
+                  'E: Some index files failed to download. They have been ignored, or old ones used instead.\n')
+        code, calls, sources = self.exercise([(100, output), (0, ''), (0, '')],
+                                              packages=['poppler-utils', 'ripgrep'], suite='resolute')
+        self.assertEqual(code, 0, 'an unrelated Microsoft feed blocked required Ubuntu packages')
+        self.assertEqual(len(calls), 3)
+        self.assertIn('install', calls[-1])
+        self.assertIn('poppler-utils', calls[-1])
+        self.assertIn('ripgrep', calls[-1])
+        self.assertIn('https://archive.ubuntu.com/ubuntu/', sources[0])
+        self.assertIn('https://security.ubuntu.com/ubuntu/', sources[0])
+        self.assertIn('Signed-By:', sources[0])
+        self.assertNotIn('packages.microsoft.com', sources[0])
+        self.assertEqual(sources[0], sources[1])
+        for call in calls:
+            self.assertIn('Acquire::Retries=2', call)
+            self.assertIn('APT::Get::AllowUnauthenticated=false', call)
+
+    def test_microsoft_429_fallback_failure_is_terminal(self):
+        microsoft = 'E: Failed to fetch https://packages.microsoft.com/ubuntu/26.04/prod/dists/resolute/InRelease 429 Too Many Requests\n'
+        for results, count in [([(100, microsoft), (100, 'E: The repository is not signed.')], 2),
+                               ([(100, microsoft), (0, ''), (100, 'E: Unable to locate package poppler-utils')], 3)]:
+            with self.subTest(results=results):
+                code, calls, _ = self.exercise(results, suite='resolute')
+                self.assertEqual((code, len(calls)), (100, count))
+
+    def test_microsoft_429_mixed_failures_never_hide_required_source_or_security_errors(self):
+        microsoft = 'E: Failed to fetch https://packages.microsoft.com/ubuntu/26.04/prod/dists/resolute/InRelease 429 Too Many Requests\n'
+        for other in ['E: Failed to fetch https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease 429 Too Many Requests',
+                      'E: The repository is not signed.', 'W: GPG error NO_PUBKEY',
+                      'E: Could not get lock /var/lib/dpkg/lock',
+                      'E: Failed to fetch https://packages.microsoft.com.example.invalid/InRelease 429 Too Many Requests']:
+            with self.subTest(other=other):
+                code, calls, sources = self.exercise([(100, microsoft + other)])
+                self.assertEqual((code, len(calls), sources), (100, 1, []))
+
+    def test_required_package_download_429_is_not_an_unrelated_source_failure(self):
+        code, calls, sources = self.exercise([(0, ''), (100,
+            'E: Failed to fetch https://packages.microsoft.com/pkg.deb 429 Too Many Requests')])
+        self.assertEqual((code, len(calls), sources), (100, 2, []))
+
     def test_primary_success_never_changes_sources(self):
         code, calls, sources = self.exercise([(0, ''), (0, '')])
         self.assertEqual(code, 0)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install CI packages, with signed retries for DNS or missing Ubuntu sources.
+"""Install CI packages, with bounded signed recovery for unavailable sources.
 
 Temporary APT source options apply only to the fallback commands. Host source
 files, signature keys and system DNS configuration are never changed.
@@ -26,6 +26,15 @@ def dns_failure(output):
             'Unable to fetch some archives')):
             return False
     return not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
+
+
+def microsoft_rate_limit_failure(output):
+    errors = [line for line in output.splitlines() if line.startswith('E:')]
+    fetches = [line for line in errors if line.startswith('E: Failed to fetch ')]
+    return (bool(fetches)
+            and all(re.match(r'^E: Failed to fetch https://packages\.microsoft\.com/\S+\s+429\s+Too Many Requests(?:\s|$)', line) for line in fetches)
+            and all(line.startswith(('E: Failed to fetch ', 'E: Some index files failed to download')) for line in errors)
+            and not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I))
 
 
 def package_lookup_failure(output, packages):
@@ -98,7 +107,7 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
     # Hosted runners have IPv4 egress; avoid an unavailable IPv6 route turning
     # a DNS-only mirror outage into a mixed error that must fail closed.
     common = ['sudo', 'apt-get', '-o', 'Acquire::ForceIPv4=true',
-              '-o', 'Acquire::Retries=0',
+              '-o', 'Acquire::Retries=2',
               '-o', 'Acquire::http::Timeout=20', '-o', 'Acquire::https::Timeout=20',
               '-o', 'APT::Update::Error-Mode=any',
               '-o', 'Acquire::AllowInsecureRepositories=false',
@@ -117,7 +126,8 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
     result, action = execute([])
     dns = dns_failure(result.stdout)
     lookup = action == "install" and package_lookup_failure(result.stdout, packages)
-    if not result.returncode or not (dns or lookup):
+    microsoft = action == "update" and microsoft_rate_limit_failure(result.stdout)
+    if not result.returncode or not (dns or lookup or microsoft):
         return result.returncode
 
     release = {}
@@ -139,9 +149,12 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
         archives = [('https://mirrors.edge.kernel.org/ubuntu/',
                      f'{suite} {suite}-updates {suite}-security {suite}-backports')]
     else:
-        if not missing_ubuntu_sources(run, common, suite):
-            return result.returncode
-        print(f'APT has no Ubuntu binary sources for {suite}: retrying once against signed Ubuntu archives', flush=True)
+        if microsoft:
+            print('Unrelated Microsoft APT source throttled: retrying once with signed Ubuntu sources only', flush=True)
+        else:
+            if not missing_ubuntu_sources(run, common, suite):
+                return result.returncode
+            print(f'APT has no Ubuntu binary sources for {suite}: retrying once against signed Ubuntu archives', flush=True)
         archives = [('https://archive.ubuntu.com/ubuntu/', f'{suite} {suite}-updates {suite}-backports'),
                     ('https://security.ubuntu.com/ubuntu/', f'{suite}-security')]
 
