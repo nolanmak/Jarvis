@@ -12170,18 +12170,18 @@ fn model_profile_ready(reasoner: &FallbackReasoner, profile: augmentagent_channe
         return Err(format!("{} is not available in this Jarvis process; restart after configuring it", profile.name()));
     }
     let router = augmentagent_channel_core::model_router::load()
-        .map_err(|_| "9Router configuration is invalid".to_string())?;
+        .map_err(|_| "Model gateway configuration is invalid".to_string())?;
     match profile {
         ProviderKind::Qwen => {
             if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
                 Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
-            } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
+            } else if router.is_none() { Err("Qwen requires a configured model gateway endpoint".into()) }
             else { Ok(()) }
         }
         ProviderKind::Glm => {
             if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
                 Err("GLM is paused; enable it after live deployment verification".into())
-            } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
+            } else if router.is_none() { Err("GLM requires a configured model gateway endpoint".into()) }
             else { Ok(()) }
         }
         ProviderKind::Claude => Ok(()),
