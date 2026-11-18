@@ -21361,7 +21361,7 @@ mod recovered_issue_selection_regressions {
     async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
         const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            for case in ["family-wait", "family-wait-restored", "preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+            for case in ["worker-peer", "family-wait", "family-wait-restored", "preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
                 let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
                 git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
                 std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
@@ -21458,7 +21458,7 @@ raise AssertionError(args)
             }
         }
         let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let ready_id="fixture-owner/repo#1830";
-        if !case.starts_with("preview-") && !matches!(case.as_str(),"family-wait"|"family-wait-restored"|"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
+        if !case.starts_with("preview-") && !matches!(case.as_str(),"worker-peer"|"family-wait"|"family-wait-restored"|"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
             let controls=workflow::FreshIssueControls::open().unwrap();
             let issue=Issue {number:1830,title:"Correct retained widget rounding".into(),body:"Preserve exact rounding behavior.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
             let in_flight_preview=controls.unchanged_initial_hold(&repo,"fixture-owner/repo",&issue);
@@ -21482,6 +21482,10 @@ raise AssertionError(args)
             augmentagent_test_support::write_executable(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
         }
         let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
+        if case == "worker-peer" {
+            super::peer_selection_tests::worker_selects_real_ready_peer(&repo, &database).await;
+            return;
+        }
         if case=="recovery-history-disappeared" {
             std::fs::write(format!("{}.lose-recovery-store",std::env::var("AUTOSHIP_RECOVERED_SELECTION_HEAD_FILE").unwrap()),b"armed disposable recovery-store fault").unwrap();
             let outcome=qualification_reconcile::issue_retries(&repo).await;
@@ -21622,3 +21626,7 @@ mod ci_repair_tests;
 #[cfg(test)]
 #[path = "self_improve_family_wait_selection_tests.rs"]
 mod family_wait_selection_tests;
+
+#[cfg(test)]
+#[path = "self_improve_peer_selection_tests.rs"]
+mod peer_selection_tests;
