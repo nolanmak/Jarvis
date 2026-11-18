@@ -254,6 +254,14 @@ class WordSigningTests(unittest.TestCase):
         lines = sign_docx.lines(dict(docx=b64(raw)))["lines"]
         self.assertEqual([l["text"] for l in lines], ["Signed: _____"])
 
+    def test_a_signature_cell_in_a_tracked_row_is_not_offered(self):
+        # Review of #2241: the row's revision marker lives in w:trPr.
+        row = ('<w:tbl><w:tr><w:trPr><w:ins w:id="7" w:author="Other"/></w:trPr>'
+               '<w:tc><w:p><w:r><w:t>Signature:</w:t></w:r></w:p></w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl>')
+        self.assertEqual(sign_docx.lines(dict(docx=b64(docx(para(run("Terms.")) + row))))["lines"], [])
+        plain = row.replace('<w:trPr><w:ins w:id="7" w:author="Other"/></w:trPr>', "")
+        self.assertEqual(len(sign_docx.lines(dict(docx=b64(docx(para(run("Terms.")) + plain))))["lines"]), 1)
+
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
         raw = docx(para(run("By signing this agreement, you accept these terms."))

@@ -177,6 +177,20 @@ def field_ranges(doc):
     return ranges
 
 
+TRACKED_CELL = re.compile(r"<w:(ins|del|cellIns|cellDel|cellMerge)\b")
+
+
+def in_tracked_row_or_cell(doc, cell):
+    """A table row inserted or deleted as a tracked change keeps its marker
+    in the row properties (`<w:trPr><w:ins/>`), and a tracked cell in its
+    cell properties, outside any paragraph. Rejecting either revision would
+    take a signature placed there with it."""
+    row = max(doc.rfind("<w:tr>", 0, cell[0]), doc.rfind("<w:tr ", 0, cell[0]))
+    trpr = re.search(r"<w:trPr>.*?</w:trPr>", doc[row:cell[0]], re.S) if row >= 0 else None
+    tcpr = re.search(r"<w:tcPr>.*?</w:tcPr>", doc[cell[0]:cell[1]], re.S)
+    return bool((trpr and TRACKED_CELL.search(trpr.group(0))) or (tcpr and TRACKED_CELL.search(tcpr.group(0))))
+
+
 def candidates(doc):
     """Paragraphs a signature can go into, top to bottom, numbered from 1:
     a blank drawn with underscores that is not labelled as a date, name or
@@ -192,7 +206,8 @@ def candidates(doc):
         stripped = text.strip()
         cell = cell_of(doc, start)
         if (NON_TEXT.search(doc[start:end]) or TRACKED.search(doc[start:end])
-                or any(a < end and start < b for a, b in fields)):
+                or any(a < end and start < b for a, b in fields)
+                or (cell is not None and in_tracked_row_or_cell(doc, cell))):
             continue
         if stripped:
             if len(stripped) > MAX_LINE_CHARS or BLOCKED.search(stripped):
