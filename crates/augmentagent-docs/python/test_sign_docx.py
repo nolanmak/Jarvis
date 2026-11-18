@@ -96,6 +96,26 @@ class WordSigningTests(unittest.TestCase):
         self.assertIn(" end", text)
         self.assertNotIn("&amp;#", doc)
 
+    def test_references_are_decoded_once(self):
+        # Review of #2241: &#38;lt; is the literal text "&lt;", not "<".
+        self.assertEqual(sign_docx.unescape("&#38;lt;Client&#38;gt; &amp;amp; &#x41;"), "&lt;Client&gt; &amp; A")
+        raw = docx(para(run("Terms.")) + para(run("Signature &#38;lt;Client&#38;gt;: _____")))
+        doc = part(sign_line(raw), "word/document.xml")
+        text = "".join(sign_docx.unescape(t) for t in re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))
+        self.assertIn("Signature &lt;Client&gt;: ", text)
+
+    def test_the_preview_shows_the_whole_signed_line(self):
+        # Review of #2241: a long label or wide signature was cropped away.
+        label = "Signature of the authorized representative of Example Client LLC: "
+        raw = docx(para(run("Terms.")) + para(run(label + "_____ (seal)")))
+        data = dict(docx=b64(raw), png=b64(signature_png()))
+        placement = sign_docx.resolve(dict(data, target=dict(line=1), width=432))
+        png = sign_docx.preview(dict(data, placement=placement, date="2026-11-18"))
+        im = Image.open(io.BytesIO(png)).convert("L")
+        box = Image.eval(im, lambda v: 255 if v < 200 else 0).getbbox()
+        self.assertIsNotNone(box)
+        self.assertLess(box[2], im.width - 10, "nothing is drawn up to the right edge")
+
     def test_a_blank_split_across_runs_is_removed_entirely(self):
         # Review of #2241: the preview showed the whole blank gone.
         raw = docx(para(run("Terms.")) + para(run("Signature: ___"), run("____"), run(" (Client)")))

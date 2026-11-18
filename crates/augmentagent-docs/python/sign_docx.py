@@ -34,15 +34,22 @@ R_SPAN = re.compile(r"<w:r(?:\s[^>]*)?>.*?</w:r>", re.S)
 RPR = re.compile(r"<w:rPr>.*?</w:rPr>|<w:rPr/>", re.S)
 
 
-NUMERIC_REF = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+);")
+XML_REF = re.compile(r"&(#x[0-9a-fA-F]+|#[0-9]+|lt|gt|amp|quot|apos);")
+NAMED = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
 
 
 def unescape(text):
-    """XML character data to text: numeric references (`&#65;`, `&#x41;`)
-    and the five predefined entities, `&amp;` last so it is decoded once."""
-    text = NUMERIC_REF.sub(lambda m: chr(int(m.group(1)[1:], 16) if m.group(1)[0] == "x" else int(m.group(1))), text)
-    return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
-            .replace("&apos;", "'").replace("&amp;", "&"))
+    """XML character data to text, in one pass: numeric references (`&#65;`,
+    `&#x41;`) and the five predefined entities. A single pass never reads a
+    decoded character as markup again (`&#38;lt;` is the text `&lt;`)."""
+    def ref(m):
+        name = m.group(1)
+        if name.startswith("#x"):
+            return chr(int(name[2:], 16))
+        if name.startswith("#"):
+            return chr(int(name[1:]))
+        return NAMED[name]
+    return XML_REF.sub(ref, text)
 
 
 def escape(text):
@@ -405,7 +412,15 @@ def preview(data):
     font = ImageFont.load_default(size=28)
     small = ImageFont.load_default(size=22)
     date = data.get("date") or ""
-    width = 1400
+    # Size the canvas to the whole signed line, so the signature and date are
+    # never cropped out of the preview the owner approves.
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    line_width = 40 + int(measure.textlength(head.strip(), font=font)) + 16 + sig.width + 16
+    if date:
+        line_width += int(measure.textlength(date, font=font)) + 16
+    if tail.strip():
+        line_width += int(measure.textlength(tail.strip(), font=font))
+    width = max(1400, line_width + 40)
     height = 120 + sig.height + 120
     img = Image.new("RGB", (width, height), "white")
     d = ImageDraw.Draw(img)
