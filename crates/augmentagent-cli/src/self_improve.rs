@@ -101,6 +101,8 @@ mod policy_hold;
 mod legacy_readmission;
 #[path = "self_improve_closed_targets.rs"]
 mod closed_targets;
+#[path = "self_improve_owner_checkout_recovery.rs"]
+mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
 pub(crate) mod readoption;
 #[path = "self_improve_qualification_reconcile.rs"]
@@ -1060,9 +1062,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .map_err(|error|error.context(workflow::OwnerControlUnavailable))?;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
-    let qualification_retries=qualification_reconcile::issue_retries(repo_root).await
+    let mut qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
+    qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
@@ -1150,7 +1153,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 continue;
             },
         }
-        if acceptance::readiness::blocked(repo_root,&candidate).await? {
+        if owner_checkout_recovery::readiness_blocked(repo_root,&repository,&candidate).await? {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
         }
@@ -8409,18 +8412,16 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         Ok(false)=>(),
         Err(_)=>return Err(linked_claims::Hold::Unknown.into()),
     }
-    let branch = format!("{BRANCH_PREFIX}{}", issue.number);
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let (worktree, branch) = owner_checkout_recovery::layout(repo_root,&workflow::path(),&repository,issue.number).await?;
     let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Issue(issue.number)).await?;
     reasoner.track_review_history(repo_root, &branch, false)?;
     // Keep each issue's checkout stable across interruption. Other issues can
     // advance without deleting this candidate or its compiler fixture paths.
-    let worktree = workspace::candidate_parent(repo_root).await?
-        .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
-    let repository = workflow::canonical_repository(repo_root).await?;
     let id = crate::autoship_workflow::workflow_id(&repository, issue.number)?;
     recovery::prepare_issue_at(&workflow::path(), repo_root, &worktree, &id, &repository, &branch).await?;
     let upstream_main = workflow::remote_main_head(&worktree,&repository).await?;
-    let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
+    let environment = owner_checkout_recovery::environment(&workflow::path(),&repository,issue.number,recovery::environment_identity(&worktree,&upstream_main).await?)?;
     let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;
     let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root, worktree: &worktree, repository: &repository,

@@ -167,15 +167,14 @@ impl FreshIssueControls {
         async move {
             let result=async {
                 let Some((snapshot,context,request))=inspected? else{return Ok(false)};
-                let expected=workspace::candidate_parent(&root).await?
-                    .join(format!("{}-issue-{}",lane_from_env().worktree_name(),number));
+                let (expected,expected_branch)=owner_checkout_recovery::layout(&root,&state,&repository,number).await?;
                 recovery::existing_checkout(&root,&context.worktree).await?;
                 anyhow::ensure!(context.worktree.canonicalize()?==expected.canonicalize()?
-                    && snapshot.branch==format!("{BRANCH_PREFIX}{number}"),"held issue checkout differs from execution lane");
+                    && snapshot.branch==expected_branch,"held issue checkout differs from execution lane");
                 let (ok,branch,_)=run("git",&["symbolic-ref","--quiet","--short","HEAD"],&context.worktree).await?;
                 anyhow::ensure!(ok && branch.trim()==snapshot.branch,"held issue branch differs");
                 let upstream=remote_main_head(&root,&repository).await?;
-                let current_environment=recovery::environment_identity(&context.worktree,&upstream).await?;
+                let current_environment=owner_checkout_recovery::environment(&state,&repository,number,recovery::environment_identity(&context.worktree,&upstream).await?)?;
                 if !recovery_context_matches(&context,&request,&expected,&current_environment,true) {return Ok(false);}
                 let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
                 // A genuine recovery cue arriving during Git inspection must

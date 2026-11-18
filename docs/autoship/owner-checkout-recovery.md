@@ -1,0 +1,49 @@
+# Recover a held issue after checkout continuity loss
+
+`augmentagent autopr readopt --list --json` includes `continuity_lost`
+candidates and a per-issue `action` command. Listing is read-only and provisional:
+execution rechecks GitHub authorization, open state, manual routing, owner pause,
+checkout custody and lease state. Intact checkouts are not recovery candidates.
+Malformed or missing custody records do not authorize recovery.
+
+Run the displayed command from the production controller checkout, with an owner
+reason and a stable request ID. For example (synthetic repository):
+
+```sh
+augmentagent autopr readopt --repo example-owner/example-repo --issue 7 \
+  --reason 'Restart from current main after checkout continuity loss' \
+  --request-id owner-checkout-7-generation-1 --json
+```
+
+This command records authenticated owner authority and a durable, immutable
+archive in `owner_checkout_recovery`. It retains the exact checkpoint TEXT,
+original snapshot/context, original receipt path and bytes, and original readiness
+dependency evidence. Existing scope responses, execution contexts, events,
+receipt files, checkout and branch content remain untouched. The append-only
+`superseded_by_owner_recovery` event links the prior hold to its archive/request;
+only the live workflow scheduling projection advances to Intake.
+
+The next ordinary picker/claim uses a separate request-specific branch and
+checkout, based on the GitHub main commit observed during owner recovery.
+Preparation fetches main and creates that branch from the recorded base, never
+from the old candidate. A new environment authority identity and domain-separated scope/readiness/budget
+keys prevent old records from being reused as current verification. Current scope
+readers and history scans honor the supersession event: malformed or missing
+evidence from before cutover remains archived, while missing evidence after
+cutover still fails closed. The pending
+Intake gets one opportunity past old daily/dependency scheduling advice; ordinary
+checks and backoff resume as soon as it advances. Recovery grants no build,
+review, publication or merge approval. All normal execution gates still apply.
+
+Retry the **same command and request ID** after an interrupted response. The
+archive, authority, replacement path and base commit are committed together.
+Replay reauthenticates and returns the original result without resetting a
+progressed workflow or creating another checkout. Reusing the ID with different
+intent is refused. A subsequent continuity loss needs a new owner request.
+
+Owner pauses are preserved: explicitly resume an issue first only if that is the
+owner's intent. Closed issues, `autoship-manual`, live leases and pending workflow
+operations are refused. A separate GitHub `agent-gave-up` hold still follows the
+existing legacy readoption rules; recovery does not silently remove that label.
+Never delete the old receipt, reset the old branch, hand-edit the database, or
+copy an unverified surviving branch into the new checkout to bypass a refusal.

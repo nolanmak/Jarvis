@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path = "autoship_owner_checkout_recovery.rs"]
+pub(crate) mod owner_checkout_recovery;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
@@ -421,6 +423,7 @@ pub struct WorkflowStore {
 /// The same immutable response lookup serves leased execution and free data
 /// inspection; a recorded-but-missing result is never a fresh empty slot.
 fn read_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<String>> {
+    if let Some(value)=owner_checkout_recovery::scope_response(conn,workflow,key)? {return Ok(value);}
     let value=conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,key],|r|r.get(0)).optional()?;
     if value.is_none() {
         let malformed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[workflow],|row|row.get(0))?;
@@ -442,6 +445,7 @@ fn read_recorded_scope_response(conn:&Connection,workflow:&str,key:&str)->Result
 }
 
 fn read_scope_response_keys(conn:&Connection,workflow:&str,after:&str)->Result<Vec<String>> {
+    if let Some(keys)=owner_checkout_recovery::scope_keys(conn,workflow,after)? {return Ok(keys);}
     let invalid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[workflow],|row|row.get(0))?;
     if invalid {return Err(MissingScopeResponse.into());}
     let keys={let mut statement=conn.prepare("SELECT key FROM (SELECT key FROM scope_stage_response WHERE workflow=?1 UNION SELECT json_extract(payload,'$.key') AS key FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded') WHERE key>?2 ORDER BY key LIMIT 16")?;
@@ -855,6 +859,7 @@ impl WorkflowStore {
         discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
+        conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
         Ok(Self { conn })
     }
 
