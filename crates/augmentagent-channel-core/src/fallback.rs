@@ -209,7 +209,7 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
             }
             None
         }
-        ProviderKind::Qwen | ProviderKind::Glm => Some("Runpod profile requires 9Router".into()),
+        ProviderKind::Qwen | ProviderKind::Glm => Some("Runpod profile requires a configured model gateway".into()),
     }
 }
 
@@ -730,7 +730,7 @@ impl FallbackReasoner {
                 diagnostics.push(format!("{name}: excluded by selected model route"));
                 continue;
             }
-            // Account cooldowns belong to 9Router. Native-login cooldowns must
+            // Account cooldowns belong to the model gateway. Native-login cooldowns must
             // neither block a fresh account pool nor be cleared by its success.
             let routed = routing.as_ref().is_some_and(|r| r.enabled());
             if opts.audit_logger.as_ref().is_some_and(|logger| logger.run_resources_required())

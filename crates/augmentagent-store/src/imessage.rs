@@ -149,6 +149,8 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
              ON imessage_outbox(status, id);\
          CREATE INDEX IF NOT EXISTS idx_imessage_outbox_target \
              ON imessage_outbox(target, status);\
+         CREATE INDEX IF NOT EXISTS idx_imessage_outbox_sent_guid \
+             ON imessage_outbox(message_guid) WHERE status='sent' AND message_guid IS NOT NULL;\
          CREATE TABLE IF NOT EXISTS imessage_outbound_allowlist (\
              identifier    TEXT PRIMARY KEY,\
              enabled_at_ms INTEGER NOT NULL\
