@@ -4167,8 +4167,13 @@ async fn main() -> Result<()> {
             // is a zero-cost tick, and the engine honours dry_run (logs
             // would-fire lines, sends nothing, leaves rows armed). Also owns
             // flagging rows stuck mid-send from a previous crash.
-            match std::env::var("COMPOSIO_API_KEY") {
-                Ok(api_key) => {
+            // #1640 review — Slack and iMessage schedules fire through the
+            // approver and need no Composio key, so the engine runs whenever
+            // either kind of send is possible. Without a key no Gmail draft
+            // can exist, so the Gmail half simply has nothing to fire.
+            let composio_key = std::env::var("COMPOSIO_API_KEY").ok();
+            match scheduled_send_engine_key(composio_key, approver.is_some()) {
+                Some(api_key) => {
                     let mut engine = augmentagent_channel_email::ScheduledSendEngine::new(
                         Arc::clone(&store),
                         Arc::new(ComposioClient::new(api_key)),
@@ -4194,8 +4199,8 @@ async fn main() -> Result<()> {
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move { engine.run(sd).await }));
                 }
-                Err(_) => warn!(
-                    "COMPOSIO_API_KEY not set; scheduled email sends will not fire"
+                None => warn!(
+                    "COMPOSIO_API_KEY not set and no approver; scheduled sends will not fire"
                 ),
             }
             // #25: Gmail + LinkedIn now run through the generic
@@ -16481,6 +16486,35 @@ impl ReplyApprover {
 /// #501 — owner-local display string for a scheduled fire time, e.g.
 /// "Mon Sep 1, 9:05 AM". `chrono::Local` follows the daemon host's timezone
 /// — the same zone the schedule was resolved in.
+/// #1640 review — whether the scheduled-send engine runs, and with which
+/// Composio key. Gmail schedules need the key; Slack and iMessage schedules
+/// fire through the approver and do not, so an approver alone is enough
+/// (with an empty key: no Gmail draft can exist without one).
+fn scheduled_send_engine_key(composio_key: Option<String>, has_approver: bool) -> Option<String> {
+    if composio_key.is_none() && has_approver {
+        tracing::warn!(
+            "COMPOSIO_API_KEY not set; scheduled email sends will not fire, \
+             Slack and iMessage schedules still do"
+        );
+    }
+    composio_key.or_else(|| has_approver.then(String::new))
+}
+
+#[cfg(test)]
+mod scheduled_send_engine_tests {
+    use super::scheduled_send_engine_key;
+
+    /// An armed iMessage or Slack schedule must fire on a daemon without
+    /// Composio; with neither, there is nothing the engine could send.
+    #[test]
+    fn the_engine_runs_for_platform_schedules_without_composio() {
+        assert_eq!(scheduled_send_engine_key(Some("k".into()), false), Some("k".into()));
+        assert_eq!(scheduled_send_engine_key(Some("k".into()), true), Some("k".into()));
+        assert_eq!(scheduled_send_engine_key(None, true), Some(String::new()));
+        assert_eq!(scheduled_send_engine_key(None, false), None);
+    }
+}
+
 fn format_local_send_time(at_ms: i64) -> String {
     augmentagent_approval_discord::timeparse::format_local_send_time(at_ms)
 }
