@@ -143,6 +143,9 @@ LABEL_ONLY = re.compile(r"^\s*(signature|sign\s+here|signed|by)\s*[:\-\u2013]?\s
 # a Word field (its result is regenerated when the field updates, which would
 # drop a signature placed inside it).
 NON_TEXT = re.compile(r"<w:(drawing|pict|object|fldChar|fldSimple|instrText)\b")
+# Unresolved tracked changes: a signature inside one would belong to that
+# revision and vanish if it were rejected. Resolve them first.
+TRACKED = re.compile(r"<w:(ins|del|moveFrom|moveTo)\b")
 CT_NS = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 
 
@@ -188,7 +191,8 @@ def candidates(doc):
     for index, (start, end, text) in enumerate(paragraphs(doc)):
         stripped = text.strip()
         cell = cell_of(doc, start)
-        if NON_TEXT.search(doc[start:end]) or any(a < end and start < b for a, b in fields):
+        if (NON_TEXT.search(doc[start:end]) or TRACKED.search(doc[start:end])
+                or any(a < end and start < b for a, b in fields)):
             continue
         if stripped:
             if len(stripped) > MAX_LINE_CHARS or BLOCKED.search(stripped):
@@ -300,16 +304,55 @@ def twips_attr(tag, name):
     return int(m.group(1)) if m else None
 
 
-def refuse_clipping(doc, start, end, height_pt):
+STYLES = "word/styles.xml"
+
+
+def effective_spacing(doc, start, end, styles):
+    """(lineRule, line twips) in effect for the paragraph: its own spacing,
+    else its style's, following basedOn, else the document default. Each
+    attribute is taken from the nearest level that sets it, as Word does."""
+    levels = []
+    ppr = re.search(r"<w:pPr>.*?</w:pPr>", doc[start:end], re.S)
+    ppr = ppr.group(0) if ppr else ""
+    levels.append(ppr)
+    style_id = re.search(r'<w:pStyle\b[^>]*\bw:val="([^"]+)"', ppr)
+    style_id = style_id.group(1) if style_id else None
+    if styles:
+        if style_id is None:
+            default = re.search(r'<w:style\b[^>]*w:type="paragraph"[^>]*w:default="1"[^>]*\bw:styleId="([^"]+)"', styles) \
+                or re.search(r'<w:style\b[^>]*w:default="1"[^>]*w:type="paragraph"[^>]*\bw:styleId="([^"]+)"', styles)
+            style_id = default.group(1) if default else None
+        seen = set()
+        while style_id and style_id not in seen and len(seen) < 32:
+            seen.add(style_id)
+            m = re.search(rf'<w:style\b[^>]*\bw:styleId="{re.escape(style_id)}"[^>]*>(.*?)</w:style>', styles, re.S)
+            if not m:
+                break
+            levels.append(m.group(1))
+            based = re.search(r'<w:basedOn\b[^>]*\bw:val="([^"]+)"', m.group(1))
+            style_id = based.group(1) if based else None
+        defaults = re.search(r"<w:pPrDefault>.*?</w:pPrDefault>", styles, re.S)
+        if defaults:
+            levels.append(defaults.group(0))
+    rule = line = None
+    for level in levels:
+        for tag in EXACT_LINE.findall(level):
+            if rule is None:
+                r = re.search(r'\bw:lineRule="([^"]+)"', tag)
+                rule = r.group(1) if r else None
+            if line is None:
+                line = twips_attr(tag, "line")
+    return rule, line
+
+
+def refuse_clipping(doc, start, end, height_pt, styles=None):
     """An inline picture taller than a fixed line height (exact paragraph
     spacing) or a fixed table row height is clipped in Word, while the
     preview shows it whole. Refuse such a placement, naming the limit."""
-    ppr = re.search(r"<w:pPr>.*?</w:pPr>", doc[start:end], re.S)
-    for tag in EXACT_LINE.findall(ppr.group(0) if ppr else ""):
-        line = twips_attr(tag, "line")
-        if 'w:lineRule="exact"' in tag and line is not None and line / 20 < height_pt:
-            raise ValueError(f"the signature line has a fixed height of {line / 20:g} pt, shorter than the "
-                             f"{height_pt:.0f} pt signature; use a smaller --width or sign by hand")
+    rule, line = effective_spacing(doc, start, end, styles)
+    if rule == "exact" and line is not None and line / 20 < height_pt:
+        raise ValueError(f"the signature line has a fixed height of {line / 20:g} pt, shorter than the "
+                         f"{height_pt:.0f} pt signature; use a smaller --width or sign by hand")
     cell = cell_of(doc, start)
     if cell is not None:
         row = max(doc.rfind("<w:tr>", 0, cell[0]), doc.rfind("<w:tr ", 0, cell[0]))
@@ -435,7 +478,8 @@ def sign(data):
     width = float(placement["width"])
     cx = int(round(width * EMU_PER_PT))
     cy = int(round(width * h / w * EMU_PER_PT))
-    refuse_clipping(doc, start, end, width * h / w)
+    styles = z.read(STYLES).decode("utf-8", "replace") if STYLES in z.namelist() else None
+    refuse_clipping(doc, start, end, width * h / w, styles)
     names = set(z.namelist())
     media = unique(names, lambda n: f"word/media/jarvis-signature-{n}.png")
     rels = z.read(RELS).decode("utf-8") if RELS in names else (

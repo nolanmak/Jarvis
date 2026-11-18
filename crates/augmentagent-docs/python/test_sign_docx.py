@@ -15,9 +15,11 @@ TYPES = ('<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.ope
 RELS = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
 
 
-def docx(body, rels=RELS, types_extra=""):
+def docx(body, rels=RELS, types_extra="", styles=None):
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        if styles is not None:
+            z.writestr("word/styles.xml", f'<?xml version="1.0" encoding="UTF-8"?><w:styles {NS}>{styles}</w:styles>')
         z.writestr("[Content_Types].xml", TYPES.format(extra=types_extra))
         z.writestr("word/document.xml",
                    f'<?xml version="1.0" encoding="UTF-8"?><w:document {NS}><w:body>{body}</w:body></w:document>')
@@ -227,6 +229,30 @@ class WordSigningTests(unittest.TestCase):
         self.assertIn("<w:drawing>", part(sign_line(docx(para(run("Terms.")) + roomy)), "word/document.xml"))
         at_least = exact.replace('w:lineRule="exact"', 'w:lineRule="atLeast"')
         self.assertIn("<w:drawing>", part(sign_line(docx(para(run("Terms.")) + at_least)), "word/document.xml"))
+
+    def test_exact_spacing_inherited_from_a_style_or_default_is_checked(self):
+        # Review of #2241: the clip check read only the paragraph's own pPr.
+        tight = '<w:pPr><w:spacing w:line="240" w:lineRule="exact"/></w:pPr>'
+        styled = ('<w:p><w:pPr><w:pStyle w:val="SigLine"/></w:pPr>' + run("Signature: _____") + "</w:p>")
+        styles = (f'<w:style w:type="paragraph" w:styleId="Base">{tight}</w:style>'
+                  '<w:style w:type="paragraph" w:styleId="SigLine"><w:basedOn w:val="Base"/></w:style>')
+        with self.assertRaisesRegex(ValueError, "fixed height of 12 pt"):
+            sign_line(docx(para(run("Terms.")) + styled, styles=styles))
+        defaults = f"<w:docDefaults><w:pPrDefault>{tight}</w:pPrDefault></w:docDefaults>"
+        with self.assertRaisesRegex(ValueError, "fixed height of 12 pt"):
+            sign_line(docx(para(run("Terms.")) + para(run("Signature: _____")), styles=defaults))
+        # The paragraph's own "at least" spacing overrides an exact style.
+        own = ('<w:p><w:pPr><w:pStyle w:val="SigLine"/><w:spacing w:line="240" w:lineRule="atLeast"/></w:pPr>'
+               + run("Signature: _____") + "</w:p>")
+        self.assertIn("<w:drawing>", part(sign_line(docx(para(run("Terms.")) + own, styles=styles)), "word/document.xml"))
+
+    def test_a_line_with_unresolved_tracked_changes_is_not_offered(self):
+        # Review of #2241: a signature inside w:ins would belong to that revision.
+        tracked = '<w:p><w:ins w:id="1" w:author="Other">' + run("Signature: _____") + "</w:ins></w:p>"
+        deleted = '<w:p>' + run("By: _____") + '<w:del w:id="2" w:author="Other"><w:r><w:delText>x</w:delText></w:r></w:del></w:p>'
+        raw = docx(para(run("Terms.")) + tracked + deleted + para(run("Signed: _____")))
+        lines = sign_docx.lines(dict(docx=b64(raw)))["lines"]
+        self.assertEqual([l["text"] for l in lines], ["Signed: _____"])
 
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
