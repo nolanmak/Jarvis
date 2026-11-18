@@ -10,6 +10,8 @@ mod stage_activity;
 mod family_dispatch_control;
 #[path = "self_improve_family_wait_settlement.rs"]
 mod family_wait_settlement;
+#[path = "self_improve_family_wait_selection.rs"]
+mod family_wait_selection;
 #[cfg(test)]
 #[path = "self_improve_family_wait_settlement_tests.rs"]
 mod family_wait_settlement_tests;

@@ -1067,12 +1067,12 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         }
         // An open GitHub issue can outlive its completed workflow. Do not
         // spend another selection turn on work the claim gate cannot restart.
-        match owner_controls.terminal(&repository,iss.number) {
-            Ok(true)=> {
-                info!(issue=iss.number,"skip: workflow already merged or retired; preserve completed history");
+        match owner_controls.fresh_blocker(&repository,iss.number) {
+            Ok(Some(reason))=> {
+                info!(issue=iss.number,reason,"skip: protected workflow state blocks fresh intake; consider eligible peers");
                 continue;
             }
-            Ok(false)=>{},
+            Ok(None)=>{},
             Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
             Err(error)=> {
                 warn!(issue=iss.number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
@@ -10848,12 +10848,12 @@ async fn pick_issue_for_repo(
             info!(repo=%repo.full_name,issue=number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
-        match owner_controls.terminal(&repo.full_name,number) {
-            Ok(true)=> {
-                info!(repo=%repo.full_name,issue=number,"skip: workflow already merged or retired; preserve completed history");
+        match owner_controls.fresh_blocker(&repo.full_name,number) {
+            Ok(Some(reason))=> {
+                info!(repo=%repo.full_name,issue=number,reason,"skip: protected workflow state blocks fresh intake; consider eligible peers");
                 continue;
             }
-            Ok(false)=>{},
+            Ok(None)=>{},
             Err(error)=> {
                 warn!(repo=%repo.full_name,issue=number,error=%error,"skip: workflow history unavailable; preserve candidate and consider peers");
                 if unavailable_history.is_none() {unavailable_history=Some(error);}
@@ -21357,7 +21357,7 @@ mod recovered_issue_selection_regressions {
     async fn real_issue_selector_advances_recovered_and_eligible_peers_without_mutating_holds() {
         const CHILD:&str="AUTOSHIP_RECOVERED_SELECTION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            for case in ["preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
+            for case in ["family-wait", "family-wait-restored", "preview-global-disappeared-peer","preview-global-between-peers","preview-global-schema-peer","preview-local-unavailable-peer","corrupt-recovery-peer-operation-kind","corrupt-recovery-peer-operation-binding","corrupt-recovery-peer-operation-column","recovery-history-disappeared","corrupt-recovery-peer-schema","corrupt-recovery-peer-json","corrupt-recovery-peer-snapshot","recovery-history-unavailable","preview-global-disappeared","preview-empty","preview-empty-fallback","preview-fallback","preview-no-fallback","preview-build-lane","preview-global-error","physical-restored","physical-missing","semantic-native","recovery-priority","recovered","held-only","changed-source","changed-candidate","paused","untrusted","manual","research","missing-context","upstream-only","changed-environment"] {
                 let root=tempfile::tempdir().unwrap();let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
                 git(&repo,&["init","-q","-b","main"]);git(&repo,&["remote","add","origin","https://github.com/fixture-owner/repo.git"]);
                 std::fs::write(repo.join("code.txt"),"original widget\n").unwrap();std::fs::write(repo.join("Cargo.lock"),"# fixture lock\n").unwrap();
@@ -21446,12 +21446,15 @@ raise AssertionError(args)
                 guard.hold_initial_acceptance_custody("acceptance_verifier_evidence_unknown","await_original_evidence_recovery",case!="semantic-native").await.unwrap();
                 guard.finish().unwrap();
                 if case!="physical-missing" {std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();}
+            }else if number==1833 && case.starts_with("family-wait") {
+                family_wait_selection_tests::prepare_wait(&mut guard, &database, case=="family-wait-restored").await;
+                guard.finish().unwrap();
             }else {
                 guard.hold_initial_acceptance(if number==1833 {"readiness_assessment_invalid"}else{"acceptance_contract_invalid"},if number==1833 {"await_readiness_input_change"}else{"await_acceptance_input_change"}).await.unwrap();guard.finish().unwrap();
             }
         }
         let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();let ready_id="fixture-owner/repo#1830";
-        if !case.starts_with("preview-") && !matches!(case.as_str(),"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
+        if !case.starts_with("preview-") && !matches!(case.as_str(),"family-wait"|"family-wait-restored"|"held-only"|"changed-source"|"changed-candidate"|"missing-context"|"upstream-only"|"changed-environment"|"physical-restored"|"physical-missing"|"semantic-native") {
             let controls=workflow::FreshIssueControls::open().unwrap();
             let issue=Issue {number:1830,title:"Correct retained widget rounding".into(),body:"Preserve exact rounding behavior.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
             let in_flight_preview=controls.unchanged_initial_hold(&repo,"fixture-owner/repo",&issue);
@@ -21580,11 +21583,11 @@ raise AssertionError(args)
             fault.execute("UPDATE workflow SET checkpoint=?2,pr=NULL WHERE id=?1",rusqlite::params![held_id,serde_json::to_string(&held_before.as_ref().unwrap().checkpoint).unwrap()]).unwrap();
         }
         let selected=match outcome.unwrap() {IssueSelection::Issue(issue)=>issue,IssueSelection::Report(_)=>panic!("eligible ordinary peer was starved")};
-        let expected=match case.as_str(){case if case.starts_with("corrupt-recovery-peer-")=>1830,"recovered"|"recovery-priority"=>1830,"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
+        let expected=match case.as_str(){case if case.starts_with("corrupt-recovery-peer-")=>1830,"recovered"|"recovery-priority"=>1830,"family-wait-restored"|"changed-source"|"changed-candidate"|"changed-environment"|"physical-restored"=>1833,_=>1829};
         assert_eq!(selected.number,expected,"{case}: real issue selector chose an unchanged hold ahead of eligible work");
         assert_eq!(store.snapshot(held_id).unwrap(),held_before);assert_eq!(store.snapshot(ready_id).unwrap(),ready_before);
         assert_eq!(store.events(held_id).unwrap(),held_events);assert_eq!(store.events(ready_id).unwrap(),ready_events);
-        assert_eq!(held_before.as_ref().unwrap().model_calls,u64::from(matches!(case.as_str(),"physical-restored"|"physical-missing"|"semantic-native")));assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
+        assert_eq!(held_before.as_ref().unwrap().model_calls,u64::from(case.starts_with("family-wait") || matches!(case.as_str(),"physical-restored"|"physical-missing"|"semantic-native")));assert_eq!(ready_before.unwrap().model_calls,0);assert!(!store.has_command_jobs().unwrap());
         let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_RECOVERED_SELECTION_CALLS").unwrap()).unwrap();
         assert!(!calls.contains("\"edit\"") && !calls.contains("\"comment\"") && !calls.contains("\"merge\""),"selection mutated remote state");
         if case=="physical-restored" {
@@ -21611,3 +21614,7 @@ mod observation_wake_tests;
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]
 mod ci_repair_tests;
+
+#[cfg(test)]
+#[path = "self_improve_family_wait_selection_tests.rs"]
+mod family_wait_selection_tests;

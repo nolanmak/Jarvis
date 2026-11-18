@@ -30,7 +30,7 @@ fn validate(wait: &Wait, workflow: &str) -> Result<()> {
     ensure!(wait.generation > 0, "invalid family wait generation");
     wait.validate_evidence(workflow)
 }
-fn latest(conn: &Connection, workflow: &str) -> Result<Option<Wait>> {
+pub(super) fn latest(conn: &Connection, workflow: &str) -> Result<Option<Wait>> {
     let row:Option<(String,i64)>=conn.query_row("SELECT payload,generation FROM workflow_event WHERE workflow=?1 AND kind='family_budget_wait' ORDER BY seq DESC LIMIT 1",
         [workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((raw, generation)) = row else {
@@ -181,6 +181,48 @@ pub(crate) fn current(conn: &Connection, workflow: &str, generation: i64, cp: &C
         .then_some(wait))
 }
 
+/// Same protected-input calculation for selection and claim; never a grant.
+pub(super) fn observe_wait(conn: &Connection, workflow: &str, generation: i64, wait: &Wait) -> Result<Option<Observation>> {
+    // Use a replacement only when a trusted service already published it for
+    // this generation. Never substitute a newly displayed policy for old intent.
+    let raw: Option<String> = if table(conn, "workflow_family_scope")? {
+        conn.query_row(
+            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+            params![workflow, generation],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    // Reconciliation alone may have advanced the generation. Historical scope
+    // is only an observation input; it never authorizes a new native dispatch.
+    let raw =
+        if raw.is_none() && generation != wait.generation && table(conn, "workflow_family_scope")? {
+            conn.query_row(
+                "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
+                params![workflow, wait.generation],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            raw
+        };
+    let scope = raw
+        .and_then(|raw| serde_json::from_str::<Scope>(&raw).ok())
+        .filter(|scope| scope.schema_version == 1 && !scope.verified_authority_ref.is_empty());
+    let observation = if let Some(scope) = scope {
+        observe_scope(conn, workflow, &scope, 1)?
+    } else if let Some(known) = &wait.observation {
+        let mut status = observe(conn, workflow, &known.intent, 1)?;
+        status.block(observation::Reason::FamilyExecutionScopeUnknown);
+        status
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(observation))
+}
+
 /// Budget-only scheduling. A free reconciliation may rotate the lease without
 /// resolving the wait, so match its checkpoint rather than only its generation.
 /// Final native dispatch still requires a fresh, fully verified execution frame.
@@ -202,41 +244,7 @@ pub(crate) fn prepare_productive_claim(
     {
         return Ok(true);
     }
-    // Use a replacement only when a trusted service already published it for
-    // this generation. Never substitute a newly displayed policy for old intent.
-    let raw: Option<String> = if table(tx, "workflow_family_scope")? {
-        tx.query_row(
-            "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
-            params![workflow, generation],
-            |r| r.get(0),
-        )
-        .optional()?
-    } else {
-        None
-    };
-    // Reconciliation alone may have advanced the generation. Historical scope
-    // is only an observation input; it never authorizes a new native dispatch.
-    let raw =
-        if raw.is_none() && generation != wait.generation && table(tx, "workflow_family_scope")? {
-            tx.query_row(
-                "SELECT payload FROM workflow_family_scope WHERE workflow=?1 AND generation=?2",
-                params![workflow, wait.generation],
-                |r| r.get(0),
-            )
-            .optional()?
-        } else {
-            raw
-        };
-    let scope = raw
-        .and_then(|raw| serde_json::from_str::<Scope>(&raw).ok())
-        .filter(|scope| scope.schema_version == 1 && !scope.verified_authority_ref.is_empty());
-    let observation = if let Some(scope) = scope {
-        observe_scope(tx, workflow, &scope, 1)?
-    } else if let Some(known) = &wait.observation {
-        let mut status = observe(tx, workflow, &known.intent, 1)?;
-        status.block(observation::Reason::FamilyExecutionScopeUnknown);
-        status
-    } else {
+    let Some(observation) = observe_wait(tx, workflow, generation, &wait)? else {
         return Ok(false);
     };
     if !observation.ready() {
