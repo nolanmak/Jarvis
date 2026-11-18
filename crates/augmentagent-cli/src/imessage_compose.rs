@@ -59,6 +59,12 @@ pub(crate) struct ComposeArgs {
     /// Resolve and print; store nothing. Same as omitting `--post`.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    /// #1640 — propose a send time ("tomorrow 9am", an RFC 3339 time, …).
+    /// Requires `--post`: the card shows "[sends: <local time>]" and Approve
+    /// arms the schedule instead of sending now, as `gmail compose
+    /// --send-at` does. The text is queued for the Mac when it comes due.
+    #[arg(long)]
+    pub send_at: Option<String>,
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub json: bool,
 }
@@ -482,6 +488,7 @@ pub(crate) async fn run(
     let body = crate::read_body(args.body.clone(), args.body_file.clone())?;
     let config = ComposeConfig::from_env(wiki_root);
     let dry_run = args.dry_run || !args.post;
+    let send_at_ms = parse_send_at(args.send_at.as_deref(), args.post)?;
     match compose(store, &config, &args.to, &body, dry_run) {
         ComposeOutcome::Preview { recipient, target } => {
             if args.json {
@@ -512,6 +519,11 @@ pub(crate) async fn run(
             superseded,
             ..
         } => {
+            // #1640 — the proposal rides on the still-pending row, before the
+            // card is drawn, so the card shows it and Approve arms it.
+            if let Some(at_ms) = send_at_ms {
+                store.set_action_scheduled_at(&action_id, Some(at_ms))?;
+            }
             let posted = post_card_now(store, &action_id).await;
             if posted.is_err() {
                 // Release the initial posting reservation to the ordinary queue.
@@ -573,6 +585,41 @@ pub(crate) async fn run(
 /// Post the card from this process, as `gmail compose --post` does (#352),
 /// and mark it the active nudge so the daemon's serial queue does not post a
 /// duplicate. Needs `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`.
+/// #1640 — `--send-at`, parsed and checked up front: it needs `--post`
+/// (nothing is stored without it) and must clear the minimum lead.
+fn parse_send_at(raw: Option<&str>, post: bool) -> anyhow::Result<Option<i64>> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(post, "--send-at needs --post: nothing is stored without it");
+    let now = chrono::Local::now();
+    let at_ms = augmentagent_channel_core::timeparse::parse_send_at(raw, now)
+        .map_err(|e| anyhow::anyhow!("--send-at: {e}"))?;
+    augmentagent_channel_core::timeparse::validate_send_at(at_ms, now.timestamp_millis())
+        .map_err(|e| anyhow::anyhow!("--send-at: {e}"))?;
+    Ok(Some(at_ms))
+}
+
+#[cfg(test)]
+mod send_at_tests {
+    use super::parse_send_at;
+
+    /// #1640 — `--send-at` needs `--post`, parses natural times, and is
+    /// held to the minimum lead; omitted means send on Approve.
+    #[test]
+    fn send_at_is_checked_before_anything_is_stored() {
+        assert_eq!(parse_send_at(None, true).unwrap(), None);
+        assert_eq!(parse_send_at(Some("  "), false).unwrap(), None);
+        let msg = parse_send_at(Some("in 2h"), false).unwrap_err().to_string();
+        assert!(msg.contains("--post"), "{msg}");
+        let at = parse_send_at(Some("in 2h"), true).unwrap().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!((at - now - 7_200_000).abs() < 120_000, "{at} vs {now}");
+        assert!(parse_send_at(Some("yesterday"), true).is_err(), "past times refused");
+        assert!(parse_send_at(Some("not a time"), true).is_err());
+    }
+}
+
 fn pending_compose_card(
     store: &Store,
     action_id: &str,
@@ -590,8 +637,14 @@ fn pending_compose_card(
         .draft_body
         .as_deref()
         .context("compose draft missing")?;
+    // #1640 — Approve on this card arms a schedule: the owner must see when
+    // it will send before clicking. Display-only, like Gmail's marker.
+    let shown = match store.action_scheduled_at(action_id)? {
+        Some(at_ms) => format!("{draft}\n[sends: {}]", crate::format_local_send_time(at_ms)),
+        None => draft.to_string(),
+    };
     Ok(augmentagent_approval_discord::approval_message(
-        action_id, &row.email, draft, 0,
+        action_id, &row.email, &shown, 0,
     ))
 }
 

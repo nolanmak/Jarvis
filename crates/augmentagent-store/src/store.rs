@@ -7587,6 +7587,29 @@ impl Store {
     /// (engine fire-time guard, reconcile scheduled pass) bound the reply
     /// check to the row's own arming moment first. Notice pointers are left
     /// intact so the notice message can still be cleaned up afterwards.
+    /// #1640 — armed schedules on `thread_id` whose `emails.kind` is not
+    /// `excluded_kind`, with the moment each was armed. The iMessage replier
+    /// cancels these when the owner answers the thread by hand.
+    pub fn scheduled_actions_for_thread_except_kind(
+        &self,
+        thread_id: &str,
+        excluded_kind: &str,
+    ) -> StoreResult<Vec<(String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id, COALESCE(a.status_updated_at, a.createdAt) FROM actions a \
+             LEFT JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND a.status = 'scheduled' \
+               AND COALESCE(e.kind, '') != ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![thread_id, excluded_kind], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn mark_scheduled_superseded(
         &self,
         action_id: &str,

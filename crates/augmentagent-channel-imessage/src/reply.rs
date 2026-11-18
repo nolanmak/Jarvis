@@ -275,6 +275,27 @@ impl ImessageReplier {
                         },
                         Err(error) => warn!("compose manual-activity lookup failed: {error}"),
                     }
+                    // #1640 — a *scheduled* reply goes stale the same way once
+                    // the owner answers by hand after arming it. Scheduled
+                    // composes are kept, for the #1635 reason below.
+                    match self.store.scheduled_actions_for_thread_except_kind(&thread, COMPOSE_KIND) {
+                        Ok(rows) => for (id, armed_at) in rows {
+                            if split_own_entries_since(&self.store, delta, Some(armed_at)).1 == 0 { continue; }
+                            match self.store.mark_scheduled_superseded(
+                                &id,
+                                "superseded: you replied by hand after scheduling",
+                                "imessage-manual-reply",
+                            ) {
+                                Ok(true) => stats.superseded += 1,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(action_id=%id, "cancelling a scheduled reply after a manual reply failed: {e}");
+                                    stats.errors += 1;
+                                }
+                            }
+                        },
+                        Err(e) => warn!("scheduled reply lookup failed: {e}"),
+                    }
                     // #1635 — a pending *compose* (a text the owner started)
                     // is not answered by the owner texting something else;
                     // only drafted replies go stale.
@@ -1045,6 +1066,31 @@ mod tests {
         rep.handle_deltas(&[by_hand(10, "fourth by hand")]).await;
         rep.handle_deltas(&[by_hand(11, "fifth by hand")]).await;
         assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose.clone(), compose]);
+    }
+
+    /// #1640: the owner answers a thread by hand after scheduling a reply
+    /// on it: the scheduled reply is stale and is cancelled. A scheduled
+    /// compose (a text the owner started) is kept, the #1635 rule.
+    #[tokio::test]
+    async fn a_manual_reply_cancels_a_scheduled_reply_but_not_a_scheduled_compose() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let d1 = one_to_one(&[(PHONE, "free tonight?")]);
+        ingest(&f.store, &d1);
+        let rep = replier(&f, Scripted::new(&[REPLY, "yes"]));
+        rep.handle_deltas(&[d1]).await;
+        let reply = pending(&f.store).remove(0);
+        let compose = pending_compose(&f.store, "happy birthday!");
+        let at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        for id in [&reply, &compose] {
+            assert!(f.store.schedule_action(id, at, "test").unwrap());
+        }
+        let mut d2 = one_to_one(&[("me", "typed by hand")]);
+        d2.new_entries[0].1.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        rep.handle_deltas(&[d2]).await;
+        let status = |id: &str| f.store.get_action_with_email(id).unwrap().unwrap().action.status;
+        assert_eq!(status(&reply), "superseded");
+        assert_eq!(status(&compose), "scheduled");
     }
 
     #[tokio::test]

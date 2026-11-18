@@ -15029,11 +15029,12 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 }
 
-/// #1291 — the shared scheduler hands due Slack contact sends here.
+/// #1291 — the shared scheduler hands due Slack contact sends here, and
+/// (#1640) due iMessage sends.
 #[async_trait]
 impl augmentagent_channel_email::ScheduledPlatformSender for ReplyApprover {
     fn handles(&self, platform: &str) -> bool {
-        platform == augmentagent_channel_slack::PLATFORM
+        platform == augmentagent_channel_slack::PLATFORM || platform == imessage_send::PLATFORM
     }
 
     /// The due-gated claim and the same send as an approval
@@ -15050,6 +15051,27 @@ impl augmentagent_channel_email::ScheduledPlatformSender for ReplyApprover {
         let Some(action) = self.handle_load(action_id) else {
             return PlatformFire::LostClaim;
         };
+        if action.email.platform == imessage_send::PLATFORM {
+            // Claimed due-gated, re-checked, then one outbox row. A refusal
+            // found after the claim is already a retry-exempt error.
+            return match self
+                .send_imessage(action_id, action, imessage_send::ImessageClaim::Due { now_ms })
+                .await
+            {
+                ApprovalActionOutcome::Approved => PlatformFire::Sent,
+                ApprovalActionOutcome::Failed { message } => {
+                    let still_armed = self
+                        .handle_load(action_id)
+                        .is_some_and(|a| a.action.status == "scheduled");
+                    if still_armed {
+                        PlatformFire::NotStarted(message)
+                    } else {
+                        PlatformFire::Failed(message)
+                    }
+                }
+                _ => PlatformFire::LostClaim,
+            };
+        }
         let out = self
             .send_slack(
                 action,
@@ -15969,7 +15991,9 @@ impl ReplyApprover {
         // run_approve.
         // #1291 — Slack contact messages are scheduled too: the engine
         // hands them to the Slack sender (`ScheduledPlatformSender`).
+        // #1640 — and iMessage, queued for the Mac sender when due.
         let slack = action.email.platform == augmentagent_channel_slack::PLATFORM;
+        let imessage = action.email.platform == imessage_send::PLATFORM;
         let unsupported = matches!(
             action.email.platform.as_str(),
             "discord" | "telegram" | "github" | "gcal"
@@ -15977,10 +16001,16 @@ impl ReplyApprover {
             || is_linkedin_email(&action.email);
         if unsupported {
             return ApprovalActionOutcome::Failed {
-                message: "scheduling is only supported for email drafts and Slack messages".into(),
+                message: "scheduling is only supported for email drafts, Slack messages and iMessages".into(),
             };
         }
-        if slack {
+        if imessage {
+            // Refuse before arming what could never be sent: off, no
+            // target, not allowed to receive sends, or an empty draft.
+            if let Err(message) = self.imessage_preflight(&action) {
+                return ApprovalActionOutcome::Failed { message };
+            }
+        } else if slack {
             // Refuse before arming what could never be sent.
             if let Err(message) =
                 augmentagent_channel_slack::contact::reply_target(&self.store, &action.email)
@@ -16071,6 +16101,20 @@ impl ReplyApprover {
     /// through `pending` — that would re-enter the nudge queue and, after
     /// #502, re-arm the proposal.
     async fn run_send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        // #1640 — a scheduled iMessage: claimed from `scheduled`, re-checked
+        // and queued for the Mac sender, as the engine would at fire time.
+        if let Some(action) = self
+            .handle_load(action_id)
+            .filter(|a| a.email.platform == imessage_send::PLATFORM)
+        {
+            let outcome = self
+                .send_imessage(action_id, action, imessage_send::ImessageClaim::SendNow)
+                .await;
+            if !matches!(outcome, ApprovalActionOutcome::AlreadyResolved { .. }) {
+                self.delete_stored_notice(action_id).await;
+            }
+            return outcome;
+        }
         // #1291 — a Slack contact send: the contact path claims it from
         // `scheduled` and sends it with its ledger, as an approval would.
         if let Some(action) = self
