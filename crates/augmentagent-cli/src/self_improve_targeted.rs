@@ -928,7 +928,7 @@ mod tests {
             "https://github.com/owner/repo.git",
         ]);
         let gh = root.join("gh.py");
-        std::fs::write(
+        augmentagent_test_support::write_executable(
             &gh,
             r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -1055,7 +1055,7 @@ else:raise Exception('unexpected request '+repr(a))
             assert!(std::process::Command::new("git").args(args).current_dir(root).output().unwrap().status.success());
         }
         let gh = root.join("gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())

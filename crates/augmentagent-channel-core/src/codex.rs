@@ -622,15 +622,11 @@ impl Reasoner for CodexCliReasoner {
 mod tests {
     use super::*;
     use crate::providers::ModelTier;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
     fn stub(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
         let path = dir.path().join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/usr/bin/env bash").unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        drop(f);
+        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
@@ -1730,7 +1726,8 @@ exec python3 -I - "$@" <<'PY'
 import json, os, select, subprocess, sys, time
 spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
 args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
-bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+observer = __GREP_TIMEOUT_OBSERVER__
+bridge = subprocess.Popen(['python3', '-I', '-c', observer, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 pending = b''
 def call(identifier, method, params, seconds):
     global pending
@@ -1755,7 +1752,8 @@ if reply is None:
     bridge.kill()
 bridge.stdin.close()
 bridge.wait()
-report = json.dumps({'grep_seconds': elapsed, 'reply': reply})
+audit = [json.loads(line.split('=', 1)[1]) for line in bridge.stderr.read().decode().splitlines() if line.startswith('GREP_TIMEOUT_AUDIT=')]
+report = json.dumps({'grep_seconds': elapsed, 'reply': reply, 'matchers': audit[-1] if audit else []})
 print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': report}}), flush=True)
 PY
 "##;
@@ -1770,7 +1768,9 @@ PY
         std::fs::create_dir(&workspace).unwrap();
         // Forty characters of backtracking bait for Python's re engine.
         std::fs::write(workspace.join("bait.txt"), format!("{}b\n", "a".repeat(40))).unwrap();
-        let bin = stub(&dir, "fake-codex-grep", FAKE_CODEX_PATHOLOGICAL_GREP);
+        let observer = include_str!("../../../scripts/tests/fixtures/grep_timeout_observer.py");
+        let fixture = FAKE_CODEX_PATHOLOGICAL_GREP.replace("__GREP_TIMEOUT_OBSERVER__", &serde_json::to_string(observer).unwrap());
+        let bin = stub(&dir, "fake-codex-grep", &fixture);
         let gate = std::sync::Arc::new(crate::cli_gate::CliGate::new(1));
         let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: gate.clone(), usage_log: crate::token_usage::UsageLogger::global() };
         let mut options = opts();
@@ -1783,7 +1783,17 @@ PY
         assert_eq!(report["reply"]["result"]["isError"], true, "{report}");
         assert!(report["reply"]["result"]["content"][0]["text"].as_str().unwrap_or_default()
             .contains("time limit"), "{report}");
-        assert!(report["grep_seconds"].as_f64().unwrap() < 2.0, "{report}");
+        // End-to-end elapsed time includes Python startup and host scheduling.
+        // Observe the actual wait deadline and kill/reap outcome instead.
+        let matchers = report["matchers"].as_array().unwrap();
+        assert_eq!(matchers.len(), 1, "{report}");
+        assert_eq!(matchers[0]["timed_waits"], serde_json::json!([1.5]), "{report}");
+        assert_eq!(matchers[0]["expired"], true, "{report}");
+        assert_eq!(matchers[0]["killed"], true, "{report}");
+        assert_eq!(matchers[0]["reaped"], true, "{report}");
+        assert_eq!(matchers[0]["returncode"], -9, "{report}");
+        // Outer liveness watchdog only: 20 s allows CLI/bridge startup,
+        // scheduling and cleanup; the 1.5 s matcher budget is asserted above.
         assert!(held < std::time::Duration::from_secs(20), "gate slot held for {held:?}");
         assert_eq!(gate.in_flight(), 0);
         let next = gate.acquire_timed("codex", "synthetic-next-call", std::time::Duration::from_millis(500)).await;

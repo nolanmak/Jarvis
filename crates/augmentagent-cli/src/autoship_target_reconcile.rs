@@ -126,7 +126,7 @@ mod tests {
             return;
         }
         let dir=tempfile::tempdir().unwrap();let root=dir.path();let gh=root.join("gh.py");
-        std::fs::write(&gh,r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_TERMINAL_FIXTURE']);s=json.loads((root/'scenario.json').read_text());a=sys.argv[1:]
 if a[:2]==['repo','view']:print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
@@ -186,7 +186,7 @@ else:raise Exception('unexpected GitHub call '+repr(a))
             return;
         }
         let dir=tempfile::tempdir().unwrap();let root=dir.path().canonicalize().unwrap();let gh=root.join("gh.py");
-        std::fs::write(&gh,r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_CLOSED_FENCE_FIXTURE']);s=json.loads((root/'scenario.json').read_text());a=sys.argv[1:]
 if a[:2]==['repo','view']:print(s['permission'] if 'viewerPermission' in a else 'owner/repo')

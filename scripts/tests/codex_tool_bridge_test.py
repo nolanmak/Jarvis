@@ -2394,19 +2394,23 @@ class BoundedGrepTests(unittest.TestCase):
             (self.root / relative).write_text(content)
         (self.root / 'bait.txt').unlink()
 
-    def start_bridge(self):
+    def start_bridge(self, observe_matcher=False):
         import os
         import signal
-        process = subprocess.Popen([sys.executable, '-I', str(SPEC.origin), str(self.config)],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        args = [sys.executable, '-I', str(SPEC.origin), str(self.config)]
+        if observe_matcher:
+            observer = Path(__file__).with_name('fixtures') / 'grep_timeout_observer.py'
+            args = [sys.executable, '-I', '-c', observer.read_text(), str(SPEC.origin), str(self.config)]
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE if observe_matcher else subprocess.DEVNULL)
         def stop():
-            try:
-                os.kill(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if process.poll() is None:
+                process.kill()
             process.wait()
             process.stdin.close()
             process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
         self.addCleanup(stop)
         self.pending = b''
         return process
@@ -2431,27 +2435,30 @@ class BoundedGrepTests(unittest.TestCase):
         line, self.pending = self.pending.split(b'\n', 1)
         return json.loads(line)
 
-    def test_pathological_pattern_returns_within_two_seconds_and_bridge_keeps_serving(self):
-        import time
-        process = self.start_bridge()
+    def test_pathological_pattern_is_killed_reaped_and_bridge_keeps_serving(self):
+        process = self.start_bridge(observe_matcher=True)
         self.send(process, {'jsonrpc': '2.0', 'id': 1, 'method': 'ping'})
         self.assertEqual(self.receive(process, 10)['id'], 1)
-        started = time.monotonic()
         self.send(process, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
             'name': 'Grep', 'arguments': {'pattern': self.PATHOLOGICAL}}})
         self.send(process, {'jsonrpc': '2.0', 'id': 3, 'method': 'ping'})
+        # Existing transport watchdog: 5 s leaves 3.5 s beyond the matcher
+        # wait for scheduling/startup/reap. Check the exact wait budget below.
         reply = self.receive(process, 5)
-        elapsed = time.monotonic() - started
         self.assertIsNotNone(reply, 'bridge stalled on a pathological Grep pattern')
-        self.assertLess(elapsed, 2.0)
         self.assertEqual(reply['id'], 2)
         self.assertTrue(reply['result']['isError'])
         text = reply['result']['content'][0]['text']
-        # Matching ran out, so the advice is about the pattern, not the path.
+        # Advice depends on CPU availability; both outcomes are real timeouts.
         self.assertIn('time limit', text)
-        self.assertIn('simplify the pattern', text)
-        self.assertNotIn('narrow the path', text)
         self.assertEqual(self.receive(process, 2), {'jsonrpc': '2.0', 'id': 3, 'result': {}})
+        process.stdin.close()
+        process.wait(timeout=10)
+        audits = [json.loads(line.partition('=')[2]) for line in process.stderr.read().decode().splitlines()
+                  if line.startswith('GREP_TIMEOUT_AUDIT=')]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0], [dict(timed_waits=[1.5], expired=True,
+                                        killed=True, reaped=True, returncode=-9)])
 
     def test_parent_death_during_a_long_match_ends_the_bridge_and_its_matcher(self):
         import os
@@ -2598,6 +2605,37 @@ sys.stdin.readline()
         self.assertIn('scan limit', note)
         self.assertIn('2 files', note)
         self.assertIn('narrow the path', note)
+
+    def test_match_deadline_kills_and_reaps_before_returning_with_a_controlled_clock(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        now = [100.0]
+        events = []
+        class Matcher:
+            dead = False
+            def wait(self, timeout=None):
+                events.append(('wait', timeout, now[0]))
+                if timeout is not None:
+                    now[0] += timeout
+                    raise subprocess.TimeoutExpired('matcher', timeout)
+                self.dead = True
+                return -9
+            def kill(self):
+                events.append(('kill', now[0]))
+            def poll(self):
+                return -9 if self.dead else None
+        policy = bridge.Policy(json.loads(self.config.read_text()))
+        self.addCleanup(policy.close)
+        with patch.object(bridge.subprocess, 'Popen', return_value=Matcher()), \
+                patch.object(bridge, 'MATCH_CLOCK', lambda: now[0]), \
+                patch.object(bridge, 'CHILD_RUSAGE', lambda: SimpleNamespace(ru_utime=0, ru_stime=0)):
+            reply = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+                'name': 'Grep', 'arguments': {'pattern': self.PATHOLOGICAL}}})
+        self.assertTrue(reply['isError'], reply)
+        self.assertIn('time limit', reply['content'][0]['text'])
+        self.assertEqual(now[0], 101.5)
+        self.assertEqual(events[:3], [('wait', 1.5, 100.0), ('kill', 101.5),
+                                  ('wait', None, 101.5)])
 
     def matching_timeout_text(self, child_cpu_seconds):
         """Force a matching timeout; report `child_cpu_seconds` over 1.5 s of wall clock."""

@@ -24,6 +24,23 @@ pub(crate) enum Operation {
         #[arg(long)] owner_dm:bool,
         #[arg(long)] json:bool,
     },
+    /// Record an uncertain progress event as delivered from fetched evidence.
+    Resolve {
+        /// WORKFLOW:SEQUENCE
+        #[arg(long)] event:String,
+        #[arg(long)] message:u64,
+        #[arg(long)] json:bool,
+    },
+    /// Retry undelivered progress. `--workflow` only reschedules definitely
+    /// unsent events; `--event --allow-duplicate --request-id` resends one
+    /// uncertain event once and records the duplicate risk.
+    Retry {
+        #[arg(long,required_unless_present="event",conflicts_with="event")] workflow:Option<String>,
+        #[arg(long,requires_all=["allow_duplicate","request_id"])] event:Option<String>,
+        #[arg(long)] allow_duplicate:bool,
+        #[arg(long)] request_id:Option<String>,
+        #[arg(long)] json:bool,
+    },
 }
 
 fn snowflake(value:&Value)->Result<u64> {
@@ -97,6 +114,8 @@ pub(crate) async fn run(args:&Args)->i32 {
     let (result,json_output)=match &args.operation {
         Operation::Rebind {workflow,channel,json,..}=>(apply_rebind(workflow,*channel).await,*json),
         Operation::Configure {repo,channel,json,..}=>(apply_configure(repo,*channel).await,*json),
+        Operation::Resolve {event,message,json}=>(super::delivery_recovery::resolve(event,*message).await,*json),
+        Operation::Retry {workflow,event,allow_duplicate,request_id,json}=>(super::delivery_recovery::retry(workflow.as_deref(),event.as_deref(),*allow_duplicate,request_id.as_deref()).await,*json),
     };
     let (code,value)=match result {
         Ok(value)=>(0,value),Err(error)=>(3,json!({"schema_version":1,"accepted":false,"complete":false,

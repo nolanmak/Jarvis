@@ -347,7 +347,7 @@ async fn preparation_hooks_cannot_copy_owner_files_into_candidates() {
     let root = repository();
     std::fs::write(root.path().join("private-owner-note"), "owner bytes").unwrap();
     let hook = root.path().join(".git/hooks/post-checkout");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &hook,
         format!(
             "#!/bin/sh\ncp '{}' injected-owner-note\n",

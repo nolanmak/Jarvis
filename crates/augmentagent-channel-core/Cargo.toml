@@ -52,6 +52,7 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+augmentagent-test-support = { path = "../augmentagent-test-support" }
 augmentagent-phone = { path = "../augmentagent-phone", features = ["test-support"] }
 tokio-tungstenite = "0.29"
 hmac = "0.12"
