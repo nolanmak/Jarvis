@@ -142,6 +142,11 @@ mod acceptance;
 mod alignment;
 #[path = "self_improve_push_destination.rs"]
 mod push_destination;
+#[path = "self_improve_repository_identity.rs"]
+mod repository_identity;
+#[cfg(test)]
+#[path = "self_improve_repository_identity_tests.rs"]
+mod repository_identity_tests;
 #[path = "self_improve_publication.rs"]
 mod publication;
 #[cfg(test)]
@@ -8411,8 +8416,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // advance without deleting this candidate or its compiler fixture paths.
     let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
-    recovery::prepare(repo_root, &worktree, &branch).await?;
     let repository = workflow::canonical_repository(repo_root).await?;
+    let id = crate::autoship_workflow::workflow_id(&repository, issue.number)?;
+    recovery::prepare_issue_at(&workflow::path(), repo_root, &worktree, &id, &repository, &branch).await?;
     let upstream_main = workflow::remote_main_head(&worktree,&repository).await?;
     let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
     let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;

@@ -67,8 +67,9 @@ fn quote(value:&str)->String {format!("'{}'",value.replace('\'',"'\\''"))}
 fn check_destination(repository:&str,destination:&str)->Result<Option<PathBuf>> {
     ensure!(!destination.is_empty() && destination.len()<=16384
         && !destination.bytes().any(|byte|byte.is_ascii_control()),"invalid Push destination envelope");
-    if let Some(identity)=crate::wiki_sync_remote(destination)? {
-        ensure!(identity.eq_ignore_ascii_case(repository),"Push destination differs from protected repository");
+    let policy=repository_identity::Policy::from_env()?;
+    if let Some(identity)=policy.origin(destination)? {
+        ensure!(identity==policy.canonical(repository)?,"Push destination differs from protected repository");
         return Ok(None);
     }
     let path=if destination.starts_with("file://") {
