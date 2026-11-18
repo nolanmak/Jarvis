@@ -21,10 +21,8 @@ on:
       - 'docs/macos-parity-inventory.json'
       - 'scripts/tests/model_router*'
       - 'scripts/tests/runpod_adapter_install_test.py'
-      - 'scripts/tests/run_model_router_image_fixture.py'
       - 'scripts/tests/verify_codex_redirect.py'
       - 'scripts/tests/test_verify_codex_redirect.py'
-      - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
       - "scripts/ci-contract.py"
       - "scripts/ci-contract.json"
@@ -54,10 +52,8 @@ on:
       - 'docs/macos-parity-inventory.json'
       - 'scripts/tests/model_router*'
       - 'scripts/tests/runpod_adapter_install_test.py'
-      - 'scripts/tests/run_model_router_image_fixture.py'
       - 'scripts/tests/verify_codex_redirect.py'
       - 'scripts/tests/test_verify_codex_redirect.py'
-      - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
       - "scripts/ci-contract.py"
       - "scripts/ci-contract.json"
@@ -128,19 +124,6 @@ jobs:
 
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/dashboard/6"
 
-
-  pinned-gateway:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Build pinned 9Router with the reconciliation patch
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/pinned-gateway/1"
-
-      - name: Exercise account failover, request identity and media refusal
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/pinned-gateway/2"
 
   codex-redirect:
     runs-on: ubuntu-latest

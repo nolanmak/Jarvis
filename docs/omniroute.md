@@ -73,7 +73,7 @@ keys/tokens, reinstall npm packages, or restart an already healthy service.
 
 `model-router.json` is created with `gateway: omniroute`, **`mode: direct`**, and
 `base_url: http://127.0.0.1:20128/v1`. Compatible existing direct-mode settings
-are preserved. Existing automatic routing or a 9Router configuration is refused
+are preserved. Existing automatic routing or a legacy gateway configuration is refused
 rather than silently redirected. Initial model aliases follow the existing
 router installer defaults; connecting accounts and selecting supported routes
 remain separate setup steps.
@@ -148,8 +148,8 @@ scripts/install-omniroute.sh --uninstall --purge
 ```
 
 Uninstall requires an owned installation receipt. It never changes the host's
-Node installation or unrelated services. Removal of the legacy 9Router scripts
-and sidecar is tracked separately in #1660, after #1656 merges.
+Node installation or unrelated services. The obsolete gateway installer and sidecar sources were removed by #1660;
+see the retirement note in [model-router.md](model-router.md).
 
 ## Validation
 

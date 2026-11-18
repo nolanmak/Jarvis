@@ -1,156 +1,60 @@
-# Model accounts through 9Router
+# Optional OmniRoute gateway
 
-For the optional pinned OmniRoute installer (routing stays direct), see
-[OmniRoute installation](omniroute.md). Legacy 9Router removal is tracked in #1660.
+Native CLI accounts are the default. OmniRoute is an optional account gateway;
+installing it does not turn routing on. Production remains in `mode: direct`.
+Follow [the pinned Linux installer, prerequisites and rollback procedure](omniroute.md).
+The installer is an explicit operator command, not part of daemon startup or
+normal updates. The macOS service installer is deferred.
 
-The Rust agent's existing Claude and Codex CLI adapters can route inference through
-a local 9Router service. Their tool permissions, constrained Codex MCP bridge,
-approval hooks, handoff journals, and provider attribution remain in the agent.
-9Router owns account login, token refresh, priority, and account cooldowns.
+## Routing and credentials
 
-## Install and connect
+`$XDG_CONFIG_HOME/augmentagent/model-router.json` (normally
+`~/.config/augmentagent/model-router.json`) chooses the gateway and mode.
+`AUGMENTAGENT_MODEL_ROUTER_CONFIG` can select another owner-private path.
+The config contains `gateway: omniroute`, `mode: direct`, a loopback `/v1`
+base URL and the inference API key. The mode values `auto`, `claude` and
+`codex` are explicit operator choices. Do not set them during installation,
+rollout, timer activation, or health recovery.
 
-As the user who runs the agent, on Linux or macOS:
+Service secrets are in the system keyring and a mode-0600 `omniroute.env`;
+management tokens are distinct from the inference key. Data lives outside the
+repository under `$XDG_DATA_HOME/augmentagent/omniroute`. Secrets, account
+tokens and database backups never belong in a wiki mirror or source checkout.
+The default service is `augmentagent-omniroute.service`, headless and bound to
+127.0.0.1:20128 only. Public tunnels are disabled.
 
-```sh
-python3 scripts/install-model-router.py
-```
+A reasoner call snapshots its routing config. Changes affect the next call,
+while an in-flight call retains its route. Claude models stay within `cc/…`
+and Codex models within `cx/…`; a gateway account name does not establish
+independent reviewer identity. Independent review stays on native transport.
+Global compression, Caveman and RTK are disabled by the installer.
 
-The installer requires Node.js 22+, npm, Git, Python 3, and either systemd user services on Linux or a logged-in launchd user session on macOS. It pins
-9Router to `17c4cc76877bd1755030a8414f8d0083f48dcccf` (0.5.75), installs dependencies
-using the committed lockfile, builds its standalone server, and starts
-`augmentagent-model-router.service` on Linux or `com.nolanmak.augmentagent.model-router` on macOS, bound to **127.0.0.1:20128**. The macOS LaunchAgent reads its owner-private credential file through a Python launcher; the plist contains paths and public settings only. Install both the Claude
-and Codex CLIs for the corresponding routes. Re-running the installer preserves
-accounts, API keys and the selected route. `--built-source PATH` can reuse an
-already built checkout at the pinned commit during local development. The
-installer applies `sidecars/9router/runpod-reconciliation.patch` before building;
-a supplied built source must already contain it. The service uses a distinct
-runtime directory for this patched version. For Docker, run
-`bash scripts/build-model-router-image.sh` to build
-`jarvis-9router:0.5.75-runpod-5` from the same source and dependency lock.
+## Operator workflow and release gates
 
-After deploying this agent version, open **Settings → Models & accounts**:
+Use `scripts/install-omniroute.sh` only after reviewing its prerequisites.
+It verifies `scripts/omniroute.pin`, provisions private credentials, checks
+loopback health, and leaves routing direct. `--upgrade` takes a supported CLI
+backup and restores the prior package/data after failed health.
+`--uninstall` retains data; `--uninstall --purge` is an explicit destructive
+choice for owned state. See [the complete commands](omniroute.md).
 
-1. Choose **Connect Claude** or **Connect Codex**, then open the sign-in link.
-2. Sign in with the account you want. For another account, use a private browser
-   window or switch accounts on the provider's sign-in screen.
-3. Paste the returned authorization code (Claude, including `#state`) or complete
-   callback address (Codex) into the connection form. Codex's localhost callback
-   may show a connection error when the browser is on another machine; its URL
-   still contains the code needed here. No callback port needs to be exposed.
-4. Repeat for every account. Lower priority numbers are tried first. Disable other
-   accounts for that provider if you want to use one specific account only.
-   Enable the replacement first: the dashboard rejects disabling the last active
-   account required by the current route. Switch to direct mode to disable them all.
-5. Select **Claude accounts only**, **Codex accounts only**, or **Auto — Claude,
-   then Codex**, and save. Auto requires an enabled account for both providers.
+Gateway operations (#1665), health polling and the opt-in signed receiver
+(#1658), the dashboard adapter (#1657), and end-to-end tool/capability smoke
+(#1659) are separate delivery gates. An installer health check or a model
+catalog entry does not prove end-to-end tool use. Keep routing direct until
+those gates pass. Runpod support remains deferred under #1661.
 
-The initial route is **Existing CLI accounts (9Router off)**. A route change takes
-effect on the next call; each in-flight call keeps one configuration snapshot
-through its fallback attempts. After the first installation, restart/deploy the
-agent once so it registers both gateway adapters; subsequent account, route, and
-model changes do not require a restart. Direct mode uses the original
-`AUGMENTAGENT_REASONER_CHAIN`; gateway Auto is explicitly Claude then Codex.
-
-Quality and fast model IDs must be available to your accounts. The defaults
-match this agent's existing defaults; availability still needs a live provider
-smoke test after sign-in. Claude routes accept only `cc/…` models and Codex routes
-only `cx/…`. Cross-provider 9Router combos are intentionally not accepted: the
-agent's independent-review provenance must identify the actual model provider.
-
-## Storage and boundaries
-
-Configuration is stored at
-`$XDG_CONFIG_HOME/augmentagent/model-router.json` (default
-`~/.config/augmentagent/model-router.json`). Override with
-`AUGMENTAGENT_MODEL_ROUTER_CONFIG` in both the daemon and dashboard environment.
-The dashboard atomically writes mode-0600 files. Public responses and templates
-omit API keys, dashboard passwords and provider tokens. Codex receives its gateway
-key through a dedicated environment variable, never a command-line argument.
-The upstream dashboard password and JWT secret are in mode-0600 `9router.env`.
-Account tokens live in 9Router's private data directory under
-`$XDG_DATA_HOME/augmentagent/9router/data`.
-
-Local browsers open the dashboard without entering an API key. Remote browsers
-and machine clients still require authentication. Socket, browser Fetch Metadata,
-and Host/Origin checks protect local access; forwarded requests require login.
-OAuth verifiers are held server-side for ten minutes, keyed by a random session
-ID. Each exchange validates provider, callback and state and consumes its session
-once. Restarting the dashboard requires restarting unfinished login flows. New flows
-resolve the current router configuration; pending flows retain their original
-gateway client so changing endpoints does not send an exchange to another server.
-
-The installer disables cloud sync, tunnels, prompt rewriting, compression and
-cross-provider capacity adapters. The CLI requests also set the token-saver
-bypass header. Native CLI quota latches are kept separate: 9Router manages the
-connected account pool's availability. Routing does not replay completed tool
-operations or change the existing failover policy for content/local failures.
-
-## Verify and roll back
+The old patched-image CI gate is retired with its source. The current pinned
+installer tests use disposable service/API fixtures and verify direct defaults,
+private credentials, checksum/Node checks, loopback-only startup, idempotence,
+and backup/restore. They do not claim a live OmniRoute package smoke or actual
+host acceptance; #1659 owns that replacement integration gate.
 
 ```sh
-./target/release/augmentagent service status --unit augmentagent-model-router.service
-./target/release/augmentagent logs --unit model-router --lines 100
-npm test
-cargo test -p augmentagent-channel-core --lib
-python3 -m unittest discover -s scripts/tests -p '*_test.py'
+python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v
+python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v
 ```
 
-Opt-in integration checks use synthetic content only:
+## Legacy retirement
 
-```sh
-# Real router, two temporary local API accounts: first returns quota, second succeeds.
-# Temporary provider and both connections are deleted in finally.
-JARVIS_TEST_MODEL_ROUTER_CONFIG="$HOME/.config/augmentagent/model-router.json" \
-  python3 scripts/tests/model_router_live_test.py -v
-
-# Real installed Claude/Codex CLIs and the built agent, with a local fake gateway.
-JARVIS_TEST_ROUTER_AGENT_BIN="$PWD/target/release/augmentagent" \
-  python3 scripts/tests/model_router_live_test.py -v
-
-# After the owner has signed into real subscription accounts and selected a route:
-./target/release/augmentagent reasoner-selftest --prompt 'Reply exactly ROUTER_OK'
-```
-
-The synthetic checks prove transport, streaming, auth forwarding, account failover
-and disabling accounts. They do **not** prove that a particular subscription can
-access a model or complete a real provider login. Verify those after connecting
-each account. The existing provider output-contract suites are opt-in live
-fixtures for structured output and wiki/tool operations.
-
-For a Docker-hosted router, add `"upstream_host":"host.docker.internal"` to a
-private copy of the router test config before running the synthetic suite. The
-patched router must pass quota failover, request-key/409 and unsupported-image
-tests. Stock 0.5.75 fails the latter two. Keep the original data volume backed up
-when switching an existing router to the patched image.
-
-The patched build treats a direct OpenAI-compatible model selection as pinned:
-9Router will not switch it to a capacity-adapter provider. When the selected
-model's declared capabilities cannot read an image, document,
-audio or video input, it returns 422 before contacting an upstream. This
-checks every turn in the request and prevents a normal-looking answer after a
-current or historical attachment was removed. A capability
-declaration is not proof that the deployed model handles that input; the live
-attachment acceptance test remains required before enabling the profile.
-
-To roll back, select **Existing CLI accounts (9Router off)**. Then optionally stop
-`augmentagent-model-router.service`; stored accounts are retained. On macOS,
-use `augmentagent service stop --unit augmentagent-model-router.service`, then
-`bash scripts/uninstall-model-router.sh` to remove the LaunchAgent while retaining
-accounts and keys. `augmentagent service status --unit augmentagent-model-router.service`
-and `augmentagent logs --unit model-router` show service state and logs on either
-platform. If the router
-is unavailable, the dashboard still lets you save the direct route. Malformed
-configuration fails closed rather than silently sending requests via another
-account.
-
-## Sources
-
-- [9Router source at the pinned revision](https://github.com/decolua/9router/tree/17c4cc76877bd1755030a8414f8d0083f48dcccf)
-- [Codex custom model provider configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
-
-The `runpod-5` patch also preserves Responses API namespace tools through Chat
-Completions backends. It forwards leaf schemas under stable aliases and restores
-namespace/name on returned calls, including streamed events and follow-up history.
-The installed gateway fixture tests two namespaces containing the same `Read`
-name, so schemas and identities cannot silently collapse into a group tool.
+**9Router (removed).** The installer, launcher, image builder, patched sidecar and their obsolete image/lifecycle fixtures were removed after the OmniRoute gateway kind and installer landed; see [#1652](https://github.com/nolanmak/Jarvis/issues/1652) and [#1660](https://github.com/nolanmak/Jarvis/issues/1660). The optional serialized compatibility kind remains for existing private configurations, without provisioning or starting it. Host cleanup is an owner-only step: inspect `systemctl --user cat 9router-mini-tunnel.service`, run `systemctl --user disable --now 9router-mini-tunnel.service` if present, remove its reviewed user-unit file/drop-ins, then `systemctl --user daemon-reload` and confirm it is inactive; this PR does not change production services, delete private account data, or alter the operator's interactive `claude-9router` shell wrapper. Historical patch receipts are not OmniRoute acceptance evidence; git history retains the removed source.

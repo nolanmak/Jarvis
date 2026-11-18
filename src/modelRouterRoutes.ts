@@ -30,7 +30,7 @@ export function createModelRouterRoutes(
     const config = store.read();
     if (!config)
       throw new Error(
-        "9Router is not installed. Run scripts/install-model-router.py on the agent host.",
+        "OmniRoute is not installed. Run scripts/install-omniroute.sh on the agent host.",
       );
     return config;
   };
@@ -48,7 +48,7 @@ export function createModelRouterRoutes(
       config = publicConfig(c);
       if (c) accounts = await clientFor(c).accounts();
     } catch (e) {
-      error = e instanceof Error ? e.message : "9Router is unavailable";
+      error = e instanceof Error ? e.message : "OmniRoute is unavailable";
     }
     res.render("model-accounts", { config, accounts, error, page: "settings" });
   });

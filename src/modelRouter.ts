@@ -145,7 +145,7 @@ export class RouterClient {
   async api(endpoint: string, method = "GET", body?: unknown): Promise<any> {
     if (!this.config.admin_password)
       throw new Error(
-        "9Router management is not configured. Run the installer.",
+        "OmniRoute management is not configured. Run the installer.",
       );
     const base = this.config.base_url.slice(0, -3);
     const login = await this.request(`${base}/api/auth/login`, {
@@ -160,7 +160,7 @@ export class RouterClient {
       .find((c) => c.startsWith("auth_token="))
       ?.split(";")[0];
     if (!login.ok || !cookie)
-      throw new Error("9Router management login failed");
+      throw new Error("OmniRoute management login failed");
     const response = await this.request(`${base}${endpoint}`, {
       method,
       headers: { Cookie: cookie, "Content-Type": "application/json" },
@@ -169,13 +169,13 @@ export class RouterClient {
       redirect: "error",
     });
     if (!response.ok)
-      throw new Error(`9Router request failed (${response.status})`);
+      throw new Error(`OmniRoute request failed (${response.status})`);
     return response.json();
   }
   async accounts(): Promise<Account[]> {
     const data = await this.api("/api/providers");
     if (!Array.isArray(data.connections))
-      throw new Error("Invalid account response from 9Router");
+      throw new Error("Invalid account response from OmniRoute");
     return data.connections
       .filter((c: any) => ["claude", "codex"].includes(c.provider))
       .map((c: any) => ({

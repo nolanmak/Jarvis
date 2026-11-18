@@ -372,7 +372,7 @@
       "shell": "bash"
     },
     "model-router/dashboard/5": {
-      "body": "python3 -m unittest discover -s scripts/tests -p model_router_install_test.py",
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
       "shell": "bash"
     },
     "model-router/dashboard/6": {
@@ -396,11 +396,11 @@
       "shell": "bash"
     },
     "model-router/installer/3": {
-      "body": "python3 -m unittest discover -s scripts/tests -p model_router_install_test.py -v",
+      "body": "python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v",
       "shell": "bash"
     },
     "model-router/installer/4": {
-      "body": "bash scripts/tests/model-router-uninstall.test.sh",
+      "body": "bash -n scripts/install-omniroute.sh",
       "shell": "bash"
     },
     "model-router/installer/5": {
@@ -422,20 +422,6 @@
     "model-router/installer/9": {
       "body": "python3 -m unittest discover -s scripts/runpod-adapter -p test_verify_deployment.py -v",
       "shell": "bash"
-    },
-    "model-router/pinned-gateway/1": {
-      "body": "bash scripts/build-model-router-image.sh",
-      "shell": "bash",
-      "vm_provisioning": [
-        "docker-daemon-images"
-      ]
-    },
-    "model-router/pinned-gateway/2": {
-      "body": "python3 scripts/tests/run_model_router_image_fixture.py",
-      "shell": "bash",
-      "vm_provisioning": [
-        "docker-daemon-images"
-      ]
     },
     "no-gmail-authors/check/1": {
       "body": "range=\"${CI_CONTRACT_BASE}..${CI_CONTRACT_HEAD}\"\nbad=$(git log --format='%ae %ce' \"$range\" | tr ' ' '\\n' | grep -iE 'gmail\\.com' | sort -u || true)\nif [ -n \"$bad\" ]; then\n  echo \"::error::Commit(s) in this PR use a personal gmail author/committer address:\"\n  echo \"$bad\"\n  echo \"Commit as the nolanmak GitHub noreply instead \u2014 see docs/PUBLISH.md.\"\n  exit 1\nfi\necho \"OK: no gmail author/committer emails in this PR's commits.\"\n",
@@ -1892,10 +1878,8 @@
             "docs/macos-parity-inventory.json",
             "scripts/tests/model_router*",
             "scripts/tests/runpod_adapter_install_test.py",
-            "scripts/tests/run_model_router_image_fixture.py",
             "scripts/tests/verify_codex_redirect.py",
             "scripts/tests/test_verify_codex_redirect.py",
-            "sidecars/9router/**",
             ".github/workflows/model-router.yml",
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
@@ -1929,10 +1913,8 @@
             "docs/macos-parity-inventory.json",
             "scripts/tests/model_router*",
             "scripts/tests/runpod_adapter_install_test.py",
-            "scripts/tests/run_model_router_image_fixture.py",
             "scripts/tests/verify_codex_redirect.py",
             "scripts/tests/test_verify_codex_redirect.py",
-            "sidecars/9router/**",
             ".github/workflows/model-router.yml",
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
@@ -2078,30 +2060,10 @@
             }
           },
           "timeout-minutes": 5
-        },
-        "pinned-gateway": {
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-              "with": {
-                "persist-credentials": false
-              }
-            },
-            {
-              "command_id": "model-router/pinned-gateway/1",
-              "name": "Build pinned 9Router with the reconciliation patch"
-            },
-            {
-              "command_id": "model-router/pinned-gateway/2",
-              "name": "Exercise account failover, request identity and media refusal"
-            }
-          ],
-          "timeout-minutes": 30
         }
       },
       "role": "validation",
-      "sha256": "087f1d0ef1ec8343f85664f7d6eb72390ee4d5b583632c57a3a5e0ffe57f54fc"
+      "sha256": "5c592e695be7a39d718b84b57c171a1064d569c15d183c384ee4281bcff0cce7"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},

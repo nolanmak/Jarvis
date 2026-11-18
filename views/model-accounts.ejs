@@ -1,14 +1,14 @@
 <%- include('partials/header', {page:'settings'}) %>
 <div class="space-y-6 max-w-4xl">
   <div><a href="/settings" class="text-blue-400 text-sm">Settings</a><h1 class="text-xl font-semibold mt-2">Models & accounts</h1></div>
-  <p class="text-gray-400">Connect your subscriptions once, then choose which model answers. Account priorities and availability are managed by your local 9Router.</p>
+  <p class="text-gray-400">Connect your subscriptions once, then choose which model answers. Account priorities and availability are managed by your local OmniRoute.</p>
   <% if (error) { %><div role="alert" class="border border-red-800 rounded-lg p-4 text-red-300"><%= error %></div><% } %>
   <% if (!config) { %>
-    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">9Router is not configured on this agent. Run <code>scripts/install-model-router.py</code> on the agent host, then refresh this page.</div>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">OmniRoute is not configured on this agent. Run <code>scripts/install-omniroute.sh</code> on the agent host, then refresh this page.</div>
   <% } else { %>
   <section class="bg-gray-900 border border-gray-800 rounded-lg p-6 space-y-4">
     <h2 class="font-semibold">Connected accounts</h2>
-    <p class="text-sm text-gray-400">Add another account with the same button. Use a private browser window or switch accounts on the sign-in page. Lower priority numbers run first; 9Router tries the next enabled account when one is unavailable.</p>
+    <p class="text-sm text-gray-400">Add another account with the same button. Use a private browser window or switch accounts on the sign-in page. Lower priority numbers run first; OmniRoute tries the next enabled account when one is unavailable.</p>
     <div class="flex gap-3 flex-wrap">
       <% for (const provider of ['claude','codex']) { %>
       <form action="/model-accounts/connect" method="post"><input type="hidden" name="provider" value="<%= provider %>" /><button class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md">Connect <%= provider === 'claude' ? 'Claude' : 'Codex' %></button></form>
@@ -29,7 +29,7 @@
     <form action="/model-accounts/settings" method="post" class="space-y-4">
       <label class="block">Use
         <select name="mode" class="block mt-2 w-full bg-gray-800 rounded-md px-3 py-2">
-          <% for (const [value,label] of [['direct','Existing CLI accounts (9Router off)'],['auto','Auto — Claude, then Codex'],['claude','Claude accounts only'],['codex','Codex accounts only'],['qwen','Runpod Qwen'],['glm','Runpod GLM']]) { %>
+          <% for (const [value,label] of [['direct','Existing CLI accounts (OmniRoute off)'],['auto','Auto — Claude, then Codex'],['claude','Claude accounts only'],['codex','Codex accounts only'],['qwen','Runpod Qwen'],['glm','Runpod GLM']]) { %>
           <option value="<%= value %>" <%= config.mode === value ? 'selected' : '' %>><%= label %></option>
           <% } %>
         </select>
