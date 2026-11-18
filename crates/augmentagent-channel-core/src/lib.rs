@@ -113,6 +113,7 @@ pub use trigger::{
 
 pub mod model_router;
 pub mod model_selection;
+pub mod yolo;
 pub mod native_session;
 pub mod native_vm;
 // #1288 — the transport-neutral conversation turn (native sessions, turn
