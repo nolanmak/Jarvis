@@ -4,7 +4,12 @@ The missing #1655 breaker adapter is explicitly unavailable: enabling must stay
 closed until a real process-shared breaker observation can be wired.
 """
 if 'Installer' not in globals():
-    from scripts.lib.omniroute_install import Installer, private_read, private_write, UNIT
+    import importlib.util
+    from pathlib import Path
+    _installer_spec = importlib.util.spec_from_file_location('omniroute_installer', Path(__file__).with_name('omniroute_install.py'))
+    _installer = importlib.util.module_from_spec(_installer_spec)
+    _installer_spec.loader.exec_module(_installer)
+    Installer, private_read, private_write, UNIT = (_installer.Installer, _installer.private_read, _installer.private_write, _installer.UNIT)
 import datetime
 import json
 import os
