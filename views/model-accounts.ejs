@@ -4,7 +4,7 @@
   <p class="text-gray-400">Connect your subscriptions once, then choose which model answers. Account priorities and availability are managed by your local OmniRoute.</p>
   <% if (error) { %><div role="alert" class="border border-red-800 rounded-lg p-4 text-red-300"><%= error %></div><% } %>
   <% if (!config) { %>
-    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">OmniRoute is not configured on this agent. Run <code>scripts/install-omniroute.sh</code> on the agent host, then refresh this page.</div>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">The optional gateway is not configured. Follow <code>docs/omniroute.md</code> for installation. Gateway account management in this dashboard is not yet available; keep using native CLI accounts in direct mode.</div>
   <% } else { %>
   <section class="bg-gray-900 border border-gray-800 rounded-lg p-6 space-y-4">
     <h2 class="font-semibold">Connected accounts</h2>

@@ -2,7 +2,10 @@ name: Model router
 on:
   pull_request:
     paths:
-      - 'crates/augmentagent-channel-core/**'
+      - 'README.md'
+      - 'docs/**'
+      - 'scripts/**'
+      - 'crates/**'
       - 'crates/augmentagent-approval-discord/**'
       - 'crates/augmentagent-cli/**'
       - 'scripts/runpod-adapter/**'
@@ -33,7 +36,10 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/augmentagent-channel-core/**'
+      - 'README.md'
+      - 'docs/**'
+      - 'scripts/**'
+      - 'crates/**'
       - 'crates/augmentagent-approval-discord/**'
       - 'crates/augmentagent-cli/**'
       - 'scripts/runpod-adapter/**'
@@ -124,6 +130,20 @@ jobs:
 
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/dashboard/6"
 
+
+  # Preserve the required job identity across retirement: the collector also
+  # considers base-revision jobs. These checks replace the removed image build.
+  pinned-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify retired provisioners stay absent
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/pinned-gateway/1"
+      - name: Verify pinned optional gateway installer
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/pinned-gateway/2"
 
   codex-redirect:
     runs-on: ubuntu-latest

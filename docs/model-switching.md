@@ -149,6 +149,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now augmentagent-runpod-adapter.service
 ```
 
+**Deferred gateway registration:** the following is historical setup guidance,
+not an instruction to enable a route. Do not register this upstream until
+OmniRoute acceptance (#1659) and Runpod enablement (#1661) are approved.
+Standalone adapter setup above does not satisfy either gate.
+
 The unit uses `/usr/bin/python3`, private persistent journal storage, and
 `127.0.0.1:20129`. It sets `RUNPOD_ADAPTER_ROUTES`, `RUNPOD_ADAPTER_JOURNAL`,
 `RUNPOD_ADAPTER_HOST`, and `RUNPOD_ADAPTER_PORT`; the Docker defaults remain
@@ -278,7 +283,11 @@ transfer enabled authenticated preflight and live host testing. Qwen returned
 returned no model output; its load-balancer cancellation remains explicitly
 unsupported in the adapter journal. Both endpoints were restored to zero workers.
 
-The live Qwen Read probe exposed a missing Responses namespace translation:
+**Historical retired-revision evidence (not OmniRoute acceptance):** the
+following describes the removed `runpod-5` gateway and does not establish the
+current replacement gateway’s tool behavior. #1659 must supply new receipts.
+
+The historical Qwen Read probe exposed a missing Responses namespace translation:
 the gateway advertised `mcp__jarvis` as an empty function instead of exposing
 its Read leaf and parameters. Gateway revision `runpod-5` flattens namespace
 leaves to stable collision-checked aliases, retains prior-call identities, and

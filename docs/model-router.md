@@ -34,7 +34,8 @@ Global compression, Caveman and RTK are disabled by the installer.
 Use `scripts/install-omniroute.sh` only after reviewing its prerequisites.
 It verifies `scripts/omniroute.pin`, provisions private credentials, checks
 loopback health, and leaves routing direct. `--upgrade` takes a supported CLI
-backup and restores the prior package/data after failed health.
+backup and attempts to restore the prior package/data after failed health. If rollback
+fails, inspect the service before relying on the prior installation.
 `--uninstall` retains data; `--uninstall --purge` is an explicit destructive
 choice for owned state. See [the complete commands](omniroute.md).
 
@@ -54,6 +55,39 @@ host acceptance; #1659 owns that replacement integration gate.
 python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v
 python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v
 ```
+
+## Migrating an existing private configuration
+
+The installer refuses a conflicting active configuration, including one already
+set to direct. Preserve the private config, atomically disable its route, then
+move it out of the active path before explicitly installing OmniRoute. Existing
+in-flight calls retain their snapshot; subsequent calls use native CLI accounts
+when the active file is absent. This does not migrate account tokens or enable
+a gateway route. Run from the repository as the owning user:
+
+```sh
+python3 - <<'PYTHON'
+import datetime, json, os
+from pathlib import Path
+from scripts.lib.omniroute_install import private_read, private_write
+config_root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+source = Path(os.environ.get('AUGMENTAGENT_MODEL_ROUTER_CONFIG', config_root / 'augmentagent/model-router.json'))
+original = private_read(source)
+stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+private_write(source.with_name(source.name + '.pre-migration-' + stamp), original)
+value = json.loads(original)
+value['mode'] = 'direct'
+private_write(source, json.dumps(value, indent=2) + '\n')
+os.replace(source, source.with_name(source.name + '.disabled-' + stamp))
+PYTHON
+# Review prerequisites first; this remains an explicit operator action:
+scripts/install-omniroute.sh
+```
+
+Both preserved configurations stay mode 0600 outside the repository. Keep the
+old service's private account data until the owner confirms migration. Dashboard
+account management awaits the compatible adapter (#1657); installation alone
+does not complete account setup. Use native CLI accounts/direct mode meanwhile.
 
 ## Legacy retirement
 

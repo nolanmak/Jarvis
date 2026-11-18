@@ -145,7 +145,7 @@ export class RouterClient {
   async api(endpoint: string, method = "GET", body?: unknown): Promise<any> {
     if (!this.config.admin_password)
       throw new Error(
-        "OmniRoute management is not configured. Run the installer.",
+        "Gateway account management is not available in this dashboard yet. Use native CLI accounts in direct mode.",
       );
     const base = this.config.base_url.slice(0, -3);
     const login = await this.request(`${base}/api/auth/login`, {

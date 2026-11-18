@@ -423,6 +423,14 @@
       "body": "python3 -m unittest discover -s scripts/runpod-adapter -p test_verify_deployment.py -v",
       "shell": "bash"
     },
+    "model-router/pinned-gateway/1": {
+      "body": "python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v",
+      "shell": "bash"
+    },
+    "model-router/pinned-gateway/2": {
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
+      "shell": "bash"
+    },
     "no-gmail-authors/check/1": {
       "body": "range=\"${CI_CONTRACT_BASE}..${CI_CONTRACT_HEAD}\"\nbad=$(git log --format='%ae %ce' \"$range\" | tr ' ' '\\n' | grep -iE 'gmail\\.com' | sort -u || true)\nif [ -n \"$bad\" ]; then\n  echo \"::error::Commit(s) in this PR use a personal gmail author/committer address:\"\n  echo \"$bad\"\n  echo \"Commit as the nolanmak GitHub noreply instead \u2014 see docs/PUBLISH.md.\"\n  exit 1\nfi\necho \"OK: no gmail author/committer emails in this PR's commits.\"\n",
       "shell": "bash"
@@ -1859,7 +1867,10 @@
       "events": {
         "pull_request": {
           "paths": [
-            "crates/augmentagent-channel-core/**",
+            "README.md",
+            "docs/**",
+            "scripts/**",
+            "crates/**",
             "crates/augmentagent-approval-discord/**",
             "crates/augmentagent-cli/**",
             "scripts/runpod-adapter/**",
@@ -1894,7 +1905,10 @@
             "main"
           ],
           "paths": [
-            "crates/augmentagent-channel-core/**",
+            "README.md",
+            "docs/**",
+            "scripts/**",
+            "crates/**",
             "crates/augmentagent-approval-discord/**",
             "crates/augmentagent-cli/**",
             "scripts/runpod-adapter/**",
@@ -2060,10 +2074,30 @@
             }
           },
           "timeout-minutes": 5
+        },
+        "pinned-gateway": {
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+              "with": {
+                "persist-credentials": false
+              }
+            },
+            {
+              "command_id": "model-router/pinned-gateway/1",
+              "name": "Verify retired provisioners stay absent"
+            },
+            {
+              "command_id": "model-router/pinned-gateway/2",
+              "name": "Verify pinned optional gateway installer"
+            }
+          ],
+          "timeout-minutes": 5
         }
       },
       "role": "validation",
-      "sha256": "5c592e695be7a39d718b84b57c171a1064d569c15d183c384ee4281bcff0cce7"
+      "sha256": "ed55a1f011912fb82060b86ceddbe28e520d4bbbb8104ee1c8cc898e69d3d395"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},

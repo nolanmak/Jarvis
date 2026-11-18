@@ -30,7 +30,7 @@ export function createModelRouterRoutes(
     const config = store.read();
     if (!config)
       throw new Error(
-        "OmniRoute is not installed. Run scripts/install-omniroute.sh on the agent host.",
+        "The optional gateway is not configured. See docs/omniroute.md; keep native CLI accounts in direct mode until dashboard account management is available.",
       );
     return config;
   };

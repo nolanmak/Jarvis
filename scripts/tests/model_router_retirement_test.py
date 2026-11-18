@@ -1,9 +1,29 @@
 """Retirement contract: active tooling cannot resurrect the removed gateway."""
 from pathlib import Path
+import json
 import re
+import subprocess
 import unittest
+from scripts.tests import omniroute_install_test as installer_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def legacy_allowed(relative, line):
+    lower, title = '9' + 'router', '9' + 'Router'
+    allowed = {
+        'crates/augmentagent-channel-core/src/model_router.rs': {
+            f'#[serde(rename = "{lower}")]', f'Self::NineRouter => "{title}",',
+            f'Self::NineRouter => "X-{title}-Token-Saver",',
+            f'("{lower}","{title}","X-{title}-Token-Saver"),',
+            f'for gateway in ["omniroute","{lower}"] {{',
+        },
+        'scripts/tests/omniroute_install_test.py': {
+            'self.inst.router.write_text(' + repr(json.dumps({'gateway': lower, 'mode': 'auto'}, separators=(',', ':'))) + ')',
+        },
+    }
+    return (line.strip() in allowed.get(relative, set())
+            or relative == 'docs/model-router.md' and line.startswith('**' + title + ' (removed).**'))
 
 
 class RetirementTests(unittest.TestCase):
@@ -14,30 +34,38 @@ class RetirementTests(unittest.TestCase):
             self.assertFalse((ROOT / relative).exists(), relative)
 
     def test_only_explicit_legacy_note_and_optional_kind_remain(self):
-        allowed = {'crates/augmentagent-channel-core/src/model_router.rs',
-                   'scripts/tests/omniroute_install_test.py'}
+        paths = subprocess.check_output(['git', 'ls-files', '-z', '--', 'crates', 'scripts', 'docs', 'README.md'], cwd=ROOT).decode().split('\0')
         hits = []
-        paths = [ROOT / 'README.md']
-        for directory in ['crates', 'scripts', 'docs']:
-            paths.extend(p for p in (ROOT / directory).rglob('*') if p.is_file()
-                         and '.git' not in p.parts and '__pycache__' not in p.parts)
-        for path in paths:
-            relative = path.relative_to(ROOT).as_posix()
-            if relative in allowed or path == Path(__file__).resolve():
+        for relative in filter(None, paths):
+            path = ROOT / relative
+            if not path.is_file():
                 continue
             try:
                 for number, line in enumerate(path.read_text().splitlines(), 1):
-                    if re.search('9' + 'router', line, re.I):
-                        if relative == 'docs/model-router.md' and line.startswith('**9' + 'Router (removed).**'):
-                            continue
+                    if re.search('9' + 'router', line, re.I) and not legacy_allowed(relative, line):
                         hits.append(f'{relative}:{number}')
             except UnicodeError:
                 pass
         self.assertEqual(hits, [])
 
+    def test_compatibility_exception_does_not_hide_new_provisioning_reference(self):
+        line = '// install ' + '9' + 'router' + ' automatically'
+        for relative in ['crates/augmentagent-channel-core/src/model_router.rs', 'scripts/tests/omniroute_install_test.py']:
+            self.assertFalse(legacy_allowed(relative, line))
+
+    def test_required_gateway_job_identity_is_preserved_for_replacement_checks(self):
+        contract = json.loads((ROOT / 'scripts/ci-contract.json').read_text())
+        job = contract['workflows']['.github/workflows/model-router.yml']['jobs']['pinned-gateway']
+        bodies = [contract['commands'][row['command_id']]['body'] for row in job['steps'] if 'command_id' in row]
+        self.assertTrue(any('model_router_retirement_test.py' in body for body in bodies))
+        self.assertTrue(any('omniroute_install_test.py' in body for body in bodies))
+
     def test_default_installation_and_routing_remain_opt_in(self):
-        config = (ROOT / 'scripts/lib/omniroute_install.py').read_text()
-        self.assertIn("'mode': 'direct'", config)
+        fixture = installer_fixture.InstallTests('test_node_floor_versions')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.inst.install()
+        self.assertEqual(json.loads(fixture.inst.router.read_text())['mode'], 'direct')
         for path in [ROOT / 'scripts/install-autostart.sh', ROOT / 'scripts/install-autoupdate.sh']:
             self.assertNotIn('install-omniroute', path.read_text())
 
