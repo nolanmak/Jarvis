@@ -2,6 +2,8 @@
 //! policy as unattended execution. Resolution is read-only and spends no models.
 use super::*;
 use crate::autoship_workflow::submission::{Request, Target};
+#[path = "self_improve_target_routing.rs"]
+mod routing;
 
 pub(super) enum Resolved {
     Issue(Issue),
@@ -412,6 +414,54 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
     Ok(())
 }
 
+/// #1712 — owner cancel: durable retirement through the same fenced settle
+/// path as terminal reconciliation. Never races active work (an active lease,
+/// pending operation or merge reconciliation refuses), never undoes a merge,
+/// and is idempotent. Returns once the workflow is retired as canceled.
+pub(crate) async fn cancel_workflow(repo:&Path,path:&Path,id:&str,repository:&str)->Result<()> {
+    use crate::autoship_workflow::{Stage,WorkflowStore};
+    let store=WorkflowStore::open_read_only(path)?
+        .context(CommandFailure {code:2,reason:"workflow-not-found"})?;
+    let request=store.command_request(id)?;
+    let before=store.snapshot(id)?;
+    if request.is_none() && before.is_none() {
+        return Err(anyhow::anyhow!("no durable workflow or command job")
+            .context(CommandFailure {code:2,reason:"workflow-not-found"}));
+    }
+    drop(store);
+    let principal=match &request {
+        Some(request)=>authorize_command(repo,request).await,
+        None=>authorize_repository(repo,repository).await,
+    }.context(CommandFailure {code:2,reason:"target-authorization-failed"})?;
+    let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+    let before=store.snapshot(id)?;
+    if let Some(before)=&before {
+        match before.checkpoint.stage {
+            Stage::Retired if before.checkpoint.next.reason==OWNER_CANCELED=>return Ok(()),
+            Stage::Merged=>return Err(anyhow::anyhow!("a completed merge cannot be undone by cancel")
+                .context(CommandFailure {code:3,reason:"workflow-already-merged"})),
+            Stage::Retired=>return Err(anyhow::anyhow!("workflow already retired for another reason; history retained")
+                .context(CommandFailure {code:3,reason:"workflow-already-retired"})),
+            _=>{}
+        }
+        if before.lease_until_ms>chrono::Utc::now().timestamp_millis()
+            || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)? {
+            return Err(anyhow::anyhow!("active lease or unresolved operation; pause first and cancel once the worker has quiesced")
+                .context(CommandFailure {code:3,reason:"cancel-held-active-work"}));
+        }
+    }
+    drop(store);
+    if !settle_outside_target_expected(path,id,Stage::Retired,OWNER_CANCELED,
+        format!("owner:canceled:{principal}"),before.as_ref())? {
+        return Err(anyhow::anyhow!("workflow changed, leased or awaiting operation recovery during cancel")
+            .context(CommandFailure {code:3,reason:"cancel-held-active-work"}));
+    }
+    Ok(())
+}
+
+/// Checkpoint reason of an owner-canceled workflow (`autopr cancel`).
+pub(crate) const OWNER_CANCELED:&str="owner_canceled";
+
 #[derive(Debug)]
 pub(crate) struct CommandFailure {
     pub code: i32,
@@ -545,11 +595,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             RunReport::held("Selected PR awaits current CI, review or merge admission".into())
         });
     }
-    COMMAND_LANE
-        .scope(
-            Lane::Combined,
-            run_selected(repo, false, Some(selected), mode),
-        )
+    routing::dispatch(selected, |selected| run_selected(repo, false, Some(selected), mode))
         .await.map_err(linked_claims::command_error)
 }
 
@@ -824,6 +870,38 @@ mod tests {
             assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),0,"unavailable native consumer must not queue messages or strand a workflow");
             assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),13);
+            drop(store);
+            // #1713 — status must also work once a worker has registered the
+            // workflow (a snapshot exists), not only while it is queued.
+            let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            store.register(&discord.admission.workflow,"agent-fix/issue-7",crate::autoship_workflow::Binding {
+                head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()},300).unwrap();
+            drop(store);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(107),"!autoship status").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let claimed=store.replay_discord_control(&origin(107),&digest("!autoship status")).unwrap().unwrap();
+            assert_eq!(claimed.reason,"status-observed","registered workflow status: {}",claimed.reply);
+            assert!(claimed.reply.contains("stage ") && !claimed.reply.contains("stage unknown"),"{}",claimed.reply);
+            assert!(claimed.reply.contains("owner-pause-requested"),"{}",claimed.reply);
+            drop(store);
+            // #1713 — Discord cancel requires an explicit workflow, retires it
+            // through T's fenced cancel, and later controls are terminal.
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(109),"!autoship cancel").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert!(store.replay_discord_control(&origin(109),&digest("!autoship cancel")).unwrap().is_none(),"bare cancel changes nothing");
+            assert_ne!(store.snapshot(&discord.admission.workflow).unwrap().unwrap().checkpoint.stage,crate::autoship_workflow::Stage::Retired);drop(store);
+            let cancel=format!("!autoship cancel --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(110),&cancel).await.unwrap(),"redelivery replays");
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let canceled=store.replay_discord_control(&origin(110),&digest(&cancel)).unwrap().unwrap();
+            assert_eq!(canceled.reason,"owner-canceled","{}",canceled.reply);
+            assert_eq!(store.snapshot(&discord.admission.workflow).unwrap().unwrap().checkpoint.stage,crate::autoship_workflow::Stage::Retired);
+            drop(store);
+            let pause=format!("!autoship pause --workflow {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(111),&pause).await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.replay_discord_control(&origin(111),&digest(&pause)).unwrap().unwrap().reason,"workflow-terminal");
 
 
 
@@ -850,7 +928,7 @@ mod tests {
             "https://github.com/owner/repo.git",
         ]);
         let gh = root.join("gh.py");
-        std::fs::write(
+        augmentagent_test_support::write_executable(
             &gh,
             r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -977,7 +1055,7 @@ else:raise Exception('unexpected request '+repr(a))
             assert!(std::process::Command::new("git").args(args).current_dir(root).output().unwrap().status.success());
         }
         let gh = root.join("gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())

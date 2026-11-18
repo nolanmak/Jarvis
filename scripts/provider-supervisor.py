@@ -102,6 +102,12 @@ class RawCapture:
 def supervise(receipt, argv):
     libc = ctypes.CDLL(None, use_errno=True)
     stopping = False
+    cancel_path = Path(receipt).with_name('cancel-requested')
+
+    def stopped():
+        nonlocal stopping
+        stopping = stopping or cancel_path.exists()
+        return stopping
 
     def stop(signum, frame):
         nonlocal stopping
@@ -162,7 +168,7 @@ def supervise(receipt, argv):
         deadline = time.monotonic() + 10
         expected = b'admitted\n'
         while True:
-            if stopping or time.monotonic() >= deadline:
+            if stopped() or time.monotonic() >= deadline:
                 observation = scope.observation() if scope else {}
                 if scope:
                     resource_path.write_text(json.dumps({'phase':'cancelled_before_dispatch', **observation}))
@@ -225,7 +231,7 @@ def supervise(receipt, argv):
             deadline = time.monotonic() + 60
             expected = b'ready\n'
             while True:
-                if stopping or child.poll() is not None or time.monotonic() >= deadline:
+                if stopped() or child.poll() is not None or time.monotonic() >= deadline:
                     return 125
                 try:
                     with vm_ready.open('rb') as stream:
@@ -242,7 +248,7 @@ def supervise(receipt, argv):
             ready = Path(receipt).with_name('launch-ready')
             ready.write_text('ready\n')
             ready.chmod(0o600)
-        while not stopping:
+        while not stopped():
             if capture:
                 capture.drain(0.05)
                 if capture.limited:

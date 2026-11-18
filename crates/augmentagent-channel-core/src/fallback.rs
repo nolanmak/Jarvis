@@ -1532,7 +1532,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
             let executable=home.path().join("codex");
-            std::fs::write(&executable,b"#!/bin/sh\nexit 0\n").unwrap();
+            augmentagent_test_support::write_executable(&executable,b"#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
             let guest=home.path().join("guest");std::fs::create_dir(&guest).unwrap();
             std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1582,7 +1582,7 @@ mod tests {
         assert_eq!(scripted.count(),1);
         let executable=std::path::PathBuf::from(std::env::var_os("CODEX_CLI").unwrap());
         let original=std::fs::read(&executable).unwrap();
-        std::fs::write(&executable,b"#!/bin/sh\n# updated executable\nexit 0\n").unwrap();
+        augmentagent_test_support::write_executable(&executable,b"#!/bin/sh\n# updated executable\nexit 0\n").unwrap();
         assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
         assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:provider-runtime-companion-missing"));
         assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"stale runtime must not dispatch")).await.is_err());
@@ -2048,7 +2048,7 @@ exit 1
         ];
         for (name, body, provider_side) in cases {
             let bin = dir.path().join(format!("fake-codex-{name}"));
-            std::fs::write(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\n{body}")).unwrap();
+            augmentagent_test_support::write_executable(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\n{body}")).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let latch = CooldownLatch::at(dir.path().join(format!("{name}-cooldowns.json")));
             let backup = Scripted::ok("served by the next provider");
@@ -2201,7 +2201,7 @@ exit 1
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.path().join(name);
         let count = dir.path().join(format!("{name}.count"));
-        std::fs::write(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\necho spawn >> '{}'\n{body}", count.display())).unwrap();
+        augmentagent_test_support::write_executable(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\necho spawn >> '{}'\n{body}", count.display())).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         (bin.to_string_lossy().into_owned(), count)
     }
@@ -2446,3 +2446,7 @@ exit 1
         assert!(latch.active().is_empty(), "success clears the stale entry");
     }
 }
+
+#[cfg(test)]
+#[path="fallback_review_recovery_tests.rs"]
+mod review_recovery_tests;

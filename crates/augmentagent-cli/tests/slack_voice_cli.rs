@@ -58,7 +58,7 @@ impl Env {
         let tools = root.join("tools");
         std::fs::create_dir_all(&tools).unwrap();
         let fake = tools.join("ffmpeg");
-        std::fs::write(
+        augmentagent_test_support::write_executable(
             &fake,
             "#!/bin/sh\nin=\"\"; out=\"\"; prev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-i\" ]; then in=\"$a\"; fi\n  prev=\"$a\"; out=\"$a\"\ndone\ncp \"$in\" \"$out\"\n",
         )

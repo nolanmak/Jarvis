@@ -12,6 +12,7 @@ pub mod audit_chain;
 pub mod autoship_scope;
 pub mod autoship_write_scope;
 pub mod autoship_workflow_contract;
+pub mod publication_command_custody;
 pub mod build_scratch;
 pub mod cerebras;
 pub mod cli_gate;
@@ -52,6 +53,7 @@ pub mod state_dir;
 // fence instead of each starting its own.
 #[path = "storage_ci_holds.rs"]
 pub mod build_storage_ci_holds;
+pub mod build_volume;
 pub mod storage_checkout;
 pub mod storage_coordination;
 pub mod storage_reservations;

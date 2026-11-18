@@ -4,6 +4,8 @@ pub(crate) mod wait;
 pub(crate) mod work_command;
 #[path = "autoship_control_command.rs"]
 pub(crate) mod control_command;
+#[path = "autoship_cancel_command.rs"]
+pub(crate) mod cancel_command;
 #[path = "autoship_target_reconcile.rs"]
 pub(crate) mod target_reconcile;
 #[path = "autoship_run_command.rs"]
@@ -12,6 +14,10 @@ pub(crate) mod run_command;
 pub(crate) mod merge_recovery;
 #[path = "autoship_delivery_command.rs"]
 pub(crate) mod delivery_command;
+#[path = "autoship_delivery_recovery.rs"]
+pub(crate) mod delivery_recovery;
+#[path = "autoship_deployment_command.rs"]
+pub(crate) mod deployment_command;
 // Shared command projections. Read paths never create state or launch work.
 use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 use anyhow::{ensure, Result};
@@ -74,7 +80,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
         let command = store.command_request(workflow)?;
         let attempt = store.command_attempt(workflow)?;
         let owner_control=store.owner_control(workflow)?;
-        let delivery=store.progress_delivery(workflow)?;
+        let delivery=store.progress_delivery_at(workflow,chrono::Utc::now().timestamp_millis())?;
         let owner_messages_pending=store.pending_owner_messages(workflow)?;
         let paused=owner_control.as_ref().is_some_and(|c|c.paused);
         let Some(snapshot) = store.snapshot(workflow)? else {
@@ -135,7 +141,9 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             crate::autoship_workflow::submission::Milestone::Pr=>pr_ready.is_some() && !recovery_needed && snapshot.checkpoint.stage != Stage::Retired,
         };
         let pause_blocks=paused && !complete && !recovery_needed && snapshot.checkpoint.stage!=Stage::Retired;
-        let code = if complete {0} else if paused || recovery_needed || snapshot.checkpoint.next.action=="await_capacity" || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
+        let canceled = snapshot.checkpoint.stage == Stage::Retired
+            && snapshot.checkpoint.next.reason == crate::self_improve::targeted::OWNER_CANCELED;
+        let code = if complete {0} else if canceled {cancel_command::CANCELED_EXIT} else if paused || recovery_needed || snapshot.checkpoint.next.action=="await_capacity" || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
             3
         } else {
             0

@@ -296,6 +296,7 @@ const HELPERS: &[(&str, &[u8])] = &[
 pub(crate) struct Launch {
     command: Command,
     resource_policy: serde_json::Value,
+    audit:std::sync::Arc<crate::tool_audit::AuditLogger>,
     spawn_attempted: bool,
     fresh_runtime: Option<FreshUnreleasedRuntime>,
     aliases: PathBuf,
@@ -423,7 +424,7 @@ impl Launch {
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
         let fresh_runtime=if resume {None}else{Some(FreshUnreleasedRuntime::capture(&session,&aliases)?)};
-        let result = Self { command, resource_policy, spawn_attempted:false,fresh_runtime,aliases,session, ephemeral:native.is_none(), _directory:directory };
+        let result = Self { command, resource_policy, audit:owner_logger.clone(), spawn_attempted:false,fresh_runtime,aliases,session, ephemeral:native.is_none(), _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         if let Some(session)=unpublished_session {let _=session.keep();}
         Ok(result)
@@ -434,7 +435,7 @@ impl Launch {
         -> std::io::Result<(tokio::process::Child,crate::process_tree::ProcessGroup)> {
         if self.spawn_attempted {return Err(std::io::Error::other("prepared native launch already used"));}
         self.spawn_attempted=true;
-        match crate::process_tree::spawn_admitted_vm(&self.command,clean,journal,&self.resource_policy) {
+        match crate::process_tree::spawn_admitted_vm(&self.command,clean,journal,&self.resource_policy, Some(&self.audit)) {
             Ok((child,group))=>Ok((child,group.with_fresh_native_session(self.fresh_runtime.take()))),
             Err(error)=>{
                 // spawn_admitted_vm returns Err only before a supervisor is
@@ -673,7 +674,7 @@ mod tests {
                 command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')"]).arg(&effect);
                 std::env::remove_var("AUGMENTAGENT_RUN_RESOURCES");
                 let clean=Arc::new(AtomicBool::new(true));
-                let (mut child,group)=crate::process_tree::spawn_admitted(&command,true,clean.clone(),Some(&journal),false).unwrap();
+                let (mut child,group)=crate::process_tree::spawn_admitted(&command,true,clean.clone(),Some(&journal),false, None).unwrap();
                 std::env::set_var("AUGMENTAGENT_RUN_RESOURCES","1");
                 vm.spawn_attempted=true;
                 let group=group.with_fresh_native_session(vm.fresh_runtime.take());

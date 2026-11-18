@@ -1394,7 +1394,7 @@ impl ClaudeCliReasoner {
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &mut native_vm {
             Some(vm) => vm.spawn_admitted(clean, opts.handoff_path.as_deref()),
-            None => crate::process_tree::spawn_admitted_with_policy(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref(), launch_audit.as_ref()),
         };
         let (mut child, process_group) = spawned
         .map_err(|error| {
@@ -5294,13 +5294,9 @@ mod failover_error_tests {
     /// Write an executable stub script the reasoner spawns instead of the
     /// real `claude` (same override the fault-injection rig uses, #666).
     fn stub_cli(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
-        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.path().join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/usr/bin/env bash").unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        drop(f);
+        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }

@@ -68,7 +68,7 @@ struct Fixture {
 
 fn fake_tool(dir: &Path, name: &str, script: &str) {
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+    augmentagent_test_support::write_executable(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 

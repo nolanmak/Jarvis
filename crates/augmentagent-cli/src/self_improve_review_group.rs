@@ -53,6 +53,34 @@ pub(super) struct EvidenceGroupInput<'a> {
     pub workflow: Option<&'a workflow::WorkflowGuard>,
 }
 
+/// The production cache boundary is also used by subprocess crash fixtures.
+/// Only a fully validated completed group enters the transactional fragment
+/// store; a provider response orphaned before that commit is safely rerun.
+pub(super) async fn execute_cached_evidence_group(input:EvidenceGroupInput<'_>,transport:&dyn GroupTransport,
+    cache:Option<&workflow::WorkflowGuard>)->Result<CompletedGroup> {
+    let binding=input.inputs.binding;
+    let key=aligned::digest(&serde_json::to_vec(&("review-source-ranges-v1",binding,input.role,&input.actor.provider,
+        &input.actor.model,&input.opts.system_prompt,&input.original_request.coverage.prompt_hash))?);
+    if let Some(raw)=cache.map(|guard|guard.review_fragment(&key)).transpose()?.flatten() {
+        anyhow::ensure!(raw.len()<=MAX_COMPLETED_GROUP_BYTES,"cached review exceeds encoded bound");
+        let cached:CompletedGroup=serde_json::from_str(&raw)?;
+        anyhow::ensure!(cached.binding==*binding && cached.original_hash==input.original_request.coverage.prompt_hash && cached.role==input.role,"review fragment binding mismatch");
+        anyhow::ensure!(!cached.native_sessions.is_empty() && cached.native_sessions.len()<=2,"cached review lacks bounded native observations");
+        for id in &cached.native_sessions {
+            anyhow::ensure!(!id.is_empty() && id.len()<=512 && id.bytes().all(|b|b.is_ascii_graphic()),"invalid cached native identity");
+            let mut actual=input.actor.clone();actual.session_id=id.clone();actual.independent_for(input.builders,input.origin)?;
+            if let Some(guard)=cache {guard.require_independent_native_session(&actual.provider,id)?;}
+        }
+        return Ok(cached);
+    }
+    let completed=execute_evidence_group(input,transport).await?;
+    if let Some(guard)=cache {
+        guard.audit_health().await?;
+        guard.record_review_fragment(&key,&serde_json::to_string(&completed)?)?;
+    }
+    Ok(completed)
+}
+
 pub(super) async fn execute_evidence_group(
     input: EvidenceGroupInput<'_>,
     transport: &dyn GroupTransport,
@@ -109,6 +137,7 @@ pub(super) async fn execute_evidence_group(
         let mut shard_actor = actor.clone();
         shard_actor.session_id = native_id.clone();
         shard_actor.independent_for(builders, origin)?;
+        if let Some(guard)=workflow {guard.require_independent_native_session(&shard_actor.provider,&shard_actor.session_id)?;}
         group_sessions.push(native_id);
         let parsed = aligned::parse_review_pass_with_sources(
             &raw,
@@ -209,3 +238,7 @@ pub(super) async fn execute_evidence_group(
 #[cfg(test)]
 #[path = "self_improve_review_group_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path="self_improve_review_restart_tests.rs"]
+mod restart_tests;

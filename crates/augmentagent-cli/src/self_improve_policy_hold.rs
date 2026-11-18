@@ -244,7 +244,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use ApprovalDisposition::{Free,Repair};
         let temp=tempfile::tempdir().unwrap();let root=temp.path();let gh=root.join("fake-gh");
-        std::fs::write(&gh,r#"#!/usr/bin/python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json,sys,pathlib
 root=pathlib.Path.cwd();mode=(root/'mode').read_text();args=sys.argv[1:]
 with (root/'calls').open('a') as f:f.write(json.dumps(args)+'\n')
@@ -316,7 +316,7 @@ print(json.dumps(out))
             heads.insert(pr,fixture_git(&root,&["rev-parse","HEAD"])); bases.insert(pr,base.clone());
         }
         let gh=dir.path().join("fake-gh");
-        std::fs::write(&gh,r#"#!/usr/bin/python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json, pathlib, subprocess, sys
 root=pathlib.Path.cwd(); statefile=root.parent/'remote.json'; state=json.loads(statefile.read_text())
 args=sys.argv[1:]; pr=args[2]; row=state[pr]

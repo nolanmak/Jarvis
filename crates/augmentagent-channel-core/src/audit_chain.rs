@@ -15,6 +15,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "audit_chain_inspection.rs"]
+mod inspection;
+
 const LIMIT: u64 = 64 * 1024 * 1024;
 
 /// Bounds the encoded anchor as it is written: a pending log line is escaped a

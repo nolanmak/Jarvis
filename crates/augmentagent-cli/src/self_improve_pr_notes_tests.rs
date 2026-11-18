@@ -19,7 +19,7 @@ async fn optional_recovery_note_preserves_pr_source_and_issue_link() {
     assert!(std::process::Command::new("git").args(["init","-q"]).current_dir(root).status().unwrap().success());
     std::fs::write(root.join("body"),ORIGINAL).unwrap();
     let gh=root.join("gh.py");
-    std::fs::write(&gh,r#"#!/usr/bin/env python3
+    augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_PR_NOTE_FIXTURE']);args=sys.argv[1:]
 assert args[:1]==['pr'] and args[2]=='1669'
