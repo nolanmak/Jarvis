@@ -294,6 +294,7 @@ pub(crate) enum OutboxOp {
 /// `error`. Returns the rows that changed so the daemon can notify.
 pub(crate) fn reconcile_outbox(store: &Store) -> anyhow::Result<Vec<ImessageOutboxItem>> {
     let now = chrono::Utc::now().timestamp_millis();
+    crate::owner_alerts::enqueue_digest(store,now)?;
     store.enqueue_owner_alert_texts(now)?;
     store.reconcile_owner_alert_texts(now)?;
     let claim_timeout_ms = env_secs(ENV_CLAIM_TIMEOUT_SECS, DEFAULT_CLAIM_TIMEOUT_SECS) * 1000;
@@ -412,14 +413,15 @@ pub(crate) fn run_outbox(store: &Store, op: &OutboxOp) -> anyhow::Result<()> {
             let item = if augmentagent_channel_imessage::send_enabled() {
                 match store.claim_owner_alert_text(now)? {
                     Some(item) => Some(item),
-                    None => store.claim_imessage_outbox()?,
+                    None => match store.claim_owner_alert_digest(now)? { Some(item)=>Some(item),None=>store.claim_imessage_outbox()? },
                 }
             } else {
                 None
             };
             let send_by_ms = match item.as_ref() {
                 Some(item) => store.owner_alert_for_outbox(item.id)?.map(|a|
-                    (now + 5_000).min(a.expires_at_ms).min(a.due_at_ms.unwrap_or(i64::MAX))),
+                    (now + 5_000).min(a.expires_at_ms).min(a.due_at_ms.unwrap_or(i64::MAX)))
+                    .or(store.owner_alert_digest_deadline(item.id)?.map(|d|(now+5_000).min(d))),
                 None => None,
             };
             println!("{}", claim_json(item.as_ref(), send_by_ms));

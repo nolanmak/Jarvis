@@ -441,6 +441,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyComplete)?;
             return Ok(None);
         }
+        if !self.config.dry_run {
+            crate::owner_alert_gate::arrival(&self.store,&email,self.config.wiki_root.as_deref(),chrono::Utc::now().timestamp_millis())?;
+        }
         // If a prior dispatch already produced a pending or errored action for
         // this email, leave it alone — the existing Discord card or the retry
         // tick will carry it forward. Without this gate, every poll cycle on
@@ -504,7 +507,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .unwrap_or_default();
         let wiki_hint = with_notes_hint(&self.store, &email, &wiki_hint);
         let mut triage_prompt = triage_user_message(&email, learned, &wiki_hint);
-        triage_prompt.push_str(&crate::owner_alerts::prompt_context(&self.store,&email,chrono::Utc::now().timestamp_millis())?);
+        triage_prompt.push_str(&crate::owner_alerts::prompt_context_with_wiki(&self.store,&email,self.config.wiki_root.as_deref(),chrono::Utc::now().timestamp_millis())?);
         if let Some((_, _, context)) = retry {
             triage_prompt.push_str("\n\n");
             triage_prompt.push_str(context);
@@ -547,7 +550,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             &serde_json::to_string(&captured.evidence())?).ok();
         augmentagent_store::triage_calibration_scope(input, async {
         if !self.config.dry_run {
-            if let Err(error)=crate::owner_alerts::persist_assessment(&self.store,&email,&raw,chrono::Utc::now().timestamp_millis()) {
+            if let Err(error)=crate::owner_alerts::persist_assessment_with_wiki(&self.store,&email,&raw,self.config.wiki_root.as_deref(),chrono::Utc::now().timestamp_millis()) {
                 warn!(message_id=%email.message_id,"owner alert assessment failed; background reevaluation will retry: {error}");
             }
         }

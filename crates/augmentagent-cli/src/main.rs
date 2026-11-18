@@ -3166,6 +3166,9 @@ async fn drain_daemon_tasks(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Cmd::Imessage { op: ImessageOp::Alerts { op: owner_alerts::Op::Calibrate { ref input } } } = cli.cmd {
+        return owner_alerts::calibrate(input);
+    }
     // Compute QA is explicitly isolated from live configuration and storage.
     if let Cmd::CodeMode { op: code_mode::CodeModeOp::ComputeRun(ref args) } = cli.cmd {
         std::process::exit(compute_cli::run(args).await);
@@ -5293,7 +5296,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Imessage { ref op } => match op {
-            ImessageOp::Alerts { op } => owner_alerts::run(&store, op).await,
+            ImessageOp::Alerts { op } => owner_alerts::run(&store, op, cli.wiki_dir.as_deref()).await,
             ImessageOp::Owner { op } => imessage_owner::run(&store, op),
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;

@@ -143,35 +143,50 @@ def stamp_page(writer, page, overlay):
     page[NameObject('/Resources')] = private
 
 
-def canonical(value, depth=0):
-    """Reader-independent structure of a PDF value: references by object
-    number plus their resolved content (a few levels deep), streams by their
-    raw bytes. Two readers of the same bytes produce equal results."""
+def canonical(value, depth=0, memo=None):
+    """Reader-independent structure, memoized for one immutable reader pass.
+
+    Depth is part of the key because reference expansion stops at six levels.
+    Never share this memo between the original and signed readers: identical
+    object numbers can have different content in the incremental update.
+    """
+    if memo is None:
+        memo = {}
     if hasattr(value, 'idnum'):
         if depth >= 6:
             return ('ref', value.idnum, value.generation)
-        return ('ref', value.idnum, value.generation, canonical(value.get_object(), depth + 1))
+        key = ('ref', value.idnum, value.generation, depth)
+        if key not in memo:
+            memo[key] = ('ref', value.idnum, value.generation,
+                         canonical(value.get_object(), depth + 1, memo))
+        return memo[key]
     if isinstance(value, dict):
-        items = tuple(sorted((str(k), canonical(v, depth + 1)) for k, v in value.items()))
-        raw = getattr(value, '_data', None)
-        return ('stream', items, hashlib.sha256(raw).hexdigest()) if raw is not None else ('dict', items)
+        # Inherited resource dictionaries are resolved before this call. Cache
+        # them too, so shared dictionaries do not walk every XObject per page.
+        key = ('dict', id(value), depth)
+        if key not in memo:
+            items = tuple(sorted((str(k), canonical(v, depth + 1, memo)) for k, v in value.items()))
+            raw = getattr(value, '_data', None)
+            memo[key] = ('stream', items, hashlib.sha256(raw).hexdigest()) if raw is not None else ('dict', items)
+        return memo[key]
     if isinstance(value, list):
-        return ('array', tuple(canonical(v, depth + 1) for v in value))
+        return ('array', tuple(canonical(v, depth + 1, memo) for v in value))
     return ('value', str(value))
 
 
-def page_fingerprint(page):
+def page_fingerprint(page, memo=None):
     contents = page.get_contents()
     return (contents.get_data() if contents is not None else b'',
-            canonical(inherited_resources(page)),
+            canonical(inherited_resources(page), memo=memo),
             [float(v) for v in page.mediabox], page.rotation)
 
 
 def verify_other_pages(original, signed, signed_index):
     if len(original.pages) != len(signed.pages):
         raise ValueError('signing changed the page count')
+    original_memo, signed_memo = {}, {}
     for i, (a, b) in enumerate(zip(original.pages, signed.pages)):
-        if i != signed_index and page_fingerprint(a) != page_fingerprint(b):
+        if i != signed_index and page_fingerprint(a, original_memo) != page_fingerprint(b, signed_memo):
             raise ValueError(f'signing would change page {i + 1}; nothing was signed')
 
 

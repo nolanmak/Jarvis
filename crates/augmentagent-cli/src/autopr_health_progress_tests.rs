@@ -13,11 +13,12 @@ struct Fixture {
     binding: Binding,
 }
 
-/// A real store with one claimed workflow in Verify. Not under /tmp: the
-/// macOS sandbox cannot open SQLite there.
+/// A real store with one claimed workflow in Verify. Canonicalize the temp
+/// directory because SQLite intentionally refuses symlinked parents such as
+/// macOS /var (which aliases /private/var).
 fn verifying_workflow(at_ms: i64) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("workflow.db");
+    let path = dir.path().canonicalize().unwrap().join("workflow.db");
     let binding = Binding { head: "a".repeat(40), contract: "contract-v1".into(), evidence_hash: "evidence-v1".into() };
     let mut store = WorkflowStore::open(&path).unwrap();
     store.register("owner/repo#7", "fixture", binding.clone(), at_ms).unwrap();
@@ -96,7 +97,7 @@ fn unknown_inventory_is_never_reported_healthy_and_complete_empty_is_idle() {
     let now = 1_800_000_000_000;
     // Complete and empty: a fresh store with no workflows.
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("workflow.db");
+    let path = dir.path().canonicalize().unwrap().join("workflow.db");
     drop(WorkflowStore::open(&path).unwrap());
     let empty = workflow_progress_at(&path, now).unwrap();
     assert!(empty.inventory_complete && empty.events.is_empty(), "fixture: fresh store is a complete empty inventory");
@@ -162,7 +163,7 @@ fn passed_stage_inactivity_deadline_alerts_and_heartbeats_cannot_extend_it() {
 fn blocked_workflows_report_separate_review_and_ci_reasons_and_what_wakes_them() {
     let t0 = 1_800_000_000_000;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("workflow.db");
+    let path = dir.path().canonicalize().unwrap().join("workflow.db");
     let mut store = WorkflowStore::open(&path).unwrap();
     for (issue, stage, reason, action) in [
         (7, Stage::AwaitChecks, "ci_pending", "reconcile_checks"),
@@ -196,4 +197,33 @@ fn blocked_workflows_report_separate_review_and_ci_reasons_and_what_wakes_them()
     let text = render_text(&findings, &health);
     assert!(text.contains("owner/repo#7 (await_checks): CI pending; wakes: reconcile_checks"), "{text}");
     assert!(text.contains("owner/repo#10 (review): review invalidated by a main change; wakes: rereview_current_head"), "{text}");
+}
+
+/// Exercise the real fixture constructors even when managed Cargo supplies a
+/// canonical TMPDIR. The child owns its environment, so parallel tests keep
+/// their own temporary roots.
+#[cfg(unix)]
+#[test]
+fn health_workflow_fixtures_accept_a_symlinked_temp_root() {
+    const CHILD: &str = "JARVIS_TEST_HEALTH_SYMLINK_TEMP_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["autopr_health::progress_tests::", "autoship_workflow::progress_status::tests::", "--test-threads=4", "--nocapture"])
+        .env(CHILD, "1")
+        .env("TMPDIR", &alias)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "health fixtures failed below a symlinked temp root:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
