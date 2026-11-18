@@ -2,6 +2,10 @@
 //! tree. The provider never receives filesystem or command tools.
 use super::*;
 
+#[path = "self_improve_native_history.rs"]
+mod native_history;
+pub(super) use native_history::requires_baseline_custody;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CallPurpose {

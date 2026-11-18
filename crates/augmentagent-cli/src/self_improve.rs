@@ -69,6 +69,11 @@ mod linked_claim_boundaries;
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
 #[cfg(test)]
+#[path = "self_improve_epic_selection_tests.rs"]
+mod epic_selection_tests;
+#[path = "self_improve_epics.rs"]
+mod epics;
+#[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
@@ -449,6 +454,10 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
             if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
+                return None;
+            }
+            if epics::is_epic(iss) {
+                info!(issue=number,"{}",epics::SKIP_EPIC);
                 return None;
             }
             let s = |k: &str| {
@@ -1044,6 +1053,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
+    if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let mut candidates=rest_issue_candidates(&issues);
     // Recovery wakes the ordinary selector, not a special execution path.
     // Within human/research tiers, consider due recovery hints before
@@ -10818,6 +10828,7 @@ async fn pick_issue_for_repo(
 ) -> Result<Option<Issue>> {
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
+    if let Ok(rows)=serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {epics::flag_childless_epics(repo_dir,&rows).await;}
     let owner_controls=workflow::FreshIssueControls::open()?;
     let mut unavailable_history=None;
     for iss in issues.as_array().cloned().unwrap_or_default() {
@@ -10827,6 +10838,10 @@ async fn pick_issue_for_repo(
         }
         if has_label(&iss,MANUAL_ENGINEERING_LABEL) {
             info!(repo=%repo.full_name,issue=number,"skip: manual engineering routing");
+            continue;
+        }
+        if epics::is_epic(&iss) {
+            info!(repo=%repo.full_name,issue=number,"{}",epics::SKIP_EPIC);
             continue;
         }
         if owner_controls.paused(&repo.full_name,number)? {
