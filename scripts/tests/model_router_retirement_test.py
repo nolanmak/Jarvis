@@ -4,7 +4,11 @@ import json
 import re
 import subprocess
 import unittest
-from scripts.tests import omniroute_install_test as installer_fixture
+import importlib.util
+
+_fixture_spec = importlib.util.spec_from_file_location('omniroute_installer_fixture', Path(__file__).with_name('omniroute_install_test.py'))
+installer_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(installer_fixture)
 
 ROOT = Path(__file__).resolve().parents[2]
 
