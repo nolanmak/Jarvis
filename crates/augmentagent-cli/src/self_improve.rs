@@ -4496,7 +4496,7 @@ fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerSta
     if augmentagent_channel_core::model_router::load().is_err() {
         return ReviewerStatus::NotConfigured("invalid model router configuration".into());
     }
-    // 9Router's account label cannot attest to its underlying model. An
+    // A model gateway's account label cannot attest to its underlying model. An
     // author model could appear again as `cx/...` or `cc/...` and falsely
     // approve its own work. Automated review uses native identities only.
     if let Some(why) = augmentagent_channel_core::fallback::workflow_native_ineligible_reason(kind) {
@@ -13424,7 +13424,7 @@ for tool, arguments in [
                 "an undeclared host login cannot authorize a workflow reviewer");
             declared_review_fixture(&home, "codex", true);
             assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
-                "declared native authentication remains eligible with 9Router configured");
+                "declared native authentication remains eligible with a model gateway configured");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

@@ -14,11 +14,43 @@ pub struct ProviderModels {
     pub claude: Models,
     pub codex: Models,
 }
+/// Wire contract for an optional model gateway. Routing remains off unless
+/// the separate mode setting explicitly enables it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayKind {
+    #[default]
+    OmniRoute,
+    #[serde(rename = "9router")]
+    NineRouter,
+}
+
+impl GatewayKind {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::OmniRoute => "OmniRoute",
+            Self::NineRouter => "9Router",
+        }
+    }
+
+    fn compression_header(self) -> &'static str {
+        match self {
+            Self::OmniRoute => "x-omniroute-compression",
+            Self::NineRouter => "X-9Router-Token-Saver",
+        }
+    }
+}
+
+fn direct_mode() -> String { "direct".into() }
+
 // Deliberately no Debug: the gateway key is a secret. Dashboard administration
 // credentials are ignored during deserialization and never reach subprocesses.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct RouterConfig {
     pub version: u32,
+    #[serde(default)]
+    pub gateway: GatewayKind,
+    #[serde(default = "direct_mode")]
     pub mode: String,
     pub base_url: String,
     pub api_key: String,
@@ -119,7 +151,7 @@ fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<P
             };
         } else {
             anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
-                "Selected Runpod model requires a configured 9Router endpoint");
+                "Selected Runpod model requires a configured model gateway endpoint");
         }
     }
     Ok(config)
@@ -218,12 +250,12 @@ impl RouterConfig {
     pub fn codex_overrides(&self) -> Vec<String> {
         vec![
             "model_provider=\"augmentagent_router\"".into(),
-            "model_providers.augmentagent_router.name=\"9Router\"".into(),
+            format!("model_providers.augmentagent_router.name=\"{}\"", self.gateway.display_name()),
             format!("model_providers.augmentagent_router.base_url={}", serde_json::to_string(&self.base_url).expect("string")),
             "model_providers.augmentagent_router.wire_api=\"responses\"".into(),
             "model_providers.augmentagent_router.env_key=\"AUGMENTAGENT_ROUTER_API_KEY\"".into(),
             "model_providers.augmentagent_router.requires_openai_auth=false".into(),
-            "model_providers.augmentagent_router.http_headers={ \"X-9Router-Token-Saver\" = \"off\" }".into(),
+            format!("model_providers.augmentagent_router.http_headers={{ \"{}\" = \"off\" }}", self.gateway.compression_header()),
         ]
     }
     pub fn configure_codex(&self, cmd: &mut tokio::process::Command) {
@@ -233,7 +265,7 @@ impl RouterConfig {
     pub fn configure_claude(&self, cmd: &mut tokio::process::Command) {
         cmd.env("ANTHROPIC_BASE_URL", self.base_url.trim_end_matches("/v1"))
             .env("ANTHROPIC_AUTH_TOKEN", &self.api_key)
-            .env("ANTHROPIC_CUSTOM_HEADERS", "X-9Router-Token-Saver: off")
+            .env("ANTHROPIC_CUSTOM_HEADERS", format!("{}: off", self.gateway.compression_header()))
             // #1404 — a dead route should fail in seconds, not sit in the
             // CLI's own retry loop; the caller has the direct CLI to fall to.
             .env("CLAUDE_CODE_MAX_RETRIES", "2")
@@ -247,10 +279,80 @@ pub(crate) mod tests {
     use super::*;
     use crate::providers::{ModelTier, ProviderKind};
     pub(crate) fn fixture() -> serde_json::Value {
-        serde_json::json!({"version":1,"mode":"auto","base_url":"http://127.0.0.1:20128/v1",
+        serde_json::json!({"version":1,"gateway":"omniroute","mode":"auto","base_url":"http://127.0.0.1:20128/v1",
           "api_key":"router-secret","models":{"claude":{"quality":"cc/claude-opus-4-6","fast":"cc/claude-haiku-4-5"},
           "codex":{"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}}})
     }
+    #[test]
+    fn gateway_kinds_select_their_claude_and_codex_wire_contracts() {
+        for (gateway,name,header) in [
+            ("omniroute","OmniRoute","x-omniroute-compression"),
+            ("9router","9Router","X-9Router-Token-Saver"),
+        ] {
+            let mut value=fixture();value["gateway"]=gateway.into();
+            let config=parse(&value.to_string()).unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],gateway);
+            let overrides=config.codex_overrides();
+            assert!(overrides.contains(&format!("model_providers.augmentagent_router.name=\"{name}\"")));
+            assert!(overrides.contains(&format!("model_providers.augmentagent_router.http_headers={{ \"{header}\" = \"off\" }}")));
+            assert!(overrides.contains(&"model_providers.augmentagent_router.base_url=\"http://127.0.0.1:20128/v1\"".into()));
+            assert!(overrides.contains(&"model_providers.augmentagent_router.requires_openai_auth=false".into()));
+            assert!(!overrides.join(" ").contains("router-secret"));
+            let mut cmd=tokio::process::Command::new("claude");
+            config.configure_claude(&mut cmd);
+            let env=cmd.as_std().get_envs().map(|(k,v)|(k.to_string_lossy().into_owned(),v.map(|v|v.to_string_lossy().into_owned()))).collect::<std::collections::BTreeMap<_,_>>();
+            assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"],Some(format!("{header}: off")));
+            assert_eq!(env["ANTHROPIC_BASE_URL"].as_deref(),Some("http://127.0.0.1:20128"));
+            assert_eq!(env["ANTHROPIC_AUTH_TOKEN"].as_deref(),Some("router-secret"));
+            assert_eq!(env["CLAUDE_CODE_MAX_RETRIES"].as_deref(),Some("2"));
+            assert_eq!(env["ANTHROPIC_API_KEY"],None);
+            assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"],None);
+        }
+    }
+
+    #[test]
+    fn missing_gateway_defaults_to_omniroute_and_missing_mode_stays_direct() {
+        let mut value=fixture();
+        value.as_object_mut().unwrap().remove("gateway");
+        let config=parse(&value.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],"omniroute");
+        assert!(config.codex_overrides().iter().any(|arg|arg.contains("OmniRoute")));
+        value.as_object_mut().unwrap().remove("mode");
+        let direct=parse(&value.to_string()).unwrap();
+        assert_eq!(direct.mode,"direct");
+        assert!(!direct.enabled());
+        for provider in [ProviderKind::Claude,ProviderKind::Codex,ProviderKind::Gemini] {
+            assert!(direct.allows(provider));
+            assert!(direct.model(provider,ModelTier::Quality).is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_gateway_is_rejected_without_echoing_secrets() {
+        for gateway in [serde_json::json!("other"),serde_json::json!(null),serde_json::json!(7)] {
+            let mut value=fixture();value["gateway"]=gateway;
+            let error=parse(&value.to_string()).err().expect("unsupported gateway must fail closed");
+            assert!(!error.to_string().contains("router-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mode_and_native_review_do_not_depend_on_gateway_kind() {
+        for gateway in ["omniroute","9router"] {
+            let mut value=fixture();value["gateway"]=gateway.into();value["mode"]="direct".into();
+            let direct=parse(&value.to_string()).unwrap();
+            assert!(!direct.enabled());
+            assert!(direct.model(ProviderKind::Claude,ModelTier::Quality).is_none());
+            assert!(direct.model(ProviderKind::Codex,ModelTier::Fast).is_none());
+            value["mode"]="auto".into();
+            let config=Some(parse(&value.to_string()).unwrap());
+            let native=native_reviewer_scope(ProviderKind::Codex,async {
+                select_profile_with_auth(config,Some(ProviderKind::Codex),true)
+            }).await.unwrap().unwrap();
+            assert_eq!(native.mode,"direct");
+        }
+    }
+
     #[test]
     fn account_profiles_respect_enabled_router_and_direct_mode() {
         let original = parse(&fixture().to_string()).unwrap();
@@ -414,7 +516,7 @@ pub(crate) mod tests {
         let lost_login = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), false)
         }).await;
-        assert!(lost_login.is_err(), "a lost native login must not fall through to 9Router");
+        assert!(lost_login.is_err(), "a lost native login must not fall through to a model gateway");
         let native_codex = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), true)
         }).await.unwrap().unwrap();
