@@ -45,7 +45,7 @@ else:raise AssertionError(args)
     let peer="fixture-owner/repo#2";let retry="fixture-owner/repo#3";
     for (number,id) in [(2,peer),(3,retry)] {
         store.register(id,&format!("agent-fix/issue-{number}"),binding.clone(),now-20_000).unwrap();
-        let attempts=if number==3 && case=="rotation" {3}else{1};
+        let attempts=if number==3 && case=="rotation" {3}else if number==3 && case=="initial-order" {2}else{1};
         for round in 0..attempts {
             let at=now-10_000+round*10+number;
             let lease=store.claim(id,"fixture-worker",at,1_000).unwrap().unwrap();
@@ -62,7 +62,7 @@ else:raise AssertionError(args)
     let before=[store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()];
     let events=[store.events(peer).unwrap(),store.events(retry).unwrap()];
     let picked=pick_issue(&repo,true).await.unwrap().unwrap();
-    assert_eq!(picked.number,2,"{case}: an unavailable or repeatedly retrying newest issue starved an eligible changed hold");
+    assert_eq!(picked.number,if case=="initial-order" {3}else{2},"{case}: picker did not preserve due-work fairness and initial newest-first order");
     assert_eq!([store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()],before,"preview changed protected workflow state");
     assert_eq!([store.events(peer).unwrap(),store.events(retry).unwrap()],events,"preview wrote events or accounting");
     if case=="rotation" {
@@ -97,4 +97,9 @@ async fn retained_lease_yields_to_changed_hold_peer() {
 #[tokio::test]
 async fn repeated_scope_attempts_rotate_between_eligible_issues() {
     fixture("rotation","self_improve::picker_fairness_tests::repeated_scope_attempts_rotate_between_eligible_issues").await;
+}
+
+#[tokio::test]
+async fn first_scope_attempts_preserve_existing_newest_first_order() {
+    fixture("initial-order","self_improve::picker_fairness_tests::first_scope_attempts_preserve_existing_newest_first_order").await;
 }

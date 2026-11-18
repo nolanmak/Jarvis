@@ -71,6 +71,8 @@ mod paused_selection_tests;
 #[cfg(test)]
 #[path = "self_improve_epic_selection_tests.rs"]
 mod epic_selection_tests;
+#[path = "self_improve_picker_fairness.rs"]
+mod picker_fairness;
 #[cfg(test)]
 #[path = "self_improve_picker_fairness_tests.rs"]
 mod picker_fairness_tests;
@@ -1057,11 +1059,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
-    let mut candidates=rest_issue_candidates(&issues);
-    // Recovery wakes the ordinary selector, not a special execution path.
-    // Within human/research tiers, consider due recovery hints before
-    // unrelated fresh issues; stable sorting preserves normal newest-first.
-    candidates.sort_by_key(|issue|(issue.research_filed,!qualification_retries.contains(&issue.number)));
+    let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
+        &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
