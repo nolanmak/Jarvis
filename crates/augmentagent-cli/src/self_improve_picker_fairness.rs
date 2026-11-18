@@ -29,12 +29,15 @@ pub(super) fn candidates(
                     "skip: workflow retry or lease is not due; consider eligible peers");
                 continue;
             }
-        }
-        if let Err(error)=controls.selection_checkout(repository,issue.number) {
-            if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some() {return Err(error);}
-            warn!(issue=issue.number,reason=%error,
-                "skip: checkout continuity unavailable; preserve original evidence and consider eligible peers");
-            continue;
+            // Unknown workflow history must reach the canonical per-issue
+            // reader, which retains its typed hold while considering peers.
+            // Only a readable snapshot can justify a checkout-continuity skip.
+            if let Err(error)=controls.selection_checkout(repository,issue.number) {
+                if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some() {return Err(error);}
+                warn!(issue=issue.number,reason=%error,
+                    "skip: checkout continuity unavailable; preserve original evidence and consider eligible peers");
+                continue;
+            }
         }
         // Preserve human/research and genuine recovery priorities. After
         // three scope claims, a repeatedly deferred issue yields to less
