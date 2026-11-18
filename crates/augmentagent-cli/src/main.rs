@@ -4172,7 +4172,7 @@ async fn main() -> Result<()> {
             // either kind of send is possible. Without a key no Gmail draft
             // can exist, so the Gmail half simply has nothing to fire.
             let composio_key = std::env::var("COMPOSIO_API_KEY").ok();
-            match scheduled_send_engine_key(composio_key, approver.is_some()) {
+            match scheduled_send_engine_key(composio_key.clone(), approver.is_some()) {
                 Some(api_key) => {
                     let mut engine = augmentagent_channel_email::ScheduledSendEngine::new(
                         Arc::clone(&store),
@@ -4192,6 +4192,11 @@ async fn main() -> Result<()> {
                             .as_deref(),
                     ))
                     .with_card_surfaces(card_surfaces.clone());
+                    if composio_key.is_none() {
+                        // Review of #2196: leave Gmail schedules armed rather
+                        // than fail them for want of a key.
+                        engine = engine.without_gmail();
+                    }
                     if let Some(approver) = approver.as_ref() {
                         engine = engine.with_platform_sender(Arc::clone(approver)
                             as Arc<dyn augmentagent_channel_email::ScheduledPlatformSender>);

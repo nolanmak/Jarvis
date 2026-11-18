@@ -172,6 +172,10 @@ pub struct ScheduledSendEngine<G: GmailApi> {
     platforms: Vec<Arc<dyn ScheduledPlatformSender>>,
     /// #1291 — card surfaces redrawn after the engine moves a row.
     surfaces: Option<CardSurfaces>,
+    /// #1640 — false on a daemon without Composio, which runs the engine
+    /// only for platform sends (Slack, iMessage). Gmail rows are then left
+    /// armed, untouched, rather than claimed and failed without a key.
+    gmail_enabled: bool,
 }
 
 impl<G: GmailApi> ScheduledSendEngine<G> {
@@ -190,7 +194,15 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             missed_window: Some(DEFAULT_MISSED_WINDOW),
             platforms: Vec::new(),
             surfaces: None,
+            gmail_enabled: true,
         }
+    }
+
+    /// #1640 — run for platform sends only: due Gmail rows stay armed until
+    /// a daemon with Composio fires them.
+    pub fn without_gmail(mut self) -> Self {
+        self.gmail_enabled = false;
+        self
     }
 
     pub fn with_tick(mut self, tick: Duration) -> Self {
@@ -294,6 +306,11 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             );
         }
         for (action_id, scheduled_at_ms, armed_at_ms, thread_id) in due {
+            // #1640 — no Composio: a Gmail row is not this engine's to touch.
+            let platform = self.platform_for(&action_id);
+            if !self.gmail_enabled && platform.is_none() {
+                continue;
+            }
             // The owner replied after arming: cancelled, whatever else.
             match self
                 .supersede_if_replied(&action_id, armed_at_ms, thread_id.as_deref())
@@ -332,7 +349,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                     continue;
                 }
             }
-            if let Some(platform) = self.platform_for(&action_id) {
+            if let Some(platform) = platform {
                 match self.fire_platform(&platform, &action_id, now_ms).await {
                     Ok(FireOutcome::Sent) => summary.fired += 1,
                     Ok(FireOutcome::Failed) => summary.failed += 1,
@@ -1359,6 +1376,28 @@ mod tests {
             .with_platform_sender(Arc::clone(&self.platform) as Arc<dyn ScheduledPlatformSender>)
             .with_card_surfaces(self.surfaces.clone())
         }
+    }
+
+    /// #1640 review: a daemon without Composio runs the engine for platform
+    /// sends only. A due Gmail row is left armed (not claimed and failed for
+    /// want of a key), however late, while a due platform row still fires.
+    #[tokio::test]
+    async fn without_gmail_platform_rows_fire_and_gmail_rows_stay_armed() {
+        let r = rig();
+        let at = 10 * MIN;
+        let mail = seed_scheduled(&r.store, "mail-1", at);
+        let text = seed_slack_scheduled(&r.store, "slack-1", at);
+        *r.platform.answer.lock().unwrap() = Some(PlatformFire::Sent);
+        let engine = r.engine().without_gmail();
+        let s = engine.tick_once(at + MIN).await.unwrap();
+        assert_eq!(s.fired, 1, "{s:?}");
+        assert_eq!(r.gmail.call_count(), 0);
+        assert_eq!(status_of(&r.store, &mail), "scheduled");
+        assert_ne!(status_of(&r.store, &text), "scheduled");
+        // Even past the missed window it is not returned to the queue.
+        let later = engine.tick_once(at + 120 * MIN).await.unwrap();
+        assert_eq!(later.returned_to_queue, 0, "{later:?}");
+        assert_eq!(status_of(&r.store, &mail), "scheduled");
     }
 
     #[test]
