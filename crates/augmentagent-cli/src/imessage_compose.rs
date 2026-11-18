@@ -637,12 +637,15 @@ fn pending_compose_card(
         .draft_body
         .as_deref()
         .context("compose draft missing")?;
-    // #1640 — Approve on this card arms a schedule: the owner must see when
-    // it will send before clicking. Display-only, like Gmail's marker.
-    let shown = match store.action_scheduled_at(action_id)? {
-        Some(at_ms) => format!("{draft}\n[sends: {}]", crate::format_local_send_time(at_ms)),
-        None => draft.to_string(),
-    };
+    // #1640 — Approve on this card arms a schedule: the shared renderer
+    // shows the proposal, as on every later redraw of the card.
+    let shown = augmentagent_approval_discord::append_envelope_markers(
+        draft.to_string(),
+        Some(store),
+        action_id,
+        &row.email.from,
+        None,
+    );
     Ok(augmentagent_approval_discord::approval_message(
         action_id, &row.email, &shown, 0,
     ))

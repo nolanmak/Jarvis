@@ -2177,6 +2177,14 @@ async fn delete_notice_message(
 /// (auto-triage replies, non-gmail platforms) and no `attachment` → the body
 /// passes through unchanged. Public since #501: the Back-to-queue repost in
 /// the CLI reuses it so the reposted card matches the Revise repost exactly.
+/// The `--send-at` proposal of a card that is still `pending` (an armed
+/// schedule has its own notice; a resolved row has no card).
+fn pending_send_at_proposal(store: &augmentagent_store::Store, action_id: &str) -> Option<i64> {
+    let at_ms = store.action_scheduled_at(action_id).ok().flatten()?;
+    let row = store.get_action_with_email(action_id).ok().flatten()?;
+    (row.action.status == "pending").then_some(at_ms)
+}
+
 pub fn append_envelope_markers(
     body: String,
     store: Option<&augmentagent_store::Store>,
@@ -2203,6 +2211,15 @@ pub fn append_envelope_markers(
         if let Some(subject) = env.subject.as_deref() {
             markers.push_str(&format!("\n[subject: {subject}]"));
         }
+    }
+    // #1640 — a still-pending card carrying a `--send-at` proposal: Approve
+    // arms a schedule, so every redraw (queued post, reminder, Revise) must
+    // show when it will send, not only the first post.
+    if let Some(at_ms) = store.and_then(|s| pending_send_at_proposal(s, action_id)) {
+        markers.push_str(&format!(
+            "\n[sends: {}]",
+            crate::timeparse::format_local_send_time(at_ms)
+        ));
     }
     // #1188 — a file attached to the (replacement) draft is shown as its own
     // display marker so the redrawn card names exactly what Approve will send.
@@ -3390,6 +3407,26 @@ mod tests {
             .unwrap();
         s.set_action_envelope(&id, to, cc, bcc).unwrap();
         (s, id, f)
+    }
+
+    /// Review of #2196: a card with a `--send-at` proposal is redrawn (queued
+    /// post, reminder, Revise) through this renderer, so the proposal must
+    /// show on every redraw while the card is pending, and not once armed.
+    #[test]
+    fn a_pending_send_time_proposal_shows_on_every_redraw() {
+        let (s, id, _f) = store_with_envelope(None, None, None);
+        let at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        assert!(!append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None)
+            .contains("[sends:"));
+        s.set_action_scheduled_at(&id, Some(at)).unwrap();
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None);
+        let want = format!("[sends: {}]", crate::timeparse::format_local_send_time(at));
+        assert!(out.contains(&want), "{out}");
+        assert!(out.starts_with("body"), "{out}");
+        // Armed: the schedule notice speaks for it; the card marker is gone.
+        assert!(s.schedule_action(&id, at, "test").unwrap());
+        assert!(!append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None)
+            .contains("[sends:"));
     }
 
     #[test]

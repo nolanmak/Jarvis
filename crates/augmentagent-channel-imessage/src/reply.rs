@@ -281,12 +281,26 @@ impl ImessageReplier {
                     match self.store.scheduled_actions_for_thread_except_kind(&thread, COMPOSE_KIND) {
                         Ok(rows) => for (id, armed_at) in rows {
                             if split_own_entries_since(&self.store, delta, Some(armed_at)).1 == 0 { continue; }
+                            // Snapshot the notice first: the supersede keeps
+                            // the pointers, but nothing else will retire them
+                            // once the row is no longer scheduled.
+                            let notice = self.store.action_notice(&id).ok().flatten();
                             match self.store.mark_scheduled_superseded(
                                 &id,
                                 "superseded: you replied by hand after scheduling",
                                 "imessage-manual-reply",
                             ) {
-                                Ok(true) => stats.superseded += 1,
+                                Ok(true) => {
+                                    stats.superseded += 1;
+                                    if let Some((chan, msg)) = notice {
+                                        if let (Ok(c), Ok(m)) = (chan.parse::<u64>(), msg.parse::<u64>()) {
+                                            if let Err(e) = self.approvals.delete_message(c, m).await {
+                                                warn!(action_id=%id, "scheduled notice delete failed: {e}");
+                                            }
+                                        }
+                                        let _ = self.store.clear_action_notice(&id);
+                                    }
+                                }
                                 Ok(false) => {}
                                 Err(e) => {
                                     warn!(action_id=%id, "cancelling a scheduled reply after a manual reply failed: {e}");
@@ -1085,12 +1099,17 @@ mod tests {
         for id in [&reply, &compose] {
             assert!(f.store.schedule_action(id, at, "test").unwrap());
         }
+        // Review of #2196: the reply's "Sends at" notice is retired with it.
+        f.store.set_action_notice(&reply, "100", "200").unwrap();
+        f.store.set_action_notice(&compose, "100", "201").unwrap();
         let mut d2 = one_to_one(&[("me", "typed by hand")]);
         d2.new_entries[0].1.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
         rep.handle_deltas(&[d2]).await;
         let status = |id: &str| f.store.get_action_with_email(id).unwrap().unwrap().action.status;
         assert_eq!(status(&reply), "superseded");
         assert_eq!(status(&compose), "scheduled");
+        assert_eq!(f.store.action_notice(&reply).unwrap(), None, "notice retired");
+        assert!(f.store.action_notice(&compose).unwrap().is_some(), "compose keeps its notice");
     }
 
     #[tokio::test]

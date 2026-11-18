@@ -16482,15 +16482,7 @@ impl ReplyApprover {
 /// "Mon Sep 1, 9:05 AM". `chrono::Local` follows the daemon host's timezone
 /// — the same zone the schedule was resolved in.
 fn format_local_send_time(at_ms: i64) -> String {
-    use chrono::TimeZone;
-    match chrono::Local.timestamp_millis_opt(at_ms) {
-        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-            dt.format("%a %b %-d, %-I:%M %p").to_string()
-        }
-        // Out-of-range epoch — unreachable behind the 60-day guard, but a
-        // display path must never panic.
-        chrono::LocalResult::None => format!("epoch+{at_ms}ms"),
-    }
+    augmentagent_approval_discord::timeparse::format_local_send_time(at_ms)
 }
 
 fn resolve_discord_voice_socket(
