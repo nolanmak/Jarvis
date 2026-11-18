@@ -12,6 +12,9 @@ on:
       - 'views/model-*'
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
+      - 'scripts/*omniroute*'
+      - 'scripts/lib/omniroute_install.py'
+      - 'scripts/tests/omniroute_install_test.py'
       - 'scripts/*runpod-adapter*'
       - 'scripts/lib/install-launchd-plist.sh'
       - 'scripts/macos_parity_inventory.py'
@@ -42,6 +45,9 @@ on:
       - 'views/model-*'
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
+      - 'scripts/*omniroute*'
+      - 'scripts/lib/omniroute_install.py'
+      - 'scripts/tests/omniroute_install_test.py'
       - 'scripts/*runpod-adapter*'
       - 'scripts/lib/install-launchd-plist.sh'
       - 'scripts/macos_parity_inventory.py'
@@ -98,6 +104,9 @@ jobs:
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/installer/9"
 
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/installer/10"
+
+      - name: Optional OmniRoute installer contracts
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/installer/11"
 
   dashboard:
     runs-on: ubuntu-latest

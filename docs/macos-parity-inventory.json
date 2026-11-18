@@ -1612,6 +1612,22 @@
     "evidence": null
   },
   {
+    "id": "installer:install-omniroute.sh",
+    "source": "scripts/install-omniroute.sh",
+    "linux_baseline": "Explicit opt-in pinned OmniRoute systemd user installer; direct routing remains default.",
+    "macos_target": "Launchd service variant deferred by #1656; Linux-only entry point refuses macOS installation.",
+    "prerequisites": [
+      "Linux systemd user session",
+      "supported Node/npm",
+      "Secret Service keyring",
+      "private disposable test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1656",
+    "test_plan": "Run scripts/tests/omniroute_install_test.py on the mini and CI with disposable host fixtures; add a launchd variant before claiming macOS service parity.",
+    "status": "gap",
+    "evidence": null
+  },
+  {
     "id": "installer:install-research.sh",
     "source": "scripts/install-research.sh",
     "linux_baseline": "Linux install-research.sh installs or removes its matching component.",
