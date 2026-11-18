@@ -329,7 +329,7 @@ fn errors_redact_credentials_before_truncating() {
 
 #[tokio::test]
 async fn transport_errors_never_carry_the_request_url_or_key() {
-    let secret = "sk-live-12345";
+    let secret = "fixture-credential-value";
     let (_, keys) = availability(&move |name| (name == SERPAPI_KEY).then(|| secret.to_string()));
     let http = reqwest::Client::new();
     // Connection refused: nothing listens on port 1.
