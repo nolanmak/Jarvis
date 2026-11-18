@@ -137,21 +137,30 @@ def label_left_of(doc, cell):
     return "".join(unescape(t) for t in T_TEXT.findall(doc[prev_start:prev_end])).strip()
 
 
+# A signing field's label on its own: "Signature", "Sign here:", "By:".
+LABEL_ONLY = re.compile(r"^\s*(signature|sign\s+here|signed|by)\s*[:\-\u2013]?\s*$", re.I)
+# Content that is not text: an existing signature image, an object, a field.
+NON_TEXT = re.compile(r"<w:(drawing|pict|object)\b")
+
+
 def candidates(doc):
     """Paragraphs a signature can go into, top to bottom, numbered from 1:
-    a short line that starts with a signing label ("Signature:", "Sign here",
-    "By:") or is a blank drawn with underscores that is not labelled as a
-    date, name or title; or the empty cell right of a signing label in a
-    table (the two-column signature block). Prose that merely mentions a
-    signature is not a line."""
+    a blank drawn with underscores that is not labelled as a date, name or
+    title ("Signature: ____", "By: ____"); a signing label on its own line
+    ("Signature:"); or the empty cell right of such a label in a table (the
+    two-column signature block). Prose that begins like a label ("By signing
+    this agreement, ...") is not a line, and a paragraph that already holds a
+    picture (a signature already there) is never offered again."""
     out = []
     for index, (start, end, text) in enumerate(paragraphs(doc)):
         stripped = text.strip()
         cell = cell_of(doc, start)
+        if NON_TEXT.search(doc[start:end]):
+            continue
         if stripped:
             if len(stripped) > MAX_LINE_CHARS or BLOCKED.search(stripped):
                 continue
-            signing = SIGN_LABEL.search(stripped)
+            signing = LABEL_ONLY.search(stripped)
             blank = UNDERSCORES.search(stripped) and not OTHER_LABEL.search(stripped)
             if cell is not None and not UNDERSCORES.search(stripped):
                 continue  # a table label: its signature goes in the cell beside it
@@ -160,7 +169,7 @@ def candidates(doc):
             out.append(dict(line=len(out) + 1, paragraph=index, text=stripped, kind="line"))
         elif cell is not None:
             label = label_left_of(doc, cell)
-            if label and SIGN_LABEL.search(label) and len(label) <= MAX_LINE_CHARS:
+            if label and LABEL_ONLY.search(label):
                 out.append(dict(line=len(out) + 1, paragraph=index, text=label, kind="cell"))
     return out
 
@@ -169,13 +178,29 @@ def norm(text):
     return " ".join(text.casefold().split())
 
 
+# Parts a reader sees besides the body, checked for manual-only documents.
+VISIBLE_PARTS = re.compile(r"^word/(header\d*|footer\d*|footnotes|endnotes)\.xml$")
+
+
+def refuse_manual_documents(z, doc):
+    """Affidavits, sworn statements, perjury declarations and government
+    filings are signed by hand, wherever the words appear: the body, a header,
+    a footer, or a note."""
+    texts = [" ".join(p[2] for p in paragraphs(doc))]
+    for name in z.namelist():
+        if VISIBLE_PARTS.match(name):
+            part = z.read(name).decode("utf-8", "replace")
+            texts.append(" ".join(unescape(t) for t in T_TEXT.findall(part)))
+    if BLOCKED.search(" ".join(texts)):
+        raise ValueError("this document requires manual signing outside Jarvis")
+    return texts[0]
+
+
 def resolve(data):
-    _, _, doc = load(data)
-    text = " ".join(p[2] for p in paragraphs(doc))
+    _, z, doc = load(data)
+    text = refuse_manual_documents(z, doc)
     if not text.strip():
         raise ValueError("document must have readable text for signing review")
-    if BLOCKED.search(text):
-        raise ValueError("this document requires manual signing outside Jarvis")
     found = candidates(doc)
     target = data["target"]
     if "line" in target:
@@ -311,6 +336,7 @@ def place_in_paragraph(body, drawing, date):
 
 def sign(data):
     raw, z, doc = load(data)
+    refuse_manual_documents(z, doc)
     placement = data["placement"]
     date = data.get("date")
     if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):

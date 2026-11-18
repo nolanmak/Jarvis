@@ -116,6 +116,34 @@ class WordSigningTests(unittest.TestCase):
         self.assertIsNotNone(box)
         self.assertLess(box[2], im.width - 10, "nothing is drawn up to the right edge")
 
+    def test_a_cell_already_signed_is_not_offered_again(self):
+        # Review of #2241: an existing signature image has no text.
+        raw = docx(para(run("Terms.")) + table_row("Signature:", "<w:p/>"))
+        once = sign_line(raw)
+        self.assertEqual(sign_docx.lines(dict(docx=b64(once)))["lines"], [])
+        with self.assertRaisesRegex(ValueError, "no line 1"):
+            sign_line(once)
+
+    def test_manual_only_words_in_a_header_or_footer_are_refused(self):
+        # Review of #2241: the exclusion read only the body.
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(docx(para(run("Terms.")) + para(run("Signature: _____")))), "r") as src, \
+                zipfile.ZipFile(out, "w") as dst:
+            for info in src.infolist():
+                dst.writestr(info, src.read(info))
+            dst.writestr("word/footer1.xml", f'<w:ftr {NS}><w:p><w:r><w:t>Signed under penalty of perjury</w:t></w:r></w:p></w:ftr>')
+        with self.assertRaisesRegex(ValueError, "manual signing"):
+            sign_line(out.getvalue())
+
+    def test_prose_that_starts_like_a_label_is_not_a_line(self):
+        # Review of #2241.
+        raw = docx(para(run("By signing this agreement, you accept these terms."))
+                   + para(run("Signed copies are kept by both parties."))
+                   + para(run("By:"))
+                   + para(run("Signature")))
+        lines = sign_docx.lines(dict(docx=b64(raw)))["lines"]
+        self.assertEqual([l["text"] for l in lines], ["By:", "Signature"])
+
     def test_a_blank_split_across_runs_is_removed_entirely(self):
         # Review of #2241: the preview showed the whole blank gone.
         raw = docx(para(run("Terms.")) + para(run("Signature: ___"), run("____"), run(" (Client)")))
