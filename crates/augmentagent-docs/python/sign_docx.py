@@ -152,6 +152,7 @@ def candidates(doc):
     this agreement, ...") is not a line, and a paragraph that already holds a
     picture (a signature already there) is never offered again."""
     out = []
+    offered_cells = set()
     for index, (start, end, text) in enumerate(paragraphs(doc)):
         stripped = text.strip()
         cell = cell_of(doc, start)
@@ -168,8 +169,13 @@ def candidates(doc):
                 continue
             out.append(dict(line=len(out) + 1, paragraph=index, text=stripped, kind="line"))
         elif cell is not None:
+            # A cell is offered once (its first empty paragraph), and never
+            # when any paragraph in it already holds a signature.
+            if cell in offered_cells or NON_TEXT.search(doc[cell[0]:cell[1]]):
+                continue
             label = label_left_of(doc, cell)
             if label and LABEL_ONLY.search(label):
+                offered_cells.add(cell)
                 out.append(dict(line=len(out) + 1, paragraph=index, text=label, kind="cell"))
     return out
 
@@ -425,6 +431,25 @@ def lines(data):
     return dict(lines=candidates(doc))
 
 
+# The paragraph as laid out: breaks start a row, tabs are wide spaces.
+LAYOUT = re.compile(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>|<w:(br|cr|tab)\b[^>]*>")
+
+
+def preview_layout(doc, para_span):
+    """(rows before the signature row, text before the signature on its row,
+    text after it on its row, rows after) for the signed paragraph, so the
+    preview places the signature where the published document does, across
+    the paragraph's own line breaks and tabs."""
+    start, end, _ = para_span
+    text = "".join(
+        unescape(m.group(1)) if m.group(1) is not None else ("\n" if m.group(2) in ("br", "cr") else "    ")
+        for m in LAYOUT.finditer(doc[start:end]))
+    blank = UNDERSCORES.search(text)
+    head, tail = (text[:blank.start()], text[blank.end():]) if blank else (text, "")
+    head_rows, tail_rows = head.split("\n"), tail.split("\n")
+    return head_rows[:-1], head_rows[-1], tail_rows[0], tail_rows[1:]
+
+
 def preview(data):
     """A picture of the signature line as it will read once signed: the
     paragraphs before and after for context, and the line itself with the
@@ -433,11 +458,9 @@ def preview(data):
     _, _, doc = load(data)
     paras = paragraphs(doc)
     index = data["placement"]["paragraph"]
-    text = paras[index][2]
     before = paras[index - 1][2].strip() if index > 0 else ""
     after = paras[index + 1][2].strip() if index + 1 < len(paras) else ""
-    m = UNDERSCORES.search(text)
-    head, tail = (text[:m.start()], text[m.end():]) if m else (text, "")
+    rows_before, head, tail, rows_after = preview_layout(doc, paras[index])
     png, (w, h) = ink_png(base64.b64decode(data["png"], validate=True))
     sig = Image.open(io.BytesIO(png)).convert("RGBA")
     sig_w = int(data["placement"]["width"] * 2)
@@ -453,12 +476,17 @@ def preview(data):
         line_width += int(measure.textlength(date, font=font)) + 16
     if tail.strip():
         line_width += int(measure.textlength(tail.strip(), font=font))
+    for row in rows_before + rows_after:
+        line_width = max(line_width, 40 + int(measure.textlength(row, font=font)))
     width = max(1400, line_width + 40)
-    height = 120 + sig.height + 120
+    row_h = 40
+    height = 120 + row_h * len(rows_before) + sig.height + row_h * len(rows_after) + 120
     img = Image.new("RGB", (width, height), "white")
     d = ImageDraw.Draw(img)
     d.text((40, 20), before[:110], fill=(130, 130, 130), font=small)
-    y = 70 + sig.height
+    for n, row in enumerate(rows_before):
+        d.text((40, 70 + n * row_h), row, fill="black", font=font)
+    y = 70 + row_h * len(rows_before) + sig.height
     x = 40
     d.text((x, y - 30), head.strip(), fill="black", font=font)
     x += int(d.textlength(head.strip(), font=font)) + 16
@@ -469,7 +497,9 @@ def preview(data):
         x += int(d.textlength(date, font=font)) + 16
     if tail.strip():
         d.text((x, y - 30), tail.strip(), fill="black", font=font)
-    d.text((40, y + 30), after[:110], fill=(130, 130, 130), font=small)
+    for n, row in enumerate(rows_after):
+        d.text((40, y + 10 + n * row_h), row, fill="black", font=font)
+    d.text((40, y + 30 + row_h * len(rows_after)), after[:110], fill=(130, 130, 130), font=small)
     out = io.BytesIO()
     img.save(out, "PNG")
     return out.getvalue()

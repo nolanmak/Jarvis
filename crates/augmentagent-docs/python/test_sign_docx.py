@@ -147,6 +147,25 @@ class WordSigningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manual signing"):
             sign_line(raw)
 
+    def test_a_cell_is_offered_once_and_never_after_it_is_signed(self):
+        # Review of #2241: two empty paragraphs in one cell meant two offers.
+        raw = docx(para(run("Terms.")) + table_row("Signature:", "<w:p/><w:p/>"))
+        self.assertEqual(len(sign_docx.lines(dict(docx=b64(raw)))["lines"]), 1)
+        once = sign_line(raw)
+        self.assertEqual(sign_docx.lines(dict(docx=b64(once)))["lines"], [])
+
+    def test_the_preview_follows_line_breaks_in_the_signed_line(self):
+        # Review of #2241: "Signature:<w:br/>_____" signs below the label.
+        raw = docx(para(run("Terms.")) + para('<w:r><w:t>Signature:</w:t><w:br/><w:t>_____</w:t><w:tab/><w:t>(seal)</w:t></w:r>'))
+        doc = part(raw, "word/document.xml")
+        span = sign_docx.paragraphs(doc)[1]
+        self.assertEqual(sign_docx.preview_layout(doc, span), (["Signature:"], "", "    (seal)", []))
+        data = dict(docx=b64(raw), png=b64(signature_png()))
+        placement = sign_docx.resolve(dict(data, target=dict(line=1), width=None))
+        self.assertTrue(sign_docx.preview(dict(data, placement=placement)).startswith(b"\x89PNG"))
+        signed = part(sign_line(raw), "word/document.xml")
+        self.assertLess(signed.index("<w:br/>"), signed.index("<w:drawing>"), "signed below the label too")
+
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
         raw = docx(para(run("By signing this agreement, you accept these terms."))
