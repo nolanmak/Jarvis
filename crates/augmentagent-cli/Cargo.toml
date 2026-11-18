@@ -106,6 +106,7 @@ rusqlite = { workspace = true }
 # is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated
 # sqlite db path so probe output is deterministic on a fresh box.
 [dev-dependencies]
+augmentagent-test-support = { path = "../augmentagent-test-support" }
 wiremock.workspace = true
 # #1215 — paused tokio time drives the scripted-day loop test.
 tokio = { workspace = true, features = ["test-util"] }

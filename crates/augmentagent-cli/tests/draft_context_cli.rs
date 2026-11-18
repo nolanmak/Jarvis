@@ -65,7 +65,7 @@ fn context_from_ask_working_directory_uses_the_supplied_wiki_and_never_sends() {
     let dir = fixture();
     let root = dir.path();
     let fake = root.join("fake-claude.py");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &fake,
         r#"#!/usr/bin/env python3
 import json,sys

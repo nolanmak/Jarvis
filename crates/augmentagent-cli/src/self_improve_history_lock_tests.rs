@@ -62,7 +62,7 @@ async fn locked_writer(mode: &str, test: &str) {
         "label": GAVE_UP_LABEL,
         "reason": format!("{GAVE_UP_REASON_MARKER_PREFIX}gate-red -->"),
     })).unwrap()).unwrap();
-    std::fs::write(&gh, r#"#!/usr/bin/python3
+    augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/python3
 import json, pathlib, sys
 root = pathlib.Path(__file__).parent
 scenario = json.loads((root / 'scenario.json').read_text())

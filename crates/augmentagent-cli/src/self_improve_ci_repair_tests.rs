@@ -90,7 +90,7 @@ async fn historical_ci_failures_require_classification_before_builder_dispatch()
         };
         std::fs::write(root.path().join("scenario.json"), serde_json::to_vec(&serde_json::json!({"head": head, "base": head, "job_name": current_job, "log": log, "expected_classification": expected})).unwrap()).unwrap();
         let gh = root.path().join("fake-gh");
-        std::fs::write(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
+        augmentagent_test_support::write_executable(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])

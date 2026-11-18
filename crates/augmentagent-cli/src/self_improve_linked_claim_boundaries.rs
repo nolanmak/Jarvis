@@ -51,7 +51,7 @@ async fn fixture(kind: &str, mode: &str, name: &str) -> bool {
     }
     let root = tempfile::tempdir().unwrap();
     let gh = root.path().join("github.py");
-    std::fs::write(&gh, GH).unwrap();
+    augmentagent_test_support::write_executable(&gh, GH).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([

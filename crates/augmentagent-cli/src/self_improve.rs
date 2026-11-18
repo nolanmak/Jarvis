@@ -98,6 +98,9 @@ mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
+#[path = "self_improve_preflight_retry.rs"]
+mod preflight_retry;
+
 #[path = "self_improve_provider_readiness.rs"]
 pub(crate) mod provider_readiness;
 
@@ -11368,6 +11371,9 @@ struct DailyCounter {
     history: std::collections::BTreeMap<u64, u32>,
     #[serde(default)]
     reservations: std::collections::BTreeMap<String, u64>,
+    /// Unpaid readiness observation; never shipping authority.
+    #[serde(default)]
+    preflight_observation: Option<preflight_retry::Observation>,
 }
 
 impl DailyCounter {
@@ -12485,6 +12491,7 @@ impl AutoPrLoop {
             } else {
                 self.interval
             };
+            let wait = preflight_retry::delay(&counter_path, (self.clock)().timestamp_millis(), wait)?;
             let next_tick = tokio::time::Instant::now() + wait;
             loop {
                 self.upgrade_boundary()?;
@@ -12570,9 +12577,11 @@ impl AutoPrLoop {
                     r = tick() => r,
                 };
                 let completed_day = utc_day_of((self.clock)());
-                let billed = outcome.as_ref().map_or(true, |r| r.billed);
+                let billed = outcome.as_ref().map(|r| r.billed)
+                    .unwrap_or_else(|error| !preflight_retry::is_blocked(error));
                 let runs_today = DailyCounter::update(&counter_path, |counter| {
                     counter.settle_reservation(&reservation, completed_day, billed);
+                    preflight_retry::record(counter, outcome.as_ref().err(), (self.clock)().timestamp_millis());
                     Ok(counter.runs_today(completed_day))
                 })?;
                 // A durable retry may be both paid and held. Settle its
@@ -12757,7 +12766,7 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh");
-        std::fs::write(&gh,"#!/bin/sh\n[ \"$1 $2\" = 'repo view' ] || exit 93\nprintf 'owner/repo\\n'\n").unwrap();
+        augmentagent_test_support::write_executable(&gh,"#!/bin/sh\n[ \"$1 $2\" = 'repo view' ] || exit 93\nprintf 'owner/repo\\n'\n").unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
         let out=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::tests::owner_resume_does_not_reserve_a_turn_in_the_build_only_lane","--nocapture"])
@@ -12806,7 +12815,7 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
-        std::fs::write(&gh,r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json,sys
 args=sys.argv[1:]
 if args[:2]==['repo','view']:print('ADMIN' if 'viewerPermission' in args else 'owner/repo')
@@ -18739,7 +18748,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn fake_gh_1214(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let gh = root.join("fake-gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['JARVIS_1214_ROOT'])
 args = sys.argv[1:]
@@ -18813,7 +18822,7 @@ else:
             use std::os::unix::fs::PermissionsExt;
             let root = tempfile::tempdir().unwrap();
             let gh = root.path().join("gh.py");
-            std::fs::write(&gh,r#"#!/usr/bin/env python3
+            augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 a=sys.argv[1:]
 assert a[1]=='list' and a[a.index('--state')+1]=='open'
@@ -20111,7 +20120,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     fn fake_gh_1037(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let gh = root.join("fake-gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['JARVIS_1037_ROOT'])
 args = sys.argv[1:]
@@ -21105,7 +21114,7 @@ mod linked_pr_dedup_regressions {
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
             let gh = root.path().join("github.py");
-            std::fs::write(&gh, r#"#!/usr/bin/python3
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/python3
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
@@ -21340,8 +21349,8 @@ mod recovered_issue_selection_regressions {
                 git(&repo,&["add","."]);git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","original"]);
                 let head=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&head]);
                 let bin=root.path().join("bin");std::fs::create_dir(&bin).unwrap();let rustc=bin.join("rustc");
-                std::fs::write(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
-                let gh=bin.join("gh.py");std::fs::write(&gh,r#"#!/usr/bin/python3
+                augmentagent_test_support::write_executable(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let gh=bin.join("gh.py");augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json,os,sys,sqlite3
 args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
 with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
@@ -21448,7 +21457,7 @@ raise AssertionError(args)
         }
         if case=="changed-environment" {
             let compiler=PathBuf::from(std::env::var_os("GH_BIN").unwrap()).parent().unwrap().join("rustc");
-            std::fs::write(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
+            augmentagent_test_support::write_executable(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
         }
         let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
         if case=="recovery-history-disappeared" {
@@ -21575,6 +21584,10 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_preflight_retry_tests.rs"]
+mod preflight_retry_tests;
 
 #[cfg(test)]
 #[path = "self_improve_observation_wake_tests.rs"]

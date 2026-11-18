@@ -840,7 +840,7 @@ mod tests {
         // it up and tag the source as WellKnown.
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("deno");
-        std::fs::write(&fake, "#!/bin/sh\necho 1\n").expect("write fake deno");
+        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\necho 1\n").expect("write fake deno");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -882,7 +882,7 @@ mod tests {
         // path) so spawn behaviour matches the pre-fix happy path.
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("deno");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\nexit 0\n").expect("write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -901,7 +901,7 @@ mod tests {
         // Env var must win even when a well-known candidate is present.
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("deno");
-        std::fs::write(&fake, "#!/bin/sh\n").expect("write");
+        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\n").expect("write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

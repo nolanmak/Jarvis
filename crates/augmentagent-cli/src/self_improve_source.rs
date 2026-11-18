@@ -304,7 +304,7 @@ mod tests {
             let dir = tempfile::Builder::new().prefix("adopted-source-").tempdir_in("/tmp").unwrap();
             let root = dir.path().canonicalize().unwrap();
             let gh = root.join("gh.py");
-            std::fs::write(&gh, r#"#!/usr/bin/env python3
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 r=pathlib.Path(os.environ['AUTOSHIP_ADOPTED_SOURCE_FIXTURE']);a=sys.argv[1:]
 with (r/'calls').open('a') as f:f.write(json.dumps(a)+'\n')

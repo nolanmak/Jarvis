@@ -772,7 +772,7 @@ mod tests {
                 let observed=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
                 let receipt=registration.observe(root.path(),"observe",registration.binding(&base).unwrap(),&observed).unwrap();
                 prepared.baseline=BaselineEvidence {registration,receipts:vec![receipt]};
-                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+                augmentagent_test_support::write_executable(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
                 std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let database=control.path().join("workflow.db");
                 let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
@@ -826,7 +826,7 @@ mod tests {
             let (root,control,mut prepared)=fixture();
             persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
             let base=prepared.baseline.registration.baseline_head().to_owned();
-            std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+            augmentagent_test_support::write_executable(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
             let database=control.path().join("workflow.db");
@@ -1023,7 +1023,7 @@ mod tests {
                 assert!(native_control.join(format!("{}-workflow.json",source.key())).exists());
                 let base=prepared.baseline.registration.baseline_head();
                 let script=PathBuf::from(std::env::var_os("GH_BIN").unwrap());
-                std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+                augmentagent_test_support::write_executable(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
                 std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let epoch=amendment::digest(&serde_json::to_vec(&(source,base,environment_id(root.path()).unwrap())).unwrap());
                 for _ in 0..4 {assert!(next.admit_epoch_attempt("verifier-amend-total",&epoch,4).unwrap());}
@@ -1378,7 +1378,7 @@ mod tests {
             let origin=context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY).unwrap();
             judgment["context"]=origin.clone().into();let raw=judgment.to_string();
             let base=prepared.baseline.registration.baseline_head();
-            std::fs::write(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
+            augmentagent_test_support::write_executable(&script,format!("#!/bin/sh\n[ \"$1\" = api ] || exit 91\nprintf '%s\\n' '{base}'\n")).unwrap();
             std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
             let database=workflow::path();
             assert_eq!(database,script.parent().unwrap().join("workflow.db"),"fault injection requires disposable fixture state");
