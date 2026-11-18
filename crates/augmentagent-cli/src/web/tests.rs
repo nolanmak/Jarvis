@@ -329,8 +329,8 @@ fn errors_redact_credentials_before_truncating() {
 
 #[tokio::test]
 async fn transport_errors_never_carry_the_request_url_or_key() {
-    let secret = "fixture-credential-value";
-    let (_, keys) = availability(&move |name| (name == SERPAPI_KEY).then(|| secret.to_string()));
+    let fixture = "fixture-credential-value";
+    let (_, keys) = availability(&move |name| (name == SERPAPI_KEY).then(|| fixture.to_string()));
     let http = reqwest::Client::new();
     // Connection refused: nothing listens on port 1.
     let cx = Call {
@@ -342,10 +342,10 @@ async fn transport_errors_never_carry_the_request_url_or_key() {
     };
     let request = http
         .get(format!("{}/search", cx.base_url))
-        .query(&[("api_key", secret)]);
+        .query(&[("api_key", fixture)]);
     let error = send(&cx, ProviderId::Serpapi, request).await.unwrap_err();
     assert!(
-        !error.message.contains(secret) && !error.message.contains("api_key"),
+        !error.message.contains(fixture) && !error.message.contains("api_key"),
         "{}",
         error.message
     );
@@ -372,11 +372,11 @@ async fn transport_errors_never_carry_the_request_url_or_key() {
     };
     let request = http
         .get(format!("{base}/search"))
-        .query(&[("api_key", secret)]);
+        .query(&[("api_key", fixture)]);
     let error = send(&cx, ProviderId::Serpapi, request).await.unwrap_err();
     assert!(error.message.starts_with("timed out"), "{}", error.message);
     assert!(
-        !error.message.contains(secret) && !error.message.contains("api_key"),
+        !error.message.contains(fixture) && !error.message.contains("api_key"),
         "{}",
         error.message
     );
