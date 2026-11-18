@@ -69,6 +69,11 @@ mod linked_claim_boundaries;
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
 #[cfg(test)]
+#[path = "self_improve_epic_selection_tests.rs"]
+mod epic_selection_tests;
+#[path = "self_improve_epics.rs"]
+mod epics;
+#[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
@@ -98,6 +103,9 @@ mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
+#[path = "self_improve_preflight_retry.rs"]
+mod preflight_retry;
+
 #[path = "self_improve_provider_readiness.rs"]
 pub(crate) mod provider_readiness;
 
@@ -118,6 +126,9 @@ mod recovery;
 mod checkout_identity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
+#[path = "self_improve_observation_wake.rs"]
+mod observation_wake;
+
 #[path = "self_improve_targeted.rs"]
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
@@ -128,6 +139,11 @@ mod alignment;
 mod push_destination;
 #[path = "self_improve_publication.rs"]
 mod publication;
+#[cfg(test)]
+#[path="self_improve_review_recovery_acceptance_tests.rs"]
+pub(crate) mod review_recovery_acceptance_tests;
+#[path="self_improve_review_capacity.rs"]
+mod review_capacity;
 #[path = "self_improve_review.rs"]
 mod aligned_review;
 #[path = "self_improve_review_canary.rs"]
@@ -438,6 +454,10 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
             if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
+                return None;
+            }
+            if epics::is_epic(iss) {
+                info!(issue=number,"{}",epics::SKIP_EPIC);
                 return None;
             }
             let s = |k: &str| {
@@ -1033,6 +1053,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
+    if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let mut candidates=rest_issue_candidates(&issues);
     // Recovery wakes the ordinary selector, not a special execution path.
     // Within human/research tiers, consider due recovery hints before
@@ -4507,49 +4528,18 @@ fn select_reviewer(
     if candidates.is_empty() {
         return Err(ReviewUnavailable::AllReviewersBuiltIt);
     }
-    let mut latched = Vec::new();
-    let mut missing = Vec::new();
-    for candidate in &candidates {
-        match status(*candidate) {
-            ReviewerStatus::Ready => return Ok(*candidate),
-            ReviewerStatus::Latched(until) => latched.push((candidate.name().to_string(), until)),
-            ReviewerStatus::NotConfigured(why) => missing.push(format!("{}: {why}", candidate.name())),
-        }
-    }
-    // A latch names when the draft can move again, so it outranks a reviewer
-    // that is merely not set up: waiting fixes the first, not the second.
-    if latched.is_empty() {
-        Err(ReviewUnavailable::NoCapacity {
-            reviewers: candidates,
-            detail: missing.join("; "),
-        })
-    } else {
-        Err(ReviewUnavailable::Latched { until: latched })
-    }
+    review_capacity::available(candidates,status)
 }
 
 /// Provider diversity is preferred, while a protected fresh-session origin
-/// permits native Codex to review work whose provider history includes Codex.
+/// permits admitted native sessions to review work by the same provider family.
 /// This selects capacity only; approval still requires the controller receipt.
 fn select_session_isolated_reviewer(
     pool: &[augmentagent_channel_core::ProviderKind],
     authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
     status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
 ) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
-    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
-    let authors = match authors {
-        Ok(Some(authors)) if !authors.is_empty() => authors,
-        Ok(_) => return Err(ReviewUnavailable::ProvenanceUnknown),
-        Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
-    };
-    let native: Vec<_> = pool.iter().copied().filter(|provider| matches!(provider, Claude | Codex)).collect();
-    match select_reviewer(&native, Ok(Some(authors)), &status) {
-        Ok(provider) => Ok(provider),
-        Err(prior) => {
-            if native.contains(&Codex) && matches!(status(Codex), ReviewerStatus::Ready) { Ok(Codex) }
-            else { Err(prior) }
-        }
-    }
+    review_capacity::isolated(pool,authors,status)
 }
 
 /// Select only providers of `pool` outside every recorded builder attempt.
@@ -10836,6 +10826,7 @@ async fn pick_issue_for_repo(
 ) -> Result<Option<Issue>> {
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
+    if let Ok(rows)=serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {epics::flag_childless_epics(repo_dir,&rows).await;}
     let owner_controls=workflow::FreshIssueControls::open()?;
     let mut unavailable_history=None;
     for iss in issues.as_array().cloned().unwrap_or_default() {
@@ -10845,6 +10836,10 @@ async fn pick_issue_for_repo(
         }
         if has_label(&iss,MANUAL_ENGINEERING_LABEL) {
             info!(repo=%repo.full_name,issue=number,"skip: manual engineering routing");
+            continue;
+        }
+        if epics::is_epic(&iss) {
+            info!(repo=%repo.full_name,issue=number,"{}",epics::SKIP_EPIC);
             continue;
         }
         if owner_controls.paused(&repo.full_name,number)? {
@@ -11389,6 +11384,9 @@ struct DailyCounter {
     history: std::collections::BTreeMap<u64, u32>,
     #[serde(default)]
     reservations: std::collections::BTreeMap<String, u64>,
+    /// Unpaid readiness observation; never shipping authority.
+    #[serde(default)]
+    preflight_observation: Option<preflight_retry::Observation>,
 }
 
 impl DailyCounter {
@@ -12506,6 +12504,7 @@ impl AutoPrLoop {
             } else {
                 self.interval
             };
+            let wait = preflight_retry::delay(&counter_path, (self.clock)().timestamp_millis(), wait)?;
             let next_tick = tokio::time::Instant::now() + wait;
             loop {
                 self.upgrade_boundary()?;
@@ -12523,7 +12522,8 @@ impl AutoPrLoop {
                                 .and_then(|store| store.map(|s| -> Result<bool> {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
-                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12549,7 +12549,12 @@ impl AutoPrLoop {
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
-                            Ok(false) => {},
+                            Ok(false) => match observation_wake::reserve(&self.workflow_path,
+                                self.command_repository.as_deref().unwrap(),(self.clock)().timestamp_millis()) {
+                                Ok(true)=>break,
+                                Ok(false)=>{},
+                                Err(error)=>warn!("activity observation wake-up unavailable: {error:#}"),
+                            },
                             Err(error) => warn!("command queue wake-up unavailable: {error:#}"),
                         }
                     }
@@ -12585,9 +12590,11 @@ impl AutoPrLoop {
                     r = tick() => r,
                 };
                 let completed_day = utc_day_of((self.clock)());
-                let billed = outcome.as_ref().map_or(true, |r| r.billed);
+                let billed = outcome.as_ref().map(|r| r.billed)
+                    .unwrap_or_else(|error| !preflight_retry::is_blocked(error));
                 let runs_today = DailyCounter::update(&counter_path, |counter| {
                     counter.settle_reservation(&reservation, completed_day, billed);
+                    preflight_retry::record(counter, outcome.as_ref().err(), (self.clock)().timestamp_millis());
                     Ok(counter.runs_today(completed_day))
                 })?;
                 // A durable retry may be both paid and held. Settle its
@@ -12772,7 +12779,7 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh");
-        std::fs::write(&gh,"#!/bin/sh\n[ \"$1 $2\" = 'repo view' ] || exit 93\nprintf 'owner/repo\\n'\n").unwrap();
+        augmentagent_test_support::write_executable(&gh,"#!/bin/sh\n[ \"$1 $2\" = 'repo view' ] || exit 93\nprintf 'owner/repo\\n'\n").unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
         let out=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::tests::owner_resume_does_not_reserve_a_turn_in_the_build_only_lane","--nocapture"])
@@ -12821,7 +12828,7 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
-        std::fs::write(&gh,r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json,sys
 args=sys.argv[1:]
 if args[:2]==['repo','view']:print('ADMIN' if 'viewerPermission' in args else 'owner/repo')
@@ -12913,6 +12920,8 @@ else:raise Exception('unexpected fixture call '+repr(args))
                 store.release(&lease, 0).unwrap();
                 if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
                 assert!(!store.has_command_jobs().unwrap());
+                assert_eq!(store.has_due_main_reconciliation(Some("owner/repo"),1_000).unwrap(),
+                    case=="ready", "the dedicated main gate must still reject {case}");
                 tokio::time::sleep(std::time::Duration::from_secs(26)).await;
                 timer_stop.cancel();
             };
@@ -12922,7 +12931,10 @@ else:raise Exception('unexpected fixture call '+repr(args))
             }, || async {0});
             let (result, ()) = tokio::join!(run, submitted);
             result.unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+            // Eligible generic reconciliation now has its independent S activity
+            // wake; it must not masquerade as a main-dependency signal above.
+            assert_eq!(calls.load(Ordering::SeqCst),
+                usize::from(matches!(case,"ready"|"generic-reconcile")), "{case}");
         }
     }
 
@@ -18749,7 +18761,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn fake_gh_1214(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let gh = root.join("fake-gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['JARVIS_1214_ROOT'])
 args = sys.argv[1:]
@@ -18823,7 +18835,7 @@ else:
             use std::os::unix::fs::PermissionsExt;
             let root = tempfile::tempdir().unwrap();
             let gh = root.path().join("gh.py");
-            std::fs::write(&gh,r#"#!/usr/bin/env python3
+            augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 a=sys.argv[1:]
 assert a[1]=='list' and a[a.index('--state')+1]=='open'
@@ -20121,7 +20133,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     fn fake_gh_1037(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let gh = root.join("fake-gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['JARVIS_1037_ROOT'])
 args = sys.argv[1:]
@@ -21115,7 +21127,7 @@ mod linked_pr_dedup_regressions {
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
             let gh = root.path().join("github.py");
-            std::fs::write(&gh, r#"#!/usr/bin/python3
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/python3
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
@@ -21350,8 +21362,8 @@ mod recovered_issue_selection_regressions {
                 git(&repo,&["add","."]);git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","original"]);
                 let head=git(&repo,&["rev-parse","HEAD"]);git(&repo,&["update-ref","refs/remotes/origin/main",&head]);
                 let bin=root.path().join("bin");std::fs::create_dir(&bin).unwrap();let rustc=bin.join("rustc");
-                std::fs::write(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
-                let gh=bin.join("gh.py");std::fs::write(&gh,r#"#!/usr/bin/python3
+                augmentagent_test_support::write_executable(&rustc,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.94.1 (selection fixture)'\n").unwrap();std::fs::set_permissions(&rustc,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let gh=bin.join("gh.py");augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json,os,sys,sqlite3
 args=sys.argv[1:];mode=os.environ['AUTOSHIP_RECOVERED_SELECTION_CASE']
 with open(os.environ['AUTOSHIP_RECOVERED_SELECTION_CALLS'],'a') as out:out.write(json.dumps(args)+'\n')
@@ -21458,7 +21470,7 @@ raise AssertionError(args)
         }
         if case=="changed-environment" {
             let compiler=PathBuf::from(std::env::var_os("GH_BIN").unwrap()).parent().unwrap().join("rustc");
-            std::fs::write(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
+            augmentagent_test_support::write_executable(compiler,"#!/bin/sh\nprintf '%s\\n' 'rustc 1.95.0 (changed selection fixture)'\n").unwrap();
         }
         let held_before=store.snapshot(held_id).unwrap();let ready_before=store.snapshot(ready_id).unwrap();let held_events=store.events(held_id).unwrap();let ready_events=store.events(ready_id).unwrap();
         if case=="recovery-history-disappeared" {
@@ -21585,6 +21597,14 @@ raise AssertionError(args)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_preflight_retry_tests.rs"]
+mod preflight_retry_tests;
+
+#[cfg(test)]
+#[path = "self_improve_observation_wake_tests.rs"]
+mod observation_wake_tests;
 
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]

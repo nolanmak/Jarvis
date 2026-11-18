@@ -506,7 +506,7 @@ fn setup(shared: bool) -> Fixture {
     .unwrap();
     commit(root.path(), "introduce API caller mismatch");
     let gh = control.path().join("fake-gh");
-    std::fs::write(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
+    augmentagent_test_support::write_executable(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
     Fixture {
         root,

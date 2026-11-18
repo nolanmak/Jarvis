@@ -1,0 +1,11 @@
+[package]
+name = "augmentagent-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tempfile = "3"
+
+[dev-dependencies]
+libc = "0.2"

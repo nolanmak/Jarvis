@@ -43,7 +43,7 @@ impl Env {
         let tools = root.join("tools");
         std::fs::create_dir_all(&tools).unwrap();
         let fake = tools.join("pdftotext");
-        std::fs::write(&fake, "#!/bin/sh\necho 'SYNTHETIC PDF TEXT'\n").unwrap();
+        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\necho 'SYNTHETIC PDF TEXT'\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut server = mockito::Server::new();
         mock_install(&mut server);

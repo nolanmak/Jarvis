@@ -237,7 +237,7 @@ async fn approved_ready_pr_preserves_review_but_never_replays_uncertain_merge() 
         let dir = tempfile::Builder::new().prefix("autoship-sweep-test-").tempdir_in("/tmp").unwrap();
         let root = dir.path();
         let gh = root.join("gh.py");
-        std::fs::write(&gh, r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import base64, importlib.util, json, os, pathlib, sys, time, urllib.parse
 root=pathlib.Path(os.environ['AUTOSHIP_PROGRESS_FIXTURE'])
 a=sys.argv[1:]

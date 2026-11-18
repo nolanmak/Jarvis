@@ -242,7 +242,7 @@ async fn exercise(kind: &str, test: &str) {
     );
     std::fs::write(root.join("rows.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
     let gh = root.join("gh");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &gh,
         include_str!("../tests/fixtures/integration-restart-gh.py"),
     )

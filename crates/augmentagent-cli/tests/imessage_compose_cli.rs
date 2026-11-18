@@ -133,7 +133,7 @@ fn fault_injected_ask_raises_one_pending_compose_and_asks_on_ambiguity() {
             std::fs::write(root.join("wiki/people/synthetic-jane-other.md"),"---\nkind: person\nidentities:\n  imessage: [\"+15555550101\"]\n---\n# Synthetic Jane\n").unwrap();
         }
         let script = root.join("fake-claude.py");
-        std::fs::write(&script,r#"#!/usr/bin/env python3
+        augmentagent_test_support::write_executable(&script,r#"#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 prompt=sys.stdin.read()
 assert 'text Synthetic Jane' in prompt, prompt

@@ -47,6 +47,7 @@ impl WorkflowStore {
         let branch:String=tx.query_row("SELECT branch FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         ensure!(reference==format!("refs/heads/{branch}"),"Push reference differs from current workflow branch");
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        family_budget::control::require_dispatch(&tx,lease)?;
         qualification_recovery::require_mutation_allowed(&tx,&lease.workflow)?;
         let other:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND kind=?2 AND receipt IS NULL AND id<>?3)",
             params![lease.workflow,serde_json::to_string(&kind)?,id],|r|r.get(0))?;

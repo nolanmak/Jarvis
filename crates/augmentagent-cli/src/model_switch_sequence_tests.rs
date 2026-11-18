@@ -27,10 +27,10 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
     // The scope guard sources aa-wiki-protected-names.sh from its own dir
     // (#1078); copy both or the guard aborts under `set -euo pipefail`.
     for script in ["aa-wiki-scope-guard.sh", "aa-wiki-protected-names.sh"] {
-        std::fs::copy(source_repo.join("scripts").join(script), scripts.join(script)).unwrap();
+        augmentagent_test_support::copy_executable(source_repo.join("scripts").join(script), scripts.join(script)).unwrap();
     }
     let memory = release.join("augmentagent-mcp-memory");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &memory,
         r#"#!/usr/bin/env python3
 import json, sys
@@ -60,7 +60,7 @@ for line in sys.stdin:
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let finance = release.join("augmentagent");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &finance,
         "#!/bin/sh\nif [ \"$1\" = model-tool ] || [ \"$1\" = composio-auth-tool ]; then exec \"$(dirname \"$0\")/augmentagent-mcp-memory\"; fi\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
     )

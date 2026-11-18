@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install CI packages, with one signed Ubuntu mirror fallback for DNS failures.
+"""Install CI packages, with signed retries for DNS or missing Ubuntu sources.
 
 Temporary APT source options apply only to the fallback commands. Host source
 files, signature keys and system DNS configuration are never changed.
@@ -26,6 +26,36 @@ def dns_failure(output):
             'Unable to fetch some archives')):
             return False
     return not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
+
+
+def package_lookup_failure(output, packages):
+    errors = [line for line in output.splitlines() if line.startswith('E:')]
+    expected = {f'E: Unable to locate package {package}' for package in packages}
+    return bool(errors) and all(line in expected for line in errors) and not re.search(
+        r'Temporary failure resolving|Could not resolve|NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
+
+
+def missing_ubuntu_sources(run, common, suite):
+    # APT resolves both legacy .list and deb822 .sources entries, including
+    # Enabled/Types filtering. Origin/Codename come from the Release metadata;
+    # a Microsoft source can use the Ubuntu codename without being Ubuntu.
+    try:
+        inventory = run([*common, 'indextargets', '--format', '$(ORIGIN)\t$(CODENAME)',
+                         'Identifier: Packages'], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if inventory.returncode:
+        return False
+    targets = []
+    for line in inventory.stdout.splitlines():
+        if not line:
+            continue
+        fields = line.split('\t')
+        if len(fields) != 2 or '$(' in line:
+            return False  # Unknown inventory must not change source selection.
+        targets.append(fields)
+    return ['Ubuntu', suite] not in targets
 
 
 def playwright_dependencies(browser, *, run=subprocess.run):
@@ -81,11 +111,13 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
                          stderr=subprocess.STDOUT, text=True, timeout=600)
             print(result.stdout, end='', flush=True)
             if result.returncode:
-                return result
-        return result
+                return result, action[0]
+        return result, "install"
 
-    result = execute([])
-    if not result.returncode or not dns_failure(result.stdout):
+    result, action = execute([])
+    dns = dns_failure(result.stdout)
+    lookup = action == "install" and package_lookup_failure(result.stdout, packages)
+    if not result.returncode or not (dns or lookup):
         return result.returncode
 
     release = {}
@@ -99,21 +131,32 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
     if architecture is None:
         architecture = subprocess.check_output(['dpkg', '--print-architecture'], text=True).strip()
     if release.get('ID') != 'ubuntu' or suite not in ('noble', 'resolute') or architecture not in ('amd64', 'amd64v3') or not keyring.is_file():
-        print('DNS fallback unavailable: unsupported Ubuntu suite/architecture or missing archive keyring', flush=True)
+        print('Signed APT fallback unavailable: unsupported Ubuntu suite/architecture or missing archive keyring', flush=True)
         return result.returncode
 
-    print('APT DNS failure: retrying once against kernel.org with Ubuntu archive signatures required', flush=True)
+    if dns:
+        print('APT DNS failure: retrying once against kernel.org with Ubuntu archive signatures required', flush=True)
+        archives = [('https://mirrors.edge.kernel.org/ubuntu/',
+                     f'{suite} {suite}-updates {suite}-security {suite}-backports')]
+    else:
+        if not missing_ubuntu_sources(run, common, suite):
+            return result.returncode
+        print(f'APT has no Ubuntu binary sources for {suite}: retrying once against signed Ubuntu archives', flush=True)
+        archives = [('https://archive.ubuntu.com/ubuntu/', f'{suite} {suite}-updates {suite}-backports'),
+                    ('https://security.ubuntu.com/ubuntu/', f'{suite}-security')]
+
     with tempfile.TemporaryDirectory(prefix='jarvis-ci-apt-') as directory:
         # The unprivileged _apt downloader needs read/traverse permission.
         os.chmod(directory, 0o755)
         source = Path(directory) / 'ubuntu.sources'
-        source.write_text(f'Types: deb\nURIs: https://mirrors.edge.kernel.org/ubuntu/\n'
-                          f'Suites: {suite} {suite}-updates {suite}-security {suite}-backports\n'
-                          f'Components: main restricted universe multiverse\n'
-                          f'Architectures: {architecture}\nSigned-By: {keyring}\n')
+        source.write_text('\n'.join(
+            f'Types: deb\nURIs: {uri}\nSuites: {suites}\n'
+            f'Components: main restricted universe multiverse\n'
+            f'Architectures: {architecture}\nSigned-By: {keyring}\n'
+            for uri, suites in archives))
         source.chmod(0o644)
         return execute(['-o', f'Dir::Etc::sourcelist={source}',
-                        '-o', 'Dir::Etc::sourceparts=-']).returncode
+                        '-o', 'Dir::Etc::sourceparts=-'])[0].returncode
 
 
 if __name__ == '__main__':
