@@ -33,3 +33,12 @@ Tests use temporary real workflow stores and the actual `charge_admitted_model` 
 The installed native dispatch observer and controller publication intent, bound push, note/ready and publication-reservation entry points consume this check. S's durable operation/push/publication reservation transactions recheck it as well. Refusals enter the existing specific durable wait path before any model charge. The old controller's hold flag also fences native dispatch, even if the control-only predicate remains ready after compute exhaustion. General lease/binding and shared metadata-recovery checks remain separate; no family control check was added to completed-effect receipt or late-accounting methods.
 
 M's final merge reservation/dispatch transactions still need the same family-control predicate beside their existing owner-control guards; this S slice does not edit M's implementation. Automatic T funding-frame production, ancestor cancellation/teardown composition, and ordinary live acceptance remain separate integration work. The family feature is not activated by these component tests.
+
+
+## Post-pipeline wait settlement
+
+Ordinary issue, resumed PR and adopted-PR execution settle a confirmed family wait after their pipeline future returns. Settlement retains the original controller logger; it does not reconstruct an empty process registry after restart. It signals only that native owner's supervisors and waits up to 30 seconds for their actual cleanup registrations and checked audit drain. Missing cleanup proof leaves execution custody fenced.
+
+A fenced store transaction revalidates the live lease, active same-generation wait and exact registered audit proof, records native retirement intent and releases the execution lease. The checkpoint, stage, evidence, meaningful-progress clock and five-minute observation deadline remain intact. Actual elapsed usage is recorded; model admissions and merge allowance do not reset. A shared family-settlement marker prevents guard destruction or completion from repeating release or charging after it. Existing non-family completion behavior is unchanged.
+
+Failed wait persistence cannot become a successful held report or a cleanup release. An idle-recovery request still requires its separate recovery completion. Native VM retirement retains its existing checked retry path; releasing a stopped controller is not a claim that retained VMs have already been deleted.

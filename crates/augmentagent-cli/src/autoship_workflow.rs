@@ -25,6 +25,8 @@ mod family_budget_tests;
 mod activity_observation;
 #[path = "autoship_idle_recovery.rs"]
 pub(crate) mod idle_recovery;
+#[path = "autoship_family_wait_release.rs"]
+mod family_wait_release;
 #[path = "autoship_outcome_classification.rs"]
 mod outcome_classification;
 
