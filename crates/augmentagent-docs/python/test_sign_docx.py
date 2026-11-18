@@ -27,8 +27,11 @@ def docx(body, rels=RELS, types_extra=""):
 
 
 def signature_png():
+    # Ink 180 x 30 px, about 24 pt tall at the default 144 pt width, like a
+    # real handwritten signature.
     im = Image.new("RGBA", (200, 50), (0, 0, 0, 0))
     for x in range(10, 190):
+        im.putpixel((x, 10 + (x % 30)), (0, 0, 0, 255))
         im.putpixel((x, 25), (0, 0, 0, 255))
     out = io.BytesIO()
     im.save(out, "PNG")
@@ -196,6 +199,34 @@ class WordSigningTests(unittest.TestCase):
                    types_extra="<Default Extension='png' ContentType='image/png'/>")
         types = part(sign_line(raw), "[Content_Types].xml")
         self.assertEqual(sign_docx.default_extensions(types).count("png"), 1)
+
+    def test_a_field_spanning_paragraphs_excludes_its_result_paragraphs(self):
+        # Review of #2241: begin/separate in one paragraph, end in a later one.
+        body = (para(run("Terms."))
+                + '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> IF 1 = 1 </w:instrText></w:r>'
+                  '<w:r><w:fldChar w:fldCharType="separate"/></w:r></w:p>'
+                + para(run("Signature: _____"))
+                + '<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+                + para(run("By: _____")))
+        lines = sign_docx.lines(dict(docx=b64(docx(body))))["lines"]
+        self.assertEqual([l["text"] for l in lines], ["By: _____"])
+
+    def test_a_fixed_height_line_or_row_too_short_for_the_signature_is_refused(self):
+        # Review of #2241: Word clips an inline picture to an exact height.
+        exact = ('<w:p><w:pPr><w:spacing w:line="240" w:lineRule="exact"/></w:pPr>'
+                 + run("Signature: _____") + "</w:p>")
+        with self.assertRaisesRegex(ValueError, "fixed height of 12 pt"):
+            sign_line(docx(para(run("Terms.")) + exact))
+        row = ('<w:tbl><w:tr><w:trPr><w:trHeight w:val="300" w:hRule="exact"/></w:trPr>'
+               '<w:tc><w:p><w:r><w:t>Signature:</w:t></w:r></w:p></w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl>')
+        with self.assertRaisesRegex(ValueError, "row has a fixed height of 15 pt"):
+            sign_line(docx(para(run("Terms.")) + row))
+        # A fixed height tall enough, or an "at least" height, signs.
+        roomy = ('<w:p><w:pPr><w:spacing w:line="1440" w:lineRule="exact"/></w:pPr>'
+                 + run("Signature: _____") + "</w:p>")
+        self.assertIn("<w:drawing>", part(sign_line(docx(para(run("Terms.")) + roomy)), "word/document.xml"))
+        at_least = exact.replace('w:lineRule="exact"', 'w:lineRule="atLeast"')
+        self.assertIn("<w:drawing>", part(sign_line(docx(para(run("Terms.")) + at_least)), "word/document.xml"))
 
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.

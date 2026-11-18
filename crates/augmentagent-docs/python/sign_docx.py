@@ -153,6 +153,27 @@ def default_extensions(types_xml):
     return [d.get("Extension", "").lower() for d in root.iter(CT_NS + "Default")]
 
 
+FIELD_CHAR = re.compile(r'<w:fldChar\b[^>]*\bw:fldCharType="(begin|end)"')
+
+
+def field_ranges(doc):
+    """Document offsets covered by complex fields (begin .. end), however
+    many paragraphs a field spans. Fields nest; the outermost range counts."""
+    ranges, depth, opened = [], 0, 0
+    for m in FIELD_CHAR.finditer(doc):
+        if m.group(1) == "begin":
+            if depth == 0:
+                opened = m.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                ranges.append((opened, m.end()))
+    if depth:
+        ranges.append((opened, len(doc)))
+    return ranges
+
+
 def candidates(doc):
     """Paragraphs a signature can go into, top to bottom, numbered from 1:
     a blank drawn with underscores that is not labelled as a date, name or
@@ -163,10 +184,11 @@ def candidates(doc):
     picture (a signature already there) is never offered again."""
     out = []
     offered_cells = set()
+    fields = field_ranges(doc)
     for index, (start, end, text) in enumerate(paragraphs(doc)):
         stripped = text.strip()
         cell = cell_of(doc, start)
-        if NON_TEXT.search(doc[start:end]):
+        if NON_TEXT.search(doc[start:end]) or any(a < end and start < b for a, b in fields):
             continue
         if stripped:
             if len(stripped) > MAX_LINE_CHARS or BLOCKED.search(stripped):
@@ -267,6 +289,36 @@ def ink_png(png_bytes):
     out = io.BytesIO()
     im.save(out, "PNG", optimize=False)
     return out.getvalue(), im.size
+
+
+EXACT_LINE = re.compile(r'<w:spacing\b[^>]*>')
+EXACT_ROW = re.compile(r'<w:trHeight\b[^>]*>')
+
+
+def twips_attr(tag, name):
+    m = re.search(rf'\bw:{name}="(-?\d+)"', tag)
+    return int(m.group(1)) if m else None
+
+
+def refuse_clipping(doc, start, end, height_pt):
+    """An inline picture taller than a fixed line height (exact paragraph
+    spacing) or a fixed table row height is clipped in Word, while the
+    preview shows it whole. Refuse such a placement, naming the limit."""
+    ppr = re.search(r"<w:pPr>.*?</w:pPr>", doc[start:end], re.S)
+    for tag in EXACT_LINE.findall(ppr.group(0) if ppr else ""):
+        line = twips_attr(tag, "line")
+        if 'w:lineRule="exact"' in tag and line is not None and line / 20 < height_pt:
+            raise ValueError(f"the signature line has a fixed height of {line / 20:g} pt, shorter than the "
+                             f"{height_pt:.0f} pt signature; use a smaller --width or sign by hand")
+    cell = cell_of(doc, start)
+    if cell is not None:
+        row = max(doc.rfind("<w:tr>", 0, cell[0]), doc.rfind("<w:tr ", 0, cell[0]))
+        trpr = re.search(r"<w:trPr>.*?</w:trPr>", doc[row:cell[0]], re.S) if row >= 0 else None
+        for tag in EXACT_ROW.findall(trpr.group(0) if trpr else ""):
+            val = twips_attr(tag, "val")
+            if 'w:hRule="exact"' in tag and val is not None and val / 20 < height_pt:
+                raise ValueError(f"the signature cell's row has a fixed height of {val / 20:g} pt, shorter than the "
+                                 f"{height_pt:.0f} pt signature; use a smaller --width or sign by hand")
 
 
 def unique(existing, make):
@@ -383,6 +435,7 @@ def sign(data):
     width = float(placement["width"])
     cx = int(round(width * EMU_PER_PT))
     cy = int(round(width * h / w * EMU_PER_PT))
+    refuse_clipping(doc, start, end, width * h / w)
     names = set(z.namelist())
     media = unique(names, lambda n: f"word/media/jarvis-signature-{n}.png")
     rels = z.read(RELS).decode("utf-8") if RELS in names else (
