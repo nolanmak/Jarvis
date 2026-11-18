@@ -118,7 +118,10 @@ pub(super) struct Identity {
     ownership: Ownership,
 }
 
-fn read_receipt(path: &Path) -> Result<Option<Ownership>> {
+fn read_receipt(path:&Path)->Result<Option<Ownership>> {
+    read_receipt_bytes(path)?.map(|bytes|Ok(serde_json::from_slice(&bytes)?)).transpose()
+}
+fn read_receipt_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -137,7 +140,10 @@ fn read_receipt(path: &Path) -> Result<Option<Ownership>> {
             && metadata.len() <= 65536,
         hold("checkout_receipt_invalid")
     );
-    Ok(Some(serde_json::from_reader(file)?))
+    use std::io::Read;
+    let mut bytes=Vec::new();file.take(65537).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len()<=65536,hold("checkout_receipt_invalid"));
+    Ok(Some(bytes))
 }
 async fn git(root: &Path, args: &[&str]) -> Result<String> {
     let mut options = vec!["-c", "core.hooksPath=/dev/null"];
@@ -183,6 +189,22 @@ pub(super) fn check_recorded(state: &Path, workflow: &str, worktree: &Path,
         .map_err(|error| error.context(hold("checkout_identity_changed")))?;
     anyhow::ensure!(current == recorded.fingerprint, hold("checkout_identity_changed"));
     Ok(())
+}
+
+pub(super) fn has_recorded(state:&Path,workflow:&str,worktree:&Path)->Result<bool> {
+    let root=canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    Ok(read_receipt(&receipt_path(state,workflow,&root)?)?.is_some())
+}
+
+/// Read validated original bytes for an owner archive; never change the receipt.
+pub(super) fn archive_recorded(state:&Path,workflow:&str,worktree:&Path)->Result<(PathBuf,Vec<u8>)> {
+    let root=canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    let path=receipt_path(state,workflow,&root)?;
+    let bytes=read_receipt_bytes(&path)?.context(hold("checkout_receipt_invalid"))?;
+    let _:Ownership=serde_json::from_slice(&bytes)?;
+    Ok((path,bytes))
 }
 
 /// An in-process handoff from the existing lease-fenced reconstruction path.

@@ -1596,7 +1596,7 @@ fn native_custody_failure(error:&anyhow::Error)->bool {
 // Keep the actual initial producer available to crash/reopen regression fixtures.
 fn initial_repair_epoch(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str,
     scope:&str,required_criteria:&[String],policy:&str)->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow,
+    owner_checkout_recovery::scope_key(workflow,amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow,
         contract,source,base,environment,scope,required_criteria,policy))?))
 }
 
@@ -1604,10 +1604,10 @@ pub(super) fn initial_scope_replay_error(error:anyhow::Error)->anyhow::Error {
     error.context(initial_repair::Hold::EvidenceUnknown)
 }
 fn initial_plan_budget_context(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str)->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-verifier-budget-context-v1",workflow,contract,source,base,environment))?))
+    owner_checkout_recovery::scope_key(workflow,amendment::digest(&serde_json::to_vec(&("initial-verifier-budget-context-v1",workflow,contract,source,base,environment))?))
 }
 fn initial_scope_origin_inputs(workflow:&str,owner_request:&str,base:&str,environment:&str)->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow,owner_request,base,environment))?))
+    owner_checkout_recovery::scope_key(workflow,amendment::digest(&serde_json::to_vec(&("initial-scope-inputs-v1",workflow,owner_request,base,environment))?))
 }
 fn initial_scope_origin(workflow:&workflow::WorkflowGuard,base:&str,environment:&str)->Result<String> {
     initial_scope_origin_inputs(workflow.id(),&workflow.original_owner_request()?,base,environment)
@@ -1642,7 +1642,7 @@ pub(super) fn preflight_initial_scope(root:&Path,workflow:&workflow::WorkflowGua
 
 fn initial_budget_inputs(workflow:&str,contract:&str,source:AcceptanceSource,base:&str,environment:&str,
     scope:&str,required_criteria:&[String])->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&("initial-baseline-budget-inputs-v1",workflow,
+    owner_checkout_recovery::scope_key(workflow,amendment::digest(&serde_json::to_vec(&("initial-baseline-budget-inputs-v1",workflow,
         contract,source,base,environment,scope,required_criteria))?))
 }
 
@@ -1757,7 +1757,7 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
     trusted_git(root,&["clean","-fdx"]).await?;
     let environment=environment_id(root)?;
     let epoch=initial_budget_epoch(workflow,source,base,&environment,scope,required_criteria)?;
-    let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
+    let legacy=owner_checkout_recovery::scope_key(workflow.id(),amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes()))?;
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,
         |key|workflow.scope_stage_response(key).map_err(initial_scope_error),
@@ -1791,7 +1791,7 @@ async fn retain_initial_measurement<'a,F,Fut>(root:&Path,control:&Path,proposal:
 where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::Future<Output=Result<BaselineEvidence>> {
     let base=actual_head(root).await?;let environment=environment_id(root)?;
     let execution=verifier_executor_id()?;
-    let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?);
+    let key=owner_checkout_recovery::scope_key(workflow.id(),amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?))?;
     let path=|hash:&str|control.join(format!("baseline-measurement-{key}-{hash}.json"));
     if let Some(hash)=workflow.scope_stage_response(&key).map_err(initial_scope_error)? {
         return (||->Result<BaselineEvidence> {

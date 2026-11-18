@@ -29,7 +29,7 @@ pub(crate) struct Args {
     /// Caller-chosen idempotency key; a retry with it resumes, never repeats.
     #[arg(long = "request-id", required_unless_present = "list")]
     request_id: Option<String>,
-    /// List held issues the legacy sweep could not lift, with their action.
+    /// List legacy holds and continuity-lost workflows, with owner actions.
     #[arg(long, conflicts_with_all = ["repo", "issue", "pr", "reason", "request_id"])]
     list: bool,
     #[arg(long)]
@@ -52,7 +52,7 @@ impl Refusal {
     /// Bounded, stable reason code for adapters (Discord) that echo it.
     pub(crate) fn reason(&self) -> &'static str { self.reason }
 }
-fn refuse(code: i32, reason: &'static str, detail: impl Into<String>) -> anyhow::Error {
+pub(super) fn refuse(code: i32, reason: &'static str, detail: impl Into<String>) -> anyhow::Error {
     Refusal { code, reason, detail: detail.into() }.into()
 }
 
@@ -180,6 +180,14 @@ pub(crate) async fn apply(repo: &Path, request: &Request) -> Result<Value> {
     if is_issue_blast_radius(&format!("{}\n{}", issue["title"].as_str().unwrap_or(""), issue["body"].as_str().unwrap_or(""))) {
         return Err(refuse(3, "security-hold", "security-sensitive issues keep their hold"));
     }
+    if issue["labels"].as_array().is_some_and(|labels|labels.iter().any(|label|label["name"]==MANUAL_ENGINEERING_LABEL || label.as_str()==Some(MANUAL_ENGINEERING_LABEL))) {
+        return Err(refuse(3,"autoship-manual","manual engineering issues cannot be readopted"));
+    }
+    if !has_gave_up_label(&issue) {
+        if let Some(hold)=owner_checkout_recovery::apply(repo,request,&principal).await? {
+            return Ok(output(request,&principal,&hold,false));
+        }
+    }
     if !has_gave_up_label(&issue) {
         // A retry after the label write landed completes the same request.
         if let Some((_, _, _, _, principal, hold, _)) = &prior {
@@ -212,8 +220,10 @@ pub(crate) async fn apply(repo: &Path, request: &Request) -> Result<Value> {
 
 fn list() -> Result<Value> {
     let rows = legacy_readmission::readoption_required(&workflow::path())?;
+    let continuity = owner_checkout_recovery::list(&workflow::path())?;
     Ok(json!({
         "schema_version": 1,
+        "continuity_lost": continuity,
         "readoption_required": rows.into_iter().map(|(repository, issue, hold, action)| json!({
             "repository": repository, "issue": issue, "hold_reason": hold, "action": action,
         })).collect::<Vec<_>>(),
@@ -257,19 +267,28 @@ pub(crate) async fn run_command(args: &Args) -> i32 {
 }
 
 #[cfg(test)]
+#[path = "self_improve_owner_checkout_recovery_tests.rs"]
+mod continuity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    const CHILD: &str = "AUTOSHIP_READOPTION_FIXTURE";
-    const GH: &str = r#"#!/usr/bin/env python3
+    pub(super) const CHILD: &str = "AUTOSHIP_READOPTION_FIXTURE";
+    pub(super) const GH: &str = r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 r=pathlib.Path(os.environ['AUTOSHIP_READOPTION_FIXTURE']);a=sys.argv[1:]
 with (r/'calls').open('a') as f:f.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view'] and 'viewerPermission' in a: print((r/'permission').read_text())
 elif a[:2]==['repo','view']: print('Controller/Repo')
 elif a[:2]==['api','graphql']: print(json.dumps({'data':{'viewer':{'login':'controller'}}}))
+elif a[:2]==['pr','list']: print('[]')
 elif a[:2]==['pr','view']: print(json.dumps({'number':42,'state':'OPEN','url':'https://github.com/controller/repo/pull/42','headRefName':'feat/imported','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':False,'author':{'login':'controller'},'title':'Fix arithmetic','body':'Repair addition','closingIssuesReferences':[]}))
+elif a[:1]==['api'] and '/git/ref/heads/main' in a[1]: print((r/'main-head').read_text())
 elif a[:1]==['api'] and '/timeline?' in a[1]: print((r/'timeline.json').read_text())
+elif a[:1]==['api'] and '/issues?' in a[1]:
+ i=json.loads((r/'issue.json').read_text());i['user']={'login':'controller'};i['author_association']='OWNER'
+ print(json.dumps([i] if a[1].endswith('page=1') else []))
 elif a[:1]==['api'] and '/issues/' in a[1]: print((r/'issue.json').read_text())
 elif a[:2]==['issue','edit']:
  assert a[3:]==['--remove-label','agent-gave-up']
@@ -289,17 +308,17 @@ else: sys.exit(2)
             json!({"event":"cross-referenced","actor":{"login":"controller"},"created_at":"2026-01-02T00:00:00Z"}),
         ]
     }
-    fn issue(labelled: bool) -> Value {
+    pub(super) fn issue(labelled: bool) -> Value {
         let labels = if labelled { json!([{"name":"bug"},{"name":GAVE_UP_LABEL}]) } else { json!([{"name":"bug"}]) };
         json!({"number":7,"state":"open","title":"Phone setup drifts","body":"Fix the phone setup","labels":labels})
     }
-    fn request(id: &str) -> Request {
+    pub(super) fn request(id: &str) -> Request {
         Request { repository: "controller/repo".into(), issue: 7, reason: "owner re-scoped after #2053".into(), request_id: id.into() }
     }
-    fn refusal(error: anyhow::Error) -> &'static str {
+    pub(super) fn refusal(error: anyhow::Error) -> &'static str {
         error.downcast_ref::<Refusal>().unwrap_or_else(|| panic!("untyped refusal: {error:#}")).reason
     }
-    fn rows(path: &Path) -> Vec<(String, String)> {
+    pub(super) fn rows(path: &Path) -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(path).unwrap();
         let mut q = conn.prepare("SELECT request_id,status FROM owner_readoption ORDER BY created_at_ms,request_id").unwrap();
         q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
