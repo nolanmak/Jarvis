@@ -7,6 +7,8 @@
 //! the pool: the next workflow still passes fresh scope and review. It never
 //! lifts a manual owner hold, an owner pause or a security verdict, and it
 //! never readmits by reason across issues.
+#[path = "self_improve_pr_readoption.rs"]
+pub(crate) mod pr;
 use super::*;
 use augmentagent_channel_core::autoship_workflow_contract::{Actor, Origin, WorkflowStage};
 use serde_json::{json, Value};
@@ -18,7 +20,7 @@ pub(crate) struct Args {
     repo: Option<String>,
     #[arg(long, conflicts_with = "pr", required_unless_present_any = ["pr", "list"])]
     issue: Option<u64>,
-    /// PR readoption ships with explicit PR adoption (#1537).
+    /// Adopt an existing PR for fresh review without clearing protected holds.
     #[arg(long)]
     pr: Option<u64>,
     /// Why the owner readopts this target; recorded with the authority.
@@ -54,7 +56,7 @@ fn refuse(code: i32, reason: &'static str, detail: impl Into<String>) -> anyhow:
     Refusal { code, reason, detail: detail.into() }.into()
 }
 
-const TABLE: &str = "CREATE TABLE IF NOT EXISTS owner_readoption(
+pub(crate) const TABLE: &str = "CREATE TABLE IF NOT EXISTS owner_readoption(
     request_id TEXT PRIMARY KEY, repository TEXT NOT NULL, target TEXT NOT NULL,
     number INTEGER NOT NULL, reason TEXT NOT NULL, principal TEXT NOT NULL,
     prior_hold TEXT NOT NULL, status TEXT NOT NULL,
@@ -69,9 +71,6 @@ pub(crate) struct Request {
 }
 
 fn validate(args: &Args) -> Result<Request> {
-    if let Some(pr) = args.pr {
-        return Err(refuse(2, "pr-readoption-unsupported", format!("PR #{pr}: PR readoption ships with explicit PR adoption (#1537)")));
-    }
     let repository = crate::autoship_workflow::submission::normalized_repository(args.repo.as_deref().unwrap_or_default())
         .map_err(|e| refuse(2, "invalid-request", format!("{e:#}")))?
         .to_ascii_lowercase();
@@ -224,6 +223,15 @@ fn list() -> Result<Value> {
 pub(crate) async fn run_command(args: &Args) -> i32 {
     let result = if args.list {
         list().map_err(|e| refuse(4, "workflow-state-unavailable", format!("{e:#}")))
+    } else if let Some(number) = args.pr {
+        match std::env::current_dir() {
+            Ok(repo) => pr::apply(&repo, &workflow::path(), &pr::Request {
+                repository: args.repo.clone().unwrap_or_default(), number,
+                reason: args.reason.clone().unwrap_or_default(),
+                request_id: args.request_id.clone().unwrap_or_default(), origin: "cli".into(),
+            }).await,
+            Err(e) => Err(e.into()),
+        }
     } else {
         match (validate(args), std::env::current_dir()) {
             (Ok(request), Ok(repo)) => apply(&repo, &request).await,
@@ -260,6 +268,7 @@ with (r/'calls').open('a') as f:f.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view'] and 'viewerPermission' in a: print((r/'permission').read_text())
 elif a[:2]==['repo','view']: print('Controller/Repo')
 elif a[:2]==['api','graphql']: print(json.dumps({'data':{'viewer':{'login':'controller'}}}))
+elif a[:2]==['pr','view']: print(json.dumps({'number':42,'state':'OPEN','url':'https://github.com/controller/repo/pull/42','headRefName':'feat/imported','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':False,'author':{'login':'controller'},'title':'Fix arithmetic','body':'Repair addition','closingIssuesReferences':[]}))
 elif a[:1]==['api'] and '/timeline?' in a[1]: print((r/'timeline.json').read_text())
 elif a[:1]==['api'] and '/issues/' in a[1]: print((r/'issue.json').read_text())
 elif a[:2]==['issue','edit']:
@@ -443,12 +452,22 @@ else: sys.exit(2)
         assert_eq!(readopt_rows().len(), 1);
         assert_eq!(edits(), "7\n");
 
-        // PR readoption is refused through the same record, without writes.
+        // PR readoption uses current authenticated intake and one shared job.
         let pr = "!autoship readopt https://github.com/controller/repo/pull/42 --reason adopt it";
-        let refused = crate::autoship_discord_command::gateway_command(&root, &path, &context(102, 22), pr).await.unwrap().unwrap();
-        assert!(refused.content.contains("pr-readoption-unsupported"), "{}", refused.content);
+        let accepted_pr = crate::autoship_discord_command::gateway_command(&root, &path, &context(102, 22), pr).await.unwrap().unwrap();
+        assert!(accepted_pr.content.contains("fresh review and CI"), "{}", accepted_pr.content);
         let recorded = readopt_rows();
-        assert_eq!((recorded.len(), recorded[1].4, recorded[1].5.as_str()), (2, false, "pr-readoption-unsupported"));
+        assert_eq!((recorded.len(), recorded[1].4, recorded[1].5.as_str()), (2, true, "owner-readopted"));
+        let store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        let command=store.command_request("controller/repo/pr/42").unwrap().unwrap();
+        assert_eq!(command.target,crate::autoship_workflow::submission::Target::Pr(42));
+        drop(store);
+        let conn=rusqlite::Connection::open(&path).unwrap();
+        let origin:String=conn.query_row("SELECT json_extract(prior_hold,'$.origin') FROM owner_readoption WHERE request_id='discord:11:102'",[],|r|r.get(0)).unwrap();
+        assert_eq!(origin,"discord");drop(conn);
+        let again=crate::autoship_discord_command::gateway_command(&root,&path,&context(102,22),pr).await.unwrap();
+        assert!(again.is_none_or(|r|r.content==accepted_pr.content));
+        assert_eq!(readopt_rows().len(),2);
         assert_eq!(edits(), "7\n");
 
         // Only the configured owner may issue it: no record, no call.
@@ -459,7 +478,7 @@ else: sys.exit(2)
     }
 
     #[test]
-    fn pr_readoption_is_deferred_to_explicit_adoption() {
+    fn readoption_cli_requires_a_target_and_validates_issue_requests() {
         use clap::Parser;
         #[derive(clap::Parser)]
         struct Cli {
@@ -467,7 +486,7 @@ else: sys.exit(2)
             args: Args,
         }
         let cli = Cli::try_parse_from(["readopt", "--repo", "o/r", "--pr", "4", "--reason", "x", "--request-id", "a"]).unwrap();
-        assert_eq!(refusal(validate(&cli.args).unwrap_err()), "pr-readoption-unsupported");
+        assert_eq!(cli.args.pr, Some(4));
         assert!(Cli::try_parse_from(["readopt", "--repo", "o/r", "--reason", "x", "--request-id", "a"]).is_err(), "target required");
         assert!(Cli::try_parse_from(["readopt", "--list"]).is_ok());
         let cli = Cli::try_parse_from(["readopt", "--repo", "O/R", "--issue", "4", "--reason", "x", "--request-id", "bad id"]).unwrap();
