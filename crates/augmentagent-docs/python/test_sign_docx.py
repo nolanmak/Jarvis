@@ -180,6 +180,23 @@ class WordSigningTests(unittest.TestCase):
         self.assertIn("<w:br/><w:t>____</w:t>", signed, "the second blank, after the break, is kept")
         self.assertLess(signed.index("<w:drawing>"), signed.index("<w:br/>"))
 
+    def test_a_blank_inside_a_word_field_is_not_offered(self):
+        # Review of #2241: a field result is regenerated on update.
+        field = ('<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> MERGEFIELD Sig </w:instrText></w:r>'
+                 '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' + run("Signature: _____")
+                 + '<w:r><w:fldChar w:fldCharType="end"/></w:r>')
+        simple = '<w:fldSimple w:instr=" MERGEFIELD Sig ">' + run("Signature: _____") + "</w:fldSimple>"
+        for body in (field, simple):
+            raw = docx(para(run("Terms.")) + para(body))
+            self.assertEqual(sign_docx.lines(dict(docx=b64(raw)))["lines"], [])
+
+    def test_a_single_quoted_png_mapping_is_not_duplicated(self):
+        # Review of #2241.
+        raw = docx(para(run("Terms.")) + para(run("Signature: _____")),
+                   types_extra="<Default Extension='png' ContentType='image/png'/>")
+        types = part(sign_line(raw), "[Content_Types].xml")
+        self.assertEqual(sign_docx.default_extensions(types).count("png"), 1)
+
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
         raw = docx(para(run("By signing this agreement, you accept these terms."))

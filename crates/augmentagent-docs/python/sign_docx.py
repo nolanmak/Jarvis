@@ -139,8 +139,18 @@ def label_left_of(doc, cell):
 
 # A signing field's label on its own: "Signature", "Sign here:", "By:".
 LABEL_ONLY = re.compile(r"^\s*(signature|sign\s+here|signed|by)\s*[:\-\u2013]?\s*$", re.I)
-# Content that is not text: an existing signature image, an object, a field.
-NON_TEXT = re.compile(r"<w:(drawing|pict|object)\b")
+# Content that is not plain text: an existing signature image, an object, or
+# a Word field (its result is regenerated when the field updates, which would
+# drop a signature placed inside it).
+NON_TEXT = re.compile(r"<w:(drawing|pict|object|fldChar|fldSimple|instrText)\b")
+CT_NS = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+
+
+def default_extensions(types_xml):
+    """Extensions with a <Default> content-type mapping, lowercased, read
+    with an XML parser so quoting and attribute order do not matter."""
+    root = ET.fromstring(types_xml.encode("utf-8") if isinstance(types_xml, str) else types_xml)
+    return [d.get("Extension", "").lower() for d in root.iter(CT_NS + "Default")]
 
 
 def candidates(doc):
@@ -391,7 +401,7 @@ def sign(data):
         raise ValueError("document relationships are unreadable")
     signed_rels = rels[:close] + rel + rels[close:]
     types = z.read(TYPES).decode("utf-8")
-    if not re.search(r'<Default\b[^>]*\bExtension="png"', types, re.I):
+    if "png" not in default_extensions(types):
         close = types.rfind("</Types>")
         types = types[:close] + '<Default Extension="png" ContentType="image/png"/>' + types[close:]
     changed = {DOC: signed_doc.encode("utf-8"), RELS: signed_rels.encode("utf-8"), TYPES: types.encode("utf-8")}
@@ -433,6 +443,9 @@ def verify(original, signed, start, end, media):
         raise ValueError("signing would change text outside the signature line; nothing was signed")
     for name in (DOC, RELS, TYPES):
         ET.fromstring(b.read(name))
+    exts = default_extensions(b.read(TYPES))
+    if len(exts) != len(set(exts)):
+        raise ValueError("signing would duplicate a content-type mapping; nothing was signed")
 
 
 def lines(data):
