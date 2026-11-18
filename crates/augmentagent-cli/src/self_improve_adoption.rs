@@ -203,6 +203,7 @@ pub(super) fn episode_retries(
         }
         let retry_requested=matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
             (crate::autoship_workflow::Stage::Verify,"verification_infrastructure_retry","retry_verification")
+            | (crate::autoship_workflow::Stage::Verify,integration::CHECKS_REQUIRED,"verify_integrated_head")
             | (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
             | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
         let owned_candidate=(recovered.contains(&id) || retry_requested)
@@ -211,6 +212,11 @@ pub(super) fn episode_retries(
             && (snapshot.checkpoint.binding.head==candidate.head
                 || store.retained_candidate_head(&candidate.repository,candidate.pr,&candidate.branch,&candidate.head,
                     &snapshot.checkpoint.binding.head,now)?.as_deref()==Some(snapshot.checkpoint.binding.head.as_str()));
+        if snapshot.checkpoint.next.reason == integration::CHECKS_REQUIRED
+            && snapshot.checkpoint.binding.head != candidate.head && !owned_candidate {
+            info!(pr=candidate.pr, reason="dependency-adoption-provenance",
+                "retained integration requires recorded publication custody");
+        }
         let review_capacity_wait = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Held
             && matches!(snapshot.checkpoint.next.reason.as_str(), "no-reviewer-capacity" | "reviewer-latched")
             && snapshot.checkpoint.next.action == "resume_preserved_work"
