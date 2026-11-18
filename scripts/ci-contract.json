@@ -391,6 +391,10 @@
       "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
       "shell": "bash"
     },
+    "model-router/installer/12": {
+      "body": "python3 -I -B -m unittest discover -s scripts/tests -p omniroute_ops_test.py -v",
+      "shell": "bash"
+    },
     "model-router/installer/2": {
       "body": "sw_vers",
       "shell": "bash"
@@ -775,7 +779,7 @@
       ]
     },
     "rust/cli/7": {
-      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --test env_key_snapshot_cli --locked\n",
+      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --test env_key_snapshot_cli --test gateway_ops_cli --locked\n",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
@@ -1885,6 +1889,8 @@
             "scripts/*model-router*",
             "scripts/*omniroute*",
             "scripts/lib/omniroute_install.py",
+            "scripts/lib/omniroute_ops.py",
+            "scripts/tests/omniroute_ops_test.py",
             "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
@@ -1922,6 +1928,8 @@
             "scripts/*model-router*",
             "scripts/*omniroute*",
             "scripts/lib/omniroute_install.py",
+            "scripts/lib/omniroute_ops.py",
+            "scripts/tests/omniroute_ops_test.py",
             "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
@@ -2066,6 +2074,10 @@
             {
               "command_id": "model-router/installer/11",
               "name": "Optional OmniRoute installer contracts"
+            },
+            {
+              "command_id": "model-router/installer/12",
+              "name": "Gateway owner operations"
             }
           ],
           "strategy": {
@@ -2101,7 +2113,7 @@
         }
       },
       "role": "validation",
-      "sha256": "087f1d0ef1ec8343f85664f7d6eb72390ee4d5b583632c57a3a5e0ffe57f54fc"
+      "sha256": "04396b40dd4903242fd61ef07c70c539f43f7dab45b394e3a6039bfd3ab40018"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},

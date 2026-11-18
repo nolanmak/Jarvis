@@ -14,6 +14,8 @@ on:
       - 'scripts/*model-router*'
       - 'scripts/*omniroute*'
       - 'scripts/lib/omniroute_install.py'
+      - 'scripts/lib/omniroute_ops.py'
+      - 'scripts/tests/omniroute_ops_test.py'
       - 'scripts/tests/omniroute_install_test.py'
       - 'scripts/*runpod-adapter*'
       - 'scripts/lib/install-launchd-plist.sh'
@@ -47,6 +49,8 @@ on:
       - 'scripts/*model-router*'
       - 'scripts/*omniroute*'
       - 'scripts/lib/omniroute_install.py'
+      - 'scripts/lib/omniroute_ops.py'
+      - 'scripts/tests/omniroute_ops_test.py'
       - 'scripts/tests/omniroute_install_test.py'
       - 'scripts/*runpod-adapter*'
       - 'scripts/lib/install-launchd-plist.sh'
@@ -107,6 +111,9 @@ jobs:
 
       - name: Optional OmniRoute installer contracts
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/installer/11"
+
+      - name: Gateway owner operations
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/installer/12"
 
   dashboard:
     runs-on: ubuntu-latest

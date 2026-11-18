@@ -223,6 +223,7 @@ const CLI: &str = "crates/augmentagent-cli/src/main.rs";
 /// Every posting site in the workspace (see [`scan_producer_sites`]).
 // producer-scan: off
 pub static PRODUCERS: &[Producer] = &[
+    p("gateway_ops", "crates/augmentagent-cli/src/gateway_ops.rs", "notify_owner(", 1, routed(C::Health, D::Webhook), "owner gateway maintenance failure"),
     // -- Routed here (#1295) -------------------------------------------------
     p("email_digest", CLI, "notify_owner(", 1, routed(C::Digest, D::Channel), "`digest --post-discord`: the email digest"),
     p("research_digest", "crates/augmentagent-cli/src/research.rs", "notify_owner(", 2, routed(C::Research, D::Channel), "`research`: the daily research digest"),

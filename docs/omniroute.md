@@ -78,10 +78,11 @@ rather than silently redirected. Initial model aliases follow the existing
 router installer defaults; connecting accounts and selecting supported routes
 remain separate setup steps.
 
-The final output names `augmentagent gateway status` and `augmentagent gateway
-on` for the owner. Those CLI commands are delivered by #1665; the installer does
-not pretend they already exist or invoke `gateway on`. Until that lands, inspect
-the service and direct-mode config using the commands below.
+Owner operations are available through `augmentagent gateway`; see
+[gateway operations](gateway-ops.md). The installer never invokes `gateway on`.
+Status and enablement fail closed while the daemon breaker observation from
+#1655 is unavailable. Keep production direct until that integration and the
+routed/tool acceptance gates are complete.
 
 ```sh
 systemctl --user is-active augmentagent-omniroute.service

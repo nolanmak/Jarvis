@@ -9,6 +9,7 @@ mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod gateway_ops;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -809,6 +810,8 @@ enum Cmd {
     /// Internal owner-DM-bound computation MCP facade.
     #[command(hide = true)]
     ComputeTool,
+    /// Owner-only optional gateway operations; enablement is never automatic.
+    Gateway { #[command(subcommand)] op: gateway_ops::GatewayOp },
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
     /// eligibility checks), sends a trivial text-only prompt, and prints the
@@ -817,6 +820,9 @@ enum Cmd {
     /// a stub that refuses on quota and watch the call get served by the
     /// next provider.
     ReasonerSelftest {
+        /// Require a successful gateway call; native fallback cannot pass this gate.
+        #[arg(long, conflicts_with = "tool_probe")]
+        routed: bool,
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
@@ -3182,6 +3188,11 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if let Cmd::Gateway { ref op } = cli.cmd {
+        let code = gateway_ops::run(&gateway_ops::repository(), op).await?;
+        std::process::exit(code);
+    }
 
     // Dry-run must precede Store::open and all persistent bootstrap hooks.
     if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
@@ -5919,8 +5930,12 @@ async fn main() -> Result<()> {
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::AutoPrWorker { .. } => unreachable!("worker dispatch precedes database initialization"),
-        Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
-            run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
+        Cmd::Gateway { .. } => unreachable!("gateway controls precede database initialization"),
+        Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe, routed } => {
+            let profile=if routed {Some(profile.as_deref().unwrap_or("claude"))} else {profile.as_deref()};
+            if routed {gateway_ops::routed_selftest(profile,run_reasoner_selftest(prompt,profile,tool_probe)).await}
+            else {run_reasoner_selftest(prompt,profile,tool_probe).await}
+        },
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -12126,6 +12141,9 @@ impl QueryHandler for WikiQuerier {
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
+        if let Some(operation)=gateway_ops::discord_operation(text) {
+            return Some(gateway_ops::discord(&self.repo_root,operation).await);
+        }
         use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
         let store = SelectionStore::new(config_path());
         run_command(&store, &channel_id.to_string(), text, |profile| {
