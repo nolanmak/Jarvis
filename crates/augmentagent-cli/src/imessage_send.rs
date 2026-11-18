@@ -835,6 +835,11 @@ mod tests {
         // A second tick finds nothing to do: exactly one send.
         assert_eq!(fire(&f, &id, at + 60_000).await, PlatformFire::LostClaim);
         assert_eq!(outbox_len(&f.store), 1);
+        // Review of #2196: a Mac offline past the engine grace does not turn
+        // the queued send into a stuck-send error; the outbox owns its
+        // timeout (reconcile_outbox), as for an approved send.
+        let much_later = chrono::Utc::now().timestamp_millis() + 2 * 3_600_000;
+        assert!(!f.store.stuck_sending_actions(much_later, 600_000).unwrap().contains(&id));
     }
 
     /// Pre-arm refusals: a schedule that could never send is refused and the
