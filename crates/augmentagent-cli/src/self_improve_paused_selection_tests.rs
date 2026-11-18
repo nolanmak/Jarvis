@@ -11,6 +11,9 @@ async fn exercise(case:&str,test:&str) {
     let routes:&[&str]=if case=="race" || case=="terminal-race" || case.starts_with("trust-") {&["primary"]}else{&["primary","configured"]};
     for &route in routes {
         let root=tempfile::tempdir_in("/tmp").unwrap();
+        // SQLite's no-follow opens require the physical path on macOS,
+        // where /tmp is a symlink. Keep the same isolated fixture on Linux.
+        let physical_root=root.path().canonicalize().unwrap();
         let gh=root.path().join("github.py");
         augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json, os, sys, subprocess
@@ -35,7 +38,7 @@ if args[:2] == ['issue', 'list'] or (args[:1] == ['api'] and '/issues?' in args[
 raise AssertionError('Unexpected or mutating GitHub call: ' + repr(args))
 "#).unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
-        let repo=root.path().join("repo");std::fs::create_dir(&repo).unwrap();
+        let repo=physical_root.join("repo");std::fs::create_dir(&repo).unwrap();
         std::fs::write(repo.join("code.txt"),"original candidate\n").unwrap();
         for args in [vec!["init","-q"],vec!["remote","add","origin","https://github.com/fixture-owner/repo.git"],
             vec!["add","code.txt"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
@@ -48,7 +51,7 @@ raise AssertionError('Unexpected or mutating GitHub call: ' + repr(args))
             .args(["--exact",&format!("self_improve::paused_selection_tests::{test}"),"--nocapture"])
             .env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path())
             .env("XDG_STATE_HOME",root.path().join("state"))
-            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("workflow.db"))
+            .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",physical_root.join("workflow.db"))
             .env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","fixture-owner")
             .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner,explicit-author")
             .env("AUTOSHIP_PAUSED_CASE",case).env("AUTOSHIP_PAUSED_ROUTE",route).env("AUTOSHIP_PAUSED_CALLS",root.path().join("calls"))

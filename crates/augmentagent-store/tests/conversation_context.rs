@@ -79,6 +79,86 @@ fn window_orders_instants_not_offset_strings_and_reports_missing_timestamp() {
 }
 
 #[test]
+fn unanswered_tail_stops_at_the_owner_reply_and_keeps_every_later_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.with_conn(|c| {
+        for (id,sender,minute,kind) in [("answered","peer",1,"dm"),("owner","me",2,"dm"),("waiting-a","peer",3,"dm"),("waiting-b","peer",4,"dm"),("draft","peer",5,"compose")] {
+            c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,firstSeenAt,platform,accountEntityId,kind)
+                VALUES (?1,'thread',?2,'subject','body',?3,999999,'imessage','account',?4)",
+                params![id,sender,format!("2026-01-01T00:{minute:02}:00Z"),kind])?;
+        }
+        Ok(())
+    }).unwrap();
+    let scope = ConversationScope {
+        platform: "imessage",
+        account_id: Some("account"),
+        thread_id: "thread",
+    };
+    let tail = store
+        .unanswered_inbound_tail(&scope, "peer", i64::MAX, 10)
+        .unwrap();
+    assert_eq!(
+        tail.iter().map(|m| m.message_id.as_str()).collect::<Vec<_>>(),
+        ["waiting-a", "waiting-b"]
+    );
+    let at_owner_reply = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:02:00Z")
+        .unwrap()
+        .timestamp_millis();
+    assert!(
+        store
+            .unanswered_inbound_tail(&scope, "peer", at_owner_reply, 10)
+            .unwrap()
+            .is_empty(),
+        "nothing is owed while the owner's reply is the newest turn"
+    );
+}
+
+#[test]
+fn unanswered_tail_orders_instants_and_stays_inside_the_exact_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.with_conn(|c| {
+        for (id,platform,account,thread,date) in [
+            ("late","imessage","account","thread","2026-01-01T01:00:00+01:00"),
+            ("early","imessage","account","thread","2026-01-01T00:00:00Z"),
+            ("other-account","imessage","other","thread","2026-01-01T00:30:00Z"),
+            ("other-platform","whatsapp","account","thread","2026-01-01T00:30:00Z"),
+            ("other-thread","imessage","account","elsewhere","2026-01-01T00:30:00Z"),
+        ] {
+            c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,firstSeenAt,platform,accountEntityId,kind)
+                VALUES (?1,?4,'peer','subject','body',?5,999999,?2,?3,'dm')",
+                params![id,platform,account,thread,date])?;
+        }
+        Ok(())
+    }).unwrap();
+    let scope = ConversationScope {
+        platform: "imessage",
+        account_id: Some("account"),
+        thread_id: "thread",
+    };
+    let tail = store
+        .unanswered_inbound_tail(&scope, "peer", i64::MAX, 10)
+        .unwrap();
+    assert_eq!(
+        tail.iter().map(|m| m.message_id.as_str()).collect::<Vec<_>>(),
+        ["early", "late"]
+    );
+    assert!(store
+        .unanswered_inbound_tail(
+            &ConversationScope {
+                account_id: None,
+                ..scope
+            },
+            "peer",
+            i64::MAX,
+            10
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn context_source_restores_normalized_recipients_without_retry_context() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("db")).unwrap();

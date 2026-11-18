@@ -5,6 +5,7 @@
 //! primitives (`Reasoner`, prompt builders, decision parsing, ingest) live in
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
+mod draft_body;
 pub mod gmail;
 pub mod google;
 pub mod inbound;

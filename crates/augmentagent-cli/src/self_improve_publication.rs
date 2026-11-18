@@ -136,7 +136,7 @@ struct GitPushRead<'a> {root:&'a Path,accessible:std::collections::BTreeSet<Stri
 impl<'a> GitPushRead<'a> {
     fn new(root:&'a Path)->Self {Self {root,accessible:std::collections::BTreeSet::new()}}
     async fn head_at(&mut self,destination:&str,reference:&str)->Result<Option<String>> {
-        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?.to_ascii_lowercase();
+        let repository=repository_identity::Policy::from_env()?.origin(destination)?.context("network Push identity unavailable")?.to_ascii_lowercase();
         let head=self.query(destination,reference).await?;
         if head.is_some() {self.accessible.insert(repository);return Ok(head);}
         // A 404 may hide an inaccessible private repository. A successful Git
@@ -149,7 +149,7 @@ impl<'a> GitPushRead<'a> {
         Ok(None)
     }
     async fn query(&self,destination:&str,reference:&str)->Result<Option<String>> {
-        let repository=crate::wiki_sync_remote(destination)?.context("network Push identity unavailable")?;
+        let repository=repository_identity::Policy::from_env()?.origin(destination)?.context("network Push identity unavailable")?;
         let (owner,repository)=repository.split_once('/').context("network Push identity malformed")?;
         let reference=reference.strip_prefix("refs/").context("Push reference malformed")?;
         // Observe the verified destination through its authoritative GitHub
@@ -185,10 +185,9 @@ pub(super) async fn read_bound_push_head(root:&Path,destination:&str,reference:&
 }
 fn verified_push_destination<'a>(repository:&str,destinations:&'a [String])->Option<&'a str> {
     let [destination]=destinations else {return None};
-    // Reuse the strict existing GitHub URL grammar; its local-mirror
-    // alternative supplies no network repository identity here.
-    let identity=crate::wiki_sync_remote(destination).ok().flatten()?;
-    identity.eq_ignore_ascii_case(repository).then_some(destination.as_str())
+    let policy=repository_identity::Policy::from_env().ok()?;
+    let identity=policy.origin(destination).ok().flatten()?;
+    (identity==policy.canonical(repository).ok()?).then_some(destination.as_str())
 }
 
 /// The fresh pipeline calls this before its linked-PR dedup return.
