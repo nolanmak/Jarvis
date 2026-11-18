@@ -500,7 +500,8 @@ record_restart() {
 # gate cache doubled to 26 GB in one evening. Dropping `debug/` from inside a
 # gate run would race the other lane's build; the updater runs every few
 # minutes and can see both lane locks, so it is the safe place to trim.
-GATE_CACHE_DIR="${AUGMENTAGENT_GATE_TARGET_DIR:-$HOME/.cache/augmentagent-gate-target}"
+GATE_CACHE_DIR="${AUGMENTAGENT_GATE_TARGET_DIR:-${AUGMENTAGENT_BUILD_VOLUME:+$AUGMENTAGENT_BUILD_VOLUME/augmentagent-gate-target}}"
+GATE_CACHE_DIR="${GATE_CACHE_DIR:-$HOME/.cache/augmentagent-gate-target}"
 GATE_CACHE_MAX_MB="${AUGMENTAGENT_GATE_CACHE_MAX_MB:-20000}"
 RESUME_LANE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self-improve.lock}"
 RESUME_LANE_LOCK="${RESUME_LANE_LOCK%.lock}-resume.lock"

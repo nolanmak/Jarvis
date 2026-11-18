@@ -12,7 +12,7 @@ fn fixture() -> tempfile::TempDir {
         .unwrap()
         .success());
     let gh = root.path().join("gh");
-    std::fs::write(&gh, r#"#!/usr/bin/env python3
+    augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
 import json,os,pathlib,sys,datetime,time
 r=pathlib.Path(os.environ['FIXTURE']);a=sys.argv[1:]
 s=json.loads((r/'scenario.json').read_text())

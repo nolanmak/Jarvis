@@ -30,6 +30,12 @@ pub struct DeliveryStatus {
     pub pending_events:i64,
     pub oldest_pending_at_ms:Option<i64>,
     pub latest_sequence:Option<i64>,
+    /// Dispatched events awaiting resolution, as `WORKFLOW:SEQUENCE` (#1714).
+    #[serde(default,skip_serializing_if="Vec::is_empty")]
+    pub uncertain_events:Vec<String>,
+    /// Owner commands that recover this delivery state; never run automatically.
+    #[serde(default,skip_serializing_if="Vec::is_empty")]
+    pub recovery:Vec<String>,
 }
 /// #1714: undelivered for 15 minutes is degraded; after 24 hours it is a
 /// visible dead letter that stays retryable.
@@ -115,10 +121,11 @@ impl WorkflowStore {
             if age>=DEAD_LETTER_AFTER_MS {status.state="delivery-dead-letter".into();}
             else if age>=DEGRADED_AFTER_MS {status.state="delivery-degraded".into();}
         }
+        super::delivery_actions::annotate(&self.conn,workflow,&mut status,now)?;
         Ok(status)
     }
     pub fn progress_delivery(&self,workflow:&str)->Result<DeliveryStatus> {
-        if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None});}
+        if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None,uncertain_events:Vec::new(),recovery:Vec::new()});}
         let delivery_table:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_delivery')",[],|r|r.get(0))?;
         let new_routes:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_delivery_binding')",[],|r|r.get(0))?;
         let routes=if new_routes {"workflow_delivery_binding"} else {"discord_workflow_binding"};
@@ -129,7 +136,7 @@ impl WorkflowStore {
         let bound:bool=self.conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {routes} WHERE workflow=?1)"),[workflow],|r|r.get(0))?;
         let uncertain=delivery_table && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND state='uncertain')",[workflow],|r|r.get::<_,bool>(0))?;
         Ok(DeliveryStatus {state:if uncertain {"delivery-uncertain"} else if pending==0 {"delivery-confirmed"} else if bound {"delivery-pending"} else {"delivery-unconfigured"}.into(),
-            pending_events:pending,oldest_pending_at_ms:oldest,latest_sequence:latest})
+            pending_events:pending,oldest_pending_at_ms:oldest,latest_sequence:latest,uncertain_events:Vec::new(),recovery:Vec::new()})
     }
 }
 

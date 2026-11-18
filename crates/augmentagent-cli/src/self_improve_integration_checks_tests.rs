@@ -113,7 +113,7 @@ async fn integration_checks_require_the_published_integration_head() {
     );
     std::fs::write(root.join("scenario.json"),serde_json::to_vec(&serde_json::json!({"head":old,"base":base,"job_name":"no-failing-job","required_state":"SUCCESS","log":"error[E0308]: mismatched types"})).unwrap()).unwrap();
     let gh = root.join("fake-gh");
-    std::fs::write(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
+    augmentagent_test_support::write_executable(&gh, include_str!("../tests/fixtures/ci-repair-gh.py")).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST, "--nocapture"])
