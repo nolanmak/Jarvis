@@ -32,5 +32,7 @@ failure history.
 
 The caller must validate the successor lease before gathering proof and again when
 committing it. Missing cleanup receipts or writer custody never become inferred
-quiescence. Automatic timer/reconciliation wiring, legacy custody recovery and ready-peer
-scheduling remain part of #1706; this change does not claim live recovery acceptance.
+quiescence. Native controller renewal and unpaid maintenance now consume these APIs;
+see [idle-recovery.md](idle-recovery.md). Legacy writer-custody recovery, coverage of
+other controller roles and ready-peer scheduling remain part of #1706. Production
+end-to-end autonomous merge acceptance remains separate.

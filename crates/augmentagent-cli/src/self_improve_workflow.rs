@@ -1,6 +1,9 @@
 //! Production bridge between the autoship lanes and durable workflow state.
 //! Included beneath self_improve so Git commands use the same sanitized runner.
 use super::*;
+#[path = "self_improve_idle_controller.rs"]
+mod idle_controller;
+
 #[path = "self_improve_stage_activity.rs"]
 mod stage_activity;
 #[path = "self_improve_family_dispatch_control.rs"]
@@ -465,17 +468,11 @@ fn acquire_audit_generation(
 /// Free, bounded reconciliation; durable intent survives terminal workflows and
 /// crash between audit-generation commit and filesystem retirement.
 pub(super) fn reconcile_runtime_retirements()->Result<usize> {
-    reconcile_runtime_retirements_at(&path(),millis())
+    idle_controller::reconcile_runtime_and_idle(&path(),millis)
 }
+#[cfg(test)]
 fn reconcile_runtime_retirements_at(state:&Path,now:i64)->Result<usize> {
-    if !state.exists(){return Ok(0);}
-    let mut store=WorkflowStore::open(state)?;
-    let retired=reconcile_runtime_retirements_in(&mut store,now)?;
-    augmentagent_channel_core::native_vm::reconcile_retired_runtimes()?;
-    let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
-    let woken=store.reconcile_native_capacity(&report,now,16)?;
-    if woken>0 {info!(woken,"native capacity wait schedules eligible; normal admission remains required");}
-    Ok(retired)
+    idle_controller::reconcile_runtime_and_idle(state,||now)
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
     if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){store.settle_owner_execution_retries(now,16)?;return Ok(0);}
@@ -996,6 +993,7 @@ impl WorkflowGuard {
                     .context("issue or PR identity required")?,
             )?
         };
+        if store.idle_recovery_request(&id)?.is_some() {return Ok(None);}
         let checkout_identity = checkout_identity::Identity::observe(state, start.repo_root, start.worktree,
             &id, start.repository, start.branch).await?;
         let existing = store.snapshot(&id)?;
@@ -1126,45 +1124,7 @@ impl WorkflowGuard {
     }
 
     fn spawn_renewal(&self) {
-        let store = self.store.clone();
-        let lease = self.lease.clone();
-        let stop = self.heartbeat.clone();
-        let failure = self.lease_failure.clone();
-        let started = self.started;
-        let accounted = self.accounted_ms.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _=stop.cancelled()=>break,
-                    _=tokio::time::sleep(std::time::Duration::from_secs(RENEW_SECS))=>{}
-                }
-                let store = store.clone();
-                let lease = lease.clone();
-                let accounted = accounted.clone();
-                let result = tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut store = store
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
-                    let now = millis();
-                    store.heartbeat(&lease, now, LEASE_MS)?;
-                    charge_elapsed(&mut store, &lease, started, &accounted, now)
-                })
-                .await;
-                let error = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e.to_string()),
-                    Err(e) => Some(e.to_string()),
-                };
-                if let Some(error) = error {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    // Do not keep a lost lease alive or report success. The
-                    // next checkpoint/side-effect validation must fail closed.
-                    break;
-                }
-            }
-        });
+        idle_controller::spawn(self,std::time::Duration::from_secs(RENEW_SECS));
     }
 
     pub(super) fn capacity_accounting(&self, resumed: bool) -> Result<CapacityAccounting> {
@@ -2370,6 +2330,7 @@ impl WorkflowGuard {
     }
 
     fn release_after_teardown(&mut self) -> Result<()> {
+        self.settle_idle_recovery()?;
         self.audit.protected_health()?;
         self.healthy_lease()?;
         self.audit_event("workflow_released", serde_json::json!({}))?;

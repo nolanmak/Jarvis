@@ -15,6 +15,9 @@ mod native_tool_progress;
 #[path = "autoship_guarded_progress.rs"]
 mod guarded_progress;
 
+#[path = "autoship_idle_inspection.rs"]
+pub(crate) mod idle_inspection;
+
 #[path = "autoship_family_budget.rs"]
 pub(crate) mod family_budget;
 
@@ -1281,7 +1284,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
-        idle_recovery::require_dispatch(&tx,&lease.workflow)?;
+        idle_recovery::require_release(&tx,lease)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -1737,7 +1740,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
-        let recovery_inspection=qualification_recovery::is_inspection(&tx,lease)?;
+        let recovery_inspection=qualification_recovery::is_inspection(&tx,lease)? || idle_inspection::is_inspection(&tx,lease)?;
         ensure!(!(recovery_inspection && admission.is_some()),"qualification recovery cannot dispatch a model");
         let prior: Option<(i64,i64,i64)> = tx.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -2030,6 +2033,7 @@ impl WorkflowStore {
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(!idle_inspection::is_inspection(&tx,lease)?,"idle inspection cannot dispatch native work");
         idle_recovery::require_dispatch(&tx,&lease.workflow)?;
         require_binding(&tx,lease,binding,now)?;
         owner_turn::require_native_dispatch(&tx,lease,now)?;
