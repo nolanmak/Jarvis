@@ -51,6 +51,11 @@ pub struct ConversationMessage {
     pub body: String,
     pub timestamp: Option<String>,
     pub timestamp_ms: i64,
+    /// Set only by [`Store::unanswered_inbound_tail`]: this message belongs to
+    /// the run that still owes a reply (#2176). A plain window read says
+    /// nothing about it and leaves it false.
+    #[serde(default)]
+    pub awaiting_reply: bool,
 }
 
 /// Account is an exact scope: None means legacy rows with no account, not all
@@ -139,6 +144,7 @@ impl Store {
                             body: r.get(6)?,
                             timestamp: r.get(7)?,
                             timestamp_ms: r.get(8)?,
+                            awaiting_reply: false,
                         })
                     },
                 )?
@@ -146,5 +152,33 @@ impl Store {
             rows.reverse();
             Ok(rows)
         })
+    }
+
+    /// The messages from `sender` that still owe an answer: the trailing run
+    /// of [`Self::conversation_window`], oldest first, bounded by the newest
+    /// turn that is not theirs — the owner's own ingested reply above all
+    /// (#2176). A burst of messages is one reply target, not just its last
+    /// entry.
+    ///
+    /// Another participant's turn ends the run as well: storage knows which
+    /// contact is being answered, not whether a third member of a group is
+    /// still owed something.
+    pub fn unanswered_inbound_tail(
+        &self,
+        scope: &ConversationScope<'_>,
+        sender: &str,
+        at_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ConversationMessage>> {
+        let mut window = self.conversation_window(scope, at_ms, limit)?;
+        let start = window
+            .iter()
+            .rposition(|m| m.sender != sender)
+            .map_or(0, |answered| answered + 1);
+        let mut tail = window.split_off(start);
+        for message in &mut tail {
+            message.awaiting_reply = true;
+        }
+        Ok(tail)
     }
 }
