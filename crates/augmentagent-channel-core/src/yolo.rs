@@ -3,7 +3,6 @@
 //! Yolo is a hosted, unfiltered model reached through the Codex CLI. It is
 //! dispatched only for turns in a yolo thread; this module answers "is it
 //! configured well enough to try", with no network call.
-use crate::reasoner::{Reasoner, ReasonerError, ReasonerOpts};
 
 pub const ENABLED_ENV: &str = "AUGMENTAGENT_MODEL_YOLO_ENABLED";
 pub const BASE_URL_ENV: &str = "AUGMENTAGENT_YOLO_BASE_URL";
@@ -122,6 +121,69 @@ impl Inputs<'_> {
     }
 }
 
+/// What one Codex launch needs to reach the vendor. Built only when ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub base_url: String,
+    pub api_key: String,
+    pub zdr: bool,
+}
+
+/// Name of the environment variable the Codex child reads the key from.
+pub const CHILD_KEY_ENV: &str = "AUGMENTAGENT_YOLO_API_KEY";
+
+impl Launch {
+    /// Codex `-c` values for a dedicated provider block. The model gateway's
+    /// block is never combined with this one. The key is not here: it goes
+    /// in the child's environment under [`CHILD_KEY_ENV`].
+    pub fn codex_overrides(&self) -> Vec<String> {
+        let mut values = vec![
+            "model_provider=\"augmentagent_yolo\"".to_string(),
+            "model_providers.augmentagent_yolo.name=\"Experiential\"".to_string(),
+            format!(
+                "model_providers.augmentagent_yolo.base_url={}",
+                serde_json::to_string(&self.base_url).expect("string")
+            ),
+            "model_providers.augmentagent_yolo.wire_api=\"responses\"".to_string(),
+            format!("model_providers.augmentagent_yolo.env_key=\"{CHILD_KEY_ENV}\""),
+            "model_providers.augmentagent_yolo.requires_openai_auth=false".to_string(),
+        ];
+        if self.zdr {
+            values.push(
+                "model_providers.augmentagent_yolo.http_headers={ \"X-Gateway-ZDR\" = \"true\" }"
+                    .to_string(),
+            );
+        }
+        values
+    }
+}
+
+impl Inputs<'_> {
+    pub fn launch(&self) -> Result<Launch, NotReady> {
+        self.readiness()?;
+        Ok(Launch {
+            base_url: self.endpoint()?.as_str().trim_end_matches('/').to_string(),
+            api_key: self.api_key().ok_or(NotReady::MissingKey)?,
+            zdr: self.zdr_requested(),
+        })
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: a launch that does not depend on the process environment.
+    pub(crate) static LAUNCH_FOR_TESTS: Launch;
+}
+
+/// Readiness is re-checked here, immediately before every Yolo dispatch.
+pub fn launch() -> Result<Launch, NotReady> {
+    #[cfg(test)]
+    if let Ok(launch) = LAUNCH_FOR_TESTS.try_with(Clone::clone) {
+        return Ok(launch);
+    }
+    system(|inputs| inputs.launch())
+}
+
 fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
@@ -147,21 +209,6 @@ pub fn model_id() -> String {
 
 pub fn readiness() -> Result<(), NotReady> {
     system(|inputs| inputs.readiness())
-}
-
-/// Placeholder adapter until the transport lands (#2214): the profile is
-/// registered so every enumeration handles it, but a dispatch starts no
-/// inference.
-pub struct PendingTransport;
-
-#[async_trait::async_trait]
-impl Reasoner for PendingTransport {
-    async fn call(&self, _opts: &ReasonerOpts, _user_message: &str) -> anyhow::Result<String> {
-        Err(ReasonerError::Local {
-            message: "yolo transport is not implemented yet".into(),
-        }
-        .into())
-    }
 }
 
 #[cfg(test)]
@@ -321,6 +368,43 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_launch_carries_the_endpoint_and_key_but_never_puts_the_key_in_an_override() {
+        let launch = inputs(&enabled_env, &primary_key).launch().unwrap();
+        assert_eq!(launch.base_url, DEFAULT_BASE_URL);
+        assert_eq!(launch.api_key, "xpl_fixture");
+        let values = launch.codex_overrides();
+        for wanted in [
+            "model_provider=\"augmentagent_yolo\"".to_string(),
+            format!("model_providers.augmentagent_yolo.base_url=\"{DEFAULT_BASE_URL}\""),
+            "model_providers.augmentagent_yolo.wire_api=\"responses\"".to_string(),
+            "model_providers.augmentagent_yolo.env_key=\"AUGMENTAGENT_YOLO_API_KEY\"".to_string(),
+            "model_providers.augmentagent_yolo.requires_openai_auth=false".to_string(),
+        ] {
+            assert!(values.contains(&wanted), "{wanted} missing from {values:?}");
+        }
+        assert!(values
+            .iter()
+            .any(|value| value.contains("\"X-Gateway-ZDR\" = \"true\"")));
+        assert!(!values.iter().any(|value| value.contains("xpl_fixture")));
+        // With retention requests off, no header is sent at all.
+        let env = |name: &str| match name {
+            ENABLED_ENV => Some("1".to_string()),
+            ZDR_ENV => Some("0".to_string()),
+            _ => None,
+        };
+        let values = inputs(&env, &primary_key)
+            .launch()
+            .unwrap()
+            .codex_overrides();
+        assert!(!values.iter().any(|value| value.contains("ZDR")));
+        // Not ready means no launch.
+        assert_eq!(
+            inputs(&|_| None, &primary_key).launch(),
+            Err(NotReady::Disabled)
+        );
     }
 
     #[test]
