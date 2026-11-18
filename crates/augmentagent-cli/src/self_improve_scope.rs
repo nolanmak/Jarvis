@@ -634,11 +634,11 @@ async fn run_native_scope_at(root:&Path,control:&Path,workflow:&workflow::Workfl
     }
     for provider in providers.iter().copied() {
         if selected.is_some() {break;}
-        let key=|attempt|amendment::digest(serde_json::to_string(&("indexed-source-selection-v1",&head,&prompt_hash,provider.name(),&workflow.binding().contract,attempt)).unwrap().as_bytes());
+        let key=|attempt|owner_checkout_recovery::scope_key(workflow.id(),amendment::digest(serde_json::to_string(&("indexed-source-selection-v1",&head,&prompt_hash,provider.name(),&workflow.binding().contract,attempt)).unwrap().as_bytes()));
         let control=control.as_path();let files=&entries;let head=head.as_str();
         let result=recoverable_source_selection(&choose,
-            |attempt|workflow.scope_stage_response(&key(attempt)),
-            |attempt,raw|workflow.record_scope_stage_response(&key(attempt),raw),
+            |attempt|workflow.scope_stage_response(&key(attempt)?),
+            |attempt,raw|workflow.record_scope_stage_response(&key(attempt)?,raw),
             |request:String| {
                 let witness=witness.as_ref();
                 async move{call(root,control,workflow,provider,SOURCE_SELECTION_SYSTEM,&request,CallPurpose::SourceSelection,witness).await.map(|reply| reply.text)}

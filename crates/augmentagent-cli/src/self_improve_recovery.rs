@@ -131,6 +131,7 @@ pub(super) async fn prepare(root: &Path, worktree: &Path, branch: &str) -> Resul
 /// Prepare an issue checkout without manufacturing a new physical generation.
 pub(super) async fn prepare_issue_at(state: &Path, root: &Path, worktree: &Path,
     workflow: &str, repository: &str, branch: &str) -> Result<()> {
+    if owner_checkout_recovery::prepare(state,root,worktree,workflow,repository,branch).await? {return Ok(());}
     checkout_identity::check_recorded(state, workflow, worktree, repository, branch)?;
     prepare(root, worktree, branch).await
 }

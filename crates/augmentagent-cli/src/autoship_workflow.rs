@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path = "autoship_owner_checkout_recovery.rs"]
+pub(crate) mod owner_checkout_recovery;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
@@ -385,8 +387,9 @@ fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScope
     Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
 }
 fn baseline_native_admissions(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeAdmissionData>> {
-    let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
-    let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
+    let cutover=owner_checkout_recovery::cutover_seq(tx,workflow)?;
+    let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='native_model_admitted' ORDER BY seq")?;
+    let admissions=statement.query_map(params![workflow,cutover],|r|r.get::<_,String>(0))?;
     let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();
     for admission in admissions {
         let admission:serde_json::Value=serde_json::from_str(&admission?)?;
@@ -407,7 +410,10 @@ fn baseline_native_admissions(tx:&Connection,workflow:&str)->Result<Vec<NativeSc
             _=>return Err(NativeScopeOutcomeUnresolved.into()),
         }
     }
-    let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get(0))?;
+    let counted=match owner_checkout_recovery::native_attempts(tx,workflow)? {
+        Some(counted)=>counted,
+        None=>tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get::<_,u64>(0))?,
+    };
     if counted!=custody.len() as u64 {return Err(NativeScopeOutcomeUnresolved.into());}
     // This returns original custody, not semantic qualification. The consumer
     // must validate every private native provenance file before new dispatch.
@@ -421,6 +427,7 @@ pub struct WorkflowStore {
 /// The same immutable response lookup serves leased execution and free data
 /// inspection; a recorded-but-missing result is never a fresh empty slot.
 fn read_scope_response(conn:&Connection,workflow:&str,key:&str)->Result<Option<String>> {
+    if let Some(value)=owner_checkout_recovery::scope_response(conn,workflow,key)? {return Ok(value);}
     let value=conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,key],|r|r.get(0)).optional()?;
     if value.is_none() {
         let malformed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[workflow],|row|row.get(0))?;
@@ -442,6 +449,7 @@ fn read_recorded_scope_response(conn:&Connection,workflow:&str,key:&str)->Result
 }
 
 fn read_scope_response_keys(conn:&Connection,workflow:&str,after:&str)->Result<Vec<String>> {
+    if let Some(keys)=owner_checkout_recovery::scope_keys(conn,workflow,after)? {return Ok(keys);}
     let invalid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND CASE WHEN json_valid(payload) THEN COALESCE(json_type(payload,'$.key')!='text' OR length(json_extract(payload,'$.key'))!=64,1) ELSE 1 END)",[workflow],|row|row.get(0))?;
     if invalid {return Err(MissingScopeResponse.into());}
     let keys={let mut statement=conn.prepare("SELECT key FROM (SELECT key FROM scope_stage_response WHERE workflow=?1 UNION SELECT json_extract(payload,'$.key') AS key FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded') WHERE key>?2 ORDER BY key LIMIT 16")?;
@@ -855,6 +863,7 @@ impl WorkflowStore {
         discord_request_schema::initialize(&conn)?;
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
+        conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
         Ok(Self { conn })
     }
 
