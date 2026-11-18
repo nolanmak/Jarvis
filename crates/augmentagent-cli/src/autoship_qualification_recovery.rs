@@ -187,7 +187,8 @@ fn semantic_hash(value:&str)->bool {
 }
 
 fn semantic_cue(conn:&Connection,workflow:&str,binding:&Binding,generation:i64)->Result<Option<SemanticReconsideration>> {
-    let saved:Option<(i64,String)>=conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",[workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let cutover=owner_checkout_recovery::cutover_seq(conn,workflow)?;
+    let saved:Option<(i64,String)>=conn.query_row("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='original_semantic_witness_recovered' ORDER BY seq DESC LIMIT 1",params![workflow,cutover],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
     let Some((recorded_generation,raw))=saved else{return Ok(None)};
     let cue:SemanticReconsideration=serde_json::from_str(&raw)?;
     ensure!(cue.qualification_required && cue.original_generation==recorded_generation
