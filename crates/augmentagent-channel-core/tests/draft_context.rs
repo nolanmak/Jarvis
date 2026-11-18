@@ -90,6 +90,28 @@ fn a_trigger_without_a_conversation_keeps_the_gap_and_targets_only_itself() {
 }
 
 #[test]
+fn the_prompt_asks_for_an_answer_to_every_retained_unanswered_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.upsert_email_backfill(&owner_turn(0), 1).unwrap();
+    for i in 1..13 {
+        store.upsert_email_backfill(&message(i), 1).unwrap();
+    }
+    let seed = load_seed(&store, &message(12), None).unwrap();
+    let retained: Vec<String> = seed.messages.iter().map(|m| m.message_id.clone()).collect();
+    assert_eq!(
+        target_ids(&seed),
+        retained,
+        "the owner's turn fell out of the window, so every retained turn is owed an answer"
+    );
+    let prompt = seed.prompt();
+    assert!(prompt.contains("awaiting an answer"));
+    for id in &retained {
+        assert!(prompt.contains(id.as_str()), "target {id} is not in the prompt");
+    }
+}
+
+#[test]
 fn seed_uses_stored_turns_and_explicit_wiki_identity_not_only_new_batch() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("data.db")).unwrap();
