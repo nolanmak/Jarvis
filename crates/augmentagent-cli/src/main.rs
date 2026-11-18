@@ -98,6 +98,7 @@ use async_trait::async_trait;
 
 mod whatsapp_history;
 mod whatsapp_phone;
+mod socialapi_compose_identity;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -1846,8 +1847,8 @@ enum SocialapiOp {
         /// Conversation to reply into. This is the send target.
         #[arg(long)]
         conversation_id: String,
-        /// SocialAPI.ai account that owns the conversation. Required by the
-        /// inbox API on send; omit only if you know the API can infer it.
+        /// SocialAPI.ai account that owns the conversation. Omit to infer
+        /// exactly one known account from this conversation's stored DMs.
         #[arg(long)]
         account_id: Option<String>,
         /// Who you're replying to, for the card title.
@@ -8193,7 +8194,8 @@ async fn post_social_approval_card(
         anyhow::bail!("CCat blocked external-message draft");
     }
 
-    let inbound = social_card_row(
+    let inbound = socialapi_compose_identity::prepare_card(
+        store,
         platform,
         kind,
         message_id,
@@ -8202,14 +8204,14 @@ async fn post_social_approval_card(
         counterparty,
         subject,
         context_body,
-    );
+    )?;
     store
         .upsert_email(&inbound)
         .context("upsert inbound row for action linkage")?;
 
     let action_id = store
         .log_action(
-            message_id,
+            &inbound.message_id,
             Some(thread_id),
             counterparty,
             subject,
