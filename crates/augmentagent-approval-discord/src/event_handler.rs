@@ -2838,7 +2838,7 @@ async fn extract_doc_attachments(attachments: &[Attachment], msg_id: u64, signab
         };
         record_original_name(&in_path, &att.filename).await;
         // Preserve main's owner-only signing workflow alongside retained originals.
-        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf | DocKind::Docx)) {
             match tokio::fs::read(&in_path).await {
                 Ok(bytes) => if let Some(note) = stage_signable_upload(root, &att.filename, &bytes) {
                     out.notices.push(note);
@@ -2891,6 +2891,15 @@ fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<St
         augmentagent_docs::signing::stage_owner_upload(root, &state, filename, bytes)
     });
     match staged {
+        Ok(path) if path.extension().and_then(|e| e.to_str()) == Some("docx") => {
+            info!(file = %filename, path = %path.display(), "owner Word document staged for signing");
+            Some(format!(
+                "original Word document saved unchanged at {}; to sign this exact file run `augmentagent doc sign-lines {}` then `augmentagent doc sign {} --out <new-signed.docx> --line <n>` (or --anchor-text \"<text of that line>\")",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
+        }
         Ok(path) => {
             info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
             Some(format!(

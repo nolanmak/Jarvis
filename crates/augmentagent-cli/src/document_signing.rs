@@ -35,7 +35,11 @@ pub async fn propose(
         to: String::new(),
         cc: String::new(),
         attachments: vec![],
-        subject: format!("Sign PDF: {}", proposal.source),
+        subject: if is_word(&proposal) {
+            format!("Sign Word document: {}", proposal.source)
+        } else {
+            format!("Sign PDF: {}", proposal.source)
+        },
         body: serde_json::to_string(&proposal)?,
         date: chrono::Utc::now().to_rfc3339(),
         account_entity_id: None,
@@ -53,7 +57,8 @@ pub async fn propose(
         ActionStatus::Pending,
     )?;
     let unsigned = signing::review_bytes(&root, &proposal)?;
-    let card = approval_message(&id, &email, &human, 0).add_files(card_files(unsigned, preview_png));
+    let card = approval_message(&id, &email, &human, 0)
+        .add_files(card_files(unsigned, preview_png, is_word(&proposal)));
     serenity::all::ChannelId::new(cid)
         .send_message(&serenity::http::Http::new(&token), card)
         .await
@@ -64,8 +69,27 @@ pub async fn propose(
 
 /// What the owner reads before approving: where the ink lands (and on which
 /// detected line), plus the hashes binding the preview to the published bytes.
+/// A Word (.docx) proposal: placed on a paragraph, not page coordinates.
+fn is_word(p: &Proposal) -> bool {
+    p.placement.paragraph.is_some()
+}
+
 fn card_text(p: &Proposal) -> String {
     let pl = &p.placement;
+    if is_word(p) {
+        let line = pl.anchor.as_ref();
+        let mut text = format!(
+            "Apply signature '{}' to {} (Word document).\nLine {}: \"{}\", signature {} pt wide; date: {}.\nOutput: {}\nDocument SHA-256: {}\nSignature SHA-256: {}",
+            p.signature, p.source,
+            line.map(|a| a.line).unwrap_or(0),
+            line.and_then(|a| a.text.as_deref()).unwrap_or(""),
+            pl.width, pl.date.as_deref().unwrap_or("none"), p.output, p.document_sha256, p.signature_sha256);
+        if let (Some(preview), Some(out)) = (&p.preview_sha256, &p.expected_output_sha256) {
+            text.push_str(&format!("\nPreview SHA-256: {preview}\nSigned output SHA-256: {out}"));
+        }
+        text.push_str("\nThe preview shows the signed line in context; the signature replaces that line's blank (or follows its label) and nothing else in the document changes. Approve publishes exactly the pinned signed file; it does not send the document.");
+        return text;
+    }
     let placed = match (&pl.ink, &pl.anchor) {
         (Some(ink), Some(a)) => format!(
             "on line {} (top y={}, x {}–{}{}): ink bottom y={}, {:.1} pt above the line; ink x={}, width={}",
@@ -85,7 +109,13 @@ fn card_text(p: &Proposal) -> String {
     text
 }
 
-fn card_files(unsigned: Vec<u8>, preview_png: Vec<u8>) -> Vec<serenity::all::CreateAttachment> {
+fn card_files(unsigned: Vec<u8>, preview_png: Vec<u8>, word: bool) -> Vec<serenity::all::CreateAttachment> {
+    if word {
+        return vec![
+            serenity::all::CreateAttachment::bytes(preview_png, "signed-line-preview.png"),
+            serenity::all::CreateAttachment::bytes(unsigned, "unsigned-review.docx"),
+        ];
+    }
     vec![
         serenity::all::CreateAttachment::bytes(preview_png, "signed-page-preview.png"),
         serenity::all::CreateAttachment::bytes(unsigned, "unsigned-review.pdf"),
@@ -315,7 +345,7 @@ mod tests {
         p.placement.anchor = None;
         p.preview_sha256 = None;
         assert!(card_text(&p).contains("image box x=70.1, y=707.1, width=187"), "{}", card_text(&p));
-        let files = card_files(b"%PDF-".to_vec(), b"\x89PNG".to_vec());
+        let files = card_files(b"%PDF-".to_vec(), b"\x89PNG".to_vec(), false);
         let names: Vec<_> = files.iter().map(|f| f.filename.as_str()).collect();
         assert_eq!(names, ["signed-page-preview.png", "unsigned-review.pdf"]);
         assert_eq!(files[0].data, b"\x89PNG");
