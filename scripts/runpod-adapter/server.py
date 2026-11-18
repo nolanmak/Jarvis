@@ -248,7 +248,7 @@ def normalize(output, model, request_id):
 def normalize_messages(messages):
     """Translate OpenAI chat message parts into Ollama's chat wire format.
 
-    9Router converts Responses calls to Chat Completions but keeps content as
+    gateway converts Responses calls to Chat Completions but keeps content as
     typed parts. Ollama requires a string plus optional base64 images.
     """
     if not isinstance(messages, list):

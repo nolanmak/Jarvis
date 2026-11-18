@@ -1,4 +1,4 @@
-"""Opt-in live probe of a Runpod model through 9Router and Codex Responses.
+"""Opt-in live probe of a Runpod model through OmniRoute and Codex Responses.
 
 Requires OPENAI_BASE_URL and OPENAI_API_KEY in the environment. This launches
 Codex with a clean environment and never puts the key in argv or test output.
@@ -22,12 +22,12 @@ def run(profile):
         instructions.write_text('Answer the user concisely. Do not use tools for this probe.\n')
         overrides = [
             'model_provider="augmentagent_router"',
-            'model_providers.augmentagent_router.name="9Router"',
+            'model_providers.augmentagent_router.name="OmniRoute"',
             f'model_providers.augmentagent_router.base_url={json.dumps(base)}',
             'model_providers.augmentagent_router.wire_api="responses"',
             'model_providers.augmentagent_router.env_key="AUGMENTAGENT_ROUTER_API_KEY"',
             'model_providers.augmentagent_router.requires_openai_auth=false',
-            'model_providers.augmentagent_router.http_headers={ "X-9Router-Token-Saver" = "off" }',
+            'model_providers.augmentagent_router.http_headers={ "x-omniroute-compression" = "off" }',
         ]
         args = ['codex', 'exec', '--json', '--skip-git-repo-check',
                 '--ignore-user-config', '--ignore-rules', '--ephemeral', '--strict-config',
