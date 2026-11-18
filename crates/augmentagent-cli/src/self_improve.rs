@@ -142,6 +142,11 @@ mod acceptance;
 mod alignment;
 #[path = "self_improve_push_destination.rs"]
 mod push_destination;
+#[path = "self_improve_repository_identity.rs"]
+mod repository_identity;
+#[cfg(test)]
+#[path = "self_improve_repository_identity_tests.rs"]
+mod repository_identity_tests;
 #[path = "self_improve_publication.rs"]
 mod publication;
 #[cfg(test)]

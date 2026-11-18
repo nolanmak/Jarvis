@@ -2528,7 +2528,7 @@ pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
         "canonical GitHub repository identity unavailable"
     );
-    Ok(name.to_ascii_lowercase())
+    repository_identity::Policy::from_env()?.canonical(name)
 }
 
 async fn untracked_evidence(worktree: &Path) -> Result<Vec<(String, String)>> {

@@ -1,5 +1,7 @@
 //! Controller checkouts are distinct from owner and candidate worktrees.
 use super::*;
+#[path = "self_improve_controller_receipt.rs"]
+mod receipt;
 
 pub(super) struct Controller {
     pub root: PathBuf,
@@ -60,7 +62,7 @@ pub(super) async fn candidate_parent(repo: &Path) -> Result<PathBuf> {
     Ok(primary_root(repo).await?.join(".self-improve-worktrees"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
 struct Ownership {
     version: u32,
     primary: PathBuf,
@@ -68,6 +70,10 @@ struct Ownership {
     device: u64,
     inode: u64,
     git_pointer_sha256: String,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    previous_origin_sha256: Option<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    previous_identity_sha256: Option<String>,
 }
 
 fn fingerprint(path: &Path, primary: PathBuf, origin: &str) -> Result<Ownership> {
@@ -81,13 +87,17 @@ fn fingerprint(path: &Path, primary: PathBuf, origin: &str) -> Result<Ownership>
             && std::fs::symlink_metadata(&pointer)?.file_type().is_file(),
         "invalid controller checkout type"
     );
+    let identity=repository_identity::Policy::from_env()?.origin(origin)?;
+    let normalized=identity.as_ref().map(|name|format!("github:{name}"));
     Ok(Ownership {
-        version: 1,
+        version: if identity.is_some() {2} else {1},
         primary,
-        origin_sha256: format!("{:x}", Sha256::digest(origin.as_bytes())),
+        origin_sha256: format!("{:x}", Sha256::digest(normalized.as_deref().unwrap_or(origin).as_bytes())),
         device: metadata.dev(),
         inode: metadata.ino(),
         git_pointer_sha256: format!("{:x}", Sha256::digest(std::fs::read(pointer)?)),
+        previous_origin_sha256: None,
+        previous_identity_sha256: None,
     })
 }
 
@@ -151,23 +161,13 @@ pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
     let receipt = control.join(format!("{lane}.json"));
     let origin = git(repo, &["remote", "get-url", "origin"]).await?;
     let exists = path.try_exists()?;
+    let mut migration=None;
     if exists {
         recovery::existing_checkout(repo, &path).await?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&receipt)
-            .context("existing controller has no ownership receipt; preserved")?;
-        let meta = file.metadata()?;
-        anyhow::ensure!(
-            meta.is_file() && meta.len() <= 16384,
-            "invalid controller receipt"
-        );
-        let recorded: Ownership = serde_json::from_reader(file)?;
-        anyhow::ensure!(
-            recorded == fingerprint(&path, primary.clone(), &origin)?,
-            "controller ownership changed; preserved"
-        );
+        let recorded=receipt::read(&receipt).context("existing controller has no valid ownership receipt; preserved")?;
+        if let Some(migrated)=receipt::migration(&recorded,&fingerprint(&path,primary.clone(),&origin)?,&origin)? {
+            migration=Some((recorded,migrated));
+        }
         anyhow::ensure!(
             git(
                 &path,
@@ -209,6 +209,13 @@ pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
     if exists {
         checkout_identity::controller_refresh(&path, &head).await?;
         git(&path, &["checkout", "--detach", &head]).await?;
+        if let Some((previous,migrated))=migration {
+            let final_origin=git(repo,&["remote","get-url","origin"]).await?;
+            let final_fingerprint=fingerprint(&path,primary.clone(),&final_origin)?;
+            anyhow::ensure!(receipt::migration(&previous,&final_fingerprint,&final_origin)?.as_ref()==Some(&migrated),
+                "controller ownership changed during migration; preserved");
+            receipt::commit(&receipt,&previous,&migrated)?;
+        }
     } else {
         git(
             repo,
