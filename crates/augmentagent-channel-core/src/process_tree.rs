@@ -31,8 +31,10 @@ impl ProcessGroup {
     }
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if let Some(logger)=logger {
-            let mut registration=self.owned_run.lock().map_err(|_|anyhow::anyhow!("owned-run registration poisoned"))?;
-            if registration.is_none() {*registration=logger.register_owned_run(&self.receipt)?;}
+            let registration=self.owned_run.lock().map_err(|_|anyhow::anyhow!("owned-run registration poisoned"))?;
+            if logger.is_protected() && logger.native_runtime_owner()?.is_some() {
+                anyhow::ensure!(registration.is_some(),"owned supervisor was not registered before spawn");
+            }
             *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone()));
         }
         Ok(())
@@ -603,47 +605,47 @@ const ADMISSION_WAIT_SECS: u64 = 120;
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None,None)
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None,None, None)
 }
-pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
+pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None,None)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None,None, logger)
 }
 /// Raw command with externally retained supervisor receipts. Its declared
 /// resource policy is unchanged, and no storage descriptors reach the child.
-pub(crate) fn spawn_admitted_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path)
+pub(crate) fn spawn_admitted_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     ->std::io::Result<(Child,ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),None)
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),None, logger)
 }
-pub(crate) fn spawn_admitted_recorded_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path,capture:&std::path::Path)
+pub(crate) fn spawn_admitted_recorded_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path,capture:&std::path::Path, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     ->std::io::Result<(Child,ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),Some(capture))
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),Some(capture), logger)
 }
 /// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
 /// supervisor's own declaration lookup (the builder tier).
-pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
+pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None,None)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None,None, logger)
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
-pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
+pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None,None)
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None,None, logger)
 }
 pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
-    storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
+    storage_files: &[std::fs::File], policy: &serde_json::Value, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> std::io::Result<(Child, ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len() > 64 {
         return Err(std::io::Error::other("invalid inherited storage descriptor set"));
     }
-    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None,None)
+    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None,None, logger)
 }
 pub(crate) fn spawn_admitted_storage_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,
-    storage_files:&[std::fs::File],policy:&serde_json::Value,directory:&std::path::Path)
+    storage_files:&[std::fs::File],policy:&serde_json::Value,directory:&std::path::Path, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     -> std::io::Result<(Child,ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len()>64 {return Err(std::io::Error::other("invalid inherited storage descriptor set"));}
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory),None)
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory),None, logger)
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>,raw_capture:Option<&std::path::Path>)
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>,raw_capture:Option<&std::path::Path>, logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
     -> std::io::Result<(Child, ProcessGroup)> {
     if let Some(capture)=raw_capture {
         private_directory(capture)?;
@@ -719,17 +721,25 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
         }); }
     }
     let active_request = begin_request(journal, &receipt)?;
+    let owned_run=match logger.map(|logger|logger.register_owned_run(&receipt)).transpose() {
+        Ok(registration)=>registration.flatten(),
+        Err(error)=>{
+            if let Some(marker)=&active_request {retire_request(marker,&receipt)?;}
+            return Err(std::io::Error::other(error));
+        }
+    };
     let child = match supervised.spawn() {
         Ok(child) => child,
         Err(error) => {
             // No process was created, so this request has no surviving tools.
+            if let Some(registration)=owned_run {registration.complete(true);}
             if let Some(marker) = &active_request { retire_request(marker, &receipt)?; }
             return Err(error);
         }
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, owned_run:std::sync::Mutex::new(owned_run),resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -822,7 +832,7 @@ mod tests {
             .env_clear().env("PATH","/usr/bin:/bin");
         let policy=serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
         let (mut child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),
-            true,&[lease],&policy,&directory).unwrap();
+            true,&[lease],&policy,&directory, None).unwrap();
         let mut admitted=None;
         group.admit_command_observed("verification",None,&mut |identity| {
             assert!(!directory.join("launch-continue").exists(),"callback ran after release");
@@ -1059,7 +1069,7 @@ mod tests {
         let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
         let mut command=Command::new("/usr/bin/python3");
         command.args(["-I", "-c", "import json,pathlib,sys; rows=[json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]; assert any(row.get('kind') == 'model_call_admitted' and row.get('accounting_receipt') == 'synthetic-charge-17' for row in rows)"]).arg(&log);
-        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false, None).unwrap();
         let proceed=group.receipt.with_file_name("launch-continue");
         logger.set_correlated_model_call_observer(Arc::new(move |_| {
             assert!(!proceed.exists(), "provider released before accounting");
@@ -1104,7 +1114,7 @@ mod tests {
         logger.set_resource_capacity_observer(Arc::new(move |_|{callback.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
         let mut command=Command::new("/usr/bin/python3");
         command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
-        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false, None).unwrap();
         // Inject a missing required receipt after an ordinary test supervisor
         // is created, without requiring systemd in this transport unit test.
         group.resource_required=true;
@@ -1126,7 +1136,7 @@ mod tests {
             let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
             logger.set_dispatch_observer(Arc::new(move || {anyhow::ensure!(!check.load(Ordering::SeqCst),"owner-paused");Ok(())})).unwrap();
             logger.dispatch_allowed().unwrap();
-            let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+            let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false, None).unwrap();
             paused.store(true,Ordering::SeqCst);
             let result=if model {group.admit_model("codex",Some(&logger)).await} else {group.admit_command("verification",Some(&logger)).await};
             assert_eq!(result.unwrap_err().to_string(),"owner-paused");
@@ -1158,7 +1168,7 @@ mod tests {
             }
         })).unwrap();
         let clean=Arc::new(AtomicBool::new(true));
-        let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
+        let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false, None).unwrap();
         let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
         if failure=="callback" {assert!(error.to_string().contains("synthetic budget denied"));}
         if failure=="receipt" {assert!(error.to_string().contains("invalid model accounting receipt"));}
@@ -1185,7 +1195,7 @@ mod tests {
         let observed=count.clone();let expected=effect.clone();
         let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
         logger.set_model_call_observer(Arc::new(move |_|{ assert!(!expected.exists()); observed.fetch_add(1,Ordering::SeqCst);Ok(()) })).unwrap();
-        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false, None).unwrap();
         group.admit_model("codex",Some(&logger)).await.unwrap();
         assert!(child.wait_with_output().await.unwrap().status.success());
         drop(group);

@@ -63,7 +63,8 @@ impl WorkflowStore {
         tx.commit()?;
         Ok(Some(request))
     }
-    /// Complete only the request belonging to this fenced lease and its registered
+    /// Complete this lease's request, or an interrupted predecessor only with a
+    /// sealed recovery proof issued for the exact current successor. Match its registered
     /// native audit. The proof is issued by supervised guard cleanup, not JSON.
     /// Custody is retained until the ordinary release path runs after this commit.
     pub fn complete_idle_recovery(
@@ -83,19 +84,30 @@ impl WorkflowStore {
         ensure!(
             pending == *request
                 && request.workflow_id == lease.workflow
-                && request.lease_generation == lease.generation,
+                && request.lease_generation <= lease.generation,
             "inactivity recovery request belongs to a different fenced lease"
         );
         ensure!(
             proof.owner().workflow_id == lease.workflow
-                && proof.owner().lease_generation == lease.generation,
+                && proof.owner().lease_generation == request.lease_generation,
             "inactivity recovery proof belongs to a different native owner"
         );
+        if request.lease_generation == lease.generation {
+            ensure!(
+                proof.recovered_for_generation().is_none(),
+                "restart proof was issued for a different successor lease"
+            );
+        } else {
+            ensure!(
+                proof.recovered_for_generation() == Some(lease.generation),
+                "interrupted recovery requires this successor's sealed old-owner proof"
+            );
+        }
         let audit_path = proof
             .audit_path()
             .to_str()
             .context("non-UTF8 native audit")?;
-        let registered:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3)",params![lease.workflow,lease.generation,audit_path],|r|r.get(0))?;
+        let registered:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3)",params![lease.workflow,request.lease_generation,audit_path],|r|r.get(0))?;
         ensure!(
             registered,
             "inactivity recovery proof does not match registered native audit"
@@ -149,9 +161,9 @@ impl WorkflowStore {
             "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
             params![lease.workflow, serde_json::to_string(&checkpoint)?],
         )?;
-        tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'inactivity_recovery') WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,lease.generation])?;
-        event(&tx,&lease.workflow,lease.generation,"inactivity_recovery_completed",
-            &serde_json::json!({"request":request,"failures":failures,"dependency_sha256":dependency_sha256,"supervised_runs":proof.runs(),"audit_sha256":format!("{:x}",Sha256::digest(audit_path.as_bytes()))}).to_string(),now)?;
+        tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'inactivity_recovery') WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,request.lease_generation])?;
+        event(&tx,&lease.workflow,request.lease_generation,"inactivity_recovery_completed",
+            &serde_json::json!({"request":request,"completed_by_generation":lease.generation,"failures":failures,"dependency_sha256":dependency_sha256,"supervised_runs":proof.runs(),"audit_sha256":format!("{:x}",Sha256::digest(audit_path.as_bytes()))}).to_string(),now)?;
         event(
             &tx,
             &lease.workflow,
@@ -505,5 +517,77 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+    #[tokio::test]
+    async fn successor_can_complete_interrupted_request_only_with_its_exact_sealed_old_owner_proof()
+    {
+        let (root, mut store, old, binding) = setup();
+        let audit = proof_logger(root.path(), &old, "restart");
+        let audit_path = audit.path().to_str().unwrap().to_owned();
+        store.register_native_owner(&old, &audit_path, 5).unwrap();
+        let request = store.request_idle_recovery(&old, 900_003).unwrap().unwrap();
+        let owner = audit.native_runtime_owner().unwrap().unwrap();
+        audit.cancel_owned_runs(&owner).unwrap();
+        let local = audit.owned_runs_quiescent(&owner).await.unwrap();
+        let recovered = audit
+            .recover_owned_runs(&owner, old.generation + 1)
+            .unwrap();
+        assert!(
+            store
+                .complete_idle_recovery(&old, &request, &recovered, 900_004)
+                .is_err(),
+            "old lease consumed a proof issued for its successor"
+        );
+        assert_eq!(
+            store.idle_recovery_request(&old.workflow).unwrap(),
+            Some(request.clone())
+        );
+        drop(store);
+        store = WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        let now = 20_000_003;
+        let successor = store
+            .claim(&old.workflow, "successor", now, 20_000_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .complete_idle_recovery(&successor, &request, &local, now + 1)
+                .is_err(),
+            "live-instance proof was treated as restart custody"
+        );
+        let reopened = augmentagent_channel_core::AuditLogger::protected(
+            audit.path().to_path_buf(),
+            root.path().join("anchors-restart/anchor.json"),
+            &[],
+        )
+        .unwrap();
+        let recovered = reopened
+            .recover_owned_runs(&owner, successor.generation)
+            .unwrap();
+        assert!(
+            store
+                .complete_idle_recovery(&successor, &request, &recovered, now + 2)
+                .unwrap(),
+            "fenced successor could not settle interrupted recovery"
+        );
+        assert!(store
+            .idle_recovery_request(&old.workflow)
+            .unwrap()
+            .is_none());
+        let snapshot = store.snapshot(&old.workflow).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.binding, binding);
+        assert_eq!(snapshot.checkpoint.next.reason, "inactivity_expired");
+        assert_eq!(snapshot.checkpoint.next.eligible_at_ms, now + 2 + 300_000);
+        assert_eq!(snapshot.model_calls, 0);
+        assert_eq!(store.merge_allowance(now + 2, 5).unwrap().confirmed, 0);
+        let retirements = store.pending_native_retirements(now + 2, 16).unwrap();
+        assert_eq!(
+            retirements,
+            vec![(old.workflow.clone(), old.generation, audit_path)]
+        );
+        assert!(!store
+            .complete_idle_recovery(&successor, &request, &recovered, now + 3)
+            .unwrap());
+        store.release(&successor, now + 4).unwrap();
     }
 }

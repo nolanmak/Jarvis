@@ -38,6 +38,9 @@
 
 #[path = "tool_audit_cancellation.rs"]
 pub(crate) mod cancellation;
+#[path = "tool_audit_run_inventory.rs"]
+pub(crate) mod run_inventory;
+pub use run_inventory::OwnedRunInventory;
 pub use cancellation::OwnedRunsQuiescence;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -523,6 +526,9 @@ impl AuditLogger {
         anyhow::ensure!(self.is_protected() && owner.lease_generation>0 && !owner.workflow_id.is_empty(),"invalid native runtime owner");
         let mut current=self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?;
         anyhow::ensure!(current.as_ref().is_none_or(|existing|existing==&owner),"native runtime owner cannot change within a logger instance");
+        if current.is_none() {
+            self.record_controller(serde_json::json!({"actor":"controller","kind":"owned_supervisor_inventory_started","version":1,"owner":owner}))?;
+        }
         *current=Some(owner);
         Ok(())
     }

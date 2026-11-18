@@ -27,8 +27,6 @@ and new heads do not reset the debt. Trusted meaningful progress after the prior
 or a changed stage/policy/contract dependency fingerprint, resets it. Backoff never
 consumes merge allowance or imposes a global failed-attempt stop.
 
-This slice provides the lifecycle primitives. It does not enable an automatic expiry
-timer. Controller integration, reconstruction of supervised custody after a process
-restart, and fenced takeover of an interrupted older-generation request remain part
-of #1706. A newly opened logger's empty in-memory registry is not restart teardown
-evidence; consumers must not use it to clear an interrupted older lease.
+The restart custody APIs are described in [restart-custody.md](restart-custody.md).
+Controller timer integration and dispatch of these lifecycle APIs remain part of #1706;
+automatic expiry is not enabled by these primitives.
