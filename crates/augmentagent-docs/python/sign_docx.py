@@ -67,9 +67,16 @@ def load(data):
 
 
 def paragraphs(doc):
-    """Every <w:p> element as (start, end, text), end just past </w:p>.
-    Paragraphs nest (text boxes), so open/close tags are paired with a stack."""
-    events = [(m.start(), "open", m.end()) for m in P_OPEN.finditer(doc) if not m.group(0).endswith("/>")]
+    """Every <w:p> element as (start, end, text), end just past </w:p> (or
+    past a self-closing <w:p/>, an empty paragraph as Word often writes it in
+    an empty table cell). Paragraphs nest (text boxes), so open/close tags are
+    paired with a stack."""
+    events = []
+    for m in P_OPEN.finditer(doc):
+        if m.group(0).endswith("/>"):
+            events.append((m.start(), "empty", m.end()))
+        else:
+            events.append((m.start(), "open", m.end()))
     pos = 0
     while True:
         i = doc.find(P_CLOSE, pos)
@@ -80,7 +87,9 @@ def paragraphs(doc):
     events.sort()
     stack, out = [], []
     for at, kind, end in events:
-        if kind == "open":
+        if kind == "empty":
+            out.append((at, end, ""))
+        elif kind == "open":
             stack.append(at)
         elif stack:
             start = stack.pop()
@@ -222,25 +231,68 @@ def drawing_run(rid, docpr_id, cx, cy):
     )
 
 
+T_ELEM = re.compile(r"(<w:t(?:\s[^>]*)?>)([^<]*)(</w:t>)")
+R_OPEN = re.compile(r"<w:r(?:\s[^>]*)?>")
+
+
 def place_in_paragraph(body, drawing, date):
-    """Insert the signature into one paragraph's XML. A blank line drawn with
-    underscores is replaced by the signature; otherwise the signature follows
-    the paragraph's text. The date, if any, follows the signature."""
+    """Insert the signature into one paragraph's XML. The paragraph's first
+    underscore blank (3+ underscores of its text, across however many text
+    elements it spans) is removed and the signature put where it began;
+    without a blank the signature follows the paragraph's text. The date, if
+    any, follows the signature. Only text characters of the blank are
+    removed: every other element of every run is kept, in order."""
     date_run = f'<w:r><w:t xml:space="preserve">   {escape(date)}</w:t></w:r>' if date else ""
-    for run in R_SPAN.finditer(body):
-        texts = T_TEXT.findall(run.group(0))
-        if len(texts) != 1:
+    insert = drawing + date_run
+    if body.endswith("/>"):  # an empty <w:p/>: open it up
+        return body[:-2] + ">" + insert + P_CLOSE
+    elems = list(T_ELEM.finditer(body))
+    texts = [unescape(m.group(2)) for m in elems]
+    full = "".join(texts)
+    blank = UNDERSCORES.search(full)
+    if not blank:
+        close = body.rfind(P_CLOSE)
+        return body[:close] + insert + body[close:]
+    # Edits run back to front so earlier offsets stay valid.
+    edits = []
+    offset = 0
+    first = None
+    for m, text in zip(elems, texts):
+        lo, hi = offset, offset + len(text)
+        offset = hi
+        a, b = max(lo, blank.start()), min(hi, blank.end())
+        if a >= b:
             continue
-        m = re.match(r"^(.*?)(_{3,})(.*)$", texts[0], re.S)
-        if not m:
-            continue
-        rpr = RPR.search(run.group(0))
-        rpr = rpr.group(0) if rpr else ""
-        part = lambda t: f'<w:r>{rpr}<w:t xml:space="preserve">{t}</w:t></w:r>' if t else ""
-        replacement = part(m.group(1)) + drawing + date_run + part(m.group(3))
-        return body[:run.start()] + replacement + body[run.end():]
-    close = body.rfind(P_CLOSE)
-    return body[:close] + drawing + date_run + body[close:]
+        head, tail = text[: a - lo], text[b - lo:]
+        if first is None:
+            first = (m, head, tail)
+        else:
+            edits.append((m.start(2), m.end(2), escape(tail) if tail is not None else ""))
+            if head:
+                raise ValueError("signature blank is interleaved with text; sign it by hand")
+    m, head, tail = first
+    run_start = max((r.start() for r in R_OPEN.finditer(body, 0, m.start()) if body.rfind("</w:r>", r.start(), m.start()) < 0), default=-1)
+    run_end = body.find("</w:r>", m.end())
+    if run_start < 0 or run_end < 0:
+        raise ValueError("signature blank is not inside a text run; sign it by hand")
+    run_open = R_OPEN.match(body, run_start).group(0)
+    rpr = RPR.search(body, run_start, m.start())
+    rpr = rpr.group(0) if rpr else ""
+    t_open = '<w:t xml:space="preserve">'
+    before = body[run_start:m.start()] + (t_open + escape(head) + "</w:t>" if head else "") + "</w:r>"
+    after_children = body[m.end():run_end]
+    for s_, e_, text in sorted((x for x in edits if m.end() <= x[0] and x[1] <= run_end), reverse=True):
+        after_children = after_children[:s_ - m.end()] + text + after_children[e_ - m.end():]
+    after = ""
+    if tail or after_children.strip():
+        after = run_open + rpr + (t_open + escape(tail) + "</w:t>" if tail else "") + after_children + "</w:r>"
+    rebuilt = before + insert + after
+    replacements = [x for x in edits if not (m.end() <= x[0] and x[1] <= run_end)]
+    replacements.append((run_start, run_end + len("</w:r>"), rebuilt))
+    out = body
+    for s, e, text in sorted(replacements, key=lambda x: x[0], reverse=True):
+        out = out[:s] + text + out[e:]
+    return out
 
 
 def sign(data):
@@ -264,6 +316,7 @@ def sign(data):
     rels = z.read(RELS).decode("utf-8") if RELS in names else (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>')
+    rels = re.sub(r"<Relationships(\s[^>]*)?/>", lambda m: f"<Relationships{m.group(1) or ''}></Relationships>", rels)
     rid = unique(set(re.findall(r'Id="([^"]+)"', rels)), lambda n: f"rIdJarvisSignature{n}")
     docpr = max([int(x) for x in re.findall(r'<wp:docPr[^>]*\bid="(\d+)"', doc)] + [0]) + 1
     drawing = drawing_run(rid, docpr, cx, cy)
@@ -276,7 +329,7 @@ def sign(data):
         raise ValueError("document relationships are unreadable")
     signed_rels = rels[:close] + rel + rels[close:]
     types = z.read(TYPES).decode("utf-8")
-    if not re.search(r'<Default\s+Extension="png"', types, re.I):
+    if not re.search(r'<Default\b[^>]*\bExtension="png"', types, re.I):
         close = types.rfind("</Types>")
         types = types[:close] + '<Default Extension="png" ContentType="image/png"/>' + types[close:]
     changed = {DOC: signed_doc.encode("utf-8"), RELS: signed_rels.encode("utf-8"), TYPES: types.encode("utf-8")}
