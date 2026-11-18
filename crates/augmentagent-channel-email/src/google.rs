@@ -1121,7 +1121,7 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
     let text_part = |out: &mut String| {
         out.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
         out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-        out.push_str(&wrap_base64(spec.body.as_bytes()));
+        out.push_str(&wrap_base64(crate::draft_body::plaintext(spec.body).as_bytes()));
         out.push_str("\r\n");
     };
 
@@ -1622,6 +1622,17 @@ mod tests {
         let hinted = app.auth_url("http://localhost:3000/oauth/google/callback", "s", Some("me@example.com"));
         let hq: HashMap<_, _> = reqwest::Url::parse(&hinted).unwrap().query_pairs().into_owned().collect();
         assert_eq!(hq["login_hint"], "me@example.com");
+    }
+
+    #[test]
+    fn mime_legacy_breaks_are_renderable_plaintext_newlines() {
+        let spec = DraftSpec {to: "recipient@example.test", subject: "Synthetic reply",
+            body: "Hello,<br/><BR>First & second < quarter.", ..Default::default()};
+        let mime = build_mime(&spec, &Threading::default());
+        assert!(mime.contains("Content-Type: text/plain; charset=\"UTF-8\""));
+        let body = mime.split_once("\r\n\r\n").unwrap().1;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(body.replace("\r\n", "")).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "Hello,\n\nFirst & second < quarter.");
     }
 
     #[test]

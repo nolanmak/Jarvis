@@ -35,7 +35,7 @@ else:raise AssertionError(args)
             .env("GH_BIN",gh).env("AUGMENTAGENT_GH_OWNER","fixture-owner")
             .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","fixture-owner")
             .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",tmp.path().join("workflow.db"))
-            .env("AUTOSHIP_FAIRNESS_HEAD",head).env(CHILD,&repo).current_dir(&repo).output().await.unwrap();
+            .env("AUTOSHIP_CHECKOUT_CASE",case).env("AUTOSHIP_FAIRNESS_HEAD",head).env(CHILD,&repo).current_dir(&repo).output().await.unwrap();
         assert!(out.status.success(),"{case}: {}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
         return;
     }
@@ -56,6 +56,24 @@ else:raise AssertionError(args)
                 store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:id.into(),repository:"fixture-owner/repo".into(),worktree:repo.clone(),source_request:request.clone(),source_pr:None,contract:request,environment:"synthetic-environment".into(),binding:binding.clone()},at+1).unwrap();
             }
             store.checkpoint(&lease,&cp,at+2).unwrap();store.release(&lease,at+3).unwrap();
+        }
+    }
+    if matches!(case,"lost-checkout"|"replaced-checkout") {
+        git(&repo,&["update-ref","refs/remotes/origin/main",&binding.head]);
+        let candidate=workspace::candidate_parent(&repo).await.unwrap().join("current-issue-3");
+        let branch="agent-fix/issue-3";
+        recovery::prepare(&repo,&candidate,branch).await.unwrap();
+        let lease=store.claim(retry,"fixture-enrollment",now-1000,500).unwrap().unwrap();
+        let identity=checkout_identity::Identity::observe(&workflow::path(),&repo,&candidate,retry,"fixture-owner/repo",branch).await.unwrap();
+        identity.enroll(&mut store,&lease,&binding,now-999).unwrap();
+        store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:retry.into(),repository:"fixture-owner/repo".into(),worktree:candidate.clone(),source_request:"synthetic-request".into(),source_pr:None,contract:"synthetic-contract".into(),environment:"synthetic-environment".into(),binding:binding.clone()},now-998).unwrap();
+        store.release(&lease,now-997).unwrap();
+        if case=="lost-checkout" {
+            git(&repo,&["worktree","remove","--force",candidate.to_str().unwrap()]);
+        } else {
+            let original=candidate.with_file_name("preserved-original");
+            git(&repo,&["worktree","move",candidate.to_str().unwrap(),original.to_str().unwrap()]);
+            git(&repo,&["worktree","add","--force",candidate.to_str().unwrap(),branch]);
         }
     }
     if case=="leased" {store.claim(retry,"still-owned",now,600_000).unwrap().unwrap();}
@@ -102,4 +120,14 @@ async fn repeated_scope_attempts_rotate_between_eligible_issues() {
 #[tokio::test]
 async fn first_scope_attempts_preserve_existing_newest_first_order() {
     fixture("initial-order","self_improve::picker_fairness_tests::first_scope_attempts_preserve_existing_newest_first_order").await;
+}
+
+#[tokio::test]
+async fn invalid_checkout_yields_to_eligible_peer_without_claiming() {
+    const TEST:&str="self_improve::picker_fairness_tests::invalid_checkout_yields_to_eligible_peer_without_claiming";
+    if std::env::var_os("AUTOSHIP_PICKER_FAIRNESS_ROOT").is_some() {
+        fixture(&std::env::var("AUTOSHIP_CHECKOUT_CASE").unwrap(),TEST).await;
+    } else {
+        for case in ["lost-checkout","replaced-checkout"] { fixture(case,TEST).await; }
+    }
 }

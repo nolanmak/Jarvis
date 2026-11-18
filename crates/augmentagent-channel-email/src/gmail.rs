@@ -856,7 +856,8 @@ impl ComposioClient {
         let mut args = serde_json::json!({
             "recipient_email": first,
             "subject": subject,
-            "body": body,
+            "body": crate::draft_body::plaintext(body),
+            "is_html": false,
         });
         if !rest.is_empty() {
             args["extra_recipients"] = serde_json::json!(rest);
@@ -2102,6 +2103,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn draft_legacy_breaks_are_plaintext_newlines_on_the_wire() {
+        let (addr, captured) = spawn_capturing_http(r#"{"successful":true,"data":{"id":"synthetic-draft"}}"#).await;
+        let client = ComposioClient::new("synthetic".into()).with_base_url(format!("http://{addr}"));
+        client.create_draft_with_attachment("synthetic-account", "recipient@example.test", "Synthetic reply",
+            "Hello,<br/><br />First & second < quarter.", Some("synthetic-thread"), &[],
+            &["copy@example.test".into()], &[]).await.unwrap();
+        let request = captured.await.unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(value["arguments"]["body"], "Hello,\n\nFirst & second < quarter.");
+        assert_eq!(value["arguments"]["thread_id"], "synthetic-thread");
+        assert_eq!(value["arguments"]["cc"], serde_json::json!(["copy@example.test"]));
     }
 
     #[tokio::test]

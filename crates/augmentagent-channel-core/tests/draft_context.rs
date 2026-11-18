@@ -18,6 +18,99 @@ fn message(i: usize) -> Email {
     }
 }
 
+fn owner_turn(i: usize) -> Email {
+    Email {
+        from: "me".into(),
+        body: format!("owner answer {i}"),
+        ..message(i)
+    }
+}
+
+fn target_ids(seed: &augmentagent_channel_core::draft_context::ContextSeed) -> Vec<String> {
+    seed.reply_targets()
+        .into_iter()
+        .map(|t| t.message_id)
+        .collect()
+}
+
+#[test]
+fn reply_targets_cover_every_message_sent_since_the_owner_last_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.upsert_email_backfill(&message(1), 1).unwrap();
+    store.upsert_email_backfill(&owner_turn(2), 1).unwrap();
+    let mut first = message(3);
+    first.body = "couldn't make it, fell asleep".into();
+    store.upsert_email_backfill(&first, 1).unwrap();
+    let mut newest = message(4);
+    newest.body = "thanks for the help, let us plan for next month".into();
+    store.upsert_email_backfill(&newest, 1).unwrap();
+    let seed = load_seed(&store, &newest, None).unwrap();
+    assert_eq!(target_ids(&seed), ["m03", "m04"]);
+    assert_eq!(seed.messages.len(), 4, "history keeps the answered turns");
+    let rendered = serde_json::to_value(&seed).unwrap();
+    assert_eq!(
+        rendered["reply_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["message_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["m03", "m04"],
+        "the drafting workflow sees the whole run"
+    );
+}
+
+#[test]
+fn owner_requested_context_retargets_messages_that_arrived_after_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.upsert_email_backfill(&owner_turn(1), 1).unwrap();
+    let original = message(2);
+    for row in [&original, &message(3), &message(4)] {
+        store.upsert_email_backfill(row, 1).unwrap();
+    }
+    let seed =
+        augmentagent_channel_core::draft_context::load_latest_seed(&store, &original, None).unwrap();
+    assert_eq!(target_ids(&seed), ["m02", "m03", "m04"]);
+}
+
+#[test]
+fn a_trigger_without_a_conversation_keeps_the_gap_and_targets_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    let mut current = message(1);
+    current.thread_id = None;
+    let seed = load_seed(&store, &current, None).unwrap();
+    assert!(seed
+        .gaps
+        .iter()
+        .any(|g| g == "Conversation identifier unavailable"));
+    assert_eq!(target_ids(&seed), ["m01"]);
+}
+
+#[test]
+fn the_prompt_asks_for_an_answer_to_every_retained_unanswered_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("data.db")).unwrap();
+    store.upsert_email_backfill(&owner_turn(0), 1).unwrap();
+    for i in 1..13 {
+        store.upsert_email_backfill(&message(i), 1).unwrap();
+    }
+    let seed = load_seed(&store, &message(12), None).unwrap();
+    let retained: Vec<String> = seed.messages.iter().map(|m| m.message_id.clone()).collect();
+    assert_eq!(
+        target_ids(&seed),
+        retained,
+        "the owner's turn fell out of the window, so every retained turn is owed an answer"
+    );
+    let prompt = seed.prompt();
+    assert!(prompt.contains("awaiting an answer"));
+    for id in &retained {
+        assert!(prompt.contains(id.as_str()), "target {id} is not in the prompt");
+    }
+}
+
 #[test]
 fn seed_uses_stored_turns_and_explicit_wiki_identity_not_only_new_batch() {
     let dir = tempfile::tempdir().unwrap();
@@ -552,6 +645,10 @@ fn owner_requested_context_refreshes_turns_after_the_original_inbound() {
         "Already answered by hand"
     );
     assert_eq!(refreshed.audience["trigger_message_id"], "m00");
+    assert!(
+        refreshed.reply_targets().is_empty(),
+        "the owner's own newest reply leaves nothing unanswered"
+    );
 }
 
 #[tokio::test]

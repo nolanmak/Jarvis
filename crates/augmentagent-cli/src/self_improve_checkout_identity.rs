@@ -164,6 +164,27 @@ fn receipt_path(state: &Path, workflow: &str, root: &Path) -> Result<PathBuf> {
         .join(format!("{key}.json")))
 }
 
+/// Read-only preparation/scheduling check. Never enroll a physical replacement
+/// or turn unchanged commit bytes into permission to replace a lost checkout.
+pub(super) fn check_recorded(state: &Path, workflow: &str, worktree: &Path,
+    repository: &str, branch: &str) -> Result<()> {
+    if !state.try_exists()? { return Ok(()); }
+    // Canonicalize the parent, not the final component: a final symlink must
+    // be inspected as the recorded path rather than selecting another receipt.
+    let root = canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    let receipt = receipt_path(state, workflow, &root)?;
+    let Some(recorded) = read_receipt(&receipt)? else { return Ok(()); };
+    anyhow::ensure!(recorded.version == 1 && recorded.workflow == workflow
+        && recorded.repository.eq_ignore_ascii_case(repository)
+        && recorded.source_branch == branch && recorded.worktree == root,
+        hold("checkout_identity_changed"));
+    let current = fingerprint(&root, &recorded.common)
+        .map_err(|error| error.context(hold("checkout_identity_changed")))?;
+    anyhow::ensure!(current == recorded.fingerprint, hold("checkout_identity_changed"));
+    Ok(())
+}
+
 /// An in-process handoff from the existing lease-fenced reconstruction path.
 /// It can be captured only while the path is absent; ordinary acquisitions
 /// never refresh a physical identity merely because its bytes still match.
