@@ -5,6 +5,11 @@ use super::*;
 mod stage_activity;
 #[path = "self_improve_family_dispatch_control.rs"]
 mod family_dispatch_control;
+#[path = "self_improve_family_wait_settlement.rs"]
+mod family_wait_settlement;
+#[cfg(test)]
+#[path = "self_improve_family_wait_settlement_tests.rs"]
+mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
 #[cfg(test)]
@@ -230,6 +235,7 @@ pub(super) struct WorkflowGuard {
     accounted_ms: Arc<AtomicU64>,
     capacity_exhausted: Arc<AtomicBool>,
     family_budget_wait: Arc<AtomicBool>,
+    family_wait_released: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
     acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
@@ -320,6 +326,11 @@ pub(super) struct CapacityAccounting {
     resumed: bool,
     generation: i64,
     family_budget_wait: Arc<AtomicBool>,
+    lease: Lease,
+    heartbeat: tokio_util::sync::CancellationToken,
+    started: std::time::Instant,
+    accounted_ms: Arc<AtomicU64>,
+    released: Arc<AtomicBool>,
 }
 impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
@@ -710,6 +721,7 @@ impl SweepGuard {
             family_budget_wait: Arc::new(AtomicBool::new(false)),
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:source_from_workflow(&id),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
         };
         inner.install_model_accounting()?;
@@ -1088,6 +1100,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             family_budget_wait: Arc::new(AtomicBool::new(false)),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
@@ -1162,7 +1175,9 @@ impl WorkflowGuard {
             .snapshot(self.id())?.context("capacity workflow missing")?.model_calls;
         Ok(CapacityAccounting { store:self.store.clone(), audit:self.audit.clone(),
             workflow:self.id().into(), calls_before, resumed, generation:self.lease.generation,
-            family_budget_wait:self.family_budget_wait.clone() })
+            family_budget_wait:self.family_budget_wait.clone(), lease:self.lease.clone(),
+            heartbeat:self.heartbeat.clone(), started:self.started,
+            accounted_ms:self.accounted_ms.clone(), released:self.family_wait_released.clone() })
     }
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
@@ -1287,7 +1302,7 @@ impl WorkflowGuard {
         let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),released:false };
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),family_wait_released:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
         guard.spawn_renewal();
@@ -2344,7 +2359,7 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
-        if !self.released { self.release_after_teardown()?; }
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) { self.release_after_teardown()?; }
         Ok(())
     }
 
@@ -2384,7 +2399,7 @@ impl WorkflowGuard {
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
         self.heartbeat.cancel();
-        if !self.released {
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) {
             // Best-effort final usage accounting, never release/cleanup here:
             // dropping an async task is not proof its descendants are gone.
             if let Ok(mut store) = self.store.lock() {

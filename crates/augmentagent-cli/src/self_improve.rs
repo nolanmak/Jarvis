@@ -7791,6 +7791,7 @@ async fn resume_draft_pr(
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
     }.await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     capacity_accounting.settle_ci(outcome)
 }
@@ -9960,6 +9961,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         issue.number
     )))
     }.await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     let outcome=match outcome {
         Err(error)=>match linked_claims::report(&error) {Some(report)=>Ok(report),None=>Err(error)},
