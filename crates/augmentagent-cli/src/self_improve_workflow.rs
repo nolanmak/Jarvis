@@ -125,6 +125,19 @@ impl FreshIssueControls {
             self.store.as_ref().map(|store|store.snapshot(&id)).transpose().map(Option::flatten)
         })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
     }
+    /// Read existing protected execution paths; this cannot mint a receipt or
+    /// admit a replacement when a retained checkout has disappeared.
+    pub(super) fn selection_checkout(&self, repository:&str, issue:u64)->Result<()> {
+        (|| -> Result<()> {
+            let Some(store)=self.store.as_ref() else {return Ok(())};
+            let id=durable::workflow_id(repository,issue)?;
+            let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
+            let Some(context)=store.recovery_context(&id,&snapshot.checkpoint.binding)? else {return Ok(())};
+            anyhow::ensure!(context.workflow==id && context.repository.eq_ignore_ascii_case(repository)
+                && context.binding==snapshot.checkpoint.binding,"selection checkout context differs");
+            checkout_identity::check_recorded(&self.state,&id,&context.worktree,repository,&snapshot.branch)
+        })().map_err(classify_issue_history_error)
+    }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         Ok(self.selection_snapshot(repository,issue)?.is_some_and(|snapshot|
             matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
@@ -2515,7 +2528,7 @@ pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
         "canonical GitHub repository identity unavailable"
     );
-    Ok(name.to_ascii_lowercase())
+    repository_identity::Policy::from_env()?.canonical(name)
 }
 
 async fn untracked_evidence(worktree: &Path) -> Result<Vec<(String, String)>> {
