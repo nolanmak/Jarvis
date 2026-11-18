@@ -3991,3 +3991,6 @@ mod observation_accounting_tests {
     }
 
 }
+
+#[path = "autoship_pr_readoption.rs"]
+mod pr_readoption;
