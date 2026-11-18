@@ -59,7 +59,7 @@ pub async fn connect(
         bail!("finance credential store failed persistence check");
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let mut body = json!({"client_name":"Personal finance agent","user":{"client_user_id":"personal-owner"},"language":"en","country_codes":countries,"hosted_link":{},"products":["transactions"],"transactions":{"days_requested":730}});
+    let mut body = json!({"client_name":"Jarvis","user":{"client_user_id":"personal-owner"},"language":"en","country_codes":countries,"hosted_link":{},"products":["transactions"],"transactions":{"days_requested":730}});
     if let Some(item) = update {
         store.cursor(env, item)?;
         body.as_object_mut().unwrap().remove("products");
