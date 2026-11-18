@@ -135,6 +135,18 @@ class WordSigningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manual signing"):
             sign_line(out.getvalue())
 
+    def test_a_manual_only_phrase_split_by_a_break_or_tab_is_refused(self):
+        # Review of #2241: "penalty of<w:br/>perjury" read as "penalty ofperjury".
+        for sep in ("<w:br/>", "<w:tab/>"):
+            raw = docx(para(f'<w:r><w:t>I declare under penalty of</w:t>{sep}<w:t>perjury that this is true.</w:t></w:r>')
+                       + para(run("Signature: _____")))
+            with self.subTest(sep=sep), self.assertRaisesRegex(ValueError, "manual signing"):
+                sign_line(raw)
+        raw = docx(para(run("I declare under penalty of")) + para(run("perjury that this is true."))
+                   + para(run("Signature: _____")))
+        with self.assertRaisesRegex(ValueError, "manual signing"):
+            sign_line(raw)
+
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
         raw = docx(para(run("By signing this agreement, you accept these terms."))

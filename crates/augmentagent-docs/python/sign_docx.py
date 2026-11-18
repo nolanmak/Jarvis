@@ -182,15 +182,22 @@ def norm(text):
 VISIBLE_PARTS = re.compile(r"^word/(header\d*|footer\d*|footnotes|endnotes)\.xml$")
 
 
+# Text as a reader sees it: line breaks, tabs and paragraph ends separate words.
+READABLE = re.compile(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>|<w:(?:br|tab|cr)\b[^>]*>|</w:p>")
+
+
+def readable_text(xml):
+    return "".join(unescape(m.group(1)) if m.group(1) is not None else " " for m in READABLE.finditer(xml))
+
+
 def refuse_manual_documents(z, doc):
     """Affidavits, sworn statements, perjury declarations and government
     filings are signed by hand, wherever the words appear: the body, a header,
-    a footer, or a note."""
-    texts = [" ".join(p[2] for p in paragraphs(doc))]
+    a footer, or a note, and however the words are broken across lines."""
+    texts = [readable_text(doc)]
     for name in z.namelist():
         if VISIBLE_PARTS.match(name):
-            part = z.read(name).decode("utf-8", "replace")
-            texts.append(" ".join(unescape(t) for t in T_TEXT.findall(part)))
+            texts.append(readable_text(z.read(name).decode("utf-8", "replace")))
     if BLOCKED.search(" ".join(texts)):
         raise ValueError("this document requires manual signing outside Jarvis")
     return texts[0]
