@@ -560,7 +560,13 @@ augmentagent imessage compose --to "<person, +E.164 number, or Apple-ID email>" 
 ```
 
 **This command requests a card. It does not send anything.** Approve does, through
-the Mac. Report the actual command result and its ref: say the card was posted
+the Mac.
+
+**Texts can be scheduled (#1640).** For "text Jane tomorrow at 9am" or "wish Sam
+happy birthday at midnight", add `--send-at "<time>"` to the same command, with the
+time rules in "Schedule a send for later" above. The card shows
+`[sends: <local time>]`, Approve arms the schedule, and the text goes to the Mac
+when it is due. The card's Schedule menu also schedules an existing text reply. Report the actual command result and its ref: say the card was posted
 only when posting succeeded; if it is queued after a posting failure, say it is
 queued and not yet available. Never say "I've sent it".
 

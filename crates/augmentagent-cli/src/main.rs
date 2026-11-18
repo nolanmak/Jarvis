@@ -4167,8 +4167,13 @@ async fn main() -> Result<()> {
             // is a zero-cost tick, and the engine honours dry_run (logs
             // would-fire lines, sends nothing, leaves rows armed). Also owns
             // flagging rows stuck mid-send from a previous crash.
-            match std::env::var("COMPOSIO_API_KEY") {
-                Ok(api_key) => {
+            // #1640 review — Slack and iMessage schedules fire through the
+            // approver and need no Composio key, so the engine runs whenever
+            // either kind of send is possible. Without a key no Gmail draft
+            // can exist, so the Gmail half simply has nothing to fire.
+            let composio_key = std::env::var("COMPOSIO_API_KEY").ok();
+            match scheduled_send_engine_key(composio_key.clone(), approver.is_some()) {
+                Some(api_key) => {
                     let mut engine = augmentagent_channel_email::ScheduledSendEngine::new(
                         Arc::clone(&store),
                         Arc::new(ComposioClient::new(api_key)),
@@ -4187,6 +4192,11 @@ async fn main() -> Result<()> {
                             .as_deref(),
                     ))
                     .with_card_surfaces(card_surfaces.clone());
+                    if composio_key.is_none() {
+                        // Review of #2196: leave Gmail schedules armed rather
+                        // than fail them for want of a key.
+                        engine = engine.without_gmail();
+                    }
                     if let Some(approver) = approver.as_ref() {
                         engine = engine.with_platform_sender(Arc::clone(approver)
                             as Arc<dyn augmentagent_channel_email::ScheduledPlatformSender>);
@@ -4194,8 +4204,8 @@ async fn main() -> Result<()> {
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move { engine.run(sd).await }));
                 }
-                Err(_) => warn!(
-                    "COMPOSIO_API_KEY not set; scheduled email sends will not fire"
+                None => warn!(
+                    "COMPOSIO_API_KEY not set and no approver; scheduled sends will not fire"
                 ),
             }
             // #25: Gmail + LinkedIn now run through the generic
@@ -15029,11 +15039,12 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 }
 
-/// #1291 — the shared scheduler hands due Slack contact sends here.
+/// #1291 — the shared scheduler hands due Slack contact sends here, and
+/// (#1640) due iMessage sends.
 #[async_trait]
 impl augmentagent_channel_email::ScheduledPlatformSender for ReplyApprover {
     fn handles(&self, platform: &str) -> bool {
-        platform == augmentagent_channel_slack::PLATFORM
+        platform == augmentagent_channel_slack::PLATFORM || platform == imessage_send::PLATFORM
     }
 
     /// The due-gated claim and the same send as an approval
@@ -15050,6 +15061,27 @@ impl augmentagent_channel_email::ScheduledPlatformSender for ReplyApprover {
         let Some(action) = self.handle_load(action_id) else {
             return PlatformFire::LostClaim;
         };
+        if action.email.platform == imessage_send::PLATFORM {
+            // Claimed due-gated, re-checked, then one outbox row. A refusal
+            // found after the claim is already a retry-exempt error.
+            return match self
+                .send_imessage(action_id, action, imessage_send::ImessageClaim::Due { now_ms })
+                .await
+            {
+                ApprovalActionOutcome::Approved => PlatformFire::Sent,
+                ApprovalActionOutcome::Failed { message } => {
+                    let still_armed = self
+                        .handle_load(action_id)
+                        .is_some_and(|a| a.action.status == "scheduled");
+                    if still_armed {
+                        PlatformFire::NotStarted(message)
+                    } else {
+                        PlatformFire::Failed(message)
+                    }
+                }
+                _ => PlatformFire::LostClaim,
+            };
+        }
         let out = self
             .send_slack(
                 action,
@@ -15969,7 +16001,9 @@ impl ReplyApprover {
         // run_approve.
         // #1291 — Slack contact messages are scheduled too: the engine
         // hands them to the Slack sender (`ScheduledPlatformSender`).
+        // #1640 — and iMessage, queued for the Mac sender when due.
         let slack = action.email.platform == augmentagent_channel_slack::PLATFORM;
+        let imessage = action.email.platform == imessage_send::PLATFORM;
         let unsupported = matches!(
             action.email.platform.as_str(),
             "discord" | "telegram" | "github" | "gcal"
@@ -15977,10 +16011,16 @@ impl ReplyApprover {
             || is_linkedin_email(&action.email);
         if unsupported {
             return ApprovalActionOutcome::Failed {
-                message: "scheduling is only supported for email drafts and Slack messages".into(),
+                message: "scheduling is only supported for email drafts, Slack messages and iMessages".into(),
             };
         }
-        if slack {
+        if imessage {
+            // Refuse before arming what could never be sent: off, no
+            // target, not allowed to receive sends, or an empty draft.
+            if let Err(message) = self.imessage_preflight(&action) {
+                return ApprovalActionOutcome::Failed { message };
+            }
+        } else if slack {
             // Refuse before arming what could never be sent.
             if let Err(message) =
                 augmentagent_channel_slack::contact::reply_target(&self.store, &action.email)
@@ -16071,6 +16111,20 @@ impl ReplyApprover {
     /// through `pending` — that would re-enter the nudge queue and, after
     /// #502, re-arm the proposal.
     async fn run_send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        // #1640 — a scheduled iMessage: claimed from `scheduled`, re-checked
+        // and queued for the Mac sender, as the engine would at fire time.
+        if let Some(action) = self
+            .handle_load(action_id)
+            .filter(|a| a.email.platform == imessage_send::PLATFORM)
+        {
+            let outcome = self
+                .send_imessage(action_id, action, imessage_send::ImessageClaim::SendNow)
+                .await;
+            if !matches!(outcome, ApprovalActionOutcome::AlreadyResolved { .. }) {
+                self.delete_stored_notice(action_id).await;
+            }
+            return outcome;
+        }
         // #1291 — a Slack contact send: the contact path claims it from
         // `scheduled` and sends it with its ledger, as an approval would.
         if let Some(action) = self
@@ -16437,16 +16491,37 @@ impl ReplyApprover {
 /// #501 — owner-local display string for a scheduled fire time, e.g.
 /// "Mon Sep 1, 9:05 AM". `chrono::Local` follows the daemon host's timezone
 /// — the same zone the schedule was resolved in.
-fn format_local_send_time(at_ms: i64) -> String {
-    use chrono::TimeZone;
-    match chrono::Local.timestamp_millis_opt(at_ms) {
-        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-            dt.format("%a %b %-d, %-I:%M %p").to_string()
-        }
-        // Out-of-range epoch — unreachable behind the 60-day guard, but a
-        // display path must never panic.
-        chrono::LocalResult::None => format!("epoch+{at_ms}ms"),
+/// #1640 review — whether the scheduled-send engine runs, and with which
+/// Composio key. Gmail schedules need the key; Slack and iMessage schedules
+/// fire through the approver and do not, so an approver alone is enough
+/// (with an empty key: no Gmail draft can exist without one).
+fn scheduled_send_engine_key(composio_key: Option<String>, has_approver: bool) -> Option<String> {
+    if composio_key.is_none() && has_approver {
+        tracing::warn!(
+            "COMPOSIO_API_KEY not set; scheduled email sends will not fire, \
+             Slack and iMessage schedules still do"
+        );
     }
+    composio_key.or_else(|| has_approver.then(String::new))
+}
+
+#[cfg(test)]
+mod scheduled_send_engine_tests {
+    use super::scheduled_send_engine_key;
+
+    /// An armed iMessage or Slack schedule must fire on a daemon without
+    /// Composio; with neither, there is nothing the engine could send.
+    #[test]
+    fn the_engine_runs_for_platform_schedules_without_composio() {
+        assert_eq!(scheduled_send_engine_key(Some("k".into()), false), Some("k".into()));
+        assert_eq!(scheduled_send_engine_key(Some("k".into()), true), Some("k".into()));
+        assert_eq!(scheduled_send_engine_key(None, true), Some(String::new()));
+        assert_eq!(scheduled_send_engine_key(None, false), None);
+    }
+}
+
+fn format_local_send_time(at_ms: i64) -> String {
+    augmentagent_approval_discord::timeparse::format_local_send_time(at_ms)
 }
 
 fn resolve_discord_voice_socket(
