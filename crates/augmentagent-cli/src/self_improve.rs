@@ -71,6 +71,9 @@ mod paused_selection_tests;
 #[cfg(test)]
 #[path = "self_improve_epic_selection_tests.rs"]
 mod epic_selection_tests;
+#[cfg(test)]
+#[path = "self_improve_picker_fairness_tests.rs"]
+mod picker_fairness_tests;
 #[path = "self_improve_epics.rs"]
 mod epics;
 #[cfg(test)]
