@@ -171,7 +171,8 @@ def candidates(doc):
         elif cell is not None:
             # A cell is offered once (its first empty paragraph), and never
             # when any paragraph in it already holds a signature.
-            if cell in offered_cells or NON_TEXT.search(doc[cell[0]:cell[1]]):
+            cell_xml = doc[cell[0]:cell[1]]
+            if cell in offered_cells or NON_TEXT.search(cell_xml) or readable_text(cell_xml).strip():
                 continue
             label = label_left_of(doc, cell)
             if label and LABEL_ONLY.search(label):
@@ -298,20 +299,28 @@ def place_in_paragraph(body, drawing, date):
     insert = drawing + date_run
     if body.endswith("/>"):  # an empty <w:p/>: open it up
         return body[:-2] + ">" + insert + P_CLOSE
-    elems = list(T_ELEM.finditer(body))
-    texts = [unescape(m.group(2)) for m in elems]
-    full = "".join(texts)
+    # The paragraph's text with breaks and tabs kept as separators, so a
+    # blank never runs across them (the preview reads them the same way).
+    elems, texts, starts = [], [], []
+    full = ""
+    for tok in LAYOUT.finditer(body):
+        if tok.group(1) is None:
+            full += "\n"
+            continue
+        m = T_ELEM.match(body, tok.start())
+        elems.append(m)
+        texts.append(unescape(m.group(2)))
+        starts.append(len(full))
+        full += texts[-1]
     blank = UNDERSCORES.search(full)
     if not blank:
         close = body.rfind(P_CLOSE)
         return body[:close] + insert + body[close:]
     # Edits run back to front so earlier offsets stay valid.
     edits = []
-    offset = 0
     first = None
-    for m, text in zip(elems, texts):
-        lo, hi = offset, offset + len(text)
-        offset = hi
+    for m, text, lo in zip(elems, texts, starts):
+        hi = lo + len(text)
         a, b = max(lo, blank.start()), min(hi, blank.end())
         if a >= b:
             continue

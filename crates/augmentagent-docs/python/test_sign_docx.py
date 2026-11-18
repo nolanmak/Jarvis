@@ -166,6 +166,20 @@ class WordSigningTests(unittest.TestCase):
         signed = part(sign_line(raw), "word/document.xml")
         self.assertLess(signed.index("<w:br/>"), signed.index("<w:drawing>"), "signed below the label too")
 
+    def test_a_cell_with_text_in_it_is_not_offered(self):
+        # Review of #2241: a typed name above an empty paragraph.
+        raw = docx(para(run("Terms.")) + table_row("Signature:", "<w:p><w:r><w:t>J. Example</w:t></w:r></w:p><w:p/>"))
+        self.assertEqual(sign_docx.lines(dict(docx=b64(raw)))["lines"], [])
+
+    def test_a_blank_stops_at_a_line_break(self):
+        # Review of #2241: "Signature: ___<w:br/>____" removed both blanks.
+        raw = docx(para(run("Terms.")) + para('<w:r><w:t>Signature: ___</w:t><w:br/><w:t>____</w:t></w:r>'))
+        doc = part(raw, "word/document.xml")
+        self.assertEqual(sign_docx.preview_layout(doc, sign_docx.paragraphs(doc)[1]), ([], "Signature: ", "", ["____"]))
+        signed = part(sign_line(raw), "word/document.xml")
+        self.assertIn("<w:br/><w:t>____</w:t>", signed, "the second blank, after the break, is kept")
+        self.assertLess(signed.index("<w:drawing>"), signed.index("<w:br/>"))
+
     def test_prose_that_starts_like_a_label_is_not_a_line(self):
         # Review of #2241.
         raw = docx(para(run("By signing this agreement, you accept these terms."))
