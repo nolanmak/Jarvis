@@ -295,9 +295,13 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
 
         summary.stuck_flagged = self.reconcile_stuck_sending(now_ms).await?;
 
-        let due = self
-            .store
-            .due_scheduled_actions(now_ms, PER_TICK_LIMIT)?;
+        // #1640 — without Composio, Gmail rows are excluded before the batch
+        // limit, so a backlog of them cannot starve platform sends.
+        let due = self.store.due_scheduled_actions_except_platform(
+            now_ms,
+            PER_TICK_LIMIT,
+            (!self.gmail_enabled).then_some("gmail"),
+        )?;
         if due.len() as i64 == PER_TICK_LIMIT {
             info!(
                 limit = PER_TICK_LIMIT,
@@ -1398,6 +1402,23 @@ mod tests {
         let later = engine.tick_once(at + 120 * MIN).await.unwrap();
         assert_eq!(later.returned_to_queue, 0, "{later:?}");
         assert_eq!(status_of(&r.store, &mail), "scheduled");
+    }
+
+    /// Review of #2196: more due Gmail rows than one tick's batch, all older
+    /// than a platform row, must not starve it on a Composio-less engine.
+    #[tokio::test]
+    async fn a_gmail_backlog_cannot_starve_platform_sends_without_composio() {
+        let r = rig();
+        let at = 10 * MIN;
+        for n in 0..(PER_TICK_LIMIT + 2) {
+            seed_scheduled(&r.store, &format!("mail-{n}"), at);
+        }
+        let text = seed_slack_scheduled(&r.store, "slack-late", at + MIN);
+        *r.platform.answer.lock().unwrap() = Some(PlatformFire::Sent);
+        let s = r.engine().without_gmail().tick_once(at + 2 * MIN).await.unwrap();
+        assert_eq!(s.fired, 1, "{s:?}");
+        assert_ne!(status_of(&r.store, &text), "scheduled");
+        assert_eq!(r.gmail.call_count(), 0);
     }
 
     #[test]

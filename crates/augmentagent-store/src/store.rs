@@ -7557,18 +7557,32 @@ impl Store {
         now_ms: i64,
         limit: i64,
     ) -> StoreResult<Vec<(String, i64, i64, Option<String>)>> {
+        self.due_scheduled_actions_except_platform(now_ms, limit, None)
+    }
+
+    /// [`Self::due_scheduled_actions`] without rows of `platform`, filtered
+    /// before the limit (#1640 review): an engine that may not send Gmail
+    /// must not have its batch filled every tick by Gmail rows it skips.
+    pub fn due_scheduled_actions_except_platform(
+        &self,
+        now_ms: i64,
+        limit: i64,
+        excluded_platform: Option<&str>,
+    ) -> StoreResult<Vec<(String, i64, i64, Option<String>)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, scheduledAtMs, COALESCE(status_updated_at, createdAt), \
-                    threadId \
-               FROM actions \
-              WHERE status = 'scheduled' AND scheduledAtMs IS NOT NULL \
-                AND scheduledAtMs <= ?1 \
-              ORDER BY scheduledAtMs ASC \
+            "SELECT a.id, a.scheduledAtMs, COALESCE(a.status_updated_at, a.createdAt), \
+                    a.threadId \
+               FROM actions a \
+               LEFT JOIN emails e ON e.messageId = a.messageId \
+              WHERE a.status = 'scheduled' AND a.scheduledAtMs IS NOT NULL \
+                AND a.scheduledAtMs <= ?1 \
+                AND (?3 IS NULL OR COALESCE(e.platform, 'gmail') != ?3) \
+              ORDER BY a.scheduledAtMs ASC \
               LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![now_ms, limit], |r| {
+            .query_map(params![now_ms, limit, excluded_platform], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
