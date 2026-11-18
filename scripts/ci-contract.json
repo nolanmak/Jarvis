@@ -387,6 +387,10 @@
       "body": "python3 -m unittest scripts.tests.macos_parity_inventory_test -v",
       "shell": "bash"
     },
+    "model-router/installer/11": {
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
+      "shell": "bash"
+    },
     "model-router/installer/2": {
       "body": "sw_vers",
       "shell": "bash"
@@ -1879,6 +1883,9 @@
             "views/model-*",
             "test/modelRouter*",
             "scripts/*model-router*",
+            "scripts/*omniroute*",
+            "scripts/lib/omniroute_install.py",
+            "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
             "scripts/macos_parity_inventory.py",
@@ -1913,6 +1920,9 @@
             "views/model-*",
             "test/modelRouter*",
             "scripts/*model-router*",
+            "scripts/*omniroute*",
+            "scripts/lib/omniroute_install.py",
+            "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
             "scripts/macos_parity_inventory.py",
@@ -2052,6 +2062,10 @@
             },
             {
               "command_id": "model-router/installer/10"
+            },
+            {
+              "command_id": "model-router/installer/11",
+              "name": "Optional OmniRoute installer contracts"
             }
           ],
           "strategy": {
@@ -2087,7 +2101,7 @@
         }
       },
       "role": "validation",
-      "sha256": "b5e498f8b8a5e91cb16e0e8d7e3ace842b7677b4e4418fe1c55f11057d85ea8a"
+      "sha256": "087f1d0ef1ec8343f85664f7d6eb72390ee4d5b583632c57a3a5e0ffe57f54fc"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},

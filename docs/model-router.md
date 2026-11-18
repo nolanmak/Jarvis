@@ -1,5 +1,8 @@
 # Model accounts through 9Router
 
+For the optional pinned OmniRoute installer (routing stays direct), see
+[OmniRoute installation](omniroute.md). Legacy 9Router removal is tracked in #1660.
+
 The Rust agent's existing Claude and Codex CLI adapters can route inference through
 a local 9Router service. Their tool permissions, constrained Codex MCP bridge,
 approval hooks, handoff journals, and provider attribution remain in the agent.
