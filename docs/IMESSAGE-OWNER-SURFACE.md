@@ -138,6 +138,27 @@ verified native GUID or a verified terminal rejection from the Mac sender; if
 neither is available, keep the surface disabled and report the unresolved send.
 Do not clear that barrier just to resume self-chat or rebinding.
 
+Known sent-GUID echoes are retired even while another delivery remains queued,
+claimed, unknown, or sent without a GUID. This does not release unmatched input
+or resolve the outbound uncertainty. Equal message text never proves an echo.
+
+For an accumulated backlog, the operator must first inspect the remaining
+unmatched input receipts and explicitly retire obsolete ones with
+`imessage owner discard-input <event-guid>`. Do this before settling the last
+uncertain delivery, because normal dispatch can resume once all barriers are
+resolved. Never bulk accept or replay historical quarantined input.
+
+Then reconcile each uncertain outbox ID against the Mac sender's fixed error
+class and native receipt. The existing `imessage outbox complete <outbox-id>
+--status failed --reason <verified-terminal-rejection>` records a verified
+pre-send rejection without sending. A positively verified sent native GUID uses
+`--status sent --message-guid <native-guid>` instead. An osascript CLI usage exit
+is not a native Messages error code: do not copy its exit status into
+`--error-code`. Absence of a native row alone is not a terminal rejection. If
+neither receipt nor rejection is verified, retain the barrier and use the
+existing disable/recovery procedure. These operations never requeue an old
+outbox item; any desired replacement message requires fresh owner authorization.
+
 ## Build order and testable exits
 
 1. Store contracts: binding/revision, event receipt, delivery association and
