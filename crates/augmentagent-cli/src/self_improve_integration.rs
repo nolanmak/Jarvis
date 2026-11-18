@@ -89,6 +89,11 @@ pub(super) async fn filter(
                 Some(value) if value.as_str() == Some("MERGEABLE") => {
                     if !base.is_empty()
                         && (snapshot.checkpoint.next.reason.starts_with("integration_")
+                            || store.integration_admission_interrupted(
+                                &id,
+                                &candidate.head,
+                                base,
+                            )?
                             || reviewed_base.as_ref().is_some_and(|old| old != base)
                             || snapshot.checkpoint.next.reason == "parent_merged_child_retargeted"
                             || matches!(

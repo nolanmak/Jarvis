@@ -63,9 +63,9 @@ pub fn health_message(id: i64, status: &str) -> serenity::all::CreateMessage {
                 .description(health_description(id, status))
                 .footer(serenity::all::CreateEmbedFooter::new(HEALTH_FOOTER)),
         )
-        .nonce(serenity::all::Nonce::String(format!(
+        .nonce(serenity::all::Nonce::String(crate::nonce::bounded_nonce(&format!(
             "owner-imessage-health-{id}"
-        )))
+        ))))
         .enforce_nonce(true)
         .allowed_mentions(serenity::all::CreateAllowedMentions::new())
 }
@@ -1249,5 +1249,21 @@ impl ApprovalCardSurface for OwnerSurface {
                 chrono::Utc::now().timestamp_millis(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+    fn nonce(id:i64)->String {serde_json::to_value(health_message(id,"unknown")).unwrap()["nonce"].as_str().unwrap().to_string()}
+    #[test]
+    fn health_nonce_fits_discord_limit_once_ids_reach_four_digits() {
+        assert_eq!(nonce(7),"owner-imessage-health-7","small ids keep their deployed nonce");
+        for id in [1000,123_456,i64::MAX] {
+            let value=nonce(id);
+            assert!(value.chars().count()<=crate::nonce::MAX_NONCE_CHARS,"id {id}: {value}");
+            assert_eq!(value,nonce(id),"a retried health notice reuses its nonce");
+        }
+        assert_ne!(nonce(1000),nonce(1001));
     }
 }

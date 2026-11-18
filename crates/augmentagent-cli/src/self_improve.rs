@@ -69,6 +69,16 @@ mod linked_claim_boundaries;
 #[path = "self_improve_paused_selection_tests.rs"]
 mod paused_selection_tests;
 #[cfg(test)]
+#[path = "self_improve_epic_selection_tests.rs"]
+mod epic_selection_tests;
+#[path = "self_improve_picker_fairness.rs"]
+mod picker_fairness;
+#[cfg(test)]
+#[path = "self_improve_picker_fairness_tests.rs"]
+mod picker_fairness_tests;
+#[path = "self_improve_epics.rs"]
+mod epics;
+#[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
@@ -449,6 +459,10 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
             if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
+                return None;
+            }
+            if epics::is_epic(iss) {
+                info!(issue=number,"{}",epics::SKIP_EPIC);
                 return None;
             }
             let s = |k: &str| {
@@ -1044,11 +1058,9 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    let mut candidates=rest_issue_candidates(&issues);
-    // Recovery wakes the ordinary selector, not a special execution path.
-    // Within human/research tiers, consider due recovery hints before
-    // unrelated fresh issues; stable sorting preserves normal newest-first.
-    candidates.sort_by_key(|issue|(issue.research_filed,!qualification_retries.contains(&issue.number)));
+    if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
+    let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
+        &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
@@ -4486,7 +4498,7 @@ fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerSta
     if augmentagent_channel_core::model_router::load().is_err() {
         return ReviewerStatus::NotConfigured("invalid model router configuration".into());
     }
-    // 9Router's account label cannot attest to its underlying model. An
+    // A model gateway's account label cannot attest to its underlying model. An
     // author model could appear again as `cx/...` or `cc/...` and falsely
     // approve its own work. Automated review uses native identities only.
     if let Some(why) = augmentagent_channel_core::fallback::workflow_native_ineligible_reason(kind) {
@@ -7779,6 +7791,7 @@ async fn resume_draft_pr(
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
     }.await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     capacity_accounting.settle_ci(outcome)
 }
@@ -8398,8 +8411,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // advance without deleting this candidate or its compiler fixture paths.
     let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
-    recovery::prepare(repo_root, &worktree, &branch).await?;
     let repository = workflow::canonical_repository(repo_root).await?;
+    let id = crate::autoship_workflow::workflow_id(&repository, issue.number)?;
+    recovery::prepare_issue_at(&workflow::path(), repo_root, &worktree, &id, &repository, &branch).await?;
     let upstream_main = workflow::remote_main_head(&worktree,&repository).await?;
     let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
     let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;
@@ -9948,6 +9962,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         issue.number
     )))
     }.await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     let outcome=match outcome {
         Err(error)=>match linked_claims::report(&error) {Some(report)=>Ok(report),None=>Err(error)},
@@ -10816,6 +10831,7 @@ async fn pick_issue_for_repo(
 ) -> Result<Option<Issue>> {
     let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
     let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
+    if let Ok(rows)=serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {epics::flag_childless_epics(repo_dir,&rows).await;}
     let owner_controls=workflow::FreshIssueControls::open()?;
     let mut unavailable_history=None;
     for iss in issues.as_array().cloned().unwrap_or_default() {
@@ -10825,6 +10841,10 @@ async fn pick_issue_for_repo(
         }
         if has_label(&iss,MANUAL_ENGINEERING_LABEL) {
             info!(repo=%repo.full_name,issue=number,"skip: manual engineering routing");
+            continue;
+        }
+        if epics::is_epic(&iss) {
+            info!(repo=%repo.full_name,issue=number,"{}",epics::SKIP_EPIC);
             continue;
         }
         if owner_controls.paused(&repo.full_name,number)? {
@@ -13409,7 +13429,7 @@ for tool, arguments in [
                 "an undeclared host login cannot authorize a workflow reviewer");
             declared_review_fixture(&home, "codex", true);
             assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
-                "declared native authentication remains eligible with 9Router configured");
+                "declared native authentication remains eligible with a model gateway configured");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

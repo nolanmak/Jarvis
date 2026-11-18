@@ -2,6 +2,7 @@
 
 chat.db is synthetic, osascript is a fake runner and the agent is a fake, so
 the suite runs anywhere without Messages, Full Disk Access or a real send.
+A macOS-only argument probe runs a pure AppleScript that never addresses Messages.
 """
 import json
 import os
@@ -97,6 +98,41 @@ def item(body="see you at 8", target=PHONE, kind="handle", item_id=5):
 
 
 class SenderTests(unittest.TestCase):
+    def test_option_like_bodies_are_passed_after_the_option_terminator(self):
+        self.con.execute("INSERT INTO chat VALUES (4, 'any;-;owner@example.invalid', 'owner@example.invalid')")
+        self.con.commit()
+        rowid = 2
+        for kind, target in [("handle", "owner@example.invalid"),
+                             ("chat_guid", "any;-;owner@example.invalid")]:
+            for body in ["- synthetic report", "--synthetic", "--"]:
+                with self.subTest(kind=kind, body=body):
+                    def runner(cmd, **kwargs):
+                        self.assertEqual(cmd[3:], ["--", body, target])
+                        insert(self.con, rowid, 4, body)
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    agent = FakeAgent([item(body=body, target=target, kind=kind)])
+                    self.sender(agent, runner).run_once()
+                    self.assertEqual(agent.completed[0]["status"], "sent")
+                    rowid += 1
+
+    @unittest.skipUnless(sys.platform == "darwin", "pure osascript argv probe requires macOS")
+    def test_leading_hyphen_reaches_a_pure_applescript_run_handler(self):
+        body = "- synthetic report"
+        self.con.execute("INSERT INTO chat VALUES (4, 'any;-;owner@example.invalid', 'owner@example.invalid')")
+        self.con.commit()
+        # Preserve the sender's actual CLI argv layout, substituting a pure
+        # argument-returning script. Never issue an AppleEvent to Messages.
+        pure_script = "on run argv\nreturn item 1 of argv\nend run"
+        def runner(cmd, **kwargs):
+            result = subprocess.run([cmd[0], "-e", pure_script, *cmd[3:]], **kwargs)
+            if result.returncode == 0:
+                self.assertEqual(result.stdout.strip(), body)
+                insert(self.con, 2, 4, body)
+            return result
+        agent = FakeAgent([item(body=body, target="owner@example.invalid")])
+        self.sender(agent, runner).run_once()
+        self.assertEqual(agent.completed[0]["status"], "sent")
+
     def test_expired_dispatch_lease_never_calls_messages(self):
         expired = item()
         expired["send_by_ms"] = 1

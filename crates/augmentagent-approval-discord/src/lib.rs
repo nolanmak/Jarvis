@@ -29,6 +29,7 @@ pub mod owner_alerts;
 pub mod owner_commands;
 pub mod phone;
 pub mod autoship;
+pub mod nonce;
 pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
@@ -61,7 +62,7 @@ pub use layout::{
 };
 // #785: the drafter emits the assumed-facts marker; the channel splits it off
 // the Gmail body and the card renders it as the "⚠ Assumes" field.
-pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};
+pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send, unwrap_code_fence, unwrap_fenced_draft};
 // #2014: the DM compose paths attach the register warning via
 // `register::attach_dm_register_warning`; the card renders it as "⚠️ Register".
 pub use layout::{append_register_warning, split_register};

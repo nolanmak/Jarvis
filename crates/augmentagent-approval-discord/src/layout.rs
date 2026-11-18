@@ -234,6 +234,55 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
+    let clean = strip_markers_for_send(body);
+    // #2177 — a reply the drafter wrapped whole in a code fence must not
+    // reach the recipient as literal backticks.
+    unwrap_code_fence(&clean).unwrap_or(clean)
+}
+
+/// A draft the model returned wrapped whole in one markdown code fence
+/// (```` ``` ```` or ```` ```text ````), unwrapped: a message reply is prose,
+/// and the fence reached recipients as literal backticks (#2177). `None`
+/// unless the fence opens the body, closes it, and has no other fence inside,
+/// so a draft that merely contains a code block is left alone.
+pub fn unwrap_code_fence(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix("```")?;
+    let (info, body) = rest.split_once('\n')?;
+    let info = info.trim();
+    if info.len() > 16 || !info.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let inner = body.trim_end().strip_suffix("```")?;
+    if inner.contains("```") {
+        return None;
+    }
+    let inner = inner.trim();
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// [`unwrap_code_fence`] for a stored draft, which may carry card metadata
+/// after the reply (needs-input asks, assumptions, the register warning).
+/// The metadata is set aside, the visible reply unwrapped, and the metadata
+/// reattached, so the card shows the same text [`strip_assumes_for_send`]
+/// delivers (review of #2177: the email adapter appends asks before
+/// `guard_draft`, so the fence survived on the card). Unchanged when the
+/// reply is not wrapped whole in a fence.
+pub fn unwrap_fenced_draft(draft: &str) -> String {
+    let (human, needs) = split_needs_input(draft);
+    let (human, register) = split_register(&human);
+    let (prose, assumes) = split_assumes(&human);
+    let Some(reply) = unwrap_code_fence(&prose) else {
+        return draft.to_string();
+    };
+    let mut out = append_assumes_marker(&reply, &assumes);
+    if let Some(warning) = register {
+        out = append_register_warning(&out, &warning);
+    }
+    let asks: Vec<(String, String)> = needs.into_iter().map(|n| (n.kind, n.text)).collect();
+    append_needs_input_marker(&out, &asks)
+}
+
+fn strip_markers_for_send(body: &str) -> String {
     let (mut clean, _) = split_assumes(body);
     let mut touched = false;
     // A complete marker comment anywhere (the model sometimes writes a
@@ -250,6 +299,64 @@ pub fn strip_assumes_for_send(body: &str) -> String {
     }
     // A marker-free draft goes out byte-identical (Gmail keeps its CRLFs).
     if touched { clean.trim().to_string() } else { clean }
+}
+
+#[cfg(test)]
+mod unwrap_code_fence_tests {
+    use super::*;
+
+    /// #2177: a reply wrapped whole in a fence is unwrapped at send time on
+    /// every channel; anything else ships unchanged.
+    #[test]
+    fn only_a_fence_around_the_whole_reply_is_removed() {
+        for (fenced, clean) in [
+            ("```\nSounds good, 5 works.\n```", "Sounds good, 5 works."),
+            ("```text\nSounds good.\n```\n", "Sounds good."),
+            ("  ```\r\nline one\r\nline two\r\n```  ", "line one\r\nline two"),
+        ] {
+            assert_eq!(unwrap_code_fence(fenced).as_deref(), Some(clean), "{fenced:?}");
+            assert_eq!(strip_assumes_for_send(fenced), clean, "{fenced:?}");
+        }
+        for kept in [
+            "Sounds good, 5 works.",
+            "Run this:\n```\ncargo test\n```",
+            "```\nfirst\n```\nand\n```\nsecond\n```",
+            "```this is not an info string\nx\n```",
+            "```\n```",
+            "Hi\r\nthere",
+        ] {
+            assert_eq!(unwrap_code_fence(kept), None, "{kept:?}");
+            assert_eq!(strip_assumes_for_send(kept), kept, "byte-identical: {kept:?}");
+        }
+        // Card metadata is scrubbed first, then the fence.
+        let carded = append_assumes_marker("```\nSee you at 7.\n```", &["they said 7".to_string()]);
+        assert_eq!(strip_assumes_for_send(&carded), "See you at 7.");
+    }
+
+    /// Review of #2177: a fenced reply that already carries card metadata
+    /// (the email adapter appends asks before `guard_draft`) is unwrapped on
+    /// the card too, with every marker kept, so the owner approves exactly
+    /// what is delivered.
+    #[test]
+    fn a_fenced_reply_with_card_metadata_is_unwrapped_and_keeps_the_metadata() {
+        let fenced = "```\nSee you at 7.\n```";
+        let asks = [("scheduling".to_string(), "which day?".to_string())];
+        let with_assumes = append_assumes_marker(fenced, &["they said 7".to_string()]);
+        let with_register = append_register_warning(&with_assumes, "register mismatch: example");
+        let carded = append_needs_input_marker(&with_register, &asks);
+        let unwrapped = unwrap_fenced_draft(&carded);
+        let (human, needs) = split_needs_input(&unwrapped);
+        let (human, register) = split_register(&human);
+        let (prose, assumes) = split_assumes(&human);
+        assert_eq!(prose, "See you at 7.", "{unwrapped}");
+        assert_eq!(assumes, ["they said 7"]);
+        assert_eq!(register.as_deref(), Some("register mismatch: example"));
+        assert_eq!(needs.iter().map(|n| (n.kind.as_str(), n.text.as_str())).collect::<Vec<_>>(), [("scheduling", "which day?")]);
+        assert_eq!(strip_assumes_for_send(&unwrapped), strip_assumes_for_send(&carded));
+        // Not fenced: the stored draft is untouched, metadata and all.
+        let plain = append_needs_input_marker("See you at 7.", &asks);
+        assert_eq!(unwrap_fenced_draft(&plain), plain);
+    }
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
@@ -560,12 +667,15 @@ fn approval_embed_and_rows(
 /// literal because the dep edge to `augmentagent-channel-linkedin` runs the
 /// other way, mirroring `ACCOUNT_PREFIX` there).
 fn is_schedulable(email: &Email) -> bool {
-    email.platform == "gmail"
-        && !email
-            .account_entity_id
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("linkedin:")
+    // #1640 — iMessage cards too: the engine queues them for the Mac sender
+    // when due.
+    email.platform == "imessage"
+        || email.platform == "gmail"
+            && !email
+                .account_entity_id
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("linkedin:")
 }
 
 /// One bullet per unresolved ask for the card field.
@@ -1492,6 +1602,20 @@ mod tests {
         e.account_entity_id = None;
         let v = json(&approval_message("act-s6", &e, "d", 0));
         assert!(!v.contains("schedule_pick"), "linkedin-platform card gated");
+    }
+
+    /// #1640 — iMessage cards (replies and composes) offer Schedule: the
+    /// engine queues them for the Mac sender when due.
+    #[test]
+    fn schedule_row_present_on_imessage_cards() {
+        for kind in ["dm", "compose"] {
+            let mut e = email();
+            e.platform = "imessage".into();
+            e.kind = kind.into();
+            e.account_entity_id = Some("imessage".into());
+            let v = json(&approval_message("act-im", &e, "d", 0));
+            assert!(v.contains("schedule_pick"), "imessage {kind} card offers Schedule");
+        }
     }
 
     #[test]
