@@ -2540,11 +2540,11 @@ mod tests {
     #[tokio::test]
     async fn a_loop_delivery_arriving_in_a_connected_inbox_is_skipped_without_a_model_call() {
         let (store, _f) = tmp_store();
-        let token = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let reference = "0f8fad5b-d9cb-469f-a165-70867728950e";
         store
-            .record_loop_delivery(token, "loop-1", "sender@example.com", "owner@example.com", "Example Person asked about pricing")
+            .record_loop_delivery(reference, "loop-1", "sender@example.com", "owner@example.com", "Example Person asked about pricing")
             .unwrap();
-        let body = format!("Details.\n\n{}\n", augmentagent_store::loop_delivery_footer("loop-1", token));
+        let body = format!("Details.\n\n{}\n", augmentagent_store::loop_delivery_footer("loop-1", reference));
         let email = |id: &str, subject: &str| Email {
             attachments: Vec::new(),
             to: "owner@example.com".into(),

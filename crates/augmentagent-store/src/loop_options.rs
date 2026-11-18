@@ -363,17 +363,17 @@ mod tests {
     #[test]
     fn an_inbound_copy_of_a_loop_email_is_recognised_by_its_footer() {
         let (_dir, store) = store();
-        let token = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let reference = "0f8fad5b-d9cb-469f-a165-70867728950e";
         store
-            .record_loop_delivery(token, "loop", "sender@example.com", "owner@example.com", "Lead: Example Person")
+            .record_loop_delivery(reference, "loop", "sender@example.com", "owner@example.com", "Lead: Example Person")
             .unwrap();
-        let body = format!("Details here.\n\n{}", loop_delivery_footer("loop", token));
+        let body = format!("Details here.\n\n{}", loop_delivery_footer("loop", reference));
         let from = "Example Sender <sender@example.com>";
         assert!(store.is_loop_delivery_email(from, "Lead: Example Person", &body).unwrap());
         assert!(!store.is_loop_delivery_email(from, "Re: Lead: Example Person", &body).unwrap());
         assert!(!store.is_loop_delivery_email("Other <other@example.com>", "Lead: Example Person", &body).unwrap());
         assert!(!store.is_loop_delivery_email(from, "Lead: Example Person", "Details here.").unwrap());
-        let forged = body.replace(token, "11111111-2222-3333-4444-555555555555");
+        let forged = body.replace(reference, "11111111-2222-3333-4444-555555555555");
         assert!(!store.is_loop_delivery_email(from, "Lead: Example Person", &forged).unwrap());
         assert!(!store.is_loop_delivery_email(from, "Lead: Example Person", "loop-delivery:short").unwrap());
     }
