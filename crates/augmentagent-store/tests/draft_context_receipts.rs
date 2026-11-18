@@ -1,3 +1,6 @@
+#[path = "draft_context_receipts/ordering.rs"]
+mod ordering;
+
 use augmentagent_store::{ActionStatus, Store};
 use serde_json::json;
 

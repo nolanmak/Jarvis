@@ -4,12 +4,16 @@ use crate::{
     Store, StoreResult,
 };
 
+#[path = "draft_context_receipt_order.rs"]
+mod order;
+
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS draft_context_receipts (
         id TEXT PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT,
         created_at_ms INTEGER NOT NULL, receipt_json TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS draft_context_receipts_message ON draft_context_receipts(message_id, created_at_ms);
         CREATE INDEX IF NOT EXISTS draft_context_receipts_action ON draft_context_receipts(action_id);")?;
+    order::migrate(conn)?;
     Ok(())
 }
 
@@ -60,9 +64,16 @@ impl Store {
         })
     }
 
+    /// Receipts in durable append order (oldest first), independent of clock/UUID.
     pub fn draft_context_receipts(&self, action_id: &str) -> StoreResult<Vec<String>> {
         self.with_conn(|c| {
-            let mut stmt=c.prepare("SELECT receipt_json FROM draft_context_receipts WHERE action_id=?1 ORDER BY created_at_ms,id")?;
+            let query = if order::has_order(c)? {
+                "SELECT receipt_json FROM draft_context_receipts WHERE action_id=?1 ORDER BY receipt_order"
+            } else {
+                // A strictly read-only Store cannot install the migration.
+                "SELECT receipt_json FROM draft_context_receipts WHERE action_id=?1 ORDER BY rowid"
+            };
+            let mut stmt = c.prepare(query)?;
             let rows=stmt.query_map([action_id],|r|r.get(0))?.collect();
             rows
         })
