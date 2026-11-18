@@ -38,7 +38,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 branch:"feat/repair-9",contract:"Original request",environment:"fixture",
             }).await.unwrap().unwrap();
             let hook=root.join(".git/hooks/pre-push");
-            std::fs::write(&hook,"#!/bin/sh\nexit 1\n").unwrap();
+            augmentagent_test_support::write_executable(&hook,"#!/bin/sh\nexit 1\n").unwrap();
             std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(guard.push("feat/repair-9").await.is_err(),"transport failure fixture did not fail");
             let id=guard.id().to_owned();let head=guard.binding().head.clone();guard.finish().unwrap();
@@ -156,11 +156,11 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             git(&["init","--bare","--quiet",other.to_str().unwrap()]);
             let hook=root.join(".git/hooks/pre-push");
             if case=="push-after-config-change" {
-                std::fs::write(&hook,format!("#!/usr/bin/python3\nimport subprocess\nfor args in [['remote','set-url','origin',{:?}],['remote','set-url','--push','origin',{:?}]]:subprocess.run(['/usr/bin/git',*args],check=True)\n",other.to_str().unwrap(),other.to_str().unwrap())).unwrap();
+                augmentagent_test_support::write_executable(&hook,format!("#!/usr/bin/python3\nimport subprocess\nfor args in [['remote','set-url','origin',{:?}],['remote','set-url','--push','origin',{:?}]]:subprocess.run(['/usr/bin/git',*args],check=True)\n",other.to_str().unwrap(),other.to_str().unwrap())).unwrap();
                 std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             if matches!(case.as_str(),"push-hook-composition"|"push-valid-ccat") {
-                std::fs::write(&hook,format!("#!/usr/bin/python3\n# ccat-public-push-gate.sh fixture marker; no native gate execution claimed\nimport pathlib,sys,json,subprocess\np=subprocess.run(['/usr/bin/git','config','--get','core.hooksPath'],capture_output=True,text=True)\npathlib.Path({:?}).write_text(json.dumps(dict(args=sys.argv[1:],input=sys.stdin.read(),configuration=p.stdout)))\n",root.join("hook-observation"))).unwrap();
+                augmentagent_test_support::write_executable(&hook,format!("#!/usr/bin/python3\n# ccat-public-push-gate.sh fixture marker; no native gate execution claimed\nimport pathlib,sys,json,subprocess\np=subprocess.run(['/usr/bin/git','config','--get','core.hooksPath'],capture_output=True,text=True)\npathlib.Path({:?}).write_text(json.dumps(dict(args=sys.argv[1:],input=sys.stdin.read(),configuration=p.stdout)))\n",root.join("hook-observation"))).unwrap();
                 std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             if matches!(case.as_str(),"push-empty-destination"|"push-multiple-destination") {
@@ -173,10 +173,10 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 first=git(&["remote","get-url","--push","origin"]);
             }
             if case=="push-shadowed-ccat" {
-                std::fs::write(&hook,"#!/bin/sh\n# ccat-public-push-gate.sh fixture marker\nexit 0\n").unwrap();
+                augmentagent_test_support::write_executable(&hook,"#!/bin/sh\n# ccat-public-push-gate.sh fixture marker\nexit 0\n").unwrap();
                 std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let actual=root.parent().unwrap().join("actual-hooks");std::fs::create_dir(&actual).unwrap();
-                std::fs::write(actual.join("pre-push"),"#!/bin/sh\nexit 0\n").unwrap();
+                augmentagent_test_support::write_executable(actual.join("pre-push"),"#!/bin/sh\nexit 0\n").unwrap();
                 std::fs::set_permissions(actual.join("pre-push"),std::fs::Permissions::from_mode(0o700)).unwrap();
                 git(&["config","core.hooksPath",actual.to_str().unwrap()]);
             }
@@ -310,7 +310,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 // disposable fixture DB only; production state is untouched.
                 format!("#!/usr/bin/python3\nimport sqlite3\nc=sqlite3.connect({:?})\nc.execute(\"INSERT OR REPLACE INTO workflow_owner_control(workflow,revision,paused,principal,updated_at) VALUES(?,1,1,'github:owner',1)\",({:?},))\nc.commit()\n",path.to_str().unwrap(),guard.id())
             }else {format!("#!/usr/bin/python3\nfrom pathlib import Path\nPath({:?}).write_text('owner changed routing during actual push')\n",root.join("manual-after-admission"))};
-            std::fs::write(&hook,script).unwrap();
+            augmentagent_test_support::write_executable(&hook,script).unwrap();
             std::fs::set_permissions(&hook,std::fs::Permissions::from_mode(0o700)).unwrap();
             let result=guard.publish_round("feat/repair-9",&root,9,1,"gate repair","Synthetic verified findings",false,true,Some(7)).await;
             if case=="round-label-during-push" {assert!(root.join("manual-after-admission").exists(),"hook never changed routing during the push");}
@@ -614,7 +614,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 std::fs::write(root.join("prs.json"),serde_json::to_vec(&prs).unwrap()).unwrap();
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
                 let gh=dir.path().join("github.py");
-                std::fs::write(&gh,r#"#!/usr/bin/python3
+                augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/python3
 import json,os,pathlib,sys,subprocess,urllib.parse,sqlite3
 a=sys.argv[1:];root=pathlib.Path(os.environ['AUTOSHIP_MANUAL_PR_FIXTURE'])
 prs=json.loads((root/'prs.json').read_text());issues=json.loads((root/'issues.json').read_text())

@@ -509,7 +509,7 @@ mod tests {
         let audit="node-release\tnpm audit\t2026-11-13T00:53:58Z # npm audit report\nnode-release\tnpm audit\t2026-11-13T00:53:58Z hono <=4.13.15\nnode-release\tnpm audit\t2026-11-13T00:53:58Z Severity: moderate\nnode-release\tnpm audit\t2026-11-13T00:53:58Z https://github.com/advisories/GHSA-4m76-xfj5-7975\nnode-release\tnpm audit\t2026-11-13T00:53:58Z ##[error]Process completed with exit code 1.\n";
         std::fs::write(root.path().join("failed"),audit).unwrap();
         std::fs::write(root.path().join("whole"),format!("{}{}{}","2026-11-13T00:53:50Z ok successful node test\n".repeat(200),audit,"2026-11-13T00:54:00Z post cleanup cache saved\n".repeat(200))).unwrap();
-        std::fs::write(&gh,"#!/bin/sh\ncase \"$*\" in\n *--log-failed*) cat failed;;\n *) cat whole;;\nesac\n").unwrap();
+        augmentagent_test_support::write_executable(&gh,"#!/bin/sh\ncase \"$*\" in\n *--log-failed*) cat failed;;\n *) cat whole;;\nesac\n").unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
         let failures=vec![serde_json::json!({"name":"node-release","job":123,"url":"https://github.com/o/r/actions/runs/1/job/123"})];
         let red=failed_main_diagnostics(root.path(),gh.to_str().unwrap(),"o/r","abc1234def5678",&failures).await;
@@ -525,7 +525,7 @@ mod tests {
     async fn red_main_publication_carries_multiple_failures_and_unavailable_evidence() {
         use std::os::unix::fs::PermissionsExt;
         let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh");
-        std::fs::write(&gh,"#!/bin/sh\ncase \"$*\" in\n *--job\\ 123*) printf 'node-release\\tnpm audit\\t2026-11-13T00:53:58Z Severity: moderate; GHSA-example\\n';;\n *--job\\ 124*) printf 'cli\\tcargo test\\t2026-11-13T00:53:58Z error[E0308]: mismatched types\\ncli\\tcargo test\\t2026-11-13T00:53:58Z failures:\\ncli\\tcargo test\\t2026-11-13T00:53:58Z     widget::tests::rounding\\ncli\\tcargo test\\t2026-11-13T00:53:58Z error: test failed, to rerun pass `-p augmentagent-cli`\\n';;\n *) exit 1;;\nesac\n").unwrap();
+        augmentagent_test_support::write_executable(&gh,"#!/bin/sh\ncase \"$*\" in\n *--job\\ 123*) printf 'node-release\\tnpm audit\\t2026-11-13T00:53:58Z Severity: moderate; GHSA-example\\n';;\n *--job\\ 124*) printf 'cli\\tcargo test\\t2026-11-13T00:53:58Z error[E0308]: mismatched types\\ncli\\tcargo test\\t2026-11-13T00:53:58Z failures:\\ncli\\tcargo test\\t2026-11-13T00:53:58Z     widget::tests::rounding\\ncli\\tcargo test\\t2026-11-13T00:53:58Z error: test failed, to rerun pass `-p augmentagent-cli`\\n';;\n *) exit 1;;\nesac\n").unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
         let failures=[("node-release",123),("cli",124),("privacy",125)].map(|(name,job)|serde_json::json!({"name":name,"job":job,"url":format!("https://github.com/o/r/actions/runs/1/job/{job}")}));
         let red=failed_main_diagnostics(root.path(),gh.to_str().unwrap(),"o/r","abc1234def5678",&failures).await;

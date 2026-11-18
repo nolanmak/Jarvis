@@ -17,7 +17,7 @@ const RESET_MARKER: &str = "<!-- self-improve-attempts-reset -->";
 /// `review-reject`. Mutating calls succeed silently.
 fn fake_gh(dir: &Path) -> std::path::PathBuf {
     let gh = dir.join("fake-gh.py");
-    std::fs::write(
+    augmentagent_test_support::write_executable(
         &gh,
         r#"#!/usr/bin/env python3
 import json, os, sys

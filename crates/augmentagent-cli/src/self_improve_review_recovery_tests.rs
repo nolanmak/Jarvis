@@ -93,7 +93,7 @@ async fn missing_approval_schedules_one_durable_review_request_across_polls() {
             .success());
     }
     let gh = root.path().join("gh");
-    std::fs::write(&gh, r#"#!/usr/bin/python3
+    augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/python3
 import json, subprocess, sys
 args=sys.argv[1:]
 if args[:2]==['repo','view']: print('owner/repo')

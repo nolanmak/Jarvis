@@ -303,7 +303,7 @@ else: sys.exit(2)
             let root = tempfile::Builder::new().prefix("readoption-").tempdir_in("/tmp").unwrap();
             let root_path = root.path().canonicalize().unwrap();
             let gh = root_path.join("gh.py");
-            std::fs::write(&gh, GH).unwrap();
+            augmentagent_test_support::write_executable(&gh, GH).unwrap();
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "self_improve::readoption::tests::owner_readoption_records_authority_and_preserves_protected_holds", "--nocapture"])
@@ -392,7 +392,7 @@ else: sys.exit(2)
             let root = tempfile::Builder::new().prefix("discord-readopt-").tempdir_in("/tmp").unwrap();
             let root_path = root.path().canonicalize().unwrap();
             let gh = root_path.join("gh.py");
-            std::fs::write(&gh, GH).unwrap();
+            augmentagent_test_support::write_executable(&gh, GH).unwrap();
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "self_improve::readoption::tests::discord_readopt_is_durable_idempotent_and_owner_only", "--nocapture"])

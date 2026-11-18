@@ -31,7 +31,7 @@ async fn dry_run_helpers_use_trusted_controller_and_preserve_owner_bytes() {
         .tempdir_in("/tmp")
         .unwrap();
     let gh = control.path().join("fake-gh");
-    std::fs::write(&gh,"#!/usr/bin/python3\nimport os,json\nwith open(os.environ['GH_CWD_LOG'],'a') as log:log.write(json.dumps(os.getcwd())+'\\n')\nprint('[]')\n").unwrap();
+    augmentagent_test_support::write_executable(&gh,"#!/usr/bin/python3\nimport os,json\nwith open(os.environ['GH_CWD_LOG'],'a') as log:log.write(json.dumps(os.getcwd())+'\\n')\nprint('[]')\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(root.path().join("code"), "owner staged").unwrap();
