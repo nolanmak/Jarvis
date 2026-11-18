@@ -441,6 +441,26 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyComplete)?;
             return Ok(None);
         }
+        // #2246 — a finding email one of the owner's loops sent to the owner's
+        // own address arrives here when that address is a connected account.
+        // It is the owner's own output, not correspondence: no alert, no
+        // triage, no draft and no model call.
+        if self.store.is_loop_delivery_email(&email.from, &email.subject, &email.body)? {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::LoopDelivery)?;
+            self.store.log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                None,
+                ActionStatus::Skipped,
+            )?;
+            self.store
+                .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+            println!("[skip:loop-delivery] {} from={}", email.message_id, email.from);
+            return Ok(Some(DispatchOutcome::Skipped));
+        }
         if !self.config.dry_run {
             crate::owner_alert_gate::arrival(&self.store,&email,self.config.wiki_root.as_deref(),chrono::Utc::now().timestamp_millis())?;
         }
@@ -2512,6 +2532,61 @@ mod tests {
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
         // Email is terminally processed so the next tick won't re-spawn.
         assert!(store.is_email_complete("m-bot").unwrap());
+    }
+
+    /// #2246: the inbound copy of an email a loop sent to the owner's own
+    /// connected address is skipped before any model call, while a reply
+    /// that quotes it goes through triage as usual.
+    #[tokio::test]
+    async fn a_loop_delivery_arriving_in_a_connected_inbox_is_skipped_without_a_model_call() {
+        let (store, _f) = tmp_store();
+        let token = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        store
+            .record_loop_delivery(token, "loop-1", "sender@example.com", "owner@example.com", "Example Person asked about pricing")
+            .unwrap();
+        let body = format!("Details.\n\n{}\n", augmentagent_store::loop_delivery_footer("loop-1", token));
+        let email = |id: &str, subject: &str| Email {
+            attachments: Vec::new(),
+            to: "owner@example.com".into(),
+            cc: String::new(),
+            message_id: id.into(),
+            thread_id: Some(format!("t-{id}")),
+            from: "Example Sender <sender@example.com>".into(),
+            subject: subject.into(),
+            body: body.clone(),
+            date: "2026-05-27".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let gmail = Arc::new(StubGmail {
+            emails: vec![
+                email("m-loop", "Example Person asked about pricing"),
+                email("m-reply", "Re: Example Person asked about pricing"),
+            ],
+        });
+        // One scripted reply only: the loop delivery must not consume it.
+        let reasoner = Arc::new(ScriptedReasoner::new([r#"{"decision":"skip","reason":"quoted copy"}"#]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner.clone(),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.skipped, 2);
+        assert_eq!(reasoner.prompts.lock().unwrap().len(), 1, "only the reply reaches the model");
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+        assert!(store.is_email_complete("m-loop").unwrap());
+        assert_eq!(store.email_guard_history("m-loop").unwrap(), "attempt 1: loop_delivery => skip");
+        assert_eq!(store.email_guard_history("m-reply").unwrap(), "", "a reply quoting the email is triaged normally");
     }
 
     /// #222: a Partiful "Registration Confirmed" event blast where the
