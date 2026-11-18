@@ -30,6 +30,12 @@ pub(super) fn candidates(
                 continue;
             }
         }
+        if let Err(error)=controls.selection_checkout(repository,issue.number) {
+            if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some() {return Err(error);}
+            warn!(issue=issue.number,reason=%error,
+                "skip: checkout continuity unavailable; preserve original evidence and consider eligible peers");
+            continue;
+        }
         // Preserve human/research and genuine recovery priorities. After
         // three scope claims, a repeatedly deferred issue yields to less
         // attempted peers; among such retries, the least recently active goes
