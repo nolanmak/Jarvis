@@ -122,7 +122,7 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn read(conn: &Connection, workflow: &str) -> Result<Option<Activity>> {
+pub(super) fn read(conn: &Connection, workflow: &str) -> Result<Option<Activity>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT payload FROM workflow_activity WHERE workflow=?1",
@@ -165,6 +165,10 @@ pub(super) fn project(
     payload: &str,
     now: i64,
 ) -> Result<()> {
+    // Wake reservation updates only next_observation_at in its own transaction;
+    // it is not a fresh dependency check, stage change, or progress receipt.
+    if kind=="activity_observation_scheduled" {return Ok(());}
+
     if !matches!(
         kind,
         "registered"

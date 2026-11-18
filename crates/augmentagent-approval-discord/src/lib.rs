@@ -29,6 +29,7 @@ pub mod owner_alerts;
 pub mod owner_commands;
 pub mod phone;
 pub mod autoship;
+pub mod nonce;
 pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
@@ -531,6 +532,12 @@ pub trait QueryHandler: Send + Sync {
     fn autoship_progress_pending(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::ProgressDelivery>> {Ok(Vec::new())}
     fn autoship_progress_claim(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<autoship::Reply>> {Ok(None)}
     fn autoship_progress_confirm(&self,_delivery:&autoship::ProgressDelivery,_message:u64)->anyhow::Result<()> {Ok(())}
+    /// Park a definitely rejected progress send for a persisted retry.
+    fn autoship_progress_defer(&self,_delivery:&autoship::ProgressDelivery,_retry_after_ms:Option<i64>)->anyhow::Result<()> {Ok(())}
+    /// Status message a claimed progress send must edit, if any.
+    fn autoship_progress_edit_target(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<u64>> {Ok(None)}
+    /// The status message no longer exists remotely.
+    fn autoship_progress_status_lost(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<()> {Ok(())}
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
     /// Attach the private voice-tool endpoint after the Discord gateway has

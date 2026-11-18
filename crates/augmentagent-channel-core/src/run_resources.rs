@@ -384,7 +384,7 @@ pub fn spawn_command(
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         None,
         logger.is_some_and(|logger| logger.run_resources_required()),
-    )?;
+     logger)?;
     guard.bind_resource_audit("verification", logger)?;
     Ok((child, CommandGuard(guard)))
 }
@@ -396,7 +396,7 @@ pub fn spawn_command_at(command:&tokio::process::Command,logger:Option<&Arc<crat
     ->Result<(tokio::process::Child,CommandGuard)> {
     check_requirement("verification",logger)?;
     let (child,guard)=crate::process_tree::spawn_admitted_at(command,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory)?;
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory, logger)?;
     Ok((child,CommandGuard(guard)))
 }
 
@@ -406,7 +406,7 @@ pub fn spawn_recorded_command_at(command:&tokio::process::Command,logger:Option<
     ->Result<(tokio::process::Child,CommandGuard)> {
     check_requirement("verification",logger)?;
     let (child,guard)=crate::process_tree::spawn_admitted_recorded_at(command,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory,capture)?;
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory,capture, logger)?;
     Ok((child,CommandGuard(guard)))
 }
 
@@ -429,7 +429,7 @@ pub fn spawn_command_with_storage(command: &tokio::process::Command,
     let policy = build_policy_or_defer(composed_native_policy(build_memory_mb, 0), logger)?;
     let (child, guard) = crate::process_tree::spawn_admitted_storage(command,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|logger| logger.run_resources_required()), files, &policy)?;
+        logger.is_some_and(|logger| logger.run_resources_required()), files, &policy, logger)?;
     guard.bind_resource_audit("verification", logger)?;
     Ok((child, CommandGuard(guard)))
 }
@@ -442,7 +442,7 @@ pub fn spawn_command_with_storage_at(command:&tokio::process::Command,
     let policy=build_policy_or_defer(composed_native_policy(build_memory_mb,0),logger)?;
     let (child,guard)=crate::process_tree::spawn_admitted_storage_at(command,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),
-        files,&policy,directory)?;
+        files,&policy,directory, logger)?;
     guard.bind_resource_audit("verification",logger)?;
     Ok((child,CommandGuard(guard)))
 }

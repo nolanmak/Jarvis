@@ -1,8 +1,25 @@
 //! Production bridge between the autoship lanes and durable workflow state.
 //! Included beneath self_improve so Git commands use the same sanitized runner.
 use super::*;
+#[path = "self_improve_idle_controller.rs"]
+mod idle_controller;
+
 #[path = "self_improve_stage_activity.rs"]
 mod stage_activity;
+#[path = "self_improve_family_dispatch_control.rs"]
+mod family_dispatch_control;
+#[path = "self_improve_family_wait_settlement.rs"]
+mod family_wait_settlement;
+#[path = "self_improve_family_wait_selection.rs"]
+mod family_wait_selection;
+#[cfg(test)]
+#[path = "self_improve_family_wait_settlement_tests.rs"]
+mod family_wait_settlement_tests;
+#[path = "self_improve_family_budget_hold.rs"]
+mod family_budget_hold;
+#[cfg(test)]
+#[path = "self_improve_family_budget_hold_tests.rs"]
+mod family_budget_hold_tests;
 use crate::autoship_workflow::{
     self as durable, Binding, Checkpoint, Lease, NextAction, Operation, OperationKind,
     ResourceCharge, Review, Stage, WorkflowStore,
@@ -219,6 +236,8 @@ pub(super) struct WorkflowGuard {
     started: std::time::Instant,
     accounted_ms: Arc<AtomicU64>,
     capacity_exhausted: Arc<AtomicBool>,
+    family_budget_wait: Arc<AtomicBool>,
+    family_wait_released: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
     acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
@@ -307,9 +326,19 @@ pub(super) struct CapacityAccounting {
     workflow: String,
     calls_before: u64,
     resumed: bool,
+    generation: i64,
+    family_budget_wait: Arc<AtomicBool>,
+    lease: Lease,
+    heartbeat: tokio_util::sync::CancellationToken,
+    started: std::time::Instant,
+    accounted_ms: Arc<AtomicU64>,
+    released: Arc<AtomicBool>,
 }
 impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
+        if self.family_budget_wait.load(Ordering::SeqCst) {
+            return self.report()?.context("family budget refusal has no durable status report");
+        }
         let source_waiting={
             let store=self.store.lock().map_err(|_|anyhow::anyhow!("source accounting store poisoned"))?;
             let snapshot=store.snapshot(&self.workflow)?.context("source accounting workflow missing")?;
@@ -343,6 +372,7 @@ impl CapacityAccounting {
         Ok(RunReport{message,billed:paid>0,held:true,resumed:self.resumed})
     }
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
+        if let Some(report)=family_budget_hold::report(self)? {return Ok(Some(report));}
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
         let snapshot=store.snapshot(&self.workflow)?.context("capacity workflow missing")?;
@@ -440,17 +470,11 @@ fn acquire_audit_generation(
 /// Free, bounded reconciliation; durable intent survives terminal workflows and
 /// crash between audit-generation commit and filesystem retirement.
 pub(super) fn reconcile_runtime_retirements()->Result<usize> {
-    reconcile_runtime_retirements_at(&path(),millis())
+    idle_controller::reconcile_runtime_and_idle(&path(),millis)
 }
+#[cfg(test)]
 fn reconcile_runtime_retirements_at(state:&Path,now:i64)->Result<usize> {
-    if !state.exists(){return Ok(0);}
-    let mut store=WorkflowStore::open(state)?;
-    let retired=reconcile_runtime_retirements_in(&mut store,now)?;
-    augmentagent_channel_core::native_vm::reconcile_retired_runtimes()?;
-    let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
-    let woken=store.reconcile_native_capacity(&report,now,16)?;
-    if woken>0 {info!(woken,"native capacity wait schedules eligible; normal admission remains required");}
-    Ok(retired)
+    idle_controller::reconcile_runtime_and_idle(state,||now)
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
     if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){store.settle_owner_execution_retries(now,16)?;return Ok(0);}
@@ -481,7 +505,7 @@ fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: 
     refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
-        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
+        .is_some_and(|snapshot| integration::requires_reverification(&snapshot.checkpoint) || snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
@@ -690,8 +714,10 @@ impl SweepGuard {
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
+            family_budget_wait: Arc::new(AtomicBool::new(false)),
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:source_from_workflow(&id),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
         };
         inner.install_model_accounting()?;
@@ -969,6 +995,7 @@ impl WorkflowGuard {
                     .context("issue or PR identity required")?,
             )?
         };
+        if store.idle_recovery_request(&id)?.is_some() {return Ok(None);}
         let checkout_identity = checkout_identity::Identity::observe(state, start.repo_root, start.worktree,
             &id, start.repository, start.branch).await?;
         let existing = store.snapshot(&id)?;
@@ -1069,6 +1096,8 @@ impl WorkflowGuard {
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
+            family_budget_wait: Arc::new(AtomicBool::new(false)),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
@@ -1097,52 +1126,17 @@ impl WorkflowGuard {
     }
 
     fn spawn_renewal(&self) {
-        let store = self.store.clone();
-        let lease = self.lease.clone();
-        let stop = self.heartbeat.clone();
-        let failure = self.lease_failure.clone();
-        let started = self.started;
-        let accounted = self.accounted_ms.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _=stop.cancelled()=>break,
-                    _=tokio::time::sleep(std::time::Duration::from_secs(RENEW_SECS))=>{}
-                }
-                let store = store.clone();
-                let lease = lease.clone();
-                let accounted = accounted.clone();
-                let result = tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut store = store
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
-                    let now = millis();
-                    store.heartbeat(&lease, now, LEASE_MS)?;
-                    charge_elapsed(&mut store, &lease, started, &accounted, now)
-                })
-                .await;
-                let error = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e.to_string()),
-                    Err(e) => Some(e.to_string()),
-                };
-                if let Some(error) = error {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    // Do not keep a lost lease alive or report success. The
-                    // next checkpoint/side-effect validation must fail closed.
-                    break;
-                }
-            }
-        });
+        idle_controller::spawn(self,std::time::Duration::from_secs(RENEW_SECS));
     }
 
     pub(super) fn capacity_accounting(&self, resumed: bool) -> Result<CapacityAccounting> {
         let calls_before = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
             .snapshot(self.id())?.context("capacity workflow missing")?.model_calls;
         Ok(CapacityAccounting { store:self.store.clone(), audit:self.audit.clone(),
-            workflow:self.id().into(), calls_before, resumed })
+            workflow:self.id().into(), calls_before, resumed, generation:self.lease.generation,
+            family_budget_wait:self.family_budget_wait.clone(), lease:self.lease.clone(),
+            heartbeat:self.heartbeat.clone(), started:self.started,
+            accounted_ms:self.accounted_ms.clone(), released:self.family_wait_released.clone() })
     }
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
@@ -1153,11 +1147,12 @@ impl WorkflowGuard {
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_root=self.worktree.clone();let dispatch_repository=self.repository.clone();
         let dispatch_identity=self.checkout_identity.clone();
+        let dispatch_family=self.family_budget_wait.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
             checkout_identity::validate(&dispatch_identity)?;
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
-            store.validate_dispatch(&dispatch_lease,&binding,millis())?;
+            family_dispatch_control::validate_native(&mut store,&dispatch_lease,&binding,&dispatch_family)?;
             semantic_preparation_source(&mut store,&dispatch_lease,&dispatch_root,&dispatch_repository)?;
             Ok(())
         }))?;
@@ -1183,7 +1178,9 @@ impl WorkflowGuard {
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
         let acceptance_authority=self.acceptance_authority.clone();let worktree=self.worktree.clone();
         let model_identity=self.checkout_identity.clone();
+        let family_budget_flag=self.family_budget_wait.clone();
         self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
+            family_budget_hold::require_active(&family_budget_flag)?;
             checkout_identity::validate(&model_identity)?;
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
@@ -1212,9 +1209,11 @@ impl WorkflowGuard {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
             }
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
-            store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
+            let admission=store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
-                augmentagent_channel_core::native_session::is_fresh_review())?;
+                augmentagent_channel_core::native_session::is_fresh_review());
+            family_budget_hold::settle_admission(&mut store,&lease,&current.checkpoint.binding,
+                &family_budget_flag,admission,millis())?;
             Ok(receipt)
         }))
     }
@@ -1262,7 +1261,7 @@ impl WorkflowGuard {
         let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),family_wait_released:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
         guard.spawn_renewal();
@@ -1462,6 +1461,7 @@ impl WorkflowGuard {
     }
 
     fn healthy_lease(&self) -> Result<()> {
+        family_budget_hold::require_active(&self.family_budget_wait)?;
         anyhow::ensure!(!self.capacity_exhausted.load(Ordering::SeqCst),
             "resource_capacity: await_capacity checkpoint retained; reacquire after eligible retry");
         let failure = self
@@ -1551,6 +1551,11 @@ impl WorkflowGuard {
         checkout_identity::validate(&self.checkout_identity)
     }
 
+    fn validate_mutation_dispatch(&self)->Result<()> {
+        self.validate_before_side_effect()?;
+        family_dispatch_control::validate_mutation(self)
+    }
+
     // A completed remote mutation must remain recordable if the checkout was
     // replaced while its RPC was in flight. Preserve the old lease/audit gate.
     fn validate_control_state(&self) -> Result<()> {
@@ -1565,13 +1570,13 @@ impl WorkflowGuard {
     /// New notes and ready transitions must honor controls accepted after earlier reads or
     /// Push dispatch. Completion receipts use the weaker lease/binding guard.
     pub(super) fn validate_note_dispatch(&self)->Result<()> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
             .require_owner_dispatch(self.id())
     }
 
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         let operation = self
             .store
             .lock()
@@ -1585,7 +1590,7 @@ impl WorkflowGuard {
     }
 
     fn bound_push_intent(&self,destination:&str,reference:&str)->Result<Operation> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         let operation=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
             .begin_bound_push(&self.lease,&self.binding,destination,reference,millis())?;
         self.audit_event("operation_intent",serde_json::json!({"operation_id":operation.id,"operation_kind":operation.kind}))?;
@@ -1605,7 +1610,7 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.publication_dispatch(&operation.id)
     }
     pub(super) fn reserve_publication_dispatch(&self,operation:&Operation)->Result<i64> {
-        self.validate_before_side_effect()?;
+        self.validate_mutation_dispatch()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.reserve_publication_dispatch(&self.lease,operation,millis())
     }
     pub(super) fn record_publication_identity(&self,operation:&Operation,pr:u64)->Result<()> {
@@ -1691,6 +1696,12 @@ impl WorkflowGuard {
             serde_json::json!({"operation_id":operation.id,
             "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes())), "pr":pr}),
         )
+    }
+
+    pub(super) fn require_independent_native_session(&self,provider:&str,session:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .require_independent_native_session(provider,session)
     }
 
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
@@ -2307,7 +2318,7 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
-        if !self.released { self.release_after_teardown()?; }
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) { self.release_after_teardown()?; }
         Ok(())
     }
 
@@ -2321,6 +2332,7 @@ impl WorkflowGuard {
     }
 
     fn release_after_teardown(&mut self) -> Result<()> {
+        self.settle_idle_recovery()?;
         self.audit.protected_health()?;
         self.healthy_lease()?;
         self.audit_event("workflow_released", serde_json::json!({}))?;
@@ -2347,7 +2359,7 @@ impl WorkflowGuard {
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
         self.heartbeat.cancel();
-        if !self.released {
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) {
             // Best-effort final usage accounting, never release/cleanup here:
             // dropping an async task is not proof its descendants are gone.
             if let Ok(mut store) = self.store.lock() {
@@ -2768,7 +2780,7 @@ mod tests {
         assert_eq!(source_from_workflow("autoship-observation/probe"),None);
         assert_eq!(source_from_workflow("owner/repo#0"),None);
     }
-    async fn scripted_independent_admission(guard:&WorkflowGuard) {
+    pub(super) async fn scripted_independent_admission(guard:&WorkflowGuard) {
         use augmentagent_channel_core::{native_session,ProviderKind};
         native_session::fresh_review_scope(ProviderKind::Codex,async {
             let session=native_session::current_for(ProviderKind::Codex)?.unwrap();let mut native=session.begin(ProviderKind::Codex)?;
@@ -2776,7 +2788,7 @@ mod tests {
             Ok::<_,anyhow::Error>(())
         }).await.unwrap();
     }
-    fn control_dir() -> tempfile::TempDir {
+    pub(super) fn control_dir() -> tempfile::TempDir {
         // Managed Cargo puts TMPDIR inside the writable build cache. Control
         // evidence must live outside every worker write root even in fixtures.
         let dir = tempfile::Builder::new()
@@ -2788,7 +2800,7 @@ mod tests {
         dir
     }
 
-    fn repo() -> tempfile::TempDir {
+    pub(super) fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             assert!(std::process::Command::new("git")

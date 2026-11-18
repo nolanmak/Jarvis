@@ -255,7 +255,7 @@ fn selftest_tool_probe_rejects_an_answer_without_a_tool_receipt() {
 
     let rig = Rig::new();
     let bypass = rig.path("fake-codex-bypass.sh");
-    std::fs::write(&bypass, r#"#!/usr/bin/env bash
+    augmentagent_test_support::write_executable(&bypass, r#"#!/usr/bin/env bash
 set -euo pipefail
 PROMPT=$(cat)
 FILE=$(printf '%s\n' "$PROMPT" | sed -n 's/^TOOL_PROBE_FILE: //p' | head -1)
