@@ -2356,12 +2356,14 @@ enum DiscordOp {
 
 #[derive(Subcommand)]
 enum DocOp {
-    /// Propose a signature on a generated PDF. Only approval publishes the signed output.
+    /// Propose a signature on a PDF or Word (.docx) document. Only approval
+    /// publishes the signed output.
     Sign {
         file: PathBuf,
         #[arg(long)] out: PathBuf,
         #[arg(long, default_value = "default")] signature: String,
-        #[arg(long)] page: u32,
+        /// PDF page (1-based). Required for PDFs; Word documents have none.
+        #[arg(long)] page: Option<u32>,
         /// Text directly under the signature line, e.g. the signer's printed
         /// name. The signature's ink is placed on that line.
         #[arg(long, conflicts_with_all = ["line", "x", "y"])] anchor_text: Option<String>,
@@ -2376,7 +2378,8 @@ enum DocOp {
         /// Optional ISO date printed beside the signature.
         #[arg(long)] date: Option<String>,
     },
-    /// List the signature lines on a PDF's pages (JSON), with the text under each.
+    /// List the signature lines (JSON): on a PDF's pages with the text under
+    /// each, or a Word document's signature paragraphs and cells.
     SignLines {
         file: PathBuf,
         #[arg(long)] page: Option<u32>,
@@ -4932,8 +4935,16 @@ async fn main() -> Result<()> {
                     _ => anyhow::bail!("give --anchor-text (preferred), --line, or --x/--y; run doc sign-lines to see the page's lines"),
                 };
                 let width = if matches!(target, Target::Ink { .. }) { None } else { *width };
+                // Word documents are placed by line, not page.
+                let docx = augmentagent_docs::signing::DocFormat::of(file).ok()
+                    == Some(augmentagent_docs::signing::DocFormat::Docx);
+                let page = match (page, docx) {
+                    (Some(page), _) => *page,
+                    (None, true) => 0,
+                    (None, false) => anyhow::bail!("--page is required for a PDF; run doc sign-lines to see its pages"),
+                };
                 document_signing::propose(store.clone(), file, out, signature,
-                    PlacementRequest { page: *page, target, width, date: date.clone() }).await
+                    PlacementRequest { page, target, width, date: date.clone() }).await
             }
             DocOp::SignLines { .. } => unreachable!("sign-lines dispatched before store initialization"),
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
