@@ -850,22 +850,28 @@ impl Store {
         })
     }
 
-    /// Release self-chat only after every possible agent echo is accounted for.
+    /// Retire proven echoes; release unmatched self-chat only after every
+    /// possible agent echo is accounted for.
     pub fn reconcile_imessage_owner_echoes(&self, now: i64) -> StoreResult<usize> {
         self.with_conn(|c| {
             let tx=Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled && b.self_chat) else {return Ok(0)};
+            // A confirmed native GUID proves this is our own output even if
+            // another delivery remains unresolved. Retire only those echoes;
+            // ambiguity still blocks every unmatched self-chat input below.
+            let echoes=tx.execute("UPDATE imessage_owner_events SET state='ignored',updated_at_ms=?2
+                WHERE revision=?1 AND state='quarantined' AND EXISTS(
+                    SELECT 1 FROM imessage_outbox o WHERE o.message_guid=imessage_owner_events.guid
+                    AND o.status='sent')",params![b.revision,now])?;
             let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM imessage_outbox
                 WHERE status IN ('queued','claimed','unknown') AND target IN (?2,?3)) OR EXISTS(SELECT 1 FROM imessage_owner_deliveries d
                 JOIN imessage_outbox o ON o.id=d.outbox_id WHERE d.revision=?1
                 AND o.status='sent' AND o.message_guid IS NULL)",
                 params![b.revision,b.chat_guid,b.owner_handle],|r|r.get(0))?;
-            if busy {return Ok(0)}
-            let n=tx.execute("UPDATE imessage_owner_events SET state=CASE WHEN EXISTS(
-                SELECT 1 FROM imessage_outbox o WHERE o.message_guid=imessage_owner_events.guid
-                AND o.status='sent') THEN 'ignored' ELSE 'accepted' END,updated_at_ms=?2
+            if busy {tx.commit()?;return Ok(echoes)}
+            let n=tx.execute("UPDATE imessage_owner_events SET state='accepted',updated_at_ms=?2
                 WHERE revision=?1 AND state='quarantined'",params![b.revision,now])?;
-            tx.commit()?; Ok(n)
+            tx.commit()?; Ok(echoes+n)
         })
     }
 
