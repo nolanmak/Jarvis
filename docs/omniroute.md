@@ -79,7 +79,7 @@ router installer defaults; connecting accounts and selecting supported routes
 remain separate setup steps.
 
 The final output names `augmentagent gateway status` and `augmentagent gateway
-on` for the owner. Those CLI commands are delivered by #1666; the installer does
+on` for the owner. Those CLI commands are delivered by #1665; the installer does
 not pretend they already exist or invoke `gateway on`. Until that lands, inspect
 the service and direct-mode config using the commands below.
 
