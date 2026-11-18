@@ -119,12 +119,15 @@ impl FreshIssueControls {
     pub(super) fn require_current_history(&self)->Result<()> {
         Self::reopen(&self.state,self.store.is_some()).map(|_|())
     }
-    pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
-        (||->Result<bool> {
+    pub(super) fn selection_snapshot(&self,repository:&str,issue:u64)->Result<Option<durable::Snapshot>> {
+        (||->Result<Option<durable::Snapshot>> {
             let id=durable::workflow_id(repository,issue)?;
-            let snapshot=self.store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
-            Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
+            self.store.as_ref().map(|store|store.snapshot(&id)).transpose().map(Option::flatten)
         })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
+    }
+    pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
+        Ok(self.selection_snapshot(repository,issue)?.is_some_and(|snapshot|
+            matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
     }
     /// Fairness preview only: unchanged initial holds are skipped unless exact
     /// native custody has recovered. Read the same context/environment/binding inputs,
