@@ -289,13 +289,14 @@ current replacement gateway’s tool behavior. #1659 must supply new receipts.
 
 The historical Qwen Read probe exposed a missing Responses namespace translation:
 the gateway advertised `mcp__jarvis` as an empty function instead of exposing
-its Read leaf and parameters. Gateway revision `runpod-5` flattens namespace
-leaves to stable collision-checked aliases, retains prior-call identities, and
-restores the namespace/name pair in JSON and SSE responses. The regression was
+its Read leaf and parameters. The retired gateway revision `runpod-5` flattened namespace
+leaves to stable collision-checked aliases, retained prior-call identities, and
+restored the namespace/name pair in JSON and SSE responses. The regression was
 red against `runpod-4`; all five installed-router fixtures and three fragmented
-stream/schema unit tests pass with the fix. Claude/Codex live regression and
-Qwen's audited Read are checked again after installation. Full live parity and
-actual Discord gateway acceptance remain release gates.
+stream/schema unit tests passed for that retired revision. New Claude/Codex
+regressions and Qwen audited Read receipts must be collected against OmniRoute;
+those historical results do not satisfy the current live parity or Discord
+gateway acceptance gates.
 
 ## Verify stopped workers, not empty health counters
 
