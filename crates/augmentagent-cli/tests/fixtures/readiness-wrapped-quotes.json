@@ -1,0 +1,8 @@
+{
+  "owner": "Produce a summary report.\nChoose a destination externally.",
+  "files": {
+    "docs/report.md": "Failure handling preserves\npartial report output.\n\nThe report is enabled only\nafter an external choice.\n",
+    "src/report.rs": "/// Report progress covers the\n/// whole operation, never a single batch.\n"
+  },
+  "response": "{\"slots\":{\"trigger\":{\"status\":\"resolved\",\"decision\":\"Produce a summary report.\",\"evidence\":[{\"path\":null,\"quote\":\"Produce a summary report.\"}]},\"failure\":{\"status\":\"resolved\",\"decision\":\"Preserve partial output.\",\"evidence\":[{\"path\":\"docs/report.md\",\"quote\":\"Failure handling preserves partial report output.\"}]},\"surface\":{\"status\":\"resolved\",\"decision\":\"Produce a summary report.\",\"evidence\":[{\"path\":null,\"quote\":\"Produce a summary report.\"}]},\"persistence\":{\"status\":\"resolved\",\"decision\":\"Track progress over the whole operation.\",\"evidence\":[{\"path\":\"src/report.rs\",\"quote\":\"Report progress covers the whole operation, never a single batch.\"}]},\"guards\":{\"status\":\"resolved\",\"decision\":\"Produce a summary report.\",\"evidence\":[{\"path\":null,\"quote\":\"Produce a summary report.\"}]},\"rollout\":{\"status\":\"external_decision\",\"question\":\"Which external destination should receive the report?\",\"alternatives\":[\"Console\",\"File\"],\"evidence\":[{\"path\":null,\"quote\":\"Choose a destination externally.\"},{\"path\":\"docs/report.md\",\"quote\":\"The report is enabled only after an external choice.\"}]}}}"
+}

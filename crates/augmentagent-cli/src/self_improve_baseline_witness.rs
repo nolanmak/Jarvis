@@ -54,6 +54,7 @@ struct RequalifiedArtifact {
 pub(super) fn policy_hash()->String {
     amendment::digest(&serde_json::to_vec(&("original-production-witness-v1",amendment::digest(include_bytes!("self_improve_baseline_witness.rs")),
         amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
+        amendment::digest(include_bytes!("self_improve_native_history.rs")),
         amendment::digest(include_bytes!("self_improve_verifier_checkout.rs")),scope_authority::witness_policy_hash(),REQUALIFICATION_RULE)).unwrap())
 }
 fn context(proposal:&ContractProposal,baseline:&BaselineEvidence)->Result<String> {
@@ -359,7 +360,11 @@ fn require_empty_native_history(control:&Path)->Result<()> {
         Ok(entries)=>entries,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),Err(error)=>return Err(error.into()),
     };
     for entry in entries {
-        let name=entry?.file_name();let Some(name)=name.to_str() else {continue};
+        let entry=entry?;
+        let name=entry.file_name();let Some(name)=name.to_str() else {continue};
+        if name.ends_with(".json") && name.starts_with("primary-scope-")
+            && !scope_authority::requires_baseline_custody(&entry.path())
+                .map_err(|error|error.context(crate::autoship_workflow::NativeScopeOutcomeUnresolved))? {continue;}
         if name.ends_with(".json") && (name.starts_with("primary-scope-") || name.starts_with("baseline-witness-")) {
             return Err(anyhow::Error::new(crate::autoship_workflow::NativeScopeOutcomeUnresolved)
                 .context("protected native witness history exists without paid admission custody"));
@@ -2209,3 +2214,7 @@ mod tests {
         assert!(error.downcast_ref::<BaselineNotRed>().is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_native_history_tests.rs"]
+mod native_history_tests;
