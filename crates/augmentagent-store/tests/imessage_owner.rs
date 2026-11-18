@@ -429,6 +429,55 @@ async fn native_owner_decision_excludes_racing_discord_writes_across_connections
 }
 
 #[test]
+fn proven_echoes_retire_even_while_unresolved_sends_quarantine_unmatched_inputs() {
+    use augmentagent_store::ImessageSendOutcome;
+    for barrier in ["queued", "claimed", "unknown", "sent_without_guid"] {
+        let s = Store::open(":memory:").unwrap();
+        let b = s.bind_imessage_owner(
+            "iMessage;-;owner@example.invalid", "owner@example.invalid", true, 0,
+        ).unwrap();
+        output(&s, "confirmed-notice", "synthetic report", None, 1).unwrap();
+        let sent = s.claim_imessage_outbox().unwrap().unwrap();
+        s.complete_imessage_outbox(sent.id, &ImessageSendOutcome::Sent {
+            message_guid: Some("synthetic-echo".into()),
+        }).unwrap();
+        output(&s, "unresolved-notice", "pending synthetic report", None, 2).unwrap();
+        let pending_id = sent.id + 1;
+        if barrier != "queued" {
+            let pending = s.claim_imessage_outbox().unwrap().unwrap();
+            assert_eq!(pending.id, pending_id);
+            match barrier {
+                "unknown" => {s.complete_imessage_outbox(pending.id, &ImessageSendOutcome::Unknown {
+                    reason: "synthetic uncertainty".into(),
+                }).unwrap();},
+                "sent_without_guid" => {s.complete_imessage_outbox(pending.id, &ImessageSendOutcome::Sent {
+                    message_guid: None,
+                }).unwrap();},
+                _ => {},
+            }
+        }
+        let before = s.get_imessage_outbox(pending_id).unwrap().unwrap();
+        let mut echo = event(b.revision, 1);
+        echo.from_me = true; echo.guid = "synthetic-echo".into();
+        echo.body = "synthetic report".into();
+        let mut owner = event(b.revision, 2);
+        owner.from_me = true;
+        // Equal text is not authority to classify a native event as an echo.
+        owner.body = echo.body.clone();
+        s.accept_imessage_owner_events(b.revision, 2, &[echo, owner], 3).unwrap();
+        assert_eq!(s.reconcile_imessage_owner_echoes(4).unwrap(), 1, "{barrier}");
+        let status = s.imessage_owner_status(4).unwrap();
+        assert_eq!(status["events"]["ignored"], 1, "{barrier}");
+        assert_eq!(status["events"]["quarantined"], 1, "{barrier}");
+        assert!(claim(&s, 5).unwrap().is_none(), "{barrier}");
+        assert_eq!(s.reconcile_imessage_owner_echoes(6).unwrap(), 0, "{barrier}");
+        let after = s.get_imessage_outbox(pending_id).unwrap().unwrap();
+        assert_eq!(after.status, before.status, "reconciliation cannot settle or requeue {barrier}");
+        assert_eq!(after.message_guid, before.message_guid);
+    }
+}
+
+#[test]
 fn sent_guid_reconciliation_ignores_agent_echo_and_releases_real_owner_input() {
     let s = Store::open(":memory:").unwrap();
     let b = s

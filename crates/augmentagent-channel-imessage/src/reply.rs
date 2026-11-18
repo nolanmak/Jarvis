@@ -1286,6 +1286,25 @@ mod tests {
         }
     }
 
+    /// #2177: the drafter sometimes wraps its reply in a markdown code fence,
+    /// and approving sent the backticks to the recipient. The card and the
+    /// text that ships are the unwrapped reply.
+    #[tokio::test]
+    async fn a_fenced_draft_is_carded_and_sent_without_the_fence() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let d = one_to_one(&[(PHONE, "free tonight?")]);
+        ingest(&f.store, &d);
+        let fenced = "```\nHa, I'll take \"classic\" as a compliment. Free after 7.\n```";
+        let stats = replier(&f, Scripted::new(&[REPLY, fenced])).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1);
+        let clean = "Ha, I'll take \"classic\" as a compliment. Free after 7.";
+        let (action_id, card) = f.broker.cards.lock().unwrap()[0].clone();
+        assert_eq!(card, clean, "the owner approves the text the recipient gets");
+        let stored = f.store.get_action_with_email(&action_id).unwrap().unwrap().action.draft_body.unwrap();
+        assert_eq!(augmentagent_approval_discord::strip_assumes_for_send(&stored), clean);
+    }
+
     /// #1107 semantics carry over: a receipt marked `(you asked)` records an
     /// owner-dictated register this turn and is not second-guessed. A draft
     /// that mirrors the recipient and a thread with nothing sentence-shaped
