@@ -13,25 +13,38 @@ class AptInstallTests(unittest.TestCase):
         cls.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.module)
 
-    def exercise(self, results, packages=None, installed=None):
+    def exercise(self, results, packages=None, installed=None, suite="noble",
+                 os_id="ubuntu", architecture="amd64", keyring=True):
         calls = []
         sources = []
+        source_paths = []
         def run(args, **kwargs):
             calls.append(args)
             for arg in args:
                 if arg.startswith('Dir::Etc::sourcelist='):
-                    sources.append(Path(arg.split('=', 1)[1]).read_text())
+                    source = Path(arg.split('=', 1)[1])
+                    source_paths.append(source)
+                    sources.append(source.read_text())
+                    self.assertEqual(source.stat().st_mode & 0o777, 0o644)
+                    self.assertEqual(source.parent.stat().st_mode & 0o777, 0o755)
             response = results[len(calls)-1]
             code, output = response(args) if callable(response) else response
             return subprocess.CompletedProcess(args, code, output)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'etc').mkdir()
-            (root / 'etc/os-release').write_text('ID=ubuntu\nVERSION_CODENAME=noble\n')
+            (root / 'etc/os-release').write_text(f'ID={os_id}\nVERSION_CODENAME={suite}\n')
             key = root / 'usr/share/keyrings/ubuntu-archive-keyring.gpg'
             key.parent.mkdir(parents=True)
-            key.write_bytes(b'test-keyring')
-            code = self.module.install(packages or ['poppler-utils'], run=run, root=root, architecture='amd64', installed=installed or set())
+            if keyring:
+                key.write_bytes(b'test-keyring')
+            parts = root / 'etc/apt/sources.list.d'
+            parts.mkdir(parents=True)
+            (parts / 'microsoft.list').write_text('deb https://packages.microsoft.com/repos/code stable main\n')
+            original = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+            code = self.module.install(packages or ['poppler-utils'], run=run, root=root, architecture=architecture, installed=installed or set())
+            self.assertEqual(original, {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()})
+            self.assertTrue(all(not path.exists() for path in source_paths), 'temporary APT source survived installation')
         return code, calls, sources
 
     def test_primary_success_never_changes_sources(self):
@@ -90,6 +103,87 @@ class AptInstallTests(unittest.TestCase):
     def test_fallback_failure_is_terminal(self):
         code, calls, _ = self.exercise([(100, "Temporary failure resolving 'archive.ubuntu.com'"), (100, 'E: bad mirror signature')])
         self.assertEqual((code, len(calls)), (100, 2))
+
+    def test_microsoft_only_update_recovers_missing_ubuntu_archives(self):
+        for suite in ('noble', 'resolute'):
+            with self.subTest(suite=suite):
+                code, calls, sources = self.exercise([
+                    (0, f'Hit:1 https://packages.microsoft.com/ubuntu/26.04/prod {suite} InRelease\n'),
+                    (100, 'E: Unable to locate package poppler-utils\nE: Unable to locate package ripgrep\n'),
+                    (0, f'microsoft-ubuntu-{suite}-prod\t{suite}\n'),
+                    (0, ''), (0, '')], packages=['poppler-utils', 'ripgrep'], suite=suite)
+                self.assertEqual(code, 0, 'missing Ubuntu archives were not recovered after a successful Microsoft-only update')
+                self.assertEqual(len(calls), 5)
+                self.assertIn('indextargets', calls[2])
+                self.assertIn('https://archive.ubuntu.com/ubuntu/', sources[0])
+                self.assertIn('https://security.ubuntu.com/ubuntu/', sources[0])
+                self.assertIn(f'Suites: {suite} {suite}-updates {suite}-backports', sources[0])
+                self.assertIn(f'Suites: {suite}-security', sources[0])
+                self.assertIn('Signed-By:', sources[0])
+                self.assertEqual(sources[0], sources[1])
+                self.assertNotIn('Trusted:', sources[0])
+                for call in calls:
+                    self.assertIn('APT::Get::AllowUnauthenticated=false', call)
+                    self.assertIn('Acquire::AllowInsecureRepositories=false', call)
+
+    def test_no_binary_index_targets_also_recovers_missing_ubuntu_archives(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'),
+                                            (0, ''), (0, ''), (0, '')], suite='resolute')
+        self.assertEqual(code, 0, 'an empty binary-source inventory lost the signed Ubuntu fallback')
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(sources)
+
+    def test_existing_ubuntu_binary_source_keeps_unknown_packages_terminal(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'),
+                                            (0, 'Microsoft\tnoble\nUbuntu\tnoble\n')])
+        self.assertEqual((code, len(calls), sources), (100, 3, []))
+        self.assertIn('Identifier: Packages', calls[2])
+        self.assertIn('$(ORIGIN)\t$(CODENAME)', calls[2])
+
+    def test_old_ubuntu_release_does_not_supply_running_release(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'),
+                                            (0, 'Ubuntu\tjammy\n'), (0, ''), (0, '')], suite='resolute')
+        self.assertEqual((code, len(calls)), (0, 5))
+        self.assertIn('resolute', sources[0])
+        self.assertNotIn('jammy', sources[0])
+
+    def test_unknown_or_failed_source_inventory_is_terminal(self):
+        def timeout(args):
+            raise subprocess.TimeoutExpired(args, 30)
+        for response in [(100, 'E: inventory unavailable'), (0, 'unsupported output'),
+                         (0, '$(ORIGIN)\t$(CODENAME)\n'), timeout]:
+            with self.subTest(response=response):
+                code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'), response])
+                self.assertEqual((code, len(calls), sources), (100, 3, []))
+
+    def test_lookup_mixed_with_security_lock_or_dns_errors_never_retries(self):
+        for other in ['W: GPG error NO_PUBKEY', 'E: Could not get lock /var/lib/dpkg/lock',
+                      'W: Hash Sum mismatch', 'W: Certificate verification failed',
+                      "W: Temporary failure resolving 'archive.ubuntu.com'",
+                      'E: The repository is not signed.', 'E: Failed to fetch https://example.invalid/pkg 404 Not Found']:
+            with self.subTest(other=other):
+                code, calls, sources = self.exercise([(0, ''), (100, f'E: Unable to locate package poppler-utils\n{other}')])
+                self.assertEqual((code, len(calls), sources), (100, 2, []))
+
+    def test_missing_sources_retry_signature_failure_is_terminal(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'),
+                                            (0, ''), (100, 'E: The repository is not signed.')])
+        self.assertEqual((code, len(calls), len(sources)), (100, 4, 1))
+
+    def test_missing_sources_retry_install_failure_is_terminal(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils'),
+                                            (0, ''), (0, ''), (100, 'E: Unable to locate package poppler-utils')])
+        self.assertEqual((code, len(calls), len(sources)), (100, 5, 2))
+
+    def test_missing_sources_requires_supported_ubuntu_and_system_keyring(self):
+        for options in [dict(os_id='debian'), dict(suite='jammy'), dict(architecture='arm64'), dict(keyring=False)]:
+            with self.subTest(options=options):
+                code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package poppler-utils')], **options)
+                self.assertEqual((code, len(calls), sources), (100, 2, []))
+
+    def test_unrequested_package_error_does_not_retry(self):
+        code, calls, sources = self.exercise([(0, ''), (100, 'E: Unable to locate package bogus')])
+        self.assertEqual((code, len(calls), sources), (100, 2, []))
 
     def test_playwright_dependency_plan_is_data_not_a_shell_command(self):
         cases = [(0, 'All system dependencies are installed.\n', []),

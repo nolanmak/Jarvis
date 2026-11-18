@@ -14,7 +14,9 @@ reconciles storage, then holds the build/prune lease until COMMAND exits.
 Without overrides, the wrapper enrolls a dedicated session-cache parent and
 chooses a stable child per worktree. On this Linux host it prefers the writable
 `/mnt/build` volume, falling back to the user cache directory when unavailable.
-Set `AUGMENTAGENT_BUILD_PARENT` to place that
+Set `AUGMENTAGENT_BUILD_VOLUME` to place gate, session, verifier and VM scratch
+output on one owned volume; see [relocation and production rollout](build-volume.md).
+`AUGMENTAGENT_BUILD_PARENT` can independently place that
 parent on a build volume, `CARGO_TARGET_DIR` for a specific cache, or
 `AUGMENTAGENT_STORAGE_BIN` for a supporting binary during bootstrap.
 Do not start an external `CARGO_TARGET_DIR=... cargo ...` build outside this
@@ -178,8 +180,15 @@ final floor, before consuming the remaining reserve.
 A refused admission remains an infrastructure failure. `disk-reconcile.json`
 records the last admission's measured before/after space and cleanup results.
 `disk-prune-last.json` records periodic cleanup outcomes and fresh filesystem readings.
-The daily pruner and pressure-triggered health reconciliation use the same
-exclusion and report deferral when a build owns the lease. The updater uses
+Periodic pruning serializes maintenance passes with `disk-prune.lock`. Each
+target must independently yield its physical target/profile leases and pass
+the existing compiler checks before cleanup; busy targets are reported and
+skipped while unrelated idle targets can be reclaimed. Pressure-triggered
+health reconciliation retains the same physical target exclusions and
+per-filesystem reservation accounting. Public `disk prune --json` reports a
+`pruned` or `deferred` outcome per root, the explanatory verdict in `detail`,
+and `freed_bytes`. A mixed pass completes successfully while naming busy roots.
+The updater uses
 `disk build` for release builds once the deployed binary
 supports it, and never falls back to deleting a cache outside the pruner's lease.
 

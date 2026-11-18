@@ -46,6 +46,7 @@ futures = { workspace = true }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
+augmentagent-test-support = { path = "../augmentagent-test-support" }
 tempfile = "3"
 # Paused-clock Socket Mode tests (heartbeat, backoff, sleep/wake).
 tokio = { workspace = true, features = ["test-util"] }

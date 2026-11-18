@@ -1228,9 +1228,14 @@ mod tests {
         controller.start_kill().unwrap();
         controller.wait().await.unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !receipt.exists() && std::time::Instant::now() < deadline {
+        // The supervisor creates the pathname before writing its proof. Wait
+        // for the complete receipt, just as recovery requires, rather than
+        // racing the writer with a pathname-existence check.
+        let complete = || private_read(&receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        while !complete() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(complete(), "supervisor did not publish complete cleanup proof before the deadline");
         assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(!unexpected.exists(), "detached tool survived the daemon crash");

@@ -1340,7 +1340,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             for response_mode in ["known","lost"] {
             let root=tempfile::Builder::new().prefix("autoship-publication-fixture-").tempdir_in("/tmp").unwrap();let gh=root.path().join("gh.py");
-            std::fs::write(&gh,r#"#!/usr/bin/env python3
+            augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_PENDING_PUBLICATION_FIXTURE']);a=sys.argv[1:]
 if a[:2]==['repo','view']: print('owner/repo')

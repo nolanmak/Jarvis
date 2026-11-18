@@ -30,7 +30,7 @@ impl ArgvStub {
         let bin = dir.path().join("fake-claude-argv");
         // One NUL-separated argv file per spawn, named by spawn time so the
         // listing sorts in call order.
-        std::fs::write(
+        augmentagent_test_support::write_executable(
             &bin,
             format!(
                 "#!/usr/bin/env bash\nset -euo pipefail\ncat >/dev/null\n\
