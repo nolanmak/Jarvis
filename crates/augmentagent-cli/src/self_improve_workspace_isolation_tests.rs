@@ -381,3 +381,32 @@ async fn preparation_hooks_cannot_copy_owner_files_into_candidates() {
         "owner bytes"
     );
 }
+
+
+#[tokio::test]
+async fn issue_preparation_preserves_lost_checkout_identity_before_git_reconstruction() {
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    let candidate = candidate_parent(root.path()).await.unwrap().join("current-issue-7");
+    let branch = "agent-fix/issue-7";
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&state).unwrap();
+    recovery::prepare_issue_at(&state, root.path(), &candidate, "fixture/repo#7", "fixture/repo", branch).await.unwrap();
+    let binding = crate::autoship_workflow::Binding {head: git(&candidate, &["rev-parse", "HEAD"]),
+        contract: "synthetic-contract".into(), evidence_hash: "synthetic-environment".into()};
+    store.register("fixture/repo#7", branch, binding.clone(), 1).unwrap();
+    let lease = store.claim("fixture/repo#7", "fixture", 2, 1000).unwrap().unwrap();
+    let identity = checkout_identity::Identity::observe(&state, root.path(), &candidate, "fixture/repo#7", "fixture/repo", branch).await.unwrap();
+    identity.enroll(&mut store, &lease, &binding, 3).unwrap();
+    store.release(&lease, 4).unwrap();
+    let before = store.snapshot("fixture/repo#7").unwrap();
+    std::fs::write(candidate.join("unfinished"), "synthetic unfinished edit").unwrap();
+    recovery::prepare_issue_at(&state, root.path(), &candidate, "fixture/repo#7", "fixture/repo", branch).await.unwrap();
+    assert_eq!(std::fs::read_to_string(candidate.join("unfinished")).unwrap(), "synthetic unfinished edit");
+    let _old = std::fs::File::open(&candidate).unwrap();
+    git(root.path(), &["worktree", "remove", "--force", candidate.to_str().unwrap()]);
+    let result = recovery::prepare_issue_at(&state, root.path(), &candidate, "fixture/repo#7", "fixture/repo", branch).await;
+    assert!(result.is_err(), "preparation recreated an enrolled checkout before checking physical continuity");
+    assert!(!candidate.exists(), "failed preparation left an unauthorized replacement");
+    assert_eq!(crate::autoship_workflow::WorkflowStore::open(&state).unwrap().snapshot("fixture/repo#7").unwrap(), before);
+}
