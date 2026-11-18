@@ -80,7 +80,7 @@ class DeploymentVerificationTests(unittest.TestCase):
                                       'RUNPOD_API_KEY': 'fixture-runpod-key'})
                 private_env(router, {'OPENAI_BASE_URL': 'http://127.0.0.1:1/v1',
                                      'OPENAI_API_KEY': 'fixture-router-key'})
-                with self.assertRaisesRegex(verify_deployment.DeploymentError, '9Router'):
+                with self.assertRaisesRegex(verify_deployment.DeploymentError, 'gateway'):
                     verify_deployment.verify(adapter, router, f'http://127.0.0.1:{server.server_port}')
             self.assertEqual([path for path, _ in calls], ['/health', '/v1/models'])
         finally:
