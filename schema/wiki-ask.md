@@ -926,3 +926,24 @@ Then `augmentagent doc sign <wiki-relative.pdf> --out <new-signed.pdf> --signatu
 posts a separate Approve & Sign card with a preview of the signed page and the unsigned PDF. The signature's ink is placed on that line automatically. Anchor text matches whole words, ignoring case only, so copy it from the line's `below` value. If it matches several lines, use `--line <n>` from `sign-lines` instead. If the signature would touch text or marks above the line, retry with a smaller `--width`. Never invent `--x/--y` coordinates when `sign-lines` reports a line; they are only for a page with no line, and they mean the bottom-left of the visible ink. A refusal (ambiguous anchor, no line, overlap with text) is the answer: tell the owner which lines exist rather than forcing a position.
 Nothing is signed until that card is approved. Changes to the document or signature require a fresh proposal. Signing appends the signature to the original file without re-encoding it, so the signed PDF is the original file plus the signature. The completed approval history supplies the signed PDF's ATTACH marker and hash; use that receipt to deliver the file. To email it, pass that exact signed path to `compose --attach`; that still needs the normal separate email approval. If the signed file doesn't exist, the card wasn't approved: check `approval_history` before telling the owner it was signed.
 Do not read, export, copy, or attempt to install signature image assets. Installation is operator-only. Do not bypass refusals, imitate a missing signature with typed text, or claim cryptographic/e-signature-platform verification.
+
+
+### Owner email alert preferences
+
+When the owner asks “always text me when Matt emails”, resolve Matt's wiki person
+slug and run `augmentagent imessage alerts priority matt high --wiki-dir "$WIKI_ROOT"`.
+A person selector tracks every email identity on that page. For an exact sender
+use `augmentagent imessage alerts priority colleague@example.test high`; for an
+exact domain use `augmentagent imessage alerts priority example.test high`.
+Domains exclude subdomains. Use `routine` to mute new classification for that
+selector; exact email preferences take precedence over person/domain preferences.
+These commands save owner policy, never send a reply or enable the text transport.
+The operator enables the arrival/relationship behavior with
+`AUGMENTAGENT_ALERT_EMAIL_GATES=1`; if that is not enabled, explain that activation
+is still needed rather than claiming a text was sent. Existing alerts keep their
+lifecycle. Do not infer priority for a whole company from a request about one
+person. Documented `active-collaborator` / `close-contact` relationships support
+request-only High alerts; never invent such a relationship to force an alert.
+High digest times are operator environment configuration
+(`AUGMENTAGENT_ALERT_HIGH_DIGEST`, default `09:00,17:00` local after gate opt-in),
+not a message-sending command. Do not edit service configuration from a query.

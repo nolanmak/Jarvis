@@ -6,11 +6,21 @@ use augmentagent_store::{
 
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum Op {
-    /// Override priority for an exact sender; routine mutes proactive escalation.
+    /// Override an email, wiki person slug or exact domain; routine mutes escalation.
     Priority {
         sender: String,
-        #[arg(long,value_parser=["routine","high","critical"])]
-        urgency: String,
+        /// Wiki root for resolving person selectors (also accepts global --wiki-dir).
+        #[arg(long)]
+        wiki_dir: Option<std::path::PathBuf>,
+        #[arg(value_parser=["routine","high","critical"], required_unless_present="urgency")]
+        level: Option<String>,
+        #[arg(long,value_parser=["routine","high","critical"], conflicts_with="level")]
+        urgency: Option<String>,
+    },
+    /// Replay a private JSONL export offline; prints aggregate counts only.
+    Calibrate {
+        #[arg(long)]
+        input: std::path::PathBuf,
     },
     /// Persist the reminder schedule across restarts.
     Policy {
@@ -59,14 +69,10 @@ pub(crate) enum Op {
     },
     /// Record that the alert was seen; preparation reminders continue.
     #[command(visible_alias = "seen")]
-    Acknowledge {
-        id: String,
-    },
+    Acknowledge { id: String },
     /// Mark the alert done and stop all further reminders.
     #[command(visible_alias = "done")]
-    Resolve {
-        id: String,
-    },
+    Resolve { id: String },
     Snooze {
         id: String,
         #[arg(long, default_value_t = 600)]
@@ -75,21 +81,43 @@ pub(crate) enum Op {
         override_deadline: bool,
     },
     /// Print lifecycle/delivery state without message text or destination.
-    Status {
-        id: String,
-    },
+    Status { id: String },
 }
 
-pub(crate) async fn run(store: &std::sync::Arc<Store>, op: &Op) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    store: &std::sync::Arc<Store>,
+    op: &Op,
+    wiki: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     match op {
-        Op::Priority { sender, urgency } => {
-            let priority = match urgency.as_str() {
+        Op::Calibrate { input } => return calibrate(input),
+        Op::Priority {
+            sender,
+            urgency,
+            level,
+            wiki_dir,
+        } => {
+            let priority = match urgency.as_deref().or(level.as_deref()).unwrap_or("high") {
                 "critical" => Urgency::Critical,
                 "high" => Urgency::High,
                 _ => Urgency::Routine,
             };
-            store.set_owner_alert_priority(sender, priority)?;
+            let selector = augmentagent_store::owner_alert_gate::canonical_selector(sender)?;
+            if let Some(slug) = selector.strip_prefix("person:") {
+                let catalog = augmentagent_channel_email::owner_alert_gate::Catalog::load(
+                    wiki_dir.as_deref().or(wiki),
+                )?;
+                let identities = catalog
+                    .identities(slug)
+                    .filter(|i| !i.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("person must have wiki email identities; pass --wiki-dir")
+                    })?;
+                store.set_owner_alert_priority_identities(&selector, priority, identities)?;
+            } else {
+                store.set_owner_alert_priority(&selector, priority)?;
+            }
             println!("Sender priority saved");
         }
         Op::Policy {
@@ -208,4 +236,25 @@ pub(crate) async fn run(store: &std::sync::Arc<Store>, op: &Op) -> anyhow::Resul
         }
     }
     Ok(())
+}
+
+#[path = "owner_alert_calibration.rs"]
+mod calibration;
+pub(crate) fn calibrate(input: &std::path::Path) -> anyhow::Result<()> {
+    let report = calibration::replay(std::io::BufReader::new(std::fs::File::open(input)?))?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+pub(crate) fn enqueue_digest(store: &Store, now: i64) -> anyhow::Result<usize> {
+    let times = match std::env::var("AUGMENTAGENT_ALERT_HIGH_DIGEST") {
+        Ok(v) if v.trim().is_empty() => return Ok(0),
+        Ok(v) => v,
+        Err(_) if augmentagent_channel_email::owner_alert_gate::enabled() => "09:00,17:00".into(),
+        Err(_) => return Ok(0),
+    };
+    Ok(store.enqueue_owner_alert_digest(
+        now,
+        &augmentagent_channel_email::owner_alerts::timezone(),
+        &times,
+    )?)
 }

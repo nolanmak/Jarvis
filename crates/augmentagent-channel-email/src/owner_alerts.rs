@@ -11,17 +11,47 @@ pub fn context(
     email: &Email,
     now: i64,
 ) -> anyhow::Result<(Vec<MeetingContext>, Option<Urgency>)> {
+    context_with_wiki(store, email, None, now)
+}
+pub fn context_with_wiki(
+    store: &Store,
+    email: &Email,
+    wiki: Option<&std::path::Path>,
+    now: i64,
+) -> anyhow::Result<(Vec<MeetingContext>, Option<Urgency>)> {
     let meetings = store
         .owner_alert_meetings(email.account_entity_id.as_deref().unwrap_or_default(), now)?
         .into_iter()
         .map(|s| serde_json::from_str(&s))
         .collect::<Result<Vec<_>, _>>()?;
-    let priority = store.owner_alert_priority(&crate::gmail::extract_bare_email(&email.from))?;
+    let mut priority =
+        store.owner_alert_priority(&crate::gmail::extract_bare_email(&email.from))?;
+    if crate::owner_alert_gate::enabled() {
+        let catalog = crate::owner_alert_gate::Catalog::load(wiki)?;
+        match crate::owner_alert_gate::classify(
+            &email.from,
+            &email.body,
+            &store.owner_alert_priorities()?,
+            &catalog,
+        ) {
+            crate::owner_alert_gate::Gate::Muted => priority = Some(Urgency::Routine),
+            crate::owner_alert_gate::Gate::Priority { level, .. } => priority = Some(level),
+            _ => {}
+        }
+    }
     Ok((meetings, priority))
 }
 
 pub fn prompt_context(store: &Store, email: &Email, now: i64) -> anyhow::Result<String> {
-    let (meetings, priority) = context(store, email, now)?;
+    prompt_context_with_wiki(store, email, None, now)
+}
+pub fn prompt_context_with_wiki(
+    store: &Store,
+    email: &Email,
+    wiki: Option<&std::path::Path>,
+    now: i64,
+) -> anyhow::Result<String> {
+    let (meetings, priority) = context_with_wiki(store, email, wiki, now)?;
     Ok(format!("\nOwner-alert context: current UTC time {}; owner timezone {}. Priority override: {}.\n<meeting_context>{}</meeting_context>\nUse only supported request/deadline evidence. Include the alert field required by the system prompt.",
         chrono::DateTime::from_timestamp_millis(now).map(|d|d.to_rfc3339()).unwrap_or_default(),
         timezone(),priority.map(|p|p.as_str()).unwrap_or("none"),
@@ -42,6 +72,7 @@ pub async fn backfill_tick<R: augmentagent_channel_core::Reasoner + ?Sized>(
     let mut assessed = 0;
     for email in store.owner_alert_backfill_candidates(now, 10)? {
         let result: anyhow::Result<()> = async {
+            crate::owner_alert_gate::arrival(store, &email, wiki_root.as_deref(), now)?;
             let hint = wiki_root
                 .as_ref()
                 .map(|root| {
@@ -51,9 +82,14 @@ pub async fn backfill_tick<R: augmentagent_channel_core::Reasoner + ?Sized>(
                 .unwrap_or_default();
             let mut prompt =
                 augmentagent_channel_core::prompt::triage_user_message(&email, "", &hint);
-            prompt.push_str(&prompt_context(store, &email, now)?);
+            prompt.push_str(&prompt_context_with_wiki(
+                store,
+                &email,
+                wiki_root.as_deref(),
+                now,
+            )?);
             let raw = reasoner.call(&opts, &prompt).await?;
-            persist_assessment(store, &email, &raw, now)?;
+            persist_assessment_with_wiki(store, &email, &raw, wiki_root.as_deref(), now)?;
             Ok(())
         }
         .await;
@@ -97,6 +133,15 @@ pub fn persist_assessment(
     raw: &str,
     now: i64,
 ) -> anyhow::Result<Option<String>> {
+    persist_assessment_with_wiki(store, email, raw, None, now)
+}
+pub fn persist_assessment_with_wiki(
+    store: &Store,
+    email: &Email,
+    raw: &str,
+    wiki: Option<&std::path::Path>,
+    now: i64,
+) -> anyhow::Result<Option<String>> {
     let blob = augmentagent_channel_core::decision::extract_json_blob(raw)
         .ok_or_else(|| anyhow::anyhow!("missing triage JSON"))?;
     let value: serde_json::Value = serde_json::from_str(&blob)?;
@@ -113,9 +158,32 @@ pub fn persist_assessment(
         return Ok(None);
     };
     let a: Assessment = serde_json::from_value(value.clone())?;
-    let (meetings, priority) = context(store, email, now)?;
+    let (meetings, priority) = context_with_wiki(store, email, wiki, now)?;
     let zone = timezone();
-    let plan = assess(email, &a, &meetings, priority, &zone, now)?;
+    let mut plan = assess(email, &a, &meetings, priority, &zone, now)?;
+    if crate::owner_alert_gate::enabled() {
+        let catalog = crate::owner_alert_gate::Catalog::load(wiki)?;
+        let gate = crate::owner_alert_gate::classify(
+            &email.from,
+            &email.body,
+            &store.owner_alert_priorities()?,
+            &catalog,
+        );
+        match &gate {
+            crate::owner_alert_gate::Gate::Muted => plan = None,
+            crate::owner_alert_gate::Gate::Relationship { line, .. } => {
+                if let Some(p) = plan.as_mut() {
+                    p.evidence.push_str(&format!("\n{line}"));
+                } else {
+                    plan = crate::owner_alert_gate::plan(email, &gate, now)?;
+                }
+            }
+            crate::owner_alert_gate::Gate::Priority { .. } if plan.is_none() => {
+                plan = crate::owner_alert_gate::plan(email, &gate, now)?
+            }
+            _ => {}
+        }
+    }
     let delay = std::env::var("AUGMENTAGENT_ALERT_TEXT_DELAY_SECS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())

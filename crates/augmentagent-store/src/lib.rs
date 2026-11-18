@@ -26,6 +26,8 @@ pub mod owner;
 pub mod phone;
 mod local_chat;
 pub mod owner_alerts;
+pub mod owner_alert_gate;
+pub mod owner_alert_digest;
 pub mod recipients;
 pub mod redact;
 pub mod team_coverage;

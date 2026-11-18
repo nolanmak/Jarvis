@@ -2521,6 +2521,9 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_message_context_attach_bare,
             bash_imessage_allowlist_abs,
             bash_imessage_allowlist_bare,
+            // Owner-declared priority only: no configure, approve or sender tools.
+            format!("Bash({} imessage alerts priority *)",bin.display()),
+            "Bash(augmentagent imessage alerts priority *)".into(),
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
@@ -3962,6 +3965,8 @@ mod tests {
         assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
         assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
         assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage alerts priority *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage alerts *") || t.contains("imessage alerts configure")));
         assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
