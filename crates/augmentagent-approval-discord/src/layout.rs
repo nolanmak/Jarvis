@@ -667,12 +667,15 @@ fn approval_embed_and_rows(
 /// literal because the dep edge to `augmentagent-channel-linkedin` runs the
 /// other way, mirroring `ACCOUNT_PREFIX` there).
 fn is_schedulable(email: &Email) -> bool {
-    email.platform == "gmail"
-        && !email
-            .account_entity_id
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("linkedin:")
+    // #1640 — iMessage cards too: the engine queues them for the Mac sender
+    // when due.
+    email.platform == "imessage"
+        || email.platform == "gmail"
+            && !email
+                .account_entity_id
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("linkedin:")
 }
 
 /// One bullet per unresolved ask for the card field.
@@ -1599,6 +1602,20 @@ mod tests {
         e.account_entity_id = None;
         let v = json(&approval_message("act-s6", &e, "d", 0));
         assert!(!v.contains("schedule_pick"), "linkedin-platform card gated");
+    }
+
+    /// #1640 — iMessage cards (replies and composes) offer Schedule: the
+    /// engine queues them for the Mac sender when due.
+    #[test]
+    fn schedule_row_present_on_imessage_cards() {
+        for kind in ["dm", "compose"] {
+            let mut e = email();
+            e.platform = "imessage".into();
+            e.kind = kind.into();
+            e.account_entity_id = Some("imessage".into());
+            let v = json(&approval_message("act-im", &e, "d", 0));
+            assert!(v.contains("schedule_pick"), "imessage {kind} card offers Schedule");
+        }
     }
 
     #[test]

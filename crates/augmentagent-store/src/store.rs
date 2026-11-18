@@ -7557,18 +7557,32 @@ impl Store {
         now_ms: i64,
         limit: i64,
     ) -> StoreResult<Vec<(String, i64, i64, Option<String>)>> {
+        self.due_scheduled_actions_except_platform(now_ms, limit, None)
+    }
+
+    /// [`Self::due_scheduled_actions`] without rows of `platform`, filtered
+    /// before the limit (#1640 review): an engine that may not send Gmail
+    /// must not have its batch filled every tick by Gmail rows it skips.
+    pub fn due_scheduled_actions_except_platform(
+        &self,
+        now_ms: i64,
+        limit: i64,
+        excluded_platform: Option<&str>,
+    ) -> StoreResult<Vec<(String, i64, i64, Option<String>)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, scheduledAtMs, COALESCE(status_updated_at, createdAt), \
-                    threadId \
-               FROM actions \
-              WHERE status = 'scheduled' AND scheduledAtMs IS NOT NULL \
-                AND scheduledAtMs <= ?1 \
-              ORDER BY scheduledAtMs ASC \
+            "SELECT a.id, a.scheduledAtMs, COALESCE(a.status_updated_at, a.createdAt), \
+                    a.threadId \
+               FROM actions a \
+               LEFT JOIN emails e ON e.messageId = a.messageId \
+              WHERE a.status = 'scheduled' AND a.scheduledAtMs IS NOT NULL \
+                AND a.scheduledAtMs <= ?1 \
+                AND (?3 IS NULL OR COALESCE(e.platform, 'gmail') != ?3) \
+              ORDER BY a.scheduledAtMs ASC \
               LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![now_ms, limit], |r| {
+            .query_map(params![now_ms, limit, excluded_platform], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -7587,6 +7601,29 @@ impl Store {
     /// (engine fire-time guard, reconcile scheduled pass) bound the reply
     /// check to the row's own arming moment first. Notice pointers are left
     /// intact so the notice message can still be cleaned up afterwards.
+    /// #1640 — armed schedules on `thread_id` whose `emails.kind` is not
+    /// `excluded_kind`, with the moment each was armed. The iMessage replier
+    /// cancels these when the owner answers the thread by hand.
+    pub fn scheduled_actions_for_thread_except_kind(
+        &self,
+        thread_id: &str,
+        excluded_kind: &str,
+    ) -> StoreResult<Vec<(String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id, COALESCE(a.status_updated_at, a.createdAt) FROM actions a \
+             LEFT JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND a.status = 'scheduled' \
+               AND COALESCE(e.kind, '') != ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![thread_id, excluded_kind], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn mark_scheduled_superseded(
         &self,
         action_id: &str,

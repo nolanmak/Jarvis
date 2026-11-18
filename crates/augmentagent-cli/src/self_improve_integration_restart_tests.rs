@@ -6,6 +6,20 @@ const ROOT: &str = "AUTOSHIP_INTEGRATION_RESTART_ROOT";
 
 #[tokio::test]
 async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer() {
+    exercise("conflict", TEST).await;
+}
+
+#[tokio::test]
+async fn crashed_resume_of_mergeable_base_change_reuses_durable_job() {
+    exercise("mergeable", "self_improve::integration_tests::restart::crashed_resume_of_mergeable_base_change_reuses_durable_job").await;
+}
+
+async fn exercise(kind: &str, test: &str) {
+    let expected_reason = if kind == "conflict" {
+        "integration_conflict"
+    } else {
+        "integration_base_changed"
+    };
     if let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) {
         let repo = root.join("repo");
         let rows: Vec<serde_json::Value> =
@@ -69,6 +83,26 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
                     store.release(&lease, 6).unwrap();
                     opened_prs::record(issue, pr, head, None);
                 }
+                if kind == "mergeable" {
+                    // A prior controller observation left this durable
+                    // changed-base request before the worker was admitted.
+                    let row = &rows[0];
+                    assert_eq!(
+                        store
+                            .reconcile_integration(
+                                "owner/repo",
+                                1606,
+                                "agent-fix/issue-1",
+                                row["headRefOid"].as_str().unwrap(),
+                                row["baseRefOid"].as_str().unwrap(),
+                                "selected-base-change",
+                                crate::autoship_workflow::IntegrationReason::BaseChanged,
+                                10
+                            )
+                            .unwrap(),
+                        Some(true)
+                    );
+                }
                 assert_eq!(
                     find_resumable_draft(&repo, None, false).await,
                     Some((1606, 1, "agent-fix/issue-1".into()))
@@ -81,7 +115,7 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
                         .checkpoint
                         .next
                         .reason,
-                    "integration_conflict"
+                    expected_reason
                 );
             }
             "crash" => {
@@ -124,7 +158,7 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
                     "the recovered integration job must not monopolize normal rotation"
                 );
                 let snapshot = store.snapshot("owner/repo#1").unwrap().unwrap();
-                assert_eq!(snapshot.checkpoint.next.reason, "integration_conflict");
+                assert_eq!(snapshot.checkpoint.next.reason, expected_reason);
                 assert_eq!(snapshot.model_calls, 0);
                 assert!(store.current_reviews("owner/repo#1").unwrap().is_empty());
                 assert_eq!(
@@ -170,13 +204,21 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
         let branch = format!("agent-fix/issue-{issue}");
         git(&repo, &["checkout", "-qb", &branch, &base]);
         std::fs::write(
-            repo.join(if issue == 1 { "source" } else { "peer" }),
+            repo.join(if issue == 1 {
+                if kind == "conflict" {
+                    "source"
+                } else {
+                    "candidate"
+                }
+            } else {
+                "peer"
+            }),
             "preserved candidate\n",
         )
         .unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-qm", "candidate"]);
-        rows.push(serde_json::json!({"number":1605+issue,"isDraft":true,"headRefName":branch,"headRefOid":git(&repo,&["rev-parse","HEAD"]),"baseRefName":"main","isCrossRepository":false,"author":{"login":"owner"},"title":"Preserve edits","body":"Source issue","mergeable":if issue==1 {"CONFLICTING"}else{"MERGEABLE"},"closingIssuesReferences":[{"number":issue,"url":format!("https://github.com/owner/repo/issues/{issue}") }]}));
+        rows.push(serde_json::json!({"number":1605+issue,"isDraft":true,"headRefName":branch,"headRefOid":git(&repo,&["rev-parse","HEAD"]),"baseRefName":"main","isCrossRepository":false,"author":{"login":"owner"},"title":"Preserve edits","body":"Source issue","mergeable":if issue==1 && kind=="conflict" {"CONFLICTING"}else{"MERGEABLE"},"closingIssuesReferences":[{"number":issue,"url":format!("https://github.com/owner/repo/issues/{issue}") }]}));
     }
     git(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("source"), "upstream\n").unwrap();
@@ -191,8 +233,8 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
         .output()
         .unwrap();
     assert!(
-        !conflict.status.success(),
-        "fixture must have a real Git conflict"
+        conflict.status.success() == (kind != "conflict"),
+        "fixture mergeability must match the real Git tree"
     );
     git(
         &repo,
@@ -208,7 +250,7 @@ async fn crashed_resume_retains_integration_selection_and_does_not_starve_peer()
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
     for (phase, expected) in [("seed", 0), ("crash", 86), ("resume", 0)] {
         let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
+            .args(["--exact", test, "--nocapture"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &root)

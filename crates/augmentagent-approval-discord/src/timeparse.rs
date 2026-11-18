@@ -69,6 +69,19 @@ pub fn resolve_token(token: &str, now: DateTime<Local>) -> Result<i64, String> {
 }
 
 /// Parse a free-text send time (custom modal, `--send-at`) to epoch-ms. Thin
+/// A send time in the owner's zone, as cards and notices show it
+/// ("Tue Nov 18, 9:00 AM").
+pub fn format_local_send_time(at_ms: i64) -> String {
+    match Local.timestamp_millis_opt(at_ms) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+            dt.format("%a %b %-d, %-I:%M %p").to_string()
+        }
+        // Out-of-range epoch: unreachable behind the 60-day guard, but a
+        // display path must never panic.
+        LocalResult::None => format!("epoch+{at_ms}ms"),
+    }
+}
+
 /// `Local` wrapper over [`parse_send_at_in`] for production callers.
 pub fn parse_send_at(input: &str, now: DateTime<Local>) -> Result<i64, String> {
     parse_send_at_in(input, now)
