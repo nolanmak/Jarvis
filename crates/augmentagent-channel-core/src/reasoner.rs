@@ -897,7 +897,7 @@ impl ClaudeCliReasoner {
                     .ok()
                     .flatten()
                     .filter(|router| router.enabled());
-                let Some(mut direct) = routed.filter(|_| !tools_ran) else {
+                let Some(mut direct) = routed.filter(|_| !tools_ran && crate::gateway_probe::can_rescue_native()) else {
                     return Err(api_unavailable(&message));
                 };
                 warn!("routed claude call failed at the gateway ({}); retrying once on the direct CLI",
@@ -5593,6 +5593,19 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"
         assert!(calls[0].contains("cc/claude-opus-4-6"), "{}", calls[0]);
         assert!(!calls[1].contains("base=http://127.0.0.1:20128"), "{}", calls[1]);
         assert!(!calls[1].contains("cc/"), "{}", calls[1]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn routed_selftest_must_not_pass_via_native_rescue() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = gateway_down_cli(&dir, &log, "");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let result = crate::gateway_probe::scope(crate::model_router::SNAPSHOT
+            .scope(routed(), reasoner.call(&dummy_opts(), "test"))).await;
+        assert!(result.is_err(), "routed selftest falsely passed via native rescue: {result:?}");
+        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 1);
     }
 
     #[tokio::test]

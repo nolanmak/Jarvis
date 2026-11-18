@@ -81,10 +81,11 @@ class Installer:
         self.binary = shutil.which('omniroute')
         self.cookie = None
 
-    def command(self, argv, **kwargs):
+    def command(self, argv, extra_env=None, **kwargs):
         env = dict(os.environ)
         env.pop('OMNIROUTE_SKIP_POSTINSTALL', None)
         env.update(DATA_DIR=str(self.data), OMNIROUTE_NO_UPDATE_NOTIFIER='1')
+        env.update(extra_env or {})
         return subprocess.run(argv, text=True, capture_output=True, env=env, **kwargs)
 
     def checked(self, argv, **kwargs):
@@ -115,7 +116,7 @@ class Installer:
             headers['Cookie'] = cookie
         if key:
             headers['Authorization'] = 'Bearer ' + key
-        request = urllib.request.Request(BASE + path, method=method, headers=headers,
+        request = urllib.request.Request(getattr(self, 'base', BASE) + path, method=method, headers=headers,
                                          data=None if body is None else json.dumps(body).encode())
         # No ambient proxy and no redirects with operator credentials.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -255,24 +256,24 @@ WantedBy=default.target
                            'codex': {'quality': 'cx/gpt-5.6-terra', 'fast': 'cx/gpt-5.6-luna'}},
             }, indent=2) + '\n')
 
-    def validate_existing(self):
+    def validate_existing(self, allow_routed=False):
         for path in [self.env_file, self.receipt, self.pending, self.router]:
             if path.exists() or path.is_symlink():
                 content = private_read(path)
                 if path == self.router:
                     value = json.loads(content)
-                    if (value.get('gateway') != 'omniroute' or value.get('mode', 'direct') != 'direct'
+                    if (value.get('gateway') != 'omniroute' or (value.get('mode', 'direct') != 'direct' and not allow_routed)
                             or value.get('base_url') != BASE + '/v1'):
                         raise RuntimeError('existing router config must be migrated explicitly; installer keeps mode direct')
 
-    def install(self, upgrade=False):
+    def install(self, upgrade=False, before_update=None, after_health=None):
         if not supported_node(self.checked(['node', '--version'])):
             raise RuntimeError('Node >=22.22.2 <23 or >=24 <27 required; upgrade Node separately')
         if (set(self.pin) != {'version', 'integrity'}
                 or not re.fullmatch(r'\d+\.\d+\.\d+', self.pin['version'])
                 or not re.fullmatch(r'sha512-[A-Za-z0-9+/]{86}==', self.pin['integrity'])):
             raise RuntimeError('invalid OmniRoute pin')
-        self.validate_existing()
+        self.validate_existing(allow_routed=before_update is not None)
         previous = json.loads(private_read(self.receipt)) if self.receipt.exists() else None
         if previous and previous != self.pin and not upgrade:
             raise RuntimeError('pin changed; use --upgrade to take a backup before updating')
@@ -315,22 +316,23 @@ WantedBy=default.target
                 if actual != previous['integrity']:
                     raise RuntimeError('rollback package integrity mismatch')
                 os.link(self.archive, rollback_archive)
-                self.checked(['systemctl', '--user', 'stop', UNIT])
                 before = set((self.data / 'backups').glob('omniroute-backup-*'))
                 try:
                     self.checked([self.binary, 'backup'])
                 except Exception:
-                    self.checked(['systemctl', '--user', 'restart', UNIT])
                     raise
                 after = set((self.data / 'backups').glob('omniroute-backup-*'))
                 created = [p for p in after - before if (p / 'backup-info.json').is_file()]
                 if len(created) != 1:
-                    self.checked(['systemctl', '--user', 'restart', UNIT])
                     raise RuntimeError('backup did not produce one verified backup ID; update refused')
                 backup_id = created[0].name.removeprefix('omniroute-backup-')
             if not previous:
                 private_write(self.pending, json.dumps(self.pin) + '\n')
             try:
+                if previous:
+                    if before_update:
+                        before_update()
+                    self.checked(['systemctl', '--user', 'stop', UNIT])
                 self.checked(['npm', 'install', '-g', str(candidate), '--ignore-scripts=false', '--no-audit', '--no-fund'])
                 self.binary = self.binary or shutil.which('omniroute')
                 if not self.binary or self.checked([self.binary, '--version']) != self.pin['version']:
@@ -345,7 +347,15 @@ WantedBy=default.target
                 self.checked(['systemctl', '--user', 'restart', UNIT])
                 self.wait_health()
                 self.health(self.secret('inference'))
+                if after_health:
+                    after_health()
                 self.checked(['systemctl', '--user', 'enable', UNIT])
+                if previous:
+                    import shutil
+                    saved = self.archive.parent / 'previous.tgz'
+                    shutil.copyfile(rollback_archive, saved)
+                    saved.chmod(0o600)
+                    private_write(self.config / 'omniroute-rollback.json', json.dumps({'pin': previous, 'backup_id': backup_id}) + '\n')
                 candidate.chmod(0o600)
                 os.replace(candidate, self.archive)
                 private_write(self.receipt, json.dumps(self.pin) + '\n')
@@ -374,6 +384,7 @@ WantedBy=default.target
         if purge:
             shutil.rmtree(self.data)
             self.env_file.unlink(missing_ok=True)
+            (self.config / 'omniroute-rollback.json').unlink(missing_ok=True)
             self.router.unlink(missing_ok=True)
             for name in ['JWT_SECRET', 'API_KEY_SECRET', 'INITIAL_PASSWORD', 'inference', 'read', 'write']:
                 result = self.command(['secret-tool', 'clear', 'service', 'augmentagent', 'account', 'omniroute/' + name])

@@ -45,7 +45,7 @@ class InstallTests(unittest.TestCase):
         self.compression = {}
         self.keys = 0
         self.tokens = []
-        self.inst = self.mod.Installer(root / 'config', root / 'data', self.pin)
+        self.inst = self.mod.Installer(root / 'config/augmentagent', root / 'data/augmentagent/omniroute', self.pin)
         self.inst.command = self.command
         self.inst.request = self.request
         self.inst.download = lambda path: path.write_bytes(self.payload)
@@ -68,7 +68,7 @@ class InstallTests(unittest.TestCase):
             out = self.version or ''
             rc = 0 if self.version else 1
         elif argv[:3] == ['npm', 'install', '-g']:
-            self.version = '3.8.52' if argv[3].endswith('installed.tgz') else self.desired
+            self.version = '3.8.52' if Path(argv[3]).name in ('installed.tgz', 'previous.tgz') else self.desired
         elif 'backup' in argv:
             backup = self.inst.data / 'backups/omniroute-backup-fixture'
             backup.mkdir(parents=True)

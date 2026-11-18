@@ -68,6 +68,13 @@ pub const LIVE_VOICE_BLOCKER: &str = "Live voice needs the app to join a huddle 
 
 pub static OWNER_COMMANDS: &[OwnerCommand] = &[
     OwnerCommand {
+        name: "gateway", aliases: &[], usage: "gateway status | gateway off",
+        description: "Inspect or disable the optional model gateway. Enabling and maintenance are owner CLI only.",
+        discord: &["gateway"],
+        slack: SlackMapping::Blocked { issue: 1665, reason: "Gateway controls are available from owner Discord or the owner CLI." },
+        plain: PlainText::Prefix,
+    },
+    OwnerCommand {
         name: "autoship", aliases: &[],
         usage: "autoship <GitHub PR URL> [--provider codex|claude] | status|pause|resume [--workflow ID] | cancel --workflow ID | use ID",
         description: "Queue or join an Autoship workflow from the owner's private Discord DM. Inspect status, request pause/resume, cancel an idle workflow, or select a bound workflow. Acceptance does not confirm completion or teardown; PR coding follow-ups are not connected yet.",
@@ -224,7 +231,7 @@ pub fn find(word: &str) -> Option<&'static OwnerCommand> {
 /// Recognizer functions the Discord dispatcher calls, and the trigger each
 /// stands for. A new recognizer must be added here (see the pinned
 /// limitation test).
-const DISCORD_RECOGNIZERS: [(&str, &str); 7] = [
+const DISCORD_RECOGNIZERS: [(&str, &str); 8] = [
     ("autoship::dispatch(", "!autoship"),
     ("model_command_in_guild(", "model"),
     ("match_loop_prefix(", "loop"),
@@ -232,6 +239,7 @@ const DISCORD_RECOGNIZERS: [(&str, &str); 7] = [
     ("Verb::LoopAck", "button:loop_ack"),
     ("Verb::LoopDismiss", "button:loop_dismiss"),
     ("model_command(", "model"),
+    ("model_command(", "gateway"),
 ];
 
 /// Every owner-command trigger in Discord's dispatcher source: `"!word"`
