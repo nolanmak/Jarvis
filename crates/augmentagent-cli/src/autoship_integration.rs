@@ -34,6 +34,30 @@ impl IntegrationReason {
     }
 }
 impl WorkflowStore {
+    /// Free routing hint for admission crashes whose checkpoint no longer
+    /// carries integration's reason. This grants no claim or model authority;
+    /// reconcile_integration rechecks the current lease/controls transactionally.
+    pub(crate) fn integration_admission_interrupted(
+        &self,
+        workflow: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<bool> {
+        let row: Option<(String, String)> = self.conn.query_row(
+            "SELECT w.checkpoint,r.binding FROM workflow w JOIN integration_recovery r ON r.workflow=w.id
+             WHERE w.id=?1 AND r.base=?2 AND r.kind IN ('integration_conflict','integration_base_changed')",
+            params![workflow, base], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let Some((checkpoint, original)) = row else {
+            return Ok(false);
+        };
+        let checkpoint: Checkpoint = serde_json::from_str(&checkpoint)?;
+        Ok(checkpoint.binding.head == head
+            && checkpoint.stage == Stage::Reconcile
+            && checkpoint.next.reason == "resume_started"
+            && checkpoint.next.action == "reconcile_main"
+            && serde_json::from_str::<Binding>(&original).is_ok_and(|binding| binding.head == head))
+    }
     pub(crate) fn defer_integration_review(
         &mut self,
         repository: &str,
@@ -765,6 +789,57 @@ mod tests {
                 assert!(store.current_reviews("owner/repo#1").unwrap().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn integration_admission_hint_requires_current_source_and_checkpoint_without_claiming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = fixture(&dir.path().join("workflow.db"));
+        assert!(!store
+            .integration_admission_interrupted("owner/repo#1", "candidate", "base")
+            .unwrap());
+        assert_eq!(
+            observe(&mut store, IntegrationReason::BaseChanged, "base", 10),
+            Some(true)
+        );
+        assert!(!store
+            .integration_admission_interrupted("owner/repo#1", "candidate", "base")
+            .unwrap());
+        let lease = store
+            .claim_productive("owner/repo#1", "live-worker", 11, 100)
+            .unwrap()
+            .unwrap();
+        let mut cp = store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint;
+        cp.next = NextAction {
+            reason: "resume_started".into(),
+            action: "reconcile_main".into(),
+            eligible_at_ms: 0,
+        };
+        store.checkpoint(&lease, &cp, 12).unwrap();
+        assert!(store
+            .integration_admission_interrupted("owner/repo#1", "candidate", "base")
+            .unwrap());
+        assert!(!store
+            .integration_admission_interrupted("owner/repo#1", "owner-new-head", "base")
+            .unwrap());
+        assert!(!store
+            .integration_admission_interrupted("owner/repo#1", "candidate", "new-base")
+            .unwrap());
+        assert_eq!(
+            observe(&mut store, IntegrationReason::BaseChanged, "base", 13),
+            None,
+            "a routing hint bypassed the live worker"
+        );
+        assert_eq!(
+            store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint,
+            cp
+        );
+        cp.stage = Stage::Scope;
+        cp.next.reason = "acceptance_contract_invalid".into();
+        store.checkpoint(&lease, &cp, 14).unwrap();
+        assert!(!store
+            .integration_admission_interrupted("owner/repo#1", "candidate", "base")
+            .unwrap());
     }
 }
 

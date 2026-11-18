@@ -232,7 +232,7 @@ impl CodexCliReasoner {
         let native_launch = native_lease.as_ref().map(|lease| lease.launch());
         let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
         if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
-            return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
+            return Err(ReasonerError::Local { message: "Runpod model requires a configured model gateway endpoint".into() }.into());
         }
         let model = if self.kind == ProviderKind::Codex {
             router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
@@ -649,11 +649,11 @@ mod tests {
         }
     }
 
-    /// Paid, opt-in acceptance probe. Run with a private 9Router config and
+    /// Paid, opt-in acceptance probe. Run with a private model gateway config and
     /// `cargo test -- --ignored`; a text-only response cannot pass this test.
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    #[ignore = "requires live Qwen endpoint, local 9Router, and a paid inference call"]
+    #[ignore = "requires live Qwen endpoint, local model gateway, and a paid inference call"]
     async fn live_qwen_runs_the_jarvis_scoped_file_tools() {
         let config = crate::model_router::load().unwrap().expect("set AUGMENTAGENT_MODEL_ROUTER_CONFIG");
         let config = crate::model_router::select_profile(Some(config), Some(ProviderKind::Qwen)).unwrap();

@@ -9,6 +9,10 @@ fn worker(state: &Path, start: tokio::time::Instant, base: chrono::DateTime<chro
     worker.clock = Arc::new(move || base + chrono::Duration::from_std(start.elapsed()).unwrap());
     worker
 }
+fn fixture_base() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-11-17T12:00:00Z").unwrap().with_timezone(&chrono::Utc)
+}
+
 fn blocked() -> anyhow::Error {
     anyhow::anyhow!("scripted missing provider declaration").context(targeted::CommandFailure {
         code: 3, reason: "execution-readiness-blocked",
@@ -19,7 +23,7 @@ fn blocked() -> anyhow::Error {
 async fn pre_workflow_readiness_rechecks_every_five_minutes_without_compute_or_merge_debit() {
     let state = tempfile::tempdir().unwrap();
     let start = tokio::time::Instant::now();
-    let base = chrono::Utc::now();
+    let base = fixture_base();
     let times = Arc::new(Mutex::new(Vec::new()));
     let observed = times.clone();
     let stop = tokio_util::sync::CancellationToken::new();
@@ -50,7 +54,7 @@ async fn pre_workflow_readiness_rechecks_every_five_minutes_without_compute_or_m
 async fn preflight_reconciliation_deadline_survives_worker_restart() {
     let state = tempfile::tempdir().unwrap();
     let start = tokio::time::Instant::now();
-    let base = chrono::Utc::now();
+    let base = fixture_base();
     let stop = tokio_util::sync::CancellationToken::new();
     let done = stop.clone();
     worker(state.path(), start, base).run_builds(stop, move || {
@@ -77,13 +81,15 @@ async fn preflight_reconciliation_deadline_survives_worker_restart() {
     assert!(counter.preflight_observation.is_none(), "recovery kept the old readiness schedule");
 }
 
-#[tokio::test(start_paused = true)]
-async fn unrelated_error_text_does_not_enable_preflight_retries_or_refund_attempts() {
+async fn assert_unrelated_error_accounting(base: chrono::DateTime<chrono::Utc>) -> u64 {
     let state = tempfile::tempdir().unwrap();
-    let start = tokio::time::Instant::now(); let base = chrono::Utc::now();
+    let start = tokio::time::Instant::now();
     let calls = Arc::new(AtomicUsize::new(0)); let observed = calls.clone();
+    let attempt_day = Arc::new(Mutex::new(None));
+    let observed_day = attempt_day.clone();
     let run = worker(state.path(), start, base).run_builds(tokio_util::sync::CancellationToken::new(), move || {
         observed.fetch_add(1, SeqCst);
+        *observed_day.lock().unwrap() = Some(utc_day_of(base + chrono::Duration::from_std(start.elapsed()).unwrap()));
         async { anyhow::bail!("execution-readiness-blocked: untyped error after paid work") }
     });
     tokio::select! {
@@ -92,6 +98,25 @@ async fn unrelated_error_text_does_not_enable_preflight_retries_or_refund_attemp
     }
     assert_eq!(calls.load(SeqCst), 1, "prose accidentally authorized fast retry");
     let mut counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
-    assert_eq!(counter.runs_today(utc_day_of(base)), 1);
+    // Startup delays the first attempt by 30 minutes. Its debit belongs to
+    // the actual attempt day, which can differ from the fixture's start day.
+    let attempt_day = attempt_day.lock().unwrap().expect("one attempt was observed");
+    assert_eq!(counter.runs_today(attempt_day), 1);
+    if attempt_day != utc_day_of(base) {
+        assert_eq!(counter.runs_today(utc_day_of(base)), 0);
+    }
     assert!(counter.preflight_observation.is_none());
+    attempt_day
+}
+
+#[tokio::test(start_paused = true)]
+async fn unrelated_error_text_does_not_enable_preflight_retries_or_refund_attempts() {
+    let base = fixture_base();
+    assert_eq!(assert_unrelated_error_accounting(base).await, utc_day_of(base));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unrelated_error_before_midnight_charges_the_actual_attempt_day() {
+    let base = fixture_base() + chrono::Duration::hours(11) + chrono::Duration::minutes(45);
+    assert_eq!(assert_unrelated_error_accounting(base).await, utc_day_of(base) + 1);
 }
