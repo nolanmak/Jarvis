@@ -155,6 +155,28 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             4,
         )
         .unwrap();
+    // A stranded original native admission is one cause of evidence_unknown.
+    // Recovery must preserve its charge without requiring it as new custody.
+    let old_native_purpose = format!(
+        "{}{}",
+        crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,
+        "a".repeat(64)
+    );
+    store
+        .charge_admitted_model(
+            &lease,
+            "synthetic-original-native",
+            4,
+            None,
+            Some((&old_native_purpose, &binding, 1)),
+            Some(crate::autoship_workflow::submission::Provider::Codex),
+            true,
+        )
+        .unwrap();
+    assert!(store
+        .inspect_verifier_evidence(id)
+        .native_admissions()
+        .is_err());
     let source = issue(false);
     use sha2::Digest;
     let request_hash = format!(
@@ -317,6 +339,19 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         )
         .unwrap(),
         "synthetic original response"
+    );
+    assert!(
+        store
+            .inspect_verifier_evidence(id)
+            .native_admissions()
+            .unwrap()
+            .is_empty(),
+        "superseded native custody cannot poison a fresh episode"
+    );
+    assert_eq!(
+        store.snapshot(id).unwrap().unwrap().model_calls,
+        original.model_calls,
+        "historical charges must remain"
     );
     let plan = store.active_checkout_recovery(id).unwrap().unwrap();
     assert_eq!(plan.principal, "github:controller");
@@ -483,6 +518,29 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             .unwrap_err()
             .is::<crate::autoship_workflow::MissingScopeResponse>(),
         "new-generation missing evidence remains a hold"
+    );
+    let fresh_native_purpose = format!(
+        "{}{}",
+        crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,
+        "b".repeat(64)
+    );
+    store
+        .charge_admitted_model(
+            &fresh_lease,
+            "synthetic-fresh-native",
+            now,
+            None,
+            Some((&fresh_native_purpose, &current.checkpoint.binding, 1)),
+            Some(crate::autoship_workflow::submission::Provider::Codex),
+            true,
+        )
+        .unwrap();
+    assert!(
+        store
+            .inspect_verifier_evidence(id)
+            .native_admissions()
+            .is_err(),
+        "new incomplete native custody must still block"
     );
     let mut next = store.snapshot(id).unwrap().unwrap().checkpoint;
     next.stage = Stage::Scope;

@@ -29,8 +29,9 @@ Preparation fetches main and creates that branch from the recorded base, never
 from the old candidate. A new environment authority identity and domain-separated scope/readiness/budget
 keys prevent old records from being reused as current verification. Current scope
 readers and history scans honor the supersession event: malformed or missing
-evidence from before cutover remains archived, while missing evidence after
-cutover still fails closed. The pending
+evidence and incomplete native admissions from before cutover remain archived,
+with their charges intact. Missing responses or native custody after cutover still
+fail closed. The pending
 Intake gets one opportunity past old daily/dependency scheduling advice; ordinary
 checks and backoff resume as soon as it advances. Recovery grants no build,
 review, publication or merge approval. All normal execution gates still apply.

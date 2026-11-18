@@ -387,8 +387,9 @@ fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScope
     Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
 }
 fn baseline_native_admissions(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeAdmissionData>> {
-    let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
-    let admissions=statement.query_map([workflow],|r|r.get::<_,String>(0))?;
+    let cutover=owner_checkout_recovery::cutover_seq(tx,workflow)?;
+    let mut statement=tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='native_model_admitted' ORDER BY seq")?;
+    let admissions=statement.query_map(params![workflow,cutover],|r|r.get::<_,String>(0))?;
     let mut custody=Vec::new();let mut seen=std::collections::BTreeSet::new();
     for admission in admissions {
         let admission:serde_json::Value=serde_json::from_str(&admission?)?;
@@ -409,7 +410,10 @@ fn baseline_native_admissions(tx:&Connection,workflow:&str)->Result<Vec<NativeSc
             _=>return Err(NativeScopeOutcomeUnresolved.into()),
         }
     }
-    let counted:u64=tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get(0))?;
+    let counted=match owner_checkout_recovery::native_attempts(tx,workflow)? {
+        Some(counted)=>counted,
+        None=>tx.query_row("SELECT COALESCE(SUM(attempts),0) FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2",params![workflow,BASELINE_NATIVE_PURPOSE_PREFIX],|r|r.get::<_,u64>(0))?,
+    };
     if counted!=custody.len() as u64 {return Err(NativeScopeOutcomeUnresolved.into());}
     // This returns original custody, not semantic qualification. The consumer
     // must validate every private native provenance file before new dispatch.

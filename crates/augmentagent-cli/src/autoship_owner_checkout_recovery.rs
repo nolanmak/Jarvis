@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) const SCHEMA:&str="CREATE TABLE IF NOT EXISTS owner_checkout_recovery(
  request_id TEXT PRIMARY KEY,workflow TEXT NOT NULL,principal TEXT NOT NULL,reason TEXT NOT NULL,
- original_checkpoint TEXT NOT NULL,original_snapshot TEXT NOT NULL,original_context TEXT NOT NULL,original_dependencies TEXT NOT NULL,original_scope_keys TEXT NOT NULL,
+ original_checkpoint TEXT NOT NULL,original_snapshot TEXT NOT NULL,original_context TEXT NOT NULL,original_dependencies TEXT NOT NULL,original_scope_keys TEXT NOT NULL,original_bounded_attempts TEXT NOT NULL,
  receipt_path TEXT NOT NULL,receipt BLOB NOT NULL,worktree TEXT NOT NULL,branch TEXT NOT NULL,
  base TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS active_checkout_recovery(workflow TEXT PRIMARY KEY,request_id TEXT NOT NULL REFERENCES owner_checkout_recovery(request_id));";
@@ -115,7 +115,16 @@ impl WorkflowStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
-        tx.execute("INSERT INTO owner_checkout_recovery VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![plan.request_id,plan.workflow,plan.principal,plan.reason,raw,serde_json::to_string(&plan.original)?,serde_json::to_string(&plan.original_context)?,serde_json::to_string(&dependency)?,serde_json::to_string(&keys)?,plan.receipt_path.to_string_lossy(),plan.receipt,plan.worktree.to_string_lossy(),plan.branch,plan.base,now])?;
+        let bounded = {
+            let mut q=tx.prepare("SELECT purpose,binding FROM bounded_attempt WHERE workflow=?1 ORDER BY purpose,binding")?;
+            let rows = q
+                .query_map([&plan.workflow], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        tx.execute("INSERT INTO owner_checkout_recovery VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![plan.request_id,plan.workflow,plan.principal,plan.reason,raw,serde_json::to_string(&plan.original)?,serde_json::to_string(&plan.original_context)?,serde_json::to_string(&dependency)?,serde_json::to_string(&keys)?,serde_json::to_string(&bounded)?,plan.receipt_path.to_string_lossy(),plan.receipt,plan.worktree.to_string_lossy(),plan.branch,plan.base,now])?;
         let prior = serde_json::json!({"kind":"checkout_continuity_lost","archive_request_id":plan.request_id,"superseded_by_owner_recovery":plan.request_id,"original_binding":plan.original.checkpoint.binding});
         tx.execute(
             "INSERT INTO owner_readoption VALUES(?1,?2,'issue',?3,?4,?5,?6,'applied',?7,?7)",
@@ -260,4 +269,32 @@ pub(super) fn scope_keys(
             .take(16)
             .collect(),
     ))
+}
+
+pub(super) fn cutover_seq(conn: &Connection, workflow: &str) -> Result<i64> {
+    Ok(scope_frontier(conn, workflow)?.map_or(0, |(seq, _)| seq))
+}
+pub(super) fn native_attempts(conn: &Connection, workflow: &str) -> Result<Option<u64>> {
+    if scope_frontier(conn, workflow)?.is_none() {
+        return Ok(None);
+    }
+    let raw:String=conn.query_row("SELECT r.original_bounded_attempts FROM active_checkout_recovery a JOIN owner_checkout_recovery r USING(request_id) WHERE a.workflow=?1",[workflow],|r|r.get(0))?;
+    let original: std::collections::BTreeSet<(String, String)> = serde_json::from_str(&raw)?;
+    let mut q=conn.prepare("SELECT purpose,binding,attempts FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2")?;
+    let mut total = 0u64;
+    for row in q.query_map(params![workflow, BASELINE_NATIVE_PURPOSE_PREFIX], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u64>(2)?,
+        ))
+    })? {
+        let (purpose, binding, attempts) = row?;
+        if !original.contains(&(purpose, binding)) {
+            total = total
+                .checked_add(attempts)
+                .context("native scope attempt overflow")?;
+        }
+    }
+    Ok(Some(total))
 }
