@@ -79,6 +79,23 @@ class WordSigningTests(unittest.TestCase):
         self.assertIn('<w:p w:rsidR="00A1"><w:r><w:drawing>', doc)
         self.assertNotIn('<w:p w:rsidR="00A1"/>', doc)
 
+    def test_a_bare_self_closing_cell_paragraph_is_a_signing_cell(self):
+        # Review of #2241: <w:p/> with no attributes at all.
+        raw = docx(para(run("Terms.")) + table_row("Signature:", "<w:p/>"))
+        lines = sign_docx.lines(dict(docx=b64(raw)))["lines"]
+        self.assertEqual([(l["kind"], l["text"]) for l in lines], [("cell", "Signature:")])
+        doc = part(sign_line(raw), "word/document.xml")
+        self.assertIn("<w:p><w:r><w:drawing>", doc)
+
+    def test_character_references_in_the_signed_line_are_preserved(self):
+        # Review of #2241: &#65;lice must still read Alice after signing.
+        raw = docx(para(run("Terms.")) + para(run("Signature (&#65;lice &amp; B&#x6F;b): _____ end")))
+        doc = part(sign_line(raw), "word/document.xml")
+        text = "".join(sign_docx.unescape(t) for t in re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))
+        self.assertIn("Signature (Alice & Bob): ", text)
+        self.assertIn(" end", text)
+        self.assertNotIn("&amp;#", doc)
+
     def test_a_blank_split_across_runs_is_removed_entirely(self):
         # Review of #2241: the preview showed the whole blank gone.
         raw = docx(para(run("Terms.")) + para(run("Signature: ___"), run("____"), run(" (Client)")))

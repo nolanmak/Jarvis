@@ -26,14 +26,21 @@ FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 BLOCKED = re.compile(r"\b(affidavit|sworn\s+statement|penalty\s+of\s+perjury|government\s+filing)\b", re.I)
 SIGN_WORD = re.compile(r"\bsign(?:ature|ed|\s+here)?\b", re.I)
 UNDERSCORES = re.compile(r"_{3,}")
-P_OPEN = re.compile(r"<w:p(?:\s[^>]*)?>")
+# <w:p>, <w:p attr="…">, and their self-closing forms <w:p/> and <w:p attr="…"/>.
+P_OPEN = re.compile(r"<w:p(?:\s[^>]*)?/?>")
 P_CLOSE = "</w:p>"
 T_TEXT = re.compile(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>")
 R_SPAN = re.compile(r"<w:r(?:\s[^>]*)?>.*?</w:r>", re.S)
 RPR = re.compile(r"<w:rPr>.*?</w:rPr>|<w:rPr/>", re.S)
 
 
+NUMERIC_REF = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+);")
+
+
 def unescape(text):
+    """XML character data to text: numeric references (`&#65;`, `&#x41;`)
+    and the five predefined entities, `&amp;` last so it is decoded once."""
+    text = NUMERIC_REF.sub(lambda m: chr(int(m.group(1)[1:], 16) if m.group(1)[0] == "x" else int(m.group(1))), text)
     return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
             .replace("&apos;", "'").replace("&amp;", "&"))
 
