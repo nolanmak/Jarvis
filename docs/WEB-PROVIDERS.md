@@ -27,9 +27,6 @@ them in both places if you use both.
 
 Outside a yolo turn the vendor's own safe-search default is left alone.
 
-Providers whose client has not landed yet are listed by `/search list` as
-`missing not implemented`.
-
 `augmentagent doctor` reports what is usable in the `web_providers` finding,
 and warns when Qwen or GLM is enabled and nothing can search.
 

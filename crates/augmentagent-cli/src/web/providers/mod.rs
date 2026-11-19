@@ -1,13 +1,13 @@
 //! One module per vendor. Each exposes `search` and, when the vendor can
-//! fetch pages, `fetch`. Adding a provider is one module plus one arm in
-//! each dispatcher here and in `ProviderId::implemented`.
+//! fetch pages, `fetch`.
 use super::{Call, Hit, Page, ProviderError, ProviderId};
 
 pub mod brave;
-
-fn not_implemented(id: ProviderId, cx: &Call<'_>) -> ProviderError {
-    ProviderError::new(id, None, "provider is not implemented", cx.keys)
-}
+pub mod brightdata;
+pub mod context;
+pub mod exa;
+pub mod firecrawl;
+pub mod serpapi;
 
 pub async fn search(
     id: ProviderId,
@@ -17,17 +17,33 @@ pub async fn search(
 ) -> Result<Vec<Hit>, ProviderError> {
     match id {
         ProviderId::Brave => brave::search(cx, query, count).await,
-        other => Err(not_implemented(other, cx)),
+        ProviderId::Exa => exa::search(cx, query, count).await,
+        ProviderId::Firecrawl => firecrawl::search(cx, query, count).await,
+        ProviderId::Context => context::search(cx, query, count).await,
+        ProviderId::Serpapi => serpapi::search(cx, query, count).await,
+        ProviderId::Brightdata => brightdata::search(cx, query, count).await,
     }
 }
 
 pub async fn fetch(
     id: ProviderId,
     cx: &Call<'_>,
-    _url: &str,
-    _max_chars: usize,
+    url: &str,
+    max_chars: usize,
 ) -> Result<Page, ProviderError> {
-    Err(not_implemented(id, cx))
+    match id {
+        ProviderId::Exa => exa::fetch(cx, url, max_chars).await,
+        ProviderId::Firecrawl => firecrawl::fetch(cx, url, max_chars).await,
+        ProviderId::Context => context::fetch(cx, url, max_chars).await,
+        ProviderId::Brightdata => brightdata::fetch(cx, url, max_chars).await,
+        // Search-only vendors are never resolved for fetch.
+        ProviderId::Brave | ProviderId::Serpapi => Err(ProviderError::new(
+            id,
+            None,
+            "provider cannot fetch pages",
+            cx.keys,
+        )),
+    }
 }
 
 /// String field of a JSON object, empty when absent or not a string.

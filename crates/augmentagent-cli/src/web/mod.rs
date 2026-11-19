@@ -15,6 +15,8 @@ mod tests;
 mod tool_tests;
 #[cfg(test)]
 mod command_tests;
+#[cfg(test)]
+mod provider_tests;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -69,11 +71,6 @@ impl ProviderId {
             ProviderId::Brightdata => "https://api.brightdata.com",
         }
     }
-
-    /// A provider whose client has not landed yet is listed but unavailable.
-    fn implemented(self) -> bool {
-        matches!(self, ProviderId::Brave)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,7 +116,6 @@ const SERPAPI_KEY_ALIAS: &str = "SERPAPI_API_KEY";
 pub const BRIGHTDATA_API_KEY: &str = "BRIGHTDATA_API_KEY";
 pub const BRIGHTDATA_SERP_ZONE: &str = "BRIGHTDATA_SERP_ZONE";
 pub const BRIGHTDATA_UNLOCKER_ZONE: &str = "BRIGHTDATA_UNLOCKER_ZONE";
-const NOT_IMPLEMENTED: &str = "not implemented";
 
 /// Canonical credential names a provider needs for one kind; `None` when the
 /// vendor has no such product.
@@ -163,7 +159,7 @@ impl std::fmt::Debug for Keys {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Support {
     Ok,
-    /// Credential names that are not present, or `not implemented`.
+    /// Credential names that are not present.
     Missing(Vec<&'static str>),
     Unsupported,
 }
@@ -245,12 +241,10 @@ pub fn availability(lookup: &dyn Fn(&str) -> Option<String>) -> (Availability, K
                         .copied()
                         .filter(|name| !keys.contains_key(name))
                         .collect();
-                    if !missing.is_empty() {
-                        Support::Missing(missing)
-                    } else if id.implemented() {
+                    if missing.is_empty() {
                         Support::Ok
                     } else {
-                        Support::Missing(vec![NOT_IMPLEMENTED])
+                        Support::Missing(missing)
                     }
                 }
             };
