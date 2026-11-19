@@ -209,9 +209,24 @@ impl Registry {
     }
 }
 
+thread_local! {
+    static PATH_FOR_THIS_THREAD: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: point [`config_path`] at a fixture for the current thread, so
+/// tests of the isolation checks in other crates neither read the operator's
+/// registry nor change the process environment. `None` clears it.
+#[doc(hidden)]
+pub fn override_path_for_this_thread(path: Option<PathBuf>) {
+    PATH_FOR_THIS_THREAD.with(|slot| *slot.borrow_mut() = path);
+}
+
 /// `AUGMENTAGENT_YOLO_THREADS_CONFIG`, else `yolo-threads.json` beside the
 /// other small Jarvis config files.
 pub fn config_path() -> PathBuf {
+    if let Some(path) = PATH_FOR_THIS_THREAD.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     std::env::var_os("AUGMENTAGENT_YOLO_THREADS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -227,6 +242,32 @@ pub fn config_path() -> PathBuf {
 /// Is this channel a yolo thread, per the configured registry?
 pub fn mark(channel_id: u64) -> ThreadMark {
     Registry::system().mark(channel_id)
+}
+
+/// May anything that is not a yolo turn see, store or run in this channel?
+/// `Yes` closes it. `Unknown` closes guild channels only: a DM can never be
+/// a yolo thread, so a damaged registry must not blank DMs.
+pub fn closed_to_normal_turns(mark: ThreadMark, in_guild: bool) -> bool {
+    match mark {
+        ThreadMark::Yes => true,
+        ThreadMark::Unknown => in_guild,
+        ThreadMark::No => false,
+    }
+}
+
+/// The one check for every writer of stored Discord messages (#2218). A
+/// message from a yolo thread is never stored, so the memory tools that
+/// search stored messages can never return it to a normal turn. `thread_id`
+/// is the Discord channel id the row carries; `kind` is `dm`, `group` or
+/// `guild_channel`.
+pub fn blocks_discord_row(platform: &str, thread_id: Option<&str>, kind: &str) -> bool {
+    if platform != "discord" {
+        return false;
+    }
+    let Some(channel) = thread_id.and_then(|id| id.parse::<u64>().ok()) else {
+        return false;
+    };
+    closed_to_normal_turns(mark(channel), !matches!(kind, "dm" | "group"))
 }
 
 #[cfg(test)]
@@ -316,6 +357,32 @@ mod tests {
         );
         std::os::unix::fs::symlink(&target, registry.path()).unwrap();
         assert_eq!(registry.mark(42), ThreadMark::Unknown);
+    }
+
+    #[test]
+    fn discord_rows_from_yolo_threads_are_blocked_and_unknown_closes_guild_channels_only() {
+        let (_dir, registry) = registry();
+        registry.record(1001, 77, 1).unwrap();
+        override_path_for_this_thread(Some(registry.path().to_path_buf()));
+        assert!(blocks_discord_row("discord", Some("1001"), "guild_channel"));
+        assert!(!blocks_discord_row("discord", Some("77"), "guild_channel"));
+        assert!(
+            !blocks_discord_row("discord", Some("1001x"), "guild_channel"),
+            "not a channel id"
+        );
+        assert!(!blocks_discord_row("discord", None, "guild_channel"));
+        assert!(
+            !blocks_discord_row("slack", Some("1001"), "guild_channel"),
+            "other platforms are untouched"
+        );
+        // A registry that cannot be read: guild channels are closed, DMs are not.
+        write_private(registry.path(), b"{broken");
+        assert!(blocks_discord_row("discord", Some("55"), "guild_channel"));
+        assert!(!blocks_discord_row("discord", Some("55"), "dm"));
+        assert!(!blocks_discord_row("discord", Some("55"), "group"));
+        override_path_for_this_thread(None);
+        assert!(closed_to_normal_turns(ThreadMark::Yes, false));
+        assert!(!closed_to_normal_turns(ThreadMark::No, true));
     }
 
     #[test]

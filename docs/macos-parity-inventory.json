@@ -3734,7 +3734,7 @@
     "id": "cli:auto-pr-worker",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux runs opted-in auto-ship in an independent process, retaining active work across serving-daemon updates.",
-    "macos_target": "Equivalent independent worker lifetime under launchd; current macOS deployments retain the embedded loop and serialized builds.",
+    "macos_target": "Equivalent independent worker lifetime under launchd: ensure-autopr-worker.sh installs the com.nolanmak.augmentagent.autopr LaunchAgent (#2275); the daemon no longer hosts an embedded loop on any OS.",
     "prerequisites": [
       "Rust CLI",
       "Native service manager"

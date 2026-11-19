@@ -11,6 +11,21 @@ fn retry_age(snapshot:Option<&Snapshot>)->i64 {
         .map_or(0,|s|s.heartbeat_at_ms.max(1))
 }
 
+/// #2279 — a candidate that was built, verified and reviewed but whose push
+/// never landed is the cheapest finished work: it needs no model call.
+pub(super) fn publish_retry(snapshot:Option<&Snapshot>)->bool {
+    snapshot.is_some_and(|s|s.checkpoint.stage==Stage::Publish
+        && s.checkpoint.next.reason=="publishing_revision" && s.checkpoint.next.action=="push")
+}
+
+/// Issues whose durable workflow awaits only a publication retry. These are
+/// exempt from the same-day attempt marker, like other recovery retries.
+pub(super) fn publish_retries(issues:&[RestIssue],controls:&workflow::FreshIssueControls,repository:&str)
+    ->std::collections::BTreeSet<u64> {
+    issues.iter().filter(|issue|publish_retry(controls.selection_snapshot(repository,issue.number).ok().flatten().as_ref()))
+        .map(|issue|issue.number).collect()
+}
+
 pub(super) fn candidates(
     issues:Vec<RestIssue>,recovered:&std::collections::BTreeSet<u64>,
     controls:&workflow::FreshIssueControls,repository:&str,now:i64,
@@ -45,7 +60,11 @@ pub(super) fn candidates(
         // three claims, a repeatedly deferred issue yields to less
         // attempted peers; among such retries, the least recently active goes
         // first. Durable lease activity survives restart, unlike a poll cursor.
-        let key=(issue.research_filed,retry_age(snapshot.as_ref()),!recovered.contains(&issue.number));
+        // #2279 — a due publication retry is finished work and goes first.
+        // A publication retry that has itself stalled (#2280's repeated-claim
+        // tier) keeps rotating with its peers instead of starving them.
+        let age=retry_age(snapshot.as_ref());
+        let key=(!(publish_retry(snapshot.as_ref()) && age==0),issue.research_filed,age,!recovered.contains(&issue.number));
         ranked.push((key,issue));
     }
     ranked.sort_by_key(|(key,_)|*key);

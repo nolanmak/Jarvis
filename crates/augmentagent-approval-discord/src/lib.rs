@@ -16,6 +16,8 @@ pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
 pub mod owner_text;
+#[cfg(test)]
+mod yolo_isolation_tests;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
@@ -601,6 +603,11 @@ pub trait QueryHandler: Send + Sync {
         _text: &str,
     ) -> Option<owner_text::OwnerCommandOutcome> {
         None
+    }
+
+    /// #2219 — the first line of every message posted for a yolo turn.
+    fn yolo_tag(&self) -> String {
+        "[yolo]".into()
     }
 
     /// Model selected for a new scheduled loop in this conversation.

@@ -79,23 +79,39 @@ impl UpgradeWatch {
     }
 }
 
-pub fn external_enabled() -> bool {
-    cfg!(target_os = "linux")
-        && matches!(
-            std::env::var("AUGMENTAGENT_AUTOPR_EXTERNAL").as_deref(),
-            Ok("1" | "true")
-        )
+/// `AUGMENTAGENT_AUTOPR_EXTERNAL` used to choose between an in-daemon loop and
+/// this worker. Auto-ship now runs only here (#2275), so any value is ignored;
+/// returns the warning to log when it is still set.
+pub fn deprecated_external_flag(value: Option<&str>) -> Option<String> {
+    value.map(|value| format!(
+        "AUGMENTAGENT_AUTOPR_EXTERNAL={value:?} is deprecated and ignored: auto-ship always runs \
+         in the `augmentagent auto-pr-worker` service, never in the daemon; remove it from .env and unit files"
+    ))
+}
+
+/// Logs the deprecation once at startup when the old mode flag is still set.
+pub fn warn_if_external_flag_set() {
+    let value = std::env::var("AUGMENTAGENT_AUTOPR_EXTERNAL").ok();
+    if let Some(warning) = deprecated_external_flag(value.as_deref()) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// The daemon never hosts auto-ship, so its marker always reports the
+/// external worker. The updater, status and recovery helpers still verify
+/// the live daemon's identity (pid and process birth) from this record.
+fn host_marker(pid: u32, birth: String) -> serde_json::Value {
+    serde_json::json!({"pid": pid, "birth": birth, "external": true})
 }
 
 /// This is written by the actual daemon, not by the installer. The updater
-/// must not mistake a configured-but-not-yet-restarted legacy daemon for an
-/// isolated worker deployment.
-pub fn record_host_mode(external: bool) -> Result<()> {
+/// must not mistake a not-yet-restarted older daemon, which could still host
+/// an embedded loop, for one that has restarted onto this build.
+pub fn record_host_mode() -> Result<()> {
     let state = crate::build_storage::state_dir()?;
     std::fs::create_dir_all(&state)?;
     let birth = process_birth(Path::new("/proc/self/stat")).unwrap_or_default();
-    let value =
-        serde_json::json!({"pid": std::process::id(), "birth": birth, "external": external});
+    let value = host_marker(std::process::id(), birth);
     let temporary = state.join(format!("autopr-host.{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(&value)?)?;
     std::fs::rename(temporary, state.join("autopr-host.json"))?;
@@ -203,6 +219,33 @@ mod tests {
         let touched=watch();
         set_modified(before.modified().unwrap()+std::time::Duration::from_secs(60));
         assert!(!touched.changed().unwrap(),"a touch alone is not a new policy");
+    }
+    /// #2275 — one execution path: the daemon never runs the auto-ship loop,
+    /// whatever the OS or `AUGMENTAGENT_AUTOPR_EXTERNAL` say. The serve command
+    /// is the only daemon entry point, so it must not construct the loop.
+    #[test]
+    fn the_daemon_never_hosts_the_autoship_loop() {
+        let main = include_str!("main.rs");
+        assert!(!main.contains("AutoPrLoop::from_env"),
+            "serve must not start an in-daemon auto-ship loop; it runs only in `auto-pr-worker`");
+        assert!(!main.contains("external_enabled"),
+            "the daemon must not branch on AUGMENTAGENT_AUTOPR_EXTERNAL");
+        // Consumers (status, recovery, updater) read this marker; the daemon
+        // always reports that the worker, not the daemon, hosts auto-ship.
+        let marker = host_marker(31, "77".into());
+        assert_eq!(marker["external"], serde_json::json!(true));
+        assert_eq!(marker["pid"], serde_json::json!(31));
+        assert_eq!(marker["birth"], serde_json::json!("77"));
+    }
+    #[test]
+    fn the_external_flag_is_accepted_but_ignored_with_a_deprecation_warning() {
+        for value in ["1", "true", "0", "false", ""] {
+            let warning = deprecated_external_flag(Some(value))
+                .unwrap_or_else(|| panic!("AUGMENTAGENT_AUTOPR_EXTERNAL={value:?} must warn"));
+            assert!(warning.contains("AUGMENTAGENT_AUTOPR_EXTERNAL"), "{warning}");
+            assert!(warning.contains("deprecated") && warning.contains("ignored"), "{warning}");
+        }
+        assert_eq!(deprecated_external_flag(None), None);
     }
     #[test]
     fn replacing_binary_is_detected_without_treating_missing_file_as_an_upgrade() {
