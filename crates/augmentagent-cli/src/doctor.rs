@@ -222,6 +222,7 @@ pub async fn run(
     findings.push(check_socialapi(&store));
     findings.push(yolo_profile_finding(augmentagent_channel_core::yolo::readiness()));
     findings.push(check_message_index(&store));
+    findings.push(check_linkedin_session(&store));
     findings.push(check_embeddings_provider());
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
     findings.push(check_calendar_scheduled(&store));
@@ -936,6 +937,33 @@ fn check_message_index(store: &Store) -> Finding {
             "message_index",
             format!("message index check failed: {e:#}"),
             Some("augmentagent messages reindex"),
+        ),
+    }
+}
+
+/// #2255 — a LinkedIn session that needs a new login. An error, not a warn:
+/// nothing on the channel is read until the owner logs in again.
+fn check_linkedin_session(store: &Store) -> Finding {
+    use augmentagent_channel_linkedin::session_guard;
+    match session_guard::dead_sessions(store) {
+        Ok(dead) if dead.is_empty() => Finding::ok("linkedin_session", "no rejected LinkedIn session"),
+        Ok(dead) => Finding::error(
+            "linkedin_session",
+            dead.iter()
+                .map(|d| {
+                    let since = chrono::DateTime::from_timestamp_millis(d.since_ms)
+                        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| d.since_ms.to_string());
+                    format!("LinkedIn is not being read for {} since {since}: {}", d.account, d.error)
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Some(session_guard::LOGIN_COMMAND),
+        ),
+        Err(e) => Finding::warn(
+            "linkedin_session",
+            format!("LinkedIn session check failed: {e:#}"),
+            None,
         ),
     }
 }
@@ -2454,6 +2482,25 @@ mod tests {
         assert!(!item.exists());
     }
     use std::collections::BTreeMap;
+
+    #[test]
+    fn linkedin_session_fails_while_dead_and_clears_on_a_successful_read() {
+        use augmentagent_channel_linkedin::session_guard;
+        let store = Store::open(":memory:").unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Ok);
+        let account = "urn:li:fsd_profile:OWNER";
+        session_guard::record_failure(&store, account, "LinkedIn redirected the API request", 1_700_000_000_000).unwrap();
+        let finding = check_linkedin_session(&store);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains(account), "{}", finding.message);
+        assert!(finding.message.contains("2023-11-14T22:13:20Z"), "{}", finding.message);
+        assert_eq!(finding.suggested_cmd.as_deref(), Some(session_guard::LOGIN_COMMAND));
+        // A login alone lifts the pause, not the finding.
+        session_guard::clear_pause_after_login(&store, account).unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Error);
+        session_guard::record_success(&store, account, 1_700_000_100_000).unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Ok);
+    }
 
     #[test]
     fn severity_strings() {

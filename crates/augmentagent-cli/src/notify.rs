@@ -289,6 +289,8 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("pr_awaiting_approval", "crates/augmentagent-cli/src/self_improve.rs", ".post_flag_notice(", 1, BROKER, "agent-coding PR awaiting approval")),
     p("heartbeat", "crates/augmentagent-heartbeat/src/runner.rs", ".post_flag_notice(", 2, BROKER, "heartbeat check-ins"),
     p("proactive", "crates/augmentagent-proactive/src/runner.rs", ".post_flag_notice(", 1, BROKER, "proactive notices"),
+    // #2255: the owner has to log in again, so this one is actionable.
+    act(p("linkedin_session", "crates/augmentagent-channel-linkedin/src/session_guard.rs", ".post_flag_notice(", 1, BROKER, "LinkedIn session stopped reading, daily reminder, and reading again")),
     // -- Loops (#1292) --------------------------------------------------------
     act(p("loop_output_slack", "crates/augmentagent-channel-slack/src/commands/loops.rs", "impl LoopPoster for", 2, LOOP, "loop results and reminders on Slack")),
     act(p("loop_output_discord", CLI, "impl LoopPoster for", 1, LOOP, "loop results and reminders on Discord")),
