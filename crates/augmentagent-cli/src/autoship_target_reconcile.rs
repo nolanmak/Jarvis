@@ -202,4 +202,75 @@ else:raise Exception('unexpected GitHub call '+repr(a))
             .output().unwrap();
         assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
     }
+
+    /// #2279 (pr/2022 incident): a PR merged outside autoship while its own
+    /// Push intent never reached GitHub stayed at `publish / push` for days:
+    /// the unconfirmed intent held terminal reconciliation forever. A positive
+    /// remote read of a different branch head settles the intent with that
+    /// evidence and the workflow terminates with a clear reason. A matching or
+    /// unreadable head keeps the fence.
+    #[tokio::test]
+    async fn terminal_pr_with_unlanded_push_intent_reconciles() {
+        const CHILD:&str="AUTOSHIP_UNLANDED_PUSH_FIXTURE";
+        if let Some(root)=std::env::var_os(CHILD).map(std::path::PathBuf::from) {
+            for case in ["unlanded","landed","unreadable"] {
+                let path=root.join(format!("{case}.db"));
+                let mut store=WorkflowStore::open(&path).unwrap();
+                let now=chrono::Utc::now().timestamp_millis();
+                let id=crate::autoship_workflow::pr_workflow_id("owner/repo",42).unwrap();
+                let binding=Binding {head:"a".repeat(40),contract:"contract".into(),evidence_hash:"evidence".into()};
+                store.register(&id,"feat/fixture",binding.clone(),now).unwrap();
+                let lease=store.claim(&id,"original",now,60_000).unwrap().unwrap();
+                store.attach_pr_in_repo(&lease,"owner/repo",42,now).unwrap();
+                store.charge(&lease,"prior-paid",ResourceCharge {model_calls:3,tokens:700,wall_ms:5},now).unwrap();
+                let push=store.begin_operation(&lease,OperationKind::Push,&binding,now).unwrap();
+                let mut cp=store.snapshot(&id).unwrap().unwrap().checkpoint;
+                cp.stage=Stage::Publish;cp.next=NextAction {reason:"publishing_revision".into(),action:"push".into(),eligible_at_ms:0};
+                store.checkpoint(&lease,&cp,now).unwrap();
+                store.release(&lease,now).unwrap();
+                let remote=match case {"unlanded"=>json!("c".repeat(40)),"landed"=>json!("a".repeat(40)),_=>serde_json::Value::Null};
+                std::fs::write(root.join("scenario.json"),json!({"permission":"ADMIN","remote":remote,
+                    "pr":{"number":42,"state":"MERGED","url":"https://github.com/owner/repo/pull/42","mergeCommit":{"oid":"d".repeat(40)}}}).to_string()).unwrap();
+                let result=apply(&root,&path,"owner/repo/pr/42").await;
+                if case=="unlanded" {
+                    result.unwrap();
+                    let after=store.snapshot(&id).unwrap().unwrap();
+                    assert_eq!(after.checkpoint.stage,Stage::Merged,"terminal target stayed at publish");
+                    assert_eq!(after.checkpoint.next.reason,"external_merge_reconciled");
+                    assert_eq!((after.model_calls,after.tokens),(3,700));
+                    assert!(store.pending_operations(&id).unwrap().is_empty());
+                    let receipt:String=rusqlite::Connection::open(&path).unwrap().query_row(
+                        "SELECT receipt FROM operation WHERE id=?1",[&push.id],|r|r.get(0)).unwrap();
+                    assert_eq!(receipt,format!("terminal-target-unlanded:github:pr:42:terminal:remote-head:{}","c".repeat(40)),
+                        "settlement must preserve the remote observation as evidence");
+                    assert!(store.events(&id).unwrap().iter().any(|event|event.1=="pending_push_settled_terminal_target"));
+                } else {
+                    assert!(result.is_err(),"{case}: settled without positive evidence the Push never landed");
+                    assert_eq!(store.pending_operations(&id).unwrap().len(),1);
+                    assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Publish);
+                }
+            }
+            return;
+        }
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();let gh=root.join("gh.py");
+        augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['AUTOSHIP_UNLANDED_PUSH_FIXTURE']);s=json.loads((root/'scenario.json').read_text());a=sys.argv[1:]
+if a[:2]==['repo','view']:print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
+elif a[:2]==['api','graphql']:print(json.dumps({'data':{'viewer':{'login':'owner'}}}))
+elif a[:2]==['pr','view']:
+ assert a[2]=='42' and a[a.index('--repo')+1]=='owner/repo';print(json.dumps(s['pr']))
+elif a[:2]==['api','repos/owner/repo/git/ref/heads/feat/fixture']:
+ if s['remote'] is None:sys.exit(1)
+ print(s['remote'])
+else:raise Exception('unexpected GitHub call '+repr(a))
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","autoship_commands::target_reconcile::tests::terminal_pr_with_unlanded_push_intent_reconciles","--nocapture"])
+            .env(CHILD,root).env("GH_BIN",gh).env("XDG_STATE_HOME",root.join("state"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",root.join("must-not-be-opened-policy"))
+            .output().unwrap();
+        assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+    }
 }

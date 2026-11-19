@@ -2,7 +2,10 @@
 //! replaces checkout custody, original verifier evidence, owner control or leases.
 use super::*;
 pub(crate) const POLICY: &str = "safe-scope-repair-v1";
-pub(crate) const READINESS_POLICY: &str = "readiness-safe-defaults-repair-v5";
+/// v6 (#2289): readiness never parks for a decision or on validation
+/// exhaustion. The bump changes the verifier environment identity, so holds
+/// parked under v5 are re-evaluated without issue edits.
+pub(crate) const READINESS_POLICY: &str = "readiness-never-park-v6";
 fn old_policy(conn: &Connection, id: &str, cp: &Checkpoint) -> Result<bool> {
     Ok(
         qualification_schedule::context(conn, id, &cp.binding)?.is_some_and(|context| {
