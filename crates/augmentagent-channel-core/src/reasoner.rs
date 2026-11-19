@@ -1193,6 +1193,36 @@ fn select_final_text(blocks: &[String], result: Option<&str>, capture: TextCaptu
     }
 }
 
+/// Flags that set which tools a non-bridge Claude call loads.
+fn tool_scope_args(opts: &ReasonerOpts) -> Vec<String> {
+    // An empty auto-approval list is not the same as removing tools.
+    // Evidence selection and other text-only transforms execute reads
+    // through their coordinator, never through ambient CLI tools/MCP.
+    if crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
+        return vec!["--tools".into(), "".into(), "--strict-mcp-config".into(),
+            "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()];
+    }
+    // #2287 — `--allowedTools` only grants permission; Claude Code still
+    // loads every built-in tool, plus the host's own skills, slash commands
+    // and settings, unless told otherwise (~15k tokens per call). Load just
+    // the built-ins the call may use: `Bash(augmentagent …)` needs `Bash`,
+    // `Read(//path/**)` needs `Read`. MCP tools come from `--mcp-config`, and
+    // explicit `--settings` (hooks, permission denies) still applies.
+    let mut builtins: Vec<&str> = Vec::new();
+    for allowed in &opts.allowed_tools {
+        let name = allowed.split('(').next().unwrap_or_default().trim();
+        if !name.is_empty() && !name.starts_with("mcp__") && !builtins.contains(&name) {
+            builtins.push(name);
+        }
+    }
+    let mut args = vec!["--tools".into(), builtins.join(",")];
+    // The Skill tool serves skills from the host's settings sources.
+    if !builtins.contains(&"Skill") {
+        args.extend(["--setting-sources".into(), "".into(), "--disable-slash-commands".into()]);
+    }
+    args
+}
+
 impl ClaudeCliReasoner {
     /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
     /// outer wrapper can retry on a recoverable failure (corrupted
@@ -1251,12 +1281,8 @@ impl ClaudeCliReasoner {
         } else {
             args.push("--allowedTools".into());
             args.push(opts.allowed_tools.join(" "));
-            // An empty auto-approval list is not the same as removing tools.
-            // Evidence selection and other text-only transforms execute reads
-            // through their coordinator, never through ambient CLI tools/MCP.
-            if !fresh_review && crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
-                args.extend(["--tools".into(), "".into(), "--strict-mcp-config".into(),
-                    "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
+            if !fresh_review {
+                args.extend(tool_scope_args(opts));
             }
         }
 
@@ -5440,6 +5466,106 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         }
         assert!(!argv.contains("--resume") && !argv.contains("builder-session") && !argv.contains("--add-dir"));
         assert_ne!(std::fs::read_to_string(cwd_path).unwrap().trim(), dir.path().to_str().unwrap());
+    }
+
+    /// Runs `opts` through a stub CLI and returns the argv it was spawned with.
+    async fn spawned_argv(opts: &ReasonerOpts) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("argv.txt");
+        let bin = stub_cli(&dir, "fake-claude-argv", &format!(
+            "printf '%s\\0' \"$@\" > '{}'\ncat >/dev/null\n{RESULT_OK}\n", args_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_eq!(reasoner.call(opts, "synthetic question").await.unwrap(), "ok");
+        let raw = std::fs::read_to_string(args_path).unwrap();
+        raw.strip_suffix('\0').unwrap_or(&raw).split('\0').map(str::to_owned).collect()
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).map(String::as_str)
+    }
+
+    /// #2287 — `--allowedTools` only grants permission; without `--tools`
+    /// Claude Code still loads every built-in tool plus the host's own
+    /// skills, slash commands and settings (~15k tokens per ask). This one
+    /// checks the spawned argv end to end (needs Linux process tracking).
+    #[tokio::test]
+    async fn ask_opts_spawn_loads_only_the_builtin_tools_it_is_allowed() {
+        let repo = tempfile::tempdir().unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let argv = spawned_argv(&opts).await;
+        let tools: Vec<&str> = flag_value(&argv, "--tools").expect("--tools passed").split(',').collect();
+        assert_eq!(tools, ["Read", "Grep", "Glob", "Write", "Edit", "WebSearch", "WebFetch", "Bash"]);
+        assert_eq!(flag_value(&argv, "--setting-sources"), Some(""));
+        assert!(argv.iter().any(|a| a == "--disable-slash-commands"), "{argv:?}");
+        // Permissions and MCP servers are unchanged: patterns stay in
+        // --allowedTools and the memory server still comes from --mcp-config.
+        let allowed = flag_value(&argv, "--allowedTools").unwrap();
+        assert!(allowed.contains("Bash(augmentagent finance status)") && allowed.contains("mcp__memory__memory_search"));
+        assert!(flag_value(&argv, "--mcp-config").unwrap().contains("\"memory\""));
+        assert!(flag_value(&argv, "--settings").is_some(), "per-call hook settings must still be passed");
+    }
+
+    #[test]
+    fn ask_opts_tool_scope_lists_exactly_its_builtins() {
+        let repo = tempfile::tempdir().unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let argv = tool_scope_args(&opts);
+        assert_eq!(flag_value(&argv, "--tools"), Some("Read,Grep,Glob,Write,Edit,WebSearch,WebFetch,Bash"));
+        assert_eq!(flag_value(&argv, "--setting-sources"), Some(""));
+        assert!(argv.iter().any(|a| a == "--disable-slash-commands"), "{argv:?}");
+        // MCP servers still come from the settings split in call_once.
+        assert!(!argv.iter().any(|a| a == "--mcp-config"), "{argv:?}");
+    }
+
+    #[test]
+    fn tool_scope_names_builtins_from_permission_patterns_only() {
+        let mut opts = dummy_opts();
+        opts.allowed_tools = vec!["Read(//fixture/**)".into(), "Grep".into(), "Read".into(),
+            "Bash(git status*)".into(), "Bash(ls *)".into(), "mcp__fixture__search".into()];
+        let argv = tool_scope_args(&opts);
+        assert_eq!(argv, ["--tools", "Read,Grep,Bash", "--setting-sources", "", "--disable-slash-commands"]);
+
+        // A call granted only MCP tools gets no built-ins at all.
+        opts.allowed_tools = vec!["mcp__fixture__search".into()];
+        assert_eq!(flag_value(&tool_scope_args(&opts), "--tools"), Some(""));
+
+        // The Skill tool needs the host's skills, so it keeps them loaded.
+        opts.allowed_tools = vec!["Read".into(), "Skill".into()];
+        assert_eq!(tool_scope_args(&opts), ["--tools", "Read,Skill"]);
+
+        // Text-only calls keep their existing argv.
+        opts.allowed_tools.clear();
+        assert_eq!(tool_scope_args(&opts), ["--tools", "", "--strict-mcp-config", "--mcp-config",
+            r#"{"mcpServers":{}}"#, "--disable-slash-commands"]);
+    }
+
+    /// Every built-in a preset is allowed to use stays loaded.
+    #[test]
+    fn tool_scope_keeps_each_preset_builtin() {
+        let wiki = tempfile::tempdir().unwrap();
+        for (name, opts) in [
+            ("triage", triage_opts(Some(wiki.path().to_path_buf()))),
+            ("draft", draft_opts("stub".into(), Some(wiki.path().to_path_buf()))),
+            ("digest", digest_opts(Some(wiki.path().to_path_buf()))),
+            ("wiki_migrate", wiki_migrate_opts("stub".into(), wiki.path().to_path_buf())),
+            ("lint", lint_opts("stub".into(), wiki.path().to_path_buf())),
+            ("ingest", ingest_opts("stub".into(), wiki.path().to_path_buf())),
+            ("resume", resume_opts(wiki.path().to_path_buf())),
+        ] {
+            assert!(!opts.allowed_tools.is_empty(), "{name}");
+            let argv = tool_scope_args(&opts);
+            let tools: Vec<&str> = flag_value(&argv, "--tools").unwrap().split(',').filter(|t| !t.is_empty()).collect();
+            for allowed in &opts.allowed_tools {
+                let builtin = allowed.split('(').next().unwrap();
+                if !builtin.starts_with("mcp__") {
+                    assert!(tools.contains(&builtin), "{name}: {builtin} missing from {tools:?}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
