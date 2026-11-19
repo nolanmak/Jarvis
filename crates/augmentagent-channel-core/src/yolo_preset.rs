@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// The one list of integration commands yolo may run, shared with the bridge
 /// test that proves each is read-only.
 const READONLY_COMMANDS: &str =
-    include_str!("../../../scripts/tests/fixtures/yolo-readonly-commands.json");
+    include_str!("yolo_readonly_commands.json");
 
 /// Read-only memory tools, the same seven `ask_opts` grants.
 pub const MEMORY_TOOLS: [&str; 7] = [

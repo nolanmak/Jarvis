@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Every integration command the yolo preset grants is read-only (#2216).
 
-The list lives in fixtures/yolo-readonly-commands.json and is also what the
-Rust preset builds its permissions from. A yolo turn is answered by an
+The list lives beside the Rust preset, which builds its permissions from it
+(crates/augmentagent-channel-core/src/yolo_readonly_commands.json). A yolo turn is answered by an
 unfiltered model that reads untrusted web pages, so nothing on this list may
 send, post, schedule or otherwise change anything.
 """
@@ -16,7 +16,10 @@ SPEC = importlib.util.spec_from_file_location('codex_tool_bridge', SCRIPTS / 'co
 bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
-FIXTURE = json.loads((Path(__file__).parent / 'fixtures' / 'yolo-readonly-commands.json').read_text())
+# The list is embedded in the daemon, so it lives beside the preset in the
+# crate source, where the updater knows a change needs a rebuild.
+FIXTURE = json.loads(
+    (SCRIPTS.parent / 'crates/augmentagent-channel-core/src/yolo_readonly_commands.json').read_text())
 
 
 def commands():
