@@ -2799,6 +2799,17 @@ enum LinkedinOp {
         /// Read into memory only; do not open the production database.
         #[arg(long)]
         dry_run: bool,
+        /// Seconds between two page requests. Up to as much again is added
+        /// at random, so the default reads one page every 5 to 10 seconds.
+        #[arg(long, default_value_t = 5)]
+        page_delay_secs: u32,
+        /// Backfill requests allowed for the account in any hour. A spent
+        /// budget stops the run; live poll reads are not charged to it.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..))]
+        hourly_requests: u32,
+        /// Backfill requests allowed for the account in any 24 hours.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..))]
+        daily_requests: u32,
     },
     /// Persisted coverage, not a credentials-present indicator.
     ArchiveStatus {
@@ -3203,8 +3214,9 @@ async fn main() -> Result<()> {
         .init();
 
     // Dry-run must precede Store::open and all persistent bootstrap hooks.
-    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
-        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh).await;
+    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true, page_delay_secs, hourly_requests, daily_requests } } = cli.cmd {
+        let pacing = linkedin_archive::pacing(page_delay_secs, hourly_requests, daily_requests);
+        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh, pacing).await;
     }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
@@ -3706,7 +3718,7 @@ async fn main() -> Result<()> {
                     // A second serve must preserve both live configuration
                     // evidence and the updater's matching isolation receipt.
                     if let Err(error) = autoship_worker::record_host_mode() {
-                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                        warn!(%error, "could not publish auto-ship host mode; worker recovery will not attest this daemon");
                     }
                 }
                 Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
@@ -4966,7 +4978,7 @@ async fn main() -> Result<()> {
             ResumeOp::Ingest { file } => run_resume_ingest(&cli, file.clone()).await,
         },
         Cmd::Linkedin { ref op } => match op {
-            LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone()).await,
+            LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone(), &store).await,
             LinkedinOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_linkedin_channel(&cli, store, broker, *dry_run)?;
@@ -4984,8 +4996,9 @@ async fn main() -> Result<()> {
                 print!("{}", dispatch_linkedin_read(op, &reader).await?);
                 Ok(())
             },
-            LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
-                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
+            LinkedinOp::Backfill { category, max_pages, refresh, page_delay_secs, hourly_requests, daily_requests, .. } =>
+                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh,
+                    linkedin_archive::pacing(*page_delay_secs,*hourly_requests,*daily_requests)).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {
                 conversation_urn,
@@ -9776,7 +9789,14 @@ async fn run_digest(
     let reasoner = build_reasoner();
     let opts = digest_opts(cli.wiki_dir.clone());
     info!(window_hours = since_hours, post_discord, "composing digest");
-    let digest = reasoner.call(&opts, &ctx).await?;
+    let mut digest = reasoner.call(&opts, &ctx).await?;
+    // #2255: appended after composition so a dead LinkedIn session is in every
+    // digest while it lasts, whatever the model chose to summarise.
+    match augmentagent_channel_linkedin::session_guard::digest_line(&store) {
+        Ok(Some(line)) => digest = format!("{}\n\n{line}", digest.trim_end()),
+        Ok(None) => {}
+        Err(error) => warn!("LinkedIn session state unavailable for the digest: {error:#}"),
+    }
 
     println!("{digest}");
 
@@ -12155,6 +12175,22 @@ impl QueryHandler for WikiQuerier {
         let origin = context.origin().ok()?;
         let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
         Some(origin)
+    }
+
+    async fn owner_text_command(
+        &self,
+        cx: augmentagent_approval_discord::owner_text::OwnerCommandCtx,
+        text: &str,
+    ) -> Option<augmentagent_approval_discord::owner_text::OwnerCommandOutcome> {
+        // #2208 — `/search`: configuration only, never a vendor call.
+        let (availability, _) = web::availability(&augmentagent_channel_core::secret_loader::load_provider_key);
+        web::command::run(
+            text,
+            &cx.channel_id.to_string(),
+            &web::pins::PinStore::new(web::pins::config_path()),
+            &availability,
+        )
+        .map(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply)
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
@@ -17413,7 +17449,7 @@ fn load_linkedin_client(repo_root: &std::path::Path) -> Option<Arc<VoyagerClient
     }
 }
 
-async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
+async fn run_linkedin_login(cookies_json: PathBuf, store: &Store) -> Result<()> {
     let raw = std::fs::read_to_string(&cookies_json)
         .with_context(|| format!("read cookies file at {}", cookies_json.display()))?;
     let mut auth: LinkedInAuth = serde_json::from_str(&raw)
@@ -17449,6 +17485,11 @@ async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
         .context("save auth to keychain (augmentagent/linkedin/default)")?;
     println!("linkedin auth saved to {} + keychain (augmentagent/linkedin/default)", out.display());
     println!("member: {}", auth.member_urn);
+    // #2255: a dead session is paused for up to hours. The new cookies were
+    // just probed, so let the next read go out now instead of waiting it out.
+    if augmentagent_channel_linkedin::session_guard::clear_pause_after_login(store, &auth.member_urn)? {
+        println!("cleared the read pause left by the previous session; the next poll reads again");
+    }
     Ok(())
 }
 

@@ -30,13 +30,90 @@ fn enrolled(conn: &Connection, id: &str) -> Result<bool> {
 pub(crate) fn fresh_epoch(conn: &Connection, id: &str) -> Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_policy_reconsidered' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.policy')=?2 AND json_extract(payload,'$.fresh_scope')=1 ELSE 0 END)",params![id,POLICY],|r|r.get(0))?)
 }
+fn schedule_reconsideration(
+    tx: &Transaction<'_>,
+    id: &str,
+    generation: i64,
+    cp: &Checkpoint,
+    now: i64,
+) -> Result<()> {
+    let cutover = owner_checkout_recovery::cutover_seq(tx, id)?;
+    let original:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='verifier_evidence_recorded') OR EXISTS(SELECT 1 FROM workflow_event e JOIN scope_stage_response s ON s.workflow=e.workflow AND s.key=json_extract(e.payload,'$.key') WHERE e.workflow=?1 AND e.seq>?2 AND e.kind='scope_stage_response_recorded' AND json_valid(e.payload) AND CASE WHEN json_valid(s.response) THEN json_extract(s.response,'$.kind')='original_verifier_plan' ELSE 0 END)",params![id,cutover],|r|r.get(0))?;
+    let payload = serde_json::json!({"version":1,"policy":POLICY,"prior_checkpoint":serde_json::to_string(cp)?,"fresh_scope":!original,"original_evidence":"preserved"});
+    event(
+        tx,
+        id,
+        generation,
+        "scope_policy_reconsidered",
+        &payload.to_string(),
+        now,
+    )?;
+    let mut retry = cp.clone();
+    retry.next = NextAction {
+        reason: "scope_policy_changed".into(),
+        action: "rescope_executable_acceptance".into(),
+        eligible_at_ms: now,
+    };
+    let next = serde_json::to_string(&retry)?;
+    tx.execute(
+        "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+        params![id, next],
+    )?;
+    event(tx, id, generation, "checkpoint", &next, now)?;
+    Ok(())
+}
+
 impl WorkflowStore {
+    /// Free, bounded worker maintenance, independent of model/resource admission.
+    /// Readers and owner-turn/reconciliation acquisition never call this.
+    pub(crate) fn migrate_scope_policy(&mut self, repository: &str, now: i64) -> Result<usize> {
+        let issue_prefix = format!("{}#", repository.to_ascii_lowercase());
+        let pr_prefix = format!("{}/pr/", repository.to_ascii_lowercase());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows:Vec<(String,String,i64)>=tx.prepare(
+            "SELECT id,checkpoint,generation FROM workflow WHERE lease_until<=?1
+             AND json_valid(checkpoint) AND json_extract(checkpoint,'$.stage')='scope'
+             AND COALESCE(json_extract(checkpoint,'$.next.eligible_at_ms'),0)<=?1
+             AND json_extract(checkpoint,'$.next.reason') IN ('material_external_decision_missing','acceptance_contract_invalid','readiness_assessment_invalid')
+             AND (substr(id,1,length(?2))=?2 OR substr(id,1,length(?3))=?3)
+             AND NOT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=workflow.id AND e.kind='scope_policy_reconsidered' AND CASE WHEN json_valid(e.payload) THEN json_extract(e.payload,'$.policy')=?4 ELSE 0 END)
+             ORDER BY heartbeat_at,id LIMIT 64")?
+            .query_map(params![now,issue_prefix,pr_prefix,POLICY],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut migrated = 0;
+        for (id, raw, generation) in rows {
+            let cp: Checkpoint = serde_json::from_str(&raw)?;
+            let obsolete = match old_policy(&tx, &id, &cp) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(workflow=%id,error=%error,"scope policy history unavailable; preserve row and continue peers");
+                    continue;
+                }
+            };
+            if !obsolete
+                || owner_control::require_dispatch(&tx, &id).is_err()
+                || target_fence::fenced(&tx, &id)?
+                || qualification_recovery::pending_mutation(&tx, &id)?
+            {
+                continue;
+            }
+            schedule_reconsideration(&tx, &id, generation, &cp, now)?;
+            migrated += 1;
+            if migrated == 4 {
+                break;
+            }
+        }
+        tx.commit()?;
+        Ok(migrated)
+    }
+
     pub(crate) fn scope_policy_pending(&self, id: &str) -> Result<bool> {
         let Some(s) = self.snapshot(id)? else {
             return Ok(false);
         };
-        Ok(s.pr.is_none()
-            && target(&s.checkpoint)
+        Ok(target(&s.checkpoint)
             && !enrolled(&self.conn, id)?
             && old_policy(&self.conn, id, &s.checkpoint)?)
     }
@@ -67,14 +144,13 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now)?;
         owner_control::require_dispatch(&tx, &lease.workflow)?;
-        let (raw, pr): (String, Option<u64>) = tx.query_row(
-            "SELECT checkpoint,pr FROM workflow WHERE id=?1",
+        let raw: String = tx.query_row(
+            "SELECT checkpoint FROM workflow WHERE id=?1",
             [&lease.workflow],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
         let cp: Checkpoint = serde_json::from_str(&raw)?;
-        if pr.is_some()
-            || !target(&cp)
+        if !target(&cp)
             || enrolled(&tx, &lease.workflow)?
             || !old_policy(&tx, &lease.workflow, &cp)?
         {
@@ -84,17 +160,7 @@ impl WorkflowStore {
             !qualification_recovery::pending_mutation(&tx, &lease.workflow)?,
             "scope policy cannot supersede pending publication"
         );
-        let cutover = owner_checkout_recovery::cutover_seq(&tx, &lease.workflow)?;
-        let original:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='verifier_evidence_recorded') OR EXISTS(SELECT 1 FROM workflow_event e JOIN scope_stage_response s ON s.workflow=e.workflow AND s.key=json_extract(e.payload,'$.key') WHERE e.workflow=?1 AND e.seq>?2 AND e.kind='scope_stage_response_recorded' AND json_valid(e.payload) AND CASE WHEN json_valid(s.response) THEN json_extract(s.response,'$.kind')='original_verifier_plan' ELSE 0 END)",params![lease.workflow,cutover],|r|r.get(0))?;
-        let payload = serde_json::json!({"version":1,"policy":POLICY,"prior_checkpoint":raw,"fresh_scope":!original,"original_evidence":"preserved"});
-        event(
-            &tx,
-            &lease.workflow,
-            lease.generation,
-            "scope_policy_reconsidered",
-            &payload.to_string(),
-            now,
-        )?;
+        schedule_reconsideration(&tx, &lease.workflow, lease.generation, &cp, now)?;
         tx.commit()?;
         Ok(true)
     }

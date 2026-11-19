@@ -9,7 +9,20 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             "lost",
             "qualification",
             "qualification-missing",
+            "qualification-bounced",
             "readiness",
+            "material-decision",
+            "scope-retry",
+            "build",
+            "verify",
+            "review",
+            "reconcile",
+            "intake",
+            "terminal",
+            "published",
+            "protected-held",
+            "publication-stage",
+            "pending-operation",
             "intact",
             "manual",
             "closed",
@@ -67,6 +80,12 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         "https://github.com/controller/repo.git",
     ]);
     std::fs::write(root.join("fixture.txt"), "synthetic baseline\n").unwrap();
+    if case=="qualification-bounced" {
+        std::fs::write(root.join("Cargo.lock"), "# synthetic verifier fixture\n").unwrap();
+        git(&["add","Cargo.lock"]);
+        augmentagent_test_support::write_executable(&root.join("rustc"),"#!/bin/sh\necho 'rustc 1.0.0 synthetic'\n").unwrap();
+        std::env::set_var("PATH",format!("{}:/usr/bin:/bin",root.display()));
+    }
     git(&["add", "fixture.txt"]);
     git(&[
         "-c",
@@ -147,6 +166,25 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     if case == "readiness" {
         cp.next.reason = "readiness_assessment_invalid".into();
         cp.next.action = "await_readiness_input_change".into();
+    }
+    match case.as_str() {
+        "material-decision" => {
+            cp.next.reason="material_external_decision_missing".into();
+            cp.next.action="await_request_or_main_change".into();
+        }
+        "scope-retry" => {
+            cp.next.reason="acceptance_registration_retry".into();
+            cp.next.action="rescope_executable_acceptance".into();
+        }
+        "intake" => cp.stage=Stage::Intake,
+        "build" => cp.stage=Stage::Build,
+        "verify" => cp.stage=Stage::Verify,
+        "review" => cp.stage=Stage::Review,
+        "reconcile" => cp.stage=Stage::Reconcile,
+        "terminal" => cp.stage=Stage::Merged,
+        "protected-held" => cp.stage=Stage::Held,
+        "publication-stage" => cp.stage=Stage::Publish,
+        _ => {},
     }
     store
         .record_scope_stage_response(
@@ -232,6 +270,10 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         )
         .unwrap();
     store.checkpoint(&lease, &cp, 5).unwrap();
+    if case=="published" {store.attach_pr_in_repo(&lease,"controller/repo",42,5).unwrap();}
+    if case=="pending-operation" {
+        store.begin_operation(&lease,crate::autoship_workflow::OperationKind::CreatePr,&binding,5).unwrap();
+    }
     store.release(&lease, 6).unwrap();
     let original = store.snapshot(id).unwrap().unwrap();
     let events = store.events(id).unwrap();
@@ -247,7 +289,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'scope_stage_response_recorded','{',7)",[id]).unwrap();
     }
 
-    if case == "qualification-missing" {
+    if matches!(case.as_str(), "qualification-missing" | "qualification-bounced") {
         conn.execute(
             "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
             [id, &original_plan_key],
@@ -318,7 +360,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     }
     if matches!(
         case.as_str(),
-        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked"
+        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked" | "terminal" | "published" | "protected-held" | "publication-stage" | "pending-operation"
     ) {
         let before = store.snapshot(id).unwrap();
         let events = store.events(id).unwrap();
@@ -326,14 +368,19 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             .await
             .unwrap_err();
         let expected = match case.as_str() {
-            "intact" | "missing-receipt" => "no-automatic-hold",
+            "intact" | "missing-receipt" | "terminal" | "published" | "protected-held" | "publication-stage" => "no-automatic-hold",
+            "pending-operation" => "pending-workflow-operation",
             "revoked" => "target-authorization-failed",
             "manual" => "autoship-manual",
             "closed" => "target-not-open",
             "lease" => "live-workflow-lease",
             _ => "explicit-owner-hold",
         };
-        assert_eq!(refusal(error), expected);
+        if case=="pending-operation" {
+            assert!(format!("{error:#}").contains(expected));
+        } else {
+            assert_eq!(refusal(error), expected);
+        }
         assert_eq!(store.snapshot(id).unwrap(), before);
         assert_eq!(store.events(id).unwrap(), events);
         if case != "missing-receipt" {
@@ -352,7 +399,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .contains("--request-id owner-checkout-7-generation-1"));
     let recovered = apply(&root, &request("continuity-fixture"))
         .await
-        .expect("owner can recover a missing held checkout without a legacy label");
+        .expect("owner can recover a missing pre-publication checkout without a legacy label");
     assert_eq!(recovered["accepted"], true);
     assert_eq!(
         apply(&root, &request("continuity-fixture")).await.unwrap()["replayed"],
@@ -494,6 +541,10 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), head);
     assert!(!plan.worktree.join("old-candidate.txt").exists());
+    if case=="qualification-bounced" {
+        requalification_tests::bounced(&root,&path,id,&plan,&head,&receipt_path,&receipt).await;
+        return;
+    }
     if case.starts_with("qualification") {
         let guard = workflow::WorkflowGuard::acquire_fixture(
             &path,
@@ -711,3 +762,6 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     );
     assert_eq!(store.snapshot(id).unwrap(), after);
 }
+
+#[path="self_improve_owner_requalification_tests.rs"]
+mod requalification_tests;
