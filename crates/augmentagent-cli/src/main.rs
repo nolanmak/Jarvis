@@ -902,9 +902,10 @@ enum Cmd {
         #[command(subcommand)]
         op: loop_cmd::LoopOp,
     },
-    /// #1317 — the heartbeat: a periodic open-ended check-in that reads
-    /// `<wiki>/HEARTBEAT.md` and stays silent unless something needs the
-    /// operator. `run-once` wakes it now; `status --check` is a liveness
+    /// #1317/#2285 — the heartbeat: a daily safety net that surfaces things
+    /// that slipped through the cracks days ago, judged against
+    /// `<wiki>/HEARTBEAT.md`. `run-once` sweeps now; `items`, `done` and
+    /// `snooze` manage what it surfaced; `status --check` is a liveness
     /// probe for cron or an external healthcheck.
     Heartbeat {
         #[command(subcommand)]

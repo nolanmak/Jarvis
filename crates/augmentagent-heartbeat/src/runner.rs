@@ -1,9 +1,11 @@
-//! The heartbeat loop and one run of it.
+//! The heartbeat loop and one run of it: the daily sweep (#2285).
 //!
 //! Gate order matters: everything before the model call is free, so a run
 //! that is not due, is outside active hours, has no checklist, has hit its
-//! notice cap, or finds another process mid-run never spends a token.
+//! notice cap, finds nothing to judge, or finds another process mid-run
+//! never spends a token.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,22 +23,26 @@ use tracing::{info, warn};
 
 use crate::checklist;
 use crate::config::HeartbeatConfig;
-use crate::decision::{self, Decision};
+use crate::decision::{self, Pick, Sweep};
 use crate::outreach::{Outreach, OutreachResult};
-use crate::store_ext::{status, HeartbeatStore, Outcome};
+use crate::replies::{ReplyEvidence, StoreReplyEvidence};
+use crate::store_ext::{item_state, status, HeartbeatStore, ItemRecord, Outcome};
+use crate::sweep::{self, Candidate, Source, Window};
 
 /// How often the loop checks whether a run is due. The cadence itself comes
-/// from the persisted last attempt, so restarts neither double-fire nor
-/// reset the clock, and missed ticks coalesce into one run.
+/// from the persisted runs, so restarts neither double-fire nor reset the
+/// clock, and missed days coalesce into one sweep.
 pub const TICK: Duration = Duration::from_secs(60);
 /// Consecutive errors that post one "heartbeat failing" notice.
 pub const FAILURE_ALERT_AFTER: u32 = 3;
 pub const DEDUP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 pub const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Item bookkeeping outlives the sweep's 14-day lookback with room to spare.
+pub const ITEM_RETENTION_MS: i64 = 60 * 24 * 60 * 60 * 1000;
+/// A sweep that ended in error is retried after this long, same day.
+pub const RETRY_AFTER_MS: i64 = 60 * 60 * 1000;
 /// The approval card truncates its reason line here.
 pub const MAX_NOTICE_CHARS: usize = 500;
-/// Inbound items listed in the prompt.
-pub const INBOUND_LIMIT: i64 = 25;
 
 const SYSTEM_PROMPT: &str = include_str!("prompt.md");
 
@@ -60,6 +66,16 @@ pub struct RunOptions {
     pub dry_run: bool,
 }
 
+/// One item on a sweep notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SurfacedItem {
+    pub key: String,
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    pub source: Source,
+    pub note: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunReport {
     /// `not-due`, `skipped`, `silent`, `sent`, `error`, or `dry-run`.
@@ -69,6 +85,12 @@ pub struct RunReport {
     pub decision: Option<String>,
     pub message: Option<String>,
     pub run_id: Option<i64>,
+    /// Candidates collected for this sweep (absent when none were looked for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<usize>,
+    /// What the notice surfaced.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<SurfacedItem>,
     /// D16 — what became of each proposed outreach message. Empty (and
     /// absent from the JSON) whenever outreach is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -82,8 +104,7 @@ pub fn heartbeat_opts(wiki_root: &Path) -> ReasonerOpts {
 }
 
 /// D16 — the marker in `prompt.md` after which the outreach contract
-/// starts. Everything before it is the system prompt with outreach off,
-/// byte for byte what it was before outreach existed.
+/// starts. Everything before it is the system prompt with outreach off.
 const OUTREACH_MARKER: &str = "<!-- outreach:";
 
 /// The system prompt, with the outreach contract only when `outreach`.
@@ -120,6 +141,8 @@ impl RunReport {
             decision: None,
             message: None,
             run_id: None,
+            candidates: None,
+            items: Vec::new(),
             outreach: Vec::new(),
         }
     }
@@ -150,6 +173,21 @@ fn ago(ms: i64) -> String {
     }
 }
 
+/// `5d` for the notice.
+fn age_days(ms: i64) -> String {
+    format!("{}d", (ms.max(0) / sweep::DAY_MS).max(1))
+}
+
+/// Keep candidate text on one line and short.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    }
+}
+
 fn notice_email(subject: &str, body: &str, now_ms: i64) -> Email {
     Email {
         attachments: Vec::new(),
@@ -167,6 +205,24 @@ fn notice_email(subject: &str, body: &str, now_ms: i64) -> Email {
     }
 }
 
+/// The notice text: one line per item, with its age and short ref for
+/// `heartbeat done|snooze <ref>`.
+fn compose_notice(items: &[(SurfacedItem, i64)], now_ms: i64) -> String {
+    let mut out = String::from("Slipped through the cracks:");
+    for (item, at_ms) in items {
+        out.push_str(&format!(
+            "\n• {} ({}, {})",
+            item.note,
+            age_days(now_ms - at_ms),
+            item.item_ref
+        ));
+    }
+    out.chars().take(MAX_NOTICE_CHARS).collect()
+}
+
+/// A notice item and when its underlying message arrived.
+type Dated = (SurfacedItem, i64);
+
 /// Why a model call produced no decision.
 enum CallError {
     Timeout,
@@ -183,6 +239,8 @@ pub struct HeartbeatRunner<R: Reasoner + ?Sized> {
     holder: String,
     /// D16 — set only when outreach is enabled (both switches on).
     outreach: Option<Arc<dyn Outreach>>,
+    /// Whether the owner already answered a candidate (#2284 plugs in here).
+    replies: Arc<dyn ReplyEvidence>,
 }
 
 impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
@@ -193,6 +251,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         wiki_root: PathBuf,
         config: HeartbeatConfig,
     ) -> Self {
+        let replies = Arc::new(StoreReplyEvidence::new(Arc::clone(&store)));
         Self {
             store,
             broker,
@@ -202,6 +261,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             clock: Arc::new(SystemClock),
             holder: format!("pid:{}", std::process::id()),
             outreach: None,
+            replies,
         }
     }
 
@@ -223,6 +283,13 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         self
     }
 
+    /// Replace the store-backed reply check, e.g. with #2284's
+    /// cross-channel reply detection.
+    pub fn with_reply_evidence(mut self, replies: Arc<dyn ReplyEvidence>) -> Self {
+        self.replies = replies;
+        self
+    }
+
     pub fn config(&self) -> &HeartbeatConfig {
         &self.config
     }
@@ -233,7 +300,8 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             warn!("heartbeat config: {warning}");
         }
         info!(
-            interval_secs = self.config.interval.as_secs(),
+            sweep_at = %self.config.sweep_at_label(),
+            max_items = self.config.max_items,
             active_hours = ?self.config.active_hours.map(|w| w.to_string()),
             "heartbeat runner started"
         );
@@ -250,25 +318,51 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             };
             match report {
                 Ok(r) if r.status == "not-due" => continue,
-                Ok(r) => info!(status = %r.status, reason = ?r.reason, "heartbeat run"),
+                // A due sweep outside the window waits, unrecorded, for it to open.
+                Ok(r) if r.reason.as_deref() == Some("quiet-hours") => continue,
+                Ok(r) => {
+                    info!(status = %r.status, reason = ?r.reason, items = r.items.len(), "heartbeat run")
+                }
                 Err(e) => warn!("heartbeat run failed: {e:#}"),
             }
-            let cutoff = self.clock.now().timestamp_millis() - RETENTION_MS;
-            if let Err(e) = self.store.prune_runs(cutoff) {
+            let now_ms = self.clock.now().timestamp_millis();
+            if let Err(e) = self.store.prune_runs(now_ms - RETENTION_MS) {
                 warn!("heartbeat prune failed: {e}");
             }
+            if let Err(e) = self.store.prune_items(now_ms - ITEM_RETENTION_MS, now_ms) {
+                warn!("heartbeat item prune failed: {e}");
+            }
         }
+    }
+
+    /// Due when today's sweep time has passed and no run since then settled
+    /// it; a sweep that errored is retried after [`RETRY_AFTER_MS`].
+    fn is_due(&self, now: DateTime<Utc>) -> Result<bool> {
+        let now_ms = now.timestamp_millis();
+        let slot_ms = self.config.latest_slot(now).timestamp_millis();
+        if self.store.last_settled_ms()?.is_some_and(|s| s >= slot_ms) {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .last_attempt_ms()?
+            .is_none_or(|a| a < slot_ms || now_ms - a >= RETRY_AFTER_MS))
     }
 
     /// One pass through the gates and, if they all pass, one model call.
     pub async fn run_once(&self, opts: RunOptions) -> Result<RunReport> {
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
-        let last_attempt = self.store.last_attempt_ms()?;
-        let interval_ms = self.config.interval.as_millis() as i64;
-        if !opts.force && last_attempt.is_some_and(|last| now_ms - last < interval_ms) {
-            return Ok(RunReport::new("not-due"));
+        if !opts.force {
+            if !self.is_due(now)? {
+                return Ok(RunReport::new("not-due"));
+            }
+            if !self.config.is_active_at(now) {
+                // Not recorded, so the sweep runs once the window opens.
+                return Ok(RunReport::new(status::SKIPPED).with_reason("quiet-hours"));
+            }
         }
+        let last_attempt = self.store.last_attempt_ms()?;
         if opts.dry_run {
             return self.gated_run(now, last_attempt, opts).await;
         }
@@ -296,6 +390,37 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         })
     }
 
+    /// Everything the sweep may judge today: expired snoozes first (already
+    /// chosen by the owner), then the collectors' candidates.
+    fn collect(&self, now_ms: i64) -> Result<(Vec<Dated>, Vec<Candidate>)> {
+        let snoozed: Vec<Dated> = self
+            .store
+            .expired_snoozes(now_ms)?
+            .into_iter()
+            .take(self.config.max_items)
+            .map(|item| {
+                let note = item
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| item.item_key.clone());
+                (
+                    SurfacedItem {
+                        key: item.item_key,
+                        item_ref: item.item_ref,
+                        source: Source::Snoozed,
+                        note,
+                    },
+                    item.first_seen_ms,
+                )
+            })
+            .collect();
+        let window = Window { now_ms };
+        let mut candidates = sweep::unanswered(&self.store, self.replies.as_ref(), window);
+        candidates.extend(sweep::automated(&self.store, window));
+        candidates.retain(|c| !snoozed.iter().any(|(s, _)| s.key == c.key));
+        Ok((snoozed, candidates))
+    }
+
     /// The free gates, then the call. Dry runs write nothing.
     async fn gated_run(
         &self,
@@ -311,63 +436,81 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
                 self.skip(now_ms, reason)
             }
         };
-        if !opts.force && !self.config.is_active_at(now) {
-            return skip("quiet-hours");
-        }
         let Some(checklist) = checklist::load(&self.wiki_root) else {
             return skip("empty-checklist");
         };
         if self.store.sent_count_since(now_ms - DEDUP_WINDOW_MS)? >= self.config.daily_cap {
             return skip("cap");
         }
+        let (snoozed, candidates) = self.collect(now_ms)?;
+        if snoozed.is_empty() && candidates.is_empty() {
+            let mut r = skip("no-candidates")?;
+            r.candidates = Some(0);
+            return Ok(r);
+        }
+        let room = self.config.max_items.saturating_sub(snoozed.len());
 
         let run_id = if opts.dry_run {
             None
         } else {
             Some(self.store.start_run(now_ms)?)
         };
+
+        // Snoozes alone fill the notice, or nothing new to judge: no call.
+        if room == 0 || candidates.is_empty() {
+            let mut report = self
+                .deliver(run_id, now_ms, snoozed, &[], opts.dry_run)
+                .await?;
+            report.candidates = Some(candidates.len());
+            if opts.dry_run {
+                report.status = "dry-run".into();
+            }
+            report.run_id = run_id;
+            return Ok(report);
+        }
+
         // D16: the roster is the only list of people outreach may name.
         let roster = match &self.outreach {
             Some(outreach) => outreach.roster(now_ms),
             None => Vec::new(),
         };
-        let mut prompt = self.build_prompt(now, last_attempt, &checklist)?;
+        let mut prompt = self.build_prompt(now, last_attempt, &checklist, &candidates, room)?;
         prompt.push_str(&crate::outreach::prompt_section(&roster));
         let call = self.call(now_ms, &prompt, !roster.is_empty()).await;
+        let ids: Vec<String> = (1..=candidates.len()).map(|i| format!("c{i}")).collect();
         let raw = match &call {
-            Ok((_, raw)) => Some(raw.clone()),
+            Ok(raw) => Some(raw.clone()),
             Err(_) => None,
         };
-        let decision = call.map(|(decision, _)| decision);
 
-        let mut report = match decision {
+        let mut report = match call {
             Err(CallError::Timeout) => self.fail(run_id, "timeout", "model call timed out").await?,
             Err(CallError::Reasoner(e)) => self.fail(run_id, "reasoner", &e).await?,
-            Ok(Decision::Invalid(why)) => {
-                let mut r = self.fail(run_id, "invalid-output", &why).await?;
-                r.decision = Some("invalid".into());
-                r
-            }
-            Ok(Decision::Silent) => {
-                if let Some(id) = run_id {
-                    self.finish(
-                        id,
-                        &Outcome {
-                            status: status::SILENT,
-                            ..Default::default()
-                        },
-                    )?;
+            Ok(raw) => match decision::parse_sweep(&raw, &ids, room) {
+                Sweep::Invalid(why) => {
+                    let mut r = self.fail(run_id, "invalid-output", &why).await?;
+                    r.decision = Some("invalid".into());
+                    r
                 }
-                RunReport {
-                    decision: Some("silent".into()),
-                    ..RunReport::new(status::SILENT)
+                Sweep::Silent => {
+                    let mut r = self
+                        .deliver(run_id, now_ms, snoozed, &candidates, opts.dry_run)
+                        .await?;
+                    r.decision = Some("silent".into());
+                    r
                 }
-            }
-            Ok(Decision::Notify(message)) => {
-                let message: String = message.chars().take(MAX_NOTICE_CHARS).collect();
-                self.deliver(run_id, now_ms, message, opts.dry_run).await?
-            }
+                Sweep::Items(picks) => {
+                    let mut items = snoozed;
+                    items.extend(picked(&picks, &candidates));
+                    let mut r = self
+                        .deliver(run_id, now_ms, items, &candidates, opts.dry_run)
+                        .await?;
+                    r.decision = Some("notify".into());
+                    r
+                }
+            },
         };
+        report.candidates = Some(candidates.len());
         // D16: only a run that produced a valid decision may reach out.
         if let (Some(outreach), Some(raw)) = (&self.outreach, raw.as_deref()) {
             if !roster.is_empty() && matches!(report.decision.as_deref(), Some("silent" | "notify"))
@@ -402,30 +545,76 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         now_ms: i64,
         prompt: &str,
         outreach: bool,
-    ) -> std::result::Result<(Decision, String), CallError> {
+    ) -> std::result::Result<String, CallError> {
         let mut opts = heartbeat_opts_for(&self.wiki_root, outreach);
         opts.session_id = Some(format!("heartbeat:{now_ms}"));
         match tokio::time::timeout(self.config.timeout, self.reasoner.call(&opts, prompt)).await {
             Err(_) => Err(CallError::Timeout),
             Ok(Err(e)) => Err(CallError::Reasoner(format!("{e:#}"))),
-            Ok(Ok(reply)) => Ok((decision::parse(&reply), reply)),
+            Ok(Ok(reply)) => Ok(reply),
         }
     }
 
+    /// Post `items` (if any) as one notice, then record every item: the
+    /// surfaced ones as `surfaced`, the rest of `offered` as `offered`.
+    /// Nothing is recorded on a dry run or a failed delivery, so the next
+    /// sweep sees the same candidates.
     async fn deliver(
         &self,
         run_id: Option<i64>,
         now_ms: i64,
-        message: String,
+        items: Vec<(SurfacedItem, i64)>,
+        offered: &[Candidate],
         dry_run: bool,
     ) -> Result<RunReport> {
+        let surfaced: Vec<SurfacedItem> = items.iter().map(|(i, _)| i.clone()).collect();
+        let record = |state_of_rest: &str| -> Result<()> {
+            let mut rows: Vec<ItemRecord<'_>> = surfaced
+                .iter()
+                .map(|i| ItemRecord {
+                    key: &i.key,
+                    source: i.source.as_str(),
+                    state: item_state::SURFACED,
+                    summary: Some(&i.note),
+                })
+                .collect();
+            rows.extend(
+                offered
+                    .iter()
+                    .filter(|c| !surfaced.iter().any(|s| s.key == c.key))
+                    .map(|c| ItemRecord {
+                        key: &c.key,
+                        source: c.source.as_str(),
+                        state: state_of_rest,
+                        summary: None,
+                    }),
+            );
+            self.store.record_items(&rows, now_ms)?;
+            Ok(())
+        };
+
+        if surfaced.is_empty() {
+            if let Some(id) = run_id.filter(|_| !dry_run) {
+                record(item_state::OFFERED)?;
+                self.finish(
+                    id,
+                    &Outcome {
+                        status: status::SILENT,
+                        ..Default::default()
+                    },
+                )?;
+            }
+            return Ok(RunReport::new(status::SILENT));
+        }
+
+        let message = compose_notice(&items, now_ms);
         let hash = message_hash(&message);
         let duplicate = self
             .store
             .delivered_since(&hash, now_ms - DEDUP_WINDOW_MS)?;
         let decided = RunReport {
-            decision: Some("notify".into()),
             message: Some(message.clone()),
+            items: surfaced.clone(),
             ..RunReport::new(status::SENT)
         };
         let Some(id) = run_id.filter(|_| !dry_run) else {
@@ -440,6 +629,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             });
         };
         if duplicate {
+            record(item_state::OFFERED)?;
             self.finish(
                 id,
                 &Outcome {
@@ -455,12 +645,13 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             }
             .with_reason("duplicate"));
         }
-        let email = notice_email("Heartbeat", &message, now_ms);
+        let email = notice_email("Heartbeat: slipped through the cracks", &message, now_ms);
         if let Err(e) = self.broker.post_flag_notice(&email, &message).await {
             let mut r = self.fail(Some(id), "delivery", &e.to_string()).await?;
-            r.decision = decided.decision;
+            r.items = Vec::new();
             return Ok(r);
         }
+        record(item_state::OFFERED)?;
         self.finish(
             id,
             &Outcome {
@@ -522,9 +713,10 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         now: DateTime<Utc>,
         last_attempt: Option<i64>,
         checklist: &str,
+        candidates: &[Candidate],
+        room: usize,
     ) -> Result<String> {
         let now_ms = now.timestamp_millis();
-        let interval_ms = self.config.interval.as_millis() as i64;
         let mut out = format!(
             "Current local time: {}\n",
             self.config.local_time_label(now)
@@ -537,27 +729,32 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             Some(run) => out.push_str(&format!(
                 "Last notice you sent ({}): {}\n",
                 ago(now_ms - run.started_at_ms),
-                run.message.unwrap_or_default()
+                one_line(&run.message.unwrap_or_default(), 500)
             )),
             None => out.push_str("Last notice you sent: none\n"),
         }
-        if let Some(pending) = self.store.pending_action_count() {
-            out.push_str(&format!(
-                "Approval cards waiting on the operator: {pending}\n"
-            ));
-        }
-        let since = last_attempt.unwrap_or(now_ms - interval_ms);
-        let inbound = self.store.inbound_since(since, INBOUND_LIMIT);
-        out.push_str(&format!(
-            "\n## Inbound since last heartbeat ({})\n",
-            inbound.len()
-        ));
-        for (from, subject, triage) in &inbound {
-            let triage = triage
-                .as_deref()
-                .map(|t| format!(" [{t}]"))
-                .unwrap_or_default();
-            out.push_str(&format!("- {from} — {subject}{triage}\n"));
+        out.push_str(&format!("Pick at most {room} items.\n"));
+        out.push_str(&format!("\n## Candidates ({})\n", candidates.len()));
+        for (i, c) in candidates.iter().enumerate() {
+            let mut line = format!(
+                "- [c{}] {} · {} · {} · from {}",
+                i + 1,
+                c.source.as_str(),
+                c.channel,
+                ago(now_ms - c.at_ms),
+                one_line(&c.who, 120)
+            );
+            if !c.title.trim().is_empty() {
+                line.push_str(&format!(" · \"{}\"", one_line(&c.title, 160)));
+            }
+            if !c.snippet.is_empty() {
+                line.push_str(&format!(
+                    " — {}",
+                    one_line(&c.snippet, sweep::SNIPPET_CHARS)
+                ));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
         out.push_str(&format!(
             "\n## Checklist ({})\n{}\n",
@@ -566,6 +763,30 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         ));
         Ok(out)
     }
+}
+
+/// The candidates behind `picks`, in pick order, as notice items.
+fn picked(picks: &[Pick], candidates: &[Candidate]) -> Vec<(SurfacedItem, i64)> {
+    let by_id: HashMap<String, &Candidate> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("c{}", i + 1), c))
+        .collect();
+    picks
+        .iter()
+        .filter_map(|p| {
+            let c = by_id.get(&p.id)?;
+            Some((
+                SurfacedItem {
+                    key: c.key.clone(),
+                    item_ref: sweep::item_ref(&c.key),
+                    source: c.source,
+                    note: p.note.clone(),
+                },
+                c.at_ms,
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -579,7 +800,6 @@ mod tests {
 
     enum Reply {
         Text(&'static str),
-        Owned(String),
         Fail,
         Hang,
     }
@@ -611,7 +831,6 @@ mod tests {
             let next = self.replies.lock().unwrap().pop_front();
             match next {
                 Some(Reply::Text(t)) => Ok(t.to_string()),
-                Some(Reply::Owned(t)) => Ok(t),
                 Some(Reply::Fail) => Err(anyhow::anyhow!("provider exploded")),
                 Some(Reply::Hang) => {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -733,7 +952,9 @@ mod tests {
     }
 
     const SILENT: Reply = Reply::Text(r#"{"notify": false}"#);
-    const NOTIFY: Reply = Reply::Text(r#"{"notify": true, "message": "Flight UA12 moved to 6pm"}"#);
+    const PICK_C1: Reply = Reply::Text(
+        r#"{"notify": true, "items": [{"id": "c1", "note": "Example Cloud approved your credits; claim them"}]}"#,
+    );
     const RUN: RunOptions = RunOptions {
         force: false,
         dry_run: false,
@@ -742,84 +963,463 @@ mod tests {
         force: true,
         dry_run: false,
     };
+    const DAY: i64 = sweep::DAY_MS;
+    const HOUR: i64 = 60 * 60 * 1000;
 
-    fn interval(h: &Harness) -> chrono::Duration {
-        chrono::Duration::from_std(h.runner.config().interval).unwrap()
+    fn days(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
     }
 
-    #[tokio::test]
-    async fn silent_decision_posts_nothing_and_records_a_silent_row() {
-        let h = harness(vec![SILENT]);
-        let report = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(report.status, status::SILENT);
-        assert_eq!(report.decision.as_deref(), Some("silent"));
-        assert_eq!(h.reasoner.calls(), 1);
-        assert!(h.broker.reasons().is_empty());
-        let runs = h.store.recent_runs(10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, status::SILENT);
-        assert!(runs[0].finished_at_ms.is_some());
+    fn now_ms(h: &Harness) -> i64 {
+        h.clock.now().timestamp_millis()
     }
 
-    #[tokio::test]
-    async fn notify_decision_posts_one_card_and_records_the_hash() {
-        let h = harness(vec![NOTIFY]);
-        let report = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(report.status, status::SENT);
-        assert_eq!(report.message.as_deref(), Some("Flight UA12 moved to 6pm"));
-        let notices = h.broker.notices.lock().unwrap();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].1, "Flight UA12 moved to 6pm");
-        assert_eq!(notices[0].0.platform, "heartbeat");
-        assert_eq!(notices[0].0.kind, "heartbeat_notice");
-        let run = h.store.last_sent().unwrap().unwrap();
-        assert!(run.message_hash.is_some());
+    /// An inbound Gmail message `age_ms` old with the given triage.
+    fn seed_mail(
+        h: &Harness,
+        id: &str,
+        from: &str,
+        subject: &str,
+        age_ms: i64,
+        triage: Option<&str>,
+    ) {
+        let at = now_ms(h) - age_ms;
+        h.store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, firstSeenAt, \
+                     triageResult, platform, kind) VALUES (?1, ?1, ?2, ?3, 'Body text here.', ?4, ?5, 'gmail', 'dm')",
+                    params![id, from, subject, at, triage],
+                )
+            })
+            .unwrap();
     }
 
-    #[tokio::test]
-    async fn long_notices_are_truncated_to_the_card_limit() {
-        let long = format!(
-            r#"{{"notify": true, "message": "{}"}}"#,
-            "é".repeat(MAX_NOTICE_CHARS + 50)
+    /// A direct message from a person, indexed the way the message index does it.
+    fn seed_dm(
+        h: &Harness,
+        id: &str,
+        conv: &str,
+        sender: &str,
+        label: &str,
+        age_ms: i64,
+        from_me: bool,
+    ) {
+        let at = now_ms(h) - age_ms;
+        h.store
+            .with_conn(|c| {
+                if !from_me {
+                    c.execute(
+                        "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, firstSeenAt, \
+                         platform, kind) VALUES (?1, ?2, ?3, '', 'Can you send the deck?', ?4, 'imessage', 'dm')",
+                        params![id, conv, sender, at],
+                    )?;
+                }
+                c.execute(
+                    "INSERT INTO message_index (message_id, platform, conv_kind, conversation_id, sender_handle, \
+                     sender_label, counterpart_handle, from_me, ts_ms, has_attachment, extractor_version) \
+                     VALUES (?1, 'imessage', 'dm', ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)",
+                    params![
+                        id,
+                        conv,
+                        if from_me { "me" } else { sender },
+                        label,
+                        if from_me { Some(sender) } else { None },
+                        from_me,
+                        at
+                    ],
+                )
+            })
+            .unwrap();
+    }
+
+    fn credits_mail(h: &Harness) {
+        seed_mail(
+            h,
+            "m-credits",
+            "Example Cloud <no-reply@startups.example.com>",
+            "Your Example Cloud credits application was approved",
+            10 * DAY,
+            Some("skip"),
         );
-        let h = harness(vec![Reply::Owned(long)]);
-        h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(h.broker.reasons()[0].chars().count(), MAX_NOTICE_CHARS);
     }
 
+    fn prompt(h: &Harness, n: usize) -> String {
+        h.reasoner.prompts.lock().unwrap()[n].clone()
+    }
+
+    use augmentagent_store::rusqlite::params;
+
     #[tokio::test]
-    async fn same_notice_within_a_day_is_a_duplicate_and_after_a_day_is_not() {
-        let h = harness(vec![NOTIFY, NOTIFY, NOTIFY]);
-        h.runner.run_once(RUN).await.unwrap();
-        h.clock.advance(interval(&h));
-        let second = h.runner.run_once(RUN).await.unwrap();
+    async fn credits_approved_mail_surfaces_once_and_never_again_after_done() {
+        let h = harness(vec![PICK_C1]);
+        credits_mail(&h);
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.status, status::SENT, "{report:?}");
+        assert!(
+            prompt(&h, 0).contains("[c1] automated · gmail · 10d ago"),
+            "{}",
+            prompt(&h, 0)
+        );
+        let notices = h.broker.reasons();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].starts_with("Slipped through the cracks:"),
+            "{}",
+            notices[0]
+        );
+        assert!(notices[0].contains("Example Cloud approved your credits; claim them (10d, "));
+        assert_eq!(report.items.len(), 1);
+        let key = report.items[0].key.clone();
+        assert_eq!(key, "automated:m-credits");
+
+        // Next day: already surfaced, so nothing to judge and no model call.
+        h.clock.advance(days(1));
+        let next = h.runner.run_once(RUN).await.unwrap();
         assert_eq!(
-            (second.status.as_str(), second.reason.as_deref()),
-            (status::SKIPPED, Some("duplicate"))
+            (next.status.as_str(), next.reason.as_deref()),
+            (status::SKIPPED, Some("no-candidates"))
+        );
+        assert_eq!(h.reasoner.calls(), 1);
+
+        // Done is final.
+        assert!(h
+            .store
+            .set_item_state(&key, item_state::DONE, None, now_ms(&h))
+            .unwrap());
+        h.clock.advance(days(1));
+        assert_eq!(
+            h.runner.run_once(RUN).await.unwrap().reason.as_deref(),
+            Some("no-candidates")
         );
         assert_eq!(h.broker.reasons().len(), 1);
-
-        h.clock.advance(chrono::Duration::hours(24));
-        let third = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(third.status, status::SENT);
-        assert_eq!(h.broker.reasons().len(), 2);
     }
 
     #[tokio::test]
-    async fn duplicate_check_ignores_case_and_spacing() {
-        let h = harness(vec![
-            NOTIFY,
-            Reply::Text(r#"{"notify": true, "message": "flight  UA12 moved to 6PM"}"#),
-        ]);
+    async fn a_snoozed_item_comes_back_once_without_a_model_call() {
+        let h = harness(vec![PICK_C1]);
+        credits_mail(&h);
+        let key = h.runner.run_once(RUN).await.unwrap().items[0].key.clone();
+        h.store
+            .set_item_state(
+                &key,
+                item_state::SNOOZED,
+                Some(now_ms(&h) + 3 * DAY),
+                now_ms(&h),
+            )
+            .unwrap();
+
+        h.clock.advance(days(1));
+        assert_eq!(
+            h.runner.run_once(RUN).await.unwrap().reason.as_deref(),
+            Some("no-candidates")
+        );
+        h.clock.advance(days(2));
+        let back = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(back.status, status::SENT, "{back:?}");
+        assert_eq!(back.items[0].source, Source::Snoozed);
+        assert!(h.broker.reasons()[1].contains("Example Cloud approved your credits"));
+        assert_eq!(
+            h.reasoner.calls(),
+            1,
+            "a snooze is the owner's choice, not the model's"
+        );
+
+        h.clock.advance(days(1));
+        assert_eq!(
+            h.runner.run_once(RUN).await.unwrap().reason.as_deref(),
+            Some("no-candidates")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_person_surfaces_and_one_answered_on_another_channel_does_not() {
+        let h = harness(vec![SILENT]);
+        seed_dm(
+            &h,
+            "dm-a",
+            "conv-a",
+            "phone:+15550000001",
+            "Sample Person A",
+            5 * DAY,
+            false,
+        );
+        seed_dm(
+            &h,
+            "dm-b",
+            "conv-b",
+            "phone:+15550000002",
+            "Sample Person B",
+            5 * DAY,
+            false,
+        );
+        // B was answered by email, linked through the people index.
+        h.store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "INSERT INTO message_people VALUES ('phone:+15550000002', 'person-b'),
+                                                       ('email:b@example.com', 'person-b');",
+                )
+            })
+            .unwrap();
+        seed_dm(
+            &h,
+            "out-b",
+            "mail-thread-b",
+            "email:b@example.com",
+            "",
+            4 * DAY,
+            true,
+        );
+
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.candidates, Some(1));
+        let p = prompt(&h, 0);
+        assert!(
+            p.contains("unanswered · imessage · 5d ago · from Sample Person A"),
+            "{p}"
+        );
+        assert!(!p.contains("Sample Person B"), "{p}");
+        assert_eq!(
+            h.store
+                .find_items("unanswered:imessage:conv-a:dm-a")
+                .unwrap()[0]
+                .state,
+            item_state::OFFERED,
+            "a silent sweep records what it showed the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reply_check_is_pluggable() {
+        struct AlwaysReplied;
+        impl ReplyEvidence for AlwaysReplied {
+            fn owner_replied_since(&self, _: &crate::replies::InboundRef) -> bool {
+                true
+            }
+        }
+        let mut h = harness(vec![]);
+        seed_dm(
+            &h,
+            "dm-a",
+            "conv-a",
+            "phone:+15550000001",
+            "Sample Person A",
+            5 * DAY,
+            false,
+        );
+        h.runner = h.runner.with_reply_evidence(Arc::new(AlwaysReplied));
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.reason.as_deref(), Some("no-candidates"));
+    }
+
+    #[tokio::test]
+    async fn messages_from_the_last_two_days_are_never_candidates() {
+        let h = harness(vec![]);
+        seed_dm(
+            &h,
+            "dm-new",
+            "conv-n",
+            "phone:+15550000003",
+            "Sample Person C",
+            HOUR,
+            false,
+        );
+        seed_mail(
+            &h,
+            "m-new",
+            "Example Cloud <no-reply@startups.example.com>",
+            "Credits approved",
+            HOUR,
+            Some("skip"),
+        );
+        seed_mail(
+            &h,
+            "m-day",
+            "Example Bank <alerts@bank.example.com>",
+            "Transfer received",
+            DAY,
+            Some("skip"),
+        );
+        // A person who wrote 5 days ago and again an hour ago is real-time's job.
+        seed_dm(
+            &h,
+            "dm-old",
+            "conv-n",
+            "phone:+15550000003",
+            "Sample Person C",
+            5 * DAY,
+            false,
+        );
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.reason.as_deref(), Some("no-candidates"));
+        assert_eq!(h.reasoner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn trial_renewal_bulk_and_developer_mail_never_reach_the_model() {
+        let h = harness(vec![]);
+        seed_mail(
+            &h,
+            "t1",
+            "Example App <billing@app.example.com>",
+            "Your free trial ends in 3 days",
+            5 * DAY,
+            Some("skip"),
+        );
+        seed_mail(
+            &h,
+            "t2",
+            "Example Host <billing@host.example.net>",
+            "Subscription renewal notice",
+            5 * DAY,
+            Some("skip"),
+        );
+        seed_mail(
+            &h,
+            "t3",
+            "Example Shop <hi@promotion.shop.example.com>",
+            "New arrivals",
+            5 * DAY,
+            Some("skip"),
+        );
+        seed_mail(
+            &h,
+            "t4",
+            // Built at runtime so the fixture is not an address literal.
+            &format!("Sample Dev <notifications@{}>", "github.com"),
+            "[repo] PR run failed",
+            5 * DAY,
+            Some("skip"),
+        );
+        for i in 0..sweep::BULK_ADDRESS_MIN {
+            seed_mail(
+                &h,
+                &format!("n{i}"),
+                "Daily Example <daily@letters.example.org>",
+                "Today's issue",
+                (3 + i as i64) * DAY,
+                Some("skip"),
+            );
+        }
+        // Flagged or replied mail is a person, not skipped automated mail.
+        seed_mail(
+            &h,
+            "t5",
+            "Example Cloud <no-reply@startups.example.com>",
+            "Credits approved",
+            5 * DAY,
+            Some("flag"),
+        );
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("no-candidates"),
+            "{report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prompt_never_mentions_the_approval_backlog() {
+        let h = harness(vec![SILENT]);
+        h.store
+            .with_conn(|c| {
+                for i in 0..60 {
+                    c.execute(
+                        "INSERT INTO actions (id, messageId, fromEmail, subject, status, createdAt, updatedAt) \
+                         VALUES (?1, ?1, 'x@example.com', 's', 'pending', 0, 0)",
+                        [format!("a{i}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // A full approval queue alone is never a reason to run.
+        assert_eq!(
+            h.runner.run_once(RUN).await.unwrap().reason.as_deref(),
+            Some("no-candidates")
+        );
+        credits_mail(&h);
+        h.clock.advance(days(1));
         h.runner.run_once(RUN).await.unwrap();
-        h.clock.advance(interval(&h));
-        let second = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(second.reason.as_deref(), Some("duplicate"));
+        let p = prompt(&h, 0);
+        assert!(!p.to_lowercase().contains("approval"), "{p}");
     }
 
     #[tokio::test]
-    async fn failed_delivery_is_an_error_and_does_not_count_as_delivered() {
-        let h = harness(vec![NOTIFY, NOTIFY]);
+    async fn at_most_max_items_surface() {
+        let mut c = config();
+        c.max_items = 2;
+        let h = harness_with(
+            vec![Reply::Text(
+                r#"{"notify": true, "items": [{"id": "c1", "note": "one"}, {"id": "c2", "note": "two"}, {"id": "c3", "note": "three"}]}"#,
+            )],
+            c,
+            Some("- anything\n"),
+        );
+        for (i, d) in ["a", "b", "c"].iter().enumerate() {
+            seed_mail(
+                &h,
+                &format!("m{i}"),
+                &format!("Sender {d} <ops@{d}.example.com>"),
+                "Account change",
+                (3 + i as i64) * DAY,
+                Some("skip"),
+            );
+        }
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert!(prompt(&h, 0).contains("Pick at most 2 items."));
+        assert_eq!(report.items.len(), 2);
+        let notice = &h.broker.reasons()[0];
+        assert!(
+            notice.contains("one") && notice.contains("two") && !notice.contains("three"),
+            "{notice}"
+        );
+        // The unpicked third is recorded as offered: never shown again.
+        let third = h.store.find_items("automated:m2").unwrap();
+        assert_eq!(third[0].state, item_state::OFFERED);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_runs_once_a_day_at_the_sweep_time() {
+        let h = harness(vec![SILENT, SILENT]);
+        credits_mail(&h);
+        // Noon, sweep at 09:00, never run: due.
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SILENT);
+        h.clock.advance(chrono::Duration::hours(1));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, "not-due");
+        // Tomorrow 08:59: still not due; 09:00: due.
+        h.clock
+            .advance(chrono::Duration::hours(19) + chrono::Duration::minutes(59));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, "not-due");
+        seed_mail(
+            &h,
+            "m2",
+            "Example Bank <alerts@bank.example.com>",
+            "Wire received",
+            3 * DAY,
+            Some("skip"),
+        );
+        h.clock.advance(chrono::Duration::minutes(1));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SILENT);
+        assert_eq!(h.reasoner.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sweep_is_retried_an_hour_later_not_tomorrow() {
+        let h = harness(vec![Reply::Fail, PICK_C1]);
+        credits_mail(&h);
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::ERROR);
+        h.clock.advance(chrono::Duration::minutes(59));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, "not-due");
+        h.clock.advance(chrono::Duration::minutes(1));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SENT);
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_records_no_items_and_the_retry_resends() {
+        let h = harness(vec![PICK_C1, PICK_C1]);
+        credits_mail(&h);
         h.broker
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -828,53 +1428,47 @@ mod tests {
             (first.status.as_str(), first.reason.as_deref()),
             (status::ERROR, Some("delivery"))
         );
-        assert_eq!(h.store.last_sent().unwrap(), None);
+        assert!(h
+            .store
+            .find_items("automated:m-credits")
+            .unwrap()
+            .is_empty());
 
         h.broker
             .fail
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        h.clock.advance(interval(&h));
-        let retry = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(retry.status, status::SENT);
+        h.clock.advance(chrono::Duration::hours(1));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SENT);
+        assert_eq!(
+            h.store.find_items("automated:m-credits").unwrap()[0].state,
+            item_state::SURFACED
+        );
     }
 
     #[tokio::test]
-    async fn not_due_makes_no_call_and_writes_no_row_unless_forced() {
-        let h = harness(vec![SILENT, SILENT]);
-        h.runner.run_once(RUN).await.unwrap();
-        h.clock.advance(interval(&h) - chrono::Duration::seconds(1));
-        let early = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(early.status, "not-due");
-        assert_eq!(h.reasoner.calls(), 1);
-        assert_eq!(h.store.recent_runs(10).unwrap().len(), 1);
-
-        let forced = h.runner.run_once(FORCE).await.unwrap();
-        assert_eq!(forced.status, status::SILENT);
-        assert_eq!(h.reasoner.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn missed_ticks_coalesce_into_one_run() {
-        let h = harness(vec![SILENT, SILENT]);
-        h.runner.run_once(RUN).await.unwrap();
-        h.clock.advance(interval(&h) * 5);
-        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SILENT);
-        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, "not-due");
-        assert_eq!(h.reasoner.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn quiet_hours_skip_without_a_call_unless_forced() {
+    async fn quiet_hours_wait_unrecorded_until_the_window_opens() {
         let mut c = config();
-        c.active_hours = Some(crate::ActiveHours::parse("08:00-11:00").unwrap());
-        let h = harness_with(vec![SILENT], c, Some("- anything\n"));
+        c.active_hours = Some(crate::ActiveHours::parse("13:00-22:00").unwrap());
+        let h = harness_with(vec![SILENT, SILENT], c, Some("- anything\n"));
+        credits_mail(&h);
         let report = h.runner.run_once(RUN).await.unwrap();
         assert_eq!(
             (report.status.as_str(), report.reason.as_deref()),
             (status::SKIPPED, Some("quiet-hours"))
         );
+        assert!(h.store.recent_runs(10).unwrap().is_empty(), "not recorded");
         assert_eq!(h.reasoner.calls(), 0);
-
+        h.clock.advance(chrono::Duration::hours(1));
+        assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SILENT);
+        // Forcing ignores the window.
+        seed_mail(
+            &h,
+            "m2",
+            "Example Bank <alerts@bank.example.com>",
+            "Wire received",
+            3 * DAY,
+            Some("skip"),
+        );
         assert_eq!(
             h.runner.run_once(FORCE).await.unwrap().status,
             status::SILENT
@@ -885,6 +1479,7 @@ mod tests {
     async fn missing_or_empty_checklist_skips_without_a_call() {
         for checklist in [None, Some("# Heartbeat\n- [ ]\n<!-- todo -->\n")] {
             let h = harness_with(vec![], config(), checklist);
+            credits_mail(&h);
             let report = h.runner.run_once(FORCE).await.unwrap();
             assert_eq!(
                 report.reason.as_deref(),
@@ -899,10 +1494,18 @@ mod tests {
     async fn daily_cap_stops_calls_once_reached() {
         let mut c = config();
         c.daily_cap = 1;
-        let h = harness_with(vec![NOTIFY], c, Some("- anything\n"));
+        let h = harness_with(vec![PICK_C1], c, Some("- anything\n"));
+        credits_mail(&h);
         assert_eq!(h.runner.run_once(RUN).await.unwrap().status, status::SENT);
-        h.clock.advance(interval(&h));
-        let capped = h.runner.run_once(RUN).await.unwrap();
+        seed_mail(
+            &h,
+            "m2",
+            "Example Bank <alerts@bank.example.com>",
+            "Wire received",
+            3 * DAY,
+            Some("skip"),
+        );
+        let capped = h.runner.run_once(FORCE).await.unwrap();
         assert_eq!(
             (capped.status.as_str(), capped.reason.as_deref()),
             (status::SKIPPED, Some("cap"))
@@ -913,6 +1516,7 @@ mod tests {
     #[tokio::test]
     async fn busy_lease_skips_and_an_expired_lease_is_taken_over() {
         let h = harness(vec![SILENT]);
+        credits_mail(&h);
         let now = NOON().timestamp_millis();
         assert!(h.store.try_claim_lease("other", now, 60_000).unwrap());
         let busy = h.runner.run_once(FORCE).await.unwrap();
@@ -938,28 +1542,25 @@ mod tests {
         let h = harness(vec![
             Reply::Hang,
             Reply::Fail,
-            Reply::Text("Your flight moved."),
+            Reply::Text("Your credits were approved."),
+            Reply::Text(r#"{"notify": true, "items": [{"id": "c7", "note": "made up"}]}"#),
         ]);
-        for expected in ["timeout", "reasoner", "invalid-output"] {
+        credits_mail(&h);
+        for expected in ["timeout", "reasoner", "invalid-output", "invalid-output"] {
             let report = h.runner.run_once(FORCE).await.unwrap();
             assert_eq!(
                 (report.status.as_str(), report.reason.as_deref()),
                 (status::ERROR, Some(expected))
             );
         }
+        let alerts = h.broker.reasons();
+        assert_eq!(alerts.len(), 1, "only the third-error alert: {alerts:?}");
+        assert!(alerts[0].starts_with("Heartbeat failing"));
         assert!(h
             .store
-            .try_claim_lease("next", NOON().timestamp_millis(), 1)
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn invalid_output_is_never_delivered() {
-        let h = harness(vec![Reply::Text(
-            "Flight moved! HEARTBEAT_OK is what I'd say otherwise.",
-        )]);
-        h.runner.run_once(RUN).await.unwrap();
-        assert!(h.broker.reasons().is_empty());
+            .find_items("automated:m-credits")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -974,6 +1575,7 @@ mod tests {
             Reply::Fail,
             Reply::Fail,
         ]);
+        credits_mail(&h);
         for _ in 0..4 {
             h.runner.run_once(FORCE).await.unwrap();
         }
@@ -981,7 +1583,19 @@ mod tests {
         assert_eq!(alerts.len(), 1, "{alerts:?}");
         assert!(alerts[0].starts_with("Heartbeat failing"), "{}", alerts[0]);
 
-        for _ in 0..4 {
+        assert_eq!(
+            h.runner.run_once(FORCE).await.unwrap().status,
+            status::SILENT
+        );
+        seed_mail(
+            &h,
+            "m2",
+            "Example Bank <alerts@bank.example.com>",
+            "Wire received",
+            3 * DAY,
+            Some("skip"),
+        );
+        for _ in 0..3 {
             h.runner.run_once(FORCE).await.unwrap();
         }
         assert_eq!(h.broker.reasons().len(), 2);
@@ -989,7 +1603,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_calls_the_model_but_delivers_and_records_nothing() {
-        let h = harness(vec![NOTIFY]);
+        let h = harness(vec![PICK_C1]);
+        credits_mail(&h);
         let report = h
             .runner
             .run_once(RunOptions {
@@ -1000,14 +1615,20 @@ mod tests {
             .unwrap();
         assert_eq!(report.status, "dry-run");
         assert_eq!(report.decision.as_deref(), Some("notify"));
-        assert_eq!(report.message.as_deref(), Some("Flight UA12 moved to 6pm"));
+        assert!(report.message.as_deref().unwrap().contains("claim them"));
         assert!(h.broker.reasons().is_empty());
         assert!(h.store.recent_runs(10).unwrap().is_empty());
+        assert!(h
+            .store
+            .find_items("automated:m-credits")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn interrupted_run_from_a_dead_process_becomes_an_error() {
         let h = harness(vec![SILENT]);
+        credits_mail(&h);
         let stale = h
             .store
             .start_run(NOON().timestamp_millis() - 3_600_000)
@@ -1022,39 +1643,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_carries_checklist_time_history_and_inbound() {
-        let h = harness(vec![NOTIFY, SILENT]);
-        h.store
-            .with_conn(|c| {
-                c.execute_batch(
-                    "DROP TABLE IF EXISTS emails;
-                     CREATE TABLE emails (messageId TEXT PRIMARY KEY, fromEmail TEXT NOT NULL,
-                         subject TEXT NOT NULL, firstSeenAt INTEGER NOT NULL, triageResult TEXT);",
-                )?;
-                c.execute(
-                    "INSERT INTO emails VALUES ('m1', 'airline@example.com', 'Schedule change', ?1, 'important')",
-                    [NOON().timestamp_millis() + 60_000],
-                )
-            })
-            .unwrap();
+    async fn prompt_carries_checklist_time_history_and_candidates() {
+        let h = harness(vec![PICK_C1, SILENT]);
+        credits_mail(&h);
         h.runner.run_once(RUN).await.unwrap();
-        h.clock.advance(interval(&h));
+        seed_mail(
+            &h,
+            "m2",
+            "Example Bank <alerts@bank.example.com>",
+            "Wire received",
+            3 * DAY,
+            Some("skip"),
+        );
+        h.clock.advance(days(1));
         h.runner.run_once(RUN).await.unwrap();
 
-        let prompts = h.reasoner.prompts.lock().unwrap();
-        let first = &prompts[0];
+        let first = prompt(&h, 0);
         assert!(first.contains("- tell me if a flight changes"), "{first}");
         assert!(first.contains("2026-09-29 12:00 UTC (Tuesday)"), "{first}");
         assert!(first.contains("Last heartbeat: never"), "{first}");
-        let second = &prompts[1];
-        assert!(second.contains("Last heartbeat: 30m ago"), "{second}");
         assert!(
-            second.contains("Flight UA12 moved to 6pm"),
-            "last notice: {second}"
+            first.contains("Your Example Cloud credits application was approved"),
+            "{first}"
+        );
+        let second = prompt(&h, 1);
+        assert!(second.contains("Last heartbeat: 24h ago"), "{second}");
+        assert!(second.contains("claim them"), "last notice: {second}");
+        assert!(
+            second.contains("Example Bank <alerts@bank.example.com> · \"Wire received\""),
+            "{second}"
         );
         assert!(
-            second.contains("airline@example.com — Schedule change [important]"),
-            "{second}"
+            !second.contains("credits application"),
+            "surfaced items are not offered again"
         );
 
         let opts = h.reasoner.opts.lock().unwrap();
@@ -1079,19 +1700,13 @@ mod tests {
         );
         assert!(opts.settings_json.is_none() && !opts.restrict_env);
         assert!(opts.system_prompt.contains(r#"{"notify": false}"#));
+        assert!(opts.system_prompt.contains(r#""items""#));
     }
 
-    /// sha256 of `prompt.md` before outreach existed (#1833 D16).
-    const PRE_OUTREACH_PROMPT_SHA256: &str =
-        "95cd269bce968abfde0f558d403b2c57843611c01b7b0e32cc55f1057208b505";
-
     #[test]
-    fn outreach_off_system_prompt_is_byte_identical() {
+    fn outreach_off_system_prompt_is_the_base_contract() {
         let off = system_prompt(false);
-        assert_eq!(
-            format!("{:x}", Sha256::digest(off.as_bytes())),
-            PRE_OUTREACH_PROMPT_SHA256
-        );
+        assert!(!off.contains("outreach"), "{off}");
         assert_eq!(heartbeat_opts(Path::new("/w")).system_prompt, off);
         let on = system_prompt(true);
         assert!(on.starts_with(off));
@@ -1147,30 +1762,11 @@ mod tests {
     }
 
     const WITH_OUTREACH: Reply = Reply::Text(
-        r#"{"notify": true, "message": "Flight UA12 moved to 6pm", "outreach": [{"contact": "jane-doe", "message": "Running late", "why": "flight moved"}]}"#,
+        r#"{"notify": true, "items": [{"id": "c1", "note": "Credits approved"}], "outreach": [{"contact": "jane-doe", "message": "Running late", "why": "flight moved"}]}"#,
     );
 
-    #[tokio::test]
-    async fn without_outreach_the_run_is_unchanged() {
-        // No sink (switches off): the outreach key is ignored, the prompt
-        // and the notice are exactly as before.
-        let h = harness(vec![WITH_OUTREACH]);
-        let report = h.runner.run_once(RUN).await.unwrap();
-        assert_eq!(report.status, status::SENT);
-        assert!(report.outreach.is_empty());
-        assert!(!serde_json::to_string(&report).unwrap().contains("outreach"));
-        assert_eq!(h.broker.reasons(), vec!["Flight UA12 moved to 6pm"]);
-        let prompt = h.reasoner.prompts.lock().unwrap()[0].clone();
-        assert!(!prompt.contains("outreach"));
-        assert_eq!(
-            h.reasoner.opts.lock().unwrap()[0].system_prompt,
-            system_prompt(false)
-        );
-
-        // A sink with an empty roster is the same as none.
-        let h = harness(vec![WITH_OUTREACH]);
-        let empty = sink(&[]);
-        let runner = HeartbeatRunner::new(
+    fn runner_with(h: &Harness, outreach: Arc<Sink>) -> HeartbeatRunner<ScriptedReasoner> {
+        HeartbeatRunner::new(
             Arc::clone(&h.store),
             Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
             Arc::clone(&h.reasoner),
@@ -1179,8 +1775,28 @@ mod tests {
         )
         .with_clock(Arc::clone(&h.clock) as Arc<dyn Clock>)
         .with_holder("test")
-        .with_outreach(empty.clone());
-        let report = runner.run_once(RUN).await.unwrap();
+        .with_outreach(outreach)
+    }
+
+    #[tokio::test]
+    async fn without_outreach_the_run_is_unchanged() {
+        let h = harness(vec![WITH_OUTREACH]);
+        credits_mail(&h);
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.status, status::SENT);
+        assert!(report.outreach.is_empty());
+        assert!(!serde_json::to_string(&report).unwrap().contains("outreach"));
+        assert!(!prompt(&h, 0).contains("outreach"));
+        assert_eq!(
+            h.reasoner.opts.lock().unwrap()[0].system_prompt,
+            system_prompt(false)
+        );
+
+        // A sink with an empty roster is the same as none.
+        let h = harness(vec![WITH_OUTREACH]);
+        credits_mail(&h);
+        let empty = sink(&[]);
+        let report = runner_with(&h, empty.clone()).run_once(RUN).await.unwrap();
         assert!(report.outreach.is_empty());
         assert!(empty.proposed.lock().unwrap().is_empty());
         assert_eq!(
@@ -1192,58 +1808,42 @@ mod tests {
     #[tokio::test]
     async fn valid_entries_reach_the_sink_and_the_notice_still_posts() {
         let h = harness(vec![WITH_OUTREACH, WITH_OUTREACH]);
+        credits_mail(&h);
         let s = sink(&["jane-doe"]);
-        let runner = HeartbeatRunner::new(
-            Arc::clone(&h.store),
-            Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
-            Arc::clone(&h.reasoner),
-            h.runner.wiki_root.clone(),
-            config(),
-        )
-        .with_clock(Arc::clone(&h.clock) as Arc<dyn Clock>)
-        .with_holder("test")
-        .with_outreach(s.clone());
-        let report = runner.run_once(RUN).await.unwrap();
-        assert_eq!(report.status, status::SENT);
-        assert_eq!(h.broker.reasons(), vec!["Flight UA12 moved to 6pm"]);
-        assert_eq!(report.outreach.len(), 1);
-        let proposed = s.proposed.lock().unwrap().clone();
-        assert_eq!(proposed.len(), 1);
-        assert_eq!(proposed[0].0.message, "Running late");
-        assert!(!proposed[0].1);
-        let prompt = h.reasoner.prompts.lock().unwrap()[0].clone();
-        assert!(prompt.contains("- jane-doe — Name of jane-doe"));
-        assert_eq!(
-            h.reasoner.opts.lock().unwrap()[0].system_prompt,
-            system_prompt(true)
-        );
-
-        // A dry run hands the sink dry_run = true.
-        h.clock.advance(interval(&h));
-        runner
+        let runner = runner_with(&h, s.clone());
+        let report = runner
             .run_once(RunOptions {
                 force: true,
                 dry_run: true,
             })
             .await
             .unwrap();
-        assert!(s.proposed.lock().unwrap()[1].1);
+        assert!(
+            s.proposed.lock().unwrap()[0].1,
+            "a dry run hands the sink dry_run = true"
+        );
+        assert_eq!(report.outreach.len(), 1);
+
+        let report = runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.status, status::SENT);
+        assert!(h.broker.reasons()[0].contains("Credits approved"));
+        assert_eq!(report.outreach.len(), 1);
+        let proposed = s.proposed.lock().unwrap().clone();
+        assert_eq!(proposed[1].0.message, "Running late");
+        assert!(!proposed[1].1);
+        assert!(prompt(&h, 0).contains("- jane-doe — Name of jane-doe"));
+        assert_eq!(
+            h.reasoner.opts.lock().unwrap()[0].system_prompt,
+            system_prompt(true)
+        );
     }
 
     #[tokio::test]
     async fn failed_runs_never_outreach() {
         let h = harness(vec![Reply::Fail]);
+        credits_mail(&h);
         let s = sink(&["jane-doe"]);
-        let runner = HeartbeatRunner::new(
-            Arc::clone(&h.store),
-            Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
-            Arc::clone(&h.reasoner),
-            h.runner.wiki_root.clone(),
-            config(),
-        )
-        .with_holder("test")
-        .with_outreach(s.clone());
-        let report = runner.run_once(FORCE).await.unwrap();
+        let report = runner_with(&h, s.clone()).run_once(FORCE).await.unwrap();
         assert_eq!(report.status, status::ERROR);
         assert!(s.proposed.lock().unwrap().is_empty());
     }
@@ -1251,7 +1851,9 @@ mod tests {
     #[tokio::test]
     async fn run_loop_exits_on_shutdown() {
         let h = harness(vec![SILENT]);
+        credits_mail(&h);
         let shutdown = CancellationToken::new();
+        let reasoner = Arc::clone(&h.reasoner);
         let handle = tokio::spawn(h.runner.run(shutdown.clone()));
         tokio::time::sleep(Duration::from_millis(50)).await;
         shutdown.cancel();
@@ -1260,6 +1862,6 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(h.reasoner.calls(), 1, "first tick runs immediately");
+        assert_eq!(reasoner.calls(), 1, "first tick runs immediately");
     }
 }

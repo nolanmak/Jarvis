@@ -61,12 +61,78 @@ pub trait HeartbeatStore {
     fn try_claim_lease(&self, holder: &str, now_ms: i64, ttl_ms: i64) -> StoreResult<bool>;
     fn release_lease(&self, holder: &str) -> StoreResult<()>;
     fn prune_runs(&self, before_ms: i64) -> StoreResult<usize>;
-    /// Approval cards still waiting on the operator. `None` when the
-    /// Node-owned `actions` table isn't there (fresh or test databases).
-    fn pending_action_count(&self) -> Option<i64>;
-    /// `(from, subject, triage)` for inbound first seen since `since_ms`,
-    /// newest first. Empty when the `emails` table isn't there.
-    fn inbound_since(&self, since_ms: i64, limit: i64) -> Vec<(String, String, Option<String>)>;
+    /// Start time of the newest run that settled the day's sweep: silent,
+    /// sent, or skipped by a gate other than `busy`. Errors don't settle it,
+    /// so a failed sweep is retried.
+    fn last_settled_ms(&self) -> StoreResult<Option<i64>>;
+    /// Record (or update) sweep items. A recorded item is never offered
+    /// again unless it is snoozed and the snooze has run out.
+    fn record_items(&self, items: &[ItemRecord<'_>], now_ms: i64) -> StoreResult<()>;
+    /// Snoozed items whose snooze has run out, oldest first.
+    fn expired_snoozes(&self, now_ms: i64) -> StoreResult<Vec<HeartbeatItem>>;
+    /// Items whose key or short ref is `id`.
+    fn find_items(&self, id: &str) -> StoreResult<Vec<HeartbeatItem>>;
+    /// Mark one item `done`, or `snoozed` until `snooze_until_ms`.
+    fn set_item_state(
+        &self,
+        key: &str,
+        state: &str,
+        snooze_until_ms: Option<i64>,
+        now_ms: i64,
+    ) -> StoreResult<bool>;
+    /// Surfaced, done and snoozed items, newest first (offered ones are
+    /// bookkeeping and left out).
+    fn recent_items(&self, limit: u32) -> StoreResult<Vec<HeartbeatItem>>;
+    /// Drop items last touched before `before_ms`, except live snoozes.
+    fn prune_items(&self, before_ms: i64, now_ms: i64) -> StoreResult<usize>;
+}
+
+/// `heartbeat_items.state` values.
+pub mod item_state {
+    /// Shown to the model, which passed on it.
+    pub const OFFERED: &str = "offered";
+    /// Delivered on a notice.
+    pub const SURFACED: &str = "surfaced";
+    pub const DONE: &str = "done";
+    pub const SNOOZED: &str = "snoozed";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeartbeatItem {
+    pub item_key: String,
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    pub source: String,
+    pub state: String,
+    pub summary: Option<String>,
+    pub first_seen_ms: i64,
+    pub updated_ms: i64,
+    pub snooze_until_ms: Option<i64>,
+}
+
+/// One row for [`HeartbeatStore::record_items`].
+#[derive(Debug, Clone)]
+pub struct ItemRecord<'a> {
+    pub key: &'a str,
+    pub source: &'a str,
+    pub state: &'a str,
+    pub summary: Option<&'a str>,
+}
+
+const ITEM_COLUMNS: &str =
+    "item_key, ref, source, state, summary, first_seen_ms, updated_ms, snooze_until_ms";
+
+fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HeartbeatItem> {
+    Ok(HeartbeatItem {
+        item_key: r.get(0)?,
+        item_ref: r.get(1)?,
+        source: r.get(2)?,
+        state: r.get(3)?,
+        summary: r.get(4)?,
+        first_seen_ms: r.get(5)?,
+        updated_ms: r.get(6)?,
+        snooze_until_ms: r.get(7)?,
+    })
 }
 
 const RUN_COLUMNS: &str =
@@ -239,29 +305,102 @@ impl HeartbeatStore for Store {
         })
     }
 
-    fn pending_action_count(&self) -> Option<i64> {
+    fn last_settled_ms(&self) -> StoreResult<Option<i64>> {
         self.with_conn(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM actions WHERE status = 'pending'",
-                [],
+                "SELECT MAX(started_at_ms) FROM heartbeat_runs \
+                 WHERE status IN (?1, ?2) OR (status = ?3 AND COALESCE(reason, '') <> 'busy')",
+                params![status::SILENT, status::SENT, status::SKIPPED],
                 |r| r.get(0),
             )
         })
-        .ok()
     }
 
-    fn inbound_since(&self, since_ms: i64, limit: i64) -> Vec<(String, String, Option<String>)> {
+    fn record_items(&self, items: &[ItemRecord<'_>], now_ms: i64) -> StoreResult<()> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT fromEmail, subject, triageResult FROM emails \
-                 WHERE firstSeenAt >= ?1 ORDER BY firstSeenAt DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![since_ms, limit], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
+            let tx = c.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO heartbeat_items \
+                         (item_key, ref, source, state, summary, first_seen_ms, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+                     ON CONFLICT(item_key) DO UPDATE SET state = excluded.state, \
+                         summary = COALESCE(excluded.summary, heartbeat_items.summary), \
+                         updated_ms = excluded.updated_ms, snooze_until_ms = NULL",
+                )?;
+                for item in items {
+                    stmt.execute(params![
+                        item.key,
+                        crate::sweep::item_ref(item.key),
+                        item.source,
+                        item.state,
+                        item.summary,
+                        now_ms
+                    ])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
+    fn expired_snoozes(&self, now_ms: i64) -> StoreResult<Vec<HeartbeatItem>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM heartbeat_items \
+                 WHERE state = ?1 AND snooze_until_ms <= ?2 ORDER BY snooze_until_ms, item_key"
+            ))?;
+            let rows = stmt.query_map(params![item_state::SNOOZED, now_ms], item_from_row)?;
             rows.collect()
         })
-        .unwrap_or_default()
+    }
+
+    fn find_items(&self, id: &str) -> StoreResult<Vec<HeartbeatItem>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM heartbeat_items WHERE item_key = ?1 OR ref = ?1 \
+                 ORDER BY updated_ms DESC"
+            ))?;
+            let rows = stmt.query_map(params![id], item_from_row)?;
+            rows.collect()
+        })
+    }
+
+    fn set_item_state(
+        &self,
+        key: &str,
+        state: &str,
+        snooze_until_ms: Option<i64>,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        self.with_conn(|c| {
+            let changed = c.execute(
+                "UPDATE heartbeat_items SET state = ?2, snooze_until_ms = ?3, updated_ms = ?4 \
+                 WHERE item_key = ?1",
+                params![key, state, snooze_until_ms, now_ms],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    fn recent_items(&self, limit: u32) -> StoreResult<Vec<HeartbeatItem>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM heartbeat_items WHERE state <> ?1 \
+                 ORDER BY updated_ms DESC, item_key LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![item_state::OFFERED, limit], item_from_row)?;
+            rows.collect()
+        })
+    }
+
+    fn prune_items(&self, before_ms: i64, now_ms: i64) -> StoreResult<usize> {
+        self.with_conn(|c| {
+            c.execute(
+                "DELETE FROM heartbeat_items WHERE updated_ms < ?1 \
+                 AND NOT (state = ?2 AND snooze_until_ms > ?3)",
+                params![before_ms, item_state::SNOOZED, now_ms],
+            )
+        })
     }
 }
 
@@ -399,34 +538,75 @@ mod tests {
     }
 
     #[test]
-    fn context_queries_tolerate_missing_node_tables() {
+    fn errors_and_busy_skips_do_not_settle_the_sweep() {
         let (_d, s) = store();
-        s.with_conn(|c| {
-            c.execute_batch("DROP TABLE IF EXISTS actions; DROP TABLE IF EXISTS emails;")
-        })
-        .unwrap();
-        assert_eq!(s.pending_action_count(), None);
-        assert!(s.inbound_since(0, 10).is_empty());
+        assert_eq!(s.last_settled_ms().unwrap(), None);
+        let id = s.start_run(1_000).unwrap();
+        s.finish_run(id, 1_001, &outcome(status::ERROR)).unwrap();
+        s.record_skip(2_000, "busy").unwrap();
+        assert_eq!(s.last_settled_ms().unwrap(), None);
+        s.record_skip(3_000, "no-candidates").unwrap();
+        assert_eq!(s.last_settled_ms().unwrap(), Some(3_000));
+        let id = s.start_run(4_000).unwrap();
+        s.finish_run(id, 4_001, &outcome(status::SILENT)).unwrap();
+        assert_eq!(s.last_settled_ms().unwrap(), Some(4_000));
+    }
 
-        s.with_conn(|c| {
-            c.execute_batch(
-                "CREATE TABLE actions (id TEXT PRIMARY KEY, status TEXT NOT NULL);
-                 INSERT INTO actions VALUES ('a','pending'),('b','pending'),('c','sent');
-                 CREATE TABLE emails (messageId TEXT PRIMARY KEY, fromEmail TEXT NOT NULL,
-                     subject TEXT NOT NULL, firstSeenAt INTEGER NOT NULL, triageResult TEXT);
-                 INSERT INTO emails VALUES ('m1','sam@example.com','Old',100,NULL),
-                                           ('m2','ana@example.com','New',900,'important');",
-            )
-        })
+    fn rec<'a>(key: &'a str, state: &'a str) -> ItemRecord<'a> {
+        ItemRecord {
+            key,
+            source: "automated",
+            state,
+            summary: Some("note"),
+        }
+    }
+
+    #[test]
+    fn items_record_find_snooze_and_prune() {
+        let (_d, s) = store();
+        s.record_items(
+            &[
+                rec("k1", item_state::SURFACED),
+                rec("k2", item_state::OFFERED),
+            ],
+            1_000,
+        )
         .unwrap();
-        assert_eq!(s.pending_action_count(), Some(2));
+        let by_ref = s.find_items(&crate::sweep::item_ref("k1")).unwrap();
+        assert_eq!(by_ref.len(), 1);
+        assert_eq!(by_ref[0].item_key, "k1");
+        assert_eq!(s.find_items("k2").unwrap()[0].state, item_state::OFFERED);
         assert_eq!(
-            s.inbound_since(500, 10),
-            vec![(
-                "ana@example.com".to_string(),
-                "New".to_string(),
-                Some("important".to_string())
-            )]
+            s.recent_items(10)
+                .unwrap()
+                .iter()
+                .map(|i| i.item_key.as_str())
+                .collect::<Vec<_>>(),
+            ["k1"],
+            "offered rows are bookkeeping"
         );
+
+        assert!(s
+            .set_item_state("k1", item_state::SNOOZED, Some(5_000), 2_000)
+            .unwrap());
+        assert!(!s
+            .set_item_state("nope", item_state::DONE, None, 2_000)
+            .unwrap());
+        assert!(s.expired_snoozes(4_999).unwrap().is_empty());
+        assert_eq!(s.expired_snoozes(5_000).unwrap()[0].item_key, "k1");
+
+        // Re-recording clears the snooze.
+        s.record_items(&[rec("k1", item_state::SURFACED)], 6_000)
+            .unwrap();
+        assert!(s.expired_snoozes(9_000).unwrap().is_empty());
+
+        s.set_item_state("k1", item_state::SNOOZED, Some(100_000), 7_000)
+            .unwrap();
+        assert_eq!(
+            s.prune_items(50_000, 8_000).unwrap(),
+            1,
+            "k2 pruned, live snooze kept"
+        );
+        assert_eq!(s.find_items("k1").unwrap().len(), 1);
     }
 }

@@ -1901,6 +1901,27 @@ impl Store {
              )",
             [],
         )?;
+        // #2285 — what the daily sweep has already shown the model or the
+        // owner, so each item surfaces once. `state` is `offered` (the model
+        // passed on it), `surfaced`, `done` or `snoozed` (back after
+        // `snooze_until_ms`). `ref` is the short id printed on the notice.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_items (\
+                 item_key         TEXT PRIMARY KEY,\
+                 ref              TEXT NOT NULL,\
+                 source           TEXT NOT NULL,\
+                 state            TEXT NOT NULL,\
+                 summary          TEXT,\
+                 first_seen_ms    INTEGER NOT NULL,\
+                 updated_ms       INTEGER NOT NULL,\
+                 snooze_until_ms  INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_heartbeat_items_ref ON heartbeat_items(ref)",
+            [],
+        )?;
 
         // #79 — Twitter/X GraphQL queryId cache (rotated by X every 2-6 wk).
         conn.execute(

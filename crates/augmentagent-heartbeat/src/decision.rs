@@ -64,6 +64,83 @@ fn from_object(object: &serde_json::Map<String, serde_json::Value>) -> Decision 
     }
 }
 
+/// A daily-sweep note longer than this is cut (#2285): five of them must
+/// fit the 500-character notice.
+pub const MAX_NOTE_CHARS: usize = 90;
+
+/// One candidate the model chose to surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    /// The candidate id from the prompt (`c1`, `c2`, ...).
+    pub id: String,
+    /// One line for the owner.
+    pub note: String,
+}
+
+/// What the model decided on one daily sweep (#2285).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sweep {
+    Silent,
+    /// At least one valid pick, at most the cap, in the model's order.
+    Items(Vec<Pick>),
+    Invalid(String),
+}
+
+/// Parse a sweep reply: `{"notify": false}` or
+/// `{"notify": true, "items": [{"id": "c2", "note": "..."}]}`.
+///
+/// Picks naming an id not in `ids`, repeating one, or with an empty note
+/// are dropped; notes are cut to [`MAX_NOTE_CHARS`]; only the first `max`
+/// survive. `notify: true` with no valid pick is invalid, never delivered.
+pub fn parse_sweep(reply: &str, ids: &[String], max: usize) -> Sweep {
+    let Some(object) = last_decision_object(reply) else {
+        return match parse(reply) {
+            Decision::Silent => Sweep::Silent,
+            Decision::Invalid(why) => Sweep::Invalid(why),
+            Decision::Notify(_) => Sweep::Invalid("no JSON decision".into()),
+        };
+    };
+    match object.get("notify").and_then(serde_json::Value::as_bool) {
+        Some(false) => Sweep::Silent,
+        None => Sweep::Invalid("`notify` is not a boolean".into()),
+        Some(true) => {
+            let Some(serde_json::Value::Array(items)) = object.get("items") else {
+                return Sweep::Invalid("notify=true without an `items` list".into());
+            };
+            let mut picks: Vec<Pick> = Vec::new();
+            for item in items {
+                let field = |name: &str| {
+                    item.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|v| !v.is_empty())
+                };
+                let (Some(id), Some(note)) = (field("id"), field("note")) else {
+                    continue;
+                };
+                if !ids.contains(&id) || picks.iter().any(|p| p.id == id) {
+                    continue;
+                }
+                let note = if note.chars().count() > MAX_NOTE_CHARS {
+                    let cut: String = note.chars().take(MAX_NOTE_CHARS - 1).collect();
+                    format!("{}…", cut.trim_end())
+                } else {
+                    note
+                };
+                picks.push(Pick { id, note });
+                if picks.len() >= max {
+                    break;
+                }
+            }
+            if picks.is_empty() {
+                Sweep::Invalid("notify=true without a known candidate id".into())
+            } else {
+                Sweep::Items(picks)
+            }
+        }
+    }
+}
+
 /// D16 — the valid `outreach` entries of a reply, and what was dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutreachParse {
@@ -82,7 +159,15 @@ pub struct OutreachParse {
 /// nothing at all.
 pub fn parse_outreach(reply: &str, roster: &[String]) -> OutreachParse {
     let mut out = OutreachParse::default();
-    if matches!(parse(reply), Decision::Invalid(_)) {
+    // A valid legacy decision, or a sweep `notify: true` with items.
+    let shape_ok = !matches!(parse(reply), Decision::Invalid(_))
+        || last_decision_object(reply).is_some_and(|o| {
+            o.get("notify").and_then(serde_json::Value::as_bool) == Some(true)
+                && o.get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+        });
+    if !shape_ok {
         return out;
     }
     let Some(object) = last_decision_object(reply) else {
@@ -448,5 +533,76 @@ mod tests {
             let p = parse_outreach(&reply, &roster(&["jane-doe"]));
             assert!(p.entries.is_empty(), "{reply}");
         }
+    }
+
+    fn ids(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("c{i}")).collect()
+    }
+
+    #[test]
+    fn sweep_contract_silent_items_and_invalid() {
+        assert_eq!(
+            parse_sweep(r#"{"notify": false}"#, &ids(2), 5),
+            Sweep::Silent
+        );
+        assert_eq!(parse_sweep("HEARTBEAT_OK", &ids(2), 5), Sweep::Silent);
+        assert_eq!(
+            parse_sweep(
+                r#"{"notify": true, "items": [{"id": "c2", "note": "Credits approved; claim them"}]}"#,
+                &ids(2),
+                5
+            ),
+            Sweep::Items(vec![Pick {
+                id: "c2".into(),
+                note: "Credits approved; claim them".into()
+            }])
+        );
+        assert!(matches!(
+            parse_sweep(r#"{"notify": true, "message": "hi"}"#, &ids(2), 5),
+            Sweep::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_sweep(
+                r#"{"notify": true, "items": [{"id": "c9", "note": "x"}]}"#,
+                &ids(2),
+                5
+            ),
+            Sweep::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_sweep("sure thing", &ids(2), 5),
+            Sweep::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn sweep_picks_are_deduped_capped_and_trimmed() {
+        let long = "x".repeat(MAX_NOTE_CHARS + 40);
+        let reply = format!(
+            r#"{{"notify": true, "items": [
+                {{"id": "c1", "note": "{long}"}},
+                {{"id": "c1", "note": "again"}},
+                {{"id": "c2", "note": ""}},
+                {{"id": "c3", "note": "three"}},
+                {{"id": "c4", "note": "four"}}
+            ]}}"#
+        );
+        let Sweep::Items(picks) = parse_sweep(&reply, &ids(4), 2) else {
+            panic!("expected items");
+        };
+        assert_eq!(
+            picks.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["c1", "c3"]
+        );
+        assert_eq!(picks[0].note.chars().count(), MAX_NOTE_CHARS);
+    }
+
+    #[test]
+    fn outreach_rides_on_an_items_reply() {
+        let reply = r#"{"notify": true, "items": [{"id": "c1", "note": "n"}], "outreach": [{"contact": "jane-doe", "message": "hi", "why": "w"}]}"#;
+        assert_eq!(
+            parse_outreach(reply, &roster(&["jane-doe"])).entries.len(),
+            1
+        );
     }
 }
