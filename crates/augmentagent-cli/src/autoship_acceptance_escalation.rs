@@ -29,14 +29,33 @@ pub(super) fn eligible(c: &Connection, id: &str, cp: &Checkpoint) -> Result<bool
         && baseline_native_custody(c, id).is_ok())
 }
 fn retained_criteria(c: &Connection, id: &str, binding: &Binding) -> Result<Vec<String>> {
-    let mut q=c.prepare("SELECT response FROM scope_stage_response WHERE workflow=?1 AND json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan' AND json_extract(response,'$.binding.head')=?2 AND json_extract(response,'$.binding.contract')=?3 AND json_extract(response,'$.binding.evidence_hash')=?4")?;
+    // Raw model replies share this cache. Only controller-recorded verifier
+    // evidence, authenticated by its immutable receipt, supplies requirements.
+    let mut q = c.prepare(
+        "SELECT s.response,json_extract(e.payload,'$.sha256')
+         FROM scope_stage_response s JOIN workflow_event e ON e.workflow=s.workflow
+         WHERE s.workflow=?1 AND e.kind='verifier_evidence_recorded'
+         AND CASE WHEN json_valid(e.payload) THEN
+             json_extract(e.payload,'$.key')=s.key
+             AND json_extract(e.payload,'$.kind')='original_verifier_plan' ELSE 0 END
+         AND CASE WHEN json_valid(s.response) THEN
+             json_extract(s.response,'$.kind')='original_verifier_plan'
+             AND json_extract(s.response,'$.binding.head')=?2
+             AND json_extract(s.response,'$.binding.contract')=?3
+             AND json_extract(s.response,'$.binding.evidence_hash')=?4 ELSE 0 END",
+    )?;
     let rows = q.query_map(
         params![id, binding.head, binding.contract, binding.evidence_hash],
-        |r| r.get::<_, String>(0),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )?;
     let mut criteria = Vec::new();
     for row in rows {
-        let value: serde_json::Value = serde_json::from_str(&row?)?;
+        let (raw, digest) = row?;
+        ensure!(
+            format!("{:x}", Sha256::digest(raw.as_bytes())) == digest,
+            "original verifier plan receipt mismatch"
+        );
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
         if let Some(items) = value["proposal"]["contract"]["criteria"].as_array() {
             for item in items {
                 let requirement = item["requirement"]
@@ -238,7 +257,10 @@ mod tests {
                 6,
             )
             .unwrap();
-        store.record_scope_stage_response(&lease,&binding,&"e".repeat(64),&serde_json::json!({"kind":"original_verifier_plan","binding":binding,"proposal":{"contract":{"criteria":[{"requirement":"Retain structural mention safeguards"}]}}}).to_string(),6).unwrap();
+        store.record_verifier_evidence(&lease,&binding,&"e".repeat(64),"original_verifier_plan",&serde_json::json!({"version":1,"workflow":id,"kind":"original_verifier_plan","binding":binding,"proposal":{"contract":{"criteria":[{"requirement":"Retain structural mention safeguards"}]}}}).to_string(),6).unwrap();
+        // Raw completed model text can imitate a plan's JSON shape but cannot
+        // mint the controller's verifier_evidence_recorded custody receipt.
+        store.record_scope_stage_response(&lease,&binding,&"d".repeat(64),&serde_json::json!({"version":1,"workflow":id,"kind":"original_verifier_plan","binding":binding,"proposal":{"contract":{"criteria":[{"requirement":"MODEL_ADDED_REQUIREMENT"}]}}}).to_string(),6).unwrap();
         store
             .charge(
                 &lease,
