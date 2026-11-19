@@ -10,6 +10,7 @@ pub(super) fn classify(cp: &Checkpoint, paused: bool, waiting: bool) -> Workflow
     match cp.next.action.as_str() {
         "await_capacity" => WorkflowOutcome::CapacityWait,
         "await_quota" => WorkflowOutcome::QuotaWait,
+        "rescope_executable_acceptance" if cp.next.reason=="retry_cycle_exhausted" => WorkflowOutcome::RetryableInfrastructure,
         "retry_verification" | "await_verifier_infrastructure_recovery" | "await_inactivity_retry" =>
             WorkflowOutcome::RetryableInfrastructure,
         _ if matches!(cp.next.reason.as_str(),
