@@ -337,7 +337,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             if let Err(e) = self.store.prune_runs(now_ms - RETENTION_MS) {
                 warn!("heartbeat prune failed: {e}");
             }
-            if let Err(e) = self.store.prune_items(now_ms - ITEM_RETENTION_MS, now_ms) {
+            if let Err(e) = self.store.prune_items(now_ms - ITEM_RETENTION_MS) {
                 warn!("heartbeat item prune failed: {e}");
             }
         }
@@ -418,7 +418,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
                         source: Source::Snoozed,
                         note,
                     },
-                    item.first_seen_ms,
+                    item.item_at_ms.unwrap_or(item.first_seen_ms),
                 )
             })
             .collect();
@@ -585,13 +585,14 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             .collect();
         let surfaced: Vec<SurfacedItem> = items.iter().map(|(i, _)| i.clone()).collect();
         let record = |state_of_rest: &str| -> Result<()> {
-            let mut rows: Vec<ItemRecord<'_>> = surfaced
+            let mut rows: Vec<ItemRecord<'_>> = items
                 .iter()
-                .map(|i| ItemRecord {
+                .map(|(i, at_ms)| ItemRecord {
                     key: &i.key,
                     source: i.source.as_str(),
                     state: item_state::SURFACED,
                     summary: Some(&i.note),
+                    at_ms: Some(*at_ms),
                 })
                 .collect();
             rows.extend(
@@ -605,6 +606,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
                         source: c.source.as_str(),
                         state: state_of_rest,
                         summary: None,
+                        at_ms: Some(c.at_ms),
                     }),
             );
             self.store.record_items(&rows, now_ms)?;
@@ -1131,6 +1133,11 @@ mod tests {
         let back = h.runner.run_once(RUN).await.unwrap();
         assert_eq!(back.status, status::SENT, "{back:?}");
         assert_eq!(back.items[0].source, Source::Snoozed);
+        assert!(
+            h.broker.reasons()[1].contains("(13d, "),
+            "age of the mail, not of the snooze: {}",
+            h.broker.reasons()[1]
+        );
         assert!(h.broker.reasons()[1].contains("Example Cloud approved your credits"));
         assert_eq!(
             h.reasoner.calls(),

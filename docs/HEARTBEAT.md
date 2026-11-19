@@ -164,7 +164,7 @@ costs nothing:
 
 After three errors in a row, the heartbeat posts **one** "Heartbeat failing"
 card. It posts nothing more until a run succeeds. Runs are kept for 30 days;
-item bookkeeping for 60 (live snoozes are kept until they run out).
+item bookkeeping for 60 (snoozed items are kept until a sweep resurfaces them).
 
 ## Decision contract
 

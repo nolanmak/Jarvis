@@ -1904,7 +1904,8 @@ impl Store {
         // #2285 — what the daily sweep has already shown the model or the
         // owner, so each item surfaces once. `state` is `offered` (the model
         // passed on it), `surfaced`, `done` or `snoozed` (back after
-        // `snooze_until_ms`). `ref` is the short id printed on the notice.
+        // `snooze_until_ms`). `ref` is the short id printed on the notice;
+        // `item_at_ms` is when the underlying message arrived.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS heartbeat_items (\
                  item_key         TEXT PRIMARY KEY,\
@@ -1912,6 +1913,7 @@ impl Store {
                  source           TEXT NOT NULL,\
                  state            TEXT NOT NULL,\
                  summary          TEXT,\
+                 item_at_ms       INTEGER,\
                  first_seen_ms    INTEGER NOT NULL,\
                  updated_ms       INTEGER NOT NULL,\
                  snooze_until_ms  INTEGER\

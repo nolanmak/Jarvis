@@ -111,6 +111,7 @@ impl Rig {
                     source: "automated",
                     state,
                     summary: Some("Example Cloud approved your credits"),
+                    at_ms: None,
                 }],
                 now_ms(),
             )

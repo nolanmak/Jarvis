@@ -83,8 +83,9 @@ pub trait HeartbeatStore {
     /// Surfaced, done and snoozed items, newest first (offered ones are
     /// bookkeeping and left out).
     fn recent_items(&self, limit: u32) -> StoreResult<Vec<HeartbeatItem>>;
-    /// Drop items last touched before `before_ms`, except live snoozes.
-    fn prune_items(&self, before_ms: i64, now_ms: i64) -> StoreResult<usize>;
+    /// Drop items last touched before `before_ms`. Snoozed items are kept
+    /// until a sweep resurfaces them, however long ago they were snoozed.
+    fn prune_items(&self, before_ms: i64) -> StoreResult<usize>;
 }
 
 /// `heartbeat_items.state` values.
@@ -105,6 +106,8 @@ pub struct HeartbeatItem {
     pub source: String,
     pub state: String,
     pub summary: Option<String>,
+    /// When the underlying message arrived.
+    pub item_at_ms: Option<i64>,
     pub first_seen_ms: i64,
     pub updated_ms: i64,
     pub snooze_until_ms: Option<i64>,
@@ -117,10 +120,12 @@ pub struct ItemRecord<'a> {
     pub source: &'a str,
     pub state: &'a str,
     pub summary: Option<&'a str>,
+    /// When the underlying message arrived.
+    pub at_ms: Option<i64>,
 }
 
 const ITEM_COLUMNS: &str =
-    "item_key, ref, source, state, summary, first_seen_ms, updated_ms, snooze_until_ms";
+    "item_key, ref, source, state, summary, item_at_ms, first_seen_ms, updated_ms, snooze_until_ms";
 
 fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HeartbeatItem> {
     Ok(HeartbeatItem {
@@ -129,9 +134,10 @@ fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HeartbeatItem> {
         source: r.get(2)?,
         state: r.get(3)?,
         summary: r.get(4)?,
-        first_seen_ms: r.get(5)?,
-        updated_ms: r.get(6)?,
-        snooze_until_ms: r.get(7)?,
+        item_at_ms: r.get(5)?,
+        first_seen_ms: r.get(6)?,
+        updated_ms: r.get(7)?,
+        snooze_until_ms: r.get(8)?,
     })
 }
 
@@ -322,10 +328,11 @@ impl HeartbeatStore for Store {
             {
                 let mut stmt = tx.prepare(
                     "INSERT INTO heartbeat_items \
-                         (item_key, ref, source, state, summary, first_seen_ms, updated_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+                         (item_key, ref, source, state, summary, item_at_ms, first_seen_ms, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
                      ON CONFLICT(item_key) DO UPDATE SET state = excluded.state, \
                          summary = COALESCE(excluded.summary, heartbeat_items.summary), \
+                         item_at_ms = COALESCE(excluded.item_at_ms, heartbeat_items.item_at_ms), \
                          updated_ms = excluded.updated_ms, snooze_until_ms = NULL",
                 )?;
                 for item in items {
@@ -335,6 +342,7 @@ impl HeartbeatStore for Store {
                         item.source,
                         item.state,
                         item.summary,
+                        item.at_ms,
                         now_ms
                     ])?;
                 }
@@ -393,12 +401,11 @@ impl HeartbeatStore for Store {
         })
     }
 
-    fn prune_items(&self, before_ms: i64, now_ms: i64) -> StoreResult<usize> {
+    fn prune_items(&self, before_ms: i64) -> StoreResult<usize> {
         self.with_conn(|c| {
             c.execute(
-                "DELETE FROM heartbeat_items WHERE updated_ms < ?1 \
-                 AND NOT (state = ?2 AND snooze_until_ms > ?3)",
-                params![before_ms, item_state::SNOOZED, now_ms],
+                "DELETE FROM heartbeat_items WHERE updated_ms < ?1 AND state <> ?2",
+                params![before_ms, item_state::SNOOZED],
             )
         })
     }
@@ -558,6 +565,7 @@ mod tests {
             source: "automated",
             state,
             summary: Some("note"),
+            at_ms: Some(42),
         }
     }
 
@@ -575,6 +583,11 @@ mod tests {
         let by_ref = s.find_items(&crate::sweep::item_ref("k1")).unwrap();
         assert_eq!(by_ref.len(), 1);
         assert_eq!(by_ref[0].item_key, "k1");
+        assert_eq!(
+            by_ref[0].item_at_ms,
+            Some(42),
+            "the message time, not the sweep time"
+        );
         assert_eq!(s.find_items("k2").unwrap()[0].state, item_state::OFFERED);
         assert_eq!(
             s.recent_items(10)
@@ -603,7 +616,7 @@ mod tests {
         s.set_item_state("k1", item_state::SNOOZED, Some(100_000), 7_000)
             .unwrap();
         assert_eq!(
-            s.prune_items(50_000, 8_000).unwrap(),
+            s.prune_items(50_000).unwrap(),
             1,
             "k2 pruned, live snooze kept"
         );
