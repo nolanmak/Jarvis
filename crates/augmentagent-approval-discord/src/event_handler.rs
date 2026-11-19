@@ -1266,9 +1266,11 @@ impl EventHandler for Handler {
                             }
                             return;
                         }
-                        let at_ms = match crate::timeparse::resolve_token(
+                        // #2286 — the owner's zone, the same one the select's
+                        // placeholder names and confirmations show.
+                        let at_ms = match crate::timeparse::resolve_token_in(
                             &token,
-                            chrono::Local::now(),
+                            chrono::Utc::now().with_timezone(&crate::timeparse::owner_zone()),
                         ) {
                             Ok(v) => v,
                             Err(msg) => {
@@ -1552,9 +1554,9 @@ impl EventHandler for Handler {
                     let ctx_clone = ctx.clone();
                     let modal_clone = modal.clone();
                     tokio::spawn(async move {
-                        let at_ms = match crate::timeparse::parse_send_at(
+                        let at_ms = match crate::timeparse::parse_send_at_in(
                             &input,
-                            chrono::Local::now(),
+                            chrono::Utc::now().with_timezone(&crate::timeparse::owner_zone()),
                         ) {
                             Ok(v) => v,
                             Err(msg) => {
