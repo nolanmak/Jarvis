@@ -192,6 +192,24 @@ fn scope_frontier(
     conn: &Connection,
     workflow: &str,
 ) -> Result<Option<(i64, std::collections::BTreeSet<String>)>> {
+    // #2356: an unrecoverable original is the same kind of cutover. The later
+    // frontier wins; the union of archived keys is never replayed.
+    let owner = owner_frontier(conn, workflow)?;
+    let lost = super::terminal_parks::frontier(conn, workflow)?;
+    Ok(match (owner, lost) {
+        (None, None) => None,
+        (Some(owner), None) => Some(owner),
+        (None, Some((seq, keys, _))) => Some((seq, keys)),
+        (Some((owner_seq, mut keys)), Some((seq, lost, _))) => {
+            keys.extend(lost);
+            Some((owner_seq.max(seq), keys))
+        }
+    })
+}
+fn owner_frontier(
+    conn: &Connection,
+    workflow: &str,
+) -> Result<Option<(i64, std::collections::BTreeSet<String>)>> {
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_checkout_recovery')",[],|r|r.get(0))?;
     if !exists {
         return Ok(None);
@@ -282,11 +300,19 @@ pub(super) fn cutover_seq(conn: &Connection, workflow: &str) -> Result<i64> {
     Ok(scope_frontier(conn, workflow)?.map_or(0, |(seq, _)| seq))
 }
 pub(super) fn native_attempts(conn: &Connection, workflow: &str) -> Result<Option<u64>> {
-    if scope_frontier(conn, workflow)?.is_none() {
+    let owner = owner_frontier(conn, workflow)?.is_some();
+    let lost = super::terminal_parks::frontier(conn, workflow)?;
+    if !owner && lost.is_none() {
         return Ok(None);
     }
-    let raw:String=conn.query_row("SELECT r.original_bounded_attempts FROM active_checkout_recovery a JOIN owner_checkout_recovery r USING(request_id) WHERE a.workflow=?1",[workflow],|r|r.get(0))?;
-    let original: std::collections::BTreeSet<(String, String)> = serde_json::from_str(&raw)?;
+    let mut original: std::collections::BTreeSet<(String, String)> = Default::default();
+    if owner {
+        let raw:String=conn.query_row("SELECT r.original_bounded_attempts FROM active_checkout_recovery a JOIN owner_checkout_recovery r USING(request_id) WHERE a.workflow=?1",[workflow],|r|r.get(0))?;
+        original.extend(serde_json::from_str::<std::collections::BTreeSet<(String, String)>>(&raw)?);
+    }
+    if let Some((_, _, bounded)) = lost {
+        original.extend(bounded);
+    }
     let mut q=conn.prepare("SELECT purpose,binding,attempts FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2")?;
     let mut total = 0u64;
     for row in q.query_map(params![workflow, BASELINE_NATIVE_PURPOSE_PREFIX], |r| {

@@ -178,13 +178,21 @@ impl WorkflowStore {
         })
     }
     pub(crate) fn scope_policy_key(&self, id: &str, key: String) -> Result<String> {
-        Ok(if fresh_epoch(&self.conn, id)? {
+        let key = if fresh_epoch(&self.conn, id)? {
             format!(
                 "{:x}",
                 Sha256::digest(serde_json::to_vec(&(POLICY, id, key))?)
             )
         } else {
             key
+        };
+        // #2356: re-verification after a lost original starts a fresh epoch.
+        Ok(match super::terminal_parks::frontier(&self.conn, id)? {
+            Some((seq, _, _)) => format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(super::terminal_parks::UNRECOVERABLE, id, seq, key))?)
+            ),
+            None => key,
         })
     }
 }

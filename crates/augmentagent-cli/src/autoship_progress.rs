@@ -160,7 +160,7 @@ fn code(value:&str,fallback:&str)->String {
         "acceptance_strategy_escalation"|"acceptance_strategy_reviewer_capacity"|"acceptance_strategy_retry"|"acceptance_summary_retry"|
         "acceptance_strategy_backoff"|"acceptance_strategy_budget_wait"|"readiness_assessment_retry"|"readiness_budget_wait"|
         "acceptance_strategies_exhausted"|"acceptance_decomposed_into_observable_children"|"escalate_acceptance"|"await_new_execution_inputs"|"await_child_completion"|
-        "readiness_assessment_invalid"|"await_readiness_input_change"|
+        "readiness_assessment_invalid"|"await_readiness_input_change"|"original_evidence_unrecoverable"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
         "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
