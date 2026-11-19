@@ -1208,8 +1208,13 @@ fn tool_scope_args(opts: &ReasonerOpts) -> Vec<String> {
     // the built-ins the call may use: `Bash(augmentagent …)` needs `Bash`,
     // `Read(//path/**)` needs `Read`. MCP tools come from `--mcp-config`, and
     // explicit `--settings` (hooks, permission denies) still applies.
+    builtin_scope_args(opts.allowed_tools.iter())
+}
+
+/// `--tools` and the settings flags for a list of allowed tools.
+fn builtin_scope_args<'a>(allowed_tools: impl Iterator<Item = &'a String>) -> Vec<String> {
     let mut builtins: Vec<&str> = Vec::new();
-    for allowed in &opts.allowed_tools {
+    for allowed in allowed_tools {
         let name = allowed.split('(').next().unwrap_or_default().trim();
         if !name.is_empty() && !name.starts_with("mcp__") && !builtins.contains(&name) {
             builtins.push(name);
@@ -1263,9 +1268,7 @@ fn tool_scope_args_with_images(opts: &ReasonerOpts, grants: &[String]) -> Vec<St
             "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(),
             "--setting-sources".into(), "".into(), "--disable-slash-commands".into()];
     }
-    let mut widened = opts.clone();
-    widened.allowed_tools.extend(grants.iter().cloned());
-    tool_scope_args(&widened)
+    builtin_scope_args(opts.allowed_tools.iter().chain(grants))
 }
 
 impl ClaudeCliReasoner {
