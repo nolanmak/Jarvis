@@ -289,7 +289,10 @@ same account as the dashboard.
 `scripts/install-autostart.sh` and `scripts/install-dashboard.sh` write these
 units (or plists); `scripts/install-autostart.sh` accepts
 `AUGMENTAGENT_AUTOSTART_DRY_RUN=true` to register the daemon without it ever
-sending. Logs land under `~/.local/state/augmentagent*/` on both. The daemon unit runs **live** with the wiki on
+sending. When the build has the `auto-pr-worker` command, `install-autostart.sh`
+also registers the auto-ship worker: `augmentagent-autopr.service` on Linux, the
+`com.nolanmak.augmentagent.autopr` LaunchAgent on macOS. Auto-ship runs only in
+that worker, never inside the daemon. Logs land under `~/.local/state/augmentagent*/` on both. The daemon unit runs **live** with the wiki on
 (`--wiki-dir ./wiki serve --dry-run false`), which also needs `jq` on `PATH`,
 the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.

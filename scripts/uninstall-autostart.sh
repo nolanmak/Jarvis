@@ -16,6 +16,19 @@ uninstall_macos() {
   UID_NUM="$(id -u)"
   local DOMAIN="gui/$UID_NUM"
 
+  # #2275 — the auto-ship worker is its own LaunchAgent; remove it only when
+  # ensure-autopr-worker.sh manages it.
+  local WORKER_LABEL="com.nolanmak.augmentagent.autopr"
+  local WORKER_PLIST="$HOME/Library/LaunchAgents/$WORKER_LABEL.plist"
+  if [ -f "$WORKER_PLIST" ] && grep -q '<!-- Managed by ensure-autopr-worker.sh -->' "$WORKER_PLIST"; then
+    if launchctl print "$DOMAIN/$WORKER_LABEL" >/dev/null 2>&1; then
+      log "Booting out $DOMAIN/$WORKER_LABEL"
+      launchctl bootout "$DOMAIN/$WORKER_LABEL" || true
+    fi
+    log "Removing $WORKER_PLIST"
+    rm "$WORKER_PLIST"
+  fi
+
   if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
     log "Booting out $DOMAIN/$LABEL"
     launchctl bootout "$DOMAIN/$LABEL" || true

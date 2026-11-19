@@ -232,6 +232,24 @@ Tests pin this behaviour:
   `scripts/tests/updater-restart-hygiene.test.sh` checks that a lock held there
   does not defer the daemon restart (#2271).
 
+## Auto-ship worker installation
+
+Auto-ship has one execution path: the `augmentagent auto-pr-worker` process
+(#2275). The daemon never hosts the loop. These tests pin that, without touching
+the host's service manager:
+
+- `autoship_worker::tests::the_daemon_never_hosts_the_autoship_loop` fails if
+  `serve` constructs the auto-ship loop or branches on the old mode flag.
+- `autoship_worker::tests::the_external_flag_is_accepted_but_ignored_with_a_deprecation_warning`
+  checks that `AUGMENTAGENT_AUTOPR_EXTERNAL` only warns.
+- `scripts/tests/autopr_worker_install_test.py` renders the systemd unit with a
+  faked `uname` of Linux, and the launchd LaunchAgent
+  (`com.nolanmak.augmentagent.autopr`) with `Darwin`, using stub `systemctl`
+  and `launchctl`.
+- `scripts/tests/launchd_installers_test.py` checks that
+  `install-autostart.sh` registers the worker agent on macOS and that
+  `uninstall-autostart.sh` removes it.
+
 For a manual live run, add your own fence as well. It costs nothing:
 
 ```sh
