@@ -10,7 +10,11 @@ mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod yolo_command;
+mod yolo_turn;
 mod web;
+#[cfg(test)]
+mod yolo_isolation_tests;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -833,8 +837,10 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
-        /// Pin one Discord model profile for this probe, without persisting a selection.
-        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
+        /// Pin one model profile for this probe, without persisting a selection.
+        /// `yolo` is accepted here and nowhere else outside a yolo thread; it
+        /// still requires the enable flag and a configured key.
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex", "yolo"])]
         profile: Option<String>,
         /// Ask the selected model to read a synthetic file through the Jarvis
         /// bridge and require a matching tool audit receipt. Performs inference.
@@ -11531,6 +11537,20 @@ fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
     assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
 }
 
+/// #2218 — an isolation check, not routing. A turn that is not a yolo turn
+/// never runs in a yolo thread, whatever entry point produced it (voice
+/// start, voice bridge, phone, iMessage owner). An unreadable registry closes
+/// guild channels and leaves DMs alone. No inference is started.
+pub(crate) const YOLO_THREAD_REFUSAL: &str = "Not available in a yolo thread.";
+fn yolo_thread_refusal(ctx: &augmentagent_approval_discord::AuditCtx) -> Option<String> {
+    use augmentagent_store::yolo_threads::{closed_to_normal_turns, mark};
+    let channel = ctx.channel_id?;
+    if augmentagent_approval_discord::interaction::is_yolo_turn() {
+        return None;
+    }
+    closed_to_normal_turns(mark(channel.get()), ctx.guild_id.is_some()).then(|| YOLO_THREAD_REFUSAL.to_string())
+}
+
 async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
@@ -11590,8 +11610,8 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
     let probe = if tool_probe {
         let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
         anyhow::ensure!(
-            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
-            "--tool-probe requires claude, codex, qwen, or glm"
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex | ProviderKind::Yolo),
+            "--tool-probe requires claude, codex, qwen, glm, or yolo"
         );
         let directory = tempfile::tempdir()?;
         let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
@@ -11923,6 +11943,10 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            return self.answer_yolo(ctx, question).await;
+        }
         let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
             std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
                 .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
@@ -12072,6 +12096,14 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        // #2219 — a yolo turn: its own thread's history plus the message, no
+        // native session, no iMessage owner history, no other route.
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            let prompt = if history.is_empty() { current.to_string() }
+                else { format!("{history}\n\nuser's current message:\n{current}") };
+            return self.answer(ctx, &prompt).await;
+        }
         let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
         let mut combined_history=history.to_owned();
         if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {
@@ -12184,13 +12216,32 @@ impl QueryHandler for WikiQuerier {
     ) -> Option<augmentagent_approval_discord::owner_text::OwnerCommandOutcome> {
         // #2208 — `/search`: configuration only, never a vendor call.
         let (availability, _) = web::availability(&augmentagent_channel_core::secret_loader::load_provider_key);
-        web::command::run(
+        if let Some(reply) = web::command::run(
             text,
             &cx.channel_id.to_string(),
             &web::pins::PinStore::new(web::pins::config_path()),
             &availability,
+        ) {
+            return Some(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply(reply));
+        }
+        // #2219 — `/yolo`: decided here, performed by the Discord handler.
+        if text.split_whitespace().next() != Some("/yolo") {
+            return None;
+        }
+        yolo_command::run(
+            text,
+            &cx,
+            augmentagent_store::yolo_threads::mark(cx.channel_id),
+            &yolo_turn::facts(),
         )
-        .map(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply)
+    }
+
+    fn yolo_tag(&self) -> String {
+        // The id is validated by readiness; an invalid one is never printed.
+        match augmentagent_channel_core::yolo::readiness() {
+            Err(augmentagent_channel_core::yolo::NotReady::InvalidModel) => "[yolo]".into(),
+            _ => format!("[yolo · {}]", augmentagent_channel_core::yolo::model_id()),
+        }
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
