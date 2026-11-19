@@ -50,6 +50,13 @@ pub(crate) fn facts() -> crate::yolo_command::Facts {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: a ready yolo profile whose state directory is this path, so
+    /// a test depends on neither the process environment nor a stored key.
+    pub(crate) static STATE_DIR_FOR_TESTS: std::path::PathBuf;
+}
+
 impl crate::WikiQuerier {
     /// Answer one yolo turn. `question` already holds the thread's own
     /// history and the current message.
@@ -60,14 +67,23 @@ impl crate::WikiQuerier {
     ) -> anyhow::Result<String> {
         // Readiness is re-checked on every turn: the flag or key may have
         // changed since the thread was opened. No other model answers.
-        if let Err(cause) = yolo::readiness() {
-            return Ok(format!("not available: {}", cause.sentence()));
+        #[cfg(test)]
+        let fixture_state = STATE_DIR_FOR_TESTS.try_with(Clone::clone).ok();
+        #[cfg(not(test))]
+        let fixture_state: Option<std::path::PathBuf> = None;
+        if fixture_state.is_none() {
+            if let Err(cause) = yolo::readiness() {
+                return Ok(format!("not available: {}", cause.sentence()));
+            }
         }
         let channel = ctx
             .channel_id
             .context("a yolo turn needs a Discord thread")?;
-        let workspace = yolo_preset::workspace_dir(channel.get())
-            .context("no state directory for the yolo workspace")?;
+        let workspace = match fixture_state {
+            Some(state) => state.join("yolo-workspaces").join(channel.get().to_string()),
+            None => yolo_preset::workspace_dir(channel.get())
+                .context("no state directory for the yolo workspace")?,
+        };
         yolo_preset::ensure_workspace(&workspace)?;
         let mut opts =
             yolo_preset::yolo_opts(self.wiki_root.clone(), self.repo_root.clone(), workspace);
