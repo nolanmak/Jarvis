@@ -347,6 +347,41 @@ async fn a_prompt_file_symlink_out_of_the_wiki_is_refused() {
     assert!(f.row().last_status.unwrap().contains("outside the wiki"));
 }
 
+fn connect_account(store: &Store, email: &str) {
+    store.upsert_google_gmail_account(email).unwrap();
+}
+
+#[test]
+fn connected_accounts_are_own_addresses_alongside_the_env_list() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    assert!(own_send_addresses(&store, "").is_empty());
+    connect_account(&store, "Inbox@Example.com");
+    assert_eq!(own_send_addresses(&store, ""), vec!["inbox@example.com"]);
+    assert_eq!(
+        own_send_addresses(&store, "other@example.com, inbox@example.com"),
+        vec!["other@example.com", "inbox@example.com"]
+    );
+}
+
+#[tokio::test]
+async fn a_loop_may_email_a_connected_account_with_no_env_list() {
+    let reply = || report(serde_json::json!([keyed("person-a", "Person A asked", "msg:1")]));
+    let mut f = fixture(email_options(), vec![reply()]);
+    f.scheduler.self_send = None;
+    connect_account(&f.store, OWNER);
+    f.run().await;
+    assert_eq!(f.sent().len(), 1);
+
+    // Not connected and not listed: still refused.
+    let mut stranger = fixture(email_options(), vec![reply()]);
+    stranger.scheduler.self_send = None;
+    connect_account(&stranger.store, "someone-else@example.com");
+    stranger.run().await;
+    assert!(stranger.sent().is_empty());
+    assert!(stranger.row().last_status.unwrap().contains("neither a connected mail account"));
+}
+
 #[test]
 fn only_one_plain_allowlisted_address_may_be_sent_to() {
     let allow = parse_self_send_allowlist(" Owner@Example.com , ,second@example.com ");
