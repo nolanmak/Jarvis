@@ -29,7 +29,7 @@ pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub const RECENT_GRACE_MS: i64 = 2 * DAY_MS;
 /// How far back the sweep looks.
 pub const LOOKBACK_MS: i64 = 14 * DAY_MS;
-/// Inbound rows read per sweep for the unanswered-people check.
+/// Conversations read per sweep for the unanswered-people check.
 pub const UNANSWERED_SCAN: i64 = 300;
 /// Unanswered conversations offered to the model per sweep.
 pub const UNANSWERED_LIMIT: usize = 15;
@@ -218,22 +218,33 @@ pub fn unanswered(store: &Store, evidence: &dyn ReplyEvidence, w: Window) -> Vec
     } else {
         ""
     };
+    // The latest eligible inbound per conversation is chosen before the
+    // dedup check, so recording it never exposes an older message.
     let sql = format!(
-        "SELECT m.message_id, m.platform, m.conversation_id, m.sender_handle, \
-                COALESCE(NULLIF(m.sender_label, ''), e.fromEmail, m.sender_handle), \
-                m.ts_ms, COALESCE(e.subject, ''), substr(COALESCE(e.body, ''), 1, 600) \
-         FROM message_index m JOIN emails e ON e.messageId = m.message_id \
-         WHERE m.from_me = 0 AND m.conv_kind IN ('dm', 'email') \
-           AND m.ts_ms BETWEEN ?1 AND ?2 AND e.firstSeenAt <= ?2 \
-           AND e.messageId NOT LIKE 'compose:%' \
-           AND COALESCE(e.triageResult, '') NOT IN ('skip', 'digest_only') \
-           AND (m.platform <> 'gmail' OR e.triageResult IN ('flag', 'reply')) \
-           {list_headers} \
-           AND NOT EXISTS (SELECT 1 FROM message_index n WHERE n.conversation_id = m.conversation_id \
-                           AND n.from_me = 0 AND n.ts_ms > ?2) \
-           AND {blocked} \
-         ORDER BY m.ts_ms DESC LIMIT ?4",
-        blocked = not_blocked("'unanswered:' || m.platform || ':' || m.conversation_id || ':' || m.message_id", 3),
+        "SELECT message_id, platform, conversation_id, sender_handle, who, ts_ms, subject, body \
+         FROM ( \
+           SELECT m.message_id, m.platform, m.conversation_id, m.sender_handle, \
+                  COALESCE(NULLIF(m.sender_label, ''), e.fromEmail, m.sender_handle) AS who, \
+                  m.ts_ms, COALESCE(e.subject, '') AS subject, \
+                  substr(COALESCE(e.body, ''), 1, 600) AS body, \
+                  ROW_NUMBER() OVER (PARTITION BY m.conversation_id \
+                                     ORDER BY m.ts_ms DESC, m.message_id DESC) AS rn \
+           FROM message_index m JOIN emails e ON e.messageId = m.message_id \
+           WHERE m.from_me = 0 AND m.conv_kind IN ('dm', 'email') \
+             AND m.ts_ms BETWEEN ?1 AND ?2 AND e.firstSeenAt <= ?2 \
+             AND e.messageId NOT LIKE 'compose:%' \
+             AND COALESCE(e.triageResult, '') NOT IN ('skip', 'digest_only') \
+             AND (m.platform <> 'gmail' OR e.triageResult IN ('flag', 'reply')) \
+             {list_headers} \
+             AND NOT EXISTS (SELECT 1 FROM message_index n WHERE n.conversation_id = m.conversation_id \
+                             AND n.from_me = 0 AND n.ts_ms > ?2) \
+         ) \
+         WHERE rn = 1 AND {blocked} \
+         ORDER BY ts_ms DESC LIMIT ?4",
+        blocked = not_blocked(
+            "'unanswered:' || platform || ':' || conversation_id || ':' || message_id",
+            3
+        ),
     );
     let rows = store
         .with_conn(|c| {
@@ -259,13 +270,8 @@ pub fn unanswered(store: &Store, evidence: &dyn ReplyEvidence, w: Window) -> Vec
         })
         .unwrap_or_default();
 
-    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (m, who, subject, body) in rows {
-        // Newest first, so the first row per conversation is its latest.
-        if !seen.insert(m.conversation_id.clone()) {
-            continue;
-        }
         if evidence.owner_replied_since(&m) {
             continue;
         }

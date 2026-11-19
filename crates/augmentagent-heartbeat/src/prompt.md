@@ -12,7 +12,7 @@ Rules:
 - Pick an unanswered message only when a reply or action from the operator is still plausibly expected. Skip chit-chat that needs no answer, and skip anything the wiki shows was handled.
 - Use the checklist as the operator's standing guidance on what matters.
 - Pick at most the number of items the input allows, most important first.
-- Each note is one plain-text line under 90 characters that says what happened and what to do, for example "Example Cloud approved your credits application 10 days ago; claim them."
+- Each note is one plain-text line under 75 characters that says what happened and what to do, for example "Example Cloud approved your credits application; claim them."
 
 Reply with exactly one JSON object and nothing else:
 {"notify": false}

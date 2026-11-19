@@ -152,8 +152,10 @@ costs nothing:
 7. **Decision.** See the next section.
 8. **Delivery.** One card lists the picked items, one line each with the
    item's age and short ref, for example
-   `• Example Cloud approved your credits; claim them (10d, 3fa2c1)`. It is
-   truncated to 500 characters.
+   `• Example Cloud approved your credits; claim them (10d, 3fa2c1)`. Only
+   whole lines that fit the card's 500 characters are posted; five
+   full-length notes always fit, and an item that doesn't fit is left for
+   the next sweep.
 9. **Dedup.** After the card posts, every picked item is recorded as
    `surfaced` and every other candidate as `offered`, in `heartbeat_items`.
    Neither is offered again. If posting fails, the run is `error/delivery`,
@@ -174,7 +176,7 @@ The model must reply with exactly one JSON object:
 ```
 
 - `id` must be one of the candidate ids in the prompt. Unknown or repeated
-  ids and empty notes are dropped. Notes are cut to 90 characters, and only
+  ids and empty notes are dropped. Notes are cut to 75 characters, and only
   the first `MAX_ITEMS` (less any expired snoozes) are kept.
 - `notify: true` with no valid item is `error/invalid-output` and is never
   delivered.

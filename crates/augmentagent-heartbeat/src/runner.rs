@@ -206,18 +206,26 @@ fn notice_email(subject: &str, body: &str, now_ms: i64) -> Email {
 }
 
 /// The notice text: one line per item, with its age and short ref for
-/// `heartbeat done|snooze <ref>`.
-fn compose_notice(items: &[(SurfacedItem, i64)], now_ms: i64) -> String {
-    let mut out = String::from("Slipped through the cracks:");
+/// `heartbeat done|snooze <ref>`. Only whole lines that fit the card's
+/// [`MAX_NOTICE_CHARS`] are included; returns the text and how many items
+/// made it.
+fn compose_notice(items: &[Dated], now_ms: i64) -> (String, usize) {
+    let mut out = String::from("Slipped through:");
+    let mut fitted = 0;
     for (item, at_ms) in items {
-        out.push_str(&format!(
+        let line = format!(
             "\n• {} ({}, {})",
             item.note,
             age_days(now_ms - at_ms),
             item.item_ref
-        ));
+        );
+        if out.chars().count() + line.chars().count() > MAX_NOTICE_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        fitted += 1;
     }
-    out.chars().take(MAX_NOTICE_CHARS).collect()
+    (out, fitted)
 }
 
 /// A notice item and when its underlying message arrived.
@@ -563,10 +571,18 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         &self,
         run_id: Option<i64>,
         now_ms: i64,
-        items: Vec<(SurfacedItem, i64)>,
+        mut items: Vec<Dated>,
         offered: &[Candidate],
         dry_run: bool,
     ) -> Result<RunReport> {
+        let (message, fitted) = compose_notice(&items, now_ms);
+        // Items that did not fit the card are left unrecorded, so the next
+        // sweep offers them again.
+        let unshown: Vec<String> = items
+            .split_off(fitted)
+            .into_iter()
+            .map(|(i, _)| i.key)
+            .collect();
         let surfaced: Vec<SurfacedItem> = items.iter().map(|(i, _)| i.clone()).collect();
         let record = |state_of_rest: &str| -> Result<()> {
             let mut rows: Vec<ItemRecord<'_>> = surfaced
@@ -581,7 +597,9 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             rows.extend(
                 offered
                     .iter()
-                    .filter(|c| !surfaced.iter().any(|s| s.key == c.key))
+                    .filter(|c| {
+                        !surfaced.iter().any(|s| s.key == c.key) && !unshown.contains(&c.key)
+                    })
                     .map(|c| ItemRecord {
                         key: &c.key,
                         source: c.source.as_str(),
@@ -607,7 +625,6 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             return Ok(RunReport::new(status::SILENT));
         }
 
-        let message = compose_notice(&items, now_ms);
         let hash = message_hash(&message);
         let duplicate = self
             .store
@@ -1063,11 +1080,7 @@ mod tests {
         );
         let notices = h.broker.reasons();
         assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].starts_with("Slipped through the cracks:"),
-            "{}",
-            notices[0]
-        );
+        assert!(notices[0].starts_with("Slipped through:"), "{}", notices[0]);
         assert!(notices[0].contains("Example Cloud approved your credits; claim them (10d, "));
         assert_eq!(report.items.len(), 1);
         let key = report.items[0].key.clone();
@@ -1378,6 +1391,76 @@ mod tests {
         // The unpicked third is recorded as offered: never shown again.
         let third = h.store.find_items("automated:m2").unwrap();
         assert_eq!(third[0].state, item_state::OFFERED);
+    }
+
+    #[tokio::test]
+    async fn five_full_length_notes_fit_and_an_item_that_does_not_fit_is_not_recorded() {
+        let note = "n".repeat(decision::MAX_NOTE_CHARS);
+        let picks: Vec<String> = (1..=6)
+            .map(|i| format!(r#"{{"id": "c{i}", "note": "{i}{}"}}"#, &note[1..]))
+            .collect();
+        let reply = format!(r#"{{"notify": true, "items": [{}]}}"#, picks.join(","));
+        let mut c = config();
+        c.max_items = 6;
+        let h = harness_with(
+            vec![Reply::Text(Box::leak(reply.into_boxed_str()))],
+            c,
+            Some("- anything\n"),
+        );
+        for i in 0..6 {
+            seed_mail(
+                &h,
+                &format!("m{i}"),
+                &format!("S{i} <ops@s{i}.example.com>"),
+                "Account change",
+                (3 + i as i64) * DAY,
+                Some("skip"),
+            );
+        }
+        let report = h.runner.run_once(RUN).await.unwrap();
+        let notice = &h.broker.reasons()[0];
+        assert!(notice.chars().count() <= MAX_NOTICE_CHARS, "{notice}");
+        assert_eq!(report.items.len(), 5, "five full-length lines fit");
+        for item in &report.items {
+            assert!(
+                notice.contains(&format!("{})", item.item_ref)),
+                "whole line kept: {notice}"
+            );
+        }
+        assert!(
+            h.store.find_items("automated:m5").unwrap().is_empty(),
+            "the item that did not fit is neither surfaced nor offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_message_in_a_surfaced_conversation_does_not_resurface() {
+        let h = harness(vec![PICK_C1]);
+        seed_dm(
+            &h,
+            "dm-1",
+            "conv-a",
+            "phone:+15550000001",
+            "Sample Person A",
+            5 * DAY,
+            false,
+        );
+        seed_dm(
+            &h,
+            "dm-2",
+            "conv-a",
+            "phone:+15550000001",
+            "Sample Person A",
+            4 * DAY,
+            false,
+        );
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.items[0].key, "unanswered:imessage:conv-a:dm-2");
+        h.clock.advance(days(1));
+        assert_eq!(
+            h.runner.run_once(RUN).await.unwrap().reason.as_deref(),
+            Some("no-candidates")
+        );
     }
 
     #[tokio::test]

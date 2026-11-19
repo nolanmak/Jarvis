@@ -64,9 +64,9 @@ fn from_object(object: &serde_json::Map<String, serde_json::Value>) -> Decision 
     }
 }
 
-/// A daily-sweep note longer than this is cut (#2285): five of them must
-/// fit the 500-character notice.
-pub const MAX_NOTE_CHARS: usize = 90;
+/// A daily-sweep note longer than this is cut (#2285): five of them, with
+/// their age and ref, must fit the 500-character notice.
+pub const MAX_NOTE_CHARS: usize = 75;
 
 /// One candidate the model chose to surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
