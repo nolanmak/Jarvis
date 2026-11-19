@@ -13194,6 +13194,102 @@ else:raise Exception('unexpected fixture call '+repr(args))
         assert_eq!(counter.runs, 1, "finished work must be recorded before the worker reloads");
     }
 
+    /// #2303: a deploy that lands while the worker is idle must load within
+    /// minutes, not at the next 30-minute tick or "some clean boundary".
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_stamp_reloads_an_idle_worker_within_five_minutes() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(30 * 60);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(RunReport::idle()) }
+        }, || async { 0 }));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(!task.is_finished(), "an unchanged stamp must not reload");
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("an idle worker must reload within five minutes of a deploy").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(crate::autoship_worker::restart_code(&Err(error)), Some(75));
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 0, "the reload must not wait for a tick");
+    }
+
+    /// #2303: a deploy during a build never interrupts it. The worker reloads
+    /// at the tick boundary after the build settles its reservation.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_stamp_mid_build_waits_for_the_tick_boundary() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (s, f) = (started.clone(), finish.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (s, f) = (s.clone(), f.clone());
+            async move { s.notify_one(); f.notified().await; Ok(RunReport::built("synthetic build".into())) }
+        }, || async { 0 }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert!(!task.is_finished(), "a deploy must never interrupt an in-flight build");
+        finish.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("the worker must reload at the boundary after the build").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "the finished build is recorded before the reload");
+    }
+
+    /// #2303: the stamp a worker started under is not a deploy. Rewriting the
+    /// same commit (the updater's no-op ticks) must never restart it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_deploy_stamp_never_restarts_the_worker() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(300);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let rewrites = stamp.clone();
+        let operator = async move {
+            for _ in 0..12 {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                std::fs::write(&rewrites, "aaaa\n").unwrap();
+            }
+            stop.cancel();
+        };
+        let run = worker.run_with(shutdown, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(RunReport::idle()) }
+        }, || async { 0 });
+        let (result, ()) = tokio::join!(run, operator);
+        result.expect("an unchanged stamp must not reload or fail the worker");
+        assert!(ticks.load(Ordering::SeqCst) >= 10, "the worker kept ticking: {}", ticks.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn legacy_recorded_verdict_remains_readable() {
         let old = serde_json::json!({"provider":"codex","backend":"native","model":"pinned",
