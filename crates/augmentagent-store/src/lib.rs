@@ -31,6 +31,7 @@ pub mod owner_alert_digest;
 pub mod recipients;
 pub mod redact;
 pub mod team_coverage;
+pub mod yolo_threads;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
 // #1296 — live/poll reconciliation ledger for subscribed Slack messages.

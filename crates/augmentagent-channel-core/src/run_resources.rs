@@ -652,9 +652,10 @@ pub async fn readiness()->Readiness {
     let mut report=Readiness::unavailable("inspection-unavailable");
     report.policy=Some(policy.clone());
     // Execute only packaged controller code, isolated from Python environment
-    // and without writing a helper, credentials, cgroup or workflow directory.
+    // without writing a helper, credentials or workflow directory. Preparation
+    // may reclaim file cache at a limiting ancestor, with a shared rate limit.
     let mut command=tokio::process::Command::new("/usr/bin/python3");
-    command.args(["-I","-c",include_str!("../../../scripts/run-resource-scope.py"),"--inspect"])
+    command.args(["-I","-c",include_str!("../../../scripts/run-resource-scope.py"),"--prepare"])
         .arg(policy.to_string()).env_clear().stdin(std::process::Stdio::null()).kill_on_drop(true);
     let output=match tokio::time::timeout(std::time::Duration::from_secs(5),command.output()).await {
         Ok(Ok(output)) if output.status.success() && output.stdout.len()<=65536=>output,
@@ -662,6 +663,9 @@ pub async fn readiness()->Readiness {
         _=>return report,
     };
     let value:serde_json::Value=match serde_json::from_slice(&output.stdout) {Ok(value)=>value,Err(_)=>return report};
+    if let Some(event)=value.get("reclaim") {
+        tracing::info!(ancestor_reclaim=%event,"resource ancestor cache preparation");
+    }
     let Some(status)=value["status"].as_str() else {return report};
     let permits=match status {
         "available"=>true,
