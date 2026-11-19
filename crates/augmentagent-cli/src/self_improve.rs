@@ -11355,7 +11355,10 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
     command_repository: Option<String>,
-    upgrade: Option<crate::autoship_worker::UpgradeWatch>,
+    upgrade: Option<Arc<crate::autoship_worker::UpgradeWatch>>,
+    /// #2354: cancelled once a deploy has waited past the stale bound; the
+    /// concurrent recovery and sweep lanes stop claiming new work.
+    drain: tokio_util::sync::CancellationToken,
     repo_root: PathBuf,
     dry_run: bool,
     interval: std::time::Duration,
@@ -12332,6 +12335,7 @@ impl AutoPrLoop {
         Some(Self {
             command_repository: None,
             upgrade: None,
+            drain: tokio_util::sync::CancellationToken::new(),
             repo_root,
             dry_run,
             interval: std::time::Duration::from_secs(interval),
@@ -12358,6 +12362,7 @@ impl AutoPrLoop {
         Self {
             command_repository: None,
             upgrade: None,
+            drain: tokio_util::sync::CancellationToken::new(),
             repo_root,
             dry_run: true,
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
@@ -12375,7 +12380,10 @@ impl AutoPrLoop {
             .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
-        let recovery_stop=tokio_util::sync::CancellationToken::new();
+        // #2354: a deploy pending past the stale bound stops recovery from
+        // claiming new work; its in-flight verifiers drain to completion.
+        let drain = self.drain.clone();
+        let recovery_stop=drain.child_token();
         let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
         tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
@@ -12429,19 +12437,32 @@ impl AutoPrLoop {
                 merged
             }
         });
-        tokio::select! {
-            result = shipping => {
-                recovery_stop.cancel();
-                if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
-                result
-            },
-            result = &mut recovery => result,
-            result = canary => result,
+        tokio::pin!(shipping);
+        tokio::pin!(canary);
+        let mut recovery_drained = false;
+        loop {
+            tokio::select! {
+                result = &mut shipping => {
+                    recovery_stop.cancel();
+                    if !recovery_drained {
+                        if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
+                    }
+                    return result;
+                },
+                result = &mut recovery, if !recovery_drained => {
+                    // Draining toward a restart is not the end of the worker:
+                    // shipping still reaches its safe point and exits 75.
+                    if !drain.is_cancelled() { return result; }
+                    if let Err(error)=result {warn!("qualification recovery ended during drain: {error:#}");}
+                    recovery_drained = true;
+                },
+                result = &mut canary => return result,
+            }
         }
     }
 
     pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
-        self.upgrade = Some(watch);
+        self.upgrade = Some(Arc::new(watch));
         self
     }
 
@@ -12461,6 +12482,7 @@ impl AutoPrLoop {
     {
         let interval = self.interval.min(std::time::Duration::from_secs(300));
         let stop = shutdown.clone();
+        let drain = self.drain.clone();
         let upgrade_stop = tokio_util::sync::CancellationToken::new();
         let reconciliation_stop = upgrade_stop.clone();
         let reconciliation = async move {
@@ -12473,6 +12495,8 @@ impl AutoPrLoop {
                     _ = reconciliation_stop.cancelled() => return Ok(()),
                     _ = timer.tick() => {}
                 }
+                // #2354: a stale deploy is draining; claim no new work.
+                if drain.is_cancelled() { continue; }
                 let swept = tokio::select! {
                     _ = stop.cancelled() => return Ok(()),
                     swept = sweep() => swept,
@@ -12510,6 +12534,9 @@ impl AutoPrLoop {
         let mut queue_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first = true;
+        // #2354: ticks restart at safe points inside them (see SafePoints).
+        let points = self.upgrade.clone()
+            .map(|watch| crate::autoship_worker::SafePoints::new(watch, self.drain.clone()));
         loop {
             // The worker restarts to load every deploy. Waiting a full
             // interval after each start meant deploys arriving every 25-60
@@ -12601,13 +12628,38 @@ impl AutoPrLoop {
                 let reservation = DailyCounter::update(&counter_path,
                     |counter| Ok(counter.begin_attempt(started_day)))?;
                 let _ = std::fs::write(&tick_stamp, b"");
-                let outcome = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
-                        return Ok(());
+                let outcome = {
+                    let run = async {
+                        match &points {
+                            Some(points) => points.scope(tick()).await,
+                            None => tick().await,
+                        }
+                    };
+                    tokio::pin!(run);
+                    // Observe a pending deploy while the tick runs, so the
+                    // stale bound is measured even when no safe point is near.
+                    let mut observe = tokio::time::interval(std::time::Duration::from_secs(30));
+                    observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => {
+                                info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
+                                return Ok(());
+                            }
+                            r = &mut run => break r,
+                            // The tick is parked at a safe point: its
+                            // checkpoint is durable and nothing of it is in
+                            // flight. Dropping it here (end of this block)
+                            // is the restart boundary.
+                            _ = async { points.as_ref().unwrap().parked().await }, if points.is_some() => {
+                                break Err(crate::autoship_worker::UpgradeRequested.into());
+                            }
+                            _ = observe.tick(), if points.is_some() => {
+                                points.as_ref().unwrap().restart_pending();
+                            }
+                        }
                     }
-                    r = tick() => r,
                 };
                 let completed_day = utc_day_of((self.clock)());
                 let billed = outcome.as_ref().map(|r| r.billed)
@@ -12647,6 +12699,11 @@ impl AutoPrLoop {
                             );
                             break;
                         }
+                    }
+                    // #2354: parked at a safe point; the reservation is settled.
+                    Err(e) if e.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some() => {
+                        info!(attempts_today=runs_today, "auto-PR: tick stopped at a safe point to load a deploy");
+                        return Err(e);
                     }
                     // Transient controller or network failures retry next tick.
                     Err(e) => {
@@ -13290,6 +13347,152 @@ else:raise Exception('unexpected fixture call '+repr(args))
         let (result, ()) = tokio::join!(run, operator);
         result.expect("an unchanged stamp must not reload or fail the worker");
         assert!(ticks.load(Ordering::SeqCst) >= 10, "the worker kept ticking: {}", ticks.load(Ordering::SeqCst));
+    }
+
+    /// A worker following `built-commit`, ticking every second, under `state`.
+    fn stamped_worker(state: &Path) -> (AutoPrLoop, PathBuf) {
+        let binary = state.join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state)
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(1);
+        (worker, stamp)
+    }
+
+    /// #2354: production ran one tick for hours (scope, a 61-minute build,
+    /// verify, repair) across three deploys. A deploy landing mid-tick must
+    /// restart the worker at the next durable checkpoint, before the tick
+    /// claims its next workflow or step.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_mid_tick_restarts_after_the_checkpoint_before_the_next_claim() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let claims = Arc::new(AtomicUsize::new(0));
+        let observed = claims.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (claims, stamp) = (observed.clone(), stamp.clone());
+            async move {
+                claims.fetch_add(1, Ordering::SeqCst);
+                // The deploy lands while the first workflow's step runs.
+                std::fs::write(&stamp, "bbbb\n").unwrap();
+                // That step's checkpoint is now durable.
+                crate::autoship_worker::safe_point().await;
+                claims.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await;
+                Ok(RunReport::built("chained verification and repair".into()))
+            }
+        }, || async { 0 }));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10 * 60), task).await
+            .expect("a deploy mid-tick must restart at the next checkpoint, not after the whole tick")
+            .unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(crate::autoship_worker::restart_code(&Err(error)), Some(75));
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "nothing is claimed after the safe point");
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "the parked tick's reservation is settled before the restart");
+    }
+
+    /// #2354: ticks that follow each other with no idle gap still check the
+    /// stamp between them.
+    #[tokio::test(start_paused = true)]
+    async fn back_to_back_ticks_pick_up_a_deploy_stamp() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let n = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 2 { std::fs::write(&stamp, "bbbb\n").unwrap(); }
+            async move { Ok(RunReport::triage(format!("back-to-back tick {n}"))) }
+        }, || async { 0 }));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("back-to-back ticks must pick up the deploy").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(ticks.load(Ordering::SeqCst), 2, "no tick starts after the deploy");
+    }
+
+    /// #2354: a deploy never interrupts an in-flight build. The safe point
+    /// inside the build does not park; the one after it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_mid_tick_never_interrupts_an_in_flight_build() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let built = Arc::new(AtomicBool::new(false));
+        let claims = Arc::new(AtomicUsize::new(0));
+        let (s, f, b, c) = (started.clone(), finish.clone(), built.clone(), claims.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (s, f, b, c) = (s.clone(), f.clone(), b.clone(), c.clone());
+            async move {
+                crate::build_storage::watch_reserve_roots(None, None, async {
+                    s.notify_one();
+                    f.notified().await;
+                    // A checkpoint written by the build itself is not a place
+                    // to stop it.
+                    crate::autoship_worker::safe_point().await;
+                    Ok(())
+                }).await?;
+                b.store(true, Ordering::SeqCst);
+                crate::autoship_worker::safe_point().await;
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(RunReport::built("synthetic build".into()))
+            }
+        }, || async { 0 }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert!(!task.is_finished(), "a deploy must never interrupt an in-flight build");
+        finish.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("the worker restarts at the safe point after the build").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert!(built.load(Ordering::SeqCst), "the build ran to completion");
+        assert_eq!(claims.load(Ordering::SeqCst), 0, "the next step was never claimed");
+    }
+
+    /// #2354: when a deploy has waited past the bound (a single step running
+    /// longer than that), the worker's concurrent lanes stop claiming new work.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_pending_past_the_bound_stops_new_concurrent_claims() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (mut worker, stamp) = stamped_worker(state.path());
+        worker.interval = std::time::Duration::from_secs(300);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = started.clone();
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let observed = sweeps.clone();
+        let drain = worker.drain.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let s = s.clone();
+            async move {
+                s.notify_one();
+                // One step with no safe point for hours.
+                tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
+                Ok(RunReport::built("long step".into()))
+            }
+        }, move || { observed.fetch_add(1, Ordering::SeqCst); async { 0 } }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(crate::autoship_worker::STALE_DEPLOY_BOUND - std::time::Duration::from_secs(120)).await;
+        assert!(!drain.is_cancelled(), "a fresh deploy does not drain");
+        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+        assert!(drain.is_cancelled(), "a deploy pending past the bound drains the worker");
+        let drained = sweeps.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), drained, "no new concurrent sweep starts while draining");
+        assert!(!task.is_finished(), "the in-flight step is never interrupted");
+        task.abort();
     }
 
     #[test]

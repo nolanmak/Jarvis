@@ -1008,6 +1008,8 @@ impl WorkflowGuard {
         Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
     async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
+        // #2354: never claim the next workflow with a deploy pending.
+        crate::autoship_worker::safe_point().await;
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -2322,7 +2324,14 @@ impl WorkflowGuard {
             .checkpoint
             .evidence;
         self.checkpoint(stage, reason, action, eligible_at_ms, &evidence)
-            .await
+            .await?;
+        // #2354: the checkpoint is durable and the next step is not yet
+        // claimed, so a pending deploy may restart the worker here. Waiting
+        // and terminal stages end their tick normally instead.
+        if !matches!(stage,Stage::Merged|Stage::Retired|Stage::Held|Stage::AwaitChecks) {
+            crate::autoship_worker::safe_point().await;
+        }
+        Ok(())
     }
 
     /// Publish detached resumed work with a remote-head precondition. A lost
@@ -3319,6 +3328,45 @@ mod tests {
             logger.model_call_admitted("claude").is_err(),
             "released workflow cannot admit unaccounted spend"
         );
+    }
+
+    /// #2354: a productive stage transition is a restart-safe point. With a
+    /// deploy pending, the checkpoint is durably written first and only then
+    /// does the tick park, before the next step starts. Waiting and terminal
+    /// transitions finish their tick normally.
+    #[tokio::test]
+    async fn a_productive_transition_parks_for_a_deploy_after_its_checkpoint() {
+        let dir = repo();
+        // A canonical (non-symlinked) private directory, so the fixture also
+        // runs where /tmp is a symlink.
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let points = crate::autoship_worker::SafePoints::new(
+            Arc::new(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp)),
+            tokio_util::sync::CancellationToken::new());
+        let start = || Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(7), pr: None, branch: "fix/seven", contract: "C1", environment: "rust-a",
+        };
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis()).await.unwrap().unwrap();
+        let id = guard.id().to_owned();
+        points.scope(guard.transition(Stage::Build, "scoped", "build", 0)).await
+            .expect("no deploy pending: the transition completes");
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        points.scope(guard.transition(Stage::Held, "provider_capacity", "retry", 0)).await
+            .expect("a waiting transition ends its tick normally");
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(2),
+            points.scope(guard.transition(Stage::Review, "candidate_verified", "review", 0))).await;
+        assert!(parked.is_err(), "a productive transition with a deploy pending must park the tick");
+        tokio::time::timeout(std::time::Duration::from_secs(1), points.parked()).await
+            .expect("the worker is told the tick parked");
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage, Stage::Review,
+            "the checkpoint is durable before the tick parks");
     }
 
     #[tokio::test]
