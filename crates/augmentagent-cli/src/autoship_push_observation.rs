@@ -20,6 +20,42 @@ impl PendingPush {
 impl WorkflowStore {
     /// Only one exact, controller-bound Push may be recovered. Other pending
     /// effects and unknown legacy Push intents retain their existing guards.
+    /// Positive remote evidence that this exact head was pushed for the
+    /// workflow. Absence includes a push that failed before any dispatch.
+    pub(crate) fn pushed_head(&self,workflow:&str,head:&str)->Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND kind=?2 AND receipt=?3)",
+            params![workflow,serde_json::to_string(&OperationKind::Push)?,format!("git-head:{head}")],|r|r.get(0))?)
+    }
+    /// #2279 — a terminal target's unconfirmed Push intents can never publish.
+    /// Settle them only when the remote branch positively shows a different
+    /// head than every pending intent, preserving that observation as the
+    /// receipt, so terminal reconciliation is not held forever.
+    pub(crate) fn settle_unlanded_pushes(&mut self,lease:&Lease,remote_head:&str,evidence:&str,now:i64)->Result<usize> {
+        ensure!(matches!(remote_head.len(),40|64) && remote_head.bytes().all(|b|b.is_ascii_hexdigit()),"remote head observation malformed");
+        ensure!(!evidence.is_empty() && evidence.len()<=256 && !evidence.bytes().any(|b|b.is_ascii_control()),"bounded terminal evidence required");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx,lease,now)?;
+        let pending:Vec<(String,String,String)>={
+            let mut stmt=tx.prepare("SELECT id,kind,binding FROM operation WHERE workflow=?1 AND receipt IS NULL")?;
+            let rows=stmt.query_map([&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let push=serde_json::to_string(&OperationKind::Push)?;
+        for (_,kind,binding) in &pending {
+            ensure!(*kind==push,"terminal reconciliation refuses non-Push pending operations");
+            let binding:Binding=serde_json::from_str(binding)?;
+            ensure!(!binding.head.eq_ignore_ascii_case(remote_head),"pending Push head is present remotely; observe it instead");
+        }
+        let receipt=format!("terminal-target-unlanded:{evidence}:remote-head:{}",remote_head.to_ascii_lowercase());
+        for (id,_,_) in &pending {
+            tx.execute("UPDATE operation SET receipt=?2 WHERE id=?1 AND receipt IS NULL",params![id,receipt])?;
+        }
+        if !pending.is_empty() {
+            event(&tx,&lease.workflow,lease.generation,"pending_push_settled_terminal_target",
+                &serde_json::json!({"operations":pending.iter().map(|(id,_,_)|id).collect::<Vec<_>>(),"receipt":receipt}).to_string(),now)?;
+        }
+        tx.commit()?;Ok(pending.len())
+    }
     pub(crate) fn retryable_bound_push(&self,workflow:&str)->Result<bool> {
         let pending=self.pending_operations(workflow)?;
         let [operation]=pending.as_slice() else {return Ok(false)};

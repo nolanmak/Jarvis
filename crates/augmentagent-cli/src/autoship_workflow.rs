@@ -2352,6 +2352,11 @@ impl WorkflowStore {
             || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
             || !(matches!(snapshot.checkpoint.stage,
                 Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+                // #2279 — built and verified, but the push failed before any
+                // dispatch. Pending Push intents are refused below.
+                || (snapshot.checkpoint.stage==Stage::Publish
+                    && snapshot.checkpoint.next.reason=="publishing_revision"
+                    && snapshot.checkpoint.next.action=="push")
                 || (snapshot.checkpoint.stage==Stage::Held
                     && snapshot.checkpoint.next.reason=="automatic_pr_routing_held"
                     && snapshot.checkpoint.next.action=="retry_automatic_pr_routing"))
@@ -2377,6 +2382,19 @@ impl WorkflowStore {
             return Ok(None);
         }
         Ok(Some(snapshot.checkpoint.binding.head))
+    }
+
+    /// #2279 — the PR workflow is idle and authorized to resume: no lease,
+    /// retry delay, owner pause, unresolved operation or terminal stage. Only
+    /// then may an unrecorded retained head be set aside for a rebuild.
+    pub fn retained_candidate_due(&self, repository: &str, pr: u64, branch: &str, now: i64) -> Result<bool> {
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        Ok(snapshot.pr == Some(pr) && snapshot.branch == branch
+            && snapshot.lease_until_ms <= now && snapshot.checkpoint.next.eligible_at_ms <= now
+            && !matches!(snapshot.checkpoint.stage, Stage::Merge | Stage::Merged | Stage::Retired)
+            && !self.owner_control(&id)?.is_some_and(|control| control.paused)
+            && !self.merge_reconciliation_needed(&id)? && self.pending_operations(&id)?.is_empty())
     }
 
     pub fn snapshot(&self, workflow: &str) -> Result<Option<Snapshot>> {
