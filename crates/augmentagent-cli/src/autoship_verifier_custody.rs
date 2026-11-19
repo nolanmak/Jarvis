@@ -2,7 +2,8 @@
 use super::*;
 
 pub(super) fn hold(tx:&Transaction<'_>,lease:&Lease,checkpoint:&Checkpoint,plan:Option<&str>,now:i64)->Result<()> {
-    let previous:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",[&lease.workflow],|r|r.get(0)).optional()?;
+    let cutover=owner_checkout_recovery::cutover_seq(tx,&lease.workflow)?;
+    let previous:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",params![lease.workflow,cutover],|r|r.get(0)).optional()?;
     if let Some(plan)=plan {
         ensure!(checkpoint.stage==Stage::Scope && matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
             ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")|
@@ -50,8 +51,9 @@ impl<'a> VerifierEvidenceInspection<'a> {
         read_scope_response_keys(self.conn,self.workflow,after)
     }
     pub(crate) fn record(&self,key:&str,kind:&str)->Result<Option<String>> {
-        let hash:Option<String>=self.conn.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![self.workflow,key,kind],|r|r.get(0)).optional()?;
-        let body:Option<String>=self.conn.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![self.workflow,key],|r|r.get(0)).optional()?;
+        let cutover=owner_checkout_recovery::cutover_seq(self.conn,self.workflow)?;
+        let hash:Option<String>=self.conn.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND seq>?4 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![self.workflow,key,kind,cutover],|r|r.get(0)).optional()?;
+        let body=read_scope_response(self.conn,self.workflow,key)?;
         match (hash,body) {
             (None,None)=>Ok(None),
             (Some(hash),Some(body))=>{ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");Ok(Some(body))},
@@ -59,6 +61,7 @@ impl<'a> VerifierEvidenceInspection<'a> {
         }
     }
     pub(crate) fn page(&self,kind:&str,after:i64)->Result<Vec<VerifierEvidence>> {
+        let after=after.max(owner_checkout_recovery::cutover_seq(self.conn,self.workflow)?);
         let mut query=self.conn.prepare("SELECT e.seq,json_extract(e.payload,'$.key'),s.response,json_extract(e.payload,'$.sha256') FROM workflow_event e LEFT JOIN scope_stage_response s ON s.workflow=e.workflow AND s.key=json_extract(e.payload,'$.key') WHERE e.workflow=?1 AND e.kind='verifier_evidence_recorded' AND json_extract(e.payload,'$.kind')=?2 AND e.seq>?3 ORDER BY e.seq LIMIT 64")?;
         let rows=query.query_map(params![self.workflow,kind,after],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut records=Vec::new();
@@ -90,7 +93,8 @@ pub(super) fn original_hold_matches(conn:&Connection,workflow:&str,checkpoint:&C
 }
 
 pub(super) fn protected_record(tx:&Transaction<'_>,workflow:&str,key:&str,kind:&str)->Result<String> {
-    let hash:String=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![workflow,key,kind],|r|r.get(0))?;
+    let cutover=owner_checkout_recovery::cutover_seq(tx,workflow)?;
+    let hash:String=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND seq>?4 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![workflow,key,kind,cutover],|r|r.get(0))?;
     let body:String=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![workflow,key],|r|r.get(0))?;
     ensure!(format!("{:x}",Sha256::digest(body.as_bytes()))==hash,"original verifier evidence changed");
     Ok(body)

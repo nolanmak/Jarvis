@@ -95,6 +95,41 @@ class CaptureTests(unittest.TestCase):
                 process.kill()
                 process.communicate(timeout=5)
 
+    def test_cancellation_during_probe_is_not_overwritten(self):
+        touched = self.root / 'child-ran-after-cancellation'
+        # Deliver SIGTERM while the cancellation-file probe is in progress.
+        # Its false result must never overwrite the handler's sticky stop bit.
+        driver = """
+import importlib.util, os, signal, sys
+from pathlib import Path
+script, receipt = sys.argv[1:3]
+spec = importlib.util.spec_from_file_location('supervisor_fixture', script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+original_exists = Path.exists
+cancel = Path(receipt).with_name('cancel-requested')
+fired = False
+def probe(path):
+    global fired
+    if path == cancel and not fired:
+        fired = True
+        os.kill(os.getpid(), signal.SIGTERM)
+        return False
+    return original_exists(path)
+Path.exists = probe
+sys.exit(module.supervise(receipt, sys.argv[3:]))
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', driver, str(SUPERVISOR),
+                                 str(self.session / 'cleanup-complete'), sys.executable, '-I', '-c',
+                                 f"from pathlib import Path; Path({str(touched)!r}).touch()"],
+                                env=self.environment, capture_output=True, timeout=10)
+        self.assertFalse(touched.exists(), 'SIGTERM was lost and the refused command ran')
+        self.assertEqual(result.returncode, 125, result.stderr.decode())
+        self.assertEqual((self.session / 'cleanup-complete').read_bytes(), b'all-descendants-reaped\n')
+        record = self.manifest()
+        self.assertTrue(record['interrupted'])
+        self.assertEqual(record['terminal_cause'], 'cancelled_before_dispatch')
+
     def test_owner_death_retains_an_interrupted_result_and_reaps_child(self):
         started = self.root / 'started'
         child_code = f"import os,time; from pathlib import Path; print('before owner exit',flush=True); Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(60)"

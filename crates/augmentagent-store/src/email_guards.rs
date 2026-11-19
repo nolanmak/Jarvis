@@ -13,6 +13,8 @@ pub enum EmailGuard {
     EventBlast,
     CcOnly,
     MeetingInvite,
+    /// #2246 — a finding email one of the owner's own loops sent.
+    LoopDelivery,
 }
 impl EmailGuard {
     fn fields(self) -> (&'static str, &'static str) {
@@ -25,6 +27,7 @@ impl EmailGuard {
             Self::EventBlast => ("event_blast", "ingest_only"),
             Self::CcOnly => ("cc_only", "flag_without_draft"),
             Self::MeetingInvite => ("meeting_invite", "flag_without_draft"),
+            Self::LoopDelivery => ("loop_delivery", "skip"),
         }
     }
 }
