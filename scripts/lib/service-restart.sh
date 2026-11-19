@@ -256,11 +256,10 @@ should_write_stamp() {
 # The auto-PR loop holds an exclusive flock on its lane locks for a whole run
 # (#816). The updater reads them only to keep the gate-cache trim (#891) off a
 # live build. They no longer gate the daemon restart: #844 deferred it while a
-# run held the lock, but auto-ship now runs in augmentagent-autopr.service,
-# which survives a daemon restart and reloads itself between runs, so a deploy
-# never waits on auto-ship (#2271). The embedded loop still exists (macOS, or
-# Linux without AUGMENTAGENT_AUTOPR_EXTERNAL=1); there a deploy restart
-# interrupts the run, by owner decision, rather than holding the deploy.
+# run held the lock, but auto-ship now runs only in its own worker
+# (augmentagent-autopr.service on Linux, the com.nolanmak.augmentagent.autopr
+# LaunchAgent on macOS, #2275), which survives a daemon restart and reloads
+# itself between runs, so a deploy never waits on auto-ship (#2271).
 
 # #1048: the daemon's state dir, by the rule in the Rust
 # augmentagent_channel_core::state_dir::resolve: $XDG_STATE_HOME/augmentagent

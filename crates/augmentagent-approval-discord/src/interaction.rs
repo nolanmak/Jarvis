@@ -2,7 +2,7 @@
 use crate::{ApprovalActionHandler, ApprovalActionOutcome};
 pub use augmentagent_store::approval_history::DecisionContext;
 use std::{future::Future, sync::Arc};
-tokio::task_local! { static CURRENT: DecisionContext; static HISTORY: bool; }
+tokio::task_local! { static CURRENT: DecisionContext; static HISTORY: bool; static YOLO: bool; }
 pub fn current() -> Option<DecisionContext> {
     CURRENT.try_with(Clone::clone).ok()
 }
@@ -14,6 +14,16 @@ pub async fn owner_history<F: Future>(allowed: bool, f: F) -> F::Output {
 }
 pub fn history_allowed() -> bool {
     HISTORY.try_with(|v| *v).unwrap_or(false)
+}
+/// #2218 — run `f` as a yolo turn. Only the message handler, for an owner
+/// message in a yolo thread, sets this; every other entry point (voice,
+/// phone, iMessage owner, slash commands) leaves it false, and the isolation
+/// checks then keep it out of yolo threads.
+pub async fn yolo_turn<F: Future>(yolo: bool, f: F) -> F::Output {
+    YOLO.scope(yolo, f).await
+}
+pub fn is_yolo_turn() -> bool {
+    YOLO.try_with(|v| *v).unwrap_or(false)
 }
 struct Contextual {
     inner: Arc<dyn ApprovalActionHandler>,

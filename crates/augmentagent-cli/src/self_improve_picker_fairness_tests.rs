@@ -51,6 +51,13 @@ else:raise AssertionError(args)
             let at=now-10_000+round*10+number;
             let lease=store.claim(id,"fixture-worker",at,1_000).unwrap().unwrap();
             let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.stage=Stage::Scope;
+            if number==2 && case=="publish-retry" {
+                // #2279: built and verified; only the push failed.
+                cp.stage=Stage::Publish;
+                cp.next=NextAction {reason:"publishing_revision".into(),action:"push".into(),eligible_at_ms:0};
+                store.checkpoint(&lease,&cp,at+2).unwrap();store.release(&lease,at+3).unwrap();
+                continue;
+            }
             cp.next=NextAction {reason:if number==2 && case=="policy-upgrade" {"material_external_decision_missing"}else if number==2 {"readiness_assessment_invalid"}else{"acceptance_registration_retry"}.into(),action:if number==2 {"await_readiness_input_change"}else{"rescope_executable_acceptance"}.into(),eligible_at_ms:if number==3 && case=="future" {now+300_000}else{0}};
             if number==2 {
                 let request=serde_json::to_string(&(2,"Correct widget rounding","Original synthetic requirement.")).unwrap();
@@ -136,6 +143,13 @@ async fn invalid_checkout_yields_to_eligible_peer_without_claiming() {
     } else {
         for case in ["lost-checkout","replaced-checkout"] { fixture(case,TEST).await; }
     }
+}
+
+/// #2279 — finished-but-unpublished work outranks newer scope turns: a
+/// `publishing_revision` workflow is re-selected as soon as it is due.
+#[tokio::test]
+async fn due_publication_retry_outranks_newer_scope_work() {
+    fixture("publish-retry","self_improve::picker_fairness_tests::due_publication_retry_outranks_newer_scope_work").await;
 }
 
 #[tokio::test]

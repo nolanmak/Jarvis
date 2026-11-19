@@ -1078,7 +1078,9 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
     let due_retries=crate::autoship_workflow::retry_recovery::due_issues(&workflow::path(),&repository,chrono::Utc::now().timestamp_millis())?;
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
-    let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
+    let rest_issues=rest_issue_candidates(&issues);
+    qualification_retries.extend(picker_fairness::publish_retries(&rest_issues,&owner_controls,&repository));
+    let candidates=picker_fairness::candidates(rest_issues,
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
     let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
@@ -9619,33 +9621,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }, automatic_routing).await));
     }
-    // Compare-and-swap publication preserves concurrent remote work and
-    // reconciles successful pushes whose responses were lost.
-    if let Err(error) = workflow_guard.push_fresh(repo_root,&branch,automatic_routing).await {
-        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
-        let e = format!("{error:#}");
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
-        }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
-            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
-    }
-    // #1037 — the push landed, plainly or by superseding an orphan above, so
-    // the remote branch is now exactly this attempt's work, built from `main`.
-    // Its record becomes this attempt's builders: earlier authors described
-    // content that no longer exists, and keeping them disqualified reviewers
-    // (a stale `[claude, codex]` left nobody) for work they never touched.
-    // Only here — until the push lands the old work may still be on the
-    // remote, so the branch record stays the union. A failure leaves the
-    // union too, which excludes more reviewers, never fewer.
-    if let Err(e) = reasoner.supersede_review_history() {
-        warn!(
-            issue = issue.number,
-            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
-        );
-    }
-
     // Open the PR. Draft + human merge for everyone; owner-authored issues
     // auto-merge when the owner opted in AND the scoper graded the work
     // simple/medium (#653 — hard work always gets human eyes).
@@ -9775,6 +9750,36 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
     }
+    // Compare-and-swap publication preserves concurrent remote work and
+    // reconciles successful pushes whose responses were lost. #2279 — the
+    // complete publication request is retained before the push, so a built
+    // and verified candidate whose push fails is pushed and published by free
+    // reconciliation once the cause is fixed, never rebuilt from scope.
+    if let Err(error) = publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,published_head,issue.number,&args,automatic_routing).await {
+        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
+        let e = format!("{error:#}");
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
+    }
+    // #1037 — the push landed, plainly or by superseding an orphan above, so
+    // the remote branch is now exactly this attempt's work, built from `main`.
+    // Its record becomes this attempt's builders: earlier authors described
+    // content that no longer exists, and keeping them disqualified reviewers
+    // (a stale `[claude, codex]` left nobody) for work they never touched.
+    // Only here — until the push lands the old work may still be on the
+    // remote, so the branch record stays the union. A failure leaves the
+    // union too, which excludes more reviewers, never fewer.
+    if let Err(e) = reasoner.supersede_review_history() {
+        warn!(
+            issue = issue.number,
+            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
+        );
+    }
+
     let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args, automatic_routing).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
@@ -20135,10 +20140,14 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find("workflow_guard.push_fresh(repo_root,&branch,automatic_routing)").expect("guarded fresh compare-and-swap push");
+        let force = body.find("publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,").expect("guarded fresh compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
-        let create = body.find(r#""pr", "create""#).expect("PR creation");
+        // #2279: the request is built (and retained) before the push; the
+        // remote creation itself still follows the reset.
+        let request = body.find(r#""pr", "create""#).expect("PR request");
+        assert!(request < force, "publication request is retained before the push");
+        let create = body.find("publication::publish(&workflow_guard,").expect("PR creation");
         assert!(force < supersede && failed < supersede, "only after the push has landed");
         assert!(supersede < create, "before anything else can resume the branch");
         assert_eq!(body.matches("supersede_review_history(").count(), 1);
