@@ -12,7 +12,7 @@ import subprocess
 import time
 import sys
 
-from imessage_sync import load_contacts, source_staleness, sync
+from imessage_sync import heic_to_jpeg, load_contacts, source_staleness, sync
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = Path.home() / "Library/Messages/chat.db"
@@ -107,7 +107,6 @@ def run(args):
             # HEIC photos are uploaded as JPEG so the drafting models can
             # open them. `sips` ships with macOS; without it nothing changes.
             if shutil.which("sips"):
-                from imessage_sync import heic_to_jpeg
                 s3["converter"] = heic_to_jpeg
                 s3["convert_dir"] = Path.home() / "Library/Caches/augmentagent/imessage-converted"
         result = sync(args.db, args.out, args.out / ".sync_state.json", contacts=contacts, s3=s3)

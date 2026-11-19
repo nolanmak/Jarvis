@@ -486,8 +486,7 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
     files. Returns counts: {'messages': n, 'conversations': n}.
 
     s3 = {'bucket': str, 'uploader': callable(path, bucket, key) -> bool}
-    enables attachment upload. Optional 'converter': callable(src, dest) ->
-    bool with 'convert_dir' uploads HEIC photos as JPEG; failed uploads are retried on later runs via
+    enables attachment upload; failed uploads are retried on later runs via
     state['pending_uploads'] (references are written up front — keys are
     deterministic)."""
     out_dir = Path(out_dir)
@@ -584,7 +583,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
             if s3 and local and local.exists() and is_uploadable(local):
                 converted = converted_attachment(local, att_id, name, s3)
                 if converted:
-                    (local, name), mime = converted, "image/jpeg"
+                    local, name = converted
+                    mime = "image/jpeg"
             line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             if s3 and local and local.exists() and is_uploadable(local):
                 key = attachment_key(index[ident]["dir"], att_id, name)
