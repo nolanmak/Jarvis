@@ -80,6 +80,11 @@ pub use loops::{
 };
 // #1292 — Slack's loop command reuses the deterministic grammar and checks.
 pub use loops::{parse_create_args, validate_parsed};
+// #2246 — loop findings emailed to allowlisted owner addresses.
+pub use loops::{
+    parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
+    LoopMailer, SELF_SEND_ENV,
+};
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};

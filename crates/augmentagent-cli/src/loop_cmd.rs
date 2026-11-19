@@ -22,9 +22,79 @@ use serde::Serialize;
 
 use augmentagent_approval_discord::{
     max_active_per_user, min_interval_secs, normalize_and_validate_cron, parse_interval,
-    validate_tz,
+    parse_self_send_allowlist, self_send_allowed, validate_prompt_file, validate_tz, SELF_SEND_ENV,
 };
-use augmentagent_store::{rusqlite, Store};
+use augmentagent_store::{rusqlite, LoopOptions, Store};
+
+/// #2246 — what a loop reads and where its findings go. All off by default.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct LoopDeliveryArgs {
+    /// Post nothing when a run completes and reports no findings.
+    #[arg(long, default_value_t = false)]
+    pub quiet_when_empty: bool,
+    /// Report a keyed finding again once this long has passed since its last
+    /// report (`7d`, `30d`). Without it, each key is reported once.
+    #[arg(long)]
+    pub rereport_after: Option<String>,
+    /// Wiki-relative file read at every run and appended to `--prompt`, so
+    /// the instructions can be edited without recreating the loop.
+    #[arg(long)]
+    pub prompt_file: Option<String>,
+    /// Email each new finding to this address instead of posting it. The
+    /// address must be listed in `AUGMENTAGENT_LOOP_SELF_SEND_ADDRESSES`.
+    #[arg(long)]
+    pub email_findings_to: Option<String>,
+    /// Connected account that sends those emails. Optional when only one
+    /// account is connected.
+    #[arg(long, requires = "email_findings_to")]
+    pub email_account: Option<String>,
+}
+
+fn resolve_delivery<F>(args: LoopDeliveryArgs, env: F) -> Result<LoopOptions>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let rereport_after_secs = match args.rereport_after.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_interval(raw).filter(|secs| *secs > 0).ok_or_else(|| {
+            anyhow!("--rereport-after: couldn't parse `{raw}`; use e.g. `7d`, `30d`")
+        })?),
+    };
+    let prompt_file = match args.prompt_file.as_deref().map(str::trim) {
+        None => None,
+        Some(path) => {
+            validate_prompt_file(path).map_err(|e| anyhow!("--prompt-file: {e}"))?;
+            Some(path.to_string())
+        }
+    };
+    let email_to = match args.email_findings_to.as_deref() {
+        None => None,
+        Some(address) => {
+            let allowlist = parse_self_send_allowlist(&env(SELF_SEND_ENV).unwrap_or_default());
+            if !self_send_allowed(address, &allowlist) {
+                return Err(anyhow!(
+                    "--email-findings-to: `{}` is not in {SELF_SEND_ENV}; loops may only email addresses the owner has listed there",
+                    address.trim()
+                ));
+            }
+            Some(address.trim().to_ascii_lowercase())
+        }
+    };
+    let email_account = args
+        .email_account
+        .map(|account| account.trim().to_string())
+        .filter(|account| !account.is_empty());
+    if email_account.is_some() && email_to.is_none() {
+        return Err(anyhow!("--email-account needs --email-findings-to"));
+    }
+    Ok(LoopOptions {
+        quiet_when_empty: args.quiet_when_empty,
+        rereport_after_secs,
+        prompt_file,
+        email_to,
+        email_account,
+    })
+}
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum LoopOp {
@@ -97,6 +167,8 @@ pub enum LoopOp {
         /// taps Acknowledge/Dismiss on Discord. Default off (normal cadence).
         #[arg(long, default_value_t = false)]
         nag_until_ack: bool,
+        #[command(flatten)]
+        delivery: LoopDeliveryArgs,
         /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
         /// plain `<uuid>` on stdout. Lets callers parse the loop id without
         /// regex.
@@ -119,6 +191,9 @@ struct LoopRow {
     last_status: Option<String>,
     fail_count: i64,
     model_profile: Option<String>,
+    /// #2246 — present only for loops that have options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<LoopOptions>,
 }
 
 pub async fn run(store: Arc<Store>, op: LoopOp) -> Result<()> {
@@ -187,6 +262,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
             expires_in,
             model,
             nag_until_ack,
+            delivery,
             json,
         } => {
             if let Some(model) = model.as_deref() {
@@ -205,6 +281,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 nag_until_ack,
             };
             let resolved = resolve_create_args(args, env_lookup)?;
+            // Validate before the row exists, so a refused option leaves no loop.
+            let options = resolve_delivery(delivery, env_lookup)?;
             let id = store.create_user_loop_with_model(
                 &resolved.owner,
                 "discord",
@@ -217,6 +295,9 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 model.as_deref(),
                 resolved.nag_until_ack,
             )?;
+            if !options.is_default() {
+                store.set_loop_options(&id, &options)?;
+            }
             if json {
                 let payload = serde_json::json!({
                     "id": id,
@@ -228,6 +309,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                     "tz": resolved.tz,
                     "model_profile": model,
                     "nag_until_ack": resolved.nag_until_ack,
+                    "options": (!options.is_default()).then_some(&options),
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
@@ -449,11 +531,17 @@ fn list_rows(store: &Store, all: bool) -> Result<Vec<LoopRow>> {
                     last_status: r.get(7)?,
                     fail_count: r.get(8)?,
                     model_profile: r.get(9)?,
+                    options: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(v)
     })?;
+    let mut rows = rows;
+    for row in &mut rows {
+        let options = store.loop_options(&row.id)?;
+        row.options = (!options.is_default()).then_some(options);
+    }
     Ok(rows)
 }
 
@@ -509,7 +597,10 @@ fn print_table(rows: &[LoopRow]) {
         "ID", "STATUS", "INTERVAL", "MODEL", "OWNER", "PROMPT"
     );
     for r in rows {
-        let prompt = truncate(&r.prompt, 60);
+        let mut prompt = truncate(&r.prompt, 60);
+        if let Some(options) = &r.options {
+            prompt.push_str(&describe_options(options));
+        }
         let owner = truncate(&r.owner, 24);
         println!(
             "{:<38}  {:<8}  {:>8}s  {:<9}  {:<24}  {}",
@@ -517,6 +608,24 @@ fn print_table(rows: &[LoopRow]) {
             r.model_profile.as_deref().unwrap_or("default"), owner, prompt
         );
     }
+}
+
+/// Compact `[…]` suffix for the table's prompt column.
+fn describe_options(options: &LoopOptions) -> String {
+    let mut parts = Vec::new();
+    if let Some(path) = &options.prompt_file {
+        parts.push(format!("file:{path}"));
+    }
+    if let Some(to) = &options.email_to {
+        parts.push(format!("email:{to}"));
+    }
+    if let Some(secs) = options.rereport_after_secs {
+        parts.push(format!("rereport:{secs}s"));
+    }
+    if options.quiet_when_empty {
+        parts.push("quiet".into());
+    }
+    format!("  [{}]", parts.join(" "))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -914,6 +1023,7 @@ mod tests {
                 expires_in: None,
                 model: None,
                 nag_until_ack: false,
+                delivery: Default::default(),
                 json: false,
             },
         )
@@ -961,6 +1071,7 @@ mod tests {
             expires_in: None,
             model: Some(model.into()),
             nag_until_ack: false,
+            delivery: Default::default(),
             json: false,
         };
         run_with(&store, create("glm")).unwrap();
@@ -986,6 +1097,7 @@ mod tests {
             expires_in: None,
             model: None,
             nag_until_ack: nag,
+            delivery: Default::default(),
             json: false,
         };
         run_with(&store, create(true)).unwrap();
@@ -1116,5 +1228,127 @@ mod tests {
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--tz"));
+    }
+
+    // ----- #2246 delivery options -----
+
+    fn allow_owner(key: &str) -> Option<String> {
+        (key == SELF_SEND_ENV).then(|| "owner@example.com, second@example.com".to_string())
+    }
+
+    #[test]
+    fn delivery_options_default_to_off() {
+        assert!(resolve_delivery(LoopDeliveryArgs::default(), |_| None).unwrap().is_default());
+    }
+
+    #[test]
+    fn delivery_options_resolve_from_flags() {
+        let args = LoopDeliveryArgs {
+            quiet_when_empty: true,
+            rereport_after: Some("30d".into()),
+            prompt_file: Some(" scans/criteria.md ".into()),
+            email_findings_to: Some(" Owner@Example.com ".into()),
+            email_account: Some("sender@example.com".into()),
+        };
+        assert_eq!(
+            resolve_delivery(args, allow_owner).unwrap(),
+            LoopOptions {
+                quiet_when_empty: true,
+                rereport_after_secs: Some(30 * 86_400),
+                prompt_file: Some("scans/criteria.md".into()),
+                email_to: Some("owner@example.com".into()),
+                email_account: Some("sender@example.com".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_email_address_off_the_allowlist_is_refused_at_create() {
+        let to = |address: &str| LoopDeliveryArgs {
+            email_findings_to: Some(address.into()),
+            ..Default::default()
+        };
+        for address in ["stranger@example.com", "owner@example.com,stranger@example.com", "Owner <owner@example.com>"] {
+            let err = resolve_delivery(to(address), allow_owner).unwrap_err().to_string();
+            assert!(err.contains(SELF_SEND_ENV), "{address}: {err}");
+        }
+        // No allowlist configured: the feature is off for every address.
+        assert!(resolve_delivery(to("owner@example.com"), |_| None).is_err());
+    }
+
+    #[test]
+    fn a_bad_window_or_prompt_file_is_refused_at_create() {
+        let window = LoopDeliveryArgs { rereport_after: Some("soon".into()), ..Default::default() };
+        assert!(resolve_delivery(window, |_| None).unwrap_err().to_string().contains("--rereport-after"));
+        for path in ["../outside.md", "/etc/hosts", " "] {
+            let file = LoopDeliveryArgs { prompt_file: Some(path.into()), ..Default::default() };
+            assert!(resolve_delivery(file, |_| None).unwrap_err().to_string().contains("--prompt-file"), "{path}");
+        }
+    }
+
+    #[test]
+    fn create_stores_options_and_list_shows_them() {
+        let (_tmp, store) = seed_store();
+        let create = |delivery: LoopDeliveryArgs| LoopOp::Create {
+            interval: Some("1d".into()),
+            cron: None,
+            tz: None,
+            prompt: "scan".into(),
+            channel_ref: Some("test-channel".into()),
+            owner: Some("options-owner".into()),
+            expires_in: None,
+            model: None,
+            nag_until_ack: false,
+            delivery,
+            json: false,
+        };
+        run_with(&store, create(LoopDeliveryArgs {
+            quiet_when_empty: true,
+            rereport_after: Some("7d".into()),
+            prompt_file: Some("scans/criteria.md".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+        let id = store.list_user_loops("options-owner").unwrap().remove(0).id;
+        let options = store.loop_options(&id).unwrap();
+        assert!(options.quiet_when_empty);
+        assert_eq!(options.rereport_after_secs, Some(7 * 86_400));
+        let rows = list_rows(&store, false).unwrap();
+        let row = rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(
+            describe_options(row.options.as_ref().unwrap()),
+            "  [file:scans/criteria.md rereport:604800s quiet]"
+        );
+        assert!(rows.iter().filter(|r| r.id != id).all(|r| r.options.is_none()));
+
+        // A refused option leaves no loop behind.
+        let refused = create(LoopDeliveryArgs { prompt_file: Some("../x.md".into()), ..Default::default() });
+        assert!(run_with(&store, refused).is_err());
+        assert_eq!(store.list_user_loops("options-owner").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_cli_parses_delivery_flags() {
+        let cli = crate::Cli::try_parse_from([
+            "augmentagent", "loop", "create", "--cron", "0 8 * * MON-FRI", "--tz", "UTC",
+            "--prompt", "scan", "--prompt-file", "scans/criteria.md", "--quiet-when-empty",
+            "--rereport-after", "30d", "--email-findings-to", "owner@example.com",
+            "--email-account", "sender@example.com",
+        ])
+        .unwrap();
+        let crate::Cmd::Loop { op: LoopOp::Create { delivery, .. } } = cli.cmd else {
+            panic!("expected loop create");
+        };
+        assert!(delivery.quiet_when_empty);
+        assert_eq!(delivery.rereport_after.as_deref(), Some("30d"));
+        assert_eq!(delivery.prompt_file.as_deref(), Some("scans/criteria.md"));
+        assert_eq!(delivery.email_findings_to.as_deref(), Some("owner@example.com"));
+        assert_eq!(delivery.email_account.as_deref(), Some("sender@example.com"));
+        // The sending account means nothing without a destination.
+        assert!(crate::Cli::try_parse_from([
+            "augmentagent", "loop", "create", "--interval", "1d", "--prompt", "scan",
+            "--email-account", "sender@example.com",
+        ])
+        .is_err());
     }
 }
