@@ -2792,6 +2792,10 @@ impl Store {
     /// Insert email if new. Returns `true` when the row did not previously exist.
     /// Matches Node `upsertEmail` behavior in src/db.ts: preserves firstSeenAt on re-seen messages.
     pub fn upsert_email(&self, email: &Email) -> StoreResult<bool> {
+        // #2218 — a message from a yolo thread is never stored.
+        if crate::yolo_threads::blocks_discord_row(&email.platform, email.thread_id.as_deref(), &email.kind) {
+            return Ok(false);
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard
             .query_row(
@@ -2904,6 +2908,10 @@ impl Store {
     }
 
     pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
+        // #2218 — a message from a yolo thread is never stored.
+        if crate::yolo_threads::blocks_discord_row(&email.platform, email.thread_id.as_deref(), &email.kind) {
+            return Ok(false);
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard
             .query_row(
@@ -9670,6 +9678,30 @@ mod tests {
         assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 42);
         store.set_imessage_entries_seen("+14155550123", 57).unwrap();
         assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 57);
+    }
+
+    #[test]
+    fn discord_messages_from_a_yolo_thread_are_never_stored_by_either_writer() {
+        let (store, dir) = fresh_store();
+        let registry = crate::yolo_threads::Registry::new(dir.path().join("yolo-threads.json"));
+        registry.record(1001, 77, 1).unwrap();
+        crate::yolo_threads::override_path_for_this_thread(Some(registry.path().to_path_buf()));
+        let discord = |message_id: &str, channel: &str| {
+            let mut email = sample_email(message_id);
+            email.platform = "discord".into();
+            email.kind = "guild_channel".into();
+            email.thread_id = Some(channel.into());
+            email
+        };
+        // The live path and the history sync both go through these two calls.
+        assert!(!store.upsert_email(&discord("9001", "1001")).unwrap());
+        assert!(!store.upsert_email_backfill(&discord("9002", "1001"), 1).unwrap());
+        assert_eq!(store.email_first_seen_at("9001").unwrap(), None);
+        assert_eq!(store.email_first_seen_at("9002").unwrap(), None);
+        // The parent channel and other platforms are stored as before.
+        assert!(store.upsert_email(&discord("9003", "77")).unwrap());
+        assert!(store.upsert_email_backfill(&sample_email("9004"), 1).unwrap());
+        crate::yolo_threads::override_path_for_this_thread(None);
     }
 
     #[test]

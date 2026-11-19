@@ -9,6 +9,8 @@ mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+#[cfg(test)]
+mod yolo_isolation_tests;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -11501,6 +11503,20 @@ fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
     assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
 }
 
+/// #2218 — an isolation check, not routing. A turn that is not a yolo turn
+/// never runs in a yolo thread, whatever entry point produced it (voice
+/// start, voice bridge, phone, iMessage owner). An unreadable registry closes
+/// guild channels and leaves DMs alone. No inference is started.
+pub(crate) const YOLO_THREAD_REFUSAL: &str = "Not available in a yolo thread.";
+fn yolo_thread_refusal(ctx: &augmentagent_approval_discord::AuditCtx) -> Option<String> {
+    use augmentagent_store::yolo_threads::{closed_to_normal_turns, mark};
+    let channel = ctx.channel_id?;
+    if augmentagent_approval_discord::interaction::is_yolo_turn() {
+        return None;
+    }
+    closed_to_normal_turns(mark(channel.get()), ctx.guild_id.is_some()).then(|| YOLO_THREAD_REFUSAL.to_string())
+}
+
 async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
@@ -11893,6 +11909,7 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
         let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
             std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
                 .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
@@ -12036,6 +12053,7 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
         let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
         let mut combined_history=history.to_owned();
         if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {

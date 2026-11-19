@@ -15,6 +15,8 @@ pub mod imessage_owner_control;
 pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
+#[cfg(test)]
+mod yolo_isolation_tests;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;

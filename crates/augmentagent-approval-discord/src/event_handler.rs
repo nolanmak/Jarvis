@@ -825,7 +825,10 @@ impl EventHandler for Handler {
                     )
                     .await;
                     let final_spoken = handler.take_final_spoken(&audit_ctx.session_id);
-                    if !final_spoken && !answer.trim().is_empty() && answer.len() <= 12_000 {
+                    // #2218 — an answer in a yolo thread is never spoken.
+                    let yolo_thread = augmentagent_store::yolo_threads::closed_to_normal_turns(
+                        augmentagent_store::yolo_threads::mark(channel_id.get()), true);
+                    if !final_spoken && !yolo_thread && !answer.trim().is_empty() && answer.len() <= 12_000 {
                         if let (Some(bridge), Some(guild)) = (&voice_bridge, guild_id) {
                             let guild = guild.to_string();
                             let conversation = format!("{guild}:{}", channel_id.get());
@@ -2999,6 +3002,21 @@ pub async fn fetch_owner_history(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> anyhow::Result<String> {
+    // #2218 — a yolo thread's messages are history for yolo turns only. Every
+    // caller that is not one (phone bootstrap, iMessage owner, voice start)
+    // gets nothing, so they cannot seed a normal turn with yolo content. An
+    // unreadable registry closes guild channels and leaves DMs alone.
+    if !crate::interaction::is_yolo_turn() {
+        use augmentagent_store::yolo_threads::{mark, ThreadMark};
+        let closed = match mark(channel_id.get()) {
+            ThreadMark::Yes => true,
+            ThreadMark::No => false,
+            ThreadMark::Unknown => !matches!(channel_id.to_channel(http).await, Ok(serenity::all::Channel::Private(_))),
+        };
+        if closed {
+            return Ok(String::new());
+        }
+    }
     let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
     if let Some(before) = before { builder = builder.before(before); }
     let messages = channel_id.messages(http, builder).await
