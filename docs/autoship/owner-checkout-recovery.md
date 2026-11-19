@@ -80,7 +80,7 @@ means the new-policy attempt has started and consumes this legacy scheduling
 override, including if it later has a real evidence failure. The picker still
 checks current issue lifecycle/manual routing, author trust, owner pause,
 lease/backoff, checkout continuity, and publication deduplication. Existing peer
-fairness is preserved within the owner queue. Selection is read-only; normal
+fairness is preserved within the owner queue. Dry-run selection is read-only; normal
 productive acquisition establishes the fresh environment, baseline and witness.
 It does not declare a held workflow qualified or rewrite its original archive.
 
