@@ -1075,7 +1075,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
-    let candidates=owner_requalification::prioritize(candidates,&owner_recoveries);
+    let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
+        .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
@@ -1165,6 +1166,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             continue;
         }
         owner_controls.require_current_history()?;
+        if !dry_run && owner_recoveries.contains(&number) && !owner_requalification::reserve(&workflow::path(),&repository,number,chrono::Utc::now().timestamp_millis())
+            .map_err(|error|error.context(RecoveryHistoryUnavailable))? {continue;}
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give

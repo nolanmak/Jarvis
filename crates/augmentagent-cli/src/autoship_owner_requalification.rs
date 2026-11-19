@@ -2,7 +2,82 @@
 //! fresh-witness-v2. A hint never creates authority or supersedes evidence.
 use super::*;
 
+pub(crate) const RETRY_MS: i64 = 300_000;
+fn selected_at(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT MAX(e.at_ms) FROM workflow_event e JOIN active_checkout_recovery a ON a.workflow=e.workflow WHERE e.workflow=?1 AND e.kind='owner_requalification_selected' AND CASE WHEN json_valid(e.payload) THEN json_extract(e.payload,'$.request_id')=a.request_id ELSE 0 END",[id],|r|r.get(0))?)
+}
+
 impl WorkflowStore {
+    pub(crate) fn owner_requalification_selected_at(&self, id: &str) -> Result<Option<i64>> {
+        selected_at(&self.conn, id)
+    }
+
+    /// Scheduling reservation only. Preserve the held projection and original
+    /// owner grant; a failure before claim must rotate just like a claimed turn.
+    pub(crate) fn reserve_owner_requalification(&mut self, id: &str, now: i64) -> Result<bool> {
+        let Some(expected) = self.snapshot(id)? else {
+            return Ok(false);
+        };
+        let Some(plan) = self.active_checkout_recovery(id)? else {
+            return Ok(false);
+        };
+        let initial = expected.pr.is_none()
+            && expected.checkpoint.stage == Stage::Intake
+            && expected.checkpoint.next.reason == "owner_checkout_recovered"
+            && expected.branch == plan.branch;
+        if !initial && !self.owner_requalification_pending(id)? {
+            return Ok(false);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (raw, generation, leased, branch, pr): (String, i64, i64, String, Option<u64>) = tx
+            .query_row(
+                "SELECT checkpoint,generation,lease_until,branch,pr FROM workflow WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        let cp: Checkpoint = serde_json::from_str(&raw)?;
+        let active: Option<String> = tx
+            .query_row(
+                "SELECT request_id FROM active_checkout_recovery WHERE workflow=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if cp != expected.checkpoint
+            || generation != expected.generation
+            || branch != expected.branch
+            || pr.is_some()
+            || leased > now
+            || cp.next.eligible_at_ms > now
+            || active.as_deref() != Some(plan.request_id.as_str())
+            || owner_control::read(&tx, id)?.is_some_and(|c| c.paused)
+            || owner_inbox::pending(&tx, id)? > 0
+            || target_fence::fenced(&tx, id)?
+            || qualification_recovery::pending_mutation(&tx, id)?
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )?
+            || selected_at(&tx, id)?.is_some_and(|last| now < last.saturating_add(RETRY_MS))
+        {
+            return Ok(false);
+        }
+        event(
+            &tx,
+            id,
+            generation,
+            "owner_requalification_selected",
+            &serde_json::json!({"version":1,"request_id":plan.request_id,"binding":cp.binding})
+                .to_string(),
+            now,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn owner_requalification_pending(&self, id: &str) -> Result<bool> {
         let Some(snapshot) = self.snapshot(id)? else {
             return Ok(false);

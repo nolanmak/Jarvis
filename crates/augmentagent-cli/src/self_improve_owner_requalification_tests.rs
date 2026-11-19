@@ -151,6 +151,22 @@ pub(super) async fn bounced(
         }
         std::fs::write(root.join("issue.json"), request.to_string()).unwrap();
     }
+    let before_selection = store.snapshot(id).unwrap();
+    assert_eq!(pick_issue(root, false).await.unwrap().unwrap().number, 7);
+    assert_eq!(
+        store.snapshot(id).unwrap(),
+        before_selection,
+        "scheduling reservation rewrote held evidence or claimed execution"
+    );
+    assert_eq!(
+        store.events(id).unwrap().last().unwrap().1,
+        "owner_requalification_selected"
+    );
+    assert_eq!(
+        pick_issue(root, true).await.unwrap().unwrap().number,
+        8,
+        "an unsuccessful pre-claim owner turn must yield rather than monopolize every tick"
+    );
     let environment =
         owner_checkout_recovery::environment(state, "controller/repo", 7, base_environment)
             .unwrap();

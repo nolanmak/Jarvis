@@ -87,3 +87,10 @@ It does not declare a held workflow qualified or rewrite its original archive.
 Unrecovered workflows, registered acceptance contexts, and current-policy custody
 failures retain their existing protected recovery paths. The legacy scheduling
 hint cannot manufacture owner authority or discard missing new evidence.
+
+A real selection also records `owner_requalification_selected` under the active
+owner request. It reserves scheduling only: no execution lease, model admission,
+qualification or checkpoint update. If execution fails before claim, that issue
+cools down for five minutes and yields to untouched owners/eligible peers. It
+then retries automatically. Dry-run selection reads this schedule without
+writing it. Changing to a new owner request uses a separate reservation history.
