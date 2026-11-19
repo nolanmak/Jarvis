@@ -42,6 +42,10 @@ personal wiki, and social/posting integrations.
 - **Heartbeat.** An opt-in periodic check-in reads your `HEARTBEAT.md`
   checklist plus recent activity and stays silent unless something needs you,
   with a liveness probe for external monitoring. See [Heartbeat](docs/HEARTBEAT.md).
+- **Scheduled scans.** A `/loop` can read its instructions from a wiki page,
+  report each match once by a stable key, stay quiet when it finds nothing,
+  and email new findings to an address you have allowlisted. See
+  [Scheduled scans](docs/SCHEDULED-SCANS.md).
 - **Self-improvement & scheduling.** A `self-improve` mode can pick up
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.

@@ -149,7 +149,7 @@ pub(super) fn environment(
     original: String,
 ) -> Result<String> {
     Ok(match active(state, repository, number)? {
-        Some(plan) => format!("{original};owner-recovery:{}", plan.request_id),
+        Some(plan) => format!("{original};owner-recovery:{};owner-qualification:fresh-witness-v2", plan.request_id),
         None => original,
     })
 }
