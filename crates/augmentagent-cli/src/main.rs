@@ -6,6 +6,7 @@ mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
+mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
@@ -4604,6 +4605,7 @@ async fn main() -> Result<()> {
                         use augmentagent_channel_slack::commands::{
                             SlackLoopPoster, SurfaceGatedRunner, SurfaceLoopPoster,
                         };
+                        let loop_wiki_root = wiki_root.clone();
                         let repo_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
                         let inner: Arc<dyn LoopRunner> = match slack_serve::test_loop_runner(
@@ -4636,11 +4638,15 @@ async fn main() -> Result<()> {
                                 }) as Arc<dyn LoopPoster>
                             }),
                         });
-                        let loops = Arc::new(LoopScheduler::new(
-                            Arc::clone(&store),
-                            runner,
-                            poster,
-                        ));
+                        // #2246 — loops may read their instructions from the
+                        // wiki and email findings to allowlisted owner addresses.
+                        let loops = Arc::new(
+                            LoopScheduler::new(Arc::clone(&store), runner, poster)
+                                .with_wiki_root(loop_wiki_root)
+                                .with_mailer(Arc::new(loop_mailer::GmailLoopMailer {
+                                    store: Arc::clone(&store),
+                                })),
+                        );
                         let sd = shutdown.clone();
                         tasks.push(tokio::spawn(async move { loops.run(sd).await }));
                     }
