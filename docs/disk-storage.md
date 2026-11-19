@@ -245,15 +245,13 @@ CPU/memory/task budget across both processes. The worker inherits the daemon's
 run-resource delegation so native builds keep their per-run limits.
 Provisioning enables the worker but
 does not start it alongside a legacy embedded loop: first startup is ordered
-after the daemon restart. The initial legacy run may still defer this migration.
+after the daemon restart.
 
 After migration, a daemon restart leaves the worker and its child processes
-alive. The updater bypasses in-flight restart deferral only after verifying the
-actual daemon's external-worker mode, process birth identity, separate service
-cgroup, and ownership of every held fresh/resume run lock. Unknown or legacy
-owners retain the existing restart deferral. The worker detects an executable
-replacement but finishes its active run and persists accounting before reloading
-between runs. A supervisor lock prevents two new workers from polling at once.
+alive. The updater never defers a daemon restart for an auto-ship run (#2271);
+a held fresh/resume run lock only keeps the gate-cache trim away. The worker
+detects an executable replacement but finishes its active run and persists
+accounting before reloading between runs. A supervisor lock prevents two new workers from polling at once.
 
 `disk build` exits 75 for contention, 73 for capacity/budget refusal, and 76 when
 preflight cannot establish safety. The updater logs these as distinct deferrals,

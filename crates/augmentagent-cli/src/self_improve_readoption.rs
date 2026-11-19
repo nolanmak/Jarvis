@@ -288,7 +288,10 @@ elif a[:1]==['api'] and '/git/ref/heads/main' in a[1]: print((r/'main-head').rea
 elif a[:1]==['api'] and '/timeline?' in a[1]: print((r/'timeline.json').read_text())
 elif a[:1]==['api'] and '/issues?' in a[1]:
  i=json.loads((r/'issue.json').read_text());i['user']={'login':'controller'};i['author_association']='OWNER'
- print(json.dumps([i] if a[1].endswith('page=1') else []))
+ rows=[i] if i['state']=='open' else []
+ if os.environ.get('RECOVERY_CASE')=='qualification-bounced':
+  peer=dict(i);peer.update(number=8,state='open',labels=[]);rows.insert(0,peer)
+ print(json.dumps(rows if a[1].endswith('page=1') else []))
 elif a[:1]==['api'] and '/issues/' in a[1]: print((r/'issue.json').read_text())
 elif a[:2]==['issue','edit']:
  assert a[3:]==['--remove-label','agent-gave-up']
