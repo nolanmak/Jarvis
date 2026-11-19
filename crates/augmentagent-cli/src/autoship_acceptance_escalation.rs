@@ -75,7 +75,111 @@ fn retained_criteria(c: &Connection, id: &str, binding: &Binding) -> Result<Vec<
     }
     Ok(criteria)
 }
+/// Cycle-0 escalation material: the original hold, bounded private
+/// diagnostics and the receipted original criteria. Nothing is relaxed.
+fn start_material(tx: &Connection, id: &str, cp: &Checkpoint) -> Result<Material> {
+    let mut q=tx.prepare("SELECT key,response FROM scope_stage_response WHERE workflow=?1 AND json_valid(response) AND (json_type(response,'$.detail')='text' OR json_type(response,'$.diagnostic')='text') ORDER BY rowid DESC LIMIT 12")?;
+    let rows = q.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut diagnostics = Vec::new();
+    for row in rows {
+        let (key, raw) = row?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let detail = value["detail"]
+            .as_str()
+            .or(value["diagnostic"].as_str())
+            .unwrap_or("");
+        diagnostics.push(serde_json::json!({"key":key,"sha256":format!("{:x}",Sha256::digest(raw.as_bytes())),"preview":detail.chars().take(8192).collect::<String>()}));
+    }
+    Ok(Material {
+        version: 1,
+        original: cp.clone(),
+        diagnostics,
+        criteria: retained_criteria(tx, id, &cp.binding)?,
+    })
+}
+
+/// #2317 one-time audit tag for holds parked before #2301.
+pub(crate) const LADDER_MIGRATION: &str = "repair-exhausted-ladder-v1";
+/// Bounded per sweep, like #2274's scope-policy migration.
+const LADDER_MIGRATION_BATCH: usize = 8;
+
 impl WorkflowStore {
+    /// Free worker maintenance (#2317). A repair-exhausted hold parked before
+    /// #2301 still waits on `await_acceptance_input_change`, which nothing will
+    /// ever supply. Enter it into the never-give-up ladder at cycle 0 with an
+    /// audit event holding the complete prior checkpoint. Binding, evidence,
+    /// generation, attempts, spend, owner control and leases are untouched;
+    /// this grants planning eligibility only, never acceptance.
+    pub(crate) fn migrate_repair_exhausted_to_ladder(
+        &mut self,
+        repository: &str,
+        now: i64,
+    ) -> Result<usize> {
+        let prefix = format!("{}#", repository.to_ascii_lowercase());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String, i64)> = tx
+            .prepare(
+                "SELECT id,checkpoint,generation FROM workflow WHERE pr IS NULL AND lease_until<=?1
+                 AND substr(id,1,length(?2))=?2 AND json_valid(checkpoint)
+                 AND json_extract(checkpoint,'$.stage')='scope'
+                 AND json_extract(checkpoint,'$.next.reason')='acceptance_verifier_repair_exhausted'
+                 AND json_extract(checkpoint,'$.next.action')='await_acceptance_input_change'
+                 ORDER BY heartbeat_at,id LIMIT 64",
+            )?
+            .query_map(params![now, prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut migrated = 0;
+        for (id, raw, generation) in rows {
+            // A malformed row keeps its typed per-issue hold; peers continue.
+            let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) else {
+                continue;
+            };
+            if owner_control::require_dispatch(&tx, &id).is_err()
+                || target_fence::fenced(&tx, &id)?
+                || !eligible(&tx, &id, &cp).unwrap_or(false)
+            {
+                continue;
+            }
+            let material = match start_material(&tx, &id, &cp) {
+                Ok(material) => material,
+                Err(error) => {
+                    tracing::warn!(workflow=%id,error=%error,"repair-exhausted evidence unavailable; preserve hold and continue peers");
+                    continue;
+                }
+            };
+            let audit = serde_json::json!({"version":1,"migration":LADDER_MIGRATION,
+                "prior_checkpoint":serde_json::to_string(&cp)?,"original_evidence":"preserved"});
+            event(&tx, &id, generation, "acceptance_ladder_migrated", &audit.to_string(), now)?;
+            event(
+                &tx,
+                &id,
+                generation,
+                "acceptance_strategy_started",
+                &serde_json::to_string(&material)?,
+                now,
+            )?;
+            let mut next = cp;
+            next.next = NextAction {
+                reason: "acceptance_strategy_escalation".into(),
+                action: ACTION.into(),
+                eligible_at_ms: now,
+            };
+            let next = serde_json::to_string(&next)?;
+            tx.execute(
+                "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+                params![id, next],
+            )?;
+            event(&tx, &id, generation, "checkpoint", &next, now)?;
+            migrated += 1;
+            if migrated == LADDER_MIGRATION_BATCH {
+                break;
+            }
+        }
+        tx.commit()?;
+        Ok(migrated)
+    }
     pub(crate) fn acceptance_escalation_pending(&self, id: &str) -> Result<bool> {
         let Some(s) = self.snapshot(id)? else {
             return Ok(false);
@@ -140,26 +244,7 @@ impl WorkflowStore {
             );
             m
         } else {
-            let mut q=tx.prepare("SELECT key,response FROM scope_stage_response WHERE workflow=?1 AND json_valid(response) AND (json_type(response,'$.detail')='text' OR json_type(response,'$.diagnostic')='text') ORDER BY rowid DESC LIMIT 12")?;
-            let rows = q.query_map([&lease.workflow], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut diagnostics = Vec::new();
-            for row in rows {
-                let (key, raw) = row?;
-                let value: serde_json::Value = serde_json::from_str(&raw)?;
-                let detail = value["detail"]
-                    .as_str()
-                    .or(value["diagnostic"].as_str())
-                    .unwrap_or("");
-                diagnostics.push(serde_json::json!({"key":key,"sha256":format!("{:x}",Sha256::digest(raw.as_bytes())),"preview":detail.chars().take(8192).collect::<String>()}));
-            }
-            let m = Material {
-                version: 1,
-                original: cp.clone(),
-                diagnostics,
-                criteria: retained_criteria(&tx, &lease.workflow, &cp.binding)?,
-            };
+            let m = start_material(&tx, &lease.workflow, &cp)?;
             event(
                 &tx,
                 &lease.workflow,
@@ -422,5 +507,123 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+    fn park(store: &mut WorkflowStore, id: &str, reason: &str, at: i64) -> Binding {
+        let binding = Binding {
+            head: "b".repeat(40),
+            contract: format!("original owner request {id}"),
+            evidence_hash: "evidence".into(),
+        };
+        store.register(id, "candidate", binding.clone(), at).unwrap();
+        let lease = store.claim(id, "first", at + 1, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Scope;
+        cp.next = NextAction {
+            reason: reason.into(),
+            action: "await_acceptance_input_change".into(),
+            eligible_at_ms: 0,
+        };
+        cp.evidence = vec!["original-diagnostic".into()];
+        store.checkpoint(&lease, &cp, at + 2).unwrap();
+        store.release(&lease, at + 3).unwrap();
+        binding
+    }
+    #[test]
+    fn legacy_repair_exhausted_rows_migrate_once_into_the_strategy_ladder_with_audit() {
+        // #2317: rows parked before #2301 still sat at the terminal-looking
+        // await_acceptance_input_change action and were never selected.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id = "owner/repo#1615".to_string();
+        let binding = park(&mut store, &id, "acceptance_verifier_repair_exhausted", 1);
+        let paused = "owner/repo#1898".to_string();
+        park(&mut store, &paused, "acceptance_verifier_repair_exhausted", 1);
+        let control = store.owner_control(&paused).unwrap().map_or(0, |c| c.revision);
+        store.set_owner_pause(&paused, "owner", control, true, 5).unwrap();
+        let other_repo = "else/repo#1".to_string();
+        park(&mut store, &other_repo, "acceptance_verifier_repair_exhausted", 1);
+        let unrelated = "owner/repo#2".to_string();
+        park(&mut store, &unrelated, "acceptance_contract_invalid", 1);
+        let before = store.snapshot(&id).unwrap().unwrap();
+        let untouched: Vec<_> = [&paused, &other_repo, &unrelated]
+            .iter()
+            .map(|w| (store.snapshot(w).unwrap().unwrap(), store.events(w).unwrap()))
+            .collect();
+
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("Owner/Repo", 50).unwrap(), 1);
+        let after = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.action, ACTION);
+        assert_eq!(after.checkpoint.next.reason, "acceptance_strategy_escalation");
+        assert_eq!(after.checkpoint.next.eligible_at_ms, 50);
+        assert!(!awaits_initial_input(&after.checkpoint), "migrated row still looks parked");
+        // Only scheduling moved: binding, evidence, generation, attempts and spend stay.
+        assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+        assert_eq!(
+            (after.generation, after.attempts, after.model_calls, after.progress_at_ms),
+            (before.generation, before.attempts, before.model_calls, before.progress_at_ms)
+        );
+        let events = store.events(&id).unwrap();
+        let audit = events
+            .iter()
+            .find(|(_, kind, _, _)| kind == "acceptance_ladder_migrated")
+            .expect("migration must leave an audit event");
+        let audit: serde_json::Value = serde_json::from_str(&audit.2).unwrap();
+        let prior: Checkpoint =
+            serde_json::from_str(audit["prior_checkpoint"].as_str().unwrap()).unwrap();
+        assert_eq!(prior, before.checkpoint, "audit lost the original hold");
+        assert!(events.iter().any(|(_, kind, _, _)| kind == "acceptance_strategy_started"));
+        // Peers outside scope are left exactly as they were.
+        for (w, (snapshot, history)) in [&paused, &other_repo, &unrelated].iter().zip(untouched) {
+            assert_eq!(store.snapshot(w).unwrap().unwrap(), snapshot, "{w} changed");
+            assert_eq!(store.events(w).unwrap(), history, "{w} history changed");
+        }
+        // One-time: a second sweep finds nothing to do and writes nothing.
+        let settled = store.events(&id).unwrap();
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("owner/repo", 60).unwrap(), 0);
+        assert_eq!(store.events(&id).unwrap(), settled);
+
+        // The migrated row is selectable and enters cycle 0 of the ladder
+        // with its original hold as the escalation material.
+        assert!(store.acceptance_escalation_retries("owner/repo").unwrap().contains(&1615));
+        let lease = store
+            .claim_productive_for_binding(&id, "ladder", 70, 100, &binding)
+            .unwrap()
+            .expect("migrated ladder row was not claimable");
+        let material = store
+            .begin_acceptance_escalation(&lease, &binding, 71)
+            .unwrap()
+            .expect("migrated row lost its ladder material");
+        assert_eq!(material.original, before.checkpoint);
+        let started = store
+            .events(&id)
+            .unwrap()
+            .iter()
+            .filter(|(_, kind, _, _)| kind == "acceptance_strategy_started")
+            .count();
+        assert_eq!(started, 1, "claim restarted the strategy instead of resuming it");
+    }
+    #[test]
+    fn ladder_migration_leaves_leased_and_published_rows_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let leased = "owner/repo#10".to_string();
+        park(&mut store, &leased, "acceptance_verifier_repair_exhausted", 1);
+        let lease = store.claim(&leased, "busy", 10, 1_000).unwrap().unwrap();
+        let published = "owner/repo#11".to_string();
+        park(&mut store, &published, "acceptance_verifier_repair_exhausted", 1);
+        let pub_lease = store.claim(&published, "pub", 10, 100).unwrap().unwrap();
+        store.attach_pr(&pub_lease, 2135, 11).unwrap();
+        store.release(&pub_lease, 12).unwrap();
+        let before: Vec<_> = [&leased, &published]
+            .iter()
+            .map(|w| store.snapshot(w).unwrap().unwrap())
+            .collect();
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("owner/repo", 20).unwrap(), 0);
+        for (w, snapshot) in [&leased, &published].iter().zip(before) {
+            assert_eq!(store.snapshot(w).unwrap().unwrap(), snapshot, "{w} changed");
+        }
+        store.release(&lease, 30).unwrap();
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("owner/repo", 40).unwrap(), 1);
     }
 }

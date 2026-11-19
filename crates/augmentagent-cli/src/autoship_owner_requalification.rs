@@ -3,13 +3,29 @@
 use super::*;
 
 pub(crate) const RETRY_MS: i64 = 300_000;
-fn selected_at(conn: &Connection, id: &str) -> Result<Option<i64>> {
-    Ok(conn.query_row("SELECT MAX(e.at_ms) FROM workflow_event e JOIN active_checkout_recovery a ON a.workflow=e.workflow WHERE e.workflow=?1 AND e.kind='owner_requalification_selected' AND CASE WHEN json_valid(e.payload) THEN json_extract(e.payload,'$.request_id')=a.request_id ELSE 0 END",[id],|r|r.get(0))?)
+/// Most recent owner turn and the number of turns this owner grant has had
+/// since the workflow last advanced past scoping. Every turn is reserved while
+/// the same `evidence_unknown` hold is pending, so these are no-progress turns.
+fn turns(conn: &Connection, id: &str) -> Result<Option<(i64, u32)>> {
+    let (last, count): (Option<i64>, u32) = conn.query_row("SELECT MAX(e.at_ms),COUNT(*) FROM workflow_event e JOIN active_checkout_recovery a ON a.workflow=e.workflow WHERE e.workflow=?1 AND e.kind='owner_requalification_selected' AND CASE WHEN json_valid(e.payload) THEN json_extract(e.payload,'$.request_id')=a.request_id ELSE 0 END
+        AND e.seq>COALESCE((SELECT MAX(c.seq) FROM workflow_event c WHERE c.workflow=?1 AND c.kind='checkpoint' AND json_valid(c.payload) AND json_extract(c.payload,'$.stage') IN ('build','verify','review','publish','await_checks','merge','merged')),0)",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    Ok(last.map(|last| (last, count)))
+}
+
+/// #2317: owner priority is bounded like #2280's peer fairness. After
+/// `NO_PROGRESS_YIELD` unchanged turns the owner hold yields to peers and its
+/// cooldown doubles per further turn, capped like other retries.
+pub(crate) fn cooldown_ms(turns: u32) -> i64 {
+    command_fairness::backoff_ms(turns).unwrap_or(RETRY_MS)
+}
+
+pub(crate) fn yields(turns: u32) -> bool {
+    turns >= command_fairness::NO_PROGRESS_YIELD
 }
 
 impl WorkflowStore {
-    pub(crate) fn owner_requalification_selected_at(&self, id: &str) -> Result<Option<i64>> {
-        selected_at(&self.conn, id)
+    pub(crate) fn owner_requalification_turns(&self, id: &str) -> Result<Option<(i64, u32)>> {
+        turns(&self.conn, id)
     }
 
     /// Scheduling reservation only. Preserve the held projection and original
@@ -61,7 +77,8 @@ impl WorkflowStore {
                 [id],
                 |r| r.get::<_, bool>(0),
             )?
-            || selected_at(&tx, id)?.is_some_and(|last| now < last.saturating_add(RETRY_MS))
+            || turns(&tx, id)?
+                .is_some_and(|(last, n)| now < last.saturating_add(cooldown_ms(n)))
         {
             return Ok(false);
         }
@@ -178,5 +195,46 @@ mod tests {
             .is_empty());
         assert_eq!(store.events(id).unwrap(), events);
         assert_eq!(store.snapshot(id).unwrap().unwrap().checkpoint, checkpoint);
+    }
+    #[test]
+    fn owner_turns_count_unchanged_selections_and_reset_after_real_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&temp.path().join("workflow.db")).unwrap();
+        let id = "fixture-owner/repo#1644";
+        let binding = Binding {
+            head: "a".repeat(40),
+            contract: "synthetic request".into(),
+            evidence_hash: "synthetic environment".into(),
+        };
+        store.register(id, "synthetic-branch", binding, 1).unwrap();
+        store.conn.execute("INSERT INTO owner_checkout_recovery VALUES('grant-1',?1,'owner','lost','{}','{}','{}','{}','[]','[]','r',x'00','w','b','main',1)",[id]).unwrap();
+        store.conn.execute("INSERT INTO active_checkout_recovery VALUES(?1,'grant-1')",[id]).unwrap();
+        assert_eq!(store.owner_requalification_turns(id).unwrap(), None);
+        let select = |store: &mut WorkflowStore, request: &str, at: i64| {
+            let tx = store.conn.transaction().unwrap();
+            event(&tx, id, 1, "owner_requalification_selected",
+                &serde_json::json!({"version":1,"request_id":request}).to_string(), at).unwrap();
+            tx.commit().unwrap();
+        };
+        let checkpoint = |store: &mut WorkflowStore, stage: &str, at: i64| {
+            let tx = store.conn.transaction().unwrap();
+            event(&tx, id, 1, "checkpoint",
+                &serde_json::json!({"stage":stage,"next":{"reason":"r","action":"a"}}).to_string(), at).unwrap();
+            tx.commit().unwrap();
+        };
+        select(&mut store, "grant-1", 10);
+        // A claimed turn passes through intermediate scope checkpoints and
+        // returns to the same hold: still no progress.
+        checkpoint(&mut store, "reconcile", 11);
+        checkpoint(&mut store, "scope", 12);
+        select(&mut store, "grant-1", 20);
+        select(&mut store, "superseded-grant", 25);
+        select(&mut store, "grant-1", 30);
+        assert_eq!(store.owner_requalification_turns(id).unwrap(), Some((30, 3)));
+        // Reaching build is real progress; earlier turns no longer count.
+        checkpoint(&mut store, "build", 40);
+        assert_eq!(store.owner_requalification_turns(id).unwrap(), None);
+        select(&mut store, "grant-1", 50);
+        assert_eq!(store.owner_requalification_turns(id).unwrap(), Some((50, 1)));
     }
 }
