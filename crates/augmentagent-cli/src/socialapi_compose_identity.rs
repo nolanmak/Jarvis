@@ -38,10 +38,6 @@ pub(super) fn prepare_card(
 /// (the synthetic `compose:socialapi:dm:<conversation>` identity, with or
 /// without the per-card suffix), never the triage card for an inbound
 /// message, and never a card already armed with a send time.
-///
-/// #2350 — cards composed inside one millisecond share `createdAt`, so the
-/// tie-break is insertion order (`rowid`); the action id is a random UUID
-/// and would order them arbitrarily.
 pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
     let base = format!("compose:socialapi:dm:{conversation}");
     let prefix = format!("{base}:");
