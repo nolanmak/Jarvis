@@ -105,6 +105,28 @@ pub static OWNER_COMMANDS: &[OwnerCommand] = &[
         plain: PlainText::Prefix,
     },
     OwnerCommand {
+        name: "search",
+        aliases: &[],
+        usage: "search [status | list | provider <id|auto> [scope:default] | fetch <id|auto> [scope:default] | reset [scope:default]]",
+        description: "Show or choose the web search and page fetch provider for models \
+             without native web tools.",
+        discord: &["/search"],
+        slack: SlackMapping::Blocked { issue: 2198, reason: "Slack /search is not built yet." },
+        // Only `/search` is a command; a sentence starting with the word
+        // `search` is an ordinary question.
+        plain: PlainText::Sigil,
+    },
+    OwnerCommand {
+        name: "yolo",
+        aliases: &[],
+        usage: "yolo [status]",
+        description: "Open a separate thread answered by the unfiltered model. \
+             Its history stays apart from every other conversation.",
+        discord: &["/yolo"],
+        slack: SlackMapping::Blocked { issue: 2199, reason: "Slack /yolo is not built yet." },
+        plain: PlainText::Sigil,
+    },
+    OwnerCommand {
         name: "loop",
         aliases: &[],
         usage: "loop <interval> <prompt> | loop <prompt> every <N> <unit> [for <N> <unit>] | \
@@ -224,7 +246,7 @@ pub fn find(word: &str) -> Option<&'static OwnerCommand> {
 /// Recognizer functions the Discord dispatcher calls, and the trigger each
 /// stands for. A new recognizer must be added here (see the pinned
 /// limitation test).
-const DISCORD_RECOGNIZERS: [(&str, &str); 7] = [
+const DISCORD_RECOGNIZERS: [(&str, &str); 9] = [
     ("autoship::dispatch(", "!autoship"),
     ("model_command_in_guild(", "model"),
     ("match_loop_prefix(", "loop"),
@@ -232,6 +254,8 @@ const DISCORD_RECOGNIZERS: [(&str, &str); 7] = [
     ("Verb::LoopAck", "button:loop_ack"),
     ("Verb::LoopDismiss", "button:loop_dismiss"),
     ("model_command(", "model"),
+    ("owner_text_command(", "/search"),
+    ("OwnerCommandOutcome::OpenYoloThread", "/yolo"),
 ];
 
 /// Every owner-command trigger in Discord's dispatcher source: `"!word"`

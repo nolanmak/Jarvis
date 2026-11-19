@@ -335,6 +335,15 @@ impl OwnerSurface {
         anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
         Ok(())
     }
+    /// #2218 — is this message from a yolo thread (or, with an unreadable
+    /// registry, from any guild channel)? A message fetched over REST carries
+    /// no guild id, so "not a verified DM" also counts as a guild message.
+    pub(crate) fn in_yolo_thread(message: &serenity::all::Message, dm_peer: Option<u64>) -> bool {
+        augmentagent_store::yolo_threads::closed_to_normal_turns(
+            augmentagent_store::yolo_threads::mark(message.channel_id.get()),
+            message.guild_id.is_some() || dm_peer.is_none(),
+        )
+    }
     /// Called only with native Discord channel/parent metadata, never a target
     /// supplied in a user's message. DMs require their verified peer ID too.
     pub fn mirror_discord(
@@ -344,6 +353,13 @@ impl OwnerSurface {
         dm_peer: Option<u64>,
     ) -> Result<(), ApprovalError> {
         if !self.active() {
+            return Ok(());
+        }
+        // #2218 — nothing posted in a yolo thread is mirrored: mirrored text
+        // is readable by later normal turns through the owner chat history.
+        // Checked here, the one function every mirror path calls (new
+        // message, edit, catch-up).
+        if Self::in_yolo_thread(message, dm_peer) {
             return Ok(());
         }
         let Some(origin) = self

@@ -23,6 +23,8 @@ pub mod models;
 pub mod linkedin_archive;
 pub mod notes;
 pub mod owner;
+// #2284 — cross-channel "has the owner replied?" signal.
+pub mod owner_reply;
 pub mod phone;
 mod local_chat;
 pub mod owner_alerts;
@@ -31,6 +33,7 @@ pub mod owner_alert_digest;
 pub mod recipients;
 pub mod redact;
 pub mod team_coverage;
+pub mod yolo_threads;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
 // #1296 — live/poll reconciliation ledger for subscribed Slack messages.
@@ -63,7 +66,7 @@ pub use models::{
 };
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
-    JournalSyncCursor, LoopFinding, LoopOccurrence,
+    JournalSyncCursor, LoopFinding, LoopOccurrence, LoopOptions, loop_delivery_footer,
     NativeConversation, PendingActionRow, whatsapp_default_coverable, MANUAL_SEND_PENDING,
     MANUAL_SEND_UNCONFIRMED, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
@@ -73,6 +76,7 @@ pub use store::{
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
+pub use owner_reply::{conversation_ids_for, UnansweredConversation};
 pub use recipients::Recipients;
 pub use rusqlite;
 

@@ -959,6 +959,20 @@
     "evidence": null
   },
   {
+    "id": "cli:web-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Hidden MCP server for web search, page fetch and the per-conversation provider pin, attached to turns whose model cannot run native web tools; credentials reach the child only through its environment.",
+    "macos_target": "Hidden MCP server for web search, page fetch and the per-conversation provider pin, attached to turns whose model cannot run native web tools; credentials reach the child only through its environment.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic vendor responses"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/2202",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent web:: on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:newsletter",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent newsletter; record its command-specific effects and authorization.",
@@ -3720,7 +3734,7 @@
     "id": "cli:auto-pr-worker",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux runs opted-in auto-ship in an independent process, retaining active work across serving-daemon updates.",
-    "macos_target": "Equivalent independent worker lifetime under launchd; current macOS deployments retain the embedded loop and serialized builds.",
+    "macos_target": "Equivalent independent worker lifetime under launchd: ensure-autopr-worker.sh installs the com.nolanmak.augmentagent.autopr LaunchAgent (#2275); the daemon no longer hosts an embedded loop on any OS.",
     "prerequisites": [
       "Rust CLI",
       "Native service manager"

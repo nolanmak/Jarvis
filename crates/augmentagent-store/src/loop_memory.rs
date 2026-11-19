@@ -7,6 +7,13 @@ pub struct LoopFinding {
     pub fingerprint: String,
     pub finding: String,
     pub evidence: Vec<String>,
+    /// #2246 — stable identifier for the finding's subject. When set, coverage
+    /// is keyed on it instead of the finding text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// #2246 — full text to deliver for this finding. Never stored in coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct LoopOccurrence {
@@ -115,7 +122,7 @@ impl Store {
     }
     pub fn loop_coverage(&self, loop_id: &str, limit: usize) -> StoreResult<Vec<LoopFinding>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let mut stmt = conn.prepare("SELECT fingerprint,finding,evidence FROM loop_coverage WHERE loop_id=?1 ORDER BY completed_at_ms DESC,fingerprint LIMIT ?2")?;
+        let mut stmt = conn.prepare("SELECT fingerprint,finding,evidence,key FROM loop_coverage WHERE loop_id=?1 ORDER BY completed_at_ms DESC,fingerprint LIMIT ?2")?;
         let rows = stmt
             .query_map(params![loop_id, limit as i64], |r| {
                 let raw: String = r.get(2)?;
@@ -130,6 +137,8 @@ impl Store {
                     fingerprint: r.get(0)?,
                     finding: r.get(1)?,
                     evidence,
+                    key: r.get(3)?,
+                    body: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -162,28 +171,7 @@ impl Store {
         }
         let now = now_millis();
         for finding in findings {
-            if finding.fingerprint.is_empty()
-                || finding.finding.trim().is_empty()
-                || finding.evidence.is_empty()
-                || finding.evidence.iter().any(|e| e.trim().is_empty())
-            {
-                return Err(StoreError::InvalidInput(
-                    "coverage requires concrete findings and evidence".into(),
-                ));
-            }
-            let evidence = serde_json::to_string(&finding.evidence)
-                .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO loop_coverage VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    loop_id,
-                    finding.fingerprint,
-                    redact::mask(&finding.finding),
-                    redact::mask(&evidence),
-                    request_id,
-                    now
-                ],
-            )?;
+            super::loop_options::insert_coverage(&tx, &loop_id, request_id, finding, now)?;
         }
         tx.execute("UPDATE loop_occurrences SET state='delivered',error=NULL,updated_at_ms=?2 WHERE request_id=?1",params![request_id,now])?;
         tx.execute("UPDATE user_loops SET last_run_ms=MAX(?2,COALESCE(last_run_ms,0)+1),last_status='ok',fail_count=0,updated_at_ms=?2 WHERE id=?1",params![loop_id,now])?;

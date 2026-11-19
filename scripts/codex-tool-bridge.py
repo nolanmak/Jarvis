@@ -932,6 +932,10 @@ def read_only_operation(name, arguments):
     # Their own permission hooks and operation contracts still apply on invocation.
     if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch', 'ToolSearch'):
         return True
+    # #2202: the Jarvis web tools only read. Explicit names, like the memory
+    # tools below; mcp__web__set_provider writes a pin and stays a mutation.
+    if name in ('mcp__web__search', 'mcp__web__fetch'):
+        return True
     # Browser jobs are asynchronous. Caching a status read as an external
     # mutation freezes the first "running" receipt forever. Keep the exact
     # status contract live; start/cancel/resume retain mutation protection.
@@ -1320,6 +1324,12 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        # #2217: a scratch-workspace profile. Its allowlisted host commands
+        # still run in the kernel sandbox with no network, but may write
+        # inside the policy's write roots, and they receive a fixed minimal
+        # environment instead of the profile's integration environment.
+        # Every other profile keeps read-only host commands.
+        self.workspace_shell = config.get('workspace_shell', False) is True
         self.write_files = set()
         for filename in config.get('write_files', []):
             path = Path(filename)
@@ -2058,6 +2068,9 @@ class Policy:
             snapshot = BuildSnapshot(self, directory / 'workspace') if build else None
             run_cwd = snapshot.root if snapshot else self.cwd
             run_env = dict(self.environment)
+            workspace_shell = self.workspace_shell and not service and not build
+            if workspace_shell:
+                run_env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(self.cwd), 'LANG': 'C.UTF-8'}
             runtime_reads = [str(resolved_executable)]
             dependency_roots = []
             if Path(argv[0]).name == 'git':
@@ -2160,7 +2173,8 @@ class Policy:
             policy_file = directory / 'policy.json'
             policy_file.write_text(json.dumps({'cwd': str(run_cwd),
                 'read_roots': [str(run_cwd), *dependency_roots] if snapshot else [str(p) for p in self.read_roots],
-                'write_roots': [str(run_cwd)] if snapshot else [],
+                'write_roots': [str(run_cwd)] if snapshot else (
+                    [str(p) for p in self.write_roots] if workspace_shell else []),
                 'runtime_reads': runtime_reads}))
             policy_file.chmod(0o600)
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:

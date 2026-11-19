@@ -201,10 +201,10 @@ pub(super) fn episode_retries(
             result.insert(candidate.pr);
             continue;
         }
-        let retry_requested=matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
-            (crate::autoship_workflow::Stage::Verify,"verification_infrastructure_retry","retry_verification")
-            | (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
-            | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
+        let retry_requested=crate::autoship_workflow::retry_recovery::class(&snapshot.checkpoint).is_some()
+            || matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
+                (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
+                | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
         let owned_candidate=(recovered.contains(&id) || retry_requested)
             && snapshot.pr==Some(candidate.pr)
             && snapshot.branch==candidate.branch && candidate.ready_for_review()
@@ -708,3 +708,7 @@ mod review_recovery_regression {
             "review capacity hold disappeared behind the daily attempt filter instead of returning to guarded preflight");
     }
 }
+
+#[cfg(test)]
+#[path="self_improve_retry_adoption_tests.rs"]
+mod retry_adoption_tests;

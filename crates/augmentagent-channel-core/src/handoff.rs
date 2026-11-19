@@ -797,7 +797,8 @@ mod tests {
         let started = std::time::Instant::now();
         let mut child = Command::new(std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()))
             .args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits",
-                "--allowedTools", "Write", "--system-prompt",
+                "--allowedTools", "Write", "--tools", "Write", "--setting-sources", "",
+                "--disable-slash-commands", "--system-prompt",
                 "You are a test harness. Follow the instruction exactly and keep replies to one word.",
                 "--model", "claude-haiku-4-5-20251001", "--settings", &hooks.settings_json])
             .current_dir(&workspace)

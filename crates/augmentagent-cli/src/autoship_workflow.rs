@@ -1,6 +1,14 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_acceptance_escalation.rs"]
+pub(crate) mod acceptance_escalation;
+#[path="autoship_retry_policy.rs"]
+pub(crate) mod retry_policy;
+#[path="autoship_owner_requalification.rs"]
+pub(crate) mod owner_requalification;
+#[path="autoship_scope_policy.rs"]
+pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
 #[path="autoship_review_custody.rs"]
@@ -95,6 +103,8 @@ pub(crate) mod target_fence;
 mod verification_retry;
 #[path = "autoship_tool_capacity.rs"]
 pub(crate) mod tool_capacity;
+#[path = "autoship_retry_recovery.rs"]
+pub(crate) mod retry_recovery;
 #[path = "autoship_capacity_retry.rs"]
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
@@ -229,6 +239,7 @@ pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
     checkpoint.stage==Stage::Scope && matches!(
         (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("acceptance_strategies_exhausted","await_new_execution_inputs")|
         ("readiness_assessment_invalid","await_readiness_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
@@ -320,7 +331,17 @@ mod acceptance_input_wait_claim_tests {
                 checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
+                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid");
+                let mut planning_claims=0;
                 for now in [6,86_400_001,2*86_400_000] {
+                    if recoverable {
+                        let plan=stale.claim_productive_for_binding(&setup.workflow,"planning",now,1000,&binding).unwrap().unwrap();
+                        assert!(store.claim_productive_for_binding(&setup.workflow,"racer",now+1,1000,&binding).unwrap().is_none());
+                        let current=store.snapshot(&setup.workflow).unwrap().unwrap();
+                        assert_eq!(current.checkpoint,before.checkpoint);
+                        assert_eq!((current.model_calls,current.tokens,current.wall_ms),(3,700,5));
+                        stale.release(&plan,now+2).unwrap();planning_claims+=1;continue;
+                    }
                     assert!(stale.claim_productive_for_binding(&setup.workflow,"stale-reader",now,1000,&binding).unwrap().is_none());
                     assert!(stale.claim_productive(&setup.workflow,"unbound-reader",now,1000).unwrap().is_none());
                     assert_eq!(store.snapshot(&setup.workflow).unwrap().unwrap(),before);
@@ -335,7 +356,7 @@ mod acceptance_input_wait_claim_tests {
                 assert!(store.claim_productive_for_binding(&setup.workflow,"racer",3*86_400_000+4,1000,&changed).unwrap().is_none());
                 let after=store.snapshot(&setup.workflow).unwrap().unwrap();
                 assert_eq!((after.model_calls,after.tokens,after.wall_ms),(3,700,5));
-                assert_eq!(after.attempts,before.attempts+1);
+                assert_eq!(after.attempts,before.attempts+planning_claims+1);
                 stale.release(&next,3*86_400_000+5).unwrap();
             }
         }
@@ -1122,7 +1143,15 @@ impl WorkflowStore {
         if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
             && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
         let awaiting_input=awaits_initial_input(&cp);
-        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input
+        let escalation=purpose==ClaimPurpose::Productive && acceptance_escalation::eligible(&tx,workflow,&cp)?;
+        if escalation {
+            let observed=baseline_native_custody(&tx,workflow)?;
+            if !observed.is_empty() {
+                let Some((root,validate))=custody else {return Ok(None)};
+                if validate(root,&observed).is_err() {return Ok(None)}
+            }
+        }
+        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input && !escalation
             && binding.is_none_or(|binding|binding==&cp.binding);
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
@@ -1173,7 +1202,10 @@ impl WorkflowStore {
             params![workflow, owner, generation, until, now_ms,i64::from(!qualification_inspection)])?;
         if qualification_inspection {event(&tx,workflow,generation,"qualification_recovery_claimed",&serde_json::to_string(&cp)?,now_ms)?;}
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
-        if purpose==ClaimPurpose::Productive {owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;}
+        if purpose==ClaimPurpose::Productive {
+            event(&tx,workflow,generation,"productive_claimed","",now_ms)?;
+            owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;
+        }
         tx.commit()?;
         Ok(Some(Lease {
             workflow: workflow.into(),
@@ -1291,6 +1323,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
         idle_recovery::require_dispatch(&tx,&lease.workflow)?;
+        retry_recovery::finish(&tx,lease,now_ms)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -2342,6 +2375,11 @@ impl WorkflowStore {
             || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
             || !(matches!(snapshot.checkpoint.stage,
                 Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+                // #2279 — built and verified, but the push failed before any
+                // dispatch. Pending Push intents are refused below.
+                || (snapshot.checkpoint.stage==Stage::Publish
+                    && snapshot.checkpoint.next.reason=="publishing_revision"
+                    && snapshot.checkpoint.next.action=="push")
                 || (snapshot.checkpoint.stage==Stage::Held
                     && snapshot.checkpoint.next.reason=="automatic_pr_routing_held"
                     && snapshot.checkpoint.next.action=="retry_automatic_pr_routing"))
@@ -2367,6 +2405,19 @@ impl WorkflowStore {
             return Ok(None);
         }
         Ok(Some(snapshot.checkpoint.binding.head))
+    }
+
+    /// #2279 — the PR workflow is idle and authorized to resume: no lease,
+    /// retry delay, owner pause, unresolved operation or terminal stage. Only
+    /// then may an unrecorded retained head be set aside for a rebuild.
+    pub fn retained_candidate_due(&self, repository: &str, pr: u64, branch: &str, now: i64) -> Result<bool> {
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        Ok(snapshot.pr == Some(pr) && snapshot.branch == branch
+            && snapshot.lease_until_ms <= now && snapshot.checkpoint.next.eligible_at_ms <= now
+            && !matches!(snapshot.checkpoint.stage, Stage::Merge | Stage::Merged | Stage::Retired)
+            && !self.owner_control(&id)?.is_some_and(|control| control.paused)
+            && !self.merge_reconciliation_needed(&id)? && self.pending_operations(&id)?.is_empty())
     }
 
     pub fn snapshot(&self, workflow: &str) -> Result<Option<Snapshot>> {

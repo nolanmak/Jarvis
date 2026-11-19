@@ -807,28 +807,30 @@ pub const SCHEDULE_CUSTOM_VALUE: &str = "custom";
 /// resolved to epoch-ms at CLICK time by `timeparse::resolve_token`, never at
 /// render time — cards sit for hours/days, and a render-time "in 1 hour"
 /// would be stale by the time it's picked.
-const SCHEDULE_OPTIONS: &[(&str, &str)] = &[
-    ("In 1 hour", "in1h"),
-    ("In 3 hours", "in3h"),
-    ("Tonight 7pm", "tonight-1900"),
-    ("Tomorrow 9am", "tomorrow-0900"),
-    ("Tomorrow 2pm", "tomorrow-1400"),
-    ("Next Monday 9am", "next-monday-0900"),
-    ("Custom…", SCHEDULE_CUSTOM_VALUE),
-];
+///
+/// #2286 — the presets are `timeparse::SCHEDULE_PRESETS`, shared with Slack,
+/// followed by Custom….
+fn schedule_options() -> impl Iterator<Item = (&'static str, &'static str)> {
+    crate::timeparse::SCHEDULE_PRESETS
+        .iter()
+        .copied()
+        .chain(std::iter::once(("Custom…", SCHEDULE_CUSTOM_VALUE)))
+}
 
 /// The "Schedule send…" `StringSelect` action row (#501). Attached to EVERY
 /// approval card (including at-cap re-renders — see `approval_message`).
 fn schedule_row(action_id: &str) -> CreateActionRow {
-    let options: Vec<CreateSelectMenuOption> = SCHEDULE_OPTIONS
-        .iter()
-        .map(|(label, value)| CreateSelectMenuOption::new(*label, *value))
+    let options: Vec<CreateSelectMenuOption> = schedule_options()
+        .map(|(label, value)| CreateSelectMenuOption::new(label, value))
         .collect();
+    // #2286 — say which clock "Next 9am" reads.
+    let zone = crate::timeparse::owner_zone();
+    let abbreviation = crate::timeparse::zone_abbreviation(&zone, chrono::Utc::now().timestamp_millis());
     let menu = CreateSelectMenu::new(
         CustomId::new(action_id, Verb::SchedulePick).to_string(),
         CreateSelectMenuKind::String { options },
     )
-    .placeholder("Schedule send…")
+    .placeholder(format!("Schedule send… (times in {abbreviation})"))
     .min_values(1)
     .max_values(1);
     CreateActionRow::SelectMenu(menu)
@@ -937,7 +939,7 @@ pub fn parse_reminder_action_id(action_id: &str) -> Option<(&str, i64)> {
 pub fn schedule_modal(action_id: &str) -> CreateModal {
     let input = CreateInputText::new(InputTextStyle::Short, "When?", "when")
         .required(true)
-        .placeholder("tomorrow 9am / fri 14:30 / in 3h / 2026-09-01 09:00")
+        .placeholder("9am / 9am et / tomorrow 2pm pt / fri 14:30 / in 8h / 2026-12-01 09:00")
         .max_length(100);
     CreateModal::new(
         CustomId::new(action_id, Verb::ScheduleModal).to_string(),
@@ -1639,10 +1641,13 @@ mod tests {
     #[test]
     fn schedule_row_carries_all_symbolic_tokens() {
         let v = json(&approval_message("act-s3", &email(), "d", 0));
-        for (_, value) in SCHEDULE_OPTIONS {
+        let mut count = 0;
+        for (_, value) in schedule_options() {
             assert!(v.contains(value), "missing schedule option value {value}");
+            count += 1;
         }
-        assert!(v.contains("Schedule send…"));
+        assert!(count <= 25, "Discord selects hold at most 25 options");
+        assert!(v.contains("Schedule send… (times in "));
     }
 
     #[test]
@@ -1693,7 +1698,7 @@ mod tests {
         let v = serde_json::to_string(&modal).expect("modal serializes");
         assert!(v.contains("aa:act-s5:schedule_modal"));
         assert!(v.contains("\"when\""));
-        assert!(v.contains("tomorrow 9am"));
+        assert!(v.contains("tomorrow 2pm pt"), "the placeholder shows a zone example");
     }
 
     /// #1203 — the recovery button carries the round-trippable Recompose
