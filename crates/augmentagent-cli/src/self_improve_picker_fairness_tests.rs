@@ -51,6 +51,8 @@ else:raise AssertionError(args)
             let at=now-10_000+round*10+number;
             let lease=store.claim(id,"fixture-worker",at,1_000).unwrap().unwrap();
             let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.stage=Stage::Scope;
+            // #2224 protection is for work that needs its prior checkout.
+            if number==3 && matches!(case,"lost-checkout"|"replaced-checkout") {cp.stage=Stage::Build;}
             if number==2 && case=="publish-retry" {
                 // #2279: built and verified; only the push failed.
                 cp.stage=Stage::Publish;
@@ -70,7 +72,7 @@ else:raise AssertionError(args)
             store.checkpoint(&lease,&cp,at+2).unwrap();store.release(&lease,at+3).unwrap();
         }
     }
-    if matches!(case,"lost-checkout"|"replaced-checkout") {
+    if matches!(case,"lost-checkout"|"replaced-checkout"|"lost-scope-checkout"|"replaced-scope-checkout"|"lost-scope-unpublished") {
         git(&repo,&["update-ref","refs/remotes/origin/main",&binding.head]);
         let candidate=workspace::candidate_parent(&repo).await.unwrap().join("current-issue-3");
         let branch="agent-fix/issue-3";
@@ -80,8 +82,13 @@ else:raise AssertionError(args)
         identity.enroll(&mut store,&lease,&binding,now-999).unwrap();
         store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:retry.into(),repository:"fixture-owner/repo".into(),worktree:candidate.clone(),source_request:"synthetic-request".into(),source_pr:None,contract:"synthetic-contract".into(),environment:"synthetic-environment".into(),binding:binding.clone()},now-998).unwrap();
         store.release(&lease,now-997).unwrap();
-        if case=="lost-checkout" {
+        if matches!(case,"lost-checkout"|"lost-scope-checkout"|"lost-scope-unpublished") {
             git(&repo,&["worktree","remove","--force",candidate.to_str().unwrap()]);
+            if case=="lost-scope-unpublished" {
+                let tree=git(&repo,&["rev-parse",&format!("{branch}^{{tree}}")]);
+                let work=git(&repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit-tree",&tree,"-p",branch,"-m","unpublished"]);
+                git(&repo,&["update-ref",&format!("refs/heads/{branch}"),&work]);
+            }
         } else {
             let original=candidate.with_file_name("preserved-original");
             git(&repo,&["worktree","move",candidate.to_str().unwrap(),original.to_str().unwrap()]);
@@ -93,7 +100,7 @@ else:raise AssertionError(args)
     let before=[store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()];
     let events=[store.events(peer).unwrap(),store.events(retry).unwrap()];
     let picked=pick_issue(&repo,true).await.unwrap().unwrap();
-    assert_eq!(picked.number,if matches!(case,"initial-order"|"same-day-retry") {3}else{2},"{case}: picker did not preserve due-work fairness and initial newest-first order");
+    assert_eq!(picked.number,if matches!(case,"initial-order"|"same-day-retry"|"lost-scope-checkout") {3}else{2},"{case}: picker did not preserve due-work fairness and initial newest-first order");
     assert_eq!([store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()],before,"preview changed protected workflow state");
     assert_eq!([store.events(peer).unwrap(),store.events(retry).unwrap()],events,"preview wrote events or accounting");
     if case=="rotation" {
@@ -141,7 +148,7 @@ async fn invalid_checkout_yields_to_eligible_peer_without_claiming() {
     if std::env::var_os("AUTOSHIP_PICKER_FAIRNESS_ROOT").is_some() {
         fixture(&std::env::var("AUTOSHIP_CHECKOUT_CASE").unwrap(),TEST).await;
     } else {
-        for case in ["lost-checkout","replaced-checkout"] { fixture(case,TEST).await; }
+        for case in ["lost-checkout","replaced-checkout","replaced-scope-checkout","lost-scope-unpublished"] { fixture(case,TEST).await; }
     }
 }
 
@@ -160,4 +167,12 @@ async fn safe_scope_policy_selects_legacy_dependency_without_owner_or_main_edits
 #[tokio::test]
 async fn due_retry_is_not_fenced_by_the_same_day_attempt_marker() {
     fixture("same-day-retry","self_improve::picker_fairness_tests::due_retry_is_not_fenced_by_the_same_day_attempt_marker").await;
+}
+
+/// #2349 — a scope-stage row whose recorded checkout path is gone needs nothing
+/// from it: the read-only picker selects it so preparation can re-establish
+/// continuity from current main, instead of skipping it forever.
+#[tokio::test]
+async fn lost_scope_checkout_is_selected_for_continuity_reestablishment() {
+    fixture("lost-scope-checkout","self_improve::picker_fairness_tests::lost_scope_checkout_is_selected_for_continuity_reestablishment").await;
 }

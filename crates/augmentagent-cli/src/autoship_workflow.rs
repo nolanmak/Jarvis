@@ -13,6 +13,8 @@ pub(crate) mod owner_requalification;
 pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
+#[path = "autoship_checkout_continuity.rs"]
+pub(crate) mod checkout_continuity;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
