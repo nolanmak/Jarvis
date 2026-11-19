@@ -130,6 +130,18 @@
         "mcp__phone__phone_number_remove",
         "mcp__phone__speak (accepted phone turn only)"
       ]
+    },
+    "yolo-workspace": {
+      "scope": "Read of the wiki, transcripts and inbound attachment temp files; writes only inside the per-thread yolo workspace; a fixed list of read-only service commands; read-only memory MCP. No wiki writes, no outbound or mutating commands, no native web tools.",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write (workspace only)",
+        "Edit (workspace only)",
+        "Bash allowlist (read-only service commands)",
+        "configured MCP (memory, read-only)"
+      ]
     }
   },
   "presets": [
@@ -810,6 +822,21 @@
         "triage_capture::tests::guidance_only_applies_to_native_replayed_route_and_pins_exact_model"
       ],
       "provider_conformance": "Deterministic boundary regressions authored; actual protected native calibration replay remains required before claiming deployed tuning."
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/yolo_preset.rs::yolo_opts",
+      "permission_profile": "yolo-workspace",
+      "output_contract": "Complete assistant transcript for a yolo thread",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the configured yolo model id: the profile has exactly one model, so no launch can inherit an interactive default; the tier is not used to choose it.",
+      "conformance": [
+        "yolo_preset::tests::the_tool_list_is_exactly_files_memory_and_the_read_only_commands",
+        "yolo_preset::tests::writes_are_confined_to_the_workspace_and_the_wiki_is_read_only",
+        "yolo_preset::tests::the_environment_is_an_allowlist_and_settings_hold_only_the_memory_server",
+        "yolo_preset::tests::no_other_preset_can_read_a_yolo_workspace",
+        "yolo_readonly_commands_test::YoloReadonlyCommands"
+      ],
+      "provider_conformance": "pending: served only by the yolo profile; live receipt is the epic acceptance (#2220)"
     }
   ]
 }

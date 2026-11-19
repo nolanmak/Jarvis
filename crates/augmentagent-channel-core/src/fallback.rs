@@ -115,6 +115,9 @@ fn unrecognised_strike_window() -> chrono::Duration {
 fn max_ratelimit_latch(kind: ProviderKind) -> chrono::Duration {
     match kind {
         ProviderKind::Claude => chrono::Duration::hours(6),
+        // Nothing else can answer a yolo turn, so a long latch would leave
+        // the thread dead; the vendor's limits reset well within the hour.
+        ProviderKind::Yolo => chrono::Duration::hours(1),
         _ => chrono::Duration::days(8),
     }
 }
@@ -210,6 +213,8 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
             None
         }
         ProviderKind::Qwen | ProviderKind::Glm => Some("Runpod profile requires a configured model gateway".into()),
+        // Never a chain member or an independent reviewer.
+        ProviderKind::Yolo => Some("yolo runs only in yolo threads".into()),
     }
 }
 
@@ -264,6 +269,7 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
         ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
         ProviderKind::Qwen | ProviderKind::Glm => Arc::new(crate::codex::CodexCliReasoner::runpod(kind)),
         ProviderKind::Gemini => Arc::new(crate::gemini::GeminiCliReasoner::new()),
+        ProviderKind::Yolo => Arc::new(crate::codex::CodexCliReasoner::yolo()),
         // Thin chat-completions client (#663 plan B — codex ≥0.148 removed
         // wire_api=chat and Cerebras has no Responses API).
         ProviderKind::Cerebras => Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
@@ -313,6 +319,12 @@ fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
     if entries.len() > 1 {
         let names: Vec<_> = entries.iter().map(|e| e.kind.name()).collect();
         info!("reasoner chain active: {}", names.join(" → "));
+    }
+    // Registered unconditionally, with or without a model gateway, and not
+    // for workflows. Readiness is checked per turn; dispatch keeps this entry
+    // out of every call whose selected profile is not Yolo.
+    if !workflow {
+        entries.push(unchecked_entry(ProviderKind::Yolo));
     }
     Arc::new(FallbackReasoner {
         entries,
@@ -638,14 +650,20 @@ impl FallbackReasoner {
         anyhow::ensure!(!self.workflow_native_only || required,"workflow-native reasoner requires protected workflow policy");
         // Respect a caller-pinned routing snapshot (including native phone turns).
         // Unscoped dispatch still reloads configuration for the next request.
-        let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
-            message: "Invalid model router configuration; refusing dispatch".into(),
-        })?;
         // Bind the selected profile and router mode together for this logical
         // call. Unscoped callers can change the selection file after this
         // read; dispatch_snapshot must not pick up their newer model.
         let selected = self.selected_profile()?;
-        let config = crate::model_router::select_profile_for_workflow(config, selected, required)?;
+        // A yolo turn never consults the model gateway: a missing, enabled or
+        // invalid router file must not change or fail it.
+        let config = if selected == Some(ProviderKind::Yolo) {
+            None
+        } else {
+            let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
+                message: "Invalid model router configuration; refusing dispatch".into(),
+            })?;
+            crate::model_router::select_profile_for_workflow(config, selected, required)?
+        };
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
         let outcome = crate::model_selection::SELECTED_PROFILE.scope(selected,
@@ -659,8 +677,8 @@ impl FallbackReasoner {
         &self, opts: &ReasonerOpts, user_message: &str, transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
-        let routing = crate::model_router::current()?;
         let selected = crate::model_selection::current()?;
+        let routing = if selected == Some(ProviderKind::Yolo) { None } else { crate::model_router::current()? };
         if let Some(profile) = selected {
             if !(self.profile_enabled)(profile) {
                 return Err(ReasonerError::Local {
@@ -710,6 +728,8 @@ impl FallbackReasoner {
         if let Some(profile) = selected {
             dispatch_entries.retain(|entry| entry.kind == profile);
         }
+        // No other turn ever reaches Yolo, in any routing mode.
+        dispatch_entries.retain(|entry| entry.kind != ProviderKind::Yolo || selected == Some(ProviderKind::Yolo));
         let primary = dispatch_entries.iter().find(|e| routing.as_ref().is_none_or(|r| r.allows(e.kind))).map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
         // the whole chain fails (#655 review): a trailing Local fault from a
@@ -1103,6 +1123,86 @@ mod tests {
             assert_eq!(codex.count(), 0);
             assert_eq!(chain.calls(), 0);
         }
+    }
+
+    // ---- #2213: Yolo is dispatched only when it is the selected profile ----
+
+    fn router_snapshots() -> Vec<Option<crate::model_router::RouterConfig>> {
+        let mut enabled = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        enabled.mode = "auto".into();
+        vec![None, Some(enabled)]
+    }
+
+    #[tokio::test]
+    async fn yolo_is_never_a_fallback_for_another_provider() {
+        for snapshot in router_snapshots() {
+            let dir = tempfile::tempdir().unwrap();
+            let claude = Scripted::err(|| ReasonerError::Timeout { provider: "claude".into(), secs: 1 }.into());
+            let yolo = Scripted::ok("yolo answered");
+            let codex = Scripted::ok("codex answered");
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, claude.clone()),
+                (ProviderKind::Yolo, yolo.clone()),
+                (ProviderKind::Codex, codex.clone()),
+            ], latch_in(&dir));
+            let routed = snapshot.is_some();
+            let answer = crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::SNAPSHOT.scope(snapshot,
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+            assert_eq!(answer.unwrap(), "codex answered", "routed={routed}");
+            assert_eq!(claude.count(), 1, "routed={routed}");
+            assert_eq!(yolo.count(), 0, "a failed Claude turn must never be answered by Yolo (routed={routed})");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_yolo_turn_runs_only_yolo_and_ignores_the_model_gateway() {
+        for snapshot in router_snapshots() {
+            let dir = tempfile::tempdir().unwrap();
+            let claude = Scripted::ok("claude answered");
+            let yolo = Scripted::ok("yolo answered");
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, claude.clone()),
+                (ProviderKind::Yolo, yolo.clone()),
+            ], latch_in(&dir));
+            let routed = snapshot.is_some();
+            // The gateway's mode does not list yolo; a yolo turn is not routed.
+            let answer = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+                crate::model_router::SNAPSHOT.scope(snapshot,
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+            assert_eq!(answer.unwrap(), "yolo answered", "routed={routed}");
+            assert_eq!((claude.count(), yolo.count()), (0, 1), "routed={routed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_paused_yolo_turn_is_never_answered_by_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = Scripted::ok("claude answered");
+        let yolo = Scripted::err(|| ReasonerError::Timeout { provider: "yolo".into(), secs: 1 }.into());
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Yolo, yolo.clone()),
+            (ProviderKind::Claude, claude.clone()),
+        ], latch_in(&dir));
+        let failed = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+            crate::model_router::without_router(
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+        assert!(failed.is_err());
+        assert_eq!((yolo.count(), claude.count()), (1, 0));
+        chain.profile_enabled = |kind| kind != ProviderKind::Yolo;
+        let paused = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+            crate::model_router::without_router(
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+        assert!(paused.unwrap_err().to_string().contains("paused by the operator"));
+        assert_eq!((yolo.count(), claude.count()), (1, 0));
+    }
+
+    #[test]
+    fn yolo_is_never_a_chain_member_reviewer_or_long_latched() {
+        assert!(native_ineligible_reason(ProviderKind::Yolo).is_some());
+        assert!(workflow_native_ineligible_reason(ProviderKind::Yolo).is_some());
+        assert!(gateway_ineligible_reason(ProviderKind::Yolo).is_some());
+        assert_eq!(max_ratelimit_latch(ProviderKind::Yolo), chrono::Duration::hours(1));
     }
 
     // ---- #828: single-provider pinning for the independent review ----

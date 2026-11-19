@@ -832,8 +832,10 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
-        /// Pin one Discord model profile for this probe, without persisting a selection.
-        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
+        /// Pin one model profile for this probe, without persisting a selection.
+        /// `yolo` is accepted here and nowhere else outside a yolo thread; it
+        /// still requires the enable flag and a configured key.
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex", "yolo"])]
         profile: Option<String>,
         /// Ask the selected model to read a synthetic file through the Jarvis
         /// bridge and require a matching tool audit receipt. Performs inference.
@@ -11575,8 +11577,8 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
     let probe = if tool_probe {
         let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
         anyhow::ensure!(
-            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
-            "--tool-probe requires claude, codex, qwen, or glm"
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex | ProviderKind::Yolo),
+            "--tool-probe requires claude, codex, qwen, glm, or yolo"
         );
         let directory = tempfile::tempdir()?;
         let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
