@@ -75,11 +75,18 @@ def heic_to_jpeg(src, dest):
     return True
 
 
-def converted_attachment(local, att_id, name, s3):
+def export_convert_dir(convert_dir, state_path):
+    """Converted copies of one export live in a subdirectory of their own,
+    named after its state file. Sweeping copies after a drain must not delete
+    a copy that another bundle sharing the cache still has queued."""
+    digest = hashlib.sha256(str(Path(state_path).resolve()).encode()).hexdigest()
+    return Path(convert_dir) / digest[:16]
+
+
+def converted_attachment(local, att_id, name, converter, convert_dir):
     """(path, name) of a JPEG copy of a HEIC attachment, or None when it is
     not one, no converter is configured, or the conversion failed (the
     original is then uploaded as before)."""
-    converter, convert_dir = s3.get("converter"), s3.get("convert_dir")
     if not converter or not convert_dir or local.suffix.lower() not in CONVERT_SUFFIXES:
         return None
     new_name = Path(name or local.name).stem + ".jpg"
@@ -496,6 +503,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
     pending = [item for item in state.get("pending_uploads", [])
                if is_uploadable(item["path"])]
+    convert_dir = (export_convert_dir(s3["convert_dir"], state_path)
+                   if s3 and s3.get("convert_dir") else None)
 
     for ident, entry in index.items():
         entry.setdefault("dir", ident)
@@ -581,7 +590,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         for att_id, mime, name, filename in attachments:
             local = Path(filename).expanduser() if filename else None
             if s3 and local and local.exists() and is_uploadable(local):
-                converted = converted_attachment(local, att_id, name, s3)
+                converted = converted_attachment(
+                    local, att_id, name, s3.get("converter"), convert_dir)
                 if converted:
                     local, name = converted
                     mime = "image/jpeg"
@@ -625,10 +635,12 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
             pending, s3["bucket"], s3["uploader"],
             deadline=time.monotonic() + UPLOAD_BUDGET_S)
 
-    # Converted copies are only needed until they are uploaded.
-    if s3 and s3.get("convert_dir") and Path(s3["convert_dir"]).is_dir():
+    # Converted copies are only needed until they are uploaded. Sweeping this
+    # export's own subdirectory runs even without a converter configured, so a
+    # copy queued by an earlier run is cleaned up once it uploads.
+    if convert_dir and convert_dir.is_dir():
         waiting = {item["path"] for item in pending}
-        for copy in Path(s3["convert_dir"]).iterdir():
+        for copy in convert_dir.iterdir():
             if str(copy) not in waiting:
                 copy.unlink(missing_ok=True)
 
