@@ -14,6 +14,7 @@ pub(super) enum Classification {
     DependencyAudit,
     Compiler,
     TestFailure,
+    PolicyViolation,
     Infrastructure,
     Unknown,
 }
@@ -89,13 +90,38 @@ fn classify(log: &str) -> Classification {
     } else if log.contains("FAILED (")
         || log.contains("test result: FAILED")
         || log.contains("AssertionError")
+        || log.contains("panicked at")
     {
         Classification::TestFailure
+    } else if [
+        "POSSIBLE secret/PII in",
+        "BLOCKED (must be gitignored",
+        "\"valid\":false",
+        "CONFLICT (",
+        "Merge conflict in",
+    ]
+    .iter()
+    .any(|s| log.contains(s))
+    {
+        Classification::PolicyViolation
     } else if [
         "No space left on device",
         "Connection timed out",
         "Temporary failure in name resolution",
         "runner lost communication",
+        "lost communication with the server",
+        "The runner has received a shutdown signal",
+        "The operation was canceled",
+        "Failed to fetch http",
+        "Unable to fetch some archives",
+        "Some index files failed to download",
+        "Hash Sum mismatch",
+        "Could not connect to",
+        "Could not resolve host",
+        "Connection reset by peer",
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+        "API rate limit exceeded",
     ]
     .iter()
     .any(|s| log.contains(s))
@@ -103,6 +129,57 @@ fn classify(log: &str) -> Classification {
         Classification::Infrastructure
     } else {
         Classification::Unknown
+    }
+}
+/// #2315: an infrastructure failure reruns its failed jobs at most this many
+/// times per head; a failure that survives them is repaired as code.
+pub(super) const INFRA_RERUN_PURPOSE: &str = "hosted-ci-infra-rerun";
+pub(super) const INFRA_RERUN_LIMIT: u32 = 2;
+
+/// Where a hosted CI hold goes. Only infrastructure waits on the bounded
+/// `verification_infrastructure_retry`; a code failure goes to repair (merge
+/// main, rebuild and test in the verifier, push) on the #2301 ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Route {
+    Infrastructure,
+    Code,
+}
+pub(super) fn route(reason: &str) -> Route {
+    match reason {
+        // The head predates main's CI policy, the failure exists only on the
+        // merge with main, it needs a rebuild to diagnose, it survived its
+        // infrastructure reruns, or targeted repair ran out: all of these are
+        // cured by merging main and repairing, never by waiting.
+        "hosted_ci_policy_stale"
+        | "ci_failure_not_reproduced"
+        | "ci_failure_requires_diagnosis"
+        | "ci_infra_reruns_exhausted"
+        | "ci_repair_budget_exhausted"
+        | "ci_repair_unchanged" => Route::Code,
+        _ => Route::Infrastructure,
+    }
+}
+/// The hosted reader answers "unknown" with a reason. A refused CI policy on
+/// the PR means its head was cut before main's policy changed (#2305, #2307):
+/// stale code that a main merge fixes, not an unavailable service.
+pub(super) fn unknown_dependency(reason: &str) -> &'static str {
+    if reason.contains("CI policy changed") {
+        "hosted_ci_policy_stale"
+    } else {
+        "hosted_ci_incomplete"
+    }
+}
+/// Job logs first: any compiler, test, privacy or contract evidence is code,
+/// even under a timeout. Otherwise a timeout, cancellation or startup failure
+/// with no test output is infrastructure.
+fn classify_job(log: &str, conclusion: Option<&str>) -> Classification {
+    match classify(log) {
+        Classification::Unknown
+            if matches!(conclusion, Some("timed_out" | "startup_failure" | "cancelled")) =>
+        {
+            Classification::Infrastructure
+        }
+        classification => classification,
     }
 }
 fn family(classification: &Classification, log: &str) -> String {
@@ -176,7 +253,9 @@ pub(super) async fn observe(root: &Path, pr: u64) -> Result<Observation> {
         dependency: None,
     };
     if result.state != "failed" {
-        if result.state != "passed" {
+        if result.state == "unknown" {
+            result.dependency = Some(unknown_dependency(&evidence.reason));
+        } else if result.state != "passed" {
             result.dependency = Some("hosted_ci_incomplete");
         }
         return Ok(result);
@@ -229,7 +308,7 @@ pub(super) async fn observe(root: &Path, pr: u64) -> Result<Observation> {
                 break;
             }
         };
-        let classification = classify(&logs);
+        let classification = classify_job(&logs, metadata["conclusion"].as_str());
         result.failures.push(Failure {
             name: row["name"].as_str().unwrap_or("unnamed check").into(),
             job,
@@ -313,6 +392,47 @@ async fn defer(
         format!("PR #{pr}: CI dependency {reason}; retry after {eligible}")
     };
     Ok(RunReport::held(message))
+}
+pub(super) enum Hold {
+    /// Go on to repair: merge main, rebuild and test in the verifier, push.
+    Repair,
+    Deferred(RunReport),
+}
+/// Route one hosted CI hold (#2315). Infrastructure keeps its bounded retry;
+/// a code failure repairs now or backs off on the #2301 ladder. `immediate`
+/// is false where the caller cannot act on a repair round right now.
+async fn hold(
+    workflow: &mut workflow::WorkflowGuard,
+    pr: u64,
+    reason: &'static str,
+    jobs: &str,
+    immediate: bool,
+) -> Result<Hold> {
+    use crate::autoship_workflow::ci_code_repair::Ladder;
+    if route(reason) == Route::Infrastructure {
+        return Ok(Hold::Deferred(defer(workflow, pr, reason, jobs).await?));
+    }
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_code_failure",
+        "head":workflow.binding().head,"reason":reason,"action":"repair",
+        "outcome":WorkflowOutcome::CodeOrReviewFailure,"transition":"observation","shipping_authority":false}))?;
+    let mut ladder = workflow.code_repair_round(reason, immediate).await?;
+    if !immediate && matches!(ladder, Ladder::Repair(_)) && reason == "ci_repair_unchanged" {
+        // An unchanged repair cannot use a round now: schedule the next one.
+        ladder = workflow.code_repair_round(reason, false).await?;
+    }
+    match ladder {
+        Ladder::Repair(_) => Ok(Hold::Repair),
+        Ladder::Wait(eligible) => {
+            workflow.finish_ci_deferral()?;
+            let message = format!("PR #{pr}: CI code failure {reason}; {jobs}; repair after {eligible}");
+            let message = if augmentagent_channel_core::public_report::validate("", &message).is_ok() {
+                message
+            } else {
+                format!("PR #{pr}: CI code failure {reason}; repair after {eligible}")
+            };
+            Ok(Hold::Deferred(RunReport::held(message)))
+        }
+    }
 }
 fn jobs(observation: &Observation) -> String {
     observation.failed_jobs.join(", ")
@@ -408,9 +528,10 @@ pub(super) async fn preflight(
         .record_controller(serde_json::json!({"kind":"hosted_ci_diagnosis",
         "diagnosis":observation,"transition":"observation","shipping_authority":false}))?;
     if let Some(reason) = observation.dependency {
-        return Ok(Preflight::Deferred(
-            defer(workflow, pr, reason, &jobs(&observation)).await?,
-        ));
+        return Ok(match hold(workflow, pr, reason, &jobs(&observation), true).await? {
+            Hold::Repair => Preflight::Continue,
+            Hold::Deferred(report) => Preflight::Deferred(report),
+        });
     }
     Ok(Preflight::Compare(observation))
 }
@@ -471,6 +592,14 @@ async fn compare_observed<R: Replay>(
     if observation.head != workflow.binding().head {
         return Ok(Preparation::Continue);
     }
+    if !observation.failures.is_empty()
+        && observation
+            .failures
+            .iter()
+            .all(|failure| failure.classification == Classification::Infrastructure)
+    {
+        return rerun_infrastructure(root, pr, workflow, &observation).await;
+    }
     let (ok, _, _) = workspace::preparation_git(
         root,
         &[
@@ -497,19 +626,13 @@ async fn compare_observed<R: Replay>(
     let mut families = Vec::new();
     let mut reproduced = Vec::new();
     for failure in &observation.failures {
-        if matches!(
-            failure.classification,
-            Classification::Unknown | Classification::Infrastructure
-        ) {
-            return Ok(Preparation::Deferred(
-                defer(
-                    workflow,
-                    pr,
-                    "ci_failure_requires_diagnosis",
-                    &jobs(&observation),
-                )
-                .await?,
-            ));
+        if failure.classification == Classification::Infrastructure {
+            // Real code failures beside it are repaired; the repair's new
+            // head reruns every job anyway.
+            continue;
+        }
+        if failure.classification == Classification::Unknown {
+            return repair_or_wait(workflow, pr, "ci_failure_requires_diagnosis", &observation).await;
         }
         workflow.validate_before_side_effect()?;
         let comparison = match replay
@@ -566,15 +689,9 @@ async fn compare_observed<R: Replay>(
         if !comparison.candidate_result.failed
             || family(&classify(&actual), &actual) != failure.family
         {
-            return Ok(Preparation::Deferred(
-                defer(
-                    workflow,
-                    pr,
-                    "ci_failure_not_reproduced",
-                    &jobs(&observation),
-                )
-                .await?,
-            ));
+            // The head alone does not fail the same way: the failure belongs
+            // to its merge with a main that moved. Merge main and rebuild.
+            return repair_or_wait(workflow, pr, "ci_failure_not_reproduced", &observation).await;
         }
         if comparison.main_result.failed {
             let baseline = plain(&comparison.main_result.diagnostics);
@@ -608,6 +725,55 @@ async fn compare_observed<R: Replay>(
     }))
 }
 
+async fn repair_or_wait(
+    workflow: &mut workflow::WorkflowGuard,
+    pr: u64,
+    reason: &'static str,
+    observation: &Observation,
+) -> Result<Preparation> {
+    Ok(match hold(workflow, pr, reason, &jobs(observation), true).await? {
+        Hold::Repair => Preparation::Continue,
+        Hold::Deferred(report) => Preparation::Deferred(report),
+    })
+}
+
+/// Rerun only the failed jobs, a bounded number of times per head. A failure
+/// that survives every rerun is no longer presumed flaky: it is repaired.
+async fn rerun_infrastructure(
+    root: &Path,
+    pr: u64,
+    workflow: &mut workflow::WorkflowGuard,
+    observation: &Observation,
+) -> Result<Preparation> {
+    if !workflow.admit_epoch_attempt(INFRA_RERUN_PURPOSE, &observation.head, INFRA_RERUN_LIMIT)? {
+        return repair_or_wait(workflow, pr, "ci_infra_reruns_exhausted", observation).await;
+    }
+    let repository = workflow::canonical_repository(root).await?;
+    let mut runs: Vec<u64> = observation.failures.iter().map(|failure| failure.run).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    for id in &runs {
+        workflow.validate_before_side_effect()?;
+        let (ok, _, _) = run(
+            &gh_bin(),
+            &["run", "rerun", &id.to_string(), "--failed", "--repo", &repository],
+            root,
+        )
+        .await?;
+        if !ok {
+            return Ok(Preparation::Deferred(
+                defer(workflow, pr, "hosted_ci_rerun_unavailable", &jobs(observation)).await?,
+            ));
+        }
+    }
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_infra_rerun",
+        "head":observation.head,"runs":runs,"limit":INFRA_RERUN_LIMIT,
+        "outcome":WorkflowOutcome::RetryableInfrastructure,"shipping_authority":false}))?;
+    Ok(Preparation::Deferred(
+        defer(workflow, pr, "ci_infra_rerun_requested", &jobs(observation)).await?,
+    ))
+}
+
 const REPAIR_LIMIT: u32 = 2;
 pub(super) async fn reserve_repair(
     workflow: &mut workflow::WorkflowGuard,
@@ -638,28 +804,12 @@ pub(super) async fn reserve_repair(
         .collect::<Vec<_>>();
     for epoch in &epochs {
         if workflow.epoch_attempts("hosted-ci-source-repair", epoch)? >= REPAIR_LIMIT {
-            return Ok(Some(
-                defer(
-                    workflow,
-                    pr,
-                    "ci_repair_budget_exhausted",
-                    "unchanged failure family requires independent recovery",
-                )
-                .await?,
-            ));
+            return exhausted(workflow, pr).await;
         }
     }
     for epoch in &epochs {
         if !workflow.admit_epoch_attempt("hosted-ci-source-repair", epoch, REPAIR_LIMIT)? {
-            return Ok(Some(
-                defer(
-                    workflow,
-                    pr,
-                    "ci_repair_budget_exhausted",
-                    "unchanged failure family requires independent recovery",
-                )
-                .await?,
-            ));
+            return exhausted(workflow, pr).await;
         }
     }
     workflow.audit_logger().record_controller(
@@ -670,17 +820,24 @@ pub(super) async fn reserve_repair(
     Ok(None)
 }
 
+/// Targeted repair of an unchanged family ran out: the next rung waits the
+/// #2301 backoff, then repairs again. `None` admits that round now.
+async fn exhausted(workflow: &mut workflow::WorkflowGuard, pr: u64) -> Result<Option<RunReport>> {
+    Ok(match hold(workflow, pr, "ci_repair_budget_exhausted",
+        "unchanged failure family takes the next repair rung", false).await? {
+        Hold::Repair => None,
+        Hold::Deferred(report) => Some(report),
+    })
+}
+
 pub(super) async fn defer_unchanged_repair(
     workflow: &mut workflow::WorkflowGuard,
     pr: u64,
 ) -> Result<RunReport> {
-    defer(
-        workflow,
-        pr,
-        "ci_repair_unchanged",
-        "no changed source to revalidate",
-    )
-    .await
+    match hold(workflow, pr, "ci_repair_unchanged", "no changed source to revalidate", false).await? {
+        Hold::Deferred(report) => Ok(report),
+        Hold::Repair => anyhow::bail!("unchanged CI repair cannot run another round now"),
+    }
 }
 
 /// A no-op repair cannot manufacture a new published head and another budget.
@@ -731,4 +888,57 @@ pub(super) async fn current_input(
         return Ok(None);
     }
     Ok(Some(input))
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    /// #2315: infrastructure is the runner, network, apt/mirror, cancellation
+    /// or a timeout with no test output. Everything the diff can cause is code.
+    #[test]
+    fn hosted_job_failures_split_into_infrastructure_and_code() {
+        let code = [
+            ("error[E0063]: missing field `latency` in initializer of `TurnMarks`\nerror: could not compile `augmentagent-cli`", Classification::Compiler),
+            ("thread 'x' panicked at src/a.rs:1:1\ntest result: FAILED. 1 passed; 1 failed", Classification::TestFailure),
+            ("POSSIBLE secret/PII in crates/x/src/lib.rs:\n  line 4", Classification::PolicyViolation),
+            ("{\"valid\":false,\"changed\":[\".github/workflows/rust.yml\"]}", Classification::PolicyViolation),
+            ("CONFLICT (content): Merge conflict in crates/x/src/lib.rs", Classification::PolicyViolation),
+        ];
+        for (log, expected) in code {
+            assert_eq!(classify_job(log, Some("failure")), expected, "{log}");
+            assert_eq!(classify_job(log, Some("timed_out")), expected, "timeout with test output stays code: {log}");
+        }
+        for log in [
+            "E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu/pool/main/x.deb  Could not connect to azure.archive.ubuntu.com:80",
+            "E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?",
+            "The runner has received a shutdown signal. This can happen when the runner service is stopped",
+            "##[error]The operation was canceled.",
+            "curl: (6) Could not resolve host: static.rust-lang.org",
+            "Hash Sum mismatch\nE: Some index files failed to download",
+        ] {
+            assert_eq!(classify_job(log, Some("failure")), Classification::Infrastructure, "{log}");
+        }
+        for conclusion in ["timed_out", "startup_failure", "cancelled"] {
+            assert_eq!(classify_job("Run cargo test --locked\n", Some(conclusion)), Classification::Infrastructure);
+        }
+        assert_eq!(classify_job("Run ./build.sh\nexit 3", Some("failure")), Classification::Unknown);
+    }
+
+    /// Only true infrastructure waits on `verification_infrastructure_retry`.
+    #[test]
+    fn code_deferrals_route_to_repair_and_infrastructure_stays_a_bounded_wait() {
+        for reason in ["hosted_ci_policy_stale", "ci_failure_not_reproduced", "ci_failure_requires_diagnosis",
+            "ci_infra_reruns_exhausted", "ci_repair_budget_exhausted", "ci_repair_unchanged"] {
+            assert_eq!(route(reason), Route::Code, "{reason}");
+        }
+        for reason in ["hosted_ci_transport_unknown", "hosted_ci_logs_unavailable", "hosted_ci_incomplete",
+            "ci_infra_rerun_requested", "ci_main_failure_dependency", "ci_comparison_deadline"] {
+            assert_eq!(route(reason), Route::Infrastructure, "{reason}");
+        }
+        // The production #2305/#2307 shape: the reader refuses a head cut
+        // before main's CI policy changed. That is stale code, not an outage.
+        assert_eq!(unknown_dependency("CI policy changed; reviewed controller rollout required"), "hosted_ci_policy_stale");
+        assert_eq!(unknown_dependency("GitHub evidence unavailable"), "hosted_ci_incomplete");
+    }
 }
