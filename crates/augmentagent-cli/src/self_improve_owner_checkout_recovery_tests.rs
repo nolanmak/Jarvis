@@ -7,6 +7,8 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     if std::env::var_os(CHILD).is_none() {
         for case in [
             "lost",
+            "qualification",
+            "qualification-missing",
             "readiness",
             "intact",
             "manual",
@@ -177,6 +179,30 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .inspect_verifier_evidence(id)
         .native_admissions()
         .is_err());
+    let original_plan_body=json!({"version":1,"kind":"original_verifier_plan","workflow":id,"binding":binding,
+        "base":head,"environment":"synthetic verifier","executor":"synthetic executor",
+        "proposal":{"contract":{"schema_version":1,"revision":1,"issue":7,"criteria":[],"allowed_paths":[],"verifiers":[]},"files":{}}}).to_string();
+    let original_plan_key = {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&("original-verifier-plan-v1", &original_plan_body)).unwrap()
+            )
+        )
+    };
+    if case.starts_with("qualification") {
+        store
+            .record_verifier_evidence(
+                &lease,
+                &binding,
+                &original_plan_key,
+                "original_verifier_plan",
+                &original_plan_body,
+                4,
+            )
+            .unwrap();
+    }
     let source = issue(false);
     use sha2::Digest;
     let request_hash = format!(
@@ -221,6 +247,37 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'scope_stage_response_recorded','{',7)",[id]).unwrap();
     }
 
+    if case == "qualification-missing" {
+        conn.execute(
+            "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
+            [id, &original_plan_key],
+        )
+        .unwrap();
+        use sha2::Digest;
+        let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"1".repeat(64),result:"2".repeat(64),data:"3".repeat(64),prepared:"4".repeat(64),contract:"5".repeat(64)};
+        let policy = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                crate::autoship_workflow::RETAINED_REQUALIFICATION_RULE
+                    .as_bytes()
+            )
+        );
+        let cue_key = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&(
+                    "retained-qualification-recovery-v1",
+                    id,
+                    &reference,
+                    &policy
+                ))
+                .unwrap()
+            )
+        );
+        let cue = json!({"version":2,"key":cue_key,"judgment":reference.data.clone(),"policy":policy,"original_generation":1,"binding":binding,"qualification_required":true,
+            "source":{"kind":"retained_original_witness","evidence":reference,"owner_request_sha256":format!("{:x}",sha2::Sha256::digest(b"synthetic recovered owner request"))}});
+        conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'original_semantic_witness_recovered',?2,7)",rusqlite::params![id,cue.to_string()]).unwrap();
+    }
     if case != "intact" {
         git(&["worktree", "remove", "--force", old.to_str().unwrap()]);
     }
@@ -437,6 +494,99 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), head);
     assert!(!plan.worktree.join("old-candidate.txt").exists());
+    if case.starts_with("qualification") {
+        let guard = workflow::WorkflowGuard::acquire_fixture(
+            &path,
+            workflow::Start {
+                repo_root: &root,
+                worktree: &plan.worktree,
+                repository: "controller/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: &plan.branch,
+                contract: "synthetic recovered owner request",
+                environment: "synthetic fresh environment",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let fresh=initial_preparation(&plan.worktree,&guard,crate::autoship_contract::AcceptanceSource::Issue(7),&head,"synthetic recovered owner request")
+            .expect("owner-authorized fresh scope must establish new qualification without superseded original evidence");
+        assert!(
+            !fresh.retained && fresh.saved.is_none(),
+            "old scope or qualification was adopted"
+        );
+        assert!(guard
+            .verifier_evidence_page("original_verifier_plan", 0)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .inspect_verifier_evidence(id)
+            .record(&original_plan_key, "original_verifier_plan")
+            .unwrap()
+            .is_none());
+        // New witnesses remain mandatory, and post-cutover missing evidence
+        // cannot be treated as a new empty episode or superseded history.
+        let mut new_plan: Value = serde_json::from_str(&original_plan_body).unwrap();
+        new_plan["binding"] = serde_json::to_value(guard.binding()).unwrap();
+        new_plan["executor"] = json!("synthetic fresh executor");
+        let body = new_plan.to_string();
+        let key = {
+            use sha2::Digest;
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&("original-verifier-plan-v1", &body)).unwrap()
+                )
+            )
+        };
+        guard
+            .record_verifier_evidence(&key, "original_verifier_plan", &body)
+            .unwrap();
+        assert_eq!(
+            guard
+                .verifier_evidence_page("original_verifier_plan", 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            initial_preparation(
+                &plan.worktree,
+                &guard,
+                crate::autoship_contract::AcceptanceSource::Issue(7),
+                &head,
+                "synthetic recovered owner request"
+            )
+            .is_err(),
+            "unaccounted fresh verifier plan became qualified"
+        );
+        conn.execute(
+            "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
+            [id, &key],
+        )
+        .unwrap();
+        assert!(guard
+            .verifier_evidence_page("original_verifier_plan", 0)
+            .is_err());
+        assert!(store
+            .inspect_verifier_evidence(id)
+            .record(&key, "original_verifier_plan")
+            .is_err());
+        let base_environment = format!(
+            "rustc fixture;cargo-lock:{};upstream-main:{};readiness-policy:fixture",
+            "a".repeat(64),
+            head
+        );
+        let old_environment = format!("{base_environment};owner-recovery:continuity-fixture");
+        let current_environment =
+            owner_checkout_recovery::environment(&path, "controller/repo", 7, base_environment)
+                .unwrap();
+        assert!(!recovery::same_initial_verifier_environment(&old_environment,&current_environment),"already re-held owner workflows must be eligible on the new policy without repeating readopt");
+        guard.finish().unwrap();
+        return;
+    }
     // Retry preparation before enrollment is bounded to the same clean main.
     recovery::prepare_issue_at(
         &path,

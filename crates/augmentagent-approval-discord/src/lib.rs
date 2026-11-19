@@ -16,6 +16,8 @@ pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
 pub mod owner_text;
+#[cfg(test)]
+mod yolo_isolation_tests;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
