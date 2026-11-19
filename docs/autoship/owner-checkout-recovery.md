@@ -64,3 +64,26 @@ policy becomes eligible on normal picker ticks after this policy deploys, subjec
 to existing leases, owner pauses and routing gates. Do not repeat readopt or edit
 state to clear that hold: its existing authority, request ID, archive and checkout
 are retained. A missing witness from the new episode remains a hold.
+
+## Automatic requalification of legacy recovered holds
+
+An owner recovery that bounced to `acceptance_verifier_evidence_unknown` before
+`fresh-witness-v2` now gets explicit priority at the next eligible issue-picker
+turn, ahead of ordinary issues and original-evidence inspection hints. It uses
+the existing per-issue owner request and replacement checkout. Today's refusal
+ledger and a stale readiness dependency cannot suppress that first new-policy
+turn. No repeated `readopt`, issue edit, environment change, or operator command
+is needed after deployment.
+
+The queue is finite: a protected context with any `owner-qualification:` version
+means the new-policy attempt has started and consumes this legacy scheduling
+override, including if it later has a real evidence failure. The picker still
+checks current issue lifecycle/manual routing, author trust, owner pause,
+lease/backoff, checkout continuity, and publication deduplication. Existing peer
+fairness is preserved within the owner queue. Selection is read-only; normal
+productive acquisition establishes the fresh environment, baseline and witness.
+It does not declare a held workflow qualified or rewrite its original archive.
+
+Unrecovered workflows, registered acceptance contexts, and current-policy custody
+failures retain their existing protected recovery paths. The legacy scheduling
+hint cannot manufacture owner authority or discard missing new evidence.

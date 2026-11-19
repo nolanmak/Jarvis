@@ -103,6 +103,8 @@ mod legacy_readmission;
 mod closed_targets;
 #[path="self_improve_scope_policy.rs"]
 mod scope_policy;
+#[path = "self_improve_owner_requalification.rs"]
+mod owner_requalification;
 #[path = "self_improve_owner_checkout_recovery.rs"]
 mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
@@ -1067,11 +1069,13 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let mut qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
+    let owner_recoveries=owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?;
+    qualification_retries.extend(owner_recoveries.iter().copied());
     qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
+    let candidates=owner_requalification::prioritize(candidates,&owner_recoveries);
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {

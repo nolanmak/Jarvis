@@ -33,10 +33,9 @@ impl WorkflowStore {
         let ids = q
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| id.strip_prefix(prefix)?.parse().ok())
-            .collect())
+        let mut pending=ids.iter().filter_map(|id|id.strip_prefix(prefix)?.parse().ok()).collect::<Vec<_>>();
+        pending.extend(self.owner_requalification_retries(prefix)?);
+        Ok(pending)
     }
     pub(crate) fn recovery_snapshots(&self) -> Result<Vec<Snapshot>> {
         let mut query = self.conn.prepare("SELECT id FROM workflow ORDER BY id")?;

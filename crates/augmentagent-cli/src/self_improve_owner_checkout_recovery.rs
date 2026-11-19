@@ -252,8 +252,9 @@ pub(super) fn list(state: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
-/// Only the unconsumed owner-authorized Intake supersedes old scheduling
-/// advice. A later assessment/attempt immediately restores ordinary backoff.
+/// The unconsumed owner Intake and pre-fresh-witness bounced scope receive
+/// one turn past old dependency advice. A current-policy claim consumes the
+/// latter through its protected context; normal scheduling and custody resume.
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(false);
@@ -263,9 +264,10 @@ pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<boo
         return Ok(false);
     };
     Ok(
-        snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Intake
+        (snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Intake
             && snapshot.checkpoint.next.reason == "owner_checkout_recovered"
-            && store.active_checkout_recovery(&id)?.is_some(),
+            && store.active_checkout_recovery(&id)?.is_some())
+            || store.owner_requalification_pending(&id)?,
     )
 }
 pub(super) fn issue_retries(
