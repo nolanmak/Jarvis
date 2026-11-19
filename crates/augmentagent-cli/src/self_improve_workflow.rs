@@ -1059,7 +1059,10 @@ impl WorkflowGuard {
         let snapshot = store
             .snapshot(&id)?
             .context("registered workflow missing")?;
-        store.reconsider_scope_policy(&lease,now)?;
+        // Only productive acquisition may migrate old scope holds. Owner
+        // turns intentionally run native work under a paused owner grant;
+        // reconciliation must preserve its original evidence and authority.
+        if mode==AcquireMode::Productive {store.reconsider_scope_policy(&lease,now)?;}
         // A new commit/contract invalidates approvals, not workflow ownership.
         // Preserve historical evidence in append-only events, not as current
         // receipts that a new build could accidentally reuse.
