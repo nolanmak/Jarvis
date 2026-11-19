@@ -4,7 +4,7 @@ use super::*;
 use serde_json::Value;
 
 fn automatic_reason(body: &str) -> Option<&'static str> {
-    for reason in [GIVE_UP_SCOPER_NOT_FIXABLE, GIVE_UP_OVERTAKEN] {
+    for reason in [GIVE_UP_SCOPER_NOT_FIXABLE, GIVE_UP_OVERTAKEN, GIVE_UP_SCOPER_PREDICTS_REFUSAL] {
         let expected=format!("{GAVE_UP_REASON_MARKER_PREFIX}{reason} -->\nAuto-PR gave up on this issue: `{reason}`. Remove the `{GAVE_UP_LABEL}` label, or run `augmentagent autopr readmit --reason <code>`, to put it back in the pool.");
         if body.trim() == expected {
             return Some(reason);
@@ -403,8 +403,8 @@ mod tests {
         migration_fixture("cross-referenced","id_less_cross_references_do_not_block_obsolete_hold_readmission").await;
     }
     #[tokio::test]
-    async fn unmigratable_automatic_hold_records_owner_readoption_action() {
-        migration_fixture("readoption-required","unmigratable_automatic_hold_records_owner_readoption_action").await;
+    async fn predicted_refusal_is_readmitted_without_owner_readoption() {
+        migration_fixture("readoption-required","predicted_refusal_is_readmitted_without_owner_readoption").await;
     }
     fn cross_reference() -> Value {
         // GitHub omits `id` on cross-referenced timeline rows (#1550/#1595/#1596).
@@ -510,11 +510,9 @@ else:sys.exit(2)
             events.push(cross_reference());
             std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();
             sweep(&root,Some(&inventory),false).await.unwrap();
-            assert!(!root.join("edits").exists(),"a current automatic hold was readmitted without owner authority");
-            let rows=readoption_rows(&workflow::path());
-            assert_eq!(rows.len(),1,"unmigratable automatic hold was not surfaced");
-            assert_eq!((rows[0].0,rows[0].1.as_str()),(7,GIVE_UP_SCOPER_PREDICTS_REFUSAL));
-            assert!(rows[0].2.starts_with("augmentagent autopr readopt --repo controller/repo --issue 7 --reason "),"{}",rows[0].2);
+            assert_eq!(std::fs::read_to_string(root.join("edits")).unwrap_or_default(),"7\n","predicted refusal still requires manual readoption");
+            assert!(readoption_rows(&workflow::path()).is_empty());
+            std::fs::remove_file(root.join("edits")).unwrap();
             // Security holds and manual owner holds offer no readoption action.
             for events in [history(GIVE_UP_BLAST_RADIUS_NAMED),vec![history(GIVE_UP_OVERTAKEN)[1].clone()]] {
                 std::fs::write(root.join("timeline.json"),serde_json::to_vec(&events).unwrap()).unwrap();

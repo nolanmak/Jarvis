@@ -4,8 +4,10 @@ use crate::autoship_workflow::{Snapshot, Stage};
 
 const REPEATED_SCOPE_CLAIMS:u64=3;
 
-fn scope_retry_age(snapshot:Option<&Snapshot>)->i64 {
-    snapshot.filter(|s|s.checkpoint.stage==Stage::Scope && s.attempts>=REPEATED_SCOPE_CLAIMS)
+fn retry_age(snapshot:Option<&Snapshot>)->i64 {
+    snapshot.filter(|s|s.attempts>=REPEATED_SCOPE_CLAIMS && (s.checkpoint.stage==Stage::Scope
+        || (!matches!(s.checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired) && matches!(s.checkpoint.next.reason.as_str(),
+            "resource_capacity"|"verification_infrastructure_retry"|"publishing_revision"|"acceptance_registration_retry"))))
         .map_or(0,|s|s.heartbeat_at_ms.max(1))
 }
 
@@ -55,14 +57,20 @@ pub(super) fn candidates(
             }
         }
         // Preserve human/research and genuine recovery priorities. After
-        // three scope claims, a repeatedly deferred issue yields to less
+        // three claims, a repeatedly deferred issue yields to less
         // attempted peers; among such retries, the least recently active goes
         // first. Durable lease activity survives restart, unlike a poll cursor.
-        // #2279 — publication retries go first: finished work outranks every
-        // new scope or build turn.
-        let key=(!publish_retry(snapshot.as_ref()),issue.research_filed,!recovered.contains(&issue.number),scope_retry_age(snapshot.as_ref()));
+        // #2279 — a due publication retry is finished work and goes first.
+        // A publication retry that has itself stalled (#2280's repeated-claim
+        // tier) keeps rotating with its peers instead of starving them.
+        let age=retry_age(snapshot.as_ref());
+        let key=(!(publish_retry(snapshot.as_ref()) && age==0),issue.research_filed,age,!recovered.contains(&issue.number));
         ranked.push((key,issue));
     }
     ranked.sort_by_key(|(key,_)|*key);
     Ok(ranked.into_iter().map(|(_,issue)|issue).collect())
 }
+
+#[cfg(test)]
+#[path="self_improve_retry_rotation_tests.rs"]
+mod retry_rotation_tests;

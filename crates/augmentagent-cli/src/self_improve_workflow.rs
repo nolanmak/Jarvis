@@ -363,10 +363,20 @@ impl CapacityAccounting {
             Ok(_)=>return outcome,
             Err(error)=>error,
         };
-        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
+        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else {
+            let checkpoint=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
+                .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+            if durable::retry_recovery::class(&checkpoint).is_some() {
+                return self.retry_report(format!("Autoship deferred {} turn; preserved work will retry automatically",checkpoint.next.reason));
+            }
+            return outcome;
+        };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+        if checkpoint.next.reason=="retry_cycle_exhausted" {
+            return self.retry_report("Autoship retry cycle exhausted; preserved request scheduled for automatic rescoping".into());
+        }
         anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
             && checkpoint.next.action == "retry_verification"
             && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
@@ -396,7 +406,7 @@ impl CapacityAccounting {
                 else if source_waiting {format!("Autoship waiting for original verification evidence; candidate and prior charges preserved ({paid} model admissions this run)")}
                 else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
-            held: source_waiting || paid == 0,
+            held: true,
             resumed: self.resumed,
         }))
     }
@@ -2422,8 +2432,8 @@ impl Drop for WorkflowGuard {
     fn drop(&mut self) {
         self.heartbeat.cancel();
         if !self.released && !self.family_wait_released.load(Ordering::SeqCst) {
-            // Best-effort final usage accounting, never release/cleanup here:
-            // dropping an async task is not proof its descendants are gone.
+            // Best-effort final usage and retry scheduling, never release or
+            // cleanup: dropping a task is not descendant teardown evidence.
             if let Ok(mut store) = self.store.lock() {
                 if let Err(error) = charge_elapsed(
                     &mut store,
@@ -2433,6 +2443,9 @@ impl Drop for WorkflowGuard {
                     millis(),
                 ) {
                     warn!(workflow=%self.lease.workflow,"autoship interrupted usage accounting failed: {error}");
+                }
+                if let Err(error)=store.record_retry_completion(&self.lease,millis()) {
+                    warn!(workflow=%self.lease.workflow,"autoship retry schedule retained without new authority: {error}");
                 }
             }
         }
@@ -4647,3 +4660,7 @@ mod initial_acceptance_hold_tests {
 #[cfg(test)]
 #[path = "self_improve_hold_outcome_tests.rs"]
 mod hold_outcome_tests;
+
+#[cfg(test)]
+#[path="self_improve_retry_drop_tests.rs"]
+mod retry_drop_tests;

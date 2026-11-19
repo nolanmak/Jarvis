@@ -89,10 +89,11 @@ else:raise AssertionError(args)
         }
     }
     if case=="leased" {store.claim(retry,"still-owned",now,600_000).unwrap().unwrap();}
+    if case=="same-day-retry" {AttemptLedger::mark_persist(&attempt_ledger_path(),utc_day_now(),3);}
     let before=[store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()];
     let events=[store.events(peer).unwrap(),store.events(retry).unwrap()];
     let picked=pick_issue(&repo,true).await.unwrap().unwrap();
-    assert_eq!(picked.number,if case=="initial-order" {3}else{2},"{case}: picker did not preserve due-work fairness and initial newest-first order");
+    assert_eq!(picked.number,if matches!(case,"initial-order"|"same-day-retry") {3}else{2},"{case}: picker did not preserve due-work fairness and initial newest-first order");
     assert_eq!([store.snapshot(peer).unwrap(),store.snapshot(retry).unwrap()],before,"preview changed protected workflow state");
     assert_eq!([store.events(peer).unwrap(),store.events(retry).unwrap()],events,"preview wrote events or accounting");
     if case=="rotation" {
@@ -154,4 +155,9 @@ async fn due_publication_retry_outranks_newer_scope_work() {
 #[tokio::test]
 async fn safe_scope_policy_selects_legacy_dependency_without_owner_or_main_edits() {
     fixture("policy-upgrade","self_improve::picker_fairness_tests::safe_scope_policy_selects_legacy_dependency_without_owner_or_main_edits").await;
+}
+
+#[tokio::test]
+async fn due_retry_is_not_fenced_by_the_same_day_attempt_marker() {
+    fixture("same-day-retry","self_improve::picker_fairness_tests::due_retry_is_not_fenced_by_the_same_day_attempt_marker").await;
 }
