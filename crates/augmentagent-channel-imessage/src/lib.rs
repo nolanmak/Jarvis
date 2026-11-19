@@ -9,6 +9,7 @@
 
 pub mod bundle;
 pub mod config;
+pub mod draft_images;
 pub mod page;
 pub mod reply;
 pub mod sync;
