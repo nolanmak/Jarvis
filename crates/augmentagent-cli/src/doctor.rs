@@ -220,6 +220,10 @@ pub async fn run(
     findings.push(check_env_file_present());
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
+    findings.push(web_providers_finding(
+        &crate::web::availability(&augmentagent_channel_core::secret_loader::load_provider_key).0,
+        |flag| std::env::var(flag).ok().as_deref() == Some("1"),
+    ));
     findings.push(check_message_index(&store));
     findings.push(check_embeddings_provider());
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
@@ -833,6 +837,49 @@ fn check_env_file_present() -> Finding {
 ///   * warn  — key set but no active accounts (connect one), or
 ///   * warn  — no key at all (optional integration, so never error).
 /// The suggested_cmd points operators at the connect flow.
+/// #2209 — which web providers are usable for search and for fetch, from
+/// configured credentials only (never a live call). A model that cannot run
+/// native web tools is blind without at least one search provider, so that
+/// case is a warning when such a profile is enabled.
+fn web_providers_finding(
+    availability: &crate::web::Availability,
+    enabled: impl Fn(&str) -> bool,
+) -> Finding {
+    use crate::web::{Kind, ProviderId, Support};
+    let ids = |kind| {
+        let available = availability.available(kind);
+        if available.is_empty() {
+            "none".to_string()
+        } else {
+            available.iter().map(|id| id.id()).collect::<Vec<_>>().join(", ")
+        }
+    };
+    let mut missing = Vec::new();
+    for id in ProviderId::ALL {
+        for kind in [Kind::Search, Kind::Fetch] {
+            if let Support::Missing(names) = availability.support(id, kind) {
+                missing.push(format!("{} {} needs {}", id.id(), kind.name(), names.join(", ")));
+            }
+        }
+    }
+    let mut message = format!("search: {}; fetch: {}", ids(Kind::Search), ids(Kind::Fetch));
+    if !missing.is_empty() {
+        message.push_str(&format!(". Not configured: {}", missing.join("; ")));
+    }
+    let needs_web = ["AUGMENTAGENT_MODEL_QWEN_ENABLED", "AUGMENTAGENT_MODEL_GLM_ENABLED"]
+        .into_iter()
+        .any(enabled);
+    if needs_web && availability.available(Kind::Search).is_empty() {
+        Finding::warn(
+            "web_providers",
+            format!("a model without native web tools is enabled but no web search provider is configured. {message}"),
+            Some("see docs/WEB-PROVIDERS.md"),
+        )
+    } else {
+        Finding::ok("web_providers", message)
+    }
+}
+
 fn check_socialapi(store: &Store) -> Finding {
     let key_present = socialapi_key_present();
     let accounts = store
@@ -2530,6 +2577,32 @@ mod tests {
             "{}",
             f.message
         );
+    }
+
+    #[test]
+    fn web_providers_finding_lists_availability_and_warns_only_when_a_web_less_model_is_enabled() {
+        let none = crate::web::availability(&|_| None).0;
+        let some = crate::web::availability(&|name| (name == "BRAVE_API_KEY").then(|| "k".to_string())).0;
+        let off = |_: &str| false;
+        let qwen = |flag: &str| flag == "AUGMENTAGENT_MODEL_QWEN_ENABLED";
+
+        // Nothing configured and nothing needs it: informational.
+        let finding = web_providers_finding(&none, off);
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(finding.message.starts_with("search: none; fetch: none"), "{}", finding.message);
+        assert!(finding.message.contains("brave search needs BRAVE_API_KEY"), "{}", finding.message);
+
+        // A model that cannot run native web tools is enabled: warn.
+        let finding = web_providers_finding(&none, qwen);
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.suggested_cmd.as_deref().unwrap_or_default().contains("WEB-PROVIDERS"));
+
+        // One search provider is enough to clear the warning.
+        let finding = web_providers_finding(&some, qwen);
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(finding.message.starts_with("search: brave; fetch: none"), "{}", finding.message);
+        // Credential names are listed; values never are.
+        assert!(!finding.message.contains("BRAVE_API_KEY"), "configured names are not repeated: {}", finding.message);
     }
 
     #[test]
