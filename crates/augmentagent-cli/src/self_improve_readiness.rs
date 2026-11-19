@@ -351,11 +351,11 @@ fn validate_decomposition(plan:&Decomposition,criteria:&[String])->Result<()> {
     ensure!(plan.children.iter().all(|child|!child.title.trim().is_empty() && child.title.len()<=200 && !child.body.trim().is_empty() && child.body.len()<=16000),"invalid observable child");
     for criterion in criteria {ensure!(plan.children.iter().any(|child|child.body.contains(criterion)),"decomposition omitted original criterion: {criterion}");}Ok(())
 }
-pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Path,issue:&Issue,criteria:&[String],detail:&str,workflow:&mut workflow::WorkflowGuard)->Result<Vec<u64>> {
+pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Path,issue:&Issue,criteria:&[String],detail:&str,workflow:&mut workflow::WorkflowGuard,provider:augmentagent_channel_core::ProviderKind)->Result<Vec<u64>> {
     if is_slice_body(&issue.body) {return Ok(vec![]);}
     workflow.check_resource_policy()?;
     let base=workflow::remote_main_head(repo,workflow.repository()).await?;
-    let epoch=amendment::digest(format!("{}|{base}|{}",request_hash(issue),serde_json::to_string(criteria)?).as_bytes());
+    let epoch=amendment::digest(format!("observable-escalation-v1|{}|{base}|{}|{}",request_hash(issue),serde_json::to_string(criteria)?,provider.name()).as_bytes());
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     std::fs::create_dir_all(&control)?;let path=control.join(format!("observable-decomposition-{epoch}.json"));
     let plan=if path.exists() {
@@ -365,7 +365,7 @@ pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Pat
         serde_json::from_reader(file)?
     } else {
         let prompt=format!("{SLICE_SYSTEM}\nIndependent acceptance generation could not produce an intended-red behavioral verifier after bounded correction. Localize the missing executable observability and split into 2-6 smallest verifiable ordered children that together preserve the ENTIRE owner request. Do not create a research-only or owner-consent task merely because implementation is difficult. Return ONLY JSON {{\"children\":[{{\"title\":\"...\",\"body\":\"...\"}}]}}. Each original criterion must appear verbatim in at least one child body. Owner request:{}\n{}\nOriginal criteria:{}\nObserved failure:{}",issue.title,issue.body,serde_json::to_string(criteria)?,truncate(detail,16000));
-        let plan=scope_authority::persistent(root,workflow,"initial_verifier_decomposition",&epoch,&prompt,false,|raw| {
+        let plan=scope_authority::persistent_on_provider(provider,root,workflow,"initial_verifier_decomposition",&epoch,&prompt,|raw| {
             let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
             let plan:Decomposition=serde_json::from_str(raw)?;validate_decomposition(&plan,criteria)?;Ok(plan)
         }).await?;

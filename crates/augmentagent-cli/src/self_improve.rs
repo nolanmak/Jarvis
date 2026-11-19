@@ -51,6 +51,7 @@ mod integration_checks;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 
+use acceptance::escalation as acceptance_escalation;
 #[path = "self_improve_episode.rs"]
 mod episode;
 #[cfg(test)]
@@ -8437,6 +8438,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let outcome = async {
     workflow_guard.require_fresh_issue(repo_root).await?;
     workflow_guard.bind_builder(reasoner.as_ref())?;
+    if let Some(report)=acceptance_escalation::execute(repo_root,&worktree,&issue,&mut workflow_guard).await? {return Ok(report);}
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
@@ -8444,7 +8446,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let owner_request=acceptance_owner_request(&issue);
     let initial=match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
         Ok(initial)=>initial,
-        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+        Err(error)=>{if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
     };
     let retained_preparation=initial.retained;
     let scope_context=initial.context;
@@ -8593,7 +8595,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
     if saved_scope.is_none() {
         if let Err(error)=retain_initial_scope(&scope_context,scope.clone(),|key,raw|workflow_guard.record_scope_stage_response(key,raw)) {
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
         }
     }
 
@@ -8603,7 +8605,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }

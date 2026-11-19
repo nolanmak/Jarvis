@@ -154,7 +154,7 @@ impl FreshIssueControls {
             let Some(store)=self.store.as_ref() else{return Ok(None)};
             let id=durable::workflow_id(repository,issue.number)?;
             let Some(snapshot)=store.snapshot(&id)? else{return Ok(None)};
-            if store.scope_policy_pending(&id)? {return Ok(None);}
+            if store.scope_policy_pending(&id)? || store.acceptance_escalation_pending(&id)? {return Ok(None);}
             if snapshot.pr.is_some() || !durable::awaits_initial_input(&snapshot.checkpoint) {return Ok(None);}
             let context=store.recovery_context(&id,&snapshot.checkpoint.binding)?
                 .context("held issue execution context unavailable")?;
@@ -1022,7 +1022,8 @@ impl WorkflowGuard {
         let context=if let Some(snapshot)=&existing {
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
-                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some()
+                || store.acceptance_escalation_pending(&id)?;
             if relevant || store.retryable_bound_push(&id)? {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
@@ -1822,6 +1823,11 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) async fn begin_acceptance_escalation(&mut self)->Result<Option<durable::acceptance_escalation::Material>> {
+        self.validate_before_side_effect()?;self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .begin_acceptance_escalation(&self.lease,&self.binding,millis())
+    }
     pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
         self.hold_initial_acceptance_custody(reason,action,false).await
     }
@@ -4417,7 +4423,7 @@ mod initial_acceptance_hold_tests {
         }
         let id=guard.id().to_owned();guard.finish().unwrap();
         let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();drop(store);
+        let before=store.snapshot(&id).unwrap().unwrap();drop(store);
         std::fs::write(upstream.join("unrelated.md"),"manual intake routing changed elsewhere\n").unwrap();
         git(&upstream,&["add","unrelated.md"]).await;
         git(&upstream,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","unrelated main advance"]).await;
@@ -4435,10 +4441,15 @@ mod initial_acceptance_hold_tests {
             assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
             resumed.finish().unwrap();return;
         }
-        assert!(next.is_none(),"upstream-only environment change revived the exhausted original verifier");
+        // A planning lease may now escalate to children. The original verifier
+        // remains exhausted: its binding, evidence and charges are unchanged.
+        let mut resumed=next.expect("exhausted verifier could not escalate planning");
+        let original=resumed.begin_acceptance_escalation().await.unwrap().unwrap();
+        assert_eq!(original.original,before.checkpoint);
         let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
-        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);
-        assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);assert_eq!(store.events(&id).unwrap(),events);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
+        drop(store);resumed.finish().unwrap();
     }
     #[tokio::test]
     async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
@@ -4468,6 +4479,12 @@ mod initial_acceptance_hold_tests {
                 let events=before.events(&id).unwrap();drop(before);
                 for offset in [1000,86_400_000,2*86_400_000] {
                     let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
+                    if reason=="acceptance_verifier_repair_exhausted" && pr.is_none() {
+                        let planning=next.expect("unpublished exhausted hold did not admit planning");
+                        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+                        assert_eq!(after.checkpoint,original.checkpoint);assert_eq!(after.model_calls,original.model_calls);assert_eq!(after.tokens,original.tokens);
+                        drop(store);planning.finish().unwrap();continue;
+                    }
                     assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
                     let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                     let after=store.snapshot(&id).unwrap().unwrap();

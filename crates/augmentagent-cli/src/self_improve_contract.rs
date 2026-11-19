@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
+#[path="self_improve_acceptance_escalation.rs"]
+pub(super) mod escalation;
 #[path = "self_improve_amendment.rs"]
 mod amendment;
 #[path = "self_improve_scope.rs"]

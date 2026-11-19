@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_acceptance_escalation.rs"]
+pub(crate) mod acceptance_escalation;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]
@@ -231,6 +233,7 @@ pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
     checkpoint.stage==Stage::Scope && matches!(
         (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("acceptance_strategies_exhausted","await_new_execution_inputs")|
         ("readiness_assessment_invalid","await_readiness_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
@@ -322,7 +325,17 @@ mod acceptance_input_wait_claim_tests {
                 checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
+                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid");
+                let mut planning_claims=0;
                 for now in [6,86_400_001,2*86_400_000] {
+                    if recoverable {
+                        let plan=stale.claim_productive_for_binding(&setup.workflow,"planning",now,1000,&binding).unwrap().unwrap();
+                        assert!(store.claim_productive_for_binding(&setup.workflow,"racer",now+1,1000,&binding).unwrap().is_none());
+                        let current=store.snapshot(&setup.workflow).unwrap().unwrap();
+                        assert_eq!(current.checkpoint,before.checkpoint);
+                        assert_eq!((current.model_calls,current.tokens,current.wall_ms),(3,700,5));
+                        stale.release(&plan,now+2).unwrap();planning_claims+=1;continue;
+                    }
                     assert!(stale.claim_productive_for_binding(&setup.workflow,"stale-reader",now,1000,&binding).unwrap().is_none());
                     assert!(stale.claim_productive(&setup.workflow,"unbound-reader",now,1000).unwrap().is_none());
                     assert_eq!(store.snapshot(&setup.workflow).unwrap().unwrap(),before);
@@ -337,7 +350,7 @@ mod acceptance_input_wait_claim_tests {
                 assert!(store.claim_productive_for_binding(&setup.workflow,"racer",3*86_400_000+4,1000,&changed).unwrap().is_none());
                 let after=store.snapshot(&setup.workflow).unwrap().unwrap();
                 assert_eq!((after.model_calls,after.tokens,after.wall_ms),(3,700,5));
-                assert_eq!(after.attempts,before.attempts+1);
+                assert_eq!(after.attempts,before.attempts+planning_claims+1);
                 stale.release(&next,3*86_400_000+5).unwrap();
             }
         }
@@ -1124,7 +1137,15 @@ impl WorkflowStore {
         if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
             && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
         let awaiting_input=awaits_initial_input(&cp);
-        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input
+        let escalation=purpose==ClaimPurpose::Productive && acceptance_escalation::eligible(&tx,workflow,&cp)?;
+        if escalation {
+            let observed=baseline_native_custody(&tx,workflow)?;
+            if !observed.is_empty() {
+                let Some((root,validate))=custody else {return Ok(None)};
+                if validate(root,&observed).is_err() {return Ok(None)}
+            }
+        }
+        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input && !escalation
             && binding.is_none_or(|binding|binding==&cp.binding);
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.

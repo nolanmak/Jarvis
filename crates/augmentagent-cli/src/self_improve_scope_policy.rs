@@ -5,13 +5,15 @@ pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<boo
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(false);
     };
-    store.scope_policy_pending(&crate::autoship_workflow::workflow_id(repository, number)?)
+    {let id=crate::autoship_workflow::workflow_id(repository,number)?;
+    Ok(store.scope_policy_pending(&id)? || store.acceptance_escalation_pending(&id)?)}
 }
 pub(super) fn retries(state: &Path, repository: &str) -> Result<std::collections::BTreeSet<u64>> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(Default::default());
     };
-    store.scope_policy_retries(repository)
+    let mut retries=store.scope_policy_retries(repository)?;
+    retries.extend(store.acceptance_escalation_retries(repository)?);Ok(retries)
 }
 pub(super) async fn readiness_blocked(
     root: &Path,

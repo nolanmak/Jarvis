@@ -572,9 +572,15 @@ pub(super) async fn assess(root:&Path,repository:&str,workflow:&workflow::Workfl
 async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,format:ResponseFormat)->Result<String> {
     Ok(run_inner_native(root, repository, workflow, prompt, format,None).await?.text)
 }
+tokio::task_local! {static STRATEGY_PROVIDER:augmentagent_channel_core::ProviderKind;}
+fn strategy_provider_allowed(provider:augmentagent_channel_core::ProviderKind)->bool {STRATEGY_PROVIDER.try_with(|p|*p==provider).unwrap_or(true)}
+pub(super) async fn persistent_on_provider<T>(provider:augmentagent_channel_core::ProviderKind,root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<T> {
+    STRATEGY_PROVIDER.scope(provider,persistent(root,workflow,purpose,epoch,prompt,false,validate)).await
+}
 async fn run_inner_native(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,format:ResponseFormat,witness_context:Option<&str>)->Result<NativeReply> {
     let control = control_directories(repository, workflow.id())?.workflow_acceptance;
     let providers = reviewer_pool().into_iter().filter(|provider| {
+        strategy_provider_allowed(*provider) &&
         matches!(provider,augmentagent_channel_core::ProviderKind::Claude|augmentagent_channel_core::ProviderKind::Codex)
             && matches!(reviewer_status(*provider),ReviewerStatus::Ready)
     }).collect::<Vec<_>>();
@@ -1823,4 +1829,17 @@ mod bounded_validator_repair_tests {
   assert!(format!("{error:#}").contains("missing verifier observation"));
   assert!(recoverable_contract_generation("complete contract",read,write,|_|async{panic!("exhausted responses must replay without more admissions")},|_|->Result<()> {bail!("missing verifier observation")}).await.is_err());
  }
+}
+
+#[cfg(test)]
+mod strategy_provider_tests {
+    use super::*;
+    use augmentagent_channel_core::ProviderKind::{Claude,Codex};
+    #[tokio::test]
+    async fn provider_switch_is_explicit_and_isolated_between_concurrent_workflows() {
+        let first=STRATEGY_PROVIDER.scope(Claude,async {tokio::task::yield_now().await;assert!(strategy_provider_allowed(Claude));assert!(!strategy_provider_allowed(Codex));});
+        let second=STRATEGY_PROVIDER.scope(Codex,async {tokio::task::yield_now().await;assert!(strategy_provider_allowed(Codex));assert!(!strategy_provider_allowed(Claude));});
+        tokio::join!(first,second);
+        assert!(strategy_provider_allowed(Claude));assert!(strategy_provider_allowed(Codex));
+    }
 }
