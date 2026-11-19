@@ -14,13 +14,15 @@ pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<boo
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(false);
     };
-    store.scope_policy_pending(&crate::autoship_workflow::workflow_id(repository, number)?)
+    {let id=crate::autoship_workflow::workflow_id(repository,number)?;
+    Ok(store.scope_policy_pending(&id)? || store.acceptance_escalation_pending(&id)?)}
 }
 pub(super) fn retries(state: &Path, repository: &str) -> Result<std::collections::BTreeSet<u64>> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(Default::default());
     };
-    store.scope_policy_retries(repository)
+    let mut retries=store.scope_policy_retries(repository)?;
+    retries.extend(store.acceptance_escalation_retries(repository)?);Ok(retries)
 }
 pub(super) async fn readiness_blocked(
     root: &Path,
@@ -33,7 +35,7 @@ pub(super) async fn readiness_blocked(
     owner_checkout_recovery::readiness_blocked(root, repository, issue).await
 }
 
-pub(super) const SCOPING_POLICY:&str="\nThe owner authorizes conservative reversible scope assumptions. Preserve the independently recorded assumed decisions below as implementation constraints. Unknown external capability/qualification means unavailable: prefer the existing local path with optional integration disabled. Never invent successful external qualification, spend, credentials, sensitive-data exposure, or production changes. A routine unresolved choice is not a reason to stop; independent readiness escalates only all-sensitive choices.\n";
+pub(super) const SCOPING_POLICY:&str="\nThe owner authorizes conservative reversible scope assumptions. When in doubt, assume the safe default and state it as an Assumed decision: conservative and reversible, behind a config flag that is default off for risky behavior, no spend, no new external account dependency, no irreversible migration, configurable thresholds with sensible values, opt-in for anything user-facing. Never stop to ask for a decision. Preserve the independently recorded assumed decisions below as implementation constraints. An assumed decision with an owner escalation means: build only the non-blocked parts behind a default-off flag and activate none of the escalated alternatives. Unknown external capability/qualification means unavailable: prefer the existing local path with optional integration disabled. Never invent successful external qualification, spend, credentials, sensitive-data exposure, or production changes. A routine unresolved choice is not a reason to stop; independent readiness escalates only all-sensitive choices.\n";
 
 /// Carry already-recorded choices into builder and contract guidance even if
 /// the spec model refuses or is unavailable. Original requirements are intact;
@@ -72,6 +74,14 @@ pub(super) fn constrain_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scope_and_contract_prompts_assume_the_safe_default_instead_of_parking() {
+        for prompt in [SCOPING_POLICY, acceptance::CONTRACT_PROMPT] {
+            assert!(prompt.contains("When in doubt, assume the safe default and state it"), "{prompt}");
+            assert!(prompt.contains("default off"));
+        }
+        assert!(SCOPING_POLICY.contains("behind a default-off flag"));
+    }
     #[test]
     fn missing_or_replayed_scope_keeps_recorded_assumptions_and_original_requirements() {
         let readiness=serde_json::json!({"assumed_decisions":[{"decision":"Keep optional integration disabled","constraints":"No new credentials or spend"}]}).to_string();
