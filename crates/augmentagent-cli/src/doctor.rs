@@ -220,6 +220,7 @@ pub async fn run(
     findings.push(check_env_file_present());
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
+    findings.push(yolo_profile_finding(augmentagent_channel_core::yolo::readiness()));
     findings.push(check_message_index(&store));
     findings.push(check_embeddings_provider());
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
@@ -833,6 +834,21 @@ fn check_env_file_present() -> Finding {
 ///   * warn  — key set but no active accounts (connect one), or
 ///   * warn  — no key at all (optional integration, so never error).
 /// The suggested_cmd points operators at the connect flow.
+/// #2213 — the yolo profile is off unless the operator enables it; when it
+/// is enabled, name the one thing that keeps it from running. No live call.
+fn yolo_profile_finding(readiness: Result<(), augmentagent_channel_core::yolo::NotReady>) -> Finding {
+    use augmentagent_channel_core::yolo::NotReady;
+    match readiness {
+        Ok(()) => Finding::ok("yolo_profile", "ready".to_string()),
+        Err(NotReady::Disabled) => Finding::ok("yolo_profile", "disabled".to_string()),
+        Err(cause) => Finding::warn(
+            "yolo_profile",
+            format!("enabled but not ready: {}", cause.sentence()),
+            None::<&str>,
+        ),
+    }
+}
+
 fn check_socialapi(store: &Store) -> Finding {
     let key_present = socialapi_key_present();
     let accounts = store
@@ -2530,6 +2546,22 @@ mod tests {
             "{}",
             f.message
         );
+    }
+
+    #[test]
+    fn yolo_profile_finding_reports_disabled_ready_or_the_missing_item() {
+        use augmentagent_channel_core::yolo::NotReady;
+        let disabled = yolo_profile_finding(Err(NotReady::Disabled));
+        assert_eq!((disabled.severity, disabled.message.as_str()), (Severity::Ok, "disabled"));
+        let ready = yolo_profile_finding(Ok(()));
+        assert_eq!((ready.severity, ready.message.as_str()), (Severity::Ok, "ready"));
+        let missing = yolo_profile_finding(Err(NotReady::MissingKey));
+        assert_eq!(missing.severity, Severity::Warn);
+        assert!(missing.message.contains("EXPLABS_API_KEY"), "{}", missing.message);
+        // A chain naming yolo is reported like any token that names no chain provider.
+        let chained = reasoner_chain_finding("claude,yolo", &[]);
+        assert_eq!(chained.severity, Severity::Warn);
+        assert!(chained.message.contains("yolo"), "{}", chained.message);
     }
 
     #[test]
