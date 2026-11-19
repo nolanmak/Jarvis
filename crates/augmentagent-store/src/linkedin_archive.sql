@@ -82,9 +82,10 @@ CREATE TABLE IF NOT EXISTS linkedin_session_health (
  dead_since_ms INTEGER, last_error TEXT, last_notice_ms INTEGER,
  recovery_pending INTEGER NOT NULL DEFAULT 0
 );
--- One row per archive request in the last day: the backfill request budget.
+-- One row per archive request in the last day. Backfill rows are its request
+-- budget; live rows only space the next backfill request.
 CREATE TABLE IF NOT EXISTS linkedin_archive_requests (
- account TEXT NOT NULL, at_ms INTEGER NOT NULL
+ account TEXT NOT NULL, at_ms INTEGER NOT NULL, backfill INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS linkedin_archive_requests_recent
  ON linkedin_archive_requests(account,at_ms);

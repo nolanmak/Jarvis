@@ -2792,11 +2792,11 @@ enum LinkedinOp {
         /// at random, so the default reads one page every 5 to 10 seconds.
         #[arg(long, default_value_t = 5)]
         page_delay_secs: u32,
-        /// Archive requests allowed for the account in any hour. Live poll
-        /// reads count against it; a spent budget stops the run.
+        /// Backfill requests allowed for the account in any hour. A spent
+        /// budget stops the run; live poll reads are not charged to it.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..))]
         hourly_requests: u32,
-        /// Archive requests allowed for the account in any 24 hours.
+        /// Backfill requests allowed for the account in any 24 hours.
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..))]
         daily_requests: u32,
     },

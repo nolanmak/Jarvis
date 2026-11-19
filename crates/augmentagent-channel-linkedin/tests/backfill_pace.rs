@@ -223,7 +223,7 @@ async fn hourly_budget_stops_backfill_and_holds_across_restarts() {
 }
 
 #[tokio::test]
-async fn live_reads_come_out_of_the_same_budget_and_are_never_held() {
+async fn live_reads_are_never_held_or_charged_to_the_backfill_budget() {
     let (server, reader) = corpus().await;
     let store = Store::open(":memory:").unwrap();
     let fake = Fake::at(50_000_000);
@@ -250,11 +250,15 @@ async fn live_reads_come_out_of_the_same_budget_and_are_never_held() {
     )
     .await
     .unwrap();
+    // Backfill gets its whole budget, and its first request still keeps the
+    // delay after the live read.
     assert_eq!(
         (backfill.pages, backfill.stopped.as_str()),
-        (2, "request_budget")
+        (5, "request_budget")
     );
-    assert_eq!(requests(&server).await, 5);
+    assert_eq!(backfill.resume_at_ms, Some(50_001_000 + HOUR));
+    assert_eq!(fake.sleeps.lock().unwrap().len(), 5);
+    assert_eq!(requests(&server).await, 8);
     // With the backfill budget spent, the live poll still reads at once.
     let sleeps = fake.sleeps.lock().unwrap().len();
     let live = archive_sync::sync_with_clock(&reader, &store, "PRIMARY_INBOX", 4, &cancel, &now)
@@ -263,14 +267,19 @@ async fn live_reads_come_out_of_the_same_budget_and_are_never_held() {
     assert_eq!((live.pages, live.stopped.as_str()), (4, "page_budget"));
     assert_eq!(live.resume_at_ms, None);
     assert_eq!(fake.sleeps.lock().unwrap().len(), sleeps);
-    assert_eq!(requests(&server).await, 9);
+    assert_eq!(requests(&server).await, 12);
+    // A poll does not move the time backfill was told it may resume.
+    assert_eq!(
+        backfill_pace::budget_resume_at(&store, OWNER, &pacing, fake.now()).unwrap(),
+        Some(50_001_000 + HOUR)
+    );
 }
 
 #[tokio::test]
 async fn cancelling_during_the_delay_stops_without_a_request() {
     let (server, reader) = corpus().await;
     let store = Store::open(":memory:").unwrap();
-    backfill_pace::record_request(&store, OWNER, 1000).unwrap();
+    backfill_pace::record_request(&store, OWNER, 1000, false).unwrap();
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     let pacer = Pacer::with_parts(
@@ -306,8 +315,16 @@ fn the_request_ledger_keeps_one_day_and_reports_the_later_window() {
         backfill_pace::budget_resume_at(&store, OWNER, &pacing, 0).unwrap(),
         None
     );
+    for at in [5, 15, 25] {
+        backfill_pace::record_request(&store, OWNER, at, false).unwrap();
+    }
+    assert_eq!(
+        backfill_pace::budget_resume_at(&store, OWNER, &pacing, 40).unwrap(),
+        None,
+        "live reads are not charged"
+    );
     for at in [10, 20, 30] {
-        backfill_pace::record_request(&store, OWNER, at).unwrap();
+        backfill_pace::record_request(&store, OWNER, at, true).unwrap();
     }
     // Both windows are spent; the daily one reopens later.
     assert_eq!(
@@ -319,7 +336,7 @@ fn the_request_ledger_keeps_one_day_and_reports_the_later_window() {
         backfill_pace::budget_resume_at(&store, "urn:li:fsd_profile:OTHER", &pacing, 40).unwrap(),
         None
     );
-    backfill_pace::record_request(&store, OWNER, 30 + DAY).unwrap();
+    backfill_pace::record_request(&store, OWNER, 30 + DAY, true).unwrap();
     assert_eq!(
         request_times(&store),
         vec![30 + DAY],

@@ -4,9 +4,10 @@
 //!
 //! Every archive request, live or backfill, is written to
 //! `linkedin_archive_requests`. Backfill waits a jittered delay after the
-//! last request and stops when the account's hourly or daily budget is spent.
-//! Live reads are counted but never held, so they keep priority: backfill
-//! only gets what the live poll has left.
+//! last request of either kind and stops when it has spent its own hourly or
+//! daily budget for the account. Live reads are never delayed, refused or
+//! charged to that budget: backfill cannot take a request the live poll
+//! needs, and the resume time it reports does not move when a poll runs.
 use augmentagent_store::{
     rusqlite::{params, OptionalExtension},
     Store,
@@ -23,7 +24,7 @@ pub struct Pacing {
     pub delay_ms: i64,
     /// Up to this much is added to each delay.
     pub jitter_ms: i64,
-    /// Requests per account in any sliding hour and day, live reads included.
+    /// Backfill requests per account in any sliding hour and day.
     pub hourly: i64,
     pub daily: i64,
 }
@@ -126,15 +127,21 @@ impl Pacer {
 }
 
 /// Record one outgoing archive request and drop rows older than a day.
-pub fn record_request(store: &Store, account: &str, now: i64) -> anyhow::Result<()> {
+/// Only `backfill` requests count against the budget.
+pub fn record_request(
+    store: &Store,
+    account: &str,
+    now: i64,
+    backfill: bool,
+) -> anyhow::Result<()> {
     store.with_conn(|c| {
         c.execute(
             "DELETE FROM linkedin_archive_requests WHERE account=?1 AND at_ms<=?2",
             params![account, now.saturating_sub(DAY_MS)],
         )?;
         c.execute(
-            "INSERT INTO linkedin_archive_requests(account,at_ms) VALUES(?1,?2)",
-            params![account, now],
+            "INSERT INTO linkedin_archive_requests(account,at_ms,backfill) VALUES(?1,?2,?3)",
+            params![account, now, backfill],
         )?;
         Ok(())
     })?;
@@ -164,7 +171,8 @@ pub fn budget_resume_at(
         // The request that must age out before one more fits in the window.
         let blocking: Option<i64> = store.with_conn(|c| {
             c.query_row(
-                "SELECT at_ms FROM linkedin_archive_requests WHERE account=?1 AND at_ms>?2
+                "SELECT at_ms FROM linkedin_archive_requests
+                 WHERE account=?1 AND at_ms>?2 AND backfill=1
                  ORDER BY at_ms DESC LIMIT 1 OFFSET ?3",
                 params![account, now.saturating_sub(window), limit.max(1) - 1],
                 |r| r.get(0),

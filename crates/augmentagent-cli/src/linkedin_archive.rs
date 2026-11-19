@@ -261,7 +261,7 @@ pub async fn backfill_paced(
         None => {
             let discovered = match pacer {
                 Some(pacer) => {
-                    archive_sync::categories_with_clock(api, store, cancel, &|| pacer.now()).await
+                    archive_sync::categories_paced(api, store, cancel, pacer).await
                 }
                 None => archive_sync::categories(api, store, cancel).await,
             };

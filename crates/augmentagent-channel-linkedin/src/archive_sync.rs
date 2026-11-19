@@ -45,7 +45,8 @@ struct Stop {
 }
 
 /// Gate one outgoing request and record it. Backfill waits for its delay and
-/// budget; live reads (no pacer) are recorded and never held.
+/// budget; live reads (no pacer) are recorded only to space the next
+/// backfill request, and are never held or charged to the budget.
 async fn admit(
     pacer: Option<&Pacer>,
     store: &Store,
@@ -71,7 +72,7 @@ async fn admit(
             return stop("retry_deferred", None, true);
         }
     }
-    backfill_pace::record_request(store, account, now())?;
+    backfill_pace::record_request(store, account, now(), pacer.is_some())?;
     Ok(None)
 }
 
@@ -279,23 +280,32 @@ pub async fn categories(
     store: &Store,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    categories_with_clock(reader, store, cancel, &now_ms).await
+    categories_inner(reader, store, cancel, &now_ms, false).await
 }
 
-/// Clock injection, as for [`sync_with_clock`]. A paced backfill passes its
-/// pacer's clock so discovery lands in the same request ledger timeline.
-#[doc(hidden)]
-pub async fn categories_with_clock(
+/// Category discovery for a paced backfill: one request out of its budget,
+/// on the pacer's clock. The caller has already been admitted by the pacer.
+pub async fn categories_paced(
+    reader: &ArchiveReader,
+    store: &Store,
+    cancel: &CancellationToken,
+    pacer: &Pacer,
+) -> anyhow::Result<Option<Vec<String>>> {
+    categories_inner(reader, store, cancel, &|| pacer.now(), true).await
+}
+
+async fn categories_inner(
     reader: &ArchiveReader,
     store: &Store,
     cancel: &CancellationToken,
     now_ms: &(dyn Fn() -> i64 + Sync),
+    backfill: bool,
 ) -> anyhow::Result<Option<Vec<String>>> {
     let started = now_ms();
     if cancel.is_cancelled() || db::account_retry_at(store, reader.mailbox())? > started {
         return Ok(None);
     }
-    backfill_pace::record_request(store, reader.mailbox(), started)?;
+    backfill_pace::record_request(store, reader.mailbox(), started, backfill)?;
     let fetched = tokio::select! {
         _=cancel.cancelled()=>return Ok(None),
         result=reader.categories()=>result,

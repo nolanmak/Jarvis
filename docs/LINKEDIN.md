@@ -250,14 +250,14 @@ but reading slowly costs nothing. So `linkedin backfill` paces itself:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--page-delay-secs` | 5 | Minimum gap before each request. Up to as much again is added at random, so requests are 5 to 10 seconds apart. |
-| `--hourly-requests` | 60 | Archive requests for the account in any 60 minutes. |
-| `--daily-requests` | 300 | Archive requests for the account in any 24 hours. |
+| `--hourly-requests` | 60 | Backfill requests for the account in any 60 minutes. |
+| `--daily-requests` | 300 | Backfill requests for the account in any 24 hours. |
 | `--max-pages` | 100 | Upper bound for this one invocation. |
 
 The budget is stored per account in the database, so it holds across
-invocations and restarts. Live poll reads are counted in the same budget but
-are never delayed or refused: backfill only gets what the live poll has left.
-When the budget is spent the run stops without sending anything further and
+invocations and restarts. Live polling keeps priority: its reads are never
+delayed, refused or charged to this budget, and backfill also waits its delay
+after a live read before sending its own. When the budget is spent the run stops without sending anything further and
 prints `"stopped": "request_budget"` with `resume_at_ms` and `resume_at`
 (UTC). A run started before that time makes no requests, category discovery
 included. Backfill is resumable, so run it again after `resume_at`, for
