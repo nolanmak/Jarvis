@@ -10,6 +10,18 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             "qualification",
             "qualification-missing",
             "readiness",
+            "material-decision",
+            "scope-retry",
+            "build",
+            "verify",
+            "review",
+            "reconcile",
+            "intake",
+            "terminal",
+            "published",
+            "protected-held",
+            "publication-stage",
+            "pending-operation",
             "intact",
             "manual",
             "closed",
@@ -148,6 +160,25 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         cp.next.reason = "readiness_assessment_invalid".into();
         cp.next.action = "await_readiness_input_change".into();
     }
+    match case.as_str() {
+        "material-decision" => {
+            cp.next.reason="material_external_decision_missing".into();
+            cp.next.action="await_request_or_main_change".into();
+        }
+        "scope-retry" => {
+            cp.next.reason="acceptance_registration_retry".into();
+            cp.next.action="rescope_executable_acceptance".into();
+        }
+        "intake" => cp.stage=Stage::Intake,
+        "build" => cp.stage=Stage::Build,
+        "verify" => cp.stage=Stage::Verify,
+        "review" => cp.stage=Stage::Review,
+        "reconcile" => cp.stage=Stage::Reconcile,
+        "terminal" => cp.stage=Stage::Merged,
+        "protected-held" => cp.stage=Stage::Held,
+        "publication-stage" => cp.stage=Stage::Publish,
+        _ => {},
+    }
     store
         .record_scope_stage_response(
             &lease,
@@ -232,6 +263,10 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         )
         .unwrap();
     store.checkpoint(&lease, &cp, 5).unwrap();
+    if case=="published" {store.attach_pr_in_repo(&lease,"controller/repo",42,5).unwrap();}
+    if case=="pending-operation" {
+        store.begin_operation(&lease,crate::autoship_workflow::OperationKind::CreatePr,&binding,5).unwrap();
+    }
     store.release(&lease, 6).unwrap();
     let original = store.snapshot(id).unwrap().unwrap();
     let events = store.events(id).unwrap();
@@ -318,7 +353,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     }
     if matches!(
         case.as_str(),
-        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked"
+        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked" | "terminal" | "published" | "protected-held" | "publication-stage" | "pending-operation"
     ) {
         let before = store.snapshot(id).unwrap();
         let events = store.events(id).unwrap();
@@ -326,14 +361,19 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             .await
             .unwrap_err();
         let expected = match case.as_str() {
-            "intact" | "missing-receipt" => "no-automatic-hold",
+            "intact" | "missing-receipt" | "terminal" | "published" | "protected-held" | "publication-stage" => "no-automatic-hold",
+            "pending-operation" => "pending-workflow-operation",
             "revoked" => "target-authorization-failed",
             "manual" => "autoship-manual",
             "closed" => "target-not-open",
             "lease" => "live-workflow-lease",
             _ => "explicit-owner-hold",
         };
-        assert_eq!(refusal(error), expected);
+        if case=="pending-operation" {
+            assert!(format!("{error:#}").contains(expected));
+        } else {
+            assert_eq!(refusal(error), expected);
+        }
         assert_eq!(store.snapshot(id).unwrap(), before);
         assert_eq!(store.events(id).unwrap(), events);
         if case != "missing-receipt" {
@@ -352,7 +392,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .contains("--request-id owner-checkout-7-generation-1"));
     let recovered = apply(&root, &request("continuity-fixture"))
         .await
-        .expect("owner can recover a missing held checkout without a legacy label");
+        .expect("owner can recover a missing pre-publication checkout without a legacy label");
     assert_eq!(recovered["accepted"], true);
     assert_eq!(
         apply(&root, &request("continuity-fixture")).await.unwrap()["replayed"],
