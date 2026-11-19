@@ -139,6 +139,8 @@ mod workflow;
 mod recovery;
 #[path = "self_improve_checkout_identity.rs"]
 mod checkout_identity;
+#[path = "self_improve_checkout_continuity.rs"]
+mod checkout_continuity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
 #[path = "self_improve_observation_wake.rs"]
