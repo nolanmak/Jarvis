@@ -2,6 +2,7 @@
 //! worker finishes its current tick before loading a replacement executable.
 //! A new executable, configuration or updater build stamp (#2303) is noticed
 //! within seconds while idle; the worker then exits 75 for its supervisor.
+//! A busy worker restarts at the next safe point inside its tick (#2354).
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
@@ -111,6 +112,105 @@ impl UpgradeWatch {
         self.deployment=Some((stamp.into(),deployment_stamp(stamp)));
         self
     }
+}
+
+/// #2354: how long a deploy may wait for a safe point before the worker stops
+/// claiming new work in its concurrent lanes and drains toward the restart.
+pub const STALE_DEPLOY_BOUND: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// #2354: a tick can chain scope, build, verification and repair for hours,
+/// so waiting for the tick boundary ran production on hours-stale code. The
+/// worker runs each tick inside these safe points. Code that has just durably
+/// written a workflow checkpoint, or is about to claim the next workflow,
+/// calls [`safe_point`]; when a deploy is pending and no build or verifier of
+/// this tick is in flight, the tick parks there and the worker drops it and
+/// exits 75. Everything the tick did up to that point is already durable.
+pub struct SafePoints {
+    watch: std::sync::Arc<UpgradeWatch>,
+    busy: std::sync::atomic::AtomicUsize,
+    parked: tokio_util::sync::CancellationToken,
+    pending_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+    drain: tokio_util::sync::CancellationToken,
+}
+tokio::task_local! {
+    static SAFE_POINTS: std::sync::Arc<SafePoints>;
+}
+impl SafePoints {
+    /// `drain` is cancelled once a deploy has been pending past
+    /// [`STALE_DEPLOY_BOUND`]; the worker's concurrent lanes stop claiming then.
+    pub fn new(watch: std::sync::Arc<UpgradeWatch>, drain: tokio_util::sync::CancellationToken) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            watch,
+            busy: std::sync::atomic::AtomicUsize::new(0),
+            parked: tokio_util::sync::CancellationToken::new(),
+            pending_since: std::sync::Mutex::new(None),
+            drain,
+        })
+    }
+    /// Run `future` (one tick) with these safe points. Only the tick's own
+    /// task sees them: spawned tasks and other lanes never park.
+    pub async fn scope<F: std::future::Future>(self: &std::sync::Arc<Self>, future: F) -> F::Output {
+        SAFE_POINTS.scope(self.clone(), future).await
+    }
+    /// Whether a deploy is waiting. Also starts the drain once it has waited
+    /// past the bound. A watch error is not a deploy.
+    pub fn restart_pending(&self) -> bool {
+        let changed = self.watch.changed().unwrap_or_else(|error| {
+            tracing::warn!("deploy watch unavailable at a safe point; not treated as a deploy: {error:#}");
+            false
+        });
+        if !changed {
+            return false;
+        }
+        let since = *self
+            .pending_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(tokio::time::Instant::now);
+        if since.elapsed() >= STALE_DEPLOY_BOUND && !self.drain.is_cancelled() {
+            tracing::info!(pending_secs = since.elapsed().as_secs(),
+                "deploy pending past the stale bound; no new work is claimed until the restart");
+            self.drain.cancel();
+        }
+        true
+    }
+    /// Resolves once the tick has parked at a safe point.
+    pub async fn parked(&self) {
+        self.parked.cancelled().await
+    }
+}
+
+/// A restart-safe point inside a tick (#2354). Returns at once outside a
+/// worker tick, with no deploy pending, or while a build or verifier of this
+/// tick is in flight. Otherwise it never returns: the worker drops the tick
+/// here and restarts onto the deploy.
+pub(crate) async fn safe_point() {
+    let Ok(points) = SAFE_POINTS.try_with(std::sync::Arc::clone) else {
+        return;
+    };
+    if points.busy.load(std::sync::atomic::Ordering::SeqCst) > 0 || !points.restart_pending() {
+        return;
+    }
+    tracing::info!("deploy pending: tick parked at a safe point; restarting onto the new build");
+    points.parked.cancel();
+    std::future::pending::<()>().await
+}
+
+/// Marks a build or verifier in flight for the current tick; no safe point
+/// parks the tick until it is dropped.
+pub(crate) struct InFlight(std::sync::Arc<SafePoints>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub(crate) fn in_flight() -> Option<InFlight> {
+    SAFE_POINTS
+        .try_with(|points| {
+            points.busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            InFlight(points.clone())
+        })
+        .ok()
 }
 
 /// The supervisor restarts the worker onto the deployed executable for this
@@ -353,5 +453,61 @@ mod tests {
         assert_eq!(restart_code(&Err(anyhow::Error::new(UpgradeRequested).context("tick"))),Some(75));
         assert_eq!(restart_code(&Ok(())),None,"operator shutdown stays stopped");
         assert_eq!(restart_code(&Err(anyhow::anyhow!("tick failed"))),None,"a fault is not a reload");
+    }
+    fn stamped_points(t:&tempfile::TempDir)->(std::sync::Arc<SafePoints>,PathBuf,tokio_util::sync::CancellationToken) {
+        let binary=t.path().join("worker");std::fs::write(&binary,"same executable").unwrap();
+        let stamp=t.path().join("built-commit");std::fs::write(&stamp,"aaaa\n").unwrap();
+        let drain=tokio_util::sync::CancellationToken::new();
+        let watch=std::sync::Arc::new(UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        (SafePoints::new(watch,drain.clone()),stamp,drain)
+    }
+    /// #2354: a safe point parks the tick once a deploy is pending, but never
+    /// while one of its builds or verifiers is still in flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_safe_point_parks_after_a_deploy_but_never_inside_a_build() {
+        let t=tempfile::tempdir().unwrap();
+        let (points,stamp,_)=stamped_points(&t);
+        let reached=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen=reached.clone();
+        let tick=points.scope(async move {
+            safe_point().await;
+            seen.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(&stamp,"bbbb\n").unwrap();
+            {
+                let _build=in_flight().expect("a tick tracks its builds");
+                safe_point().await;
+                seen.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            }
+            safe_point().await;
+            seen.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        });
+        let parked=tokio::time::timeout(std::time::Duration::from_secs(3600),tick).await;
+        assert!(parked.is_err(),"the safe point after the build must park the tick");
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst),2,"the build ran to completion; the step after it never started");
+        tokio::time::timeout(std::time::Duration::from_secs(1),points.parked()).await
+            .expect("the worker is told the tick parked");
+    }
+    /// Outside a worker tick (CLI work commands, recovery lanes, tests) a
+    /// safe point is never a reason to stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_safe_point_outside_a_tick_never_parks() {
+        assert!(in_flight().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1),safe_point()).await.expect("no tick, no parking");
+    }
+    /// #2354: a deploy pending past the bound starts the drain, so concurrent
+    /// lanes stop claiming new work while the tick finishes its step.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_pending_past_the_bound_starts_the_drain() {
+        let t=tempfile::tempdir().unwrap();
+        let (points,stamp,drain)=stamped_points(&t);
+        assert!(!points.restart_pending());
+        std::fs::write(&stamp,"bbbb\n").unwrap();
+        assert!(points.restart_pending());
+        tokio::time::advance(STALE_DEPLOY_BOUND-std::time::Duration::from_secs(60)).await;
+        assert!(points.restart_pending());
+        assert!(!drain.is_cancelled(),"a fresh deploy waits for the next safe point");
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        assert!(points.restart_pending());
+        assert!(drain.is_cancelled(),"a deploy pending past the bound drains the worker");
     }
 }
