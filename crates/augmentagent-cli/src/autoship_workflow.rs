@@ -11,6 +11,8 @@ pub(crate) mod command_fairness;
 pub(crate) mod owner_requalification;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
+#[path="autoship_terminal_parks.rs"]
+pub(crate) mod terminal_parks;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
 #[path = "autoship_checkout_continuity.rs"]
@@ -410,6 +412,15 @@ pub(crate) struct NativeScopeAdmissionData {
     pub binding:Binding,
 }
 
+/// An identical content-addressed response produced again after a recovery
+/// cutover is a fresh fact for the new episode; index it past the cutover.
+fn reindex_after_cutover(tx:&Transaction<'_>,lease:&Lease,key:&str,now:i64)->Result<()> {
+    let cutover=owner_checkout_recovery::cutover_seq(tx,&lease.workflow)?;
+    if cutover==0 {return Ok(());}
+    let indexed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?3)",params![lease.workflow,cutover,key],|r|r.get(0))?;
+    if !indexed {event(tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;}
+    Ok(())
+}
 fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeCustody>> {
     Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
 }
@@ -546,7 +557,7 @@ impl WorkflowStore {
         ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
         let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");} else {
+        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");reindex_after_cutover(&tx,lease,key,now)?;} else {
             tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,response])?;
             event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
         }tx.commit()?;Ok(())
