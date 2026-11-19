@@ -2274,6 +2274,24 @@ impl WorkflowGuard {
         Ok(Some(eligible))
     }
 
+    /// #2315: a hosted CI code failure takes a repair round now or waits on
+    /// the #2301 backoff ladder, on the main-reconciliation cue. Never the
+    /// infrastructure retry, never terminal.
+    pub(super) async fn code_repair_round(&mut self,reason:&str,immediate:bool)
+        ->Result<crate::autoship_workflow::ci_code_repair::Ladder> {
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        let ladder=self.store.lock().map_err(|_|anyhow::anyhow!("workflow code repair store poisoned"))?
+            .code_repair_round(&self.lease,&self.binding,reason,immediate,millis())?;
+        self.audit_event("hosted_ci_code_failure",match ladder {
+            crate::autoship_workflow::ci_code_repair::Ladder::Repair(round)=>serde_json::json!({
+                "reason":reason,"round":round,"action":"merge_main_rebuild_and_repair"}),
+            crate::autoship_workflow::ci_code_repair::Ladder::Wait(eligible)=>serde_json::json!({
+                "reason":reason,"action":"reconcile_main","eligible_at_ms":eligible}),
+        })?;
+        Ok(ladder)
+    }
+
     /// Transition stage while retaining the receipt set that reviewers saw.
     pub(super) async fn transition(
         &mut self,

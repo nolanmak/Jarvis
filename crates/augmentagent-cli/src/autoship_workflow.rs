@@ -103,6 +103,8 @@ pub(crate) mod owner_control;
 pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_ci_code_repair.rs"]
+pub(crate) mod ci_code_repair;
 #[path = "autoship_tool_capacity.rs"]
 pub(crate) mod tool_capacity;
 #[path = "autoship_retry_recovery.rs"]

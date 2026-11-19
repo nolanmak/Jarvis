@@ -8,7 +8,11 @@
 //! (#2040, #2081). This sweep settles such workflows the way
 //! `autopr reconcile-target` does: model-free, a closed target is retired, a
 //! merged PR is recorded as a manual merge, and an open target is left alone.
-use std::collections::HashMap;
+//!
+//! #2315: rows that keep retrying never look idle, so a merged or closed
+//! target also settles from one aggregate listing of recently closed issues
+//! and PRs, within the next sweep.
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Mutex;
@@ -125,6 +129,97 @@ async fn reconcile(repo: &Path, path: &Path, id: &str) -> Outcome {
     }
 }
 
+/// #2315: issue and PR numbers closed or merged in one listing page. Any
+/// malformed page is unavailable evidence, so nothing settles from it.
+pub(crate) fn closed_numbers(page: &serde_json::Value) -> Result<HashSet<u64>> {
+    let rows = page.as_array().ok_or_else(|| anyhow::anyhow!("closed target listing unavailable"))?;
+    Ok(rows
+        .iter()
+        .filter(|row| row["state"] == "closed")
+        .filter_map(|row| row["number"].as_u64())
+        .collect())
+}
+
+/// Non-terminal, unleased workflows of `repository` whose target, or whose
+/// attached PR, is in `closed`, however recently they made progress. An issue
+/// row whose PR merged reconciles through that PR's identity.
+fn closed_rows(path: &Path, repository: &str, now: i64, closed: &HashSet<u64>) -> Result<Vec<String>> {
+    if !path.exists() || closed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repository = repository.to_ascii_lowercase();
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut query = conn.prepare(
+        "SELECT id,pr FROM workflow
+         WHERE (instr(id,?1||'#')=1 OR instr(id,?1||'/pr/')=1)
+           AND lease_until<=?2
+           AND json_extract(checkpoint,'$.stage') NOT IN ('merged','retired')
+         ORDER BY progress_at, id",
+    )?;
+    let rows = query
+        .query_map(rusqlite::params![repository, now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut due = Vec::new();
+    for (id, pr) in rows {
+        let own = id
+            .strip_prefix(&format!("{repository}#"))
+            .or_else(|| id.strip_prefix(&format!("{repository}/pr/")))
+            .and_then(|number| number.parse::<u64>().ok());
+        if own.is_some_and(|number| closed.contains(&number)) {
+            due.push(id);
+        } else if let Some(pr) = pr.and_then(|pr| u64::try_from(pr).ok()).filter(|pr| closed.contains(pr)) {
+            due.push(format!("{repository}/pr/{pr}"));
+        }
+    }
+    due.dedup();
+    Ok(due)
+}
+
+/// Settle every row whose target closed, with an injected lookup.
+pub(crate) async fn settle_closed_with<F, Fut>(
+    path: &Path,
+    repository: &str,
+    now: i64,
+    closed: &HashSet<u64>,
+    mut check: F,
+) -> Result<usize>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Outcome>,
+{
+    let mut settled = 0;
+    for id in closed_rows(path, repository, now, closed)? {
+        match check(id.clone()).await {
+            Outcome::Settled => {
+                settled += 1;
+                info!(workflow = %id, "target closed or merged; workflow reconciled in this sweep");
+            }
+            Outcome::StillOpen => debug!(workflow = %id, "closed-listing target still open"),
+            Outcome::Held(why) => debug!(workflow = %id, "closed-target reconciliation deferred: {why}"),
+        }
+    }
+    Ok(settled)
+}
+
+/// One aggregate GitHub call: issues and PRs (the issues listing carries
+/// both) updated in the recent window and now closed. Never a per-row call.
+async fn recently_closed(repo: &Path, repository: &str, now: i64) -> Result<HashSet<u64>> {
+    let since = chrono::DateTime::from_timestamp_millis(now - CLOSED_WINDOW_MS)
+        .ok_or_else(|| anyhow::anyhow!("closed window out of range"))?
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let endpoint = format!("repos/{repository}/issues?state=closed&sort=updated&direction=desc&per_page=100&since={since}");
+    let (ok, out, _) = super::run(&super::gh_bin(), &["api", &endpoint], repo).await?;
+    anyhow::ensure!(ok, "closed target listing unavailable");
+    closed_numbers(&serde_json::from_str(&out)?)
+}
+
+/// Closed targets are looked for this often; one listing call per pass.
+const CLOSED_INTERVAL_MS: i64 = 4 * 60 * 1000;
+/// How far back a pass looks. Older closures fall to the idle rotation.
+const CLOSED_WINDOW_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+static LAST_CLOSED_PASS: Mutex<i64> = Mutex::new(i64::MIN);
+
 /// Minimum time between passes. The worker's sweep tick runs every few
 /// minutes; resolving the repository costs a GitHub call, so a pass runs at
 /// most hourly.
@@ -135,18 +230,42 @@ static LAST_PASS: Mutex<i64> = Mutex::new(i64::MIN);
 /// [`PER_PASS`] lookups a pass, each workflow at most once per [`RECHECK_MS`].
 pub(crate) async fn sweep(repo: &Path, path: &Path) -> Result<usize> {
     let now = chrono::Utc::now().timestamp_millis();
+    let mut settled = 0;
+    // #2315: merged or closed targets settle within one sweep, even rows that
+    // keep retrying and so never look idle.
+    let closed_due = {
+        let mut last = LAST_CLOSED_PASS.lock().unwrap_or_else(|e| e.into_inner());
+        let due = now.saturating_sub(*last) >= CLOSED_INTERVAL_MS;
+        if due {
+            *last = now;
+        }
+        due
+    };
+    if closed_due {
+        let repository = super::workflow::canonical_repository(repo).await?;
+        match recently_closed(repo, &repository, now).await {
+            Ok(closed) => {
+                settled += settle_closed_with(path, &repository, now, &closed, |id| async move {
+                    reconcile(repo, path, &id).await
+                })
+                .await?;
+            }
+            Err(error) => debug!("closed target listing deferred: {error:#}"),
+        }
+    }
     {
         let mut last = LAST_PASS.lock().unwrap_or_else(|e| e.into_inner());
         if now.saturating_sub(*last) < PASS_INTERVAL_MS {
-            return Ok(0);
+            return Ok(settled);
         }
         *last = now;
     }
     let repository = super::workflow::canonical_repository(repo).await?;
-    sweep_with(path, &repository, now, &LAST_CHECKED, |id| async move {
-        reconcile(repo, path, &id).await
-    })
-    .await
+    Ok(settled
+        + sweep_with(path, &repository, now, &LAST_CHECKED, |id| async move {
+            reconcile(repo, path, &id).await
+        })
+        .await?)
 }
 
 #[cfg(test)]
@@ -285,5 +404,54 @@ mod tests {
         let second = due(ids, &last, 1);
         assert_eq!(second.len(), PER_PASS);
         assert!(second.iter().all(|id| !first.contains(id)));
+    }
+
+    /// #2315: a merged or closed target must not outlive its row. pr/2314,
+    /// #2176 (PR #2231), pr/2180 and pr/2022 sat in reconcile for hours: they
+    /// kept retrying, so they never looked idle, and only a hand-run
+    /// `autopr reconcile-target` settled them. One aggregate lookup of recently
+    /// closed targets settles every such row in the very next sweep.
+    #[tokio::test]
+    async fn merged_or_closed_targets_settle_within_one_sweep_even_while_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let now = 100 * HOUR;
+        // All made progress a minute ago: none is idle.
+        for id in ["owner/repo/pr/2314", "owner/repo#2176", "owner/repo#2169", "owner/repo#9", "owner/repo#10", "other/repo#2314"] {
+            park(&mut store, id, Stage::Reconcile, now - 60_000);
+        }
+        let lease = store.claim("owner/repo#2176", "worker", now - 50_000, 1000).unwrap().unwrap();
+        store.attach_pr(&lease, 2231, now - 50_000).unwrap();
+        store.release(&lease, now - 50_000).unwrap();
+        park(&mut store, "owner/repo#11", Stage::Merged, now - 60_000);
+        // A live lease is never reconciled underneath its worker.
+        store.claim("owner/repo#10", "worker", now - 1000, HOUR).unwrap().unwrap();
+        let closed: std::collections::HashSet<u64> = [2314, 2231, 9, 10, 11].into_iter().collect();
+        let seen = Mutex::new(Vec::new());
+        let settled = settle_closed_with(&path, "Owner/Repo", now, &closed, |id: String| {
+            seen.lock().unwrap().push(id);
+            async { Outcome::Settled }
+        })
+        .await
+        .unwrap();
+        assert_eq!(settled, 3);
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort();
+        // An issue row whose PR merged reconciles through that PR's identity.
+        assert_eq!(seen, ["owner/repo#9", "owner/repo/pr/2231", "owner/repo/pr/2314"]);
+    }
+
+    #[test]
+    fn recently_closed_targets_come_from_one_aggregate_listing() {
+        let page = serde_json::json!([
+            {"number": 2314, "state": "closed", "pull_request": {"merged_at": "2026-11-19T14:10:00Z"}},
+            {"number": 2176, "state": "closed"},
+            {"number": 2169, "state": "open"},
+            {"number": "bad"}
+        ]);
+        let closed = closed_numbers(&page).unwrap();
+        assert_eq!(closed, [2314, 2176].into_iter().collect());
+        assert!(closed_numbers(&serde_json::json!({"message": "rate limited"})).is_err());
     }
 }
