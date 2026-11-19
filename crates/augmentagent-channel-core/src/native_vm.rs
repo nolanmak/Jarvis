@@ -579,6 +579,19 @@ mod tests {
             assert!(path.exists(),"successful preparation was reclaimed after its command could escape");assert_eq!(sessions(),2);
         }
     }
+    /// Pin the signal/probe interleaving behind the resource-refusal fixture's
+    /// intermittent unverified teardown, using the actual Linux supervisor.
+    #[cfg(target_os="linux")]
+    #[test]
+    fn cancellation_during_supervisor_probe_never_dispatches() {
+        let script=concat!(env!("CARGO_MANIFEST_DIR"),"/../../scripts/tests/provider_supervisor_capture_test.py");
+        let output=std::process::Command::new("/usr/bin/python3")
+            .args(["-I",script,"CaptureTests.test_cancellation_during_probe_is_not_overwritten","-v"])
+            .env_clear().env("PATH","/usr/bin:/bin").output().unwrap();
+        let stderr=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"{} {stderr}",String::from_utf8_lossy(&output.stdout));
+        assert!(stderr.contains("Ran 1 test") && stderr.contains("OK"),"supervisor regression did not execute: {stderr}");
+    }
     /// Real supervisor resource refusal happens after successful native
     /// preparation and must return the constructor's fresh reservation.
     #[tokio::test]
@@ -698,7 +711,7 @@ mod tests {
                 let released=matches!(case,"released"|"release-ack-error"|"foreign-release-before-refusal");
                 if released {assert!(child.wait().await.unwrap().success());}
                 drop(group);child.wait().await.unwrap();drop(vm);
-                assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing");
+                assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing","{provider}/{case}: supervisor cleanup proof missing");
                 assert_eq!(effect.exists(),released,"{provider}/{case}: release fixture did not exercise expected dispatch");
                 assert_eq!(original.exists(),released || case=="teardown-proof-missing","{provider}/{case}: uncertain/released runtime disposition incorrect");
                 if case=="teardown-proof-missing" {

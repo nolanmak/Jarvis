@@ -48,3 +48,19 @@ operations are refused. A separate GitHub `agent-gave-up` hold still follows the
 existing legacy readoption rules; recovery does not silently remove that label.
 Never delete the old receipt, reset the old branch, hand-edit the database, or
 copy an unverified surviving branch into the new checkout to bypass a refusal.
+
+## Fresh qualification after the owner cutover
+
+Original-verifier index pages, direct verifier records and retained semantic
+witness references honor the same supersession sequence as scope/native history.
+Old rows and receipt files remain archived; they cannot force the new owner
+episode to recover an unavailable original witness. Fresh scope establishes its
+own baseline and qualification. Records created after the cutover still require
+normal custody, budget accounting and witness validation.
+
+The `fresh-witness-v2` owner qualification policy is part of the frontend
+environment identity. A workflow which re-held under the earlier owner recovery
+policy becomes eligible on normal picker ticks after this policy deploys, subject
+to existing leases, owner pauses and routing gates. Do not repeat readopt or edit
+state to clear that hold: its existing authority, request ID, archive and checkout
+are retained. A missing witness from the new episode remains a hold.
