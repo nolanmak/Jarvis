@@ -38,6 +38,10 @@ pub(super) fn prepare_card(
 /// (the synthetic `compose:socialapi:dm:<conversation>` identity, with or
 /// without the per-card suffix), never the triage card for an inbound
 /// message, and never a card already armed with a send time.
+///
+/// #2350 — cards composed inside one millisecond share `createdAt`, so the
+/// tie-break is insertion order (`rowid`); the action id is a random UUID
+/// and would order them arbitrarily.
 pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
     let base = format!("compose:socialapi:dm:{conversation}");
     let prefix = format!("{base}:");
@@ -47,7 +51,7 @@ pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result
             WHERE e.platform = 'socialapi' AND e.kind = 'dm' AND a.threadId = ?1
               AND a.status = 'pending' AND a.scheduledAtMs IS NULL
               AND (e.messageId = ?2 OR substr(e.messageId, 1, length(?3)) = ?3)
-            ORDER BY a.createdAt, a.id",
+            ORDER BY a.createdAt, a.rowid",
         )?;
         let rows = statement.query_map(
             augmentagent_store::rusqlite::params![conversation, base, prefix],
@@ -168,6 +172,19 @@ mod tests {
                 ActionStatus::Pending,
             )
             .unwrap()
+    }
+    /// Pins an action's id and creation tick so ordering assertions do not
+    /// depend on the random id or on the clock advancing between cards.
+    fn pin(store: &Store, id: &str, pinned: &str) -> String {
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE actions SET id = ?1, createdAt = 1000 WHERE id = ?2",
+                    augmentagent_store::rusqlite::params![pinned, id],
+                )
+            })
+            .unwrap();
+        pinned.to_owned()
     }
     #[test]
     fn socialapi_compose_missing_account_can_attach_same_conversation_receipt() {
@@ -343,12 +360,14 @@ mod tests {
         let inbound = social_card_row("socialapi", "dm", "synthetic-trigger", CONVERSATION,
             Some("synthetic-account"), "Synthetic peer", "Synthetic DM", "Synthetic context");
         let triage = action(&store, &inbound);
-        // A pre-suffix legacy compose card and two current ones.
+        // A pre-suffix legacy compose card and two current ones. All three
+        // share one creation tick and carry descending ids, so the expected
+        // oldest-first order can only come from insertion order.
         let legacy = social_card_row("socialapi", "dm", COMPOSE, CONVERSATION,
             Some("synthetic-account"), "Synthetic peer", "Synthetic DM", "Synthetic context");
-        let legacy = action(&store, &legacy);
-        let first = action(&store, &card(&store, None));
-        let second = action(&store, &card(&store, None));
+        let legacy = pin(&store, &action(&store, &legacy), "c0000000-0000-4000-8000-000000000001");
+        let first = pin(&store, &action(&store, &card(&store, None)), "b0000000-0000-4000-8000-000000000002");
+        let second = pin(&store, &action(&store, &card(&store, None)), "a0000000-0000-4000-8000-000000000003");
         // A compose card for another conversation, and one already scheduled.
         let other = social_card_row("socialapi", "dm", "compose:socialapi:dm:synthetic-conversation-2:x",
             "synthetic-conversation-2", Some("synthetic-account"), "Other", "DM", "Context");
