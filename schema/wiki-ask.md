@@ -517,6 +517,9 @@ augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
 - **Drop `--post` to preview.** Without it the command prints the drafted
   message and exits without touching anything — use that if the user only
   wants to see the wording.
+- **Revising a DM card:** run `socialapi dm --post` again for the same
+  conversation. The new card replaces your earlier pending DM card for that
+  conversation (the output says so); don't ask the user to skip the old one.
 - **Finding the id.** In order: (1) the inbound approval card, which shows the
   MessageId and carries the conversation/post id; (2)
   `mcp__memory__search_conversation_history`, which searches ingested messages

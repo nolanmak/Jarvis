@@ -547,7 +547,7 @@
       ]
     },
     "platform/platform/4": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: disk_pressure:: autoship_worktree_cleanup:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/auto_pr_worker_status_test.py\npython3 scripts/tests/autopr_worker_install_test.py\npython3 scripts/tests/autopr_worker_recovery_test.py\npython3 scripts/tests/updater_worker_provision_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
+      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: disk_pressure:: autoship_worktree_cleanup:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/autopr_worker_install_test.py\npython3 scripts/tests/autopr_worker_recovery_test.py\npython3 scripts/tests/updater_worker_provision_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/5": {
@@ -712,6 +712,10 @@
     },
     "rust/channels/26": {
       "body": "cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/27": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent -- yolo_acceptance_tests:: yolo_isolation_tests::\ncargo test -p augmentagent-approval-discord --lib yolo_isolation_tests::\ncargo test -p augmentagent-store --lib yolo\n",
       "shell": "bash"
     },
     "rust/channels/3": {
@@ -2697,6 +2701,12 @@
             {
               "command_id": "rust/channels/26",
               "name": "WhatsApp Rust channel lint"
+            },
+            {
+              "command_id": "rust/channels/27",
+              "if": "runner.os == 'Linux'",
+              "name": "Yolo isolation acceptance",
+              "shell": "bash"
             }
           ],
           "strategy": {
@@ -3141,7 +3151,7 @@
         }
       },
       "role": "validation",
-      "sha256": "6a03425098d8ed81bcfa0e28901b00509e339c0b76bafc6965df224f71d1e1fc"
+      "sha256": "58ab1cf3528735e23a7c6a84999bef2e2b8d1589949d4f822c782dfeadd226f0"
     },
     ".github/workflows/targeted.yml": {
       "defaults": {},

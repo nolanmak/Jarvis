@@ -72,3 +72,41 @@ policy becomes eligible on normal picker ticks after this policy deploys, subjec
 to existing leases, owner pauses and routing gates. Do not repeat readopt or edit
 state to clear that hold: its existing authority, request ID, archive and checkout
 are retained. A missing witness from the new episode remains a hold.
+
+## Automatic requalification of legacy recovered holds
+
+An owner recovery that bounced to `acceptance_verifier_evidence_unknown` before
+`fresh-witness-v2` now gets explicit priority at the next eligible issue-picker
+turn, ahead of ordinary issues and original-evidence inspection hints. It uses
+the existing per-issue owner request and replacement checkout. Today's refusal
+ledger and a stale readiness dependency cannot suppress that first new-policy
+turn. No repeated `readopt`, issue edit, environment change, or operator command
+is needed after deployment.
+
+The queue is finite: a protected context with any `owner-qualification:` version
+means the new-policy attempt has started and consumes this legacy scheduling
+override, including if it later has a real evidence failure. The picker still
+checks current issue lifecycle/manual routing, author trust, owner pause,
+lease/backoff, checkout continuity, and publication deduplication. Existing peer
+fairness is preserved within the owner queue. Dry-run selection is read-only; normal
+productive acquisition establishes the fresh environment, baseline and witness.
+It does not declare a held workflow qualified or rewrite its original archive.
+
+Unrecovered workflows, registered acceptance contexts, and current-policy custody
+failures retain their existing protected recovery paths. The legacy scheduling
+hint cannot manufacture owner authority or discard missing new evidence.
+
+A real selection also records `owner_requalification_selected` under the active
+owner request. It reserves scheduling only: no execution lease, model admission,
+qualification or checkpoint update. If execution fails before claim, that issue
+cools down for five minutes and yields to untouched owners/eligible peers. It
+then retries automatically. Dry-run selection reads this schedule without
+writing it. Changing to a new owner request uses a separate reservation history.
+
+Owner priority is bounded (#2317). After three owner turns that leave the
+workflow at the same scoping hold (no checkpoint past Scope since), the hold
+loses its priority and rotates behind peers. Its cooldown doubles per further
+turn, capped at six hours. Owner command jobs (`autopr run --issue N`) get the
+same rule. Three consecutive attempts that end at the same stage, reason and
+action double the command lane's retry delay each further time. Real progress,
+a changed checkpoint, or a fresh owner submission restores ordinary turns.

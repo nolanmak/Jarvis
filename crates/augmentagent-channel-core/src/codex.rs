@@ -164,6 +164,13 @@ impl CodexCliReasoner {
         reasoner
     }
 
+    /// The hosted unfiltered profile (#2214): same bridge, its own endpoint.
+    pub fn yolo() -> Self {
+        let mut reasoner = Self::openai();
+        reasoner.kind = ProviderKind::Yolo;
+        reasoner
+    }
+
     /// Adapter bound to an explicit binary (fault-injection stubs in tests).
     #[cfg(test)]
     pub(crate) fn with_bin(bin: String) -> Self {
@@ -230,7 +237,16 @@ impl CodexCliReasoner {
             .map(|session| session.begin(self.kind))
             .transpose()?;
         let native_launch = native_lease.as_ref().map(|lease| lease.launch());
-        let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
+        // A yolo launch talks to its vendor directly and never consults the
+        // model gateway, whether or not a router file exists or is valid.
+        let yolo = if self.kind == ProviderKind::Yolo {
+            Some(crate::yolo::launch().map_err(|cause| ReasonerError::Local {
+                message: format!("yolo not available: {}", cause.sentence()),
+            })?)
+        } else { None };
+        let router = if yolo.is_some() { None } else {
+            crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex)
+        };
         if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
             return Err(ReasonerError::Local { message: "Runpod model requires a configured model gateway endpoint".into() }.into());
         }
@@ -244,6 +260,13 @@ impl CodexCliReasoner {
         // The marker lines are stripped from the stdin prompt; codex embeds
         // the images in the request itself, so an image turn survives a
         // claude→codex failover instead of arriving as a dead file path.
+        // The yolo model is text-only: image markers become a note, never
+        // `-i` attachments.
+        let noted;
+        let user_message = if yolo.is_some() {
+            noted = crate::images::strip_markers_with_note(user_message);
+            noted.as_str()
+        } else { user_message };
         let extracted = crate::images::extract_image_markers(user_message);
         let (user_message, image_paths) = if extracted.images.is_empty() {
             (user_message.to_string(), Vec::new())
@@ -322,7 +345,13 @@ impl CodexCliReasoner {
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
         }
+        if let Some(launch) = &yolo {
+            for value in launch.codex_overrides() { args.extend(["-c".into(), value]); }
+        }
         if let Some((context, compact)) = match self.kind {
+            // The vendor allows far more; input is billed per token and
+            // compaction keeps a long thread's cost bounded.
+            ProviderKind::Yolo => Some((262_144, 229_376)),
             ProviderKind::Qwen => Some((262_144, 229_376)),
             ProviderKind::Glm => Some((32_768, 24_576)),
             _ => None,
@@ -368,7 +397,10 @@ impl CodexCliReasoner {
         cmd.env("CODEX_HOME", codex_home());
         for (key, value) in &bridge.voice_env { cmd.env(key, value); }
         for (key, value) in &bridge.compute_env { cmd.env(key, value); }
-        if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
+        if let Some(launch) = &yolo {
+            // Its own key, under its own name; the OpenAI key is not passed.
+            cmd.env(crate::yolo::CHILD_KEY_ENV, &launch.api_key);
+        } else if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
             cmd.env("CODEX_API_KEY", key);
         }
         if let Some(router) = &router { router.configure_codex(&mut cmd); }
@@ -1520,6 +1552,46 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             let compact = if kind == ProviderKind::Qwen { 229_376 } else { 24_576 };
             assert!(argv.contains(&format!("model_auto_compact_token_limit={compact}")));
             assert!(!argv.contains("router-secret"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn yolo_launches_against_its_own_endpoint_and_never_through_the_gateway() {
+        for routed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let environment = dir.path().join("env.txt");
+            let bin = stub(&dir, "fake-codex", &format!(
+                "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\nenv >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+                record.display(), environment.display()));
+            let mut reasoner = CodexCliReasoner::yolo();
+            reasoner.bin = bin;
+            let launch = crate::yolo::Launch {
+                base_url: "https://api.experientiallabs.ai/v1".into(),
+                api_key: "xpl_fix".into(),
+                zdr: true,
+            };
+            // A configured gateway must not change a yolo launch.
+            let config = routed.then(|| crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap());
+            let answer = crate::yolo::LAUNCH_FOR_TESTS.scope(launch,
+                crate::model_router::SNAPSHOT.scope(config, reasoner.call(&opts(), "IMAGE: /tmp/picture.png\nhi"))).await.unwrap();
+            assert_eq!(answer, "ok");
+            assert_eq!(reasoner.provider_name(), "yolo");
+            let argv = std::fs::read_to_string(&record).unwrap();
+            assert!(argv.contains(&format!("-m\n{}\n", model_for(ProviderKind::Yolo, ModelTier::Quality))), "wrong model: {argv}");
+            assert!(argv.contains("model_provider=\"augmentagent_yolo\""), "{argv}");
+            assert!(argv.contains("model_providers.augmentagent_yolo.base_url=\"https://api.experientiallabs.ai/v1\""));
+            assert!(argv.contains("model_providers.augmentagent_yolo.wire_api=\"responses\""));
+            assert!(argv.contains("\"X-Gateway-ZDR\" = \"true\""));
+            assert!(argv.contains("model_context_window=262144"));
+            assert!(argv.contains("--ephemeral"));
+            assert!(!argv.contains("augmentagent_router"), "the gateway block must be absent (routed={routed}): {argv}");
+            assert!(!argv.contains("xpl_fix"), "the key must never be on argv");
+            assert!(!argv.lines().any(|line| line == "-i"), "the text-only model gets no image attachments");
+            let env = std::fs::read_to_string(&environment).unwrap();
+            assert!(env.contains("AUGMENTAGENT_YOLO_API_KEY=xpl_fix"));
+            assert!(!env.contains("CODEX_API_KEY=") && !env.contains("AUGMENTAGENT_ROUTER_API_KEY="));
         }
     }
 
