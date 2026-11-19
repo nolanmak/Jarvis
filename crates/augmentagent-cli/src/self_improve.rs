@@ -74,6 +74,9 @@ mod paused_selection_tests;
 mod epic_selection_tests;
 #[path = "self_improve_picker_fairness.rs"]
 mod picker_fairness;
+#[path="self_improve_publish_smoke.rs"]
+mod publish_smoke;
+pub(crate) async fn deployment_publish_smoke(repo:&Path)->serde_json::Value {publish_smoke::inspect(repo).await}
 #[cfg(test)]
 #[path = "self_improve_picker_fairness_tests.rs"]
 mod picker_fairness_tests;
@@ -104,6 +107,8 @@ mod legacy_readmission;
 mod closed_targets;
 #[path="self_improve_scope_policy.rs"]
 mod scope_policy;
+#[path = "self_improve_owner_requalification.rs"]
+mod owner_requalification;
 #[path = "self_improve_owner_checkout_recovery.rs"]
 mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
@@ -1068,11 +1073,15 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let mut qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
+    let owner_recoveries=owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?;
+    qualification_retries.extend(owner_recoveries.iter().copied());
     qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
+    let due_retries=crate::autoship_workflow::retry_recovery::due_issues(&workflow::path(),&repository,chrono::Utc::now().timestamp_millis())?;
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
+    let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
+        .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
@@ -1098,7 +1107,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) {
+        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) && !due_retries.contains(&iss.number) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -1162,6 +1171,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             continue;
         }
         owner_controls.require_current_history()?;
+        if !dry_run && owner_recoveries.contains(&number) && !owner_requalification::reserve(&workflow::path(),&repository,number,chrono::Utc::now().timestamp_millis())
+            .map_err(|error|error.context(RecoveryHistoryUnavailable))? {continue;}
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -12523,7 +12534,8 @@ impl AutoPrLoop {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                         || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
-                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_retry_work(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12544,7 +12556,8 @@ impl AutoPrLoop {
                                 Ok(store.command_queue_due(repository, now)?
                                     || store.has_due_main_reconciliation(Some(repository), now)?
                                     || (lane_from_env()!=Lane::Build && store.has_due_owner_resume(Some(repository),now)?)
-                                    || store.has_due_qualification_recovery(Some(repository),now)?)
+                                    || store.has_due_qualification_recovery(Some(repository),now)?
+                                    || store.has_due_retry_work(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
@@ -12607,6 +12620,11 @@ impl AutoPrLoop {
                     }
                 }
                 match outcome {
+                    Ok(r) if r.billed && r.held => {
+                        triaged+=1;
+                        info!(triaged,attempts_today=runs_today,"auto-PR: paid deferred turn yielded to eligible peers: {r}");
+                        if triaged>=Self::MAX_TRIAGE_PER_TICK {break;}
+                    }
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
@@ -13042,8 +13060,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         let stop = tokio_util::sync::CancellationToken::new();
         let timer_stop = stop.clone();
         let run = worker.run_with(stop, move || {
-            observed.fetch_add(1, Ordering::SeqCst);
+            let turn=observed.fetch_add(1, Ordering::SeqCst);
             async move {
+                if turn>0 {return Ok(RunReport::idle());}
                 Ok(RunReport {
                     message: "durable verification retry; candidate preserved".into(),
                     billed, held, resumed,
@@ -13056,7 +13075,7 @@ else:raise Exception('unexpected fixture call '+repr(args))
         };
         let (result, ()) = tokio::join!(run, timer);
         result.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "fixture must settle exactly one attempt");
+        assert_eq!(calls.load(Ordering::SeqCst), if billed && held {2}else{1}, "paid deferred turns yield once, then the empty picker stops");
         assert_eq!(DailyCounter::load(&counter_path).runs_today(utc_day_of(now)), if billed { 1 } else { 0 },
             "compute spend must remain attributable even when work is held");
         let allowance = crate::autoship_workflow::WorkflowStore::open(&workflow_path).unwrap()
@@ -21622,3 +21641,7 @@ mod observation_wake_tests;
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]
 mod ci_repair_tests;
+
+#[cfg(test)]
+#[path="self_improve_stall_tests.rs"]
+mod stall_tests;

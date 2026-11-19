@@ -5,6 +5,8 @@
 pub(crate) mod acceptance_escalation;
 #[path="autoship_retry_policy.rs"]
 pub(crate) mod retry_policy;
+#[path="autoship_owner_requalification.rs"]
+pub(crate) mod owner_requalification;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]
@@ -101,6 +103,8 @@ pub(crate) mod target_fence;
 mod verification_retry;
 #[path = "autoship_tool_capacity.rs"]
 pub(crate) mod tool_capacity;
+#[path = "autoship_retry_recovery.rs"]
+pub(crate) mod retry_recovery;
 #[path = "autoship_capacity_retry.rs"]
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
@@ -1198,7 +1202,10 @@ impl WorkflowStore {
             params![workflow, owner, generation, until, now_ms,i64::from(!qualification_inspection)])?;
         if qualification_inspection {event(&tx,workflow,generation,"qualification_recovery_claimed",&serde_json::to_string(&cp)?,now_ms)?;}
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
-        if purpose==ClaimPurpose::Productive {owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;}
+        if purpose==ClaimPurpose::Productive {
+            event(&tx,workflow,generation,"productive_claimed","",now_ms)?;
+            owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;
+        }
         tx.commit()?;
         Ok(Some(Lease {
             workflow: workflow.into(),
@@ -1316,6 +1323,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
         idle_recovery::require_dispatch(&tx,&lease.workflow)?;
+        retry_recovery::finish(&tx,lease,now_ms)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
