@@ -600,6 +600,11 @@ pub trait QueryHandler: Send + Sync {
         None
     }
 
+    /// #2219 — the first line of every message posted for a yolo turn.
+    fn yolo_tag(&self) -> String {
+        "[yolo]".into()
+    }
+
     /// Model selected for a new scheduled loop in this conversation.
     async fn selected_model(&self, _channel_id: u64) -> Result<Option<String>, String> { Ok(None) }
 }

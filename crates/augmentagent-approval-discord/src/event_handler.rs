@@ -515,17 +515,37 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #2219 — the yolo-thread gate. In a yolo thread only `/yolo`,
+        // `/search` and plain text (a yolo turn) are handled; no other owner
+        // command runs there. An unreadable registry pauses every thread under
+        // the query channel; DMs and the query channel itself can never be
+        // yolo threads and are unaffected.
+        let is_query_root = self.state.query_channel_id == Some(msg.channel_id);
+        let thread_mark = augmentagent_store::yolo_threads::mark(msg.channel_id.get());
+        let yolo_thread = thread_mark == augmentagent_store::yolo_threads::ThreadMark::Yes;
+        if thread_mark == augmentagent_store::yolo_threads::ThreadMark::Unknown && !is_dm && !is_query_root {
+            let builder = CreateMessage::new()
+                .content(format!("Yolo thread registry is unreadable ({}); threads are paused until it is fixed.",
+                    augmentagent_store::yolo_threads::config_path().display()))
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post yolo registry notice");
+            }
+            return;
+        }
         let autoship_context = crate::autoship::Context {
             bot: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
             owner: self.state.allowed_user_id.map(|id| id.get()),
             author: msg.author.id.get(), channel: msg.channel_id.get(), message: msg.id.get(),
             guild: msg.guild_id.map(|id| id.get()),
         };
+        if !yolo_thread {
         match crate::autoship::dispatch(handler.as_ref(), &crate::autoship::DiscordTransport(Arc::clone(&ctx.http)),
             &autoship_context, &user_text).await {
             Ok(false) => {},
             Ok(true) => return,
             Err(_) => { warn!("autoship command or delivery failed; message withheld from ordinary chat"); return; }
+        }
         }
         // #1496: consume phone setup before attachments, history, native turn
         // claims or model inference, even if the phone adapter is unavailable.
@@ -536,7 +556,10 @@ impl EventHandler for Handler {
             author_id: msg.author.id.get(),
             message_id: msg.id.get(),
         };
-        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+        let phone_reply = if yolo_thread { None } else {
+            crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await
+        };
+        if let Some(reply) = phone_reply {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
@@ -547,7 +570,10 @@ impl EventHandler for Handler {
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
+        let model_reply = if yolo_thread { None } else {
+            crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await
+        };
+        if let Some(reply) = model_reply {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -562,16 +588,31 @@ impl EventHandler for Handler {
             channel_id: msg.channel_id.get(),
             message_id: msg.id.get(),
             is_dm,
+            is_query_channel: is_query_root,
+            query_channel_id: self.state.query_channel_id.map(|channel| channel.get()),
         };
         if let Some(outcome) = handler.owner_text_command(command_ctx, &user_text).await {
-            match outcome {
-                crate::owner_text::OwnerCommandOutcome::Reply(reply) => {
-                    let builder = CreateMessage::new().content(reply)
-                        .reference_message(MessageReference::from((msg.channel_id, msg.id)));
-                    if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
-                        warn!("failed to post owner command reply: {error}");
-                    }
+            let reply = match outcome {
+                crate::owner_text::OwnerCommandOutcome::Reply(reply) => reply,
+                crate::owner_text::OwnerCommandOutcome::OpenYoloThread { intro } => {
+                    open_yolo_thread(&ctx.http, &msg, &intro).await
                 }
+            };
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
+                warn!("failed to post owner command reply: {error}");
+            }
+            return;
+        }
+        // Anything else that looks like a command does not run in a yolo
+        // thread. Bare words that are commands elsewhere (`model …`,
+        // `loop …`) are plain text here.
+        if yolo_thread && user_text.split_whitespace().next().is_some_and(|first| first.starts_with('/') || first.starts_with('!')) {
+            let builder = CreateMessage::new().content(crate::owner_text::NOT_IN_YOLO_THREAD)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post yolo thread command refusal");
             }
             return;
         }
@@ -581,7 +622,7 @@ impl EventHandler for Handler {
             docs,
             mut rejected,
         } = partition_attachments(&msg.attachments);
-        let compute_enabled = self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
+        let compute_enabled = !yolo_thread && self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
             && matches!(std::env::var("AUGMENTAGENT_COMPUTE_ENABLED").as_deref(), Ok("true" | "1"));
         let compute_files: Vec<_> = if compute_enabled {
             msg.attachments.iter().filter(|a| crate::compute_inputs::eligible(
@@ -693,7 +734,7 @@ impl EventHandler for Handler {
         // inline; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
         // as long as it's word-bounded (so `loops are nice` isn't matched).
-        if crate::loops::match_loop_prefix(&user_text).is_some() {
+        if !yolo_thread && crate::loops::match_loop_prefix(&user_text).is_some() {
             let owner = msg.author.id.get().to_string();
             let channel_ref = msg.channel_id.get().to_string();
             let subcommand = crate::loops::match_loop_prefix(&user_text)
@@ -746,13 +787,15 @@ impl EventHandler for Handler {
         tokio::spawn(async move {
             // Fetch recent messages in this channel/DM so follow-up questions
             // see the prior exchange. Bounded by age + char cap inside the fn.
-            let history = fetch_conversation_context(
+            // #2219 — everything this turn does runs under the yolo flag when
+            // the message is in a yolo thread; the isolation checks key on it.
+            let history = crate::interaction::yolo_turn(yolo_thread, fetch_conversation_context(
                 &ctx_for_history,
                 channel_id,
                 msg_id,
                 bot_user_id,
                 allowed_user_id,
-            )
+            ))
             .await;
 
             // Download attachments to /tmp so the reasoner's Read tool can open
@@ -760,6 +803,15 @@ impl EventHandler for Handler {
             // and warn about the rest. PDF/DOCX attachments are converted to
             // text via pdftotext/pandoc and join downloaded_txts so the prompt
             // path treats them uniformly.
+            // #2219 — a yolo turn takes no attachments: PDF and DOCX
+            // attachments are registered under the wiki, which normal turns
+            // read, and the model is text-only.
+            let had_attachments = !images.is_empty() || !text_files.is_empty() || !docs.is_empty();
+            let (images, text_files, docs) = if yolo_thread {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                (images, text_files, docs)
+            };
             let downloaded_imgs = download_images(&images, msg_id.get()).await;
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
             let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
@@ -767,6 +819,9 @@ impl EventHandler for Handler {
             downloaded_txts.extend(extracted_docs.text.iter().cloned());
 
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            if yolo_thread && had_attachments {
+                current.push_str("\n[attachments are not available in a yolo thread]");
+            }
             for notice in &extracted_docs.notices {
                 current.push('\n');
                 current.push_str(notice);
@@ -803,10 +858,12 @@ impl EventHandler for Handler {
             let result = run_with_typing(
                 &http,
                 channel_id,
-                crate::interaction::owner_history(
+                crate::interaction::yolo_turn(yolo_thread, crate::interaction::owner_history(
                     allowed_user_id.is_some() && (is_dm || in_query_channel),
-                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current)))),
             ).await;
+            // Every message posted for a yolo turn starts with this line.
+            let yolo_tag = yolo_thread.then(|| handler.yolo_tag());
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
@@ -835,11 +892,16 @@ impl EventHandler for Handler {
                         answer.push_str("\n\n");
                         answer.push_str(f);
                     }
+                    let chunks = chunk_for_discord(&answer);
+                    let chunks = match &yolo_tag {
+                        Some(tag) => crate::owner_text::tag_chunks(tag, chunks, DISCORD_MSG_LIMIT),
+                        None => chunks,
+                    };
                     send_chunks_reply_chain(
                         &http,
                         channel_id,
                         msg_id,
-                        chunk_for_discord(&answer),
+                        chunks,
                         attachments,
                         "wiki answer chunk",
                     )
@@ -876,6 +938,9 @@ impl EventHandler for Handler {
                             })
                     });
                     let mut err_msg = failed_turn_reply(&e, interrupted);
+                    if let Some(tag) = &yolo_tag {
+                        err_msg = format!("{tag}\nfailed: {err_msg}");
+                    }
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
                         err_msg.push_str(f);
@@ -3012,6 +3077,38 @@ async fn fetch_conversation_context(
         Ok(history) => history,
         Err(_) => { warn!("fetch conversation history failed"); String::new() }
     }
+}
+
+/// #2219 — create the yolo thread for a `/yolo` command and return the text
+/// to reply with in the parent channel. The thread is recorded in the
+/// registry before the intro is posted, so there is never a moment when a
+/// message in it could be handled as a normal turn. A thread that could not
+/// be recorded is deleted; if that fails too it is labelled as an ordinary
+/// thread, which is all an unrecorded thread is.
+async fn open_yolo_thread(http: &Arc<Http>, msg: &Message, intro: &str) -> String {
+    use serenity::all::{AutoArchiveDuration, CreateThread};
+    let name = format!("yolo-{}", chrono::Local::now().format("%Y%m%d-%H%M"));
+    let builder = CreateThread::new(name).auto_archive_duration(AutoArchiveDuration::OneDay);
+    let thread = match msg.channel_id.create_thread_from_message(http, msg.id, builder).await {
+        Ok(thread) => thread,
+        Err(error) => {
+            warn!("yolo thread creation failed: {error}");
+            return "Could not create the yolo thread. Jarvis needs the Create Public Threads permission in this channel.".into();
+        }
+    };
+    let registry = augmentagent_store::yolo_threads::Registry::system();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    if let Err(error) = registry.record(thread.id.get(), msg.channel_id.get(), now) {
+        if thread.id.delete(http).await.is_err() {
+            let _ = thread.id.send_message(http, CreateMessage::new()
+                .content("This thread could not be registered and is an ordinary thread.")).await;
+        }
+        return error.to_string();
+    }
+    if let Err(error) = thread.id.send_message(http, CreateMessage::new().content(intro)).await {
+        warn!("failed to post yolo thread intro: {error}");
+    }
+    format!("Yolo thread opened: <#{}>", thread.id.get())
 }
 
 /// Shared bounded owner-only history for text and phone session bootstrap.

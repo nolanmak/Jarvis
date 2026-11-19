@@ -867,7 +867,11 @@ fn web_providers_finding(
     if !missing.is_empty() {
         message.push_str(&format!(". Not configured: {}", missing.join("; ")));
     }
-    let needs_web = ["AUGMENTAGENT_MODEL_QWEN_ENABLED", "AUGMENTAGENT_MODEL_GLM_ENABLED"]
+    let needs_web = [
+        "AUGMENTAGENT_MODEL_QWEN_ENABLED",
+        "AUGMENTAGENT_MODEL_GLM_ENABLED",
+        augmentagent_channel_core::yolo::ENABLED_ENV,
+    ]
         .into_iter()
         .any(enabled);
     if needs_web && availability.available(Kind::Search).is_empty() {
@@ -878,6 +882,9 @@ fn web_providers_finding(
         )
     } else {
         Finding::ok("web_providers", message)
+    }
+}
+
 /// #2213 — the yolo profile is off unless the operator enables it; when it
 /// is enabled, name the one thing that keeps it from running. No live call.
 fn yolo_profile_finding(readiness: Result<(), augmentagent_channel_core::yolo::NotReady>) -> Finding {
@@ -2616,6 +2623,9 @@ mod tests {
         assert!(finding.message.starts_with("search: brave; fetch: none"), "{}", finding.message);
         // Credential names are listed; values never are.
         assert!(!finding.message.contains("BRAVE_API_KEY"), "configured names are not repeated: {}", finding.message);
+    }
+
+    #[test]
     fn yolo_profile_finding_reports_disabled_ready_or_the_missing_item() {
         use augmentagent_channel_core::yolo::NotReady;
         let disabled = yolo_profile_finding(Err(NotReady::Disabled));

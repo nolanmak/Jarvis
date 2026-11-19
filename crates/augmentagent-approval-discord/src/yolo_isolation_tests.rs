@@ -126,3 +126,53 @@ fn messages_in_a_yolo_thread_are_never_mirrored_to_imessage() {
     ));
     override_path_for_this_thread(None);
 }
+
+#[test]
+fn every_yolo_message_carries_the_tag_and_stays_within_the_size_limit() {
+    use crate::owner_text::tag_chunks;
+    let tag = "[yolo · glm-5.3-uncensored]";
+    // A short chunk is prefixed; an empty answer still shows the tag.
+    assert_eq!(
+        tag_chunks(tag, vec!["hello".into()], 100),
+        vec![format!("{tag}\nhello")]
+    );
+    assert_eq!(
+        tag_chunks(tag, vec![String::new()], 100),
+        vec![tag.to_string()]
+    );
+    // A chunk already at the limit is split so that tag plus text still fits,
+    // counted in characters, and no text is lost.
+    let long = "é".repeat(250);
+    let tagged = tag_chunks(tag, vec![long.clone(), "tail".into()], 100);
+    assert!(tagged.len() > 3);
+    let mut rebuilt = String::new();
+    for message in &tagged {
+        assert!(
+            message.chars().count() <= 100,
+            "{}",
+            message.chars().count()
+        );
+        let body = message
+            .strip_prefix(tag)
+            .expect("every message starts with the tag");
+        rebuilt.push_str(body.strip_prefix('\n').unwrap_or(body));
+    }
+    assert_eq!(rebuilt, format!("{long}tail"));
+}
+
+#[test]
+fn slash_commands_owned_by_the_dispatcher_are_recognised_by_first_token_only() {
+    use crate::owner_text::is_owner_text_command;
+    for command in ["/yolo", "/yolo status", "/search provider exa", "  /search"] {
+        assert!(is_owner_text_command(command), "{command}");
+    }
+    for ordinary in [
+        "yolo",
+        "search for x",
+        "please /yolo",
+        "/yolox",
+        "/searching",
+    ] {
+        assert!(!is_owner_text_command(ordinary), "{ordinary}");
+    }
+}

@@ -211,6 +211,11 @@ pub fn readiness() -> Result<(), NotReady> {
     system(|inputs| inputs.readiness())
 }
 
+/// Whether launches ask the vendor for zero data retention.
+pub fn zdr_requested() -> bool {
+    system(|inputs| inputs.zdr_requested())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
