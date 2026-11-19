@@ -2,6 +2,8 @@
 
 mod approval_context;
 mod team_coverage;
+// #2284 — cross-channel owner-reply rule of the stale-approval sweep.
+mod owner_reply_sweep;
 mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
@@ -4739,9 +4741,10 @@ async fn main() -> Result<()> {
                 // Runs once at startup (to clear whatever accumulated while the
                 // observer was off) and then on a slow tick.
                 let reconcile_store = Arc::clone(&store);
+                let reconcile_surfaces = card_surfaces.clone();
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
-                    run_stale_approval_reconcile(reconcile_store, sd).await
+                    run_stale_approval_reconcile(reconcile_store, reconcile_surfaces, sd).await
                 }));
             }
 
@@ -9195,6 +9198,7 @@ fn scheduled_send_interval_secs_from_env() -> u64 {
 /// reason in `errorMessage`, and simply stops being served by the carousel.
 async fn run_stale_approval_reconcile(
     store: Arc<Store>,
+    surfaces: augmentagent_approval_discord::CardSurfaces,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(STALE_RECONCILE_INTERVAL_SECS));
@@ -9227,12 +9231,23 @@ async fn run_stale_approval_reconcile(
             // Fires immediately on the first tick, which is what clears the
             // backlog left behind by the observer having been off.
             _ = ticker.tick() => {
-                match reconcile_stale_approvals_tick(&store) {
-                    Ok(0) => {}
-                    Ok(n) => info!(
-                        retired = n,
-                        "stale approval reconciliation: retired stale cards"
-                    ),
+                match reconcile_stale_approvals_pass(
+                    &store,
+                    &team_coverage::Config::from_env(&store),
+                    owner_reply_sweep::REPLY_CHECKS_PER_TICK,
+                ) {
+                    Ok(pass) => {
+                        if pass.retired > 0 {
+                            info!(
+                                retired = pass.retired,
+                                "stale approval reconciliation: retired stale cards"
+                            );
+                        }
+                        // #2284 — redraw every surface's card, as the other
+                        // supersede paths do, instead of leaving it to each
+                        // surface's own resolved-card poll.
+                        owner_reply_sweep::redraw(&surfaces, &pass.touched).await;
+                    }
                     Err(e) => warn!("stale approval reconciliation failed: {e:#}"),
                 }
             }
@@ -9358,19 +9373,31 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
 /// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
 /// config (#1700), so tests don't depend on the process environment.
 fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    Ok(reconcile_stale_approvals_pass(store, team, owner_reply_sweep::REPLY_CHECKS_PER_TICK)?.retired)
+}
+
+/// One reconciliation pass with at most `reply_checks` owner-reply lookups
+/// (#2284). Returns how many cards were retired and every card it tried to
+/// retire, so the caller can redraw their surfaces.
+fn reconcile_stale_approvals_pass(
+    store: &Store,
+    team: &team_coverage::Config,
+    reply_checks: usize,
+) -> Result<owner_reply_sweep::Pass> {
     let team_active = team.active();
     let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
-        return Ok(0);
+        return Ok(owner_reply_sweep::Pass::default());
     }
+    let mut budget = owner_reply_sweep::Budget::new(reply_checks, pending.len());
 
     let mut bulk_ids: Vec<String> = Vec::new();
     let mut empty_ids: Vec<String> = Vec::new();
     let mut answered_ids: Vec<String> = Vec::new();
 
-    for row in &pending {
+    for (pos, row) in budget.order(&pending).into_iter().enumerate() {
         // Rule 3 (#484) — the card has no draft to approve. This happens when a
         // draft was published with an empty body (historically the retry path
         // did this on a triage failure, fixed in #454; kept as a rule because
@@ -9436,14 +9463,19 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         // inbounds too, and the OutboundObserver deliberately never logs our
         // own sends as manual replies, so without this every older sibling
         // card stayed in the queue after the owner had answered.
+        //
+        // #2284 — "replied" is now cross-channel: any owner message in the
+        // card's conversation (iMessage, WhatsApp, Instagram, LinkedIn, …),
+        // not only Gmail's ledgers. An owner-started compose is never retired
+        // by the owner's own messages, and lookups are bounded per tick.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
-            Some(ms) if ms > 0 => ms,
-            _ => row.created_at_ms,
-        };
-        match store.thread_has_owner_send_after(tid, after_ms) {
+        if owner_reply_sweep::is_compose(row) || !budget.take(pos) {
+            continue;
+        }
+        let after_ms = owner_reply_sweep::inbound_bound_ms(store, row);
+        match store.owner_replied_since(&row.platform, tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
@@ -9471,10 +9503,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
             Err(e) => warn!(
                 action_id = %row.id,
                 thread = %tid,
-                "stale approval: thread_has_owner_send_after failed: {e:#}"
+                "stale approval: owner_replied_since failed: {e:#}"
             ),
         }
     }
+    budget.finish();
 
     // #500 — scheduled sends get Rule 1 ONLY (user replied on the thread),
     // bounded to replies AFTER the schedule was ARMED (its own cutoff, distinct
@@ -9495,6 +9528,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
     // cancellation — only the owner's Approve (arm) or the 7-day expiry
     // retires it. Both guards live in the store so every caller inherits them.
     let mut scheduled_retired = 0usize;
+    let mut scheduled_ids_retired: Vec<String> = Vec::new();
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
             Ok(true) => {
@@ -9513,6 +9547,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
                          replied after arming"
                     );
                     scheduled_retired += 1;
+                    scheduled_ids_retired.push(action_id.clone());
                 }
             }
             Ok(false) => {}
@@ -9546,6 +9581,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let mut touched: Vec<String> = Vec::new();
+    touched.extend(scheduled_ids_retired);
+    touched.extend(bulk_ids);
+    touched.extend(empty_ids);
+    touched.extend(answered_ids);
     let now = chrono::Utc::now().timestamp_millis();
     for (action_id, thread_id, c) in covered {
         let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
@@ -9570,12 +9610,13 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         }
         if team.mode == team_coverage::Mode::On {
             retired += store.mark_pending_heuristic_superseded_by_ids(
-                &[action_id],
+                &[action_id.clone()],
                 &format!("superseded: covered by teammate {}", c.teammate),
             )?;
+            touched.push(action_id);
         }
     }
-    Ok(retired)
+    Ok(owner_reply_sweep::Pass { retired, touched })
 }
 
 async fn run_stale_draft_sweep(

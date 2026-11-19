@@ -23,6 +23,8 @@ pub mod models;
 pub mod linkedin_archive;
 pub mod notes;
 pub mod owner;
+// #2284 — cross-channel "has the owner replied?" signal.
+pub mod owner_reply;
 pub mod phone;
 mod local_chat;
 pub mod owner_alerts;
@@ -74,6 +76,7 @@ pub use store::{
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
+pub use owner_reply::{conversation_ids_for, UnansweredConversation};
 pub use recipients::Recipients;
 pub use rusqlite;
 

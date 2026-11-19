@@ -1059,6 +1059,8 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        // #2284 — owner messages for channels that never index them.
+        crate::owner_reply::migrate(conn)?;
         crate::phone::migrate(conn)?;
         crate::local_chat::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
@@ -4829,7 +4831,8 @@ impl Store {
                     COALESCE(e.platform, ''), \
                     a.createdAt, \
                     e.accountEntityId, \
-                    a.messageId \
+                    a.messageId, \
+                    COALESCE(e.kind, '') \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4852,6 +4855,7 @@ impl Store {
                 created_at_ms: r.get(9)?,
                 account_entity_id: r.get(10)?,
                 message_id: r.get(11)?,
+                kind: r.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -7741,15 +7745,21 @@ impl Store {
     /// `armed_at_ms` = `COALESCE(status_updated_at, createdAt)`, the same
     /// arming-moment bound the engine's fire-time guard uses, so a reply the
     /// owner sent BEFORE deliberately arming the schedule never cancels it.
+    ///
+    /// #2284 — a scheduled *compose* (`emails.kind = 'compose'`) is left out:
+    /// the owner started that text, so their own messages never cancel it
+    /// (#1635/#1640 keep the same rule on the per-channel paths).
     pub fn scheduled_actions_for_reconcile(
         &self,
     ) -> StoreResult<Vec<(String, String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, threadId, COALESCE(status_updated_at, createdAt) \
-               FROM actions \
-              WHERE status = 'scheduled' AND threadId IS NOT NULL \
-              ORDER BY createdAt ASC",
+            "SELECT a.id, a.threadId, COALESCE(a.status_updated_at, a.createdAt) \
+               FROM actions a \
+               LEFT JOIN emails e ON e.messageId = a.messageId \
+              WHERE a.status = 'scheduled' AND a.threadId IS NOT NULL \
+                AND COALESCE(e.kind, '') != 'compose' \
+              ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -9314,6 +9324,9 @@ pub struct PendingActionRow {
     pub account_entity_id: Option<String>,
     /// The inbound's message id. #1701 — locates a Slack card in its thread.
     pub message_id: String,
+    /// `emails.kind` (empty when the join finds no email). #2284 — an
+    /// owner-started `compose` is never retired by the owner's own messages.
+    pub kind: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
