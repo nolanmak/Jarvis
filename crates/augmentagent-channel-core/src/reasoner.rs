@@ -1223,6 +1223,51 @@ fn tool_scope_args(opts: &ReasonerOpts) -> Vec<String> {
     args
 }
 
+/// #2332 — read grants for the images a prompt points at.
+///
+/// A channel shows the model an image with an `IMAGE: <path>` line. Claude
+/// opens that path with `Read`, so a call that was given no `Read` (the
+/// code-mode first draft, or a draft with no wiki) could never look at it.
+/// This grants `Read` on exactly those files and nothing else.
+///
+/// The prompt carries inbound text, so a sender could write an `IMAGE:` line
+/// of their own. Only files the daemon itself downloaded qualify: the name
+/// must start with `aa-img-`, the prefix every channel uses for them.
+fn image_read_grants(opts: &ReasonerOpts, user_message: &str) -> Vec<String> {
+    if opts.allowed_tools.iter().any(|tool| tool == "Read") {
+        return Vec::new();
+    }
+    crate::images::extract_image_markers(user_message)
+        .images
+        .into_iter()
+        .filter(|path| {
+            path.is_absolute()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("aa-img-"))
+        })
+        .map(|path| format!("Read(/{})", path.display()))
+        .collect()
+}
+
+/// `tool_scope_args` for a call that also holds image read grants.
+fn tool_scope_args_with_images(opts: &ReasonerOpts, grants: &[String]) -> Vec<String> {
+    if grants.is_empty() {
+        return tool_scope_args(opts);
+    }
+    if crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
+        // Still no MCP servers, skills or host settings: only `Read`, and
+        // only on the granted files.
+        return vec!["--tools".into(), "Read".into(), "--strict-mcp-config".into(),
+            "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(),
+            "--setting-sources".into(), "".into(), "--disable-slash-commands".into()];
+    }
+    let mut widened = opts.clone();
+    widened.allowed_tools.extend(grants.iter().cloned());
+    tool_scope_args(&widened)
+}
+
 impl ClaudeCliReasoner {
     /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
     /// outer wrapper can retry on a recoverable failure (corrupted
@@ -1279,10 +1324,12 @@ impl ClaudeCliReasoner {
             bridge.bridge.preflight_builds("claude",launch_audit.as_ref()).await?;
             args.extend(bridge.args());
         } else {
+            // A fresh review uses supplied evidence only and never reads files.
+            let image_grants = if fresh_review { Vec::new() } else { image_read_grants(opts, user_message) };
             args.push("--allowedTools".into());
-            args.push(opts.allowed_tools.join(" "));
+            args.push(opts.allowed_tools.iter().chain(&image_grants).cloned().collect::<Vec<_>>().join(" "));
             if !fresh_review {
-                args.extend(tool_scope_args(opts));
+                args.extend(tool_scope_args_with_images(opts, &image_grants));
             }
         }
 
@@ -5541,6 +5588,40 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         opts.allowed_tools.clear();
         assert_eq!(tool_scope_args(&opts), ["--tools", "", "--strict-mcp-config", "--mcp-config",
             r#"{"mcpServers":{}}"#, "--disable-slash-commands"]);
+    }
+
+    /// #2332 — a call with no `Read` can still open the images its prompt
+    /// points at, and nothing else.
+    #[test]
+    fn image_markers_grant_read_on_daemon_downloaded_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("aa-img-77-0.png");
+        std::fs::write(&image, b"\x89PNG fixture").unwrap();
+        let other = dir.path().join("family-photo.png");
+        std::fs::write(&other, b"\x89PNG fixture").unwrap();
+        let prompt = format!(
+            "What is this?\nIMAGE: {}\nIMAGE: {}\nIMAGE: aa-img-relative.png",
+            image.display(),
+            other.display()
+        );
+        let mut opts = ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "draft");
+        let grants = image_read_grants(&opts, &prompt);
+        // Only the file with the daemon's own prefix; a path a sender typed is ignored.
+        assert_eq!(grants, [format!("Read(/{})", image.display())]);
+        assert_eq!(
+            tool_scope_args_with_images(&opts, &grants),
+            ["--tools", "Read", "--strict-mcp-config", "--mcp-config", r#"{"mcpServers":{}}"#,
+                "--setting-sources", "", "--disable-slash-commands"]
+        );
+        // No images: the text-only argv is unchanged.
+        assert!(image_read_grants(&opts, "no pictures here").is_empty());
+        assert_eq!(tool_scope_args_with_images(&opts, &[]), tool_scope_args(&opts));
+        // A preset with other tools just gains Read.
+        opts.allowed_tools = vec!["Grep".into()];
+        assert_eq!(flag_value(&tool_scope_args_with_images(&opts, &grants), "--tools"), Some("Grep,Read"));
+        // A preset that already reads files needs no grant.
+        opts.allowed_tools = vec!["Read".into()];
+        assert!(image_read_grants(&opts, &prompt).is_empty());
     }
 
     /// Every built-in a preset is allowed to use stays loaded.
