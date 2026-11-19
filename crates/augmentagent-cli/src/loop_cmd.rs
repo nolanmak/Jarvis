@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use augmentagent_approval_discord::{
     max_active_per_user, min_interval_secs, normalize_and_validate_cron, parse_interval,
-    parse_self_send_allowlist, self_send_allowed, validate_prompt_file, validate_tz, SELF_SEND_ENV,
+    own_send_addresses, self_send_allowed, validate_prompt_file, validate_tz, SELF_SEND_ENV,
 };
 use augmentagent_store::{rusqlite, LoopOptions, Store};
 
@@ -50,10 +50,9 @@ pub struct LoopDeliveryArgs {
     pub email_account: Option<String>,
 }
 
-fn resolve_delivery<F>(args: LoopDeliveryArgs, env: F) -> Result<LoopOptions>
-where
-    F: Fn(&str) -> Option<String>,
-{
+/// `own_addresses` is every address the owner may be emailed at: connected
+/// mail accounts plus the env list (see `own_send_addresses`).
+fn resolve_delivery(args: LoopDeliveryArgs, own_addresses: &[String]) -> Result<LoopOptions> {
     let rereport_after_secs = match args.rereport_after.as_deref() {
         None => None,
         Some(raw) => Some(parse_interval(raw).filter(|secs| *secs > 0).ok_or_else(|| {
@@ -70,10 +69,9 @@ where
     let email_to = match args.email_findings_to.as_deref() {
         None => None,
         Some(address) => {
-            let allowlist = parse_self_send_allowlist(&env(SELF_SEND_ENV).unwrap_or_default());
-            if !self_send_allowed(address, &allowlist) {
+            if !self_send_allowed(address, own_addresses) {
                 return Err(anyhow!(
-                    "--email-findings-to: `{}` is not in {SELF_SEND_ENV}; loops may only email addresses the owner has listed there",
+                    "--email-findings-to: `{}` is neither a connected mail account nor in {SELF_SEND_ENV}; loops may only email the owner's own addresses (see `augmentagent loop guide`)",
                     address.trim()
                 ));
             }
@@ -110,6 +108,9 @@ pub enum LoopOp {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// #2256 — print how to set up a scheduled scan, followed by the
+    /// addresses findings may be emailed to. Read-only.
+    Guide,
     /// Stop a single loop by id, or every active loop with `--all`. Marks
     /// the row `status='stopped'` — the scheduler skips non-active rows on
     /// its next tick (within ~30s).
@@ -208,6 +209,11 @@ pub async fn run(store: Arc<Store>, op: LoopOp) -> Result<()> {
 /// a tokio runtime.
 pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
     match op {
+        LoopOp::Guide => {
+            let own = own_send_addresses(store, &env_lookup(SELF_SEND_ENV).unwrap_or_default());
+            print!("{}", scan_guide(&own));
+            Ok(0)
+        }
         LoopOp::List { all, json } => {
             let rows = list_rows(store, all)?;
             if json {
@@ -282,7 +288,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
             };
             let resolved = resolve_create_args(args, env_lookup)?;
             // Validate before the row exists, so a refused option leaves no loop.
-            let options = resolve_delivery(delivery, env_lookup)?;
+            let own = own_send_addresses(store, &env_lookup(SELF_SEND_ENV).unwrap_or_default());
+            let options = resolve_delivery(delivery, &own)?;
             let id = store.create_user_loop_with_model(
                 &resolved.owner,
                 "discord",
@@ -608,6 +615,22 @@ fn print_table(rows: &[LoopRow]) {
             r.model_profile.as_deref().unwrap_or("default"), owner, prompt
         );
     }
+}
+
+/// The scan-setup guide plus the one live fact it depends on.
+fn scan_guide(own_addresses: &[String]) -> String {
+    let mut out = String::from(include_str!("../../../schema/scheduled-scan.md"));
+    out.push_str("\n## Addresses findings may be emailed to right now\n\n");
+    if own_addresses.is_empty() {
+        out.push_str(&format!(
+            "None. No mail account is connected and {SELF_SEND_ENV} is empty, so a scan can only post to its channel. Tell the user.\n"
+        ));
+    } else {
+        for address in own_addresses {
+            out.push_str(&format!("- {address}\n"));
+        }
+    }
+    out
 }
 
 /// Compact `[…]` suffix for the table's prompt column.
@@ -1078,6 +1101,8 @@ mod tests {
         let row = store.list_user_loops("test-owner").unwrap().remove(0);
         assert_eq!(row.model_profile.as_deref(), Some("glm"));
         assert!(run_with(&store, create("gemini")).is_err());
+        // #2213 — yolo runs only in yolo threads, never as a loop pin.
+        assert!(run_with(&store, create("yolo")).is_err());
         assert_eq!(store.list_user_loops("test-owner").unwrap().len(), 1);
     }
 
@@ -1230,13 +1255,13 @@ mod tests {
 
     // ----- #2246 delivery options -----
 
-    fn allow_owner(key: &str) -> Option<String> {
-        (key == SELF_SEND_ENV).then(|| "owner@example.com, second@example.com".to_string())
+    fn own() -> Vec<String> {
+        vec!["owner@example.com".to_string(), "second@example.com".to_string()]
     }
 
     #[test]
     fn delivery_options_default_to_off() {
-        assert!(resolve_delivery(LoopDeliveryArgs::default(), |_| None).unwrap().is_default());
+        assert!(resolve_delivery(LoopDeliveryArgs::default(), &[]).unwrap().is_default());
     }
 
     #[test]
@@ -1249,7 +1274,7 @@ mod tests {
             email_account: Some("sender@example.com".into()),
         };
         assert_eq!(
-            resolve_delivery(args, allow_owner).unwrap(),
+            resolve_delivery(args, &own()).unwrap(),
             LoopOptions {
                 quiet_when_empty: true,
                 rereport_after_secs: Some(30 * 86_400),
@@ -1267,20 +1292,20 @@ mod tests {
             ..Default::default()
         };
         for address in ["stranger@example.com", "owner@example.com,stranger@example.com", "Owner <owner@example.com>"] {
-            let err = resolve_delivery(to(address), allow_owner).unwrap_err().to_string();
+            let err = resolve_delivery(to(address), &own()).unwrap_err().to_string();
             assert!(err.contains(SELF_SEND_ENV), "{address}: {err}");
         }
-        // No allowlist configured: the feature is off for every address.
-        assert!(resolve_delivery(to("owner@example.com"), |_| None).is_err());
+        // No connected account and no list: no address is allowed.
+        assert!(resolve_delivery(to("owner@example.com"), &[]).is_err());
     }
 
     #[test]
     fn a_bad_window_or_prompt_file_is_refused_at_create() {
         let window = LoopDeliveryArgs { rereport_after: Some("soon".into()), ..Default::default() };
-        assert!(resolve_delivery(window, |_| None).unwrap_err().to_string().contains("--rereport-after"));
+        assert!(resolve_delivery(window, &[]).unwrap_err().to_string().contains("--rereport-after"));
         for path in ["../outside.md", "/etc/hosts", " "] {
             let file = LoopDeliveryArgs { prompt_file: Some(path.into()), ..Default::default() };
-            assert!(resolve_delivery(file, |_| None).unwrap_err().to_string().contains("--prompt-file"), "{path}");
+            assert!(resolve_delivery(file, &[]).unwrap_err().to_string().contains("--prompt-file"), "{path}");
         }
     }
 
@@ -1348,5 +1373,57 @@ mod tests {
             "--email-account", "sender@example.com",
         ])
         .is_err());
+    }
+
+    // ----- #2256 connected accounts and the scan guide -----
+
+    #[test]
+    fn create_may_email_a_connected_account_without_an_env_list() {
+        let (_tmp, store) = seed_store();
+        store.upsert_google_gmail_account("inbox@example.com").unwrap();
+        let create = |to: &str| LoopOp::Create {
+            interval: Some("1d".into()),
+            cron: None,
+            tz: None,
+            prompt: "scan".into(),
+            channel_ref: Some("test-channel".into()),
+            owner: Some("mail-owner".into()),
+            expires_in: None,
+            model: None,
+            nag_until_ack: false,
+            delivery: LoopDeliveryArgs { email_findings_to: Some(to.into()), ..Default::default() },
+            json: false,
+        };
+        // Only exercised when the process has no env list of its own.
+        if std::env::var(SELF_SEND_ENV).is_err() {
+            assert!(run_with(&store, create("stranger@example.com")).is_err());
+        }
+        run_with(&store, create("Inbox@Example.com")).unwrap();
+        let id = store.list_user_loops("mail-owner").unwrap().remove(0).id;
+        assert_eq!(store.loop_options(&id).unwrap().email_to.as_deref(), Some("inbox@example.com"));
+    }
+
+    #[test]
+    fn the_guide_lists_the_addresses_a_scan_may_email() {
+        let guide = scan_guide(&own());
+        assert!(guide.starts_with("# Setting up a scheduled scan"));
+        for flag in ["--prompt-file", "--quiet-when-empty", "--rereport-after", "--email-findings-to", "--email-account"] {
+            assert!(guide.contains(flag), "guide must cover {flag}");
+        }
+        assert!(guide.ends_with("- owner@example.com\n- second@example.com\n"));
+        assert!(scan_guide(&[]).contains("can only post to its channel"));
+    }
+
+    #[test]
+    fn guide_parses_as_a_loop_subcommand() {
+        let cli = crate::Cli::try_parse_from(["augmentagent", "loop", "guide"]).unwrap();
+        assert!(matches!(cli.cmd, crate::Cmd::Loop { op: LoopOp::Guide }));
+    }
+
+    #[test]
+    fn the_ask_prompt_points_at_the_guide_instead_of_repeating_it() {
+        let ask = include_str!("../../../schema/wiki-ask.md");
+        assert!(ask.contains("augmentagent loop guide"));
+        assert!(!ask.contains("return one finding per subject"), "the method lives in the guide only");
     }
 }

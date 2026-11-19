@@ -17,7 +17,7 @@ pub(super) fn candidate(
     let Some(s) = store.snapshot(&id)? else {
         return Ok(None);
     };
-    if s.pr.is_some() || !crate::autoship_workflow::awaits_initial_input(&s.checkpoint) {
+    if s.pr.is_some() || !crate::autoship_workflow::owner_checkout_recovery::restartable(&s.checkpoint) {
         return Ok(None);
     }
     let Some(c) = store.recovery_context(&id, &s.checkpoint.binding)? else {
@@ -301,7 +301,7 @@ pub(super) fn scope_key(workflow_id: &str, key: String) -> Result<String> {
     let Some(store) = WorkflowStore::open_read_only(&workflow::path())? else {
         return Ok(key);
     };
-    Ok(match store.active_checkout_recovery(workflow_id)? {
+    let key=match store.active_checkout_recovery(workflow_id)? {
         Some(plan) => format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&(
@@ -311,5 +311,14 @@ pub(super) fn scope_key(workflow_id: &str, key: String) -> Result<String> {
             ))?)
         ),
         None => key,
-    })
+    };
+    store.scope_policy_key(workflow_id,key)
+}
+
+/// Re-admission changes bounded model-repair accounting, never original raw
+/// measurement provenance. Existing qualification contexts retain their keys.
+pub(super) fn repair_key(workflow_id:&str,key:String)->Result<String> {
+ let key=scope_key(workflow_id,key)?;
+ let Some(store)=WorkflowStore::open_read_only(&workflow::path())? else{return Ok(key)};
+ store.scope_policy_repair_key(workflow_id,key)
 }

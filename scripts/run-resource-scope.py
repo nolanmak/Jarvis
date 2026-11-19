@@ -9,18 +9,22 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
+import sys
 from pathlib import Path
 import time
 import uuid
 
 CONTROLLERS = {'cpu', 'memory', 'pids'}
+CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 
 class AdmissionRefused(RuntimeError):
-    def __init__(self, code, message, **facts):
+    def __init__(self, code, message, *, group=None, **facts):
         super().__init__(message)
         self.code = code
         self.facts = facts
+        self.group = group
 
 
 def refusal_receipt(error):
@@ -182,13 +186,13 @@ def headroom(parent, requested, host_available):
                                requested_bytes=requested,reservation_slack_bytes=slack,margin_bytes=256*1024**2,
                                required_bytes=requested+slack+256*1024**2,available_bytes=host_available)
     ancestor = parent.parent
-    while ancestor != Path('/sys/fs/cgroup') and ancestor.is_relative_to('/sys/fs/cgroup'):
+    while ancestor != CGROUP_ROOT and ancestor.is_relative_to(CGROUP_ROOT):
         limit = (ancestor / 'memory.max').read_text().strip()
         if limit != 'max':
             usage=int((ancestor / 'memory.current').read_text().strip())
             usage=max(0, usage - reclaimable(ancestor))
             if requested + slack > int(limit) - usage:
-                raise AdmissionRefused('ancestor_headroom','ancestor memory headroom unavailable',
+                raise AdmissionRefused('ancestor_headroom','ancestor memory headroom unavailable',group=ancestor,
                                        requested_bytes=requested,reservation_slack_bytes=slack,current_bytes=usage,limit_bytes=int(limit))
         ancestor = ancestor.parent
     return {'reserved_before_bytes': reserved, 'requested_bytes': requested,
@@ -230,6 +234,86 @@ def reclaim_cache(group, wanted):
         pass
 
 
+ANCESTOR_RECLAIM_MAX_BYTES = 4 * 1024**3
+ANCESTOR_RECLAIM_INTERVAL = 600
+
+
+def reclaim_stamp(group):
+    # Shared across worker/daemon helper processes, reset only on reboot or a
+    # new cgroup inode. Never use a workflow/session/credential-derived path.
+    runtime = Path(f'/run/user/{os.getuid()}')
+    info = runtime.stat()
+    if runtime.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError('unsafe reclaim rate directory')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    info = group.stat()
+    key = hashlib.sha256(f'{boot}:{info.st_dev}:{info.st_ino}'.encode()).hexdigest()
+    return runtime / f'augmentagent-ancestor-reclaim-{key}'
+
+
+def reclaim_ancestor(parent, refusal):
+    """One bounded kernel request, never an optimistic admission proof.
+
+    Inactive cache is already discounted by headroom. To reduce charged usage
+    we must also reclaim the shortfall from active file pages. Refuse if dirty
+    or writeback pages prevent that calculation. Each request is capped at 4 GiB;
+    any remaining shortfall still refuses until a later observation passes.
+    """
+    group = refusal.group
+    event = {'status': 'not-reclaimable'}
+    if (refusal.code != 'ancestor_headroom' or group not in parent.parents
+            or group == CGROUP_ROOT or not group.is_relative_to(CGROUP_ROOT)):
+        return event
+    descriptor = None
+    try:
+        target = group.stat()
+        event.update(target_device=target.st_dev, target_inode=target.st_ino)
+        stats = counters(group/'memory.stat')
+        before = int((group/'memory.current').read_text())
+        inactive = stats.get('inactive_file', 0)
+        active = stats.get('active_file', 0)
+        dirty = stats.get('file_dirty', 0) + stats.get('file_writeback', 0)
+        limit = finite(group/'memory.max')
+        missing = max(0, refusal.facts['requested_bytes'] + refusal.facts['reservation_slack_bytes']
+                      + max(0, before-inactive) - limit)
+        wanted = min(inactive + missing, ANCESTOR_RECLAIM_MAX_BYTES)
+        event.update(before_current_bytes=before, before_inactive_file_bytes=inactive,
+                     before_active_file_bytes=active, limit_bytes=limit, shortfall_bytes=missing)
+        if (min(before, inactive, active, dirty) < 0 or missing <= 0
+                or missing > max(0, active-dirty)):
+            return event
+        descriptor = os.open(reclaim_stamp(group), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077):
+            raise RuntimeError('unsafe reclaim rate file')
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        now = time.monotonic()
+        prior = os.read(descriptor, 64)
+        if prior and now - float(prior) < ANCESTOR_RECLAIM_INTERVAL:
+            event['status'] = 'rate-limited'
+            return event
+        # Charge failed/partial requests too; fresh helpers cannot hammer the
+        # shared ancestor. Keep this lock through the before/after observation.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, str(now).encode())
+        event.update(status='attempted', requested_reclaim_bytes=wanted)
+        try:
+            (group/'memory.reclaim').write_text(f'{wanted} swappiness=0')
+        except OSError as error:
+            event['errno'] = error.errno
+        event['after_current_bytes'] = int((group/'memory.current').read_text())
+        event['after_inactive_file_bytes'] = reclaimable(group)
+        return event
+    except (OSError, RuntimeError, ValueError, KeyError):
+        event['status'] = 'reclaim-unavailable'
+        return event
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 @contextlib.contextmanager
 def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.sleep):
     # A transient refusal first drops reclaimable cache, then waits (lock
@@ -256,6 +340,7 @@ def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.s
                 if refusal.code not in TRANSIENT_REFUSALS or time.monotonic() >= deadline:
                     raise
                 missing = shortfall(refusal)
+                pending = refusal
             else:
                 yield proof
                 return
@@ -263,7 +348,11 @@ def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.s
             os.close(descriptor)
         if not reclaimed:
             reclaimed = True
-            reclaim_cache(parent, missing)
+            if pending.code == 'ancestor_headroom':
+                event = reclaim_ancestor(parent, pending)
+                print(json.dumps({'ancestor_reclaim': event}, sort_keys=True), file=sys.stderr)
+            else:
+                reclaim_cache(parent, missing)
             continue
         sleep(delay)
         delay = min(delay * 2, 5.0)
@@ -302,8 +391,8 @@ def delegated_limits(policy):
     return parent, memory, pids, cpu
 
 
-def inspect(policy):
-    """Observe admission without enabling controllers, reclaiming or reserving."""
+def inspect(policy, prepare=False):
+    """Read-only by default; explicit preparation may reclaim ancestor cache."""
     def result(status, permits=False, **facts):
         return {'status':status,'permits_attempt':permits,'live_verified':False,**facts}
     try:
@@ -329,6 +418,16 @@ def inspect(policy):
     except BlockingIOError:
         return result('inspection-busy')
     except AdmissionRefused as error:
+        if prepare and error.code == 'ancestor_headroom':
+            event = reclaim_ancestor(parent, error)
+            # Exactly one fresh observation, even after EAGAIN or no progress.
+            try:
+                proof = headroom(parent, policy['memory_bytes'], available_memory())
+                return result('available', True, aggregate=aggregate, capacity=proof, reclaim=event)
+            except AdmissionRefused as after:
+                return result('capacity-exhausted', refusal=refusal_receipt(after), reclaim=event)
+            except Exception:
+                return result('inspection-unavailable', reclaim=event)
         return result('capacity-exhausted',refusal=refusal_receipt(error))
     except Exception as error:
         return result('inspection-unavailable',refusal=refusal_receipt(error))
@@ -437,8 +536,8 @@ def cleanup_receipt(receipt):
 
 if __name__=='__main__':
     import sys
-    if len(sys.argv)==3 and sys.argv[1]=='--inspect':
-        print(json.dumps(inspect(json.loads(sys.argv[2])),sort_keys=True))
+    if len(sys.argv)==3 and sys.argv[1] in ('--inspect', '--prepare'):
+        print(json.dumps(inspect(json.loads(sys.argv[2]), prepare=sys.argv[1]=='--prepare'),sort_keys=True))
         raise SystemExit(0)
     if len(sys.argv)!=3 or sys.argv[1]!='--cleanup':
         raise SystemExit('expected --cleanup receipt')

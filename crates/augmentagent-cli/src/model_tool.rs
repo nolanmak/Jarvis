@@ -181,6 +181,8 @@ mod tests {
         );
         assert_eq!(store.selected(Some("43")).unwrap(), None);
         assert_eq!(call("qwen")["result"]["isError"], true);
+        // #2213 — yolo is not a switchable profile.
+        assert_eq!(call("yolo")["result"]["isError"], true);
         assert_eq!(
             store.selected(Some("42")).unwrap(),
             Some(ProviderKind::Codex)
