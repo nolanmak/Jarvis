@@ -131,6 +131,7 @@ class HostMemoryFactsTests(unittest.TestCase):
                 resources.memory_defaults(physical, caps, reserve)
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'requires Linux child subreaper')
 class AdmissionPublicationTests(unittest.TestCase):
     """Exercise the real supervisor without delegated cgroups or a provider."""
     def start_supervisor(self):
@@ -195,6 +196,7 @@ class AdmissionPublicationTests(unittest.TestCase):
         self.assertEqual(receipt.read_bytes(), b'all-descendants-reaped\n')
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'requires Linux delegated cgroups')
 class ResourceTests(unittest.TestCase):
     def setUp(self):
         if resources.current_group().name != 'daemon':
@@ -347,6 +349,7 @@ class AdmissionDiagnosticTests(unittest.TestCase):
             self.assertNotIn('secret',json.dumps(receipt));self.assertNotIn('private',json.dumps(receipt))
         self.assertEqual(resources.refusal_receipt(PermissionError(13,'secret'))['errno'],13)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux child subreaper')
     def test_real_supervisor_refuses_before_dispatch_and_retains_safe_reason(self):
         import shutil
         with tempfile.TemporaryDirectory() as temporary:
@@ -521,6 +524,155 @@ class TransientAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'ceiling'):
                 self.run_reserve(parent,[never])
             self.assertFalse((parent/'memory.reclaim').exists())
+
+
+class AncestorCacheRecoveryTests(unittest.TestCase):
+    """Real hierarchical counters, fake kernel reclaim; no Linux writes."""
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.ancestor = self.root/'runtime.slice'; self.ancestor.mkdir()
+        self.parent = self.ancestor/'worker.service'; self.parent.mkdir()
+        self.leaf = self.parent/'daemon'; self.leaf.mkdir()
+        self.gib = 1024**3
+        for path, data in {
+            self.ancestor/'memory.max': str(10*self.gib),
+            self.ancestor/'memory.current': str(8*self.gib),
+            self.ancestor/'memory.stat': f'inactive_file {3*self.gib}\nactive_file {4*self.gib}\nfile_dirty 0\nfile_writeback 0\n',
+            self.parent/'memory.max': str(10*self.gib),
+            self.parent/'memory.current': str(128*1024**2),
+            self.parent/'cgroup.procs': '',
+            self.parent/'cgroup.controllers': 'cpu memory pids',
+            self.parent/'cgroup.subtree_control': 'cpu memory pids',
+            self.parent/'pids.max': '512', self.parent/'cpu.max': '200000 100000',
+            self.leaf/'memory.current': str(128*1024**2),
+        }.items(): path.write_text(data)
+        self.enterContext(patch.object(resources, 'CGROUP_ROOT', self.root, create=True))
+        self.enterContext(patch.object(resources, 'current_group', return_value=self.leaf))
+        self.enterContext(patch.object(resources, 'available_memory', return_value=12*self.gib))
+        self.enterContext(patch.object(resources, 'reclaim_stamp', return_value=self.root/'stamp', create=True))
+        self.writes = []
+        self.kernel_frees = True
+        self.reclaim_error = None
+        original = Path.write_text
+        def kernel(path, value, *args, **kwargs):
+            if path.name == 'cgroup.subtree_control': value = 'cpu memory pids'
+            if path.name == 'memory.reclaim':
+                self.writes.append((path, value))
+                self.assertEqual(path.parent, self.ancestor)
+                amount, option = value.split()
+                self.assertEqual(option, 'swappiness=0')
+                self.assertLessEqual(int(amount), 4*self.gib)
+                if self.kernel_frees:
+                    stats = resources.counters(self.ancestor/'memory.stat')
+                    inactive_freed = min(int(amount), stats.get('inactive_file', 0))
+                    stats['inactive_file'] -= inactive_freed
+                    stats['active_file'] -= int(amount) - inactive_freed
+                    current = int((self.ancestor/'memory.current').read_text())
+                    original(self.ancestor/'memory.current', str(current-int(amount)))
+                    original(self.ancestor/'memory.stat', ''.join(f'{k} {v}\n' for k,v in stats.items()))
+                if self.reclaim_error is not None:
+                    raise OSError(self.reclaim_error, 'synthetic')
+            return original(path, value, *args, **kwargs)
+        self.enterContext(patch.object(Path, 'write_text', kernel))
+        self.policy = {'memory_bytes': 6*self.gib, 'pids': 512, 'cpu_percent': 200}
+
+    def refuse(self):
+        with self.assertRaises(resources.AdmissionRefused) as caught:
+            resources.headroom(self.parent, 6*self.gib, 12*self.gib)
+        self.assertEqual(caught.exception.code, 'ancestor_headroom')
+        return caught.exception
+
+    def test_reserve_reclaims_limiting_ancestor_then_admits(self):
+        self.refuse()
+        with resources.reserve(self.parent, 6*self.gib, sleep=lambda _: self.fail('must retry immediately')) as proof:
+            self.assertEqual(proof['requested_bytes'], 6*self.gib)
+        self.assertEqual(self.writes, [(self.ancestor/'memory.reclaim', f'{4*self.gib} swappiness=0')])
+        self.assertEqual((self.ancestor/'memory.max').read_text(), str(10*self.gib))
+
+    def test_readonly_inspect_stays_readonly_but_preparation_recovers(self):
+        self.assertEqual(resources.inspect(self.policy)['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [])
+        self.assertFalse((self.root/'stamp').exists())
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'available', report)
+        self.assertEqual(report['reclaim']['before_current_bytes'], 8*self.gib)
+        self.assertEqual(report['reclaim']['after_current_bytes'], 4*self.gib)
+        self.assertEqual(report['reclaim']['status'], 'attempted')
+
+    def test_nonreclaimable_shortfall_never_writes(self):
+        (self.ancestor/'memory.stat').write_text('inactive_file 0\nactive_file 0\n')
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [])
+
+    def test_dirty_or_writeback_cache_does_not_justify_reclaim(self):
+        for key in ['file_dirty', 'file_writeback']:
+            with self.subTest(key=key):
+                (self.ancestor/'memory.stat').write_text(f'inactive_file {3*self.gib}\nactive_file {4*self.gib}\n{key} {4*self.gib}\n')
+                report = resources.inspect(self.policy, prepare=True)
+                self.assertEqual(report['status'], 'capacity-exhausted')
+                self.assertEqual(self.writes, [])
+
+    def test_no_progress_remains_refused_and_stamp_limits_fresh_observers(self):
+        self.kernel_frees = False
+        for _ in range(3):
+            report = resources.inspect(self.policy, prepare=True)
+            self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(report['reclaim']['status'], 'rate-limited')
+
+    def test_fresh_helper_processes_share_rate_limit(self):
+        helper = str(Path(__file__).parents[1]/'run-resource-scope.py')
+        code = f"""import importlib.util,json
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('resources',{helper!r})
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+m.CGROUP_ROOT=Path({str(self.root)!r})
+m.current_group=lambda:Path({str(self.leaf)!r})
+m.available_memory=lambda:12*1024**3
+m.reclaim_stamp=lambda group:Path({str(self.root/'stamp')!r})
+print(json.dumps(m.inspect({self.policy!r},prepare=True)))
+"""
+        statuses = []
+        for _ in range(2):
+            report = json.loads(subprocess.check_output([sys.executable, '-I', '-c', code], text=True))
+            self.assertEqual(report['status'], 'capacity-exhausted', 'fake kernel never frees pages')
+            statuses.append(report['reclaim']['status'])
+        self.assertEqual(statuses, ['attempted', 'rate-limited'])
+
+    def test_partial_or_denied_kernel_reclaim_does_not_authorize_admission(self):
+        import errno
+        self.kernel_frees = False
+        self.reclaim_error = errno.EAGAIN
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(report['reclaim']['errno'], errno.EAGAIN)
+        self.assertEqual(report['reclaim']['after_current_bytes'], 8*self.gib)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_rate_limit_expires_after_ten_minutes(self):
+        self.kernel_frees = False
+        for now in [1000, 1599, 1600]:
+            with patch.object(resources.time, 'monotonic', return_value=now):
+                resources.inspect(self.policy, prepare=True)
+        self.assertEqual(len(self.writes), 2)
+
+    def test_large_inactive_cache_can_recover_over_rate_limited_attempts(self):
+        (self.ancestor/'memory.current').write_text(str(10*self.gib))
+        (self.ancestor/'memory.stat').write_text(f'inactive_file {5*self.gib}\nactive_file {4*self.gib}\n')
+        for now, expected in [(1000, 'capacity-exhausted'), (1599, 'capacity-exhausted'), (1600, 'available')]:
+            with patch.object(resources.time, 'monotonic', return_value=now):
+                report = resources.inspect(self.policy, prepare=True)
+            self.assertEqual(report['status'], expected)
+        self.assertEqual([v for _,v in self.writes], [f'{4*self.gib} swappiness=0', f'{2*self.gib} swappiness=0'])
+
+    def test_reclaim_request_cannot_exceed_four_gib(self):
+        (self.ancestor/'memory.current').write_text(str(9*self.gib))
+        (self.ancestor/'memory.stat').write_text(f'inactive_file {self.gib}\nactive_file {6*self.gib}\n')
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [(self.ancestor/'memory.reclaim', f'{4*self.gib} swappiness=0')])
+        self.assertEqual(report['reclaim']['after_current_bytes'], 5*self.gib)
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

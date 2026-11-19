@@ -10,6 +10,7 @@ mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod web;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -785,6 +786,16 @@ enum Cmd {
         channel: u64,
         #[arg(long)]
         readiness: String,
+    },
+    /// Internal MCP server for web search and page fetch (non-native-web models).
+    #[command(hide = true)]
+    WebTool {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        tools: String,
+        #[arg(long)]
+        unfiltered: String,
     },
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
@@ -3197,6 +3208,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::WebTool { ref conversation, ref tools, ref unfiltered } = cli.cmd {
+        return web::tool::serve(conversation, tools, unfiltered == "1").await;
     }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
@@ -5933,6 +5947,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
@@ -12002,29 +12017,35 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        let answer = async {
-            let store = augmentagent_channel_core::model_selection::SelectionStore::new(
-                augmentagent_channel_core::model_selection::config_path());
-            let selected = match augmentagent_channel_core::native_session::CURRENT
-                .try_with(|session| session.provider()) {
-                Ok(provider) => Some(provider),
-                // #1292 — a surface turn (Slack) resolved its own
-                // conversation's selection; Discord keeps the channel lookup.
-                Err(_) => {
-                    match augmentagent_channel_core::model_selection::conversation_selection() {
-                        Some(selected) => selected,
-                        None => store.selected(
-                            ctx.channel_id
-                                .as_ref()
-                                .map(|channel| channel.get().to_string())
-                                .as_deref(),
-                        )?,
-                    }
+        // The dispatch override is resolved once, before the option set is
+        // final, so tools that depend on the model can be attached (#2202).
+        let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+            augmentagent_channel_core::model_selection::config_path());
+        let (selected, from_selection_store) = match augmentagent_channel_core::native_session::CURRENT
+            .try_with(|session| session.provider()) {
+            Ok(provider) => (Some(provider), false),
+            // #1292 — a surface turn (Slack) resolved its own
+            // conversation's selection; Discord keeps the channel lookup.
+            Err(_) => {
+                match augmentagent_channel_core::model_selection::conversation_selection() {
+                    Some(selected) => (selected, false),
+                    None => (store.selected(
+                        ctx.channel_id
+                            .as_ref()
+                            .map(|channel| channel.get().to_string())
+                            .as_deref(),
+                    )?, true),
                 }
-            };
-            augmentagent_channel_core::model_selection::SELECTED_PROFILE
-                .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
-        }.await;
+            }
+        };
+        // Qwen and GLM cannot run the native web tools. Only a Discord turn
+        // whose profile came from the model selection store gets the Jarvis
+        // web tools; unselected, Slack and native-session turns are unchanged.
+        if from_selection_store && matches!(selected, Some(augmentagent_channel_core::ProviderKind::Qwen | augmentagent_channel_core::ProviderKind::Glm)) {
+            web::tool::configure(&mut opts, ctx, false, true, &auth_bin);
+        }
+        let answer = augmentagent_channel_core::model_selection::SELECTED_PROFILE
+            .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await;
         if answer.is_ok() &&
             voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
             self.final_spoken_turns.insert(ctx.session_id.clone(), ());
