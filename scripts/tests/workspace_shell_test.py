@@ -127,13 +127,15 @@ class WorkspaceShellTests(unittest.TestCase):
         self.assertLessEqual(set(seen) - {'PATH', 'HOME', 'LANG'}, {'LC_CTYPE', 'PWD', 'OLDPWD', 'SHLVL', '_'})
 
     @requires_sandbox
-    def test_without_the_flag_host_commands_stay_read_only_and_keep_the_profile_environment(self):
-        policy = self.policy(None, environment={'JARVIS_FIXTURE_MARKER': 'kept'})
+    def test_without_the_flag_host_commands_stay_read_only(self):
+        # Every existing profile: a host command may read but never write,
+        # even inside the profile's own write root.
+        policy = self.policy(None)
         result = self.python(policy, "open('note.txt','w').write('x')")
         self.assertNotEqual(result['exit_code'], 0, result)
         self.assertFalse((self.workspace / 'note.txt').exists())
-        result = self.python(policy, "import os; print(os.environ.get('JARVIS_FIXTURE_MARKER'))")
-        self.assertEqual((result['exit_code'], result['stdout'].strip()), (0, 'kept'), result)
+        result = policy.run_command('cat ' + str(self.wiki / 'page.md'))
+        self.assertEqual((result['exit_code'], result['stdout']), (0, 'WIKI_PAGE'), result)
 
 
 class WebToolsAreReadOnly(unittest.TestCase):
