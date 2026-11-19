@@ -35,6 +35,20 @@ pub fn self_send_allowlist() -> Vec<String> {
     parse_self_send_allowlist(&std::env::var(SELF_SEND_ENV).unwrap_or_default())
 }
 
+/// Every address a loop may email: the env list plus the owner's own active
+/// connected mail accounts (#2256). Connecting an account is an owner action
+/// outside the agent's toolbelt, so the agent cannot widen this list.
+pub fn own_send_addresses(store: &Store, env_list: &str) -> Vec<String> {
+    let mut addresses = parse_self_send_allowlist(env_list);
+    for account in store.get_active_gmail_accounts().unwrap_or_default() {
+        let email = account.email.trim().to_ascii_lowercase();
+        if !email.is_empty() && !addresses.contains(&email) {
+            addresses.push(email);
+        }
+    }
+    addresses
+}
+
 /// One plain address, exactly as allowlisted. Anything that could name a
 /// second recipient (a list, a display name, whitespace) is refused.
 pub fn self_send_allowed(address: &str, allowlist: &[String]) -> bool {
@@ -193,7 +207,7 @@ pub(super) async fn email_findings(
 ) -> Result<Vec<String>, EmailError> {
     if !self_send_allowed(to, allowlist) {
         return Err(EmailError::Refused(format!(
-            "email delivery refused: `{to}` is not in {SELF_SEND_ENV}"
+            "email delivery refused: `{to}` is neither a connected mail account nor in {SELF_SEND_ENV}"
         )));
     }
     let Some(mailer) = mailer else {

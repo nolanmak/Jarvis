@@ -80,7 +80,7 @@ pub use loops::{
 pub use loops::{parse_create_args, validate_parsed};
 // #2246 — loop findings emailed to allowlisted owner addresses.
 pub use loops::{
-    parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
+    own_send_addresses, parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
     LoopMailer, SELF_SEND_ENV,
 };
 pub use nudge::NudgeScheduler;
