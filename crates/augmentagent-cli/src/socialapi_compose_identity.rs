@@ -38,6 +38,8 @@ pub(super) fn prepare_card(
 /// (the synthetic `compose:socialapi:dm:<conversation>` identity, with or
 /// without the per-card suffix), never the triage card for an inbound
 /// message, and never a card already armed with a send time.
+/// Cards created in the same millisecond keep their insertion order (ids are
+/// random, so ordering by id shuffled them).
 pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
     let base = format!("compose:socialapi:dm:{conversation}");
     let prefix = format!("{base}:");
@@ -47,7 +49,7 @@ pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result
             WHERE e.platform = 'socialapi' AND e.kind = 'dm' AND a.threadId = ?1
               AND a.status = 'pending' AND a.scheduledAtMs IS NULL
               AND (e.messageId = ?2 OR substr(e.messageId, 1, length(?3)) = ?3)
-            ORDER BY a.createdAt, a.id",
+            ORDER BY a.createdAt, a.rowid",
         )?;
         let rows = statement.query_map(
             augmentagent_store::rusqlite::params![conversation, base, prefix],
