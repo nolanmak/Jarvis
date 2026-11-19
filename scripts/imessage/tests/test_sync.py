@@ -323,6 +323,57 @@ class TestSync(unittest.TestCase):
             self.read_md("+15551234567"),
         )
 
+    def test_heic_photo_is_uploaded_as_jpeg_when_a_converter_is_configured(self):
+        local = self.root / "IMG_002.HEIC"
+        local.write_bytes(b"heicdata")
+        add_message(self.con, 1, 1, None, ns(1782475200), 1,
+                    cache_has_attachments=1)
+        self.con.execute(
+            "INSERT INTO attachment VALUES (1, 'image/heic', 'IMG_002.HEIC', ?)", (str(local),))
+        self.con.execute("INSERT INTO message_attachment_join VALUES (1, 1)")
+        self.con.commit()
+        uploads, convert_dir = [], self.root / "converted"
+
+        def converter(src, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"jpeg from " + Path(src).read_bytes())
+            return True
+
+        def upload(path, bucket, key):
+            uploads.append((Path(path).read_bytes(), key))
+            return True
+
+        s3 = {"bucket": "test-bucket", "uploader": upload,
+              "converter": converter, "convert_dir": convert_dir}
+        sync(self.db_path, self.out, self.state, s3=s3)
+        key = "conversations/+15551234567/attachments/1-IMG_002.jpg"
+        self.assertEqual(uploads, [(b"jpeg from heicdata", key)])
+        self.assertIn(f"[attachment: image/jpeg IMG_002.jpg s3://test-bucket/{key}]",
+                      self.read_md("+15551234567"))
+        # The converted copy is removed once uploaded.
+        self.assertEqual(list(convert_dir.iterdir()), [])
+
+    def test_heic_photo_is_uploaded_unchanged_when_conversion_fails_or_is_off(self):
+        for row, s3_extra in ((1, {}), (2, {"converter": lambda src, dest: False,
+                                             "convert_dir": self.root / "converted"})):
+            local = self.root / f"IMG_00{row}.heic"
+            local.write_bytes(b"heicdata")
+            add_message(self.con, row, 1, None, ns(1782475200 + row), 1,
+                        cache_has_attachments=1)
+            self.con.execute(
+                "INSERT INTO attachment VALUES (?, 'image/heic', ?, ?)",
+                (row, local.name, str(local)))
+            self.con.execute("INSERT INTO message_attachment_join VALUES (?, ?)", (row, row))
+            self.con.commit()
+            uploads = []
+            s3 = {"bucket": "test-bucket",
+                  "uploader": lambda p, b, k: uploads.append((p, k)) or True, **s3_extra}
+            sync(self.db_path, self.out, self.state, s3=s3)
+            key = f"conversations/+15551234567/attachments/{row}-IMG_00{row}.heic"
+            self.assertEqual(uploads, [(str(local), key)])
+            self.assertIn(f"[attachment: image/heic IMG_00{row}.heic s3://test-bucket/{key}]",
+                          self.read_md("+15551234567"))
+
     def test_failed_upload_retried_next_sync(self):
         local = self.root / "IMG_001.jpeg"
         local.write_bytes(b"jpegdata")

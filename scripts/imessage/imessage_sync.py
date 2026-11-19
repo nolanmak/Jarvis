@@ -51,6 +51,44 @@ def source_staleness(db_path, now=None, threshold=SOURCE_STALE_AFTER_S):
 # storing: uploading them cost more than half of every queue drain.
 SKIP_ATTACHMENT_SUFFIXES = (".pluginpayloadattachment",)
 
+# iPhone photos arrive as HEIC, which the drafting models cannot open. With a
+# converter configured they are uploaded as JPEG instead (#2332).
+CONVERT_SUFFIXES = (".heic", ".heif")
+
+
+def heic_to_jpeg(src, dest):
+    """Convert with macOS `sips`. True when `dest` was written."""
+    import subprocess
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    try:
+        done = subprocess.run(
+            ["sips", "-s", "format", "jpeg", str(src), "--out", str(partial)],
+            capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        done = None
+    if done is None or done.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        return False
+    partial.replace(dest)
+    return True
+
+
+def converted_attachment(local, att_id, name, s3):
+    """(path, name) of a JPEG copy of a HEIC attachment, or None when it is
+    not one, no converter is configured, or the conversion failed (the
+    original is then uploaded as before)."""
+    converter, convert_dir = s3.get("converter"), s3.get("convert_dir")
+    if not converter or not convert_dir or local.suffix.lower() not in CONVERT_SUFFIXES:
+        return None
+    new_name = Path(name or local.name).stem + ".jpg"
+    dest = Path(convert_dir) / f"{att_id}-{slugify(new_name)}"
+    if (dest.exists() and dest.stat().st_size > 0) or converter(local, dest):
+        return dest, new_name
+    return None
+
+
 UPLOAD_WORKERS = 8      # one `aws s3 cp` per file; the cold start dominates
 UPLOAD_BUDGET_S = 90.0  # leave the queue for the next run rather than overrun it
 
@@ -448,7 +486,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
     files. Returns counts: {'messages': n, 'conversations': n}.
 
     s3 = {'bucket': str, 'uploader': callable(path, bucket, key) -> bool}
-    enables attachment upload; failed uploads are retried on later runs via
+    enables attachment upload. Optional 'converter': callable(src, dest) ->
+    bool with 'convert_dir' uploads HEIC photos as JPEG; failed uploads are retried on later runs via
     state['pending_uploads'] (references are written up front — keys are
     deterministic)."""
     out_dir = Path(out_dir)
@@ -541,8 +580,12 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
         attach_lines = []
         for att_id, mime, name, filename in attachments:
-            line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             local = Path(filename).expanduser() if filename else None
+            if s3 and local and local.exists() and is_uploadable(local):
+                converted = converted_attachment(local, att_id, name, s3)
+                if converted:
+                    (local, name), mime = converted, "image/jpeg"
+            line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             if s3 and local and local.exists() and is_uploadable(local):
                 key = attachment_key(index[ident]["dir"], att_id, name)
                 line += f" s3://{s3['bucket']}/{key}"
@@ -581,6 +624,13 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         pending = drain_uploads(
             pending, s3["bucket"], s3["uploader"],
             deadline=time.monotonic() + UPLOAD_BUDGET_S)
+
+    # Converted copies are only needed until they are uploaded.
+    if s3 and s3.get("convert_dir") and Path(s3["convert_dir"]).is_dir():
+        waiting = {item["path"] for item in pending}
+        for copy in Path(s3["convert_dir"]).iterdir():
+            if str(copy) not in waiting:
+                copy.unlink(missing_ok=True)
 
     state["pending_uploads"] = pending
     state["synced_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
