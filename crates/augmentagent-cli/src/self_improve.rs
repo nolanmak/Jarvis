@@ -8490,7 +8490,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
             acceptance::readiness::Decision::Ready(evidence)=>evidence,
-            acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+            acceptance::readiness::Decision::Deferred(retry)=>return Ok(RunReport::held(format!("issue #{}: readiness retry scheduled; {}",issue.number,retry))),
         };
         scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
         readiness_decisions=Some(readiness);

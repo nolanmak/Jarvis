@@ -17,6 +17,8 @@ fn target(cp: &Checkpoint) -> bool {
             "acceptance_verifier_repair_exhausted"
                 | "acceptance_contract_invalid"
                 | "acceptance_failed"
+                // #2289: the old terminal summary state is never permanent.
+                | "acceptance_strategies_exhausted"
         ) || cp.next.action == ACTION)
 }
 pub(super) fn eligible(c: &Connection, id: &str, cp: &Checkpoint) -> Result<bool> {
@@ -240,6 +242,26 @@ mod tests {
             assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
             assert_eq!(after.model_calls, 0);
         }
+    }
+    #[test]
+    fn legacy_terminal_strategy_exhaustion_is_readmitted_for_the_next_cycle() {
+        // #2289: a row parked by the earlier terminal summary state is never
+        // permanent; normal acquisition admits it for the next strategy cycle.
+        let (_dir, mut store, id, binding) = held("acceptance_verifier_repair_exhausted");
+        let lease = store.claim(&id, "legacy", 5, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.next = NextAction {
+            reason: "acceptance_strategies_exhausted".into(),
+            action: "await_new_execution_inputs".into(),
+            eligible_at_ms: 0,
+        };
+        store.checkpoint(&lease, &cp, 6).unwrap();
+        store.release(&lease, 7).unwrap();
+        assert!(store.acceptance_escalation_pending(&id).unwrap());
+        assert!(store
+            .claim_productive_for_binding(&id, "next-cycle", 8, 100, &binding)
+            .unwrap()
+            .is_some());
     }
     #[test]
     fn restart_keeps_original_diagnostics_evidence_and_charges() {

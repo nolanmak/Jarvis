@@ -3,6 +3,8 @@
 //! callers still enforce authorization, review and CI policy before side effects.
 #[path="autoship_acceptance_escalation.rs"]
 pub(crate) mod acceptance_escalation;
+#[path="autoship_retry_policy.rs"]
+pub(crate) mod retry_policy;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]

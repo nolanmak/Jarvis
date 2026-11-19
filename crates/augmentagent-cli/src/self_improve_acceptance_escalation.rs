@@ -3,6 +3,7 @@
 //! reduced contract, owner grant or builder permission is manufactured here.
 use super::*;
 use crate::autoship_workflow::acceptance_escalation::{Material, ACTION};
+use crate::autoship_workflow::retry_policy::{self, Strategy};
 use augmentagent_channel_core::ProviderKind;
 
 #[async_trait::async_trait]
@@ -17,7 +18,10 @@ trait Backend: Sync {
         detail: &str,
         guard: &mut workflow::WorkflowGuard,
         provider: ProviderKind,
+        strategy: Option<(u32, Strategy)>,
     ) -> Result<Vec<u64>>;
+    /// `Some(at)` while this issue's rolling daily model budget is spent.
+    fn budget_reopens_at(&self, guard: &workflow::WorkflowGuard) -> Result<Option<i64>>;
     async fn summary(
         &self,
         repo: &Path,
@@ -42,9 +46,15 @@ impl Backend for Production {
         detail: &str,
         guard: &mut workflow::WorkflowGuard,
         p: ProviderKind,
+        strategy: Option<(u32, Strategy)>,
     ) -> Result<Vec<u64>> {
-        acceptance::readiness::decompose_unverifiable(repo, root, issue, criteria, detail, guard, p)
-            .await
+        acceptance::readiness::decompose_unverifiable(
+            repo, root, issue, criteria, detail, guard, p, strategy,
+        )
+        .await
+    }
+    fn budget_reopens_at(&self, guard: &workflow::WorkflowGuard) -> Result<Option<i64>> {
+        guard.daily_budget_reopens_at()
     }
     async fn summary(
         &self,
@@ -57,11 +67,29 @@ impl Backend for Production {
         publish_summary(repo, issue, guard, key, body).await
     }
 }
-fn strategy_key(material: &Material, provider: ProviderKind) -> Result<String> {
+fn strategy_key(material: &Material, provider: ProviderKind, cycle: u32) -> Result<String> {
+    // Cycle 0 keeps #2281's keys so its recorded outcomes still replay.
+    if cycle == 0 {
+        return Ok(amendment::digest(&serde_json::to_vec(&(
+            "acceptance-strategy-failed-v1",
+            &material.original.binding,
+            provider.name(),
+        ))?));
+    }
     Ok(amendment::digest(&serde_json::to_vec(&(
-        "acceptance-strategy-failed-v1",
+        "acceptance-strategy-failed-v2",
         &material.original.binding,
         provider.name(),
+        cycle,
+        retry_policy::strategy(cycle).name(),
+    ))?))
+}
+fn cycle_key(id: &str, material: &Material, cycle: u32) -> Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&(
+        "acceptance-strategy-cycle-exhausted-v1",
+        id,
+        &material.original.binding,
+        cycle,
     ))?))
 }
 fn failure_category(material: &Material) -> &'static str {
@@ -155,12 +183,46 @@ async fn execute_with(
         }
     }
     let detail = serde_json::to_string(&material)?;
+    // #2289: strategies never run out. Each exhausted cycle advances one rung
+    // of the ladder and schedules the next after a capped backoff.
+    let mut cycle = 0u32;
+    while cycle < 100_000 && guard.recorded_scope_stage_response(&cycle_key(guard.id(), &material, cycle)?)?.is_some() {
+        cycle += 1;
+    }
+    let rung = retry_policy::strategy(cycle);
+    let mut order = providers.to_vec();
+    if rung == Strategy::SwitchProvider {
+        order.reverse();
+    }
+    let strategy = (cycle > 0).then_some((cycle, rung));
+    let mut pending = false;
+    for provider in order.iter().copied() {
+        pending |= guard
+            .recorded_scope_stage_response(&strategy_key(&material, provider, cycle)?)?
+            .is_none();
+    }
+    if pending {
+        if let Some(at) = backend.budget_reopens_at(guard)? {
+            guard
+                .transition(
+                    crate::autoship_workflow::Stage::Scope,
+                    "acceptance_strategy_budget_wait",
+                    ACTION,
+                    at,
+                )
+                .await?;
+            return Ok(Some(RunReport::held(format!(
+                "Acceptance strategy {} waits for this issue's daily model budget; automatic retry queued",
+                rung.name()
+            ))));
+        }
+    }
     // Only cached, bounded completed-response failures consume a strategy.
     // Capacity, unknown native outcomes and remote publication failure retry
     // the same durable strategy without resetting its protected model budget.
     let mut waiting = false;
-    for provider in providers.iter().copied() {
-        let key = strategy_key(&material, provider)?;
+    for provider in order.iter().copied() {
+        let key = strategy_key(&material, provider, cycle)?;
         if guard.recorded_scope_stage_response(&key)?.is_some() {
             continue;
         }
@@ -169,7 +231,7 @@ async fn execute_with(
             continue;
         }
         match backend
-            .children(repo, root, issue, &criteria, &detail, guard, provider)
+            .children(repo, root, issue, &criteria, &detail, guard, provider, strategy)
             .await
         {
             Ok(children) if !children.is_empty() => {
@@ -240,44 +302,62 @@ async fn execute_with(
                 .into(),
         )));
     }
-    let key = amendment::digest(&serde_json::to_vec(&(
-        "acceptance-escalation-summary-v1",
-        guard.id(),
-        &material.original.binding,
-    ))?);
-    let category = failure_category(&material);
-    let body=format!("Autoship acceptance strategy summary\n\nBounded verifier correction and observable-child decomposition exhausted the configured independent providers. Original requirements, candidate, failure evidence and charges are preserved. No acceptance pass or approval was inferred, and no criterion was removed. This workflow can be reconsidered when execution inputs change.\n\nReason: {}. Failure category: {category}. Evidence reference: {}.\n\n<!-- jarvis-acceptance-escalation:{key} -->",material.original.next.reason,key);
-    // Intent before RPC; exact-body reconciliation makes a lost reply safe.
-    guard.record_scope_stage_response(&key, &body)?;
-    if backend
-        .summary(repo, issue, guard, &key, &body)
-        .await
-        .is_err()
-    {
-        guard
-            .transition(
-                crate::autoship_workflow::Stage::Scope,
-                "acceptance_summary_retry",
-                ACTION,
-                chrono::Utc::now().timestamp_millis() + 300_000,
-            )
-            .await?;
-        return Ok(Some(RunReport::held(
-            "Acceptance strategy summary outcome unconfirmed; automatic reconciliation queued"
-                .into(),
-        )));
+    if cycle == 0 {
+        let key = amendment::digest(&serde_json::to_vec(&(
+            "acceptance-escalation-summary-v1",
+            guard.id(),
+            &material.original.binding,
+        ))?);
+        let category = failure_category(&material);
+        let body=format!("Autoship acceptance strategy summary\n\nBounded verifier correction and observable-child decomposition did not yet succeed with the configured independent providers. Original requirements, candidate, failure evidence and charges are preserved. No acceptance pass or approval was inferred, and no criterion was removed. Autoship keeps retrying automatically with escalating strategies (re-scope with the failure evidence, switch provider, shrink to the smallest observable behavior, fresh attempt from current main) and capped backoff; no owner action is needed.\n\nReason: {}. Failure category: {category}. Evidence reference: {}.\n\n<!-- jarvis-acceptance-escalation:{key} -->",material.original.next.reason,key);
+        // Intent before RPC; exact-body reconciliation makes a lost reply safe.
+        // An intent recorded before #2289 keeps its exact original body.
+        let body = match guard.scope_stage_response(&key)? {
+            Some(recorded) => recorded,
+            None => {
+                guard.record_scope_stage_response(&key, &body)?;
+                body
+            }
+        };
+        if backend
+            .summary(repo, issue, guard, &key, &body)
+            .await
+            .is_err()
+        {
+            guard
+                .transition(
+                    crate::autoship_workflow::Stage::Scope,
+                    "acceptance_summary_retry",
+                    ACTION,
+                    chrono::Utc::now().timestamp_millis() + 300_000,
+                )
+                .await?;
+            return Ok(Some(RunReport::held(
+                "Acceptance strategy summary outcome unconfirmed; automatic reconciliation queued"
+                    .into(),
+            )));
+        }
     }
+    let delay = retry_policy::backoff_ms(cycle);
+    let next = retry_policy::strategy(cycle.saturating_add(1));
+    guard.record_scope_stage_response(
+        &cycle_key(guard.id(), &material, cycle)?,
+        &serde_json::json!({"version":1,"kind":"acceptance_strategy_cycle_exhausted","cycle":cycle,"strategy":rung.name(),"next_strategy":next.name(),"backoff_ms":delay}).to_string(),
+    )?;
     guard
         .transition(
             crate::autoship_workflow::Stage::Scope,
-            "acceptance_strategies_exhausted",
-            "await_new_execution_inputs",
-            0,
+            "acceptance_strategy_backoff",
+            ACTION,
+            chrono::Utc::now().timestamp_millis() + delay,
         )
         .await?;
-    Ok(Some(RunReport::held(
-        "Acceptance strategies exhausted; a redacted summary was posted on the issue".into(),
-    )))
+    Ok(Some(RunReport::held(format!(
+        "Acceptance strategy {} exhausted (cycle {cycle}); {} retries automatically in {} minutes",
+        rung.name(),
+        next.name(),
+        delay / 60_000
+    ))))
 }
 async fn publish_summary(
     repo: &Path,
@@ -366,6 +446,8 @@ mod tests {
         ready: AtomicBool,
         summary_fail: AtomicBool,
         posts: Mutex<Vec<String>>,
+        strategies: Mutex<Vec<(u32, &'static str, ProviderKind)>>,
+        budget: Mutex<Option<i64>>,
     }
     impl Fake {
         fn new(outcomes: Vec<ResultKind>) -> Self {
@@ -375,6 +457,8 @@ mod tests {
                 ready: AtomicBool::new(true),
                 summary_fail: AtomicBool::new(false),
                 posts: Mutex::new(vec![]),
+                strategies: Mutex::new(vec![]),
+                budget: Mutex::new(None),
             }
         }
     }
@@ -392,7 +476,10 @@ mod tests {
             detail: &str,
             _: &mut workflow::WorkflowGuard,
             p: ProviderKind,
+            strategy: Option<(u32, Strategy)>,
         ) -> Result<Vec<u64>> {
+            let (cycle, rung) = strategy.unwrap_or((0, Strategy::SplitObservableChildren));
+            self.strategies.lock().unwrap().push((cycle, rung.name(), p));
             assert!(issue
                 .body
                 .lines()
@@ -410,6 +497,9 @@ mod tests {
                 ResultKind::Transient => Err(anyhow::anyhow!("scripted provider outage")),
                 ResultKind::Children => Ok(vec![11, 12]),
             }
+        }
+        fn budget_reopens_at(&self, _: &workflow::WorkflowGuard) -> Result<Option<i64>> {
+            Ok(*self.budget.lock().unwrap())
         }
         async fn summary(
             &self,
@@ -654,11 +744,104 @@ mod tests {
         .snapshot(&id)
         .unwrap()
         .unwrap();
-        assert_eq!(s.checkpoint.next.reason, "acceptance_strategies_exhausted");
-        assert!(crate::autoship_workflow::awaits_initial_input(
+        // #2289: exhaustion is never terminal. The summary is posted once and
+        // the next strategy cycle is scheduled after a capped backoff.
+        assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_backoff");
+        assert_eq!(s.checkpoint.next.action, ACTION);
+        assert!(!crate::autoship_workflow::awaits_initial_input(
             &s.checkpoint
         ));
+        assert!(s.checkpoint.next.eligible_at_ms > chrono::Utc::now().timestamp_millis());
         assert_eq!(s.model_calls, 0);
+    }
+    fn snapshot(f: &Fixture, id: &str) -> crate::autoship_workflow::Snapshot {
+        crate::autoship_workflow::WorkflowStore::open(
+            &f.control.path().canonicalize().unwrap().join("workflow.db"),
+        )
+        .unwrap()
+        .snapshot(id)
+        .unwrap()
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn repair_exhaustion_escalates_strategy_with_capped_backoff_and_never_parks() {
+        let f = Fixture::new().await;
+        let mut g = f.held().await;
+        let id = g.id().to_owned();
+        let cycles = 7u32;
+        let fake = Fake::new(vec![ResultKind::Invalid; 2 * cycles as usize]);
+        for cycle in 0..cycles {
+            let before = chrono::Utc::now().timestamp_millis();
+            execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+                .await
+                .unwrap()
+                .expect("an exhausted cycle must report its scheduled retry");
+            let after = chrono::Utc::now().timestamp_millis();
+            g.finish().unwrap();
+            let s = snapshot(&f, &id);
+            assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_backoff", "cycle {cycle}");
+            assert_eq!(s.checkpoint.next.action, ACTION);
+            assert!(!crate::autoship_workflow::awaits_initial_input(&s.checkpoint));
+            let wait = s.checkpoint.next.eligible_at_ms;
+            assert!(
+                wait >= before + retry_policy::backoff_ms(cycle)
+                    && wait <= after + retry_policy::backoff_ms(cycle),
+                "cycle {cycle} backoff is not capped exponential"
+            );
+            assert!(wait - after <= retry_policy::BACKOFF_CAP_MS);
+            // Not claimable early; claimable once the backoff elapses.
+            g = f.acquire_at(wait).await;
+        }
+        g.finish().unwrap();
+        let seen = fake.strategies.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2 * cycles as usize, "every cycle made new attempts");
+        for cycle in 0..cycles {
+            let rungs: Vec<_> = seen.iter().filter(|(c, _, _)| *c == cycle).collect();
+            assert_eq!(rungs.len(), 2);
+            assert!(rungs.iter().all(|(_, name, _)| *name == retry_policy::strategy(cycle).name()));
+            let order: Vec<_> = rungs.iter().map(|(_, _, p)| *p).collect();
+            if retry_policy::strategy(cycle) == Strategy::SwitchProvider {
+                assert_eq!(order, vec![ProviderKind::Codex, ProviderKind::Claude]);
+            } else {
+                assert_eq!(order, PROVIDERS.to_vec());
+            }
+        }
+        assert_eq!(fake.posts.lock().unwrap().len(), 1, "one public summary, not one per cycle");
+    }
+    #[tokio::test]
+    async fn daily_model_budget_defers_the_next_cycle_without_model_calls_then_resumes() {
+        let f = Fixture::new().await;
+        let mut g = f.held().await;
+        let id = g.id().to_owned();
+        let fake = Fake::new(vec![ResultKind::Invalid, ResultKind::Invalid, ResultKind::Children]);
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap();
+        g.finish().unwrap();
+        let wait = snapshot(&f, &id).checkpoint.next.eligible_at_ms;
+        let reopen = wait + 3 * retry_policy::DAY_MS / 4;
+        *fake.budget.lock().unwrap() = Some(reopen);
+        let mut g = f.acquire_at(wait).await;
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        assert_eq!(fake.strategies.lock().unwrap().len(), 2, "spent budget made a model call");
+        let s = snapshot(&f, &id);
+        assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_budget_wait");
+        assert_eq!(s.checkpoint.next.action, ACTION);
+        assert_eq!(s.checkpoint.next.eligible_at_ms, reopen);
+        assert!(!crate::autoship_workflow::awaits_initial_input(&s.checkpoint));
+        *fake.budget.lock().unwrap() = None;
+        let mut g = f.acquire_at(reopen).await;
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        assert_eq!(fake.strategies.lock().unwrap()[2].0, 1, "budget wait resumed the next cycle");
+        assert_eq!(snapshot(&f, &id).checkpoint.next.action, "await_child_completion");
     }
     #[test]
     fn decomposition_cannot_reduce_owner_requirements_to_a_smaller_acceptance() {

@@ -33,6 +33,30 @@ are preserved. A new scope namespace is used only when there is no original
 qualification evidence after the last owner recovery. Otherwise original scope
 and witness identities remain required, and only model-repair budgets change.
 
+## Never parking for a decision (#2289)
+
+The readiness, scope and contract prompts say: when in doubt, assume the safe
+default and state it as an Assumed decision. Safe means conservative and
+reversible: a config flag that is default off for risky behavior, no spend, no
+new account dependency, no irreversible migration, configurable thresholds, and
+opt-in for user-facing behavior.
+
+`material_external_decision_missing` is no longer produced. The controller ranks
+routine alternatives by reversible, then default-off, then no new account.
+Unclassified (legacy) alternatives are read conservatively from their text. Any
+spend, credential, privacy or destructive wording counts as that effect. When
+every alternative carries such an effect, the assumption is recorded with an
+`escalation` and the comment adds **Owner decision needed**. The non-blocked
+parts still build behind a default-off flag, and none of the escalated
+alternatives is activated. Unclassified decisions are still re-prompted with
+the validator error. The final attempt accepts them as conservative assumptions.
+
+Readiness validation exhaustion no longer holds as `readiness_assessment_invalid`.
+It records the round and schedules `readiness_assessment_retry` / `retry_scope`
+with capped backoff (30 minutes doubling to 6 hours). It schedules
+`readiness_budget_wait` when the per-issue daily model budget is spent. The next
+round uses fresh attempt keys; round 0 keeps the existing keys.
+
 This is scheduling/model policy, not owner recovery or acceptance approval.
 Paused/manual workflows, lost checkout continuity, real qualification custody
 holds, and pending publication remain protected. New-policy exhaustion cannot

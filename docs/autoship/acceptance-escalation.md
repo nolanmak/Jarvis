@@ -39,9 +39,28 @@ Only after every configured strategy has returned a completed invalid result
 (or the request is already a bounded child) does the controller publish a fixed,
 redacted issue summary. The original diagnostics stay private. The comment intent
 and stable marker precede its RPC; retry scans for the exact body before posting
-again. A lost response leaves reconciliation runnable. After a confirmed summary,
-the parent waits for new execution inputs, preserving the original evidence and
-charges. Nothing is inferred to have passed, and no owner requirement is removed.
+again. A lost response leaves reconciliation runnable. Nothing is inferred to
+have passed, and no owner requirement is removed.
+
+## Never giving up (#2289)
+
+A confirmed summary is not terminal. Each exhausted cycle records an immutable
+`acceptance_strategy_cycle_exhausted` response and schedules the next cycle as
+`acceptance_strategy_backoff` / `escalate_acceptance`. Cycles walk a repeating
+ladder: split into observable children (the #2281 rung above, cycle 0), re-scope
+from the failure evidence, switch provider order, shrink to the smallest
+observable first child, and a fresh plan from current main. Every rung still
+requires all original criteria verbatim. Later cycles use fresh strategy and
+decomposition keys. Cycle 0 keeps #2281's keys so its recorded outcomes replay.
+The summary is posted once, not once per cycle.
+
+Backoff is 30 minutes and doubles per cycle, capped at 6 hours. Before a cycle
+spends a model call, the per-issue rolling 24-hour model budget is checked
+(`AUTOSHIP_DAILY_MODEL_CALLS`, default 48). A spent budget waits as
+`acceptance_strategy_budget_wait` until the oldest charge ages out. A legacy
+`acceptance_strategies_exhausted` row is admitted to the next cycle
+automatically. Only closing the issue or an owner pause stops the loop, and
+backoff rows yield to fresh work through their `eligible_at` time.
 
 Owner pause, live leases, checkout identity, original native custody, uncertain
 publication operations, and family resource policy still fence dispatch. The

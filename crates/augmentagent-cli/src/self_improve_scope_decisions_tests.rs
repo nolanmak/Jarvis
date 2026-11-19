@@ -57,13 +57,77 @@ fn only_all_sensitive_alternatives_escalate() {
         default_off: false,
         new_account_dependency: false,
     }));
-    assert!(assumptions(&a, true).unwrap().is_empty());
+    // #2289: the owner is told, but the flagged-off parts still build.
+    let built = assumptions(&a, false).unwrap();
+    assert_eq!(built.len(), 1, "an escalation must not park the workflow");
+    let escalation = built[0].escalation.as_deref().unwrap();
+    assert!(escalation.contains("spend") && escalation.contains("credentials"));
+    assert!(built[0].decision.contains("default-off flag"));
+    assert!(built[0].decision.contains("Enable paid external backend"));
+    assert!(built[0].decision.contains("Publish sensitive records"));
     assert_eq!(
         super::super::validate(&a, "synthetic request", &BTreeMap::new())
             .unwrap()
             .len(),
-        1
+        1,
+        "the escalation is still reported to the owner"
     );
+}
+#[test]
+fn missing_decision_proceeds_with_the_most_conservative_recorded_assumption() {
+    let mut a = assessment();
+    let Slot::ExternalDecision { alternatives, .. } = a.slots.get_mut("rollout").unwrap() else {
+        unreachable!()
+    };
+    // Unclassified legacy output still proceeds with a conservative pick.
+    *alternatives = vec![
+        "Enable the hosted service with a new paid account and API key".into(),
+        "Keep the existing local path with the integration disabled by default".into(),
+    ];
+    let picked = assumptions(&a, false).unwrap();
+    assert_eq!(picked.len(), 1);
+    assert!(picked[0].decision.starts_with("Keep the existing local path"));
+    assert!(picked[0].escalation.is_none());
+    // A routine choice that is not default-off no longer fails validation;
+    // the most conservative routine option wins and is constrained.
+    let Slot::ExternalDecision { alternatives, .. } = a.slots.get_mut("rollout").unwrap() else {
+        unreachable!()
+    };
+    *alternatives = vec![
+        Alternative::Classified(Choice {
+            decision: "Turn the new behavior on for everyone".into(),
+            effects: vec![],
+            reversible: false,
+            default_off: false,
+            new_account_dependency: false,
+        }),
+        Alternative::Classified(Choice {
+            decision: "Ship it behind a disabled flag".into(),
+            effects: vec![],
+            reversible: true,
+            default_off: true,
+            new_account_dependency: false,
+        }),
+    ];
+    let picked = assumptions(&a, false).unwrap();
+    assert_eq!(picked[0].decision, "Ship it behind a disabled flag");
+    assert!(super::super::validate(&a, "synthetic request", &BTreeMap::new())
+        .unwrap()
+        .is_empty());
+    let Slot::ExternalDecision { alternatives, .. } = a.slots.get_mut("rollout").unwrap() else {
+        unreachable!()
+    };
+    alternatives.remove(1);
+    alternatives.push(Alternative::Classified(Choice {
+        decision: "Buy the hosted plan".into(),
+        effects: vec![Effect::Spend],
+        reversible: true,
+        default_off: false,
+        new_account_dependency: true,
+    }));
+    let picked = assumptions(&a, false).unwrap();
+    assert_eq!(picked[0].decision, "Turn the new behavior on for everyone");
+    assert_eq!(picked[0].constraints, CONSTRAINTS, "constraints keep it reversible and default-off");
 }
 #[test]
 fn unknown_or_unsafe_routine_classification_is_a_validator_error() {
@@ -207,9 +271,34 @@ else:raise AssertionError(a)
         .as_str()
         .unwrap()
         .starts_with("Assumed decision"));
+    assert!(!comments[0]["body"].as_str().unwrap().contains("Owner decision needed"));
+    // #2289: an all-sensitive decision is escalated in the same visible
+    // record, and the flagged-off parts still proceed.
+    let mut sensitive = assessment();
+    let Slot::ExternalDecision { alternatives, .. } = sensitive.slots.get_mut("rollout").unwrap() else {
+        unreachable!()
+    };
+    alternatives.remove(0);
+    alternatives.push(Alternative::Classified(Choice {
+        decision: "Rotate production credentials".into(),
+        effects: vec![Effect::Credentials],
+        reversible: false,
+        default_off: false,
+        new_account_dependency: false,
+    }));
+    let escalated = record(&repo, AcceptanceSource::Issue(7), &guard, &sensitive)
+        .await
+        .unwrap();
+    assert_eq!(escalated.len(), 1);
+    let comments: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(root.join("comments.json")).unwrap()).unwrap();
+    assert_eq!(comments.len(), 2);
+    let body = comments[1]["body"].as_str().unwrap();
+    assert!(body.starts_with("Assumed decision"));
+    assert!(body.contains("Owner decision needed") && body.contains("credentials"));
     let conn = rusqlite::Connection::open(&path).unwrap();
     let count:i64=conn.query_row("SELECT COUNT(*) FROM scope_stage_response WHERE json_extract(response,'$.kind')='assumed_decision'",[],|r|r.get(0)).unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     assert_eq!(guard.binding().head.len(), 40);
     guard.finish().unwrap();
 }

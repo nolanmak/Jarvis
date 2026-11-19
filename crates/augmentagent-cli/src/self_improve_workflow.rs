@@ -1823,6 +1823,11 @@ impl WorkflowGuard {
         )
     }
 
+    /// `Some(at)` while this issue's rolling daily retry model budget is spent.
+    pub(super) fn daily_budget_reopens_at(&self)->Result<Option<i64>> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .daily_budget_reopens_at(self.id(),millis(),durable::retry_policy::daily_model_calls())
+    }
     pub(super) async fn begin_acceptance_escalation(&mut self)->Result<Option<durable::acceptance_escalation::Material>> {
         self.validate_before_side_effect()?;self.audit_health().await?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
