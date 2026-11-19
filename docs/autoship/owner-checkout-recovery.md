@@ -14,6 +14,26 @@ checkouts, attached PRs, publication/check/merge stages, explicit Held stages,
 and terminal workflows retain their separate recovery paths. The command does
 not turn any of those cases into a restart by changing their checkpoint.
 
+### Automatic re-establishment for scope-stage work (#2349)
+
+Scope-stage work does not need the old checkout when its recorded checkout
+path no longer exists. This covers Intake `scope` and Scope steps
+`scope_request`, `retry_scope`, `rescope_executable_acceptance` and
+`await_capacity`. The picker selects the workflow. Preparation then fetches
+main and appends an audited `checkout_continuity_reestablished` event with the
+old receipt identity and the new worktree, branch, base and repository. It then
+moves the issue branch to current main, renames the old receipt to
+`<receipt>.superseded-<ms>` and creates a fresh checkout. The next lease-fenced
+claim enrolls the new identity. The checkpoint, binding, generation and spend
+are left unchanged.
+
+This needs no command. It is refused, and the hold remains, in these cases:
+the path still exists (a replaced checkout), the branch has commits not on
+main, a PR is attached, an owner recovery is active, the owner has paused the
+workflow, or an operation is pending. Build, verify, review, reconcile and
+publication stages, verifier evidence recovery and acceptance escalation keep
+the #2224 hold. Use the owner command below for them.
+
 Run the displayed command from the production controller checkout, with an owner
 reason and a stable request ID. For example (synthetic repository):
 
