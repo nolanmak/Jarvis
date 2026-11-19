@@ -1,5 +1,7 @@
 //! Auto-ship's process lifetime is independent of the serving daemon. The
 //! worker finishes its current tick before loading a replacement executable.
+//! A new executable, configuration or updater build stamp (#2303) is noticed
+//! within seconds while idle; the worker then exits 75 for its supervisor.
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
@@ -21,6 +23,8 @@ pub struct UpgradeWatch {
     path: PathBuf,
     identity: (u64, u64),
     configuration:Vec<(PathBuf,Option<ConfigurationStamp>)>,
+    /// #2303: the updater's build stamp and the commit it named at startup.
+    deployment:Option<(PathBuf,Option<String>)>,
 }
 type ConfigurationStamp=(u64,u64,u64,String);
 fn configuration_stamp(path:&Path)->Result<Option<ConfigurationStamp>> {
@@ -42,6 +46,21 @@ fn configuration_stamp(path:&Path)->Result<Option<ConfigurationStamp>> {
     } else {String::new()};
     Ok(Some((m.dev(),m.ino(),m.len(),content)))
 }
+/// The commit the updater last deployed (`built-commit`). It is written only
+/// after a verified deploy, so it is the deploy signal even when the watched
+/// executable path was not replaced. Absent, empty or unreadable names no
+/// deploy: a withdrawn stamp is never a reason to restart.
+fn deployment_stamp(path:&Path)->Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text)=>Some(text.trim().to_string()).filter(|commit|!commit.is_empty()),
+        Err(error)=>{
+            if error.kind()!=std::io::ErrorKind::NotFound {
+                tracing::warn!(path=%path.display(),"build stamp unreadable; not treated as a deploy: {error}");
+            }
+            None
+        }
+    }
+}
 impl UpgradeWatch {
     pub fn current() -> Result<Self> {
         let path = std::env::current_exe()?;
@@ -55,11 +74,20 @@ impl UpgradeWatch {
         let mut paths=vec![config.join("augmentagent/autoship-native.env")];
         if let Some(policy)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") {paths.push(PathBuf::from(policy));}
         let configuration=paths.into_iter().map(|path|Ok((path.clone(),configuration_stamp(&path)?))).collect::<Result<Vec<_>>>()?;
-        Ok(Self {path,identity: (metadata.dev(), metadata.ino()),configuration})
+        // #2303: record the deploy this process started under, so only a
+        // later deploy (never the same stamp) requests a reload.
+        let deployment=crate::build_storage::state_dir().ok().map(|state|{
+            let stamp=state.join("built-commit");let seen=deployment_stamp(&stamp);(stamp,seen)});
+        Ok(Self {path,identity: (metadata.dev(), metadata.ino()),configuration,deployment})
     }
     pub fn changed(&self) -> Result<bool> {
         for (path,stamp) in &self.configuration {
             if &configuration_stamp(path)?!=stamp {return Ok(true);}
+        }
+        if let Some((stamp,seen))=&self.deployment {
+            if deployment_stamp(stamp).is_some_and(|commit|seen.as_deref()!=Some(commit.as_str())) {
+                return Ok(true);
+            }
         }
         match std::fs::metadata(&self.path) {
             Ok(m) => Ok(m.is_file() && (m.dev(), m.ino()) != self.identity),
@@ -75,7 +103,24 @@ impl UpgradeWatch {
             path: path.into(),
             identity: (m.dev(), m.ino()),
             configuration:Vec::new(),
+            deployment:None,
         }
+    }
+    #[cfg(test)]
+    pub fn with_deployment_stamp(mut self, stamp: &Path) -> Self {
+        self.deployment=Some((stamp.into(),deployment_stamp(stamp)));
+        self
+    }
+}
+
+/// The supervisor restarts the worker onto the deployed executable for this
+/// status (`RestartForceExitStatus=75`).
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+pub(crate) fn restart_code(result: &Result<()>) -> Option<i32> {
+    match result {
+        Err(error) if error.downcast_ref::<UpgradeRequested>().is_some() => Some(RESTART_EXIT_CODE),
+        _ => None,
     }
 }
 
@@ -139,19 +184,17 @@ pub async fn run(repo: PathBuf, dry_run: bool) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         cancelled.cancel();
     });
-    match worker
+    let result = worker
         .with_upgrade_watch(UpgradeWatch::current()?)
         .run(shutdown)
-        .await
-    {
-        Err(e) if e.downcast_ref::<UpgradeRequested>().is_some() => {
-            tracing::info!("{e}");
-            // The dedicated service treats this as an expected, forced
-            // restart. Disabled opt-in still returns zero and stays stopped.
-            std::process::exit(75)
-        }
-        result => result,
+        .await;
+    if let (Some(code), Err(e)) = (restart_code(&result), &result) {
+        tracing::info!("{e}");
+        // The dedicated service treats this as an expected, forced
+        // restart. Disabled opt-in still returns zero and stays stopped.
+        std::process::exit(code)
     }
+    result
 }
 
 #[cfg(test)]
@@ -218,5 +261,54 @@ mod tests {
         std::fs::write(&replacement, "new").unwrap();
         std::fs::rename(replacement, &file).unwrap();
         assert!(watch.changed().unwrap());
+    }
+    /// #2303: the updater writes `built-commit` only after a verified
+    /// deploy. That stamp is the deploy signal even when the executable path
+    /// the watch follows was not replaced.
+    #[test]
+    fn a_new_deployment_stamp_requests_a_reload_with_the_binary_unchanged() {
+        let t=tempfile::tempdir().unwrap();
+        let binary=t.path().join("worker");std::fs::write(&binary,"same executable").unwrap();
+        let stamp=t.path().join("built-commit");std::fs::write(&stamp,"aaaa\n").unwrap();
+        let watch=UpgradeWatch::at(&binary).with_deployment_stamp(&stamp);
+        assert!(!watch.changed().unwrap(),"the stamp this process started under is not a deploy");
+        std::fs::write(&stamp,"bbbb\n").unwrap();
+        assert!(watch.changed().unwrap(),"a new build stamp is a deploy to load");
+        // A first deploy on a fresh host: no stamp at startup, then one.
+        let fresh=t.path().join("fresh-stamp");
+        let watch=UpgradeWatch::at(&binary).with_deployment_stamp(&fresh);
+        assert!(!watch.changed().unwrap());
+        std::fs::write(&fresh,"cccc\n").unwrap();
+        assert!(watch.changed().unwrap(),"the first stamp ever written is a deploy too");
+    }
+    /// The replacement process records the stamp it started under, so the
+    /// same deploy can never restart it again: rewriting the same commit
+    /// (even as a new inode), a bare touch, withdrawal or truncation is not
+    /// a deploy.
+    #[test]
+    fn an_unchanged_or_withdrawn_stamp_never_requests_a_reload() {
+        let t=tempfile::tempdir().unwrap();
+        let binary=t.path().join("worker");std::fs::write(&binary,"same executable").unwrap();
+        let stamp=t.path().join("built-commit");std::fs::write(&stamp,"aaaa\n").unwrap();
+        let watch=UpgradeWatch::at(&binary).with_deployment_stamp(&stamp);
+        let rewritten=t.path().join("stamp.tmp");std::fs::write(&rewritten,"aaaa").unwrap();
+        std::fs::rename(&rewritten,&stamp).unwrap();
+        assert!(!watch.changed().unwrap(),"the same commit rewritten is not a new deploy");
+        std::fs::File::options().write(true).open(&stamp).unwrap()
+            .set_modified(std::time::SystemTime::now()+std::time::Duration::from_secs(60)).unwrap();
+        assert!(!watch.changed().unwrap(),"a touch is not a deploy");
+        std::fs::write(&stamp,"").unwrap();
+        assert!(!watch.changed().unwrap(),"a truncated stamp names no deploy");
+        std::fs::remove_file(&stamp).unwrap();
+        assert!(!watch.changed().unwrap(),"a withdrawn stamp names no deploy");
+    }
+    /// The process exit status is the supervisor contract: only a reload
+    /// boundary maps to the forced-restart status.
+    #[test]
+    fn only_a_reload_boundary_exits_with_the_restart_status() {
+        assert_eq!(restart_code(&Err(UpgradeRequested.into())),Some(75));
+        assert_eq!(restart_code(&Err(anyhow::Error::new(UpgradeRequested).context("tick"))),Some(75));
+        assert_eq!(restart_code(&Ok(())),None,"operator shutdown stays stopped");
+        assert_eq!(restart_code(&Err(anyhow::anyhow!("tick failed"))),None,"a fault is not a reload");
     }
 }
