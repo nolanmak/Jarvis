@@ -147,7 +147,13 @@ mod tests {
 
     #[test]
     fn unknown_token_is_rejected() {
-        assert!(resolve_token_in("in5h", ny(2026, 7, 20, 10, 0)).is_err());
+        let now = ny(2026, 7, 20, 10, 0);
+        // #2286 — `inNh`/`inNm` and `next-HHMM` are now generic token shapes,
+        // so `in5h` resolves; anything outside those shapes is still refused.
+        assert_eq!(resolve_token_in("in5h", now).unwrap(), now.timestamp_millis() + 5 * 3_600_000);
+        for token in ["soon", "in5x", "in0h", "next-25:00", "next-930", "tomorrow-noon"] {
+            assert!(resolve_token_in(token, now).is_err(), "{token}");
+        }
     }
 
     // ------------------------------------------------------------------
