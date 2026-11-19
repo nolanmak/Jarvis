@@ -3702,7 +3702,7 @@ async fn main() -> Result<()> {
                     // A second serve must preserve both live configuration
                     // evidence and the updater's matching isolation receipt.
                     if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
-                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                        warn!(%error, "could not publish auto-ship host mode; worker recovery will not attest this daemon");
                     }
                 }
                 Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
