@@ -154,6 +154,7 @@ impl FreshIssueControls {
             let Some(store)=self.store.as_ref() else{return Ok(None)};
             let id=durable::workflow_id(repository,issue.number)?;
             let Some(snapshot)=store.snapshot(&id)? else{return Ok(None)};
+            if store.scope_policy_pending(&id)? {return Ok(None);}
             if snapshot.pr.is_some() || !durable::awaits_initial_input(&snapshot.checkpoint) {return Ok(None);}
             let context=store.recovery_context(&id,&snapshot.checkpoint.binding)?
                 .context("held issue execution context unavailable")?;
@@ -1058,6 +1059,10 @@ impl WorkflowGuard {
         let snapshot = store
             .snapshot(&id)?
             .context("registered workflow missing")?;
+        // Only productive acquisition may migrate old scope holds. Owner
+        // turns intentionally run native work under a paused owner grant;
+        // reconciliation must preserve its original evidence and authority.
+        if mode==AcquireMode::Productive {store.reconsider_scope_policy(&lease,now)?;}
         // A new commit/contract invalidates approvals, not workflow ownership.
         // Preserve historical evidence in append-only events, not as current
         // receipts that a new build could accidentally reuse.

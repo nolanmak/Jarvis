@@ -281,8 +281,12 @@ impl CodexCliReasoner {
             declared file, command and integration operations. The tool workspace is {}. \
             Relative tool paths resolve there. Commands accept one executable and its arguments; \
             split compound shell operations into separate calls. Preserve ATTACH output markers \
-            verbatim when delivering original files. Use native web tools for declared web operations.",
-            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
+            verbatim when delivering original files.{}",
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default(),
+            // Profiles served by the Jarvis web tools (#2202) have no native web.
+            if opts.allowed_tools.iter().any(|tool| tool == "WebSearch") {
+                " Use native web tools for declared web operations."
+            } else { "" });
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
