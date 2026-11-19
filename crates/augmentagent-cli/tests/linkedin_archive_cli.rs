@@ -132,6 +132,96 @@ async fn command_dry_run_reads_exact_corpus_with_discovery_in_budget() {
     assert_eq!(server.received_requests().await.unwrap().len(), 56);
 }
 
+/// #2255: the command stops at the request budget, says when it may resume,
+/// and a second run before then sends nothing, discovery included.
+#[tokio::test]
+async fn paced_backfill_stops_at_the_request_budget_and_a_rerun_makes_no_requests() {
+    use augmentagent_channel_linkedin::{
+        archive::ArchiveReader,
+        backfill_pace::{Pacer, Pacing},
+    };
+    use augmentagent_store::Store;
+    use std::sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    };
+    use tokio_util::sync::CancellationToken;
+    use wiremock::{matchers::method, Mock, MockServer};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(support::respond)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(support::auth(), server.uri()).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let pacer = || {
+        let (now, advance) = (clock.clone(), clock.clone());
+        Pacer::with_parts(
+            Pacing {
+                delay_ms: 5000,
+                jitter_ms: 0,
+                hourly: 4,
+                daily: 300,
+            },
+            move || now.load(Ordering::SeqCst),
+            move |ms| {
+                advance.fetch_add(ms, Ordering::SeqCst);
+                Box::pin(async {})
+            },
+            |_| 0,
+        )
+    };
+    let cancel = CancellationToken::new();
+    let store = Store::open(file.path()).unwrap();
+    let first = command::backfill_paced(&reader, &store, None, 100, false, false, &cancel, Some(&pacer()))
+        .await
+        .unwrap();
+    assert_eq!(first["stopped"], "request_budget");
+    assert_eq!(first["pages"], 4);
+    assert_eq!(first["complete"], false);
+    assert_eq!(first["resume_at_ms"], 1_700_000_000_000_i64 + 3_600_000);
+    assert_eq!(first["resume_at"], "2023-11-14T23:13:20Z");
+    assert_eq!(first["reports"][0]["stopped"], "request_budget");
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert_eq!(clock.load(Ordering::SeqCst), 1_700_000_015_000, "three paced gaps");
+
+    drop(store);
+    let store = Store::open(file.path()).unwrap();
+    let second = command::backfill_paced(&reader, &store, None, 100, false, false, &cancel, Some(&pacer()))
+        .await
+        .unwrap();
+    assert_eq!(second["stopped"], "request_budget");
+    assert_eq!(second["pages"], 0);
+    assert_eq!(second["resume_at_ms"], first["resume_at_ms"]);
+    assert_eq!(second["reports"].as_array().unwrap().len(), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+
+    // Once the window reopens the import carries on from its checkpoint.
+    clock.store(1_700_000_000_000 + 2 * 3_600_000, Ordering::SeqCst);
+    let third = command::backfill_paced(&reader, &store, None, 100, false, false, &cancel, Some(&pacer()))
+        .await
+        .unwrap();
+    assert_eq!(third["pages"], 4);
+    assert_eq!(server.received_requests().await.unwrap().len(), 8);
+    assert_eq!(third["reports"][0]["coverage"]["mailbox_pages"]["committed"], 3);
+}
+
+#[test]
+fn backfill_pacing_flags_default_to_a_slow_read_and_reject_a_zero_budget() {
+    let pacing = command::pacing(5, 60, 300);
+    assert_eq!(
+        (pacing.delay_ms, pacing.jitter_ms, pacing.hourly, pacing.daily),
+        (5000, 5000, 60, 300)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .args(["linkedin", "backfill", "--dry-run", "--hourly-requests", "0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--hourly-requests"));
+}
+
 #[tokio::test]
 async fn status_binary_reports_thread_progress_errors_and_index_backlog_offline() {
     use augmentagent_channel_linkedin::{archive::ArchiveReader, archive_store, archive_sync};

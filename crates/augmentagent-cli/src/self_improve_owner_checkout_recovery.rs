@@ -17,7 +17,7 @@ pub(super) fn candidate(
     let Some(s) = store.snapshot(&id)? else {
         return Ok(None);
     };
-    if s.pr.is_some() || !crate::autoship_workflow::awaits_initial_input(&s.checkpoint) {
+    if s.pr.is_some() || !crate::autoship_workflow::owner_checkout_recovery::restartable(&s.checkpoint) {
         return Ok(None);
     }
     let Some(c) = store.recovery_context(&id, &s.checkpoint.binding)? else {

@@ -88,7 +88,7 @@ mod coverage;
 #[path = "loop_delivery.rs"]
 mod delivery;
 pub use delivery::{
-    parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
+    own_send_addresses, parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
     LoopMailer, SELF_SEND_ENV,
 };
 #[cfg(test)]
@@ -816,7 +816,7 @@ impl LoopScheduler {
                 let duplicate = !l.nag_until_ack && !findings.is_empty() && fresh.is_empty();
                 let quiet = !l.nag_until_ack && options.quiet_when_empty && empty_complete;
                 if let Some(to) = options.email_to.as_deref().filter(|_| !fresh.is_empty()) {
-                    let allowlist = self.self_send.clone().unwrap_or_else(delivery::self_send_allowlist);
+                    let allowlist = self.self_send.clone().unwrap_or_else(|| delivery::own_send_addresses(&self.store, &std::env::var(SELF_SEND_ENV).unwrap_or_default()));
                     match delivery::email_findings(&self.store, self.mailer.as_ref(), &allowlist, l, &options, to, &request_id, &fresh).await {
                         Ok(subjects) => answer = delivery::receipt(to, &subjects),
                         Err(delivery::EmailError::Refused(reason)) => {

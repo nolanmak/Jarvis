@@ -9,6 +9,14 @@ pub(super) const SCHEMA:&str="CREATE TABLE IF NOT EXISTS owner_checkout_recovery
  base TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS active_checkout_recovery(workflow TEXT PRIMARY KEY,request_id TEXT NOT NULL REFERENCES owner_checkout_recovery(request_id));";
 
+/// Stage eligibility only; the adapter must still prove lost custody and owner
+/// authority. Publication and terminal/explicitly held workflows retain their
+/// separate recovery paths even when their physical checkout is unavailable.
+pub(crate) fn restartable(checkpoint: &Checkpoint) -> bool {
+    matches!(checkpoint.stage,
+        Stage::Intake | Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct OwnerCheckoutRecovery {
     pub request_id: String,
@@ -95,8 +103,8 @@ impl WorkflowStore {
             "explicit-owner-hold"
         );
         ensure!(
-            awaits_initial_input(&plan.original.checkpoint),
-            "not-an-initial-input-hold"
+            restartable(&plan.original.checkpoint),
+            "not-a-prepublication-checkout"
         );
         ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",[&plan.workflow],|r|r.get::<_,bool>(0))?,"pending-workflow-operation");
         let issue = plan

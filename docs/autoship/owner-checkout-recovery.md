@@ -1,10 +1,18 @@
-# Recover a held issue after checkout continuity loss
+# Recover an issue after checkout continuity loss
 
 `augmentagent autopr readopt --list --json` includes `continuity_lost`
 candidates and a per-issue `action` command. Listing is read-only and provisional:
 execution rechecks GitHub authorization, open state, manual routing, owner pause,
 checkout custody and lease state. Intact checkouts are not recovery candidates.
 Malformed or missing custody records do not authorize recovery.
+
+A recognized acceptance hold or `agent-gave-up` label is not required. An
+unpublished issue workflow at Intake, Scope, Build, Verify, Review or Reconcile
+can be recovered when its recorded checkout continuity is lost. This includes
+material-decision dependency waits and ordinary retry checkpoints. Intact
+checkouts, attached PRs, publication/check/merge stages, explicit Held stages,
+and terminal workflows retain their separate recovery paths. The command does
+not turn any of those cases into a restart by changing their checkpoint.
 
 Run the displayed command from the production controller checkout, with an owner
 reason and a stable request ID. For example (synthetic repository):
@@ -20,7 +28,7 @@ archive in `owner_checkout_recovery`. It retains the exact checkpoint TEXT,
 original snapshot/context, original receipt path and bytes, and original readiness
 dependency evidence. Existing scope responses, execution contexts, events,
 receipt files, checkout and branch content remain untouched. The append-only
-`superseded_by_owner_recovery` event links the prior hold to its archive/request;
+`superseded_by_owner_recovery` event links the prior checkpoint to its archive/request;
 only the live workflow scheduling projection advances to Intake.
 
 The next ordinary picker/claim uses a separate request-specific branch and

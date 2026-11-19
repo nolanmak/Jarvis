@@ -20,6 +20,13 @@ someone asked about pricing, and email yourself one note per person.
 
 ## Setup
 
+The quickest way is to ask the agent: "watch my messages for people asking
+about pricing and email me about each one". It runs `augmentagent loop guide`,
+asks for anything missing, writes the criteria page, shows you a preview of
+what the scan would report, and creates the loop once you agree.
+
+To do it by hand:
+
 1. Write the criteria as a page in your wiki, for example
    `scans/pricing-questions.md`:
 
@@ -34,11 +41,15 @@ someone asked about pricing, and email yourself one note per person.
    - body: who they are, what they asked, and where
    ```
 
-2. To email findings, list your own address in `.env` and restart the daemon:
+2. Pick where findings go. Any of your connected mail accounts works with no
+   further setup. To use an address that is not a connected account, list it
+   in `.env` and restart the daemon:
 
    ```bash
    AUGMENTAGENT_LOOP_SELF_SEND_ADDRESSES=you@example.com
    ```
+
+   `augmentagent loop guide` ends with the addresses allowed right now.
 
 3. Create the loop, or ask the agent to:
 
@@ -85,12 +96,14 @@ The daemon sends the emails. The model never gets a way to send mail
 unattended, and interactive requests still draft first and wait for your
 confirmation.
 
-- **One address, on your list.** A loop can send only to the single address it
-  was created with, and only while that address is in
+- **One address, and it must be yours.** A loop can send only to the single
+  address it was created with, and only while that address is one of your
+  active connected mail accounts or is listed in
   `AUGMENTAGENT_LOOP_SELF_SEND_ADDRESSES`. There is no cc or bcc. The address
   is checked when the loop is created and again before every send, so
-  removing it from the list stops delivery. An unset or empty list turns the
-  feature off.
+  disconnecting the account or removing it from the list stops delivery. The
+  agent cannot add an address: connecting a mailbox and editing `.env` are
+  both outside its tools.
 - **One email per new finding.** The subject is the finding line. The body is
   the finding's `body`, then its evidence, then a reference line naming the
   loop.
@@ -117,6 +130,6 @@ mail. The skip is recorded as the `loop_delivery` guard.
 | Situation | Result |
 |---|---|
 | Prompt file missing, empty, or outside the wiki | The run fails without a model call; the reason is the loop's last status |
-| Address not on the allowlist, or no mail account | The run fails with `email delivery refused: …`; nothing is sent |
+| Address neither a connected account nor on the list, or no mail account | The run fails with `email delivery refused: …`; nothing is sent |
 | Mail provider error | Delivery is retried with backoff; the model is not called again |
 | Run returns prose instead of a report | Posted to the channel as usual; nothing is emailed |
