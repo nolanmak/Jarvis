@@ -12162,6 +12162,22 @@ impl QueryHandler for WikiQuerier {
         Some(origin)
     }
 
+    async fn owner_text_command(
+        &self,
+        cx: augmentagent_approval_discord::owner_text::OwnerCommandCtx,
+        text: &str,
+    ) -> Option<augmentagent_approval_discord::owner_text::OwnerCommandOutcome> {
+        // #2208 — `/search`: configuration only, never a vendor call.
+        let (availability, _) = web::availability(&augmentagent_channel_core::secret_loader::load_provider_key);
+        web::command::run(
+            text,
+            &cx.channel_id.to_string(),
+            &web::pins::PinStore::new(web::pins::config_path()),
+            &availability,
+        )
+        .map(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply)
+    }
+
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
         use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
         let store = SelectionStore::new(config_path());

@@ -6,12 +6,15 @@
 #![allow(dead_code)] // wired into turns by #2202
 
 pub mod pins;
+pub mod command;
 pub mod providers;
 pub mod tool;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tool_tests;
+#[cfg(test)]
+mod command_tests;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

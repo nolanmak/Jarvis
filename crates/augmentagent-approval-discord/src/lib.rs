@@ -15,6 +15,7 @@ pub mod imessage_owner_control;
 pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
+pub mod owner_text;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
@@ -583,6 +584,18 @@ pub trait QueryHandler: Send + Sync {
         text: &str,
     ) -> Option<String> {
         self.model_command(channel_id, text).await
+    }
+
+    /// #2208 — owner text commands other than `/model` (`/search`). Called
+    /// after the owner allowlist check and before attachment download or
+    /// history collection. `Some` for every message whose first token is a
+    /// command this handler owns, valid or not; `None` for anything else.
+    async fn owner_text_command(
+        &self,
+        _cx: owner_text::OwnerCommandCtx,
+        _text: &str,
+    ) -> Option<owner_text::OwnerCommandOutcome> {
+        None
     }
 
     /// Model selected for a new scheduled loop in this conversation.
