@@ -102,3 +102,11 @@ qualification or checkpoint update. If execution fails before claim, that issue
 cools down for five minutes and yields to untouched owners/eligible peers. It
 then retries automatically. Dry-run selection reads this schedule without
 writing it. Changing to a new owner request uses a separate reservation history.
+
+Owner priority is bounded (#2317). After three owner turns that leave the
+workflow at the same scoping hold (no checkpoint past Scope since), the hold
+loses its priority and rotates behind peers. Its cooldown doubles per further
+turn, capped at six hours. Owner command jobs (`autopr run --issue N`) get the
+same rule. Three consecutive attempts that end at the same stage, reason and
+action double the command lane's retry delay each further time. Real progress,
+a changed checkpoint, or a fresh owner submission restores ordinary turns.

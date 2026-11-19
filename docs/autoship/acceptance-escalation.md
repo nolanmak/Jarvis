@@ -88,3 +88,16 @@ merged. Those rows stay with the existing model-free closed-target sweep, which
 settles merged targets after its idle window. They must not generate new child
 issues or reopen merged code. The live unpublished issue holds use the new
 planning route. No production rows were edited to obtain this inventory.
+
+## Legacy repair-exhausted holds (#2317)
+
+Holds parked before #2289 still waited on `acceptance_verifier_repair_exhausted`
+/ `await_acceptance_input_change`, an input nothing will supply. The worker sweep
+moves each one into the ladder at cycle 0 (`acceptance_strategy_escalation` /
+`escalate_acceptance`). It writes an `acceptance_ladder_migrated` audit event with
+the complete prior checkpoint and the usual `acceptance_strategy_started` material,
+so a later claim resumes rather than restarts the strategy. Binding, evidence,
+generation, attempts, spend and leases are unchanged. PR workflows, owner-paused,
+leased, fenced or custody-unresolved rows are left alone. Each sweep moves at most
+eight rows. A read-only replay against a copy of the production store moved 24 of
+30. The rest are five PR workflows and one owner-paused issue.

@@ -6,9 +6,13 @@ pub(super) async fn migrate(root:&Path,dry_run:bool)->Result<usize> {
     let state=workflow::path();
     if WorkflowStore::open_read_only(&state)?.is_none() {return Ok(0);}
     let repository=workflow::canonical_repository(root).await?;
-    let count=WorkflowStore::open(&state)?.migrate_scope_policy(&repository,chrono::Utc::now().timestamp_millis())?;
+    let mut store=WorkflowStore::open(&state)?;
+    let count=store.migrate_scope_policy(&repository,chrono::Utc::now().timestamp_millis())?;
     if count>0 {info!(count,"reconsidered legacy scope holds under safe-default policy without model calls");}
-    Ok(count)
+    // #2317: holds parked before #2301's never-give-up ladder enter it once.
+    let ladder=store.migrate_repair_exhausted_to_ladder(&repository,chrono::Utc::now().timestamp_millis())?;
+    if ladder>0 {info!(count=ladder,"moved legacy repair-exhausted holds into the acceptance strategy ladder without model calls");}
+    Ok(count+ladder)
 }
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
