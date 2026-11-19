@@ -1,6 +1,7 @@
 //! Synthetic end-to-end picker fixtures: no providers or production state.
 use super::*;
 use crate::autoship_workflow::{Binding, NextAction, RecoveryContext, Stage, WorkflowStore};
+use sha2::{Digest, Sha256};
 
 fn git(root:&Path,args:&[&str])->String {
     let out=std::process::Command::new("git").args(args).current_dir(root).output().unwrap();
@@ -57,7 +58,7 @@ else:raise AssertionError(args)
             }
             if number==2 && case=="policy-upgrade" {
                 let request=serde_json::to_string(&(2,"Correct widget rounding","Original synthetic requirement.")).unwrap();
-                store.set_readiness_dependency(&lease,&binding,"fixture-owner/repo",2,Some((&amendment::digest(request.as_bytes()),&binding.head,"external_decision","synthetic preserved assessment")),at+1).unwrap();
+                store.set_readiness_dependency(&lease,&binding,"fixture-owner/repo",2,Some((&format!("{:x}",Sha256::digest(request.as_bytes())),&binding.head,"external_decision","synthetic preserved assessment")),at+1).unwrap();
             }
             store.checkpoint(&lease,&cp,at+2).unwrap();store.release(&lease,at+3).unwrap();
         }
