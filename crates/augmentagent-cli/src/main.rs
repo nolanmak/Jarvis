@@ -8371,6 +8371,8 @@ async fn run_socialapi_dm(
     // message, so there is no platform message id to key on. `compose:`
     // mirrors the gmail convention and can never collide with a real one.
     let message_id = format!("compose:socialapi:dm:{conversation_id}");
+    // #2331 — read before posting, so the new card is never in this list.
+    let prior = socialapi_compose_identity::pending_compose_cards(&store, &conversation_id)?;
     let action_id = post_social_approval_card(
         &store,
         augmentagent_channel_socialapi::PLATFORM,
@@ -8384,6 +8386,9 @@ async fn run_socialapi_dm(
         &draft,
     )
     .await?;
+    // Only once the replacement card is up, as `gmail compose` does: a failed
+    // post leaves the earlier card live.
+    let superseded = socialapi_compose_identity::supersede_prior_compose_cards(&store, &prior);
     if json {
         println!(
             "{}",
@@ -8392,10 +8397,17 @@ async fn run_socialapi_dm(
                 "conversation_id": conversation_id,
                 "subject": subject,
                 "approval_card_posted": true,
+                "superseded": superseded,
             })
         );
     } else {
         println!("approval card posted to Discord (action {action_id})");
+        if !superseded.is_empty() {
+            println!(
+                "replaced {} earlier pending DM card(s) for this conversation",
+                superseded.len()
+            );
+        }
     }
     Ok(())
 }
