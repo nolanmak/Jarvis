@@ -24,6 +24,28 @@ async fn fixture(test: &str, case: &str) {
     if let Some(root) = std::env::var_os(CHILD) {
         let root = PathBuf::from(root);
         let case = std::env::var("AUTOSHIP_ORIGIN_CASE").unwrap();
+        if case.starts_with("publish-") {
+            let remote=root.parent().unwrap().join("remote.git");
+            git(&root,&["init","--bare","-q",remote.to_str().unwrap()]);
+            git(&root,&["remote","set-url","--push","origin",remote.to_str().unwrap()]);
+            let before=git(&root,&["--git-dir",remote.to_str().unwrap(),"for-each-ref"]);
+            if case=="publish-no-alias" {
+                assert!(publish_smoke::probe(&root,"fixture-owner/current").await.is_err());
+                assert_eq!(git(&root,&["--git-dir",remote.to_str().unwrap(),"for-each-ref"]),before);
+                return;
+            }
+            publish_smoke::probe(&root,"fixture-owner/current").await.unwrap();
+            assert_eq!(git(&root,&["--git-dir",remote.to_str().unwrap(),"for-each-ref"]),before,"smoke published a ref");
+            let marker=root.parent().unwrap().join("pre-push-observed");
+            augmentagent_test_support::write_executable(&root.join(".git/hooks/pre-push"),
+                &format!("#!/bin/sh\nprintf observed > '{}'\nexit 1\n",marker.display())).unwrap();
+            assert!(publish_smoke::probe(&root,"fixture-owner/current").await.is_err(),"original push admission was bypassed");
+            assert!(marker.exists(),"real pre-push admission was not exercised");
+            assert_eq!(git(&root,&["--git-dir",remote.to_str().unwrap(),"for-each-ref"]),before);
+            git(&root,&["remote","set-url","origin","https://github.com/fixture-owner/unrelated.git"]);
+            assert!(publish_smoke::probe(&root,"fixture-owner/current").await.is_err(),"foreign alias accepted");
+            return;
+        }
         if case == "push" {
             let resolved = push_destination::Resolved::resolve(&root, "fixture-owner/current")
                 .await
@@ -214,7 +236,7 @@ os.execv('/usr/bin/git',['git',*args])
         .env("HOME", &root)
         .env(
             "AUGMENTAGENT_REPOSITORY_ALIASES",
-            serde_json::json!({"fixture-owner/current":[OLD]}).to_string(),
+            if case=="publish-no-alias" {"{}".into()}else{serde_json::json!({"fixture-owner/current":[OLD]}).to_string()},
         )
         .env("AUTOSHIP_ORIGIN_CASE", case)
         .env(CHILD, &repo)
@@ -254,4 +276,11 @@ async fn renamed_origin_migration_preserves_unproven_and_dirty_receipts() {
 #[tokio::test]
 async fn renamed_origin_alias_added_after_initial_v2_migration_is_safe() {
     fixture("self_improve::repository_identity_tests::renamed_origin_alias_added_after_initial_v2_migration_is_safe","late-alias").await;
+}
+
+#[tokio::test]
+async fn renamed_origin_publish_smoke_checks_real_push_admission_without_updating_refs() {
+    const TEST:&str="self_improve::repository_identity_tests::renamed_origin_publish_smoke_checks_real_push_admission_without_updating_refs";
+    if std::env::var_os("AUTOSHIP_ORIGIN_FIXTURE").is_some() {fixture(TEST,"child").await;return;}
+    for case in ["publish-smoke","publish-no-alias"] {fixture(TEST,case).await;}
 }
