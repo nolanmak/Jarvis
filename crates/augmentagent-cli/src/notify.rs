@@ -297,8 +297,8 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Replies, interaction responses and Discord-only posts ---------------
     // #1396's interrupted-turn notice stays `REPLY`: it posts in the owner
     // channel the dead turn came from, referencing the owner's own message.
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 10, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 8, REPLY, "query answers, command replies, interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 11, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 9, REPLY, "query answers, command replies, interrupted-turn notices"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "send_message(&", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),

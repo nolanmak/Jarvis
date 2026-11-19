@@ -555,6 +555,26 @@ impl EventHandler for Handler {
             }
             return;
         }
+        // #2208 — other owner text commands (`/search`). Same position and
+        // rules as the model command above: owner only, never model input.
+        let command_ctx = crate::owner_text::OwnerCommandCtx {
+            guild_id: msg.guild_id.map(|guild| guild.get()),
+            channel_id: msg.channel_id.get(),
+            message_id: msg.id.get(),
+            is_dm,
+        };
+        if let Some(outcome) = handler.owner_text_command(command_ctx, &user_text).await {
+            match outcome {
+                crate::owner_text::OwnerCommandOutcome::Reply(reply) => {
+                    let builder = CreateMessage::new().content(reply)
+                        .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+                    if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
+                        warn!("failed to post owner command reply: {error}");
+                    }
+                }
+            }
+            return;
+        }
         let AttachmentPartition {
             images,
             text_files,
@@ -2959,6 +2979,7 @@ struct HistoryTurn {
 
 fn is_model_control_text(text: &str) -> bool {
     matches!(text.split_whitespace().next(), Some("/model" | "model"))
+        || crate::owner_text::is_owner_text_command(text)
 }
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
@@ -4026,6 +4047,27 @@ mod tests {
         assert!(history.contains("> /model set glm is quoted text"), "{history}");
         assert!(history.contains("/models is a different word"), "{history}");
         assert!(history.contains("What did I ask you to remember?"), "{history}");
+    }
+
+    #[test]
+    fn search_commands_and_their_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "Find the lantern vendor".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "user", body: "/search provider exa".into(), id: 2, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Search and fetch pinned to exa".into(), id: 3, reply_to: Some(2) },
+            HistoryTurn { role: "user", body: "/search nonsense".into(), id: 4, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Usage: /search".into(), id: 5, reply_to: Some(4) },
+            HistoryTurn { role: "user", body: "search for blue lanterns".into(), id: 6, reply_to: None },
+            HistoryTurn { role: "user", body: "/searching is a different word".into(), id: 7, reply_to: None },
+        ];
+        let history = format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP);
+        for hidden in ["/search provider exa", "pinned to exa", "/search nonsense", "Usage: /search"] {
+            assert!(!history.contains(hidden), "{hidden} leaked: {history}");
+        }
+        // The bare word and other words are ordinary messages.
+        for kept in ["Find the lantern vendor", "search for blue lanterns", "/searching is a different word"] {
+            assert!(history.contains(kept), "{kept} missing: {history}");
+        }
     }
 
     #[test]
