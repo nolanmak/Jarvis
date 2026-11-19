@@ -91,12 +91,19 @@ CREATE TABLE IF NOT EXISTS phone_turn_metrics (
     outcome TEXT NOT NULL CHECK(outcome IN ('answered','interrupted','failed','dispatched')),
     queue_wait_ms INTEGER CHECK(queue_wait_ms IS NULL OR queue_wait_ms >= 0),
     t_first_token_ms INTEGER CHECK(t_first_token_ms IS NULL OR t_first_token_ms >= 0),
+    -- #2169 independent boundaries: each is NULL when the turn never reached
+    -- it, and none of them restates the queue wait or the first token.
+    t_native_start_ms INTEGER CHECK(t_native_start_ms IS NULL OR t_native_start_ms >= 0),
+    t_provider_start_ms INTEGER CHECK(t_provider_start_ms IS NULL OR t_provider_start_ms >= 0),
+    t_source_execution_ms INTEGER CHECK(t_source_execution_ms IS NULL OR t_source_execution_ms >= 0),
+    t_first_useful_fact_ms INTEGER CHECK(t_first_useful_fact_ms IS NULL OR t_first_useful_fact_ms >= 0),
+    t_completion_ms INTEGER CHECK(t_completion_ms IS NULL OR t_completion_ms >= 0),
     t_first_speech_ms INTEGER CHECK(t_first_speech_ms IS NULL OR t_first_speech_ms >= 0),
     t_last_speech_ms INTEGER CHECK(t_last_speech_ms IS NULL OR t_last_speech_ms >= 0),
     tool_ms INTEGER CHECK(tool_ms IS NULL OR tool_ms >= 0),
     t_first_played_ms INTEGER CHECK(t_first_played_ms IS NULL OR t_first_played_ms >= 0),
     t_last_played_ms INTEGER CHECK(t_last_played_ms IS NULL OR t_last_played_ms >= 0),
-    audible_delta_ms INTEGER,
+    audible_delta_ms INTEGER CHECK(audible_delta_ms IS NULL OR audible_delta_ms >= 0),
     commit_sha TEXT CHECK(commit_sha IS NULL OR length(commit_sha) BETWEEN 7 AND 40),
     PRIMARY KEY(call_id, turn_id)
 );
