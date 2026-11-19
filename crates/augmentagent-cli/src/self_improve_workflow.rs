@@ -1020,7 +1020,12 @@ impl WorkflowGuard {
         anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered")
             || semantic.is_some() || retained.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
+            // #2279 — a verified candidate whose push failed before dispatch
+            // keeps its scoped contract; the raw request must not rebind it
+            // to `inputs_changed` and send finished work back to scope.
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
+                || (snapshot.checkpoint.stage==Stage::Publish && snapshot.checkpoint.next.reason=="publishing_revision"
+                    && snapshot.checkpoint.next.action=="push")
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
                 || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
             if relevant || store.retryable_bound_push(&id)? {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
@@ -2669,12 +2674,42 @@ async fn prepare_resume_candidate_at(
     };
     let Some(mismatch) = error.downcast_ref::<RetainedHeadMismatch>() else { return Err(error); };
     let Some(store) = WorkflowStore::open_read_only(state)? else { return Err(error); };
-    let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
-        &mismatch.published, &mismatch.actual, millis())? else { return Err(error); };
-    let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
-    anyhow::ensure!(descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded,
-        "retained candidate does not extend its recorded publication; candidate preserved");
-    Ok(mismatch.path.clone())
+    let now = millis();
+    if let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
+        &mismatch.published, &mismatch.actual, now)? {
+        // Exact-head binding: only the recorded candidate, and only when it
+        // extends the publication this workflow itself confirmed.
+        let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
+        if descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded {
+            return Ok(mismatch.path.clone());
+        }
+    }
+    // #2279 — an unrecorded or non-descendant candidate is never published.
+    // Retrying the same refusal every tick held the PR forever; once the
+    // workflow is idle and due, set the candidate aside under a durable ref
+    // and resume from the authorized PR head, which re-verifies on main.
+    if !store.retained_candidate_due(repository, pr, branch, now)? { return Err(error); }
+    drop(store);
+    rebuild_from_published(mismatch, pr).await
+}
+
+async fn rebuild_from_published(mismatch: &RetainedHeadMismatch, pr: u64) -> Result<PathBuf> {
+    let path = &mismatch.path;
+    let (clean, status, _) = run("git", &["status", "--porcelain", "--untracked-files=no"], path).await?;
+    anyhow::ensure!(clean && status.trim().is_empty(),
+        "retained candidate has uncommitted edits; candidate preserved");
+    anyhow::ensure!(git_evidence(path, &["rev-parse", "HEAD"]).await?.eq_ignore_ascii_case(&mismatch.actual),
+        "retained candidate changed during rebuild; candidate preserved");
+    let preserved = format!("refs/autoship/preserved/pr-{pr}/{}", mismatch.actual);
+    let (saved, _, _) = run("git", &["update-ref", &preserved, &mismatch.actual], path).await?;
+    anyhow::ensure!(saved, "cannot preserve retained candidate; candidate preserved");
+    let (switched, _, error) = run("git", &["checkout", "--quiet", "--detach", &mismatch.published], path).await?;
+    anyhow::ensure!(switched, "cannot resume from authorized PR head: {error}; candidate preserved at {preserved}");
+    anyhow::ensure!(git_evidence(path, &["rev-parse", "HEAD"]).await?.eq_ignore_ascii_case(&mismatch.published),
+        "rebuild did not reach the authorized PR head; candidate preserved at {preserved}");
+    warn!(pr, preserved = %preserved, published = %mismatch.published,
+        "retained candidate is not a recorded descendant of its publication; set aside and resuming from the authorized PR head");
+    Ok(path.clone())
 }
 
 #[derive(Debug)]
@@ -2928,16 +2963,85 @@ mod tests {
             "a changed remote resolution must not use retained-candidate recovery");
         assert!(run("git", &["checkout", "--orphan", "unrelated-fixture"], &candidate).await.unwrap().0);
         assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "unrelated root"], &candidate).await.unwrap().0);
-        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+        let unrelated_head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
+        // #2279: an unrecorded local head never inherits the old recovery
+        // authority. An idle, due workflow sets it aside under a durable ref
+        // and resumes from the authorized PR head instead of holding forever.
+        let rebuilt = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("an unrecorded head must rebuild from the authorized PR head, not hold");
+        assert_eq!(rebuilt, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), published,
             "an unrecorded local head cannot inherit the old recovery authority");
+        assert_eq!(git_evidence(dir.path(), &["rev-parse", &format!("refs/autoship/preserved/pr-42/{unrelated_head}")]).await.unwrap(),
+            unrelated_head, "the set-aside candidate must be preserved as evidence");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before, "rebuild preparation must not rewrite workflow state");
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"), "rebuild must not publish the set-aside candidate");
+        assert!(run("git", &["checkout", "--quiet", "--detach", &unrelated_head], &candidate).await.unwrap().0);
         let mut unrelated = retained;
-        unrelated.head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
-        let next_lease = store.claim(&lease.workflow, "fixture-authority", 40, 60_000).unwrap().unwrap();
+        unrelated.head = unrelated_head.clone();
+        let next_lease = store.claim(&lease.workflow, "fixture-authority", millis(), 600_000).unwrap().unwrap();
         checkpoint.binding = unrelated;
         store.checkpoint(&next_lease, &checkpoint, 41).unwrap();
+        // While another worker holds the lease the candidate stays in place.
+        let leased = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await;
+        assert!(leased.is_err(), "a leased workflow's candidate must be preserved, not rebuilt");
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), unrelated_head);
         store.release(&next_lease, 42).unwrap();
-        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+        let rebuilt = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("a recorded non-descendant rebuilds from the authorized PR head");
+        assert_eq!(rebuilt, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), published,
             "matching protected metadata cannot replace publication ancestry");
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"));
+    }
+
+    /// #2279 — built and verified, then the push failed before any dispatch:
+    /// the workflow sits at `publish / publishing_revision / push`. Resuming
+    /// it must keep the recorded candidate (a verified descendant of the
+    /// workflow's own confirmed publication) instead of refusing every tick.
+    #[tokio::test]
+    async fn push_failed_publish_candidate_resumes_as_recorded_descendant() {
+        let dir = repo();
+        let state = control_dir();
+        let database = state.path().join("workflow.db");
+        let remote = state.path().join("remote.git");
+        assert!(run("git", &["init", "--bare", "-q", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["remote", "add", "origin", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["push", "origin", "HEAD:fixture"], dir.path()).await.unwrap().0);
+        let published = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let candidate = prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.unwrap();
+        let original = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut store = WorkflowStore::open(&database).unwrap();
+        store.register("owner/repo/pr/42", "fixture", original.clone(), 10).unwrap();
+        let lease = store.claim("owner/repo/pr/42", "original-worker", 20, 60_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 42, 21).unwrap();
+        let pushed = store.begin_operation(&lease, OperationKind::Push, &original, 22).unwrap();
+        store.complete_operation(&lease, &pushed.id, &format!("git-head:{published}"), 23).unwrap();
+        std::fs::write(candidate.join("code.txt"), "verified revision\n").unwrap();
+        assert!(run("git", &["add", "code.txt"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "verified revision"], &candidate).await.unwrap().0);
+        let verified = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding = verified.clone();
+        checkpoint.stage = Stage::Publish;
+        checkpoint.next = NextAction { reason: "publishing_revision".into(), action: "push".into(), eligible_at_ms: 30 };
+        store.checkpoint(&lease, &checkpoint, 24).unwrap();
+        store.release(&lease, 25).unwrap();
+        let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+        let resumed = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("a verified push-failed candidate must resume for publication");
+        assert_eq!(resumed, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), verified.head);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before);
+        // An unconfirmed Push intent still fences resume (outcome unknown).
+        let fenced = store.claim(&lease.workflow, "fence", 40, 60_000).unwrap().unwrap();
+        store.begin_operation(&fenced, OperationKind::Push, &verified, 41).unwrap();
+        store.release(&fenced, 42).unwrap();
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "an unknown Push outcome must not be resumed or rebuilt");
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), verified.head);
     }
 
     #[tokio::test]
