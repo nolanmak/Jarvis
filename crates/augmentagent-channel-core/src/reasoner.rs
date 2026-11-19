@@ -1987,7 +1987,7 @@ pub fn sanitize_claude_error(stderr: &str) -> String {
 /// wins, else `<repo_root>/data.db`. We always return an absolute path —
 /// `canonicalize` when the file exists, otherwise fall back to a manual
 /// absolute join so callers never inherit a relative path.
-fn resolve_db_path(repo_root: &std::path::Path) -> PathBuf {
+pub(crate) fn resolve_db_path(repo_root: &std::path::Path) -> PathBuf {
     let raw = std::env::var("AUGMENTAGENT_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| repo_root.join("data.db"));

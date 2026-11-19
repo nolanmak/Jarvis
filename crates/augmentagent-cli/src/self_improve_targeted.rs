@@ -377,6 +377,11 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
                 let evidence=match target {Target::Pr(n)=>format!("github:pr:{n}:terminal"),Target::Issue(n)=>format!("github:issue:{n}:closed")};
                 crate::autoship_workflow::WorkflowStore::open(path)?.fence_closed_target(id,&evidence,chrono::Utc::now().timestamp_millis())?;
                 info!(workflow=id,"target closed outside autoship; new admissions fenced until quiescent retirement");
+                // #2279 — an idle workflow held only by Push intents that never
+                // reached the remote branch would otherwise wait forever.
+                if settle_unlanded_terminal_pushes(repo,path,id,repository,&before,&evidence).await? {
+                    return Box::pin(reconcile_terminal_target(repo,path,id,repository,target)).await;
+                }
                 true
             },
             Err(_)=>false,
@@ -412,6 +417,33 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
     Ok(())
+}
+
+/// Settle unconfirmed Push intents of an idle workflow whose target is
+/// terminal, but only on a positive remote read of a different branch head.
+/// Unreadable, absent or matching refs keep the original fence.
+async fn settle_unlanded_terminal_pushes(repo:&Path,path:&Path,id:&str,repository:&str,
+    before:&crate::autoship_workflow::Snapshot,evidence:&str)->Result<bool> {
+    use crate::autoship_workflow::{OperationKind,WorkflowStore};
+    let now=chrono::Utc::now().timestamp_millis();
+    let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+    let pending=store.pending_operations(id)?;
+    if before.lease_until_ms>now || store.merge_reconciliation_needed(id)? || pending.is_empty()
+        || pending.iter().any(|operation|operation.kind!=OperationKind::Push) {return Ok(false);}
+    drop(store);
+    let (valid,_,_)=run("git",&["check-ref-format","--branch",&before.branch],repo).await?;
+    if !valid {return Ok(false);}
+    let (ok,out,_)=run(&gh_bin(),&["api",&format!("repos/{repository}/git/ref/heads/{}",before.branch),"--jq",".object.sha"],repo).await?;
+    let remote=out.trim();
+    if !ok || !matches!(remote.len(),40|64) || !remote.bytes().all(|b|b.is_ascii_hexdigit())
+        || pending.iter().any(|operation|operation.binding.head.eq_ignore_ascii_case(remote)) {return Ok(false);}
+    let mut store=WorkflowStore::open(path)?;
+    let Some(lease)=store.claim(id,"autoship-target-lifecycle",now,60_000)? else {return Ok(false)};
+    let settled=store.settle_unlanded_pushes(&lease,remote,evidence,now);
+    store.release(&lease,now)?;
+    let settled=settled?;
+    if settled>0 {info!(workflow=id,settled,remote_head=remote,"terminal target: unlanded Push intents settled; retirement may proceed");}
+    Ok(settled>0)
 }
 
 /// #1712 — owner cancel: durable retirement through the same fenced settle

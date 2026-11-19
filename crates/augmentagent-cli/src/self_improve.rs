@@ -51,6 +51,7 @@ mod integration_checks;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 
+use acceptance::escalation as acceptance_escalation;
 #[path = "self_improve_episode.rs"]
 mod episode;
 #[cfg(test)]
@@ -73,6 +74,9 @@ mod paused_selection_tests;
 mod epic_selection_tests;
 #[path = "self_improve_picker_fairness.rs"]
 mod picker_fairness;
+#[path="self_improve_publish_smoke.rs"]
+mod publish_smoke;
+pub(crate) async fn deployment_publish_smoke(repo:&Path)->serde_json::Value {publish_smoke::inspect(repo).await}
 #[cfg(test)]
 #[path = "self_improve_picker_fairness_tests.rs"]
 mod picker_fairness_tests;
@@ -103,6 +107,8 @@ mod legacy_readmission;
 mod closed_targets;
 #[path="self_improve_scope_policy.rs"]
 mod scope_policy;
+#[path = "self_improve_owner_requalification.rs"]
+mod owner_requalification;
 #[path = "self_improve_owner_checkout_recovery.rs"]
 mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
@@ -1067,11 +1073,17 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let mut qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
+    let owner_recoveries=owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?;
+    qualification_retries.extend(owner_recoveries.iter().copied());
     qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
+    let due_retries=crate::autoship_workflow::retry_recovery::due_issues(&workflow::path(),&repository,chrono::Utc::now().timestamp_millis())?;
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
-    let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
+    let rest_issues=rest_issue_candidates(&issues);
+    qualification_retries.extend(picker_fairness::publish_retries(&rest_issues,&owner_controls,&repository));
+    let candidates=picker_fairness::candidates(rest_issues,
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
+    let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
+        .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
@@ -1097,7 +1109,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) {
+        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) && !due_retries.contains(&iss.number) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -1161,6 +1173,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             continue;
         }
         owner_controls.require_current_history()?;
+        if !dry_run && owner_recoveries.contains(&number) && !owner_requalification::reserve(&workflow::path(),&repository,number,chrono::Utc::now().timestamp_millis())
+            .map_err(|error|error.context(RecoveryHistoryUnavailable))? {continue;}
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -3258,35 +3272,6 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &wo
 
 /// Finish an over-cap scope decision after its optional plan has been generated.
 /// Keep the real parent mutation fallback behind the typed child-publication hold.
-async fn finish_scope_refusal(repo:&Path,issue:&Issue,reason:&str,scope_body:&str,plan:&[Slice],
-    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting,automatic:bool)->Result<RunReport> {
-    if let Some(report)=accounting.report()? {return Ok(report);}
-    if plan.len()>=MIN_SLICES {
-        match file_slices(repo,issue,plan,guard).await {
-            Ok(children) if !children.is_empty()=> {
-                guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
-                if let Some(report)=accounting.report()? {return Ok(report);}
-                return Ok(RunReport::triage(format!("issue #{}: oversized — sliced into {} child issues ({})",issue.number,children.len(),
-                    children.iter().map(|n|format!("#{n}")).collect::<Vec<_>>().join(", "))));
-            },
-            Ok(_)=>(),
-            Err(error)=> {
-                if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-                warn!(issue=issue.number,"filing slices failed: {error:#}");
-            },
-        }
-    }
-    guard.require_fresh_issue(repo).await?;
-    guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
-    if let Some(report)=accounting.report()? {return Ok(report);}
-    backoff_comment(repo,issue.number,&format!(
-        "Auto-fix triage: refused before building — {reason}.\n\nThe work itself may be sound; it does not fit the unattended pipeline's bounds (focused diff ≤ 600 lines, no deploy/auth/secret/CI paths). Splitting it into smaller issues usually resolves the size case. Remove the `{GAVE_UP_LABEL}` label to re-triage it (for example if the path is only mentioned as background).\n\nScoping spec, for whoever picks this up:\n\n{}",truncate(scope_body,1500))).await.ok();
-    if label_gave_up(repo,issue.number,GIVE_UP_SCOPER_PREDICTS_REFUSAL,automatic,None).await.is_err() {
-        return Ok(RunReport::held(format!("issue #{}: terminal labeling deferred",issue.number)));
-    }
-    Ok(RunReport::triage(format!("issue #{}: refused pre-build ({reason}) — labeled out",issue.number)))
-}
-
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
 /// stronger tier as the scoper. A rejected review means no PR — it counts as
 /// a failed attempt, exactly like a red verification gate.
@@ -8437,6 +8422,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let outcome = async {
     workflow_guard.require_fresh_issue(repo_root).await?;
     workflow_guard.bind_builder(reasoner.as_ref())?;
+    if let Some(report)=acceptance_escalation::execute(repo_root,&worktree,&issue,&mut workflow_guard).await? {return Ok(report);}
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
@@ -8444,7 +8430,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let owner_request=acceptance_owner_request(&issue);
     let initial=match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
         Ok(initial)=>initial,
-        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+        Err(error)=>{if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
     };
     let retained_preparation=initial.retained;
     let scope_context=initial.context;
@@ -8517,7 +8503,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
             acceptance::readiness::Decision::Ready(evidence)=>evidence,
-            acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+            acceptance::readiness::Decision::Deferred(retry)=>return Ok(RunReport::held(format!("issue #{}: readiness retry scheduled; {}",issue.number,retry))),
         };
         scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
         readiness_decisions=Some(readiness);
@@ -8579,9 +8565,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         warn!(issue=issue.number,"slice planning failed: {error:#}");Vec::new()
                     })
             } else {Vec::new()};
-            let result=finish_scope_refusal(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting,automatic_routing).await;
-            cleanup(worktree,branch,repo_root.to_path_buf()).await;
-            return result;
+            match scope_policy::finish_prediction(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting,automatic_routing).await {
+                Ok(None)=>{},
+                Ok(Some(report))=>{
+                    cleanup(worktree,branch,repo_root.to_path_buf()).await;
+                    return Ok(report);
+                },
+                Err(error)=>{
+                    cleanup(worktree,branch,repo_root.to_path_buf()).await;
+                    return Err(error);
+                },
+            }
         }
     }
 
@@ -8593,7 +8587,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
     if saved_scope.is_none() {
         if let Err(error)=retain_initial_scope(&scope_context,scope.clone(),|key,raw|workflow_guard.record_scope_stage_response(key,raw)) {
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
         }
     }
 
@@ -8603,7 +8597,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }
@@ -9627,33 +9621,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }, automatic_routing).await));
     }
-    // Compare-and-swap publication preserves concurrent remote work and
-    // reconciles successful pushes whose responses were lost.
-    if let Err(error) = workflow_guard.push_fresh(repo_root,&branch,automatic_routing).await {
-        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
-        let e = format!("{error:#}");
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
-        }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
-            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
-    }
-    // #1037 — the push landed, plainly or by superseding an orphan above, so
-    // the remote branch is now exactly this attempt's work, built from `main`.
-    // Its record becomes this attempt's builders: earlier authors described
-    // content that no longer exists, and keeping them disqualified reviewers
-    // (a stale `[claude, codex]` left nobody) for work they never touched.
-    // Only here — until the push lands the old work may still be on the
-    // remote, so the branch record stays the union. A failure leaves the
-    // union too, which excludes more reviewers, never fewer.
-    if let Err(e) = reasoner.supersede_review_history() {
-        warn!(
-            issue = issue.number,
-            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
-        );
-    }
-
     // Open the PR. Draft + human merge for everyone; owner-authored issues
     // auto-merge when the owner opted in AND the scoper graded the work
     // simple/medium (#653 — hard work always gets human eyes).
@@ -9783,6 +9750,36 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
     }
+    // Compare-and-swap publication preserves concurrent remote work and
+    // reconciles successful pushes whose responses were lost. #2279 — the
+    // complete publication request is retained before the push, so a built
+    // and verified candidate whose push fails is pushed and published by free
+    // reconciliation once the cause is fixed, never rebuilt from scope.
+    if let Err(error) = publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,published_head,issue.number,&args,automatic_routing).await {
+        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
+        let e = format!("{error:#}");
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
+    }
+    // #1037 — the push landed, plainly or by superseding an orphan above, so
+    // the remote branch is now exactly this attempt's work, built from `main`.
+    // Its record becomes this attempt's builders: earlier authors described
+    // content that no longer exists, and keeping them disqualified reviewers
+    // (a stale `[claude, codex]` left nobody) for work they never touched.
+    // Only here — until the push lands the old work may still be on the
+    // remote, so the branch record stays the union. A failure leaves the
+    // union too, which excludes more reviewers, never fewer.
+    if let Err(e) = reasoner.supersede_review_history() {
+        warn!(
+            issue = issue.number,
+            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
+        );
+    }
+
     let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args, automatic_routing).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
@@ -12414,6 +12411,7 @@ impl AutoPrLoop {
                 if let Err(error) = publication::reconcile_merge_dispatches(&root, dry_run).await {
                     warn!("merge dispatch reconciliation unavailable: {error:#}");
                 }
+                if let Err(error)=scope_policy::migrate(&root,dry_run).await {warn!("scope-policy migration deferred: {error:#}");}
                 let controller = match workspace::prepare(&root, "sweep").await {
                     Ok(controller) => controller,
                     Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
@@ -12541,7 +12539,8 @@ impl AutoPrLoop {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                         || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
-                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_retry_work(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12562,7 +12561,8 @@ impl AutoPrLoop {
                                 Ok(store.command_queue_due(repository, now)?
                                     || store.has_due_main_reconciliation(Some(repository), now)?
                                     || (lane_from_env()!=Lane::Build && store.has_due_owner_resume(Some(repository),now)?)
-                                    || store.has_due_qualification_recovery(Some(repository),now)?)
+                                    || store.has_due_qualification_recovery(Some(repository),now)?
+                                    || store.has_due_retry_work(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
@@ -12625,6 +12625,11 @@ impl AutoPrLoop {
                     }
                 }
                 match outcome {
+                    Ok(r) if r.billed && r.held => {
+                        triaged+=1;
+                        info!(triaged,attempts_today=runs_today,"auto-PR: paid deferred turn yielded to eligible peers: {r}");
+                        if triaged>=Self::MAX_TRIAGE_PER_TICK {break;}
+                    }
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
@@ -13060,8 +13065,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         let stop = tokio_util::sync::CancellationToken::new();
         let timer_stop = stop.clone();
         let run = worker.run_with(stop, move || {
-            observed.fetch_add(1, Ordering::SeqCst);
+            let turn=observed.fetch_add(1, Ordering::SeqCst);
             async move {
+                if turn>0 {return Ok(RunReport::idle());}
                 Ok(RunReport {
                     message: "durable verification retry; candidate preserved".into(),
                     billed, held, resumed,
@@ -13074,7 +13080,7 @@ else:raise Exception('unexpected fixture call '+repr(args))
         };
         let (result, ()) = tokio::join!(run, timer);
         result.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "fixture must settle exactly one attempt");
+        assert_eq!(calls.load(Ordering::SeqCst), if billed && held {2}else{1}, "paid deferred turns yield once, then the empty picker stops");
         assert_eq!(DailyCounter::load(&counter_path).runs_today(utc_day_of(now)), if billed { 1 } else { 0 },
             "compute spend must remain attributable even when work is held");
         let allowance = crate::autoship_workflow::WorkflowStore::open(&workflow_path).unwrap()
@@ -20134,10 +20140,14 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find("workflow_guard.push_fresh(repo_root,&branch,automatic_routing)").expect("guarded fresh compare-and-swap push");
+        let force = body.find("publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,").expect("guarded fresh compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
-        let create = body.find(r#""pr", "create""#).expect("PR creation");
+        // #2279: the request is built (and retained) before the push; the
+        // remote creation itself still follows the reset.
+        let request = body.find(r#""pr", "create""#).expect("PR request");
+        assert!(request < force, "publication request is retained before the push");
+        let create = body.find("publication::publish(&workflow_guard,").expect("PR creation");
         assert!(force < supersede && failed < supersede, "only after the push has landed");
         assert!(supersede < create, "before anything else can resume the branch");
         assert_eq!(body.matches("supersede_review_history(").count(), 1);
@@ -21137,6 +21147,10 @@ mod runtime_readiness_gate_tests {
 mod linked_pr_dedup_regressions {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[tokio::test]
+    async fn predicted_refusal_without_split_keeps_build_eligible() {
+        fixture("prediction-advisory").await;
+    }
 
     // Every override is confined to a disposable child; never read the daemon's
     // workflow database or change process-global configuration in parallel tests.
@@ -21208,6 +21222,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 "remote-selection" => "linked_pr_is_not_returned_by_real_remote_issue_selector",
                 "midflight" => "pr_appearing_after_selection_holds_real_guard_before_further_work",
                 "midflight-slicing" => "pr_appearing_at_child_creation_preserves_plan_and_parent",
+                "prediction-advisory" => "predicted_refusal_without_split_keeps_build_eligible",
                 "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
                 "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
                 _ => unreachable!(),
@@ -21230,7 +21245,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             return;
         }
         let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
-        if matches!(case,"midflight"|"midflight-slicing") {
+        if matches!(case,"midflight"|"midflight-slicing"|"prediction-advisory") {
             let path=PathBuf::from(std::env::var_os("AUGMENTAGENT_AUTOPR_WORKFLOW_DB").unwrap());
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&repo,worktree:&repo,repository:"fixture-owner/repo",source_issue:Some(42),pr:None,
@@ -21240,7 +21255,15 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
             if case=="midflight" {
                 guard.require_fresh_issue(&repo).await.unwrap();
-                std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
+                if case=="prediction-advisory" {
+                let issue=Issue {number:42,title:"Correct widget rounding".into(),body:"Round widget values consistently.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
+                let accounting=guard.capacity_accounting(false).unwrap();
+                let _=scope_policy::finish_prediction(&repo,&issue,"predicted guarded or large diff","original owner request",&[],&mut guard,&accounting,false).await.unwrap();
+                let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint,before.checkpoint,"advisory scope prediction parked the real build pipeline");
+                guard.finish().unwrap();return;
+            }
+            std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
                 let error=guard.require_fresh_issue(&repo).await.unwrap_err();
                 assert_eq!(error.downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
                 assert!(linked_claims::report(&error).is_some());
@@ -21249,7 +21272,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 let plan=vec![Slice{title:"Round small values".into(),body:"Cover small widget values.".into()},
                     Slice{title:"Round large values".into(),body:"Cover large widget values.".into()}];
                 let accounting=guard.capacity_accounting(false).unwrap();
-                let report=finish_scope_refusal(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting,false).await.unwrap();
+                let report=scope_policy::finish_prediction(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting,false).await.unwrap().unwrap();
                 assert!(report.is_idle());assert!(!report.billed);
                 assert_eq!(report.message,linked_claims::Hold::Claimed.to_string());
             }
@@ -21627,3 +21650,7 @@ mod observation_wake_tests;
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]
 mod ci_repair_tests;
+
+#[cfg(test)]
+#[path="self_improve_stall_tests.rs"]
+mod stall_tests;

@@ -56,6 +56,11 @@ fn configured_build_runner(override_path: Option<std::ffi::OsString>, mode: Opti
     }
 }
 
+/// Preset environment marker for the bridge's workspace-shell mode (#2217):
+/// sandboxed host commands may write inside the write roots and receive a
+/// fixed minimal environment. Set only by the yolo preset.
+pub const WORKSPACE_SHELL_ENV: &str = "JARVIS_WORKSPACE_SHELL";
+
 /// Whether an allowed-tools entry such as `Bash(cargo *)` can run a build.
 /// Used only to warn at launch; the bridge's own shlex parse gates commands.
 fn is_build_tool_pattern(tool: &str) -> bool {
@@ -434,6 +439,10 @@ impl BridgeLaunch {
             if let Ok(value) = std::env::var(key) { environment.insert(key.into(), value); }
         }
         environment.extend(opts.env.iter().cloned());
+        // #2217 — a marker in the preset's environment, like the autoship
+        // scope marker above: it selects the bridge's workspace-shell mode
+        // and is not itself passed on to commands.
+        let workspace_shell = environment.remove(WORKSPACE_SHELL_ENV).as_deref() == Some("1");
         let runner = build_runner();
         let scratch = crate::build_scratch::policy_scratch_dir(crate::build_scratch::scratch_dir(), &write_roots);
         if let BuildRunner::Unavailable { reason } = &runner {
@@ -451,6 +460,7 @@ impl BridgeLaunch {
             "autoship_in_place_writes": in_place || scoped,
             "allowed_tools": bridge_tools,
             "environment": environment,
+            "workspace_shell": workspace_shell,
             "settings": settings,
             "session_id": opts.session_id,
             "handoff_path": opts.handoff_path,
