@@ -1,6 +1,8 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_owner_requalification.rs"]
+pub(crate) mod owner_requalification;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
 #[path = "autoship_owner_checkout_recovery.rs"]
