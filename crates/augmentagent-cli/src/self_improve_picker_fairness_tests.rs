@@ -25,7 +25,7 @@ if args[:2]==['repo','view']:print('fixture-owner/repo')
 elif args[:2]==['pr','list']:print('[]')
 elif args[:1]==['api'] and '/git/ref/heads/main' in args[1]:print(os.environ['AUTOSHIP_FAIRNESS_HEAD'])
 elif args[:1]==['api'] and '/issues?' in args[1]:
- def issue(n):return dict(number=n,title='Correct widget rounding',body='Updated synthetic requirement.' if n==2 else 'Preserve synthetic rounding.',labels=[],user={'login':'fixture-owner'},author_association='OWNER')
+ def issue(n):return dict(number=n,title='Correct widget rounding',body=('Original synthetic requirement.' if os.environ['AUTOSHIP_CHECKOUT_CASE']=='policy-upgrade' else 'Updated synthetic requirement.') if n==2 else 'Preserve synthetic rounding.',labels=[],user={'login':'fixture-owner'},author_association='OWNER')
  print(json.dumps([issue(3),issue(2)] if args[1].endswith('page=1') else []))
 else:raise AssertionError(args)
 "#).unwrap();
@@ -50,10 +50,14 @@ else:raise AssertionError(args)
             let at=now-10_000+round*10+number;
             let lease=store.claim(id,"fixture-worker",at,1_000).unwrap().unwrap();
             let mut cp=store.snapshot(id).unwrap().unwrap().checkpoint;cp.stage=Stage::Scope;
-            cp.next=NextAction {reason:if number==2 {"readiness_assessment_invalid"}else{"acceptance_registration_retry"}.into(),action:if number==2 {"await_readiness_input_change"}else{"rescope_executable_acceptance"}.into(),eligible_at_ms:if number==3 && case=="future" {now+300_000}else{0}};
+            cp.next=NextAction {reason:if number==2 && case=="policy-upgrade" {"material_external_decision_missing"}else if number==2 {"readiness_assessment_invalid"}else{"acceptance_registration_retry"}.into(),action:if number==2 {"await_readiness_input_change"}else{"rescope_executable_acceptance"}.into(),eligible_at_ms:if number==3 && case=="future" {now+300_000}else{0}};
             if number==2 {
                 let request=serde_json::to_string(&(2,"Correct widget rounding","Original synthetic requirement.")).unwrap();
-                store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:id.into(),repository:"fixture-owner/repo".into(),worktree:repo.clone(),source_request:request.clone(),source_pr:None,contract:request,environment:"synthetic-environment".into(),binding:binding.clone()},at+1).unwrap();
+                store.record_recovery_context(&lease,&binding,&RecoveryContext {version:1,workflow:id.into(),repository:"fixture-owner/repo".into(),worktree:repo.clone(),source_request:request.clone(),source_pr:None,contract:request.clone(),environment:if case=="policy-upgrade" {"synthetic-environment;readiness-policy:readiness-grounding-v4"}else{"synthetic-environment"}.into(),binding:binding.clone()},at+1).unwrap();
+            }
+            if number==2 && case=="policy-upgrade" {
+                let request=serde_json::to_string(&(2,"Correct widget rounding","Original synthetic requirement.")).unwrap();
+                store.set_readiness_dependency(&lease,&binding,"fixture-owner/repo",2,Some((&amendment::digest(request.as_bytes()),&binding.head,"external_decision","synthetic preserved assessment")),at+1).unwrap();
             }
             store.checkpoint(&lease,&cp,at+2).unwrap();store.release(&lease,at+3).unwrap();
         }
@@ -130,4 +134,9 @@ async fn invalid_checkout_yields_to_eligible_peer_without_claiming() {
     } else {
         for case in ["lost-checkout","replaced-checkout"] { fixture(case,TEST).await; }
     }
+}
+
+#[tokio::test]
+async fn safe_scope_policy_selects_legacy_dependency_without_owner_or_main_edits() {
+    fixture("policy-upgrade","self_improve::picker_fairness_tests::safe_scope_policy_selects_legacy_dependency_without_owner_or_main_edits").await;
 }
