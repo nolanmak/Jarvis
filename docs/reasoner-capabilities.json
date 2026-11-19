@@ -142,6 +142,14 @@
         "Bash allowlist (read-only service commands)",
         "configured MCP (memory, read-only)"
       ]
+    },
+    "web-mcp": {
+      "scope": "Adds the Jarvis web MCP tools (search, fetch, and for owner-authorized normal turns the per-conversation provider pin) to a preset whose model cannot run native web tools, and removes the native WebSearch/WebFetch names. Every other permission of the wrapped preset is unchanged.",
+      "operations": [
+        "mcp__web__search",
+        "mcp__web__fetch",
+        "mcp__web__set_provider (owner-authorized normal turns only)"
+      ]
     }
   },
   "presets": [
@@ -837,6 +845,20 @@
         "yolo_readonly_commands_test::YoloReadonlyCommands"
       ],
       "provider_conformance": "pending: served only by the yolo profile; live receipt is the epic acceptance (#2220)"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/web/tool.rs::configure_with",
+      "permission_profile": "web-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: swaps the native web tool names for the Jarvis web MCP tools on the wrapped preset and keeps its model.",
+      "conformance": [
+        "web::tool_tests::configure_replaces_native_web_with_the_jarvis_tools",
+        "web::tool_tests::set_provider_needs_an_owner_and_a_normal_turn",
+        "web::tool_tests::configure_changes_nothing_without_a_usable_provider_or_a_channel",
+        "web::tool_tests::the_server_lists_exactly_the_tools_it_was_given"
+      ],
+      "provider_conformance": "pending: attached only for Qwen, GLM and the yolo profile; live receipt is the epic acceptance (#2220)"
     }
   ]
 }
