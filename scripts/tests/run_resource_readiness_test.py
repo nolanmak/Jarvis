@@ -13,7 +13,7 @@ MIB=1024**2
 class ReadinessTests(unittest.TestCase):
     def test_invalid_host_facts_are_unavailable_without_claims_or_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             parent = root / 'fixture.service'
             parent.mkdir()
             leaf = parent / 'daemon'
@@ -42,7 +42,7 @@ class ReadinessTests(unittest.TestCase):
     def test_limits_capacity_and_uninitialized_accounting_are_distinct_without_writes(self):
         for case in ('available','reservations','host','ceiling','invalid','delegation','uninitialized','busy'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
-                parent=Path(tmp)/'fixture.service';parent.mkdir();leaf=parent/'daemon';leaf.mkdir()
+                parent=Path(tmp).resolve()/'fixture.service';parent.mkdir();leaf=parent/'daemon';leaf.mkdir()
                 values={'cgroup.procs':'','cgroup.controllers':'cpu memory pids','cgroup.subtree_control':'cpu memory pids',
                     'memory.max':str(512*MIB),'memory.current':str(32*MIB),'pids.max':'64','cpu.max':'100000 100000'}
                 for name,value in values.items():(parent/name).write_text(value)
