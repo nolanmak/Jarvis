@@ -1,7 +1,10 @@
 //! Explicit archive/read commands. No broker or reasoner is constructed.
 use anyhow::Result;
 use augmentagent_channel_linkedin::{
-    archive::ArchiveReader, archive_store as db, archive_sync, LinkedInAuth,
+    archive::ArchiveReader,
+    archive_store as db, archive_sync,
+    backfill_pace::{Admit, Pacer, Pacing},
+    LinkedInAuth,
 };
 use augmentagent_store::Store;
 use std::{
@@ -122,23 +125,44 @@ pub async fn thread_output(
     Ok(output)
 }
 
+/// Command-line pacing. Jitter spans one more delay, so requests land
+/// between one and two delays apart.
+pub fn pacing(page_delay_secs: u32, hourly_requests: u32, daily_requests: u32) -> Pacing {
+    let delay_ms = i64::from(page_delay_secs) * 1000;
+    Pacing {
+        delay_ms,
+        jitter_ms: delay_ms,
+        hourly: i64::from(hourly_requests),
+        daily: i64::from(daily_requests),
+    }
+}
+
 pub async fn backfill(
     store: Arc<Store>,
     category: Option<&str>,
     max_pages: usize,
     refresh: bool,
+    pacing: Pacing,
 ) -> Result<()> {
-    run_backfill(store, category, max_pages, refresh, false).await
+    run_backfill(store, category, max_pages, refresh, false, pacing).await
 }
 
-pub async fn dry_run(category: Option<&str>, max_pages: usize, refresh: bool) -> Result<()> {
+pub async fn dry_run(
+    category: Option<&str>,
+    max_pages: usize,
+    refresh: bool,
+    pacing: Pacing,
+) -> Result<()> {
     // This entry point runs before normal CLI bootstrap opens the disk store.
+    // Its request ledger is in memory too: the delay and budget hold within
+    // this run only.
     run_backfill(
         Arc::new(Store::open(":memory:")?),
         category,
         max_pages,
         refresh,
         true,
+        pacing,
     )
     .await
 }
@@ -149,6 +173,7 @@ async fn run_backfill(
     max_pages: usize,
     refresh: bool,
     dry_run: bool,
+    pacing: Pacing,
 ) -> Result<()> {
     if max_pages == 0 {
         println!(
@@ -169,14 +194,25 @@ async fn run_backfill(
             signal.cancel();
         }
     });
-    let result =
-        backfill_with_reader(&api, &store, category, max_pages, refresh, dry_run, &cancel).await;
+    let pacer = Pacer::new(pacing);
+    let result = backfill_paced(
+        &api,
+        &store,
+        category,
+        max_pages,
+        refresh,
+        dry_run,
+        &cancel,
+        Some(&pacer),
+    )
+    .await;
     task.abort();
     println!("{}", serde_json::to_string_pretty(&result?)?);
     Ok(())
 }
 
 /// Shared command implementation; callers choose durable or in-memory storage.
+/// Unpaced: the `backfill` command itself always goes through a [`Pacer`].
 pub async fn backfill_with_reader(
     api: &ArchiveReader,
     store: &Store,
@@ -186,12 +222,50 @@ pub async fn backfill_with_reader(
     dry_run: bool,
     cancel: &CancellationToken,
 ) -> Result<serde_json::Value> {
+    backfill_paced(api, store, category, max_pages, refresh, dry_run, cancel, None).await
+}
+
+/// With a pacer every request, category discovery included, waits for the
+/// page delay and the account's request budget. A spent budget ends the run
+/// with `stopped: "request_budget"` and the time it may resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_paced(
+    api: &ArchiveReader,
+    store: &Store,
+    category: Option<&str>,
+    max_pages: usize,
+    refresh: bool,
+    dry_run: bool,
+    cancel: &CancellationToken,
+    pacer: Option<&Pacer>,
+) -> Result<serde_json::Value> {
     let mut remaining = max_pages;
+    let mut stopped: Option<String> = None;
+    let mut resume_at_ms: Option<i64> = None;
+    let discovery = match (category, pacer) {
+        (None, Some(pacer)) if remaining > 0 => pacer.admit(store, api.mailbox(), cancel).await?,
+        _ => Admit::Go,
+    };
     let categories = match category {
         Some(c) => vec![c.to_string()],
         None if remaining == 0 => Vec::new(),
+        None if discovery != Admit::Go => {
+            if let Admit::Budget { resume_at_ms: at } = discovery {
+                resume_at_ms = Some(at);
+                stopped = Some("request_budget".into());
+            } else {
+                stopped = Some("cancelled".into());
+            }
+            Vec::new()
+        }
         None => {
-            let categories = archive_sync::categories(api, store, cancel).await?
+            let discovered = match pacer {
+                Some(pacer) => {
+                    archive_sync::categories_with_clock(api, store, cancel, &|| pacer.now()).await
+                }
+                None => archive_sync::categories(api, store, cancel).await,
+            };
+            let categories = discovered?
                 .ok_or_else(|| anyhow::anyhow!("LinkedIn account reads deferred or cancelled; inspect archive-status before retrying"))?;
             remaining -= 1;
             categories
@@ -202,11 +276,18 @@ pub async fn backfill_with_reader(
         if refresh && remaining > 0 && !cancel.is_cancelled() {
             db::refresh_mailbox(store, api.mailbox(), category)?;
         }
-        let report = archive_sync::sync(api, store, category, remaining, cancel).await?;
+        let report = match pacer {
+            Some(pacer) => {
+                archive_sync::sync_paced(api, store, category, remaining, cancel, pacer).await?
+            }
+            None => archive_sync::sync(api, store, category, remaining, cancel).await?,
+        };
         remaining = remaining.saturating_sub(report.pages);
         let deferred = report.account_deferred;
+        stopped = Some(report.stopped.clone());
+        resume_at_ms = report.resume_at_ms;
         reports.push(report);
-        if deferred || cancel.is_cancelled() {
+        if deferred || resume_at_ms.is_some() || cancel.is_cancelled() {
             break;
         }
     }
@@ -227,9 +308,25 @@ pub async fn backfill_with_reader(
     for (report, category) in reports.iter_mut().zip(&categories) {
         report.coverage = db::coverage(store, api.mailbox(), category)?;
     }
-    Ok(
-        serde_json::json!({"schema_version":1,"dry_run":dry_run,"persistent_writes":!dry_run,"archive_only":true,"scope":"all_accessible_history","categories":categories,"complete":!categories.is_empty() && reports.len()==categories.len() && reports.iter().all(|r|r.coverage.complete),"pages":max_pages-remaining,"reports":reports}),
-    )
+    let mut receipt = serde_json::json!({"schema_version":1,"dry_run":dry_run,"persistent_writes":!dry_run,"archive_only":true,"scope":"all_accessible_history","categories":categories,"complete":!categories.is_empty() && reports.len()==categories.len() && reports.iter().all(|r|r.coverage.complete),"pages":max_pages-remaining,"reports":reports});
+    // Why the run ended, at the top level so a budget stop before category
+    // discovery (no reports) is still explained.
+    if let Some(stopped) = stopped {
+        receipt["stopped"] = stopped.into();
+    }
+    if let Some(at) = resume_at_ms {
+        receipt["resume_at_ms"] = at.into();
+        if let Ok(utc) = time_utc(at) {
+            receipt["resume_at"] = utc.into();
+        }
+    }
+    Ok(receipt)
+}
+
+fn time_utc(ms: i64) -> Result<String> {
+    Ok(chrono::DateTime::from_timestamp_millis(ms)
+        .ok_or_else(|| anyhow::anyhow!("timestamp out of range"))?
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 pub fn status(store: &Store, category: &str) -> Result<()> {
