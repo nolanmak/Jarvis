@@ -248,13 +248,43 @@ fn page_slug(raw: &str) -> String {
 
 /// Extract the YAML front-matter from a markdown file and deserialize it.
 /// Accepts files without front-matter (returns the default front matter).
+///
+/// A malformed `identities.instagram` value is recovered by dropping that one
+/// field (#1797): LLM ingest occasionally writes a mapping there, and losing
+/// the page's email/phone identities over it is worse than losing the handle.
+/// Anything else still fails, so `IdentityIndex::build` keeps skipping pages
+/// whose front-matter is genuinely unusable.
 fn parse_front_matter(path: &Path) -> anyhow::Result<FrontMatter> {
     let raw = fs::read_to_string(path)?;
     let yaml = match extract_yaml_block(&raw) {
         Some(y) => y,
         None => return Ok(FrontMatter::default()),
     };
-    Ok(serde_yaml_ng::from_str(yaml)?)
+    match serde_yaml_ng::from_str(yaml) {
+        Ok(fm) => Ok(fm),
+        Err(e) => match front_matter_without_instagram(yaml) {
+            Some(fm) => {
+                warn!(
+                    path = %path.display(),
+                    field = "identities.instagram",
+                    error = %e,
+                    "dropping malformed identity field"
+                );
+                Ok(fm)
+            }
+            None => Err(e.into()),
+        },
+    }
+}
+
+/// Re-parse `yaml` with `identities.instagram` removed. `None` when the field
+/// is absent (so dropping it cannot be what fixes the page), when the document
+/// is not valid YAML at all, or when the rest of the front matter still fails.
+fn front_matter_without_instagram(yaml: &str) -> Option<FrontMatter> {
+    let mut doc: Value = serde_yaml_ng::from_str(yaml).ok()?;
+    let identities = doc.get_mut("identities")?.as_mapping_mut()?;
+    identities.remove("instagram")?;
+    serde_yaml_ng::from_value(doc).ok()
 }
 
 /// Pull the YAML between the opening `---\n` and the next `\n---` line.
@@ -278,8 +308,78 @@ fn extract_yaml_block(src: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::field::{Field, Visit};
+    use tracing::metadata::LevelFilter;
+    use tracing::span;
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// Must match the `IdentityIndex::build` page-skip event verbatim.
+    const SKIP_MESSAGE: &str = "skipping page with bad front-matter";
+
+    /// Records every event emitted while it is the thread's default
+    /// subscriber, one flattened `message field=value …` line per event.
+    /// Hand-rolled because the crate has no `tracing-subscriber` dependency.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<String>>>);
+
+    impl CapturedEvents {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Subscriber for CapturedEvents {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+            Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            struct Flatten(String);
+            impl Visit for Flatten {
+                fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.insert_str(0, &format!("{value:?}"));
+                    } else {
+                        self.0.push_str(&format!(" {}={value:?}", field.name()));
+                    }
+                }
+            }
+            let mut flat = Flatten(String::new());
+            event.record(&mut flat);
+            self.0.lock().unwrap().push(flat.0);
+        }
+
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    fn build_capturing_events(layout: &WikiLayout) -> (IdentityIndex, Vec<String>) {
+        let captured = CapturedEvents::default();
+        let index = tracing::subscriber::with_default(captured.clone(), || {
+            IdentityIndex::build(layout).unwrap()
+        });
+        (index, captured.lines())
+    }
 
     fn write_page(dir: &Path, slug: &str, front_matter: &str) {
         let path = dir.join(format!("{slug}.md"));
@@ -479,6 +579,73 @@ mod tests {
     }
 
     #[test]
+    fn malformed_instagram_keeps_page_indexed_with_its_other_identities() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nclose: true\naliases: Janey\nhousehold: \"[[sam-doe]]\"\nidentities:\n  email: jane@example.com\n  phone: \"+15555550123\"\n  instagram:\n    handle: jane_handle",
+        )]);
+
+        let (index, events) = build_capturing_events(&layout);
+
+        let page = index
+            .pages()
+            .iter()
+            .find(|p| p.slug == "jane")
+            .expect("page stays indexed");
+        assert!(page.identities.instagram.is_empty(), "malformed handle dropped");
+        assert!(page.close);
+        assert_eq!(page.aliases, ["Janey"]);
+        assert_eq!(page.household, ["sam-doe"]);
+        assert_eq!(
+            index.lookup("email", "jane@example.com").map(|p| p.slug.as_str()),
+            Some("jane")
+        );
+        assert_eq!(
+            index.lookup("phone", "+15555550123").map(|p| p.slug.as_str()),
+            Some("jane")
+        );
+        assert!(index.lookup("instagram", "jane_handle").is_none());
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("identities.instagram") && !e.contains(SKIP_MESSAGE)),
+            "expected a field-specific warning, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.contains(SKIP_MESSAGE)),
+            "recovered page must not be reported as skipped, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_non_instagram_identity_still_skips_the_page() {
+        let (_d, layout) = layout_with_pages(&[
+            ("ok", "kind: person\nidentities:\n  discord: \"111\""),
+            (
+                "bad-email",
+                "kind: person\nidentities:\n  email:\n    addr: nope\n  instagram: jane_handle",
+            ),
+        ]);
+
+        let (index, events) = build_capturing_events(&layout);
+
+        assert_eq!(index.len(), 1, "dropping instagram must not rescue the page");
+        assert!(index.lookup("discord", "111").is_some());
+        assert!(index.lookup("instagram", "jane_handle").is_none());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains(SKIP_MESSAGE) && e.contains("bad-email.md")),
+            "expected the page-skip warning, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.contains("identities.instagram")),
+            "no field recovery happened, got {events:?}"
+        );
+    }
+
+    #[test]
     fn whatsapp_accepts_list_and_scalar_shapes() {
         // A person legitimately has a number JID and a @lid alias, so LLM
         // ingest writes lists; legacy pages carry a bare scalar. Both must
@@ -544,10 +711,16 @@ mod tests {
         let broken = layout.people_dir().join("broken.md");
         fs::write(broken, "---\nidentities:\n  email: [one,\n---\n\n# broken\n").unwrap();
 
-        let index = IdentityIndex::build(&layout).unwrap();
+        let (index, events) = build_capturing_events(&layout);
         // Broken skipped, good one present.
         assert_eq!(index.len(), 1);
         assert!(index.lookup("discord", "111").is_some());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains(SKIP_MESSAGE) && e.contains("broken.md")),
+            "expected the page-skip warning, got {events:?}"
+        );
     }
 
     #[test]
