@@ -10,6 +10,7 @@ mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod web;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
