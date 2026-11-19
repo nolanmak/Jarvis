@@ -9,6 +9,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             "lost",
             "qualification",
             "qualification-missing",
+            "qualification-bounced",
             "readiness",
             "material-decision",
             "scope-retry",
@@ -79,6 +80,12 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         "https://github.com/controller/repo.git",
     ]);
     std::fs::write(root.join("fixture.txt"), "synthetic baseline\n").unwrap();
+    if case=="qualification-bounced" {
+        std::fs::write(root.join("Cargo.lock"), "# synthetic verifier fixture\n").unwrap();
+        git(&["add","Cargo.lock"]);
+        augmentagent_test_support::write_executable(&root.join("rustc"),"#!/bin/sh\necho 'rustc 1.0.0 synthetic'\n").unwrap();
+        std::env::set_var("PATH",format!("{}:/usr/bin:/bin",root.display()));
+    }
     git(&["add", "fixture.txt"]);
     git(&[
         "-c",
@@ -282,7 +289,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'scope_stage_response_recorded','{',7)",[id]).unwrap();
     }
 
-    if case == "qualification-missing" {
+    if matches!(case.as_str(), "qualification-missing" | "qualification-bounced") {
         conn.execute(
             "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
             [id, &original_plan_key],
@@ -534,6 +541,10 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), head);
     assert!(!plan.worktree.join("old-candidate.txt").exists());
+    if case=="qualification-bounced" {
+        requalification_tests::bounced(&root,&path,id,&plan,&head,&receipt_path,&receipt).await;
+        return;
+    }
     if case.starts_with("qualification") {
         let guard = workflow::WorkflowGuard::acquire_fixture(
             &path,
@@ -751,3 +762,6 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     );
     assert_eq!(store.snapshot(id).unwrap(), after);
 }
+
+#[path="self_improve_owner_requalification_tests.rs"]
+mod requalification_tests;

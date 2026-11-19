@@ -2,6 +2,8 @@
 
 mod approval_context;
 mod team_coverage;
+// #2284 — cross-channel owner-reply rule of the stale-approval sweep.
+mod owner_reply_sweep;
 mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
@@ -10,7 +12,13 @@ mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod yolo_command;
+mod yolo_turn;
 mod web;
+#[cfg(test)]
+mod yolo_isolation_tests;
+#[cfg(test)]
+mod yolo_acceptance_tests;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -833,8 +841,10 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
-        /// Pin one Discord model profile for this probe, without persisting a selection.
-        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
+        /// Pin one model profile for this probe, without persisting a selection.
+        /// `yolo` is accepted here and nowhere else outside a yolo thread; it
+        /// still requires the enable flag and a configured key.
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex", "yolo"])]
         profile: Option<String>,
         /// Ask the selected model to read a synthetic file through the Jarvis
         /// bridge and require a matching tool audit receipt. Performs inference.
@@ -3708,12 +3718,16 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
-            let external_autopr = autoship_worker::external_enabled();
-            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+            // #2275 — auto-ship has one execution path, the separately
+            // supervised `auto-pr-worker` (systemd on Linux, launchd on
+            // macOS). The daemon never hosts the loop; the old mode flag
+            // only earns a deprecation warning.
+            autoship_worker::warn_if_external_flag_set();
+            match autoship_deployment::record("daemon", dry_run, true).await {
                 Ok(()) => {
                     // A second serve must preserve both live configuration
                     // evidence and the updater's matching isolation receipt.
-                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                    if let Err(error) = autoship_worker::record_host_mode() {
                         warn!(%error, "could not publish auto-ship host mode; worker recovery will not attest this daemon");
                     }
                 }
@@ -4432,24 +4446,9 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
-            // #630 — auto-PR loop: poll for open `agent-fixable` issues and
-            // run the #103 self-improve pipeline (draft PR, never merge)
-            // unattended. Opt-in via AUGMENTAGENT_AUTOPR=1 — every engaged
-            // run spawns the claude CLI on the owner's subscription (#448),
-            // so it must never start billing as a side effect of a deploy.
-            // Serve's --dry-run flows through: the gate runs but no PR opens.
-            if external_autopr {
-                info!("auto-PR loop hosted by augmentagent-autopr.service");
-            } else { match self_improve::AutoPrLoop::from_env(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                dry_run,
-            ) {
-                Some(ap) => {
-                    let sd = shutdown.clone();
-                    tasks.push(tokio::spawn(async move { ap.run(sd).await }));
-                }
-                None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            } }
+            // #630 — the auto-PR loop runs only in `augmentagent
+            // auto-pr-worker` (#2275), so daemon restarts never interrupt it.
+            info!("auto-PR loop hosted by the auto-pr-worker service, not the daemon");
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same
@@ -4744,9 +4743,10 @@ async fn main() -> Result<()> {
                 // Runs once at startup (to clear whatever accumulated while the
                 // observer was off) and then on a slow tick.
                 let reconcile_store = Arc::clone(&store);
+                let reconcile_surfaces = card_surfaces.clone();
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
-                    run_stale_approval_reconcile(reconcile_store, sd).await
+                    run_stale_approval_reconcile(reconcile_store, reconcile_surfaces, sd).await
                 }));
             }
 
@@ -9200,6 +9200,7 @@ fn scheduled_send_interval_secs_from_env() -> u64 {
 /// reason in `errorMessage`, and simply stops being served by the carousel.
 async fn run_stale_approval_reconcile(
     store: Arc<Store>,
+    surfaces: augmentagent_approval_discord::CardSurfaces,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(STALE_RECONCILE_INTERVAL_SECS));
@@ -9232,12 +9233,23 @@ async fn run_stale_approval_reconcile(
             // Fires immediately on the first tick, which is what clears the
             // backlog left behind by the observer having been off.
             _ = ticker.tick() => {
-                match reconcile_stale_approvals_tick(&store) {
-                    Ok(0) => {}
-                    Ok(n) => info!(
-                        retired = n,
-                        "stale approval reconciliation: retired stale cards"
-                    ),
+                match reconcile_stale_approvals_pass(
+                    &store,
+                    &team_coverage::Config::from_env(&store),
+                    owner_reply_sweep::REPLY_CHECKS_PER_TICK,
+                ) {
+                    Ok(pass) => {
+                        if pass.retired > 0 {
+                            info!(
+                                retired = pass.retired,
+                                "stale approval reconciliation: retired stale cards"
+                            );
+                        }
+                        // #2284 — redraw every surface's card, as the other
+                        // supersede paths do, instead of leaving it to each
+                        // surface's own resolved-card poll.
+                        owner_reply_sweep::redraw(&surfaces, &pass.touched).await;
+                    }
                     Err(e) => warn!("stale approval reconciliation failed: {e:#}"),
                 }
             }
@@ -9363,19 +9375,31 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
 /// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
 /// config (#1700), so tests don't depend on the process environment.
 fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    Ok(reconcile_stale_approvals_pass(store, team, owner_reply_sweep::REPLY_CHECKS_PER_TICK)?.retired)
+}
+
+/// One reconciliation pass with at most `reply_checks` owner-reply lookups
+/// (#2284). Returns how many cards were retired and every card it tried to
+/// retire, so the caller can redraw their surfaces.
+fn reconcile_stale_approvals_pass(
+    store: &Store,
+    team: &team_coverage::Config,
+    reply_checks: usize,
+) -> Result<owner_reply_sweep::Pass> {
     let team_active = team.active();
     let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
-        return Ok(0);
+        return Ok(owner_reply_sweep::Pass::default());
     }
+    let mut budget = owner_reply_sweep::Budget::new(reply_checks, pending.len());
 
     let mut bulk_ids: Vec<String> = Vec::new();
     let mut empty_ids: Vec<String> = Vec::new();
     let mut answered_ids: Vec<String> = Vec::new();
 
-    for row in &pending {
+    for (pos, row) in budget.order(&pending).into_iter().enumerate() {
         // Rule 3 (#484) — the card has no draft to approve. This happens when a
         // draft was published with an empty body (historically the retry path
         // did this on a triage failure, fixed in #454; kept as a rule because
@@ -9441,14 +9465,19 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         // inbounds too, and the OutboundObserver deliberately never logs our
         // own sends as manual replies, so without this every older sibling
         // card stayed in the queue after the owner had answered.
+        //
+        // #2284 — "replied" is now cross-channel: any owner message in the
+        // card's conversation (iMessage, WhatsApp, Instagram, LinkedIn, …),
+        // not only Gmail's ledgers. An owner-started compose is never retired
+        // by the owner's own messages, and lookups are bounded per tick.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
-            Some(ms) if ms > 0 => ms,
-            _ => row.created_at_ms,
-        };
-        match store.thread_has_owner_send_after(tid, after_ms) {
+        if owner_reply_sweep::is_compose(row) || !budget.take(pos) {
+            continue;
+        }
+        let after_ms = owner_reply_sweep::inbound_bound_ms(store, row);
+        match store.owner_replied_since(&row.platform, tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
@@ -9476,10 +9505,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
             Err(e) => warn!(
                 action_id = %row.id,
                 thread = %tid,
-                "stale approval: thread_has_owner_send_after failed: {e:#}"
+                "stale approval: owner_replied_since failed: {e:#}"
             ),
         }
     }
+    budget.finish();
 
     // #500 — scheduled sends get Rule 1 ONLY (user replied on the thread),
     // bounded to replies AFTER the schedule was ARMED (its own cutoff, distinct
@@ -9500,6 +9530,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
     // cancellation — only the owner's Approve (arm) or the 7-day expiry
     // retires it. Both guards live in the store so every caller inherits them.
     let mut scheduled_retired = 0usize;
+    let mut scheduled_ids_retired: Vec<String> = Vec::new();
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
             Ok(true) => {
@@ -9518,6 +9549,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
                          replied after arming"
                     );
                     scheduled_retired += 1;
+                    scheduled_ids_retired.push(action_id.clone());
                 }
             }
             Ok(false) => {}
@@ -9551,6 +9583,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let mut touched: Vec<String> = Vec::new();
+    touched.extend(scheduled_ids_retired);
+    touched.extend(bulk_ids);
+    touched.extend(empty_ids);
+    touched.extend(answered_ids);
     let now = chrono::Utc::now().timestamp_millis();
     for (action_id, thread_id, c) in covered {
         let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
@@ -9575,12 +9612,13 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         }
         if team.mode == team_coverage::Mode::On {
             retired += store.mark_pending_heuristic_superseded_by_ids(
-                &[action_id],
+                &[action_id.clone()],
                 &format!("superseded: covered by teammate {}", c.teammate),
             )?;
+            touched.push(action_id);
         }
     }
-    Ok(retired)
+    Ok(owner_reply_sweep::Pass { retired, touched })
 }
 
 async fn run_stale_draft_sweep(
@@ -11542,6 +11580,20 @@ fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
     assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
 }
 
+/// #2218 — an isolation check, not routing. A turn that is not a yolo turn
+/// never runs in a yolo thread, whatever entry point produced it (voice
+/// start, voice bridge, phone, iMessage owner). An unreadable registry closes
+/// guild channels and leaves DMs alone. No inference is started.
+pub(crate) const YOLO_THREAD_REFUSAL: &str = "Not available in a yolo thread.";
+fn yolo_thread_refusal(ctx: &augmentagent_approval_discord::AuditCtx) -> Option<String> {
+    use augmentagent_store::yolo_threads::{closed_to_normal_turns, mark};
+    let channel = ctx.channel_id?;
+    if augmentagent_approval_discord::interaction::is_yolo_turn() {
+        return None;
+    }
+    closed_to_normal_turns(mark(channel.get()), ctx.guild_id.is_some()).then(|| YOLO_THREAD_REFUSAL.to_string())
+}
+
 async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
@@ -11601,8 +11653,8 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
     let probe = if tool_probe {
         let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
         anyhow::ensure!(
-            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
-            "--tool-probe requires claude, codex, qwen, or glm"
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex | ProviderKind::Yolo),
+            "--tool-probe requires claude, codex, qwen, glm, or yolo"
         );
         let directory = tempfile::tempdir()?;
         let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
@@ -11934,6 +11986,10 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            return self.answer_yolo(ctx, question).await;
+        }
         let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
             std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
                 .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
@@ -12083,6 +12139,14 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        // #2219 — a yolo turn: its own thread's history plus the message, no
+        // native session, no iMessage owner history, no other route.
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            let prompt = if history.is_empty() { current.to_string() }
+                else { format!("{history}\n\nuser's current message:\n{current}") };
+            return self.answer(ctx, &prompt).await;
+        }
         let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
         let mut combined_history=history.to_owned();
         if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {
@@ -12195,13 +12259,32 @@ impl QueryHandler for WikiQuerier {
     ) -> Option<augmentagent_approval_discord::owner_text::OwnerCommandOutcome> {
         // #2208 — `/search`: configuration only, never a vendor call.
         let (availability, _) = web::availability(&augmentagent_channel_core::secret_loader::load_provider_key);
-        web::command::run(
+        if let Some(reply) = web::command::run(
             text,
             &cx.channel_id.to_string(),
             &web::pins::PinStore::new(web::pins::config_path()),
             &availability,
+        ) {
+            return Some(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply(reply));
+        }
+        // #2219 — `/yolo`: decided here, performed by the Discord handler.
+        if text.split_whitespace().next() != Some("/yolo") {
+            return None;
+        }
+        yolo_command::run(
+            text,
+            &cx,
+            augmentagent_store::yolo_threads::mark(cx.channel_id),
+            &yolo_turn::facts(),
         )
-        .map(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply)
+    }
+
+    fn yolo_tag(&self) -> String {
+        // The id is validated by readiness; an invalid one is never printed.
+        match augmentagent_channel_core::yolo::readiness() {
+            Err(augmentagent_channel_core::yolo::NotReady::InvalidModel) => "[yolo]".into(),
+            _ => format!("[yolo · {}]", augmentagent_channel_core::yolo::model_id()),
+        }
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {

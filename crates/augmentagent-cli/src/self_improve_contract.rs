@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
+#[path="self_improve_acceptance_escalation.rs"]
+pub(super) mod escalation;
 #[path = "self_improve_amendment.rs"]
 mod amendment;
 #[path = "self_improve_scope.rs"]
@@ -49,7 +51,7 @@ const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
 const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-integrity.py");
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 pub(super) const CONTRACT_PROMPT: &str = r#"
-Owner-authorized recorded conservative assumptions constrain implementation: optional external integrations stay disabled, with no new spend, credentials, sensitive-data exposure, or irreversible production action. Unknown external capability is unavailable. Assumptions are not proof of qualification or test outcomes: establish actual local baseline behavior and preserve every original requirement.
+Owner-authorized recorded conservative assumptions constrain implementation: optional external integrations stay disabled, with no new spend, credentials, sensitive-data exposure, or irreversible production action. When in doubt, assume the safe default and state it: behind a config flag that is default off, reversible, with configurable thresholds. Unknown external capability is unavailable. Assumptions are not proof of qualification or test outcomes: establish actual local baseline behavior and preserve every original requirement.
 Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
 and `files`. contract schema_version=1, revision=1, exactly one real source:
 issue=<number> or pull_request=<number>, as a direct field of contract. There is

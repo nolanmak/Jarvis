@@ -269,7 +269,7 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
         ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
         ProviderKind::Qwen | ProviderKind::Glm => Arc::new(crate::codex::CodexCliReasoner::runpod(kind)),
         ProviderKind::Gemini => Arc::new(crate::gemini::GeminiCliReasoner::new()),
-        ProviderKind::Yolo => Arc::new(crate::yolo::PendingTransport),
+        ProviderKind::Yolo => Arc::new(crate::codex::CodexCliReasoner::yolo()),
         // Thin chat-completions client (#663 plan B — codex ≥0.148 removed
         // wire_api=chat and Cerebras has no Responses API).
         ProviderKind::Cerebras => Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
