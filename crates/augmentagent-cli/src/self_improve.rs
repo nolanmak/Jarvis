@@ -101,6 +101,8 @@ mod policy_hold;
 mod legacy_readmission;
 #[path = "self_improve_closed_targets.rs"]
 mod closed_targets;
+#[path="self_improve_scope_policy.rs"]
+mod scope_policy;
 #[path = "self_improve_owner_checkout_recovery.rs"]
 mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
@@ -1066,6 +1068,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
     qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
+    qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
     let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
@@ -1153,7 +1156,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 continue;
             },
         }
-        if owner_checkout_recovery::readiness_blocked(repo_root,&repository,&candidate).await? {
+        if scope_policy::readiness_blocked(repo_root,&repository,&candidate).await? {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
         }
@@ -8509,12 +8512,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     }
     let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    scope_prompt.push_str(scope_policy::SCOPING_POLICY);
+    let mut readiness_decisions=None;
     if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
             acceptance::readiness::Decision::Ready(evidence)=>evidence,
             acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
         };
         scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
+        readiness_decisions=Some(readiness);
         // #1515 — what landed on main since the issue was written, so the scoper
         // judges the issue against today's code rather than the code it
         // described. Empty when nothing merged or the date is unknown.
@@ -8561,6 +8567,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     }
     }
+    if saved_scope.is_none() {scope=scope_policy::constrain_scope(scope,&owner_request,readiness_decisions.as_deref())?;}
     // #843/#1516 — plan only unguarded parent issues. The post-scope caller
     // owns both child publication and the ordinary refusal fallback.
     if let Some(sc)=&scope {
