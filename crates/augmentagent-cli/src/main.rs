@@ -17,6 +17,8 @@ mod yolo_turn;
 mod web;
 #[cfg(test)]
 mod yolo_isolation_tests;
+#[cfg(test)]
+mod yolo_acceptance_tests;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
