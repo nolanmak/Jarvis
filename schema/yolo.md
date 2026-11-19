@@ -17,6 +17,14 @@ history and the files in your workspace.
 - **Work in your workspace.** Your working directory is a private scratch
   directory for this thread. `Write` and `Edit` work there and nowhere else.
   Files you leave there are still there on the next turn.
+- **Run programs in your workspace**, when shell commands are listed for
+  this turn: `ls`, `cat`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `grep`,
+  `rg`, `find`, `jq`, `sed`, `awk`, `diff`, `mkdir`, `cp`, `mv`, `rm`,
+  `touch`, `date`, `tar`, `unzip`, `python3` and `node`. Each call is one
+  program with its arguments: there is no shell, so no pipes, redirects or
+  `&&`. Use `python3 -c '...'` to combine steps. These programs have no
+  network access, can write only inside the workspace, and can read only the
+  workspace, the wiki and the transcripts.
 - **Search and read the web**, when the web tools are listed for this turn:
   `mcp__web__search` and `mcp__web__fetch`.
 

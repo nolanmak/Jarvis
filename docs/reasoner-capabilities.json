@@ -132,7 +132,7 @@
       ]
     },
     "yolo-workspace": {
-      "scope": "Read of the wiki, transcripts and inbound attachment temp files; writes only inside the per-thread yolo workspace; a fixed list of read-only service commands; read-only memory MCP. No wiki writes, no outbound or mutating commands, no native web tools.",
+      "scope": "Read of the wiki, transcripts and inbound attachment temp files; writes only inside the per-thread yolo workspace; a fixed list of read-only service commands; on Linux a fixed list of programs run in the kernel sandbox with no network, writing only in the workspace; read-only memory MCP. No wiki writes, no outbound or mutating commands, no native web tools.",
       "operations": [
         "Read",
         "Grep",
@@ -140,6 +140,7 @@
         "Write (workspace only)",
         "Edit (workspace only)",
         "Bash allowlist (read-only service commands)",
+        "Bash allowlist (sandboxed workspace programs, Linux only)",
         "configured MCP (memory, read-only)"
       ]
     },
@@ -842,7 +843,9 @@
         "yolo_preset::tests::writes_are_confined_to_the_workspace_and_the_wiki_is_read_only",
         "yolo_preset::tests::the_environment_is_an_allowlist_and_settings_hold_only_the_memory_server",
         "yolo_preset::tests::no_other_preset_can_read_a_yolo_workspace",
-        "yolo_readonly_commands_test::YoloReadonlyCommands"
+        "yolo_readonly_commands_test::YoloReadonlyCommands",
+        "yolo_preset::tests::the_workspace_shell_marker_selects_the_bridge_mode_and_never_reaches_a_command",
+        "workspace_shell_test::WorkspaceShellTests"
       ],
       "provider_conformance": "pending: served only by the yolo profile; live receipt is the epic acceptance (#2220)"
     },

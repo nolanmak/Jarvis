@@ -44,8 +44,7 @@ pub(crate) fn facts() -> crate::yolo_command::Facts {
         readiness: yolo::readiness(),
         model: yolo::model_id(),
         zdr_requested: yolo::zdr_requested(),
-        // Sandboxed workspace shell commands land with #2217.
-        shell: false,
+        shell: yolo_preset::SHELL_AVAILABLE,
         web,
         web_caveat,
     }

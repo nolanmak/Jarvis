@@ -33,7 +33,7 @@ pub const MEMORY_TOOLS: [&str; 7] = [
 /// Environment names a yolo turn may carry. Not here on purpose: the Discord
 /// bot token and channel id, every cloud credential, and the iMessage and
 /// Apple Notes storage settings that `ask_opts` forwards.
-pub const ENV_ALLOWLIST: [&str; 7] = [
+pub const ENV_ALLOWLIST: [&str; 8] = [
     "AUGMENTAGENT_DB",
     "WIKI_ROOT",
     "AUGMENTAGENT_REPO_ROOT",
@@ -42,7 +42,32 @@ pub const ENV_ALLOWLIST: [&str; 7] = [
     "PATH",
     // The granted `gmail` commands read it.
     "COMPOSIO_API_KEY",
+    // Selects the bridge's workspace-shell mode; never reaches a command.
+    crate::codex_tools::WORKSPACE_SHELL_ENV,
 ];
+
+/// Programs a yolo turn may run in its workspace (#2217). They run through
+/// the bridge's host-command path: a literal argument list with no shell,
+/// inside the kernel sandbox, with no network, writing only in the
+/// workspace, with a fixed minimal environment. The sandbox is the
+/// boundary; this list is a convenience (`python3` can start any program,
+/// which then runs inside the same sandbox). `git` is not offered: the
+/// bridge requires existing Git metadata in the working directory.
+pub const SHELL_PROGRAMS: [&str; 25] = [
+    "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "grep", "rg", "find", "jq", "sed",
+    "awk", "diff", "mkdir", "cp", "mv", "rm", "touch", "date", "tar", "unzip", "python3", "node",
+];
+
+/// Whether this build offers the workspace shell. The sandbox is Linux-only;
+/// elsewhere the commands are not offered at all.
+pub const SHELL_AVAILABLE: bool = cfg!(target_os = "linux");
+
+fn shell_tools() -> Vec<String> {
+    SHELL_PROGRAMS
+        .iter()
+        .flat_map(|program| [format!("Bash({program})"), format!("Bash({program} *)")])
+        .collect()
+}
 
 fn readonly_commands() -> Vec<(String, Vec<String>)> {
     let parsed: serde_json::Value =
@@ -172,6 +197,10 @@ pub fn yolo_opts(wiki_root: PathBuf, repo_root: PathBuf, workspace: PathBuf) -> 
         .collect();
     allowed_tools.extend(MEMORY_TOOLS.into_iter().map(String::from));
     allowed_tools.extend(command_tools(&repo_root));
+    if SHELL_AVAILABLE {
+        allowed_tools.extend(shell_tools());
+        env.push((crate::codex_tools::WORKSPACE_SHELL_ENV.into(), "1".into()));
+    }
 
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/yolo.md").to_string(),
@@ -219,7 +248,20 @@ mod tests {
             .collect();
         expected.extend(MEMORY_TOOLS.into_iter().map(String::from));
         expected.extend(command_tools(&repo));
+        if SHELL_AVAILABLE {
+            expected.extend(shell_tools());
+        }
         assert_eq!(opts.allowed_tools, expected);
+        assert_eq!(
+            shell_tools().len(),
+            50,
+            "each program with and without arguments"
+        );
+        assert!(
+            !SHELL_PROGRAMS.contains(&"git")
+                && !SHELL_PROGRAMS.contains(&"curl")
+                && !SHELL_PROGRAMS.contains(&"bash")
+        );
         // 18 augmentagent commands and 2 aa-gh commands, each in two forms.
         assert_eq!(command_tools(&repo).len(), 40);
         // Nothing that sends, posts, schedules, signs, uploads or runs loops,
@@ -346,6 +388,31 @@ mod tests {
             opts.system_prompt.contains("yolo thread")
                 && !opts.system_prompt.contains("durable-facts")
         );
+    }
+
+    #[test]
+    fn the_workspace_shell_marker_selects_the_bridge_mode_and_never_reaches_a_command() {
+        let (dir, wiki, repo, workspace) = fixture();
+        let policy_for = |opts: &ReasonerOpts, name: &str| -> serde_json::Value {
+            let launch_dir = dir.path().join(name);
+            std::fs::create_dir(&launch_dir).unwrap();
+            let launch = crate::codex_tools::BridgeLaunch::prepare(opts, &launch_dir).unwrap();
+            serde_json::from_slice(&std::fs::read(launch.policy_path).unwrap()).unwrap()
+        };
+        let mut opts = yolo_opts(wiki.clone(), repo.clone(), workspace);
+        opts.env
+            .retain(|(name, _)| name != crate::codex_tools::WORKSPACE_SHELL_ENV);
+        assert_eq!(policy_for(&opts, "without")["workspace_shell"], false);
+        opts.env
+            .push((crate::codex_tools::WORKSPACE_SHELL_ENV.into(), "1".into()));
+        let policy = policy_for(&opts, "with");
+        assert_eq!(policy["workspace_shell"], true);
+        assert!(policy["environment"]
+            .get(crate::codex_tools::WORKSPACE_SHELL_ENV)
+            .is_none());
+        // No other preset selects it.
+        let ask = crate::reasoner::ask_opts(wiki, repo);
+        assert_eq!(policy_for(&ask, "ask")["workspace_shell"], false);
     }
 
     #[test]

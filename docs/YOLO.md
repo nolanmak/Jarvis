@@ -35,6 +35,11 @@ Can:
   recent LinkedIn DMs, repository documents, and issue list and view;
 - read and write files in its own workspace,
   `<state dir>/yolo-workspaces/<thread id>/`, which persists across turns;
+- on Linux, run a short list of programs there (`python3`, `node`, `jq`,
+  `rg`, `sed` and the usual file tools; not `git`). Each call is one program
+  with its arguments and no shell. They run in the kernel sandbox with no
+  network, can write only in the workspace, and get a three-variable
+  environment;
 - search and fetch the web, only when `AUGMENTAGENT_YOLO_WEB=1` and a web
   provider is configured (see [WEB-PROVIDERS.md](WEB-PROVIDERS.md)).
 
