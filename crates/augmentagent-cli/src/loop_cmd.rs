@@ -1078,6 +1078,8 @@ mod tests {
         let row = store.list_user_loops("test-owner").unwrap().remove(0);
         assert_eq!(row.model_profile.as_deref(), Some("glm"));
         assert!(run_with(&store, create("gemini")).is_err());
+        // #2213 — yolo runs only in yolo threads, never as a loop pin.
+        assert!(run_with(&store, create("yolo")).is_err());
         assert_eq!(store.list_user_loops("test-owner").unwrap().len(), 1);
     }
 
