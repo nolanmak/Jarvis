@@ -1,14 +1,17 @@
 //! Web search and page fetch for models that cannot run native web tools
 //! (#2200, spec #2242). Six vendors; configured credentials decide which are
 //! usable. This module is the shared core: ids, availability, pin
-//! resolution, failover, deadlines and error redaction. The MCP server and
-//! turn attachment land in #2202.
+//! resolution, failover, deadlines and error redaction. `tool` holds the MCP
+//! server and the per-turn attachment.
 #![allow(dead_code)] // wired into turns by #2202
 
 pub mod pins;
 pub mod providers;
+pub mod tool;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_tests;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
