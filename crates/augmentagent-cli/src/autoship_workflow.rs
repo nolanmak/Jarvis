@@ -5,6 +5,8 @@
 pub(crate) mod acceptance_escalation;
 #[path="autoship_retry_policy.rs"]
 pub(crate) mod retry_policy;
+#[path="autoship_command_fairness.rs"]
+pub(crate) mod command_fairness;
 #[path="autoship_owner_requalification.rs"]
 pub(crate) mod owner_requalification;
 #[path="autoship_scope_policy.rs"]
@@ -101,6 +103,8 @@ pub(crate) mod owner_control;
 pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_ci_code_repair.rs"]
+pub(crate) mod ci_code_repair;
 #[path = "autoship_tool_capacity.rs"]
 pub(crate) mod tool_capacity;
 #[path = "autoship_retry_recovery.rs"]
@@ -885,6 +889,7 @@ impl WorkflowStore {
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
         conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
+        conn.execute_batch(command_fairness::SCHEMA)?;
         Ok(Self { conn })
     }
 
