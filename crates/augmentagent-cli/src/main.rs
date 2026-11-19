@@ -3708,12 +3708,16 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
-            let external_autopr = autoship_worker::external_enabled();
-            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+            // #2275 — auto-ship has one execution path, the separately
+            // supervised `auto-pr-worker` (systemd on Linux, launchd on
+            // macOS). The daemon never hosts the loop; the old mode flag
+            // only earns a deprecation warning.
+            autoship_worker::warn_if_external_flag_set();
+            match autoship_deployment::record("daemon", dry_run, true).await {
                 Ok(()) => {
                     // A second serve must preserve both live configuration
                     // evidence and the updater's matching isolation receipt.
-                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                    if let Err(error) = autoship_worker::record_host_mode() {
                         warn!(%error, "could not publish auto-ship host mode; worker recovery will not attest this daemon");
                     }
                 }
@@ -4432,24 +4436,9 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
-            // #630 — auto-PR loop: poll for open `agent-fixable` issues and
-            // run the #103 self-improve pipeline (draft PR, never merge)
-            // unattended. Opt-in via AUGMENTAGENT_AUTOPR=1 — every engaged
-            // run spawns the claude CLI on the owner's subscription (#448),
-            // so it must never start billing as a side effect of a deploy.
-            // Serve's --dry-run flows through: the gate runs but no PR opens.
-            if external_autopr {
-                info!("auto-PR loop hosted by augmentagent-autopr.service");
-            } else { match self_improve::AutoPrLoop::from_env(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                dry_run,
-            ) {
-                Some(ap) => {
-                    let sd = shutdown.clone();
-                    tasks.push(tokio::spawn(async move { ap.run(sd).await }));
-                }
-                None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            } }
+            // #630 — the auto-PR loop runs only in `augmentagent
+            // auto-pr-worker` (#2275), so daemon restarts never interrupt it.
+            info!("auto-PR loop hosted by the auto-pr-worker service, not the daemon");
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same

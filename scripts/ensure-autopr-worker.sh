@@ -1,10 +1,88 @@
 #!/usr/bin/env bash
-# Provision independently of daemon restart. Starting the worker is ordered
-# after the daemon so a legacy embedded loop is not duplicated at migration.
+# Provision the auto-ship worker (`augmentagent auto-pr-worker`) independently
+# of daemon restart. It is auto-ship's only execution path (#2275): systemd
+# runs it as augmentagent-autopr.service on Linux and launchd runs it as the
+# com.nolanmak.augmentagent.autopr LaunchAgent on macOS. The daemon never
+# hosts the loop, whatever AUGMENTAGENT_AUTOPR_EXTERNAL says.
 set -euo pipefail
-[ "$(uname -s)" = Linux ] || exit 0
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export REPO_ROOT
+
+# macOS mirror of scripts/systemd/augmentagent-autopr.service: same command,
+# working directory, environment (the daemon job's, plus the repo .env the
+# binary loads itself), logs and restart policy. KeepAlive restarts on any
+# non-zero exit, including 75 (load the updated executable), and leaves a
+# disabled worker's clean exit 0 stopped. ThrottleInterval mirrors RestartSec.
+ensure_macos() {
+  local label="com.nolanmak.augmentagent.autopr"
+  local agents="$HOME/Library/LaunchAgents"
+  local plist="$agents/$label.plist"
+  local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"
+  # shellcheck source=lib/launchd-install.sh
+  source "$REPO_ROOT/scripts/lib/launchd-install.sh"
+  mkdir -p "$agents" "$log_dir"
+  python3 "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/target/release"
+  local candidate status=0
+  candidate="$(launchd_candidate "$plist")"
+  python3 - "$plist" "$agents/com.nolanmak.augmentagent.plist" "$candidate" "$log_dir" "$label" <<'PY' || status=$?
+import os, plistlib, sys
+plist, daemon, candidate, log_dir, label = sys.argv[1:]
+repo, home = os.environ['REPO_ROOT'], os.environ['HOME']
+marker = b'<!-- Managed by ensure-autopr-worker.sh -->'
+try:
+    with open(daemon, 'rb') as f: job = plistlib.load(f)
+except FileNotFoundError:
+    job = {}
+arguments = job.get('ProgramArguments', [])
+dry = os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
+if dry is None:
+    dry = next((arguments[i + 1] for i, a in enumerate(arguments[:-1]) if a == '--dry-run'), 'true')
+if dry not in ('true', 'false'):
+    sys.exit('invalid worker dry-run setting')
+if os.environ.get('AUGMENTAGENT_NATIVE_VM_POLICY'):
+    print('native VM policy selection is Linux-only; not applied to the macOS worker', file=sys.stderr)
+environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'RUST_LOG': 'info', 'HOME': home}
+environment.update({k: str(v) for k, v in job.get('EnvironmentVariables', {}).items()})
+environment.pop('AUGMENTAGENT_AUTOPR_EXTERNAL', None)
+data = plistlib.dumps({
+    'Label': label,
+    'WorkingDirectory': repo,
+    'ProgramArguments': [repo + '/scripts/run-rs.sh', 'auto-pr-worker', '--dry-run', dry],
+    'EnvironmentVariables': environment,
+    'RunAtLoad': True,
+    'KeepAlive': {'SuccessfulExit': False, 'Crashed': True},
+    'ThrottleInterval': 3,
+    'StandardOutPath': log_dir + '/stdout.log',
+    'StandardErrorPath': log_dir + '/stderr.log',
+})
+declaration, rest = data.split(b'\n', 1)
+data = declaration + b'\n' + marker + b'\n' + rest
+if os.path.lexists(plist):
+    with open(plist, 'rb') as f: previous = f.read()
+    if marker not in previous:
+        sys.exit('preserving unmanaged launchd job ' + plist)
+    if previous == data:
+        sys.exit(10)
+with open(candidate, 'wb') as f: f.write(data)
+PY
+  case "$status" in
+    0) ;;
+    10)
+      rm -f "$candidate"
+      # Unchanged and loaded: leave the running worker alone. It reloads a
+      # new executable itself at its next clean boundary (exit 75).
+      if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then return 0; fi
+      cp -p "$plist" "$candidate" ;;
+    *) rm -f "$candidate"; return 1 ;;
+  esac
+  launchd_install "$label" "$plist" "$candidate" false
+}
+
+case "$(uname -s)" in
+  Linux) ;;
+  Darwin) ensure_macos; exit ;;
+  *) exit 0 ;;
+esac
 python3 - <<'PY'
 import os, pathlib, re, shlex, subprocess, tempfile, json, stat
 repo=pathlib.Path(os.environ['REPO_ROOT'])
@@ -132,7 +210,6 @@ write(unit_dir/'augmentagent.service.d/autoship-worker.conf',f'''# Managed by en
 [Unit]
 Wants=augmentagent-autopr.service
 [Service]
-Environment=AUGMENTAGENT_AUTOPR_EXTERNAL=1
 {shared_environment}
 Slice=augmentagent-runtime.slice
 ''')
