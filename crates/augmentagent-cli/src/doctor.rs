@@ -220,8 +220,13 @@ pub async fn run(
     findings.push(check_env_file_present());
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
+    findings.push(web_providers_finding(
+        &crate::web::availability(&augmentagent_channel_core::secret_loader::load_provider_key).0,
+        |flag| std::env::var(flag).ok().as_deref() == Some("1"),
+    ));
     findings.push(yolo_profile_finding(augmentagent_channel_core::yolo::readiness()));
     findings.push(check_message_index(&store));
+    findings.push(check_linkedin_session(&store));
     findings.push(check_embeddings_provider());
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
     findings.push(check_calendar_scheduled(&store));
@@ -834,6 +839,53 @@ fn check_env_file_present() -> Finding {
 ///   * warn  — key set but no active accounts (connect one), or
 ///   * warn  — no key at all (optional integration, so never error).
 /// The suggested_cmd points operators at the connect flow.
+/// #2209 — which web providers are usable for search and for fetch, from
+/// configured credentials only (never a live call). A model that cannot run
+/// native web tools is blind without at least one search provider, so that
+/// case is a warning when such a profile is enabled.
+fn web_providers_finding(
+    availability: &crate::web::Availability,
+    enabled: impl Fn(&str) -> bool,
+) -> Finding {
+    use crate::web::{Kind, ProviderId, Support};
+    let ids = |kind| {
+        let available = availability.available(kind);
+        if available.is_empty() {
+            "none".to_string()
+        } else {
+            available.iter().map(|id| id.id()).collect::<Vec<_>>().join(", ")
+        }
+    };
+    let mut missing = Vec::new();
+    for id in ProviderId::ALL {
+        for kind in [Kind::Search, Kind::Fetch] {
+            if let Support::Missing(names) = availability.support(id, kind) {
+                missing.push(format!("{} {} needs {}", id.id(), kind.name(), names.join(", ")));
+            }
+        }
+    }
+    let mut message = format!("search: {}; fetch: {}", ids(Kind::Search), ids(Kind::Fetch));
+    if !missing.is_empty() {
+        message.push_str(&format!(". Not configured: {}", missing.join("; ")));
+    }
+    let needs_web = [
+        "AUGMENTAGENT_MODEL_QWEN_ENABLED",
+        "AUGMENTAGENT_MODEL_GLM_ENABLED",
+        augmentagent_channel_core::yolo::ENABLED_ENV,
+    ]
+        .into_iter()
+        .any(enabled);
+    if needs_web && availability.available(Kind::Search).is_empty() {
+        Finding::warn(
+            "web_providers",
+            format!("a model without native web tools is enabled but no web search provider is configured. {message}"),
+            Some("see docs/WEB-PROVIDERS.md"),
+        )
+    } else {
+        Finding::ok("web_providers", message)
+    }
+}
+
 /// #2213 — the yolo profile is off unless the operator enables it; when it
 /// is enabled, name the one thing that keeps it from running. No live call.
 fn yolo_profile_finding(readiness: Result<(), augmentagent_channel_core::yolo::NotReady>) -> Finding {
@@ -936,6 +988,33 @@ fn check_message_index(store: &Store) -> Finding {
             "message_index",
             format!("message index check failed: {e:#}"),
             Some("augmentagent messages reindex"),
+        ),
+    }
+}
+
+/// #2255 — a LinkedIn session that needs a new login. An error, not a warn:
+/// nothing on the channel is read until the owner logs in again.
+fn check_linkedin_session(store: &Store) -> Finding {
+    use augmentagent_channel_linkedin::session_guard;
+    match session_guard::dead_sessions(store) {
+        Ok(dead) if dead.is_empty() => Finding::ok("linkedin_session", "no rejected LinkedIn session"),
+        Ok(dead) => Finding::error(
+            "linkedin_session",
+            dead.iter()
+                .map(|d| {
+                    let since = chrono::DateTime::from_timestamp_millis(d.since_ms)
+                        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| d.since_ms.to_string());
+                    format!("LinkedIn is not being read for {} since {since}: {}", d.account, d.error)
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Some(session_guard::LOGIN_COMMAND),
+        ),
+        Err(e) => Finding::warn(
+            "linkedin_session",
+            format!("LinkedIn session check failed: {e:#}"),
+            None,
         ),
     }
 }
@@ -2456,6 +2535,25 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn linkedin_session_fails_while_dead_and_clears_on_a_successful_read() {
+        use augmentagent_channel_linkedin::session_guard;
+        let store = Store::open(":memory:").unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Ok);
+        let account = "urn:li:fsd_profile:OWNER";
+        session_guard::record_failure(&store, account, "LinkedIn redirected the API request", 1_700_000_000_000).unwrap();
+        let finding = check_linkedin_session(&store);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains(account), "{}", finding.message);
+        assert!(finding.message.contains("2023-11-14T22:13:20Z"), "{}", finding.message);
+        assert_eq!(finding.suggested_cmd.as_deref(), Some(session_guard::LOGIN_COMMAND));
+        // A login alone lifts the pause, not the finding.
+        session_guard::clear_pause_after_login(&store, account).unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Error);
+        session_guard::record_success(&store, account, 1_700_000_100_000).unwrap();
+        assert_eq!(check_linkedin_session(&store).severity, Severity::Ok);
+    }
+
+    #[test]
     fn severity_strings() {
         assert_eq!(Severity::Ok.as_str(), "ok");
         assert_eq!(Severity::Warn.as_str(), "warn");
@@ -2546,6 +2644,32 @@ mod tests {
             "{}",
             f.message
         );
+    }
+
+    #[test]
+    fn web_providers_finding_lists_availability_and_warns_only_when_a_web_less_model_is_enabled() {
+        let none = crate::web::availability(&|_| None).0;
+        let some = crate::web::availability(&|name| (name == "BRAVE_API_KEY").then(|| "k".to_string())).0;
+        let off = |_: &str| false;
+        let qwen = |flag: &str| flag == "AUGMENTAGENT_MODEL_QWEN_ENABLED";
+
+        // Nothing configured and nothing needs it: informational.
+        let finding = web_providers_finding(&none, off);
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(finding.message.starts_with("search: none; fetch: none"), "{}", finding.message);
+        assert!(finding.message.contains("brave search needs BRAVE_API_KEY"), "{}", finding.message);
+
+        // A model that cannot run native web tools is enabled: warn.
+        let finding = web_providers_finding(&none, qwen);
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.suggested_cmd.as_deref().unwrap_or_default().contains("WEB-PROVIDERS"));
+
+        // One search provider is enough to clear the warning.
+        let finding = web_providers_finding(&some, qwen);
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(finding.message.starts_with("search: brave; fetch: none"), "{}", finding.message);
+        // Credential names are listed; values never are.
+        assert!(!finding.message.contains("BRAVE_API_KEY"), "configured names are not repeated: {}", finding.message);
     }
 
     #[test]

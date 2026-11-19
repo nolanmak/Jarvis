@@ -70,14 +70,22 @@ fn availability_follows_present_credentials_per_kind() {
         *availability.support(ProviderId::Brightdata, Kind::Fetch),
         Support::Missing(vec![BRIGHTDATA_UNLOCKER_ZONE])
     );
-    // Credentials complete but the client has not landed: listed, not usable.
     assert_eq!(
         *availability.support(ProviderId::Brightdata, Kind::Search),
-        Support::Missing(vec!["not implemented"])
+        Support::Ok
     );
     assert_eq!(
+        *availability.support(ProviderId::Serpapi, Kind::Search),
+        Support::Ok
+    );
+    // In preference order.
+    assert_eq!(
         availability.available(Kind::Search),
-        vec![ProviderId::Brave]
+        vec![
+            ProviderId::Brave,
+            ProviderId::Serpapi,
+            ProviderId::Brightdata
+        ]
     );
     assert!(availability.available(Kind::Fetch).is_empty());
     assert!(

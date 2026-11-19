@@ -24,6 +24,8 @@ pub struct LinkedInInbound<L: LinkedInApi> {
     /// like `LinkedInChannel::poll_once`.
     pub member_urn: String,
     store: Option<Arc<augmentagent_store::Store>>,
+    /// Where a dead or recovered session is reported to the owner.
+    session_notices: Option<Arc<dyn augmentagent_approval_discord::ApprovalBroker>>,
 }
 
 impl<L: LinkedInApi> LinkedInInbound<L> {
@@ -32,7 +34,16 @@ impl<L: LinkedInApi> LinkedInInbound<L> {
             api,
             member_urn,
             store: None,
+            session_notices: None,
         }
+    }
+    /// Report a dead session, and its recovery, on this broker after each poll.
+    pub fn with_session_notices(
+        mut self,
+        broker: Arc<dyn augmentagent_approval_discord::ApprovalBroker>,
+    ) -> Self {
+        self.session_notices = Some(broker);
+        self
     }
     pub fn with_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
         self.store = Some(store);
@@ -63,13 +74,24 @@ impl<L: LinkedInApi + 'static> InboundSource for LinkedInInbound<L> {
                     reader.mailbox() == self.member_urn,
                     "LinkedIn reader account mismatch"
                 );
-                let emails = crate::archive_live::poll(
+                let polled = crate::archive_live::poll(
                     &reader,
                     store,
                     100,
                     &tokio_util::sync::CancellationToken::new(),
                 )
-                .await?;
+                .await;
+                // After every poll, including one skipped by the backoff: this
+                // is also what repeats the notice daily and reports recovery.
+                if let Some(broker) = &self.session_notices {
+                    crate::session_guard::notify_after_poll(
+                        store,
+                        broker.as_ref(),
+                        &self.member_urn,
+                    )
+                    .await;
+                }
+                let emails = polled?;
                 return Ok(emails
                     .into_iter()
                     .map(|email| WorkItem {
