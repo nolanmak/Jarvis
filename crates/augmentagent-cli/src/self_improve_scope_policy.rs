@@ -1,6 +1,15 @@
 //! Scheduling adapters for the one-time safe scope policy admission.
 use super::*;
 use crate::autoship_workflow::WorkflowStore;
+pub(super) async fn migrate(root:&Path,dry_run:bool)->Result<usize> {
+    if dry_run {return Ok(0);}
+    let state=workflow::path();
+    if WorkflowStore::open_read_only(&state)?.is_none() {return Ok(0);}
+    let repository=workflow::canonical_repository(root).await?;
+    let count=WorkflowStore::open(&state)?.migrate_scope_policy(&repository,chrono::Utc::now().timestamp_millis())?;
+    if count>0 {info!(count,"reconsidered legacy scope holds under safe-default policy without model calls");}
+    Ok(count)
+}
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(false);
@@ -84,4 +93,28 @@ mod tests {
         .unwrap();
         assert_eq!(again.body, first);
     }
+}
+
+pub(super) async fn finish_prediction(repo:&Path,issue:&Issue,reason:&str,_scope_body:&str,plan:&[Slice],
+    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting,_automatic:bool)->Result<Option<RunReport>> {
+    if let Some(report)=accounting.report()? {return Ok(Some(report));}
+    if plan.len()>=MIN_SLICES {
+        match file_slices(repo,issue,plan,guard).await {
+            Ok(children) if !children.is_empty()=> {
+                guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                if let Some(report)=accounting.report()? {return Ok(Some(report));}
+                return Ok(Some(RunReport::triage(format!("issue #{}: oversized — sliced into {} child issues ({})",issue.number,children.len(),
+                    children.iter().map(|n|format!("#{n}")).collect::<Vec<_>>().join(", ")))));
+            },
+            Ok(_)=>(),
+            Err(error)=> {
+                if let Some(report)=linked_claims::report(&error) {return Ok(Some(report));}
+                warn!(issue=issue.number,"filing slices failed: {error:#}");
+            },
+        }
+    }
+    // A model's path/size forecast supplies no authority to stop the issue.
+    // Actual diff, owner, review and CI guards remain enforced after building.
+    warn!(issue=issue.number,prediction=reason,"scope forecast is advisory; continue within normal build limits");
+    Ok(None)
 }

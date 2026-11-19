@@ -341,8 +341,8 @@ apply_update() {
     Darwin)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
         # #1079 — the Linux guarantees, on launchd: defer under an in-flight
-        # auto-PR build (#844) or the restart budget (#903), and only count a
-        # restart that verifiably bounced the agent (#826).
+        # owner turn (#1779), memory pressure or the restart budget (#903),
+        # and only count a restart that verifiably bounced the agent (#826).
         if maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
@@ -370,17 +370,18 @@ apply_update() {
       ;;
     Linux)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
-        # #844 — an in-flight auto-PR build is ~20 min of agentic Opus; a
-        # restart kills it unrecorded. Deferring counts as a restart failure,
-        # so the stamp is withheld (#826) and the next tick retries — the
-        # binary is already built, so the retry is cheap.
+        # #1779 — an owner turn in flight defers the restart. Deferring
+        # counts as a restart failure, so the stamp is withheld (#826) and the
+        # next tick retries — the binary is already built, so the retry is
+        # cheap. Auto-ship runs never defer it (#2271): they live in
+        # augmentagent-autopr.service, which survives this restart.
         if deploy_pinned_elsewhere; then
           # #1571 — reported above; a restart would relaunch the frozen binary.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
-          # #903 — same deferral semantics as #844: counts as a restart
+          # #903 — same deferral semantics as #1779: counts as a restart
           # failure so the stamp is withheld and the next tick retries.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else

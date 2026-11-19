@@ -119,11 +119,11 @@ impl Report {
         }
     }
     pub fn preflight(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.matches && self.status == "configuration-matched",
-            "workflow-deployment:{}",
-            self.status
-        );
+        anyhow::ensure!(self.matches && self.status == "configuration-matched", "workflow-deployment:{}",self.status);
+        anyhow::ensure!(self.services["publish"]["status"]=="publish-ready"
+            && self.services["publish"]["permits_attempt"]==true
+            && self.services["publish"]["live_verified"]==false,
+            "workflow-deployment:publish-smoke-unverified");
         Ok(())
     }
 }
@@ -161,10 +161,16 @@ pub async fn inspect(repo: &Path) -> Report {
             _ => return Report::unavailable("deployment-inspection-unavailable"),
         };
     match serde_json::from_slice::<Report>(&output.stdout) {
-        Ok(report)
+        Ok(mut report)
             if !report.live_verified
                 && (!report.matches || report.status == "configuration-matched") =>
         {
+            if report.matches {
+                report.services["publish"]=crate::self_improve::deployment_publish_smoke(repo).await;
+                if report.services["publish"]["permits_attempt"]!=true {
+                    report.matches=false;report.status="publish-smoke-unverified".into();
+                }
+            }
             report
         }
         _ => Report::unavailable("deployment-report-invalid"),
@@ -274,3 +280,7 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 }
+
+#[cfg(test)]
+#[path="autoship_publish_readiness_tests.rs"]
+mod publish_readiness_tests;

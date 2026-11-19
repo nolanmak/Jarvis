@@ -13,7 +13,7 @@ use augmentagent_approval_discord::owner_commands::{
 
 const EVENT_HANDLER: &str = include_str!("../src/event_handler.rs");
 
-const KNOWN_DISCORD_TRIGGERS: [&str; 8] = [
+const KNOWN_DISCORD_TRIGGERS: [&str; 9] = [
     "!autoship",
     "model",
     "loop",
@@ -22,6 +22,7 @@ const KNOWN_DISCORD_TRIGGERS: [&str; 8] = [
     "/voice",
     "button:loop_ack",
     "button:loop_dismiss",
+    "/search",
 ];
 
 #[test]
