@@ -33,27 +33,47 @@ pub(super) fn prepare_card(
     Ok(email)
 }
 
-/// #2331 — pending owner-composed DM cards for `conversation`, oldest first:
-/// the cards a follow-up `socialapi dm --post` replaces. Only compose cards
-/// (the synthetic `compose:socialapi:dm:<conversation>` identity, with or
-/// without the per-card suffix), never the triage card for an inbound
-/// message, and never a card already armed with a send time.
-pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
-    let base = format!("compose:socialapi:dm:{conversation}");
-    let prefix = format!("{base}:");
-    Ok(store.with_conn(|conn| {
-        let mut statement = conn.prepare(
-            "SELECT a.id FROM actions a JOIN emails e ON e.messageId = a.messageId
-            WHERE e.platform = 'socialapi' AND e.kind = 'dm' AND a.threadId = ?1
+/// #2331 — the cards a follow-up `socialapi dm --post` replaces: pending,
+/// unscheduled compose cards (the synthetic
+/// `compose:socialapi:dm:<conversation>` identity, with or without the
+/// per-card suffix) for the action's own conversation. Never the triage card
+/// for an inbound message, and never a card already carrying a send time.
+/// Selection and retirement share the predicate so they cannot disagree on
+/// which cards are in scope.
+const COMPOSE_CARD_SCOPE: &str = "FROM actions a JOIN emails e ON e.messageId = a.messageId
+            WHERE e.platform = 'socialapi' AND e.kind = 'dm'
               AND a.status = 'pending' AND a.scheduledAtMs IS NULL
-              AND (e.messageId = ?2 OR substr(e.messageId, 1, length(?3)) = ?3)
-            ORDER BY a.createdAt, a.rowid",
-        )?;
-        let rows = statement.query_map(
-            augmentagent_store::rusqlite::params![conversation, base, prefix],
-            |row| row.get(0),
-        )?;
+              AND (e.messageId = 'compose:socialapi:dm:' || a.threadId
+                OR substr(e.messageId, 1, length('compose:socialapi:dm:' || a.threadId || ':'))
+                   = 'compose:socialapi:dm:' || a.threadId || ':')";
+
+/// #2331 — the in-scope cards for `conversation`, oldest first.
+///
+/// #2350 — cards composed inside one millisecond share `createdAt`, so the
+/// tie-break is insertion order (`rowid`); the action id is a random UUID and
+/// would order them arbitrarily.
+pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
+    Ok(store.with_conn(|conn| {
+        let mut statement = conn.prepare(&format!(
+            "SELECT a.id {COMPOSE_CARD_SCOPE} AND a.threadId = ?1
+            ORDER BY a.createdAt, a.rowid"
+        ))?;
+        let rows = statement.query_map([conversation], |row| row.get(0))?;
         rows.collect()
+    })?)
+}
+
+/// #2350 — `prior` is read before the replacement card is posted, so a card
+/// can leave scope in that window: a `--send-at` proposal leaves it pending
+/// with a send time set, which `Store::mark_pending_superseded_by_ids` (status
+/// only) would still retire.
+fn still_in_compose_scope(store: &Store, id: &str) -> Result<bool> {
+    Ok(store.with_conn(|conn| {
+        conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 {COMPOSE_CARD_SCOPE} AND a.id = ?1)"),
+            [id],
+            |row| row.get(0),
+        )
     })?)
 }
 
@@ -63,6 +83,13 @@ pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result
 pub(super) fn supersede_prior_compose_cards(store: &Store, prior: &[String]) -> Vec<String> {
     prior
         .iter()
+        .filter(|id| match still_in_compose_scope(store, id) {
+            Ok(in_scope) => in_scope,
+            Err(e) => {
+                tracing::warn!(action_id = %id, "follow-up social DM: failed to confirm scope: {e}");
+                false
+            }
+        })
         .filter(|id| {
             match store.mark_pending_superseded_by_ids(
                 std::slice::from_ref(*id),
@@ -387,6 +414,56 @@ mod tests {
         assert_eq!(status(&other), "pending");
         assert_eq!(status(&scheduled), "pending");
         assert!(pending_compose_cards(&store, CONVERSATION).unwrap().is_empty());
+    }
+
+    /// A pending card on `conversation`, seeded straight into the store so the
+    /// scope checks can be exercised without going through account inference.
+    fn seed_card(store: &Store, message_id: &str, conversation: &str) -> String {
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, firstSeenAt, platform, kind)
+                    VALUES (?1, ?2, 'Synthetic peer', 'Synthetic DM', 'Synthetic context', 0, 'socialapi', 'dm')",
+                    augmentagent_store::rusqlite::params![message_id, conversation],
+                )
+            })
+            .unwrap();
+        store
+            .log_action(
+                message_id,
+                Some(conversation),
+                "Synthetic peer",
+                "Synthetic DM",
+                Some("Synthetic context"),
+                Some("Synthetic draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn retirement_re_checks_scope_for_cards_that_left_it_after_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().canonicalize().unwrap().join("db")).unwrap();
+        let triage = seed_card(&store, "synthetic-trigger", CONVERSATION);
+        let armed = seed_card(&store, &format!("{COMPOSE}:armed"), CONVERSATION);
+        let live = seed_card(&store, &format!("{COMPOSE}:live"), CONVERSATION);
+
+        let mut prior = pending_compose_cards(&store, CONVERSATION).unwrap();
+        assert_eq!(prior, vec![armed.clone(), live.clone()]);
+        // While the replacement card was being posted the owner proposed a
+        // send time on one of the prior cards: it stays pending, but is no
+        // longer a card a follow-up compose may retire.
+        store.set_action_scheduled_at(&armed, Some(1)).unwrap();
+        // An inbound triage card is out of scope however it reaches here.
+        prior.push(triage.clone());
+
+        let retired = supersede_prior_compose_cards(&store, &prior);
+        assert_eq!(retired, vec![live.clone()]);
+        let status = |id: &str| store.get_action_with_email(id).unwrap().unwrap().action.status;
+        assert_eq!(status(&live), "superseded");
+        assert_eq!(status(&armed), "pending");
+        assert_eq!(status(&triage), "pending");
     }
 
     #[test]
