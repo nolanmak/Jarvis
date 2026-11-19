@@ -41,7 +41,8 @@ and publication checks still run; recovery is scheduling, not evidence.
 
 If a remote operation remains unresolved, the controller records
 `retry_cycle_exhausted_pending_effect`, preserves that intent and leaves it to
-the existing publication observer. It does not invent a successful receipt,
+the existing publication observer with its original eligibility time. Retry
+backoff never delays that fenced reconciliation path. It does not invent a successful receipt,
 rescope over an unknown remote effect, or blindly dispatch a second push.
 Paused work and pending owner input retain owner authority.
 

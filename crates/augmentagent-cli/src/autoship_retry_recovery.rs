@@ -100,7 +100,12 @@ pub(super) fn finish(tx: &Transaction<'_>, lease: &Lease, now: i64) -> Result<()
             action: "rescope_executable_acceptance".into(),
             eligible_at_ms: now.saturating_add(delay),
         };
-    } else if !matches!(class, "capacity" | "verification") || cp.next.eligible_at_ms <= 0 {
+    } else if !pending
+        && (!matches!(class, "capacity" | "verification") || cp.next.eligible_at_ms <= 0)
+    {
+        // Pending effects keep their original eligibility: the existing bound
+        // publication reconciler must remain able to observe/recover them.
+        // Productive selection still excludes every unresolved operation.
         // Capacity/verifier schedules have their own typed immutable receipts.
         // Preserve their timestamps rather than forging replacement evidence.
         if attempt > 1
@@ -443,12 +448,42 @@ mod tests {
             store.release(&lease, 5).unwrap();
             let after = store.snapshot(&lease.workflow).unwrap().unwrap();
             assert_eq!(after.checkpoint.stage, Stage::Publish);
+            assert_eq!(after.checkpoint.next.eligible_at_ms, cp.next.eligible_at_ms,
+                "pending remote effects must retain eligibility for the existing fenced reconciliation path");
             assert_eq!(
                 store.pending_operations(&lease.workflow).unwrap()[0].id,
                 op.id
             );
             if pause {
                 assert_eq!(after.checkpoint, cp);
+            } else {
+                // Even an exhausted cycle must not postpone the observer or
+                // replace the checkpoint while an exact remote effect is pending.
+                for round in 1..MAX_CYCLE {
+                    let now = 10 + i64::from(round) * 2;
+                    let lease = store
+                        .claim_productive("owner/repo#1", "observer", now, 1000)
+                        .unwrap()
+                        .unwrap();
+                    store.release(&lease, now + 1).unwrap();
+                    assert_eq!(
+                        store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,
+                        cp
+                    );
+                    assert_eq!(
+                        store.pending_operations(&lease.workflow).unwrap()[0].id,
+                        op.id
+                    );
+                }
+                let events = store.events("owner/repo#1").unwrap();
+                let (_, _, raw, _) = events
+                    .iter()
+                    .rfind(|(_, kind, _, _)| kind == "retry_turn_finished")
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(raw).unwrap()["terminal_reason"],
+                    "retry_cycle_exhausted_pending_effect"
+                );
             }
         }
     }
