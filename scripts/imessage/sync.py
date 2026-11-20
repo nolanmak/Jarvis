@@ -60,6 +60,18 @@ def mirror(out, remote):
     ], check=True, timeout=1800)
 
 
+def upload_cause(returncode, stderr, path, key, limit=200):
+    """Why one `aws s3 cp` failed, with the file's own names taken out of the
+    text. The AWS CLI names the file it could not read, which would make every
+    file in a denied run look like a different cause and defeat the drain's
+    collapsing (#1431)."""
+    detail = stderr.decode(errors="replace").strip()
+    for name in (str(path), str(key)):
+        if name:
+            detail = detail.replace(name, "<file>")
+    return f"exit {returncode}: {detail[:limit]}"
+
+
 def run(args):
     os.umask(0o077)
     if args.remote and not shutil.which("rsync"):
@@ -80,7 +92,16 @@ def run(args):
             ), recursive=True))
         s3 = None
         if args.s3_bucket:
-            def upload(path, bucket, key, deadline=None):
+            def upload(path, bucket, key, deadline=None, report=None):
+                # Report the cause rather than print it: the drain collapses
+                # repeats of one cause into a single counted line (#1431), so a
+                # denial that hits every attachment cannot flood the log.
+                def failed(cause):
+                    if report is not None:
+                        report(cause)
+                    else:
+                        print(f"upload failed, will retry: {key}: {cause}", file=sys.stderr)
+
                 cmd = ["aws", "s3", "cp", path, f"s3://{bucket}/{key}", "--only-show-errors"]
                 if args.aws_profile:
                     cmd += ["--profile", args.aws_profile]
@@ -94,14 +115,12 @@ def run(args):
                 try:
                     done = subprocess.run(cmd, capture_output=True, timeout=limit)
                 except subprocess.TimeoutExpired:
-                    print(f"upload timed out, will retry: {key}", file=sys.stderr)
+                    failed("timed out")
                     return False
                 if done.returncode != 0:
                     # Without this the failure is invisible: --only-show-errors
                     # writes to stderr and the queue silently re-grows each run.
-                    print(f"upload failed ({done.returncode}): {key}: "
-                          f"{done.stderr.decode(errors='replace').strip()[:200]}",
-                          file=sys.stderr)
+                    failed(upload_cause(done.returncode, done.stderr, path, key))
                 return done.returncode == 0
             s3 = {"bucket": args.s3_bucket, "uploader": upload}
         result = sync(args.db, args.out, args.out / ".sync_state.json", contacts=contacts, s3=s3)

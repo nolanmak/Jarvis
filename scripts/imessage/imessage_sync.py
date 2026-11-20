@@ -60,13 +60,33 @@ def is_uploadable(path):
     return not str(path).lower().endswith(SKIP_ATTACHMENT_SUFFIXES)
 
 
-def _takes_deadline(uploader):
-    """True when the uploader accepts a `deadline` keyword, so a slow file can
-    be cut off by the run's budget rather than its own per-file timeout."""
+def _accepts(uploader, keyword):
+    """True when the uploader accepts `keyword`: `deadline` lets a slow file be
+    cut off by the run's budget rather than its own per-file timeout, `report`
+    routes its failure text through the drain's collapsing."""
     try:
-        return "deadline" in inspect.signature(uploader).parameters
+        return keyword in inspect.signature(uploader).parameters
     except (TypeError, ValueError):
         return False
+
+
+def collapse_failures(failures):
+    """One line per distinct cause, in first-seen order, counting the files
+    that hit it.
+
+    A hot error loop — every attachment denied the same way on every run —
+    once wrote 426k identical lines into a 112 MB sync log (#1431). Counting
+    them bounds the volume while keeping a second, different cause visible.
+    """
+    grouped = {}
+    for key, cause in failures:
+        first, count = grouped.get(cause, (key, 0))
+        grouped[cause] = (first, count + 1)
+    lines = []
+    for cause, (key, count) in grouped.items():
+        repeats = f" ({count} files, same cause)" if count > 1 else ""
+        lines.append(f"upload failed, will retry{repeats}: {key}: {cause}")
+    return lines
 
 
 def drain_uploads(items, bucket, uploader, exists=None, workers=UPLOAD_WORKERS,
@@ -84,23 +104,32 @@ def drain_uploads(items, bucket, uploader, exists=None, workers=UPLOAD_WORKERS,
         return []
 
     def attempt(item):
+        """(uploaded, cause) — `cause` is None when there is nothing to say."""
         if deadline is not None and time.monotonic() >= deadline:
-            return False
+            return False, None
+        reported = []
+        kwargs = {}
+        if _accepts(uploader, "deadline"):
+            kwargs["deadline"] = deadline
+        if _accepts(uploader, "report"):
+            kwargs["report"] = reported.append
         try:
-            if _takes_deadline(uploader):
-                return bool(uploader(item["path"], bucket, item["key"],
-                                     deadline=deadline))
-            return bool(uploader(item["path"], bucket, item["key"]))
+            ok = bool(uploader(item["path"], bucket, item["key"], **kwargs))
         except Exception as error:
             # Never propagate: the caller saves the ROWID cursor after this
             # returns, and losing it would re-append messages already written.
-            print(f"upload error, will retry: {item['key']}: {error}",
-                  file=sys.stderr)
-            return False
+            return False, str(error)
+        return ok, (reported[0] if reported and not ok else None)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         done = list(pool.map(attempt, live))
-    return [item for item, ok in zip(live, done) if not ok]
+    failures = [(item["key"], cause)
+                for item, (_, cause) in zip(live, done) if cause is not None]
+    # Grouped after the drain, in queue order, so the lines read the same
+    # however the pool interleaved the attempts.
+    for line in collapse_failures(failures):
+        print(line, file=sys.stderr)
+    return [item for item, (ok, _) in zip(live, done) if not ok]
 
 
 def apple_time_to_iso(raw):

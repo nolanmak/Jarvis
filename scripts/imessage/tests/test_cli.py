@@ -103,6 +103,25 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(self.args), 1)
         self.assertIn("Full Disk Access", stderr.getvalue())
 
+    def test_upload_cause_is_the_same_for_every_file_of_one_failure(self):
+        # #1431 — the AWS CLI names the file it could not read, so two denials
+        # must reduce to one cause or the drain cannot collapse them.
+        denial = b"upload failed: ../Attachments/one.heic to s3://b/a/one.heic PermissionError"
+        first = cli.upload_cause(1, denial, "../Attachments/one.heic", "a/one.heic")
+        second = cli.upload_cause(
+            1,
+            denial.replace(b"one.heic", b"two.heic"),
+            "../Attachments/two.heic",
+            "a/two.heic")
+        self.assertEqual(first, second)
+        self.assertIn("PermissionError", first)
+        self.assertIn("exit 1", first)
+
+    def test_upload_cause_keeps_a_genuinely_different_error_apart(self):
+        self.assertNotEqual(
+            cli.upload_cause(1, b"PermissionError", "/a.heic", "a.heic"),
+            cli.upload_cause(1, b"NoSuchBucket", "/a.heic", "a.heic"))
+
     def test_plist_roundtrip_preserves_paths_and_arguments(self):
         args = ["--out", "/private/path with spaces & chars", "--no-contacts"]
         value = plistlib.loads(plistlib.dumps(schedule.make_plist(args, 15, self.root)))

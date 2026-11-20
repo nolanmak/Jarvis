@@ -28,10 +28,15 @@ use chrono::{Datelike, NaiveDate};
 
 pub const DEFAULT_MAX_MB: u64 = 50;
 pub const DEFAULT_KEEP_MONTHS: u32 = 3;
+pub const SYNC_DEFAULT_MAX_MB: u64 = 10;
+pub const SYNC_DEFAULT_KEEP: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub max_bytes: u64,
+    /// The retention budget: months of history for the state dir's logs, and
+    /// — for the sync job logs, which can rotate many times inside one month
+    /// — a cap on the number of archives kept (#1431).
     pub keep_months: u32,
 }
 
@@ -42,14 +47,45 @@ impl Default for Policy {
 }
 
 impl Policy {
+    /// The state dir's policy. The sync-log names are read as a fallback, so a
+    /// host that configures only its sync rotation gets one coherent policy
+    /// rather than two that disagree.
     pub fn from_env() -> Self {
-        let num = |key: &str| std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let d = Self::default();
+        Self::default().with_env(
+            &["AUGMENTAGENT_LOG_ROTATE_MB", "AUGMENTAGENT_SYNC_LOG_ROTATE_MB"],
+            &["AUGMENTAGENT_LOG_KEEP_MONTHS", "AUGMENTAGENT_SYNC_LOG_KEEP"],
+        )
+    }
+
+    /// The scheduled-sync job logs rotate tighter and keep a fixed number of
+    /// archives: 10 MB and 5, from `AUGMENTAGENT_SYNC_LOG_ROTATE_MB` /
+    /// `AUGMENTAGENT_SYNC_LOG_KEEP`.
+    pub fn sync_from_env() -> Self {
+        Self { max_bytes: SYNC_DEFAULT_MAX_MB * 1024 * 1024, keep_months: SYNC_DEFAULT_KEEP }
+            .with_env(&["AUGMENTAGENT_SYNC_LOG_ROTATE_MB"], &["AUGMENTAGENT_SYNC_LOG_KEEP"])
+    }
+
+    /// The first of `mb_keys` / `keep_keys` the environment sets wins.
+    fn with_env(self, mb_keys: &[&str], keep_keys: &[&str]) -> Self {
+        let num = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| std::env::var(*key).ok()?.trim().parse::<u64>().ok())
+        };
         Self {
-            max_bytes: num("AUGMENTAGENT_LOG_ROTATE_MB").map_or(d.max_bytes, |mb| mb * 1024 * 1024),
-            keep_months: num("AUGMENTAGENT_LOG_KEEP_MONTHS").map_or(d.keep_months, |m| m as u32),
+            max_bytes: num(mb_keys).map_or(self.max_bytes, |mb| mb * 1024 * 1024),
+            keep_months: num(keep_keys).map_or(self.keep_months, |n| n as u32),
         }
     }
+}
+
+/// Where the macOS scheduled-sync jobs write (`scripts/*/schedule.py`); nothing
+/// rotated these until #1431, and one reached 112 MB. On Linux the same jobs
+/// log into the state dir, which this command already covers.
+pub fn sync_log_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/augmentagent"))
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +95,14 @@ impl Policy {
 /// A live log this command owns: `*.log` or `*.jsonl`, not a rotated file.
 pub fn is_rotatable(name: &str) -> bool {
     (name.ends_with(".log") || name.ends_with(".jsonl")) && !name.starts_with('.')
+}
+
+/// A scheduled data-sync job's log (`imessage-sync.log`, `wiki-sync.log`, …).
+/// A run appends to it through a redirect held open for the whole run, and the
+/// file grows in bursts when a per-file failure loop is hot, so these need the
+/// inode kept and a history bounded by count rather than by age (#1431).
+pub fn is_sync_log(name: &str) -> bool {
+    is_rotatable(name) && name.ends_with("-sync.log")
 }
 
 /// `stderr.log` rotated on 2026-10-06 → `stderr.log.20261006.gz`.
@@ -107,6 +151,12 @@ pub enum Method {
 
 /// `held`: some process has the file open. `None` = cannot tell, treated as held.
 pub fn method_for(name: &str, held: Option<bool>) -> Method {
+    // A sync job's log is always copied and truncated, whatever this instant
+    // says about its fd: a job that starts between the check and the rename
+    // would spend the rest of its run appending to an unlinked file (#1431).
+    if is_sync_log(name) {
+        return Method::CopyTruncate;
+    }
     match (held.unwrap_or(true), name.ends_with(".jsonl")) {
         (false, _) => Method::Rename,
         (true, false) => Method::CopyTruncate,
@@ -188,6 +238,43 @@ pub fn rotated_files(dir: &Path, name: &str) -> Vec<(PathBuf, NaiveDate)> {
         .unwrap_or_default();
     out.sort();
     out
+}
+
+/// Which rotation of its day an archive is: `a.log.20261120.gz` is the first,
+/// `a.log.20261120-2.gz` the second. Same-day archives need this to order —
+/// plain path order puts `-2` before `.gz`.
+fn generation(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".gz"))
+        .and_then(|n| n.rsplit_once('.'))
+        .and_then(|(_, stamp)| stamp.split_once('-'))
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Keep the newest `keep` rotations of `name` and delete the rest. Only files
+/// this command named are candidates, so a hand-made archive sitting beside
+/// them (`imessage-sync.log.fda-spam-20260928.gz`) is never touched.
+fn prune_archives(dir: &Path, name: &str, keep: u32, dry_run: bool) -> Vec<Outcome> {
+    let mut archives = rotated_files(dir, name);
+    archives.sort_by_key(|(path, date)| (*date, generation(path)));
+    let excess = archives.len().saturating_sub(keep as usize);
+    archives
+        .into_iter()
+        .take(excess)
+        .map(|(path, _)| {
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let action = if dry_run {
+                "would delete (over the retained archive count)".to_string()
+            } else if std::fs::remove_file(&path).is_ok() {
+                "deleted (over the retained archive count)".to_string()
+            } else {
+                "failed to delete".to_string()
+            };
+            Outcome { file: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), action, bytes }
+        })
+        .collect()
 }
 
 fn created_on(path: &Path) -> Option<NaiveDate> {
@@ -275,13 +362,30 @@ pub fn run(dir: &Path, policy: &Policy, today: NaiveDate, dry_run: bool, keep_ex
             };
             out.push(Outcome { file: name.clone(), action, bytes });
         }
+        // Size rotations can fire many times inside one month, so the sync
+        // job logs are capped by archive count as well (#1431).
+        let mut sync_logs: Vec<&str> = names
+            .iter()
+            .filter_map(|n| if is_sync_log(n) { Some(n.as_str()) } else { parse_rotated(n).map(|(base, _)| base) })
+            .filter(|base| is_sync_log(base))
+            .collect();
+        sync_logs.sort();
+        sync_logs.dedup();
+        for name in sync_logs {
+            out.extend(prune_archives(dir, name, policy.keep_months, dry_run));
+        }
     }
     out
 }
 
 pub fn run_cli(dir: &Path, dry_run: bool, json: bool, keep_expired: bool, out: &mut dyn Write) -> Result<()> {
     let today = chrono::Utc::now().date_naive();
-    let outcomes = run(dir, &Policy::from_env(), today, dry_run, keep_expired);
+    let mut outcomes = run(dir, &Policy::from_env(), today, dry_run, keep_expired);
+    // The macOS sync jobs log outside the state dir, and nothing rotated them
+    // at all until #1431; this pass covers them on their own tighter policy.
+    if let Some(sync_dir) = sync_log_dir().filter(|d| d.as_path() != dir && d.is_dir()) {
+        outcomes.extend(run(&sync_dir, &Policy::sync_from_env(), today, dry_run, keep_expired));
+    }
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&outcomes)?)?;
         return Ok(());
@@ -385,12 +489,16 @@ mod tests {
 
     #[test]
     fn a_held_text_log_is_copied_and_a_held_record_log_is_left_alone() {
-        assert_eq!(method_for("wiki-sync.log", Some(false)), Method::Rename);
+        assert_eq!(method_for("stderr.log", Some(false)), Method::Rename);
         assert_eq!(method_for("token-usage.jsonl", Some(false)), Method::Rename);
         assert_eq!(method_for("stderr.log", Some(true)), Method::CopyTruncate);
         assert_eq!(method_for("token-usage.jsonl", Some(true)), Method::Skip);
         assert_eq!(method_for("stderr.log", None), Method::CopyTruncate, "cannot tell: assume held");
         assert_eq!(method_for("token-usage.jsonl", None), Method::Skip);
+        // A sync job's log keeps its inode however its fd looks right now.
+        assert_eq!(method_for("wiki-sync.log", Some(false)), Method::CopyTruncate);
+        assert!(is_sync_log("imessage-sync.log") && is_sync_log("apple-notes-sync.log"));
+        assert!(!is_sync_log("imessage-sync.log.20261120.gz") && !is_sync_log("stderr.log"));
     }
 
     fn read_gz(path: &Path) -> String {
@@ -485,6 +593,80 @@ mod tests {
         std::fs::write(dir.join(rotated_name("small.log", d(2026, 1, 1))), b"gz").unwrap();
         run(dir, &policy, today, false, true);
         assert!(dir.join("small.log.20260101.gz").exists(), "keep_expired leaves expiry to the caller");
+    }
+
+    /// #1431 — nothing rotated the scheduled-sync logs and one reached 112 MB.
+    #[test]
+    fn a_sync_log_is_compressed_in_place_so_the_running_job_keeps_appending() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let log = dir.join("imessage-sync.log");
+        let policy = Policy { max_bytes: 1024 * 1024, keep_months: 5 };
+        let today = d(2026, 11, 20);
+        // Between runs nothing holds the log, but the job's redirect opens it
+        // for the whole of the next run: the inode has to survive regardless.
+        std::fs::write(&log, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        let inode = log.metadata().unwrap().ino();
+
+        run(dir, &policy, today, false, false);
+        assert!(log.exists(), "the job's append target is still there");
+        assert_eq!(log.metadata().unwrap().ino(), inode, "same inode, not a fresh file");
+        assert!(log.metadata().unwrap().len() < policy.max_bytes, "cut back under the cap");
+        assert_eq!(rotated_files(dir, "imessage-sync.log").len(), 1);
+        assert!(dir.join("imessage-sync.log.20261120.gz").exists(), "and the copy is compressed");
+
+        let mut next_run = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(next_run, "synced 3 messages").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "synced 3 messages\n");
+    }
+
+    #[test]
+    fn sync_log_history_is_capped_by_count_and_hand_made_archives_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let log = dir.join("whatsapp-sync.log");
+        let policy = Policy { max_bytes: 1024, keep_months: 5 };
+        let today = d(2026, 11, 20);
+        let decoy = dir.join("whatsapp-sync.log.fda-spam-20260928.gz");
+        std::fs::write(&decoy, b"archived by hand").unwrap();
+
+        // Six size rotations inside one day: the month rule expires none.
+        for _ in 0..6 {
+            std::fs::write(&log, vec![b'x'; 2048]).unwrap();
+            run(dir, &policy, today, false, false);
+        }
+        let kept: Vec<String> = rotated_files(dir, "whatsapp-sync.log")
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(!kept.contains(&"whatsapp-sync.log.20261120.gz".to_string()), "the oldest went: {kept:?}");
+        assert!(decoy.exists(), "pruning only touches archives rotation named");
+    }
+
+    #[test]
+    fn the_sync_policy_defaults_to_ten_megabytes_and_five_archives() {
+        let saved: Vec<(&str, Option<String>)> = ["AUGMENTAGENT_SYNC_LOG_ROTATE_MB", "AUGMENTAGENT_SYNC_LOG_KEEP"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        assert_eq!(Policy::sync_from_env(), Policy { max_bytes: 10 * 1024 * 1024, keep_months: 5 });
+        std::env::set_var("AUGMENTAGENT_SYNC_LOG_ROTATE_MB", "2");
+        std::env::set_var("AUGMENTAGENT_SYNC_LOG_KEEP", "4");
+        assert_eq!(Policy::sync_from_env(), Policy { max_bytes: 2 * 1024 * 1024, keep_months: 4 });
+        assert_eq!(Policy::from_env(), Policy { max_bytes: 2 * 1024 * 1024, keep_months: 4 },
+                   "a host that configures only its sync logs gets one policy");
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 
     #[test]
