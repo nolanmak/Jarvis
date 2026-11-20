@@ -535,3 +535,120 @@ fn capacity_return_wakes_the_same_durable_job_without_owner_action() {
         "dependency-adoption-provenance"
     );
 }
+
+/// #2383: PR #2372 / #2378 shape. A held `review-recovery-required` row with a
+/// green PR is re-admitted to the independent review with no human, past the
+/// once-a-day attempt ledger, on a bounded backoff per reviewed binding. Past
+/// the bound it is left to the daily adopted-draft resume, never dropped.
+#[test]
+fn held_review_recovery_resumes_automatically_with_a_bounded_backoff() {
+    use crate::autoship_workflow::ReviewRecoveryReadiness::Ready;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("workflow.db");
+    let (id, branch, pr, head) = ("owner/repo#2329", "agent-fix/issue-2329", 2378, "6f1a".repeat(10));
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let binding = Binding { head: head.clone(), contract: "contract".into(), evidence_hash: "evidence".into() };
+    store.register(id, branch, binding, 1).unwrap();
+    let lease = store.claim(id, "reviewer", 2, 100).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, "owner/repo", pr, 3).unwrap();
+    let hold = |store: &mut WorkflowStore, lease: &crate::autoship_workflow::Lease, at: i64| {
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Held;
+        cp.next = NextAction { reason: "review-recovery-required".into(), action: "resume_preserved_work".into(), eligible_at_ms: 0 };
+        store.checkpoint(lease, &cp, at).unwrap();
+        store.release(lease, at + 1).unwrap();
+    };
+    hold(&mut store, &lease, 4);
+    let candidate = adoption::AdoptedPr {
+        repository: "owner/repo".into(), pr, source_issue: Some(2329), branch: branch.into(), head: head.clone(),
+        base: "main".into(), author: "owner".into(), title: "review".into(), body: String::new(),
+        dependency: adoption::Dependency::Main,
+    };
+    // The production ledger had already marked 2329 for the UTC day.
+    let ledger = AttemptLedger { day: 0, issues: vec![2329] };
+    let select = |retries: &std::collections::BTreeSet<u64>, ledger: &AttemptLedger| {
+        adoption::select_linked_with_retries(std::slice::from_ref(&candidate), ledger, 0, &Default::default(), None, 0, retries)
+    };
+    const MIN: i64 = 60_000;
+    let mut now = 10 * 60 * MIN;
+    for attempt in 1..=3u32 {
+        assert_eq!(
+            store.reconcile_review_recovery("owner/repo", pr, branch, &head, Ready, now).unwrap(),
+            Some(true),
+            "attempt {attempt}: held review recovery must be re-admitted without an owner"
+        );
+        let cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        assert_eq!((cp.stage, cp.next.reason.as_str(), cp.next.action.as_str()),
+            (Stage::Review, "review-recovery-required", "complete_review_or_adjudication"));
+        assert_eq!(select(&std::collections::BTreeSet::from([pr]), &ledger), Some((pr, 2329, branch.into())),
+            "a due review recovery is selected past the daily attempt ledger");
+        assert!(store.current_reviews(id).unwrap().is_empty(), "scheduling is never approval");
+        // The resumed review fails again and the executor re-parks the row.
+        let worker = store.claim(id, "review-executor", now + 1, 100).unwrap().unwrap();
+        hold(&mut store, &worker, now + 2);
+        let held_at = now + 2;
+        assert_eq!(
+            store.reconcile_review_recovery("owner/repo", pr, branch, &head, Ready, held_at + 2).unwrap(),
+            None,
+            "attempt {attempt}: an immediate re-admission would spin paid reviews"
+        );
+        now = held_at + 15 * MIN * (1 << (attempt - 1));
+    }
+    let parked = store.snapshot(id).unwrap().unwrap().checkpoint;
+    assert_eq!(
+        store.reconcile_review_recovery("owner/repo", pr, branch, &head, Ready, now + 24 * 60 * MIN).unwrap(),
+        None,
+        "the automatic recovery budget per reviewed binding is bounded"
+    );
+    assert_eq!(store.snapshot(id).unwrap().unwrap().checkpoint, parked);
+    let record = OpenedPr { pr, head: head.clone(), verdict: None };
+    assert_eq!(
+        review_recovery::observe(&path, "owner/repo", 2329, pr, branch, &head, Some(&record), now + 24 * 60 * MIN).unwrap(),
+        None,
+        "an exhausted recovery stays an adopted candidate (Some(false) would drop it)"
+    );
+    assert_eq!(select(&Default::default(), &AttemptLedger { day: 1, issues: vec![] }), Some((pr, 2329, branch.into())),
+        "past the bound the daily adopted-draft resume still reaches it");
+}
+
+/// #2383: PR #2372. The controller merged main into its own draft (dd17…)
+/// after recording the opened PR at the earlier head (424b…). That exact head
+/// is still the protected workflow binding, so review recovery must schedule
+/// instead of dropping the PR as missing provenance on every sweep.
+#[test]
+fn controller_integrated_head_keeps_review_recovery_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("workflow.db");
+    let (id, branch, pr) = ("owner/repo#2360", "agent-fix/issue-2360", 2372);
+    let (opened, integrated) = ("424b".repeat(10), "dd17".repeat(10));
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let binding = Binding { head: integrated.clone(), contract: "contract".into(), evidence_hash: "evidence".into() };
+    store.register(id, branch, binding, 1).unwrap();
+    let lease = store.claim(id, "reviewer", 2, 100).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, "owner/repo", pr, 3).unwrap();
+    let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+    cp.stage = Stage::Held;
+    cp.next = NextAction { reason: "review-recovery-required".into(), action: "resume_preserved_work".into(), eligible_at_ms: 0 };
+    store.checkpoint(&lease, &cp, 4).unwrap();
+    store.release(&lease, 5).unwrap();
+    drop(store);
+    let record = OpenedPr { pr, head: opened.clone(), verdict: None };
+    let later = 10 * 60 * 60 * 1000;
+    // A head the controller never bound is still refused.
+    assert_eq!(
+        review_recovery::observe(&path, "owner/repo", 2360, pr, branch, &"f".repeat(40), Some(&record), later).unwrap(),
+        Some(false)
+    );
+    let store = WorkflowStore::open(&path).unwrap();
+    assert!(!store.events(id).unwrap().iter().any(|e| e.1.starts_with("review_recovery_")));
+    drop(store);
+    review_recovery::observe(&path, "owner/repo", 2360, pr, branch, &integrated, Some(&record), later).unwrap();
+    let store = WorkflowStore::open(&path).unwrap();
+    assert!(
+        store.events(id).unwrap().iter().any(|e| e.1 == "review_recovery_scheduled"),
+        "the controller's own integrated head must reach review recovery"
+    );
+    let cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+    assert_ne!((cp.stage, cp.next.reason.as_str()), (Stage::Held, "review-recovery-required"),
+        "the held review recovery must move to a due review or a named reviewer wait");
+}

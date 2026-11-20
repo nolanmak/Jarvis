@@ -155,7 +155,8 @@ pub(super) fn route(reason: &str) -> Route {
         | "ci_failure_requires_diagnosis"
         | "ci_infra_reruns_exhausted"
         | "ci_repair_budget_exhausted"
-        | "ci_repair_unchanged" => Route::Code,
+        | "ci_repair_unchanged"
+        | "hosted_ci_blocked_by_conflict" => Route::Code,
         _ => Route::Infrastructure,
     }
 }
@@ -434,6 +435,43 @@ async fn hold(
         }
     }
 }
+/// #2383 (PR #2358): GitHub starts no pull_request checks on a PR that
+/// conflicts with its base, so "incomplete" hosted CI never completes and the
+/// bounded infrastructure retry spins forever. A local, read-only merge probe
+/// against origin/main turns that into code the #2316 repair fixes by merging
+/// main. Any probe error keeps the original reason.
+pub(super) async fn blocked_by_conflict(root: &Path, reason: &'static str) -> &'static str {
+    if reason != "hosted_ci_incomplete" {
+        return reason;
+    }
+    // Resolve main explicitly: a missing ref must never read as a conflict.
+    let Ok((true, main, _)) = run(
+        "git",
+        &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"],
+        root,
+    )
+    .await
+    else {
+        return reason;
+    };
+    let main = main.trim();
+    if main.is_empty() {
+        return reason;
+    }
+    let probe = tokio::process::Command::new("git")
+        .args(["--no-optional-locks", "merge-tree", "--write-tree", "--no-messages", main, "HEAD"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    // merge-tree exits 1 for conflicts, 0 for a clean merge, >1 on error.
+    match probe {
+        Ok(status) if status.code() == Some(1) => "hosted_ci_blocked_by_conflict",
+        _ => reason,
+    }
+}
 fn jobs(observation: &Observation) -> String {
     observation.failed_jobs.join(", ")
 }
@@ -528,6 +566,7 @@ pub(super) async fn preflight(
         .record_controller(serde_json::json!({"kind":"hosted_ci_diagnosis",
         "diagnosis":observation,"transition":"observation","shipping_authority":false}))?;
     if let Some(reason) = observation.dependency {
+        let reason = blocked_by_conflict(root, reason).await;
         return Ok(match hold(workflow, pr, reason, &jobs(&observation), true).await? {
             Hold::Repair => Preflight::Continue,
             Hold::Deferred(report) => Preflight::Deferred(report),
@@ -940,5 +979,47 @@ mod classification_tests {
         // before main's CI policy changed. That is stale code, not an outage.
         assert_eq!(unknown_dependency("CI policy changed; reviewed controller rollout required"), "hosted_ci_policy_stale");
         assert_eq!(unknown_dependency("GitHub evidence unavailable"), "hosted_ci_incomplete");
+    }
+
+    /// #2383, PR #2358 (#2350): GitHub starts no pull_request checks on a PR
+    /// that conflicts with main, so its hosted CI stays incomplete forever.
+    /// Production deferred it as infrastructure 21 times. A conflict is code
+    /// that the #2316 repair cures by merging main, never by waiting.
+    #[tokio::test]
+    async fn conflicting_candidate_with_incomplete_hosted_ci_routes_to_main_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"])
+                .args(args).current_dir(root.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let commit = |file: &str, text: &str| {
+            std::fs::write(root.path().join(file), text).unwrap();
+            git(&["add", file]);
+            git(&["commit", "-qm", text]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q", "-b", "candidate"]);
+        let base = commit("a.txt", "base");
+        git(&["checkout", "-q", "-b", "main"]);
+        let conflicting_main = commit("a.txt", "main");
+        git(&["checkout", "-q", &base]);
+        let clean_main = commit("b.txt", "unrelated");
+        git(&["checkout", "-q", "candidate"]);
+        commit("a.txt", "candidate");
+        git(&["update-ref", "refs/remotes/origin/main", &conflicting_main]);
+        assert_eq!(blocked_by_conflict(root.path(), "hosted_ci_incomplete").await, "hosted_ci_blocked_by_conflict");
+        assert_eq!(route("hosted_ci_blocked_by_conflict"), Route::Code);
+        assert_eq!(blocked_by_conflict(root.path(), "hosted_ci_transport_unknown").await, "hosted_ci_transport_unknown",
+            "only an incomplete hosted CI is explained by the conflict");
+        git(&["update-ref", "refs/remotes/origin/main", &clean_main]);
+        assert_eq!(blocked_by_conflict(root.path(), "hosted_ci_incomplete").await, "hosted_ci_incomplete",
+            "a cleanly mergeable candidate keeps its bounded infrastructure wait");
+        git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert_eq!(blocked_by_conflict(root.path(), "hosted_ci_incomplete").await, "hosted_ci_incomplete",
+            "an unknown main is not evidence of a conflict");
     }
 }
