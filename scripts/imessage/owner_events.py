@@ -82,7 +82,7 @@ def capture(db_path, binding, decode_body=None, limit=100):
                            "kind": kind, "target_guid": target, "body": body})
         watermark = rows[-1][0] if len(rows) == limit else high
         return {"revision": binding["revision"], "watermark": watermark, "events": events}
-    except sqlite3.Error:
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
         raise RuntimeError(UNAVAILABLE) from None
     finally:
         con.close()

@@ -118,6 +118,16 @@ class CaptureTest(unittest.TestCase):
             self.capture()
         self.assert_redacted(raised.exception)
 
+    def test_native_body_decode_failure_is_redacted(self):
+        self.add(text=None, attributedBody=b"fixture")
+
+        def malformed_native_body(_):
+            raise ValueError("native schema detail fixture.example SELECT payload")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture(decode_body=malformed_native_body)
+        self.assert_redacted(raised.exception)
+
     def test_unknown_target_is_not_guessed_from_prose(self):
         self.add(associated_message_type=2001, associated_message_guid="Liked a message")
         self.assertIsNone(self.capture()["events"][0]["target_guid"])
