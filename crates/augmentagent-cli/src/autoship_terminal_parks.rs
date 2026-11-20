@@ -154,7 +154,9 @@ impl WorkflowStore {
 
     /// Free worker maintenance (#2356). An original-verifier hold whose
     /// retained source is missing (or whose free recovery window elapsed)
-    /// can never be recovered; record it and re-verify from scratch.
+    /// can never be recovered; record it and re-verify from scratch. #2370:
+    /// a verifier-infrastructure hold gets the same bounded window, so no
+    /// initial hold waits forever when free recovery never re-selects it.
     pub(crate) fn reverify_unrecoverable_original_evidence(
         &mut self,
         repository: &str,
@@ -168,8 +170,10 @@ impl WorkflowStore {
                 "SELECT id,checkpoint,generation,pr FROM workflow WHERE lease_until<=?1
                  AND (substr(id,1,length(?2))=?2 OR substr(id,1,length(?3))=?3) AND json_valid(checkpoint)
                  AND json_extract(checkpoint,'$.stage')='scope'
-                 AND json_extract(checkpoint,'$.next.reason')='acceptance_verifier_evidence_unknown'
-                 AND json_extract(checkpoint,'$.next.action')='await_original_evidence_recovery'
+                 AND ((json_extract(checkpoint,'$.next.reason')='acceptance_verifier_evidence_unknown'
+                   AND json_extract(checkpoint,'$.next.action')='await_original_evidence_recovery')
+                  OR (json_extract(checkpoint,'$.next.reason')='acceptance_verifier_infrastructure_unavailable'
+                   AND json_extract(checkpoint,'$.next.action')='await_verifier_infrastructure_recovery'))
                  ORDER BY heartbeat_at,id LIMIT 64",
             )?
             .query_map(params![now, issue, pr], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -423,6 +427,34 @@ mod tests {
         let events = audit(&store, id, UNRECOVERABLE);
         assert_eq!(events[0]["cause"], "recovery_window_elapsed");
         assert_eq!(events[0]["mode"], "reverify_branch");
+    }
+
+    #[test]
+    fn stale_verifier_infrastructure_hold_reverifies_after_ttl_instead_of_waiting() {
+        // #2370: an infrastructure hold the free recovery never re-selects
+        // must not wait forever; it re-verifies like an evidence hold.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id = "owner/repo#2370";
+        let binding = park_evidence(&mut store, id, dir.path(), None, 1);
+        let lease = store.claim(id, "infra", 4, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.next.reason = "acceptance_verifier_infrastructure_unavailable".into();
+        cp.next.action = "await_verifier_infrastructure_recovery".into();
+        store.checkpoint(&lease, &cp, 5).unwrap();
+        store.release(&lease, 6).unwrap();
+        let before = store.snapshot(id).unwrap().unwrap();
+        assert_eq!(store.reverify_unrecoverable_original_evidence("owner/repo", 7, |p| p.exists()).unwrap(), 0,
+            "a recent infrastructure hold keeps its free recovery window");
+        let now = 6 + EVIDENCE_HOLD_TTL_MS;
+        assert_eq!(store.reverify_unrecoverable_original_evidence("owner/repo", now, |p| p.exists()).unwrap(), 1);
+        let after = store.snapshot(id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.reason, REVERIFY_REASON);
+        assert_eq!(after.checkpoint.binding, binding);
+        let events = audit(&store, id, UNRECOVERABLE);
+        assert_eq!(events[0]["cause"], "recovery_window_elapsed");
+        let prior: Checkpoint = serde_json::from_str(events[0]["prior_checkpoint"].as_str().unwrap()).unwrap();
+        assert_eq!(prior, before.checkpoint);
     }
 
     #[test]
