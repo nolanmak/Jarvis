@@ -6,9 +6,37 @@ use crate::autoship_workflow::acceptance_escalation::{Material, ACTION};
 use crate::autoship_workflow::retry_policy::{self, Strategy};
 use augmentagent_channel_core::ProviderKind;
 
+/// #2373: what one reviewer can do right now, without calling it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capacity {
+    Ready,
+    /// Can never serve on this box (not installed, not authenticated, or no
+    /// native identity). Waiting for it is a permanent park.
+    Unconfigured,
+    /// Temporarily unavailable (cooldown latch); worth a bounded wait.
+    Latched,
+}
+impl Capacity {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unconfigured => "unconfigured",
+            Self::Latched => "latched",
+        }
+    }
+}
+/// #2373: once another provider has completed a strategy rung, a latched
+/// reviewer is waited for at most this long. Past it the ladder proceeds with
+/// the outcomes it has and records an audited `reviewer_fallback` event.
+const REVIEWER_FALLBACK_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+/// Capacity waits are re-selected on this cadence.
+const REVIEWER_CAPACITY_RETRY_MS: i64 = 300_000;
 #[async_trait::async_trait]
 trait Backend: Sync {
-    fn ready(&self, provider: ProviderKind) -> bool;
+    fn capacity(&self, provider: ProviderKind) -> Capacity;
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
     async fn children(
         &self,
         repo: &Path,
@@ -34,8 +62,12 @@ trait Backend: Sync {
 struct Production;
 #[async_trait::async_trait]
 impl Backend for Production {
-    fn ready(&self, p: ProviderKind) -> bool {
-        matches!(reviewer_status(p), ReviewerStatus::Ready)
+    fn capacity(&self, p: ProviderKind) -> Capacity {
+        match reviewer_status(p) {
+            ReviewerStatus::Ready => Capacity::Ready,
+            ReviewerStatus::NotConfigured(_) => Capacity::Unconfigured,
+            ReviewerStatus::Latched(_) => Capacity::Latched,
+        }
     }
     async fn children(
         &self,
@@ -83,6 +115,41 @@ fn strategy_key(material: &Material, provider: ProviderKind, cycle: u32) -> Resu
         cycle,
         retry_policy::strategy(cycle).name(),
     ))?))
+}
+fn reviewer_wait_key(material: &Material, cycle: u32) -> Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&(
+        "acceptance-strategy-reviewer-wait-v1",
+        &material.original.binding,
+        cycle,
+    ))?))
+}
+fn reviewer_fallback_key(material: &Material, cycle: u32) -> Result<String> {
+    Ok(amendment::digest(&serde_json::to_vec(&(
+        "acceptance-strategy-reviewer-fallback-v1",
+        &material.original.binding,
+        cycle,
+    ))?))
+}
+/// When this rung first waited on a latched reviewer. Recorded once.
+fn reviewer_wait_since(
+    guard: &workflow::WorkflowGuard,
+    material: &Material,
+    cycle: u32,
+    now: i64,
+) -> Result<i64> {
+    let key = reviewer_wait_key(material, cycle)?;
+    if let Some(raw) = guard.recorded_scope_stage_response(&key)? {
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        return value["since_ms"]
+            .as_i64()
+            .context("reviewer wait start missing");
+    }
+    guard.record_scope_stage_response(
+        &key,
+        &serde_json::json!({"version":1,"kind":"acceptance_strategy_reviewer_wait","cycle":cycle,"since_ms":now})
+            .to_string(),
+    )?;
+    Ok(now)
 }
 fn cycle_key(id: &str, material: &Material, cycle: u32) -> Result<String> {
     Ok(amendment::digest(&serde_json::to_vec(&(
@@ -195,8 +262,14 @@ async fn execute_with(
         order.reverse();
     }
     let strategy = (cycle > 0).then_some((cycle, rung));
+    let capacity: Vec<(ProviderKind, Capacity)> =
+        order.iter().map(|p| (*p, backend.capacity(*p))).collect();
     let mut pending = false;
-    for provider in order.iter().copied() {
+    for provider in order
+        .iter()
+        .copied()
+        .filter(|p| !capacity.contains(&(*p, Capacity::Unconfigured)))
+    {
         pending |= guard
             .recorded_scope_stage_response(&strategy_key(&material, provider, cycle)?)?
             .is_none();
@@ -220,14 +293,18 @@ async fn execute_with(
     // Only cached, bounded completed-response failures consume a strategy.
     // Capacity, unknown native outcomes and remote publication failure retry
     // the same durable strategy without resetting its protected model budget.
-    let mut waiting = false;
-    for provider in order.iter().copied() {
+    // #2373: an unconfigured reviewer never blocks the rung, and a latched
+    // one blocks it only for a bounded time once another provider served.
+    let mut served = Vec::new();
+    let mut skipped = Vec::new();
+    for (provider, cap) in capacity.iter().copied() {
         let key = strategy_key(&material, provider, cycle)?;
         if guard.recorded_scope_stage_response(&key)?.is_some() {
+            served.push(provider);
             continue;
         }
-        if !backend.ready(provider) {
-            waiting = true;
+        if cap != Capacity::Ready {
+            skipped.push((provider, cap));
             continue;
         }
         match backend
@@ -247,9 +324,11 @@ async fn execute_with(
             }
             Ok(_) => {
                 guard.record_scope_stage_response(&key,&serde_json::json!({"version":1,"provider":provider.name(),"reason":"already_a_bounded_child"}).to_string())?;
+                served.push(provider);
             }
             Err(error) if scope_authority::completed_exhaustion(&error) => {
                 guard.record_scope_stage_response(&key,&serde_json::json!({"version":1,"provider":provider.name(),"reason":"completed_response_exhaustion","diagnostic":format!("{error:#}")}).to_string())?;
+                served.push(provider);
             }
             Err(error) => {
                 // Missing/uncertain original native evidence remains under its
@@ -288,19 +367,46 @@ async fn execute_with(
             }
         }
     }
-    if waiting || providers.is_empty() {
+    let now = backend.now_ms();
+    let latched = skipped.iter().any(|(_, cap)| *cap == Capacity::Latched);
+    let mut waited_ms = 0;
+    let wait = if served.is_empty() {
+        // Nothing served this rung: there is no outcome to fall back to. The
+        // row stays a re-selected capacity wait, bounded by the health guard.
+        true
+    } else if latched {
+        waited_ms = now - reviewer_wait_since(guard, &material, cycle, now)?;
+        waited_ms < REVIEWER_FALLBACK_AFTER_MS
+    } else {
+        false
+    };
+    if wait {
         guard
             .transition(
                 crate::autoship_workflow::Stage::Scope,
                 "acceptance_strategy_reviewer_capacity",
                 ACTION,
-                chrono::Utc::now().timestamp_millis() + 300_000,
+                chrono::Utc::now().timestamp_millis() + REVIEWER_CAPACITY_RETRY_MS,
             )
             .await?;
         return Ok(Some(RunReport::held(
             "Acceptance strategy waiting for independent provider capacity; automatic retry queued"
                 .into(),
         )));
+    }
+    if !skipped.is_empty() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "cycle": cycle,
+            "strategy": rung.name(),
+            "served": served.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|(p, cap)| serde_json::json!({"provider": p.name(), "why": cap.name()})).collect::<Vec<_>>(),
+            "waited_ms": waited_ms,
+            "bound_ms": REVIEWER_FALLBACK_AFTER_MS,
+        });
+        if guard.record_reviewer_fallback(&reviewer_fallback_key(&material, cycle)?, &payload)? {
+            tracing::warn!(workflow = guard.id(), cycle, fallback = %payload, "acceptance strategy proceeds without unavailable reviewers (reviewer_fallback)");
+        }
     }
     if cycle == 0 {
         let key = amendment::digest(&serde_json::to_vec(&(
@@ -431,9 +537,17 @@ async fn publish_summary(
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Mutex,
     };
+    /// #2373: why one provider cannot serve right now.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Cap {
+        /// Never able to serve on this box (e.g. no native identity).
+        Unconfigured,
+        /// Temporarily unavailable (cooldown latch).
+        Latched,
+    }
     #[derive(Clone, Copy)]
     enum ResultKind {
         Invalid,
@@ -448,6 +562,8 @@ mod tests {
         posts: Mutex<Vec<String>>,
         strategies: Mutex<Vec<(u32, &'static str, ProviderKind)>>,
         budget: Mutex<Option<i64>>,
+        caps: Mutex<Vec<(ProviderKind, Cap)>>,
+        skew_ms: AtomicI64,
     }
     impl Fake {
         fn new(outcomes: Vec<ResultKind>) -> Self {
@@ -459,13 +575,25 @@ mod tests {
                 posts: Mutex::new(vec![]),
                 strategies: Mutex::new(vec![]),
                 budget: Mutex::new(None),
+                caps: Mutex::new(vec![]),
+                skew_ms: AtomicI64::new(0),
             }
         }
     }
     #[async_trait::async_trait]
     impl Backend for Fake {
-        fn ready(&self, _: ProviderKind) -> bool {
-            self.ready.load(Ordering::SeqCst)
+        fn capacity(&self, p: ProviderKind) -> Capacity {
+            if !self.ready.load(Ordering::SeqCst) {
+                return Capacity::Latched;
+            }
+            match self.caps.lock().unwrap().iter().find(|(k, _)| *k == p) {
+                Some((_, Cap::Unconfigured)) => Capacity::Unconfigured,
+                Some((_, Cap::Latched)) => Capacity::Latched,
+                None => Capacity::Ready,
+            }
+        }
+        fn now_ms(&self) -> i64 {
+            chrono::Utc::now().timestamp_millis() + self.skew_ms.load(Ordering::SeqCst)
         }
         async fn children(
             &self,
@@ -919,5 +1047,125 @@ mod tests {
         .is_some());
         assert_eq!(g.binding(), &cp.binding);
         g.finish().unwrap();
+    }
+
+    fn events_of(f: &Fixture, id: &str, kind: &str) -> Vec<serde_json::Value> {
+        crate::autoship_workflow::WorkflowStore::open(
+            &f.control.path().canonicalize().unwrap().join("workflow.db"),
+        )
+        .unwrap()
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, k, _, _)| k == kind)
+        .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap())
+        .collect()
+    }
+    /// #2373 (production): `AUGMENTAGENT_AUTOPR_REVIEWERS=codex,cerebras,claude`.
+    /// Cerebras has no native identity, so it can never serve. Codex and
+    /// Claude both completed the rung, yet the ladder sat at
+    /// `acceptance_strategy_reviewer_capacity` for 10+ hours waiting on it.
+    #[tokio::test]
+    async fn unconfigured_reviewer_never_blocks_a_completed_rung_and_fallback_is_audited() {
+        const POOL: [ProviderKind; 3] =
+            [ProviderKind::Codex, ProviderKind::Cerebras, ProviderKind::Claude];
+        let f = Fixture::new().await;
+        let mut g = f.held().await;
+        let id = g.id().to_owned();
+        let fake = Fake::new(vec![ResultKind::Invalid, ResultKind::Invalid]);
+        fake.caps.lock().unwrap().push((ProviderKind::Cerebras, Cap::Unconfigured));
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &POOL, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        assert_eq!(*fake.calls.lock().unwrap(), vec![ProviderKind::Codex, ProviderKind::Claude]);
+        let s = snapshot(&f, &id);
+        assert_eq!(
+            s.checkpoint.next.reason, "acceptance_strategy_backoff",
+            "an unconfigured reviewer parked a rung every serving provider completed"
+        );
+        let fallback = events_of(&f, &id, "reviewer_fallback");
+        assert_eq!(fallback.len(), 1, "fallback must be audited exactly once");
+        assert_eq!(fallback[0]["skipped"][0]["provider"], "cerebras");
+        assert_eq!(fallback[0]["skipped"][0]["why"], "unconfigured");
+        assert_eq!(fallback[0]["cycle"], 0);
+        assert_eq!(s.model_calls, 0);
+    }
+    /// #2373: a temporarily latched reviewer is waited for, but only for a
+    /// bounded time. The row is re-selected on its capacity retry, and once
+    /// the bound passes the strongest available outcome is used with an
+    /// audited `reviewer_fallback` event instead of waiting forever.
+    #[tokio::test]
+    async fn latched_reviewer_falls_back_after_a_bounded_wait_and_the_row_is_reselected() {
+        const BOUND_MS: i64 = 2 * 3_600_000;
+        assert!(REVIEWER_FALLBACK_AFTER_MS <= BOUND_MS, "fallback bound grew");
+        let f = Fixture::new().await;
+        let mut g = f.held().await;
+        let id = g.id().to_owned();
+        let fake = Fake::new(vec![ResultKind::Invalid]);
+        fake.caps.lock().unwrap().push((ProviderKind::Codex, Cap::Latched));
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        let s = snapshot(&f, &id);
+        assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_reviewer_capacity");
+        assert!(events_of(&f, &id, "reviewer_fallback").is_empty(), "fell back before the bound");
+        // Re-selected on its capacity retry while still inside the bound.
+        let wait = s.checkpoint.next.eligible_at_ms;
+        let mut g = f.acquire_at(wait).await;
+        fake.skew_ms.store(BOUND_MS / 2, Ordering::SeqCst);
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        let s = snapshot(&f, &id);
+        assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_reviewer_capacity");
+        assert!(events_of(&f, &id, "reviewer_fallback").is_empty());
+        // Past the bound: fall back, audit it, and advance the ladder.
+        let mut g = f.acquire_at(s.checkpoint.next.eligible_at_ms).await;
+        fake.skew_ms.store(BOUND_MS + 1, Ordering::SeqCst);
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        assert_eq!(*fake.calls.lock().unwrap(), vec![ProviderKind::Claude], "no repeated model call");
+        let s = snapshot(&f, &id);
+        assert_eq!(
+            s.checkpoint.next.reason, "acceptance_strategy_backoff",
+            "a latched reviewer must not hold the ladder past the bound"
+        );
+        let fallback = events_of(&f, &id, "reviewer_fallback");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0]["skipped"][0]["provider"], "codex");
+        assert_eq!(fallback[0]["skipped"][0]["why"], "latched");
+        assert_eq!(fallback[0]["served"][0], "claude");
+    }
+    /// #2373: with no provider able to serve at all there is nothing to fall
+    /// back to; the row stays a re-selectable capacity wait (the health guard
+    /// bounds it) and never manufactures an outcome.
+    #[tokio::test]
+    async fn no_serving_reviewer_stays_a_reselectable_capacity_wait_without_fallback() {
+        let f = Fixture::new().await;
+        let mut g = f.held().await;
+        let id = g.id().to_owned();
+        let fake = Fake::new(vec![]);
+        fake.caps.lock().unwrap().push((ProviderKind::Codex, Cap::Unconfigured));
+        fake.caps.lock().unwrap().push((ProviderKind::Claude, Cap::Latched));
+        fake.skew_ms.store(30 * 3_600_000, Ordering::SeqCst);
+        execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        g.finish().unwrap();
+        let s = snapshot(&f, &id);
+        assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_reviewer_capacity");
+        assert!(events_of(&f, &id, "reviewer_fallback").is_empty());
+        assert!(fake.calls.lock().unwrap().is_empty());
+        f.acquire_at(s.checkpoint.next.eligible_at_ms).await.finish().unwrap();
     }
 }
