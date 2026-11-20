@@ -108,6 +108,36 @@ pub(crate) const AMENDMENT_LADDER_MIGRATION: &str = "amendment-declined-ladder-v
 const LADDER_MIGRATION_BATCH: usize = 8;
 
 impl WorkflowStore {
+    /// #2373: the acceptance ladder proceeded without one or more reviewers
+    /// (never configured, or latched past the bounded wait). Audited once per
+    /// key so a retried rung cannot duplicate it. True when newly recorded.
+    pub(crate) fn record_reviewer_fallback(
+        &mut self,
+        lease: &Lease,
+        binding: &Binding,
+        key: &str,
+        payload: &serde_json::Value,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(key.len() == 64, "invalid reviewer fallback key");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx, lease, binding, now)?;
+        let seen: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='reviewer_fallback'
+             AND json_valid(payload) AND json_extract(payload,'$.key')=?2)",
+            params![lease.workflow, key],
+            |r| r.get(0),
+        )?;
+        if !seen {
+            let mut payload = payload.clone();
+            payload["key"] = key.into();
+            event(&tx, &lease.workflow, lease.generation, "reviewer_fallback", &payload.to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(!seen)
+    }
     /// Free worker maintenance (#2317). A repair-exhausted hold parked before
     /// #2301 still waits on `await_acceptance_input_change`, which nothing will
     /// ever supply. Enter it into the never-give-up ladder at cycle 0 with an
