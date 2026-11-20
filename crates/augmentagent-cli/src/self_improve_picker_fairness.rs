@@ -26,6 +26,20 @@ pub(super) fn publish_retries(issues:&[RestIssue],controls:&workflow::FreshIssue
         .map(|issue|issue.number).collect()
 }
 
+/// #2373: a due repeated retry yields to fresh peers, but only for this long
+/// after its last activity. Past it the retry goes ahead of fresh work, oldest
+/// first, so a busy queue can delay a capacity wait but never starve it. The
+/// picker takes the first viable candidate, so pure yielding meant twelve due
+/// reviewer-capacity rows were never selected while new issues kept arriving.
+const RETRY_STARVATION_MS:i64=2*60*60*1000;
+
+/// Sort key for one due candidate; lower is picked first.
+fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,i64,bool) {
+    let age=retry_age(snapshot);
+    let starved=age>0 && now.saturating_sub(age)>=RETRY_STARVATION_MS;
+    (!(publish_retry(snapshot) && age==0),!starved,research_filed,age,!recovered)
+}
+
 pub(super) fn candidates(
     issues:Vec<RestIssue>,recovered:&std::collections::BTreeSet<u64>,
     controls:&workflow::FreshIssueControls,repository:&str,now:i64,
@@ -63,8 +77,7 @@ pub(super) fn candidates(
         // #2279 — a due publication retry is finished work and goes first.
         // A publication retry that has itself stalled (#2280's repeated-claim
         // tier) keeps rotating with its peers instead of starving them.
-        let age=retry_age(snapshot.as_ref());
-        let key=(!(publish_retry(snapshot.as_ref()) && age==0),issue.research_filed,age,!recovered.contains(&issue.number));
+        let key=rank(snapshot.as_ref(),issue.research_filed,recovered.contains(&issue.number),now);
         ranked.push((key,issue));
     }
     ranked.sort_by_key(|(key,_)|*key);
