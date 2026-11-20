@@ -712,7 +712,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 code: "capacity-wait-stale",
                 detail: format!("{} workflow(s) in a capacity wait past {} min: {}",
                     capacity.len(), t.capacity_wait_stale_mins, capacity.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
-                fix: "No provider has served these for hours. Check `codex login status` / `claude` on the worker, `AUGMENTAGENT_AUTOPR_REVIEWERS`, and ~/.local/state/augmentagent/reasoner-cooldowns.json.".into(),
+                fix: "No provider has served these for hours. Check `codex login status` / `claude` on the worker, `AUGMENTAGENT_AUTOPR_REVIEWERS`, and the reasoner-cooldowns.json file in the autoship state dir.".into(),
             });
         }
     }
