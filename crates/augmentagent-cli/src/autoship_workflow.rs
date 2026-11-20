@@ -37,6 +37,9 @@ pub(crate) mod family_budget;
 #[cfg(test)]
 #[path = "autoship_family_budget_tests.rs"]
 mod family_budget_tests;
+#[cfg(test)]
+#[path = "autoship_park_guard_tests.rs"]
+mod park_guard_tests;
 #[path = "autoship_activity_observation.rs"]
 mod activity_observation;
 #[path = "autoship_idle_recovery.rs"]
@@ -244,14 +247,20 @@ pub struct Snapshot {
 /// Shared wait shape for acquisition and dispatch. Recovery evidence still
 /// requires separate authentication and grants no builder or merge approval.
 pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
-    checkpoint.stage==Stage::Scope && matches!(
-        (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-        ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
-        ("acceptance_strategies_exhausted","await_new_execution_inputs")|
-        ("readiness_assessment_invalid","await_readiness_input_change")|
-        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
-        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
+    checkpoint.stage==Stage::Scope && INITIAL_INPUT_WAITS.iter().any(|(reason,action)|
+        checkpoint.next.reason==*reason && checkpoint.next.action==*action)
 }
+/// Every reason → await pair an initial verifier hold can produce. #2370's
+/// guard proves each one leaves automatically; none waits on a human.
+pub(crate) const INITIAL_INPUT_WAITS:&[(&str,&str)]=&[
+    ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+    ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
+    ("acceptance_contract_invalid","await_acceptance_input_change"),
+    ("acceptance_strategies_exhausted","await_new_execution_inputs"),
+    ("readiness_assessment_invalid","await_readiness_input_change"),
+    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+];
 
 /// Shape only; the unpaid consumer separately authenticates the exact private
 /// decline and original source before a transaction can queue reconsideration.
@@ -339,7 +348,7 @@ mod acceptance_input_wait_claim_tests {
                 checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
-                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid");
+                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid");
                 let mut planning_claims=0;
                 for now in [6,86_400_001,2*86_400_000] {
                     if recoverable {
