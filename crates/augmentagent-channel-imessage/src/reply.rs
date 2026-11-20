@@ -398,7 +398,7 @@ impl CardDrafter<'_> {
         }
         let triage = triage_opts(self.config.wiki_root.clone());
         // #2332 — triage sees the message's images, not just their names.
-        let images = crate::draft_images::DraftImages::fetch(&email).await;
+        let images = crate::draft_images::fetch(&email).await;
         let mut triage_prompt = triage_user_message(&email, &baseline, "");
         triage_prompt.push_str(&images.prompt_lines());
         let raw = self.reasoner.call(&triage, &triage_prompt).await?;
@@ -450,7 +450,7 @@ impl CardDrafter<'_> {
             samples.iter().map(|s| s.as_str()),
         );
         // #2332 — the drafter looks at the images it is replying to.
-        let images = crate::draft_images::DraftImages::fetch(&email).await;
+        let images = crate::draft_images::fetch(&email).await;
         prompt.push_str(&images.prompt_lines());
         let drafted = self
             .reasoner

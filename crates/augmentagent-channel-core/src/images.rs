@@ -103,6 +103,86 @@ pub fn image_marker_line(path: &Path) -> String {
     format!("{IMAGE_MARKER_PREFIX} {}", path.display())
 }
 
+/// Images downloaded for one prompt (#2332). Each lives in a temp file named
+/// `aa-img-…`, the prefix that lets a call without file tools read exactly
+/// that file. The files are removed when this is dropped, so keep it alive
+/// until the model calls that use the prompt have finished.
+#[derive(Default)]
+pub struct PromptImages {
+    files: Vec<tempfile::NamedTempFile>,
+}
+
+impl PromptImages {
+    /// Most images taken from one message.
+    pub const MAX: usize = 4;
+    /// Larger files are skipped: a draft should not wait on a big download.
+    pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// Whether `ext` (any case) is a format the models can open.
+    pub fn supports(ext: &str) -> bool {
+        IMAGE_EXT_ALLOWLIST.contains(&ext.to_ascii_lowercase().as_str())
+    }
+
+    /// An empty temp file for a download to write into.
+    pub fn new_file(ext: &str) -> std::io::Result<tempfile::NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix("aa-img-")
+            .suffix(&format!(".{}", ext.to_ascii_lowercase()))
+            .tempfile_in(std::env::temp_dir())
+    }
+
+    /// Keep a downloaded file. Ignored once [`Self::MAX`] are held.
+    pub fn push(&mut self, file: tempfile::NamedTempFile) {
+        if self.files.len() < Self::MAX {
+            self.files.push(file);
+        }
+    }
+
+    /// Write `bytes` to a new file and keep it. False when the format is
+    /// unsupported, the size is out of range, the limit is reached or the
+    /// write failed.
+    pub fn push_bytes(&mut self, ext: &str, bytes: &[u8]) -> bool {
+        if !Self::supports(ext)
+            || bytes.is_empty()
+            || bytes.len() as u64 > Self::MAX_BYTES
+            || self.files.len() >= Self::MAX
+        {
+            return false;
+        }
+        let Ok(mut file) = Self::new_file(ext) else {
+            return false;
+        };
+        if std::io::Write::write_all(&mut file, bytes).is_err() {
+            return false;
+        }
+        self.files.push(file);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Text to append to a prompt: one `IMAGE:` line per file, or nothing.
+    pub fn prompt_lines(&self) -> String {
+        if self.files.is_empty() {
+            return String::new();
+        }
+        let mut text = String::from(
+            "\n\nImages attached to the latest message (open each one before deciding or drafting):\n",
+        );
+        for file in &self.files {
+            text.push_str(&image_marker_line(file.path()));
+            text.push('\n');
+        }
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +211,28 @@ mod tests {
             "mid-sentence mention must survive: {}",
             got.text
         );
+    }
+
+    #[test]
+    fn prompt_images_hold_supported_files_up_to_the_limit_and_clean_up() {
+        let mut images = PromptImages::default();
+        assert_eq!(images.prompt_lines(), "");
+        assert!(!images.push_bytes("heic", b"x"), "unsupported format");
+        assert!(!images.push_bytes("png", b""), "empty file");
+        assert!(images.push_bytes("PNG", b"\x89PNG one"));
+        for _ in 0..5 {
+            images.push_bytes("jpg", b"jpeg");
+        }
+        assert_eq!(images.len(), PromptImages::MAX);
+        let lines = images.prompt_lines();
+        let seen = extract_image_markers(&lines).images;
+        assert_eq!(seen.len(), PromptImages::MAX);
+        for path in &seen {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("aa-img-"), "{name}");
+        }
+        drop(images);
+        assert!(seen.iter().all(|path| !path.exists()), "files are removed on drop");
     }
 
     #[test]
