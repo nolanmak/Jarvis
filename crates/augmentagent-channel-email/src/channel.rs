@@ -1002,6 +1002,20 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     "Draft a response using relevant conversation and cross-platform evidence.",
                     self.config.wiki_root.as_deref(),
                 ).await?;
+                // #2332 — the drafter looks at the images attached to the
+                // message it is answering. Draft stage only: triage sees ~70
+                // emails a day, mostly newsletters whose images are logos.
+                let draft_images = {
+                    let mut images = augmentagent_channel_core::images::PromptImages::default();
+                    for (ext, bytes) in self
+                        .gmail
+                        .image_attachments(entity_id, &email.message_id, augmentagent_channel_core::images::PromptImages::MAX)
+                        .await
+                    {
+                        images.push_bytes(&ext, &bytes);
+                    }
+                    images
+                };
                 let user_msg = code_mode_user_message(
                     &email,
                     &wiki_hint,
@@ -1010,7 +1024,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     &archetype_block,
                     &resolve_outcome.block,
                 );
-                let user_msg = format!("{user_msg}\n\n{}", shared_draft_context.prompt());
+                let user_msg = format!("{user_msg}\n\n{}{}", shared_draft_context.prompt(), draft_images.prompt_lines());
                 // Opts mirror `draft_opts`' shape: same permission mode, no
                 // allowed_tools / add_dirs — the Deno sandbox is the tool
                 // surface, not the host claude CLI's Read/Grep/Glob.
@@ -1194,7 +1208,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     &archetype_block,
                     &resolve_outcome.block,
                 );
-                let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
+                let draft_prompt = format!("{draft_prompt}\n\n{}{}", shared_draft_context.prompt(), draft_images.prompt_lines());
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => {
                         let body = s.trim().to_string();
@@ -2217,6 +2231,86 @@ mod tests {
         );
         let out = ch.poll_once().await.unwrap();
         assert_eq!(out.replied_dry_run, 1);
+    }
+
+    /// #2332 — the drafter is shown the images attached to the message it is
+    /// answering; triage is not.
+    #[tokio::test]
+    async fn a_reply_draft_is_shown_the_messages_image_attachments() {
+        struct ImageGmail(StubGmail);
+        #[async_trait]
+        impl GmailApi for ImageGmail {
+            async fn fetch_unread(&self, e: &str, l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+                self.0.fetch_unread(e, l).await
+            }
+            async fn fetch_with_query(&self, e: &str, q: &str, l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+                self.0.fetch_with_query(e, q, l).await
+            }
+            async fn create_draft(&self, e: &str, t: &str, s: &str, b: &str, th: Option<&str>) -> Result<String, crate::gmail::GmailError> {
+                self.0.create_draft(e, t, s, b, th).await
+            }
+            async fn send_draft(&self, e: &str, d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+                self.0.send_draft(e, d).await
+            }
+            async fn delete_draft(&self, e: &str, d: &str) -> Result<(), crate::gmail::GmailError> {
+                self.0.delete_draft(e, d).await
+            }
+            async fn image_attachments(&self, _e: &str, message_id: &str, _max: usize) -> Vec<(String, Vec<u8>)> {
+                assert_eq!(message_id, "m-img");
+                vec![
+                    ("png".into(), b"\x89PNG fixture".to_vec()),
+                    // A format no model opens is dropped.
+                    ("heic".into(), b"fixture".to_vec()),
+                ]
+            }
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ImageGmail(StubGmail {
+            emails: vec![Email {
+                attachments: vec!["floorplan.png (image/png)".into()],
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m-img".into(),
+                thread_id: Some("t-img".into()),
+                from: "user@example.com".into(),
+                subject: "Floor plan".into(),
+                body: "Does this layout work for you?".into(),
+                date: "2026-04-13".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        }));
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"asks a question about the attached plan"}"#,
+            "The layout works.",
+        ]));
+        let ch = GmailChannel::dry_run(
+            store,
+            gmail,
+            reasoner.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        ch.poll_once().await.unwrap();
+        let prompts = reasoner.prompts.lock().unwrap();
+        assert!(!prompts[0].contains("IMAGE:"), "triage is not shown images");
+        let draft = prompts[1..]
+            .iter()
+            .find(|prompt| prompt.contains("IMAGE:"))
+            .expect("a draft prompt carries the image");
+        let marked: Vec<&str> = draft
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("IMAGE:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(marked.len(), 1, "one supported image: {marked:?}");
+        let path = std::path::Path::new(marked[0]);
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("aa-img-") && name.ends_with(".png"), "{name}");
+        assert!(!path.exists(), "the image file is removed after drafting");
     }
 
     /// #1046 receipt path. A full dry-run reply poll through the REAL

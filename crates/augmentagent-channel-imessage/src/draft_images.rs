@@ -9,15 +9,13 @@
 //! Best effort and strictly additive: with no bucket configured, a format the
 //! models cannot open, or a failed download, the prompt is what it was
 //! before. A missing image must never stop a draft.
-use augmentagent_channel_core::images::{image_marker_line, IMAGE_EXT_ALLOWLIST};
+use augmentagent_channel_core::images::{PromptImages, IMAGE_EXT_ALLOWLIST};
 use augmentagent_channel_journal::s3::AttachmentSource;
 use augmentagent_store::Email;
 use tracing::debug;
 
 /// Most images taken from one message.
-pub const MAX_IMAGES: usize = 4;
-/// Larger files are skipped: a draft should not wait on a big download.
-pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_IMAGES: usize = PromptImages::MAX;
 
 /// An image reference parsed from an attachment line.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,69 +52,35 @@ fn parse(line: &str) -> Option<ImageRef> {
         .then(|| ImageRef { uri: uri.to_string(), ext })
 }
 
-/// Downloaded images. The files are removed when this is dropped, so keep it
-/// alive until the model calls that use the prompt have finished.
-#[derive(Default)]
-pub struct DraftImages {
-    files: Vec<tempfile::NamedTempFile>,
-}
-
-impl DraftImages {
-    /// Download the message's images. Never fails.
-    pub async fn fetch(email: &Email) -> Self {
-        let refs = image_refs(email);
-        if refs.is_empty() {
-            return Self::default();
+/// Download the message's images. Never fails.
+pub async fn fetch(email: &Email) -> PromptImages {
+    let mut images = PromptImages::default();
+    let refs = image_refs(email);
+    if refs.is_empty() {
+        return images;
+    }
+    let source = match AttachmentSource::from_env() {
+        Ok(source) => source,
+        Err(error) => {
+            debug!("image attachments not fetched: {error}");
+            return images;
         }
-        let source = match AttachmentSource::from_env() {
-            Ok(source) => source,
+    };
+    for image in refs {
+        let file = match PromptImages::new_file(&image.ext) {
+            Ok(file) => file,
             Err(error) => {
-                debug!("image attachments not fetched: {error}");
-                return Self::default();
+                debug!("image attachment temp file failed: {error}");
+                continue;
             }
         };
-        let mut files = Vec::new();
-        for image in refs {
-            // The `aa-img-` prefix is what lets a call without file tools
-            // read exactly this file (reasoner::image_read_grants).
-            let file = match tempfile::Builder::new()
-                .prefix("aa-img-")
-                .suffix(&format!(".{}", image.ext))
-                .tempfile_in(std::env::temp_dir())
-            {
-                Ok(file) => file,
-                Err(error) => {
-                    debug!("image attachment temp file failed: {error}");
-                    continue;
-                }
-            };
-            match source.fetch(&image.uri, file.path()).await {
-                Ok(bytes) if bytes > 0 && bytes <= MAX_IMAGE_BYTES => files.push(file),
-                Ok(bytes) => debug!("image attachment skipped: {bytes} bytes"),
-                Err(error) => debug!("image attachment download failed: {error}"),
-            }
+        match source.fetch(&image.uri, file.path()).await {
+            Ok(bytes) if bytes > 0 && bytes <= PromptImages::MAX_BYTES => images.push(file),
+            Ok(bytes) => debug!("image attachment skipped: {bytes} bytes"),
+            Err(error) => debug!("image attachment download failed: {error}"),
         }
-        Self { files }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
-    }
-
-    /// Text to append to a prompt: one `IMAGE:` line per file, or nothing.
-    pub fn prompt_lines(&self) -> String {
-        if self.files.is_empty() {
-            return String::new();
-        }
-        let mut text = String::from(
-            "\n\nImages attached to the latest message (open each one before deciding or drafting):\n",
-        );
-        for file in &self.files {
-            text.push_str(&image_marker_line(file.path()));
-            text.push('\n');
-        }
-        text
-    }
+    images
 }
 
 #[cfg(test)]
@@ -180,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_images_or_no_bucket_leaves_the_prompt_unchanged() {
-        let none = DraftImages::fetch(&email(&["[attachment: application/pdf a.pdf]"])).await;
+        let none = fetch(&email(&["[attachment: application/pdf a.pdf]"])).await;
         assert!(none.is_empty());
         assert_eq!(none.prompt_lines(), "");
     }
