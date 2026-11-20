@@ -4679,7 +4679,8 @@ mod initial_acceptance_hold_tests {
                 let mut planning_claims = 0;
                 for offset in [1000,86_400_000,2*86_400_000] {
                     let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
-                    if reason=="acceptance_verifier_repair_exhausted" && pr.is_none() {
+                    // #2370: a declined amendment enters the same ladder.
+                    if matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined") && pr.is_none() {
                         let planning=next.expect("unpublished exhausted hold did not admit planning");
                         // A lease is an attempt even when no model work is done.
                         // Recovery must retain all paid work and the exhausted
