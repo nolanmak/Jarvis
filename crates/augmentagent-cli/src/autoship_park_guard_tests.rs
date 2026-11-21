@@ -125,3 +125,99 @@ fn no_initial_hold_reason_maps_to_a_human_only_await() {
         );
     }
 }
+
+/// #2383: a review hold parks on `Stage::Held` with `resume_preserved_work`,
+/// not on an `await_*` action, so the scan above never saw it. Each review
+/// hold reason the executor can checkpoint is listed here. Only a hold whose
+/// verdict no later tick can change may stand down for a human.
+const REVIEW_HOLDS: &[&str] = &[
+    "provenance-unknown",
+    "no-reviewer-capacity",
+    "reviewer-latched",
+    "review-evidence-budget",
+    "review-recovery-required",
+];
+/// Unknown builder provenance: no model's review can be vouched for, so the
+/// loop stands down by design (`ReviewUnavailable::permanent`).
+const PERMANENT_REVIEW_STAND_DOWNS: &[&str] = &["provenance-unknown"];
+
+/// Every literal `transition(Stage::Held, reason, action)` in the crate, with
+/// the automatic mechanism that leaves it. A new held park must name its exit.
+const HELD_TRANSITIONS: &[(&str, &str, &str)] = &[
+    ("resume_deferred", "resume_preserved_work", "daily adopted-draft resume"),
+    ("automatic_pr_routing_held", "retry_automatic_pr_routing", "routing retry on the next tick"),
+    ("provider_capacity", "retry", "capacity retry"),
+    ("integration_resolution_deferred", "inspect_integration_conflict", "integration reconciler (integration_*)"),
+];
+
+fn source_held_transitions() -> std::collections::BTreeSet<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("autoship_park_guard_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (at, _) in text.match_indices("transition(Stage::Held,") {
+            let quoted: Vec<&str> = text[at..].split('"').skip(1).step_by(2).take(2).collect();
+            let head = &text[at..at + 120.min(text.len() - at)];
+            let args = head.split_once(',').map_or("", |(_, rest)| rest).trim_start();
+            if args.starts_with('"') && quoted.len() == 2 {
+                found.insert((quoted[0].to_owned(), quoted[1].to_owned()));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_literal_held_transition_names_an_automatic_exit() {
+    let found = source_held_transitions();
+    assert!(found.contains(&("resume_deferred".into(), "resume_preserved_work".into())), "scan found {found:?}");
+    for (reason, action) in &found {
+        assert!(
+            HELD_TRANSITIONS.iter().any(|(r, a, _)| r == reason && a == action),
+            "Stage::Held {reason} → {action} is a new held park: give it an automatic exit and list it in HELD_TRANSITIONS"
+        );
+    }
+}
+
+fn hold_for_review(store: &mut WorkflowStore, id: &str, pr: u64, reason: &str) -> String {
+    let head = "d".repeat(40);
+    let binding = Binding { head: head.clone(), contract: "contract".into(), evidence_hash: "evidence".into() };
+    store.register(id, "agent-fix/issue-2383", binding, 1).unwrap();
+    let lease = store.claim(id, "reviewer", 2, 100).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, "owner/repo", pr, 3).unwrap();
+    let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+    cp.stage = Stage::Held;
+    cp.next = NextAction { reason: reason.into(), action: "resume_preserved_work".into(), eligible_at_ms: 0 };
+    store.checkpoint(&lease, &cp, 4).unwrap();
+    store.release(&lease, 5).unwrap();
+    head
+}
+
+/// #2383 production shape (PRs #2372, #2378): green drafts parked on
+/// `held / review-recovery-required / resume_preserved_work` that no sweep or
+/// picker ever resumed. The free reconciler must re-admit every non-permanent
+/// review hold to the independent review once a reviewer is ready.
+#[test]
+fn no_held_review_reason_is_a_human_only_park() {
+    for reason in REVIEW_HOLDS {
+        assert!(is_review_hold_reason(reason), "{reason} is not a review hold reason");
+    }
+    for reason in REVIEW_HOLDS.iter().filter(|r| !PERMANENT_REVIEW_STAND_DOWNS.contains(r)) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id = "owner/repo#2383";
+        let head = hold_for_review(&mut store, id, 2372, reason);
+        let later = 10 * 60 * 60 * 1000;
+        let due = store
+            .reconcile_review_recovery("owner/repo", 2372, "agent-fix/issue-2383", &head, ReviewRecoveryReadiness::Ready, later)
+            .unwrap();
+        let cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        assert_eq!(due, Some(true), "held {reason} is a human-only park: the reconciler never resumes it");
+        assert_eq!((cp.stage, cp.next.reason.as_str()), (Stage::Review, "review-recovery-required"), "{reason}");
+        assert!(store.current_reviews(id).unwrap().is_empty(), "rescheduling a review is never approval");
+    }
+}

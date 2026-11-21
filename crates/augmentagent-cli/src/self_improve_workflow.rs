@@ -2087,6 +2087,10 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
     }
+    /// #2373: audited, once per key. True when this call recorded it.
+    pub(super) fn record_reviewer_fallback(&self,key:&str,payload:&serde_json::Value)->Result<bool> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_reviewer_fallback(&self.lease,&self.binding,key,payload,millis())
+    }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
     }

@@ -161,6 +161,9 @@ pub struct WorkflowProgress {
     /// S's persisted stage activity (effective inactivity deadline) for each
     /// workflow above that has one. Missing legacy activity is simply absent.
     pub activities: Vec<(String, crate::autoship_workflow::activity::Activity)>,
+    /// #2373: when each workflow now in a CapacityWait entered it. Repeated
+    /// re-holds of the same wait do not restart this clock.
+    pub capacity_waits: Vec<(String, i64)>,
 }
 
 impl WorkflowProgress {
@@ -203,12 +206,18 @@ pub fn workflow_progress_at(path: &Path, now_ms: i64) -> Option<WorkflowProgress
     let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
     let (events, inventory_complete) = store.latest_workflow_events(now_ms).ok()?;
     let mut activities = Vec::new();
+    let mut capacity_waits = Vec::new();
     for event in &events {
+        if matches!(event.outcome, augmentagent_channel_core::autoship_workflow_contract::WorkflowOutcome::CapacityWait) {
+            if let Some(since) = store.capacity_wait_since(&event.workflow_id).ok()? {
+                capacity_waits.push((event.workflow_id.clone(), since));
+            }
+        }
         if let Some(activity) = store.activity_status(&event.workflow_id).ok()? {
             activities.push((event.workflow_id.clone(), activity));
         }
     }
-    Some(WorkflowProgress { events, inventory_complete, activities })
+    Some(WorkflowProgress { events, inventory_complete, activities, capacity_waits })
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -226,6 +235,10 @@ pub struct Thresholds {
     /// #1708 — minutes an active, non-waiting workflow may go without S
     /// recording meaningful progress. Above every S stage budget.
     pub workflow_progress_stale_mins: i64,
+    /// #2373 — minutes a CapacityWait may last without useful progress. The
+    /// acceptance ladder falls back from a latched reviewer after 2 h, so a
+    /// wait past this has no automatic exit left and must reach the owner.
+    pub capacity_wait_stale_mins: i64,
 }
 
 impl Default for Thresholds {
@@ -249,6 +262,7 @@ impl Default for Thresholds {
             // S's largest stage budget is 90 min (verify); six hours without a
             // recorded gate or guarded step is not slow work.
             workflow_progress_stale_mins: 360,
+            capacity_wait_stale_mins: 360,
         }
     }
 }
@@ -678,6 +692,27 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 detail: format!("{} active workflow(s) without useful progress: {}. Heartbeats and log activity do not count.",
                     stale.len(), stale.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
                 fix: "Inspect each with `augmentagent autopr status --workflow ID`; a live lease without a recorded gate or guarded step is stuck, not slow.".into(),
+            });
+        }
+        // #2373 — a capacity wait is a wait, never a permanent park.
+        let capacity: Vec<String> = progress.events.iter()
+            .filter(|e| matches!(e.outcome, O::CapacityWait))
+            .filter_map(|e| {
+                let since = progress.capacity_waits.iter().find(|(id, _)| *id == e.workflow_id)?.1;
+                let mins = (now.timestamp_millis() - since) / 60_000;
+                (mins >= t.capacity_wait_stale_mins).then(|| {
+                    let stage = serde_json::to_value(e.stage).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                    format!("{} ({stage}: {}; waiting {} min)", e.workflow_id, e.reason_code, mins)
+                })
+            })
+            .collect();
+        if !capacity.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "capacity-wait-stale",
+                detail: format!("{} workflow(s) in a capacity wait past {} min: {}",
+                    capacity.len(), t.capacity_wait_stale_mins, capacity.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
+                fix: "No provider has served these for hours. Check `codex login status` / `claude` on the worker, `AUGMENTAGENT_AUTOPR_REVIEWERS`, and the reasoner-cooldowns.json file in the autoship state dir.".into(),
             });
         }
     }
