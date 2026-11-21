@@ -83,6 +83,9 @@ mod picker_fairness_tests;
 #[path = "self_improve_epics.rs"]
 mod epics;
 #[cfg(test)]
+#[path = "self_improve_recovered_edits_tests.rs"]
+mod recovered_edits_tests;
+#[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
@@ -1161,7 +1164,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None).await.ok();
             continue;
         }
-        if has_open_agent_pr(repo_root, number).await? {
+        if has_foreign_agent_pr(repo_root, number).await? {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
         }
@@ -1207,6 +1210,22 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     let repository=workflow::canonical_repository(repo_root).await
         .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
     Ok(!linked_claims::observe(repo_root,&repository,issue).await?.is_empty())
+}
+
+/// #2396: the fresh-work dedup, except for the PR this issue's own durable
+/// workflow already owns while it continues (publish, reconcile, review…).
+/// A pending publication still belongs to its free reconciler.
+async fn has_foreign_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
+    if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
+    let claims=linked_claims::observe(repo_root,&repository,issue).await?;
+    if claims.is_empty() { return Ok(false); }
+    let own=match crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? {
+        Some(store)=>store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?,
+        None=>None,
+    };
+    Ok(!linked_claims::foreign_claims(claims,own.as_ref()).is_empty())
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -6851,6 +6870,25 @@ async fn recovered_revision_diff(worktree:&Path)->Result<String> {
     // head; newer main changes are checked after normal integration, not charged
     // to the interrupted editor as apparent deletions or reversions here.
     let (ok,diff,error)=run("git",&["diff","--cached","HEAD"],worktree).await?;
+    anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");
+    // #2394 (PR #2358): an interrupted merge with main stages everything main
+    // brings in. A staged path identical to a MERGE_HEAD that origin/main
+    // contains is main's change, not the editor's; every other path, including
+    // conflict resolutions, remains a recovered edit.
+    let (merging,_,_)=run("git",&["rev-parse","-q","--verify","MERGE_HEAD^{commit}"],worktree).await?;
+    if !merging {return Ok(diff);}
+    let (contained,_,_)=run("git",&["merge-base","--is-ancestor","MERGE_HEAD","refs/remotes/origin/main"],worktree).await?;
+    if !contained {return Ok(diff);}
+    let (listed,names,error)=run("git",&["diff","--cached","--name-only","-z","HEAD"],worktree).await?;
+    anyhow::ensure!(listed,"cannot list recovered edits: {error}");
+    let (compared,from_main,error)=run("git",&["diff","--cached","--name-only","-z","MERGE_HEAD"],worktree).await?;
+    anyhow::ensure!(compared,"cannot compare recovered edits with main: {error}");
+    let differs_from_main:std::collections::BTreeSet<&str>=from_main.split('\0').filter(|p|!p.is_empty()).collect();
+    let edited:Vec<&str>=names.split('\0').filter(|p|!p.is_empty() && differs_from_main.contains(p)).collect();
+    if edited.is_empty() {return Ok(String::new());}
+    let mut args=vec!["diff","--cached","HEAD","--"];
+    args.extend(edited.iter().map(|p|*p));
+    let (ok,diff,error)=run("git",&args,worktree).await?;
     anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");Ok(diff)
 }
 

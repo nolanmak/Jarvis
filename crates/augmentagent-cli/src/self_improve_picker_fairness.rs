@@ -4,8 +4,14 @@ use crate::autoship_workflow::{Snapshot, Stage};
 
 const REPEATED_SCOPE_CLAIMS:u64=3;
 
+/// #2394: a publication retry is stalled only once it has retried this long
+/// without meaningful progress. Claims spent on scope, build and review before
+/// the push are not a stalled publication (#2329 had six).
+const PUBLISH_STALL_MS:i64=30*60*1000;
+
 fn retry_age(snapshot:Option<&Snapshot>)->i64 {
-    snapshot.filter(|s|s.attempts>=REPEATED_SCOPE_CLAIMS && (s.checkpoint.stage==Stage::Scope
+    snapshot.filter(|s|!publish_retry(Some(s)) || s.heartbeat_at_ms.saturating_sub(s.progress_at_ms)>=PUBLISH_STALL_MS)
+        .filter(|s|s.attempts>=REPEATED_SCOPE_CLAIMS && (s.checkpoint.stage==Stage::Scope
         || (!matches!(s.checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired) && matches!(s.checkpoint.next.reason.as_str(),
             "resource_capacity"|"verification_infrastructure_retry"|"publishing_revision"|"acceptance_registration_retry"))))
         .map_or(0,|s|s.heartbeat_at_ms.max(1))

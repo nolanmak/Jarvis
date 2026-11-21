@@ -40,14 +40,15 @@ fn all_active_retry_stages_rotate_using_durable_activity() {
             wall_ms: 0,
             model_calls: 4,
             tokens: 0,
-            heartbeat_at_ms: 700,
+            // #2394: retried past the publication stall window without progress.
+            heartbeat_at_ms: 30 * 60_000 + 700,
             progress_at_ms: 100,
             lease_until_ms: 0,
             generation: 3,
         };
         assert_eq!(
             retry_age(Some(&snapshot)),
-            700,
+            30 * 60_000 + 700,
             "{stage:?}: retry must yield to eligible peers"
         );
     }
@@ -106,4 +107,42 @@ fn due_capacity_wait_row_is_selected_within_bounded_ticks_against_busy_peers() {
     // Before the starvation bound, ordinary retries still yield to fresh work.
     let early = t0 + TICK_MS;
     assert!(rank(None, false, false, early) < rank(Some(&waiting), false, false, early));
+}
+
+/// #2394 production shape (#2329 / PR #2378): a build/review/fix cycle spent
+/// six claims, then the publish turn was killed by a worker restart right after
+/// checkpointing `publishing_revision / push`. Claims spent before publication
+/// are not a stalled publication: the due push goes ahead of fresh work. A
+/// publication that keeps retrying without progress still rotates (#2280).
+#[test]
+fn due_publish_retry_outranks_fresh_work_despite_earlier_claims() {
+    let t0 = 1_795_230_305_000;
+    let mut publish = Snapshot {
+        workflow: "owner/repo#2329".into(),
+        branch: "agent-fix/issue-2329".into(),
+        pr: Some(2378),
+        checkpoint: Checkpoint {
+            stage: Stage::Publish,
+            binding: Binding { head: "57ee".repeat(10), contract: "contract".into(), evidence_hash: "evidence".into() },
+            evidence: vec![],
+            next: NextAction { reason: "publishing_revision".into(), action: "push".into(), eligible_at_ms: t0 + 300_000 },
+        },
+        attempts: 6,
+        wall_ms: 0,
+        model_calls: 40,
+        tokens: 0,
+        heartbeat_at_ms: t0,
+        progress_at_ms: t0 + 15_000,
+        lease_until_ms: t0 + 600_000,
+        generation: 6,
+    };
+    let now = t0 + 32 * 60_000;
+    assert!(rank(Some(&publish), false, true, now) < rank(None, false, false, now),
+        "a due publication retry must not wait behind fresh issues for earlier build claims");
+    assert!(rank(Some(&publish), false, true, now) < rank(None, true, false, now));
+    // The same row after its push kept failing for 40 minutes: it rotates.
+    publish.heartbeat_at_ms = t0 + 40 * 60_000;
+    let later = t0 + 45 * 60_000;
+    assert!(rank(None, false, false, later) < rank(Some(&publish), false, true, later),
+        "a stalled publication still yields to fresh peers (#2280)");
 }

@@ -301,6 +301,8 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 9, REPLY, "query answers, command replies, interrupted-turn notices"),
     p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 2, REPLY, "yolo thread gate: unreadable-registry notice and the reply to an owner command that does not run in a yolo thread (#2219)"),
     p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 4, REPLY, "yolo thread gate notices, and the intro and could-not-register messages posted in a new yolo thread (#2219)"),
+    p("relay_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 1, REPLY, "refusal of a command relayed through a trusted webhook"),
+    p("relay_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 1, REPLY, "refusal of a command relayed through a trusted webhook"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "send_message(&", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
