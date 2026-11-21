@@ -156,19 +156,29 @@ pub(super) fn foreign_claims(
     mut claims: BTreeSet<u64>,
     own: Option<&crate::autoship_workflow::Snapshot>,
 ) -> BTreeSet<u64> {
+    if let Some((pr, _)) = own_pr_continuation(own) {
+        claims.remove(&pr);
+    }
+    claims
+}
+
+/// #2408: the PR (and its branch) an issue's own durable workflow owns while
+/// continuing. Such work runs on the PR lane, whose checkout follows the PR
+/// head; the issue lane's checkout can be stale (#2329 rebuilt on the PR's
+/// original commit and abandoned its verified revision).
+pub(super) fn own_pr_continuation(
+    own: Option<&crate::autoship_workflow::Snapshot>,
+) -> Option<(u64, String)> {
     use crate::autoship_workflow::Stage;
-    let Some(own) = own else { return claims };
-    let Some(pr) = own.pr else { return claims };
+    let own = own?;
+    let pr = own.pr?;
     let next = &own.checkpoint.next;
     let continuing = match own.checkpoint.stage {
         Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::Publish | Stage::AwaitChecks => true,
         Stage::Held => crate::autoship_workflow::is_review_hold_reason(&next.reason) && next.action == "resume_preserved_work",
         _ => false,
     };
-    if continuing {
-        claims.remove(&pr);
-    }
-    claims
+    continuing.then(|| (pr, own.branch.clone()))
 }
 
 pub(super) async fn require_absence(repo: &Path, repository: &str, issue: u64) -> Result<()> {
@@ -203,6 +213,27 @@ mod tests {
     /// push owns PR #2378, and the picker refused it as "open agent PR exists".
     /// A workflow resuming onto its own bound PR is not a duplicate; any other
     /// open PR for the issue, or a workflow that does not own one, still is.
+    /// #2408 production shape: #2329 owns PR #2378 and is continuing
+    /// (publish, then the misfiled verify retry, then a provenance reroute).
+    /// The issue lane must hand it to the PR lane; its own checkout is stale.
+    #[test]
+    fn own_pr_continuation_runs_on_the_pr_lane() {
+        for (stage, reason, action) in [
+            (Stage::Publish, "publishing_revision", "push"),
+            (Stage::Verify, "verification_infrastructure_retry", "retry_verification"),
+            (Stage::Reconcile, "candidate_provenance_diverged", "resume_preserved_pr"),
+            (Stage::Held, "review-recovery-required", "resume_preserved_work"),
+        ] {
+            assert_eq!(own_pr_continuation(Some(&own(stage, reason, action, Some(2378)))),
+                Some((2378, "agent-fix/issue-2329".into())), "{stage:?} {reason}");
+        }
+        assert_eq!(own_pr_continuation(None), None);
+        assert_eq!(own_pr_continuation(Some(&own(Stage::Publish, "publishing_revision", "push", None))), None,
+            "a workflow without a PR stays on the issue lane");
+        assert_eq!(own_pr_continuation(Some(&own(Stage::Scope, "scope_deferred", "retry_scope", Some(2378)))), None);
+        assert_eq!(own_pr_continuation(Some(&own(Stage::Retired, "target_closed", "complete", Some(2378)))), None);
+    }
+
     #[test]
     fn own_bound_pr_does_not_dedup_its_own_continuation() {
         let claims = || BTreeSet::from([2378]);
