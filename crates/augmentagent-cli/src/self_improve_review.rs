@@ -145,14 +145,72 @@ pub(super) async fn run_for_subject(
         Ok(provider) => provider,
         Err(why) => return IndependentReview::unavailable(why),
     };
+    let guard = context.workflow;
+    let head = git(&worktree, &["rev-parse", "HEAD"]).await.ok().map(|h| h.trim().to_owned());
+    let mut provider = provider;
+    if let (Some(guard), Some(head), false) = (guard, head.as_deref(), origin.is_imported()) {
+        provider = structured_review_fallback(guard, head, provider);
+    }
     match run_inner(
         provider, &authors, issue, worktree, criteria, context, origin,
     )
     .await
     {
         Ok(review) => review,
-        Err(error) => unavailable_from_error(provider, error),
+        Err(error) => {
+            let review = unavailable_from_error(provider, error);
+            if let (Some(guard), Some(head), Some(ReviewUnavailable::RecoveryRequired { .. })) =
+                (guard, head.as_deref(), review.why_unavailable.as_ref())
+            {
+                record_structured_failure(guard, head, provider);
+            }
+            review
+        }
     }
+}
+
+/// #2385: durable count of structured reviews by `provider` that needed
+/// controller recovery on this exact head. Immutable keyed records, bounded.
+fn structured_failure_key(head: &str, provider: augmentagent_channel_core::ProviderKind, n: u32) -> String {
+    aligned::digest(&serde_json::to_vec(&("structured-review-failure-v1", head, provider.name(), n)).unwrap_or_default())
+}
+fn structured_failures(guard: &workflow::WorkflowGuard, head: &str, provider: augmentagent_channel_core::ProviderKind) -> u32 {
+    let mut n = 0;
+    while n < 16 && matches!(guard.scope_stage_response(&structured_failure_key(head, provider, n)), Ok(Some(_))) {
+        n += 1;
+    }
+    n
+}
+fn record_structured_failure(guard: &workflow::WorkflowGuard, head: &str, provider: augmentagent_channel_core::ProviderKind) {
+    let n = structured_failures(guard, head, provider);
+    let body = serde_json::json!({"version":1,"kind":"structured_review_failure","head":head,"provider":provider.name(),"n":n}).to_string();
+    if let Err(error) = guard.record_scope_stage_response(&structured_failure_key(head, provider, n), &body) {
+        warn!("structured review failure could not be recorded: {error:#}");
+    }
+}
+/// #2385: never livelock one head on a reviewer whose structured output keeps
+/// failing validation. After the bound, the alternate native reviewer with
+/// capacity and fewer failures serves instead, with an audited event.
+fn structured_review_fallback(
+    guard: &workflow::WorkflowGuard,
+    head: &str,
+    selected: augmentagent_channel_core::ProviderKind,
+) -> augmentagent_channel_core::ProviderKind {
+    let pool = reviewer_pool();
+    let counts: Vec<_> = pool.iter().map(|p| (*p, structured_failures(guard, head, *p))).collect();
+    let count = |p| counts.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
+    let Some(alternate) = review_capacity::structured_fallback(&pool, selected, count, reviewer_status) else {
+        return selected;
+    };
+    let payload = serde_json::json!({"actor":"controller","kind":"review_fallback","head":head,
+        "from":selected.name(),"to":alternate.name(),"failures":{"from":count(selected),"to":count(alternate)},
+        "bound":review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK,"reason":"structured_review_validation"});
+    if let Err(error) = guard.audit_logger().record_controller(payload.clone()) {
+        warn!("review fallback audit unavailable; keeping {}: {error:#}", selected.name());
+        return selected;
+    }
+    warn!(head, fallback = %payload, "independent review falls back to the alternate reviewer (review_fallback)");
+    alternate
 }
 
 async fn git_output(root:&Path,args:&[&str])->Result<(bool,String,String)> {
@@ -1053,10 +1111,27 @@ fn supplemental_context_matches(previous:&BTreeMap<String,String>,current:&BTree
     previous==current
 }
 
+/// Identical restatements merge. #2385: a reviewer that reuses an ID for
+/// different evidence (PR #2372 restated prior finding IDs) no longer fails
+/// the whole review: the later evidence keeps a deterministic distinct ID
+/// derived from its content, so no finding is hidden or merged away.
 fn deduplicate_findings(findings: Vec<aligned::Finding>) -> Result<Vec<aligned::Finding>> {
     let mut unique = BTreeMap::<String, aligned::Finding>::new();
-    for finding in findings {
+    for mut finding in findings {
         finding.validate()?;
+        if unique.get(&finding.id).is_some_and(|existing| {
+            existing.fingerprint().ok() != finding.fingerprint().ok()
+        }) {
+            let content = aligned::digest(&serde_json::to_vec(&(
+                &finding.criterion_id,
+                &finding.evidence_hash,
+                &finding.claim,
+                &finding.requested_change,
+                &finding.repair_target,
+            ))?);
+            finding.id = format!("{}~{}", finding.id, &content[..12]);
+            finding.validate()?;
+        }
         if let Some(existing) = unique.get_mut(&finding.id) {
             anyhow::ensure!(
                 existing.fingerprint()? == finding.fingerprint()?,
@@ -1796,8 +1871,21 @@ mod tests {
         let mut linked=first.clone();linked.conflicts_with.insert("F2".into());linked.repair_rounds=2;
         let merged=deduplicate_findings(vec![first.clone(),linked]).unwrap();
         assert!(merged[0].conflicts_with.contains("F2"));assert_eq!(merged[0].repair_rounds,2);
+        // #2385 (PR #2372, 2026-11-21 01:29Z): a reviewer restated prior
+        // finding ID F1 with different evidence. The new evidence is kept
+        // under a deterministic distinct ID instead of failing the review.
         let mut changed = first.clone();
         changed.evidence_hash = "proof2".into();
-        assert!(deduplicate_findings(vec![first, changed]).is_err());
+        let kept = deduplicate_findings(vec![first.clone(), changed.clone()]).unwrap();
+        assert_eq!(kept.len(), 2, "neither restatement may be hidden");
+        assert!(kept.iter().any(|f| f == &first), "the first holder keeps its ID");
+        let renamed = kept.iter().find(|f| f.id != "F1").unwrap();
+        assert!(renamed.id.starts_with("F1~"), "{}", renamed.id);
+        assert_eq!(renamed.evidence_hash, "proof2");
+        let again = deduplicate_findings(vec![first.clone(), changed.clone()]).unwrap();
+        assert_eq!(kept, again, "renumbering is deterministic");
+        // The same restatement seen again merges with its renumbered copy.
+        let thrice = deduplicate_findings(vec![first, changed.clone(), changed]).unwrap();
+        assert_eq!(thrice.len(), 2);
     }
 }
