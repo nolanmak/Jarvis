@@ -1,11 +1,10 @@
-//! One durable, bounded high-alert text per local schedule slot, and the opt-in
-//! Discord digest of one preceding local date (#2329). Unknown delivery
+//! One durable, bounded high-alert text per local schedule slot. Unknown delivery
 //! is never retried automatically. All timestamps are supplied by the caller.
 use crate::{
     owner_alerts::{row, OwnerAlert},
     ImessageOutboxItem, Store, StoreError, StoreResult,
 };
-use chrono::{TimeZone, Timelike};
+use chrono::Timelike;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
@@ -155,6 +154,7 @@ const TEXTED: &str = "EXISTS(SELECT 1 FROM owner_alert_texts t JOIN imessage_out
     WHERE t.alert_id=a.id AND o.status IN ('sent','claimed','unknown'))";
 
 fn local_midnight(tz: chrono_tz::Tz, date: chrono::NaiveDate) -> StoreResult<i64> {
+    use chrono::TimeZone;
     let naive = date.and_hms_opt(0, 0, 0).expect("midnight exists on every date");
     // A spring-forward midnight does not exist locally; the hour after it does.
     tz.from_local_datetime(&naive)
