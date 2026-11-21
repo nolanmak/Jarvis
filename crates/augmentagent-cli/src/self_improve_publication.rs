@@ -199,7 +199,8 @@ pub(super) async fn claimed_after_reconcile(repo:&Path,issue:u64,dry_run:bool)->
         let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
         observe_pushes(repo,&repository,&mut store).await?;
     }
-    has_open_agent_pr(repo,issue).await
+    // #2396: the issue's own workflow may continue onto the PR it owns.
+    has_foreign_agent_pr(repo,issue).await
 }
 
 /// This lane spends no model calls and runs independently of builder capacity.
