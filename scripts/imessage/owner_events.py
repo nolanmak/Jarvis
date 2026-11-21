@@ -13,6 +13,10 @@ _REQUIRED = {"guid", "text", "attributedBody", "is_from_me", "date",
              "associated_message_type", "associated_message_guid",
              "reply_to_guid", "thread_originator_guid", "date_edited", "date_retracted"}
 
+# One fixed diagnostic for every native schema or database failure: column
+# names, statements, paths and private bodies never leave the Mac.
+UNAVAILABLE = "native owner capture unavailable"
+
 
 def target_guid(value):
     """Only native plain/part-prefixed UUID forms we can bind exactly."""
@@ -27,12 +31,15 @@ def capture(db_path, binding, decode_body=None, limit=100):
         return {"revision": binding["revision"], "watermark": binding["cursor"], "events": []}
     if "activated_at_ms" not in binding:
         raise RuntimeError("owner binding has no enrollment timestamp")
-    con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    except sqlite3.Error:
+        raise RuntimeError(UNAVAILABLE) from None
     try:
         con.execute("BEGIN")
         columns = {row[1] for row in con.execute("PRAGMA table_info(message)")}
         if not _REQUIRED.issubset(columns):
-            raise RuntimeError("native owner capture schema unavailable: " + ",".join(sorted(_REQUIRED - columns)))
+            raise RuntimeError(UNAVAILABLE)
         high = con.execute("SELECT COALESCE(MAX(ROWID),0) FROM message").fetchone()[0]
         cursor = binding["cursor"]
         if cursor < 0 or cursor > high:
@@ -75,5 +82,7 @@ def capture(db_path, binding, decode_body=None, limit=100):
                            "kind": kind, "target_guid": target, "body": body})
         watermark = rows[-1][0] if len(rows) == limit else high
         return {"revision": binding["revision"], "watermark": watermark, "events": events}
+    except Exception:
+        raise RuntimeError(UNAVAILABLE) from None
     finally:
         con.close()

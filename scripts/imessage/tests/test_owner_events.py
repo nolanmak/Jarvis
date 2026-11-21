@@ -90,8 +90,53 @@ class CaptureTest(unittest.TestCase):
         self.binding["cursor"] = 0
         self.con.execute("ALTER TABLE message DROP COLUMN reply_to_guid")
         self.con.commit()
-        with self.assertRaisesRegex(RuntimeError, "schema"):
+        with self.assertRaises(RuntimeError) as raised:
             self.capture()
+        self.assertEqual(str(raised.exception), owner_events.UNAVAILABLE)
+
+    def assert_redacted(self, error):
+        text = str(error)
+        self.assertEqual(text, owner_events.UNAVAILABLE)
+        self.assertLessEqual(len(text), 300)
+        for leak in ("reply_to_guid", "attributedBody", "chat_message_join", "SELECT",
+                     "no such", str(self.db), self.tmp.name, "approve abcdef01"):
+            self.assertNotIn(leak, text)
+
+    def test_invalid_native_schema_is_reported_without_native_schema_detail(self):
+        for column in ("reply_to_guid", "attributedBody", "date_retracted"):
+            self.con.execute("ALTER TABLE message DROP COLUMN " + column)
+        self.con.commit()
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture()
+        self.assert_redacted(raised.exception)
+
+    def test_malformed_native_schema_capability_is_not_reported_verbatim(self):
+        self.add()
+        self.con.execute("DROP TABLE chat_message_join")
+        self.con.commit()
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture()
+        self.assert_redacted(raised.exception)
+
+    def test_native_body_decode_failure_is_redacted(self):
+        self.add(text=None, attributedBody=b"fixture")
+
+        def malformed_native_body(_):
+            raise ValueError("native schema detail fixture.example SELECT payload")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture(decode_body=malformed_native_body)
+        self.assert_redacted(raised.exception)
+
+    def test_unexpected_native_body_decode_failure_is_redacted(self):
+        self.add(text=None, attributedBody=b"fixture")
+
+        def malformed_native_body(_):
+            raise RuntimeError("private capture detail fixture.example")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture(decode_body=malformed_native_body)
+        self.assert_redacted(raised.exception)
 
     def test_unknown_target_is_not_guessed_from_prose(self):
         self.add(associated_message_type=2001, associated_message_guid="Liked a message")
