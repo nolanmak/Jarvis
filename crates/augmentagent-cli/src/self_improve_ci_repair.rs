@@ -156,7 +156,10 @@ pub(super) fn route(reason: &str) -> Route {
         | "ci_infra_reruns_exhausted"
         | "ci_repair_budget_exhausted"
         | "ci_repair_unchanged"
-        | "hosted_ci_blocked_by_conflict" => Route::Code,
+        | "hosted_ci_blocked_by_conflict"
+        // #2394: no local replay recipe exists for this job, so a paired
+        // comparison can never succeed. Repair the hosted failure instead.
+        | "ci_job_recipe_unsupported" => Route::Code,
         _ => Route::Infrastructure,
     }
 }
@@ -693,9 +696,9 @@ async fn compare_observed<R: Replay>(
                 let reason = comparison_dependency(&error);
                 workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_comparison_unavailable",
                     "reason":reason,"cause_sha256":digest(format!("{error:#}").as_bytes()),"shipping_authority":false}))?;
-                return Ok(Preparation::Deferred(
-                    defer(workflow, pr, reason, &jobs(&observation)).await?,
-                ));
+                // #2394: one routing table (#2316) for every hold; an
+                // infrastructure reason still takes the bounded deferral.
+                return repair_or_wait(workflow, pr, reason, &observation).await;
             }
         };
         workflow.validate_before_side_effect()?;
@@ -971,6 +974,10 @@ mod classification_tests {
             "ci_infra_reruns_exhausted", "ci_repair_budget_exhausted", "ci_repair_unchanged"] {
             assert_eq!(route(reason), Route::Code, "{reason}");
         }
+        // #2394 (PR #2372): the exporter job's hosted test_failure has no local
+        // replay recipe. Paired comparison can never succeed, so waiting on it
+        // as infrastructure retried hourly forever. Repair the hosted failure.
+        assert_eq!(route("ci_job_recipe_unsupported"), Route::Code);
         for reason in ["hosted_ci_transport_unknown", "hosted_ci_logs_unavailable", "hosted_ci_incomplete",
             "ci_infra_rerun_requested", "ci_main_failure_dependency", "ci_comparison_deadline"] {
             assert_eq!(route(reason), Route::Infrastructure, "{reason}");

@@ -4169,6 +4169,33 @@ mod tests {
         audit.protected_health().unwrap();
     }
 
+    /// #2408 production shape (#2329 at 11:54:52Z): "alignment reviewer
+    /// unavailable: origin: candidate is not a descendant of trusted adopted
+    /// head" was deferred as acceptance infrastructure and retried forever.
+    /// It is provenance: reroute to the PR lane, never an infrastructure wait.
+    #[tokio::test]
+    async fn provenance_divergence_reroutes_instead_of_infrastructure_retry() {
+        let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {
+            repo_root:directory.path(),worktree:directory.path(),repository:"owner/repo",
+            source_issue:Some(2329),pr:Some(2378),branch:"fixture",contract:"C1",environment:"rust-a"
+        },millis()).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Verify,"verification_started","run_verifier",0,&["receipt".into()]).await.unwrap();
+        let error=anyhow::Error::new(adoption::CandidateProvenanceDiverged {
+            adopted_head:"1801".repeat(10),candidate_head:"1027".repeat(10)})
+            .context("alignment reviewer unavailable: origin")
+            .context("acceptance infrastructure unavailable");
+        let outcome=CiGateResult(Err(error)).for_workflow(&mut guard).await;
+        let error=match outcome { Err(error)=>error, Ok(other)=>panic!("provenance became a gate result: {other:?}") };
+        assert!(error.downcast_ref::<CiInfrastructureDeferred>().is_none(), "provenance misfiled as infrastructure: {error:#}");
+        let store=WorkflowStore::open(&path).unwrap();
+        let cp=store.snapshot(guard.id()).unwrap().unwrap().checkpoint;
+        assert_eq!((cp.stage,cp.next.reason.as_str(),cp.next.action.as_str()),
+            (Stage::Reconcile,"candidate_provenance_diverged","resume_preserved_pr"));
+        assert!(!store.events(guard.id()).unwrap().iter().any(|(_,kind,_,_)|kind=="verification_infrastructure_retry"));
+        assert_eq!(durable::retry_recovery::class(&cp),Some("provenance"),"a bounded automatic retry class, not a park");
+    }
+
     #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
         for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {

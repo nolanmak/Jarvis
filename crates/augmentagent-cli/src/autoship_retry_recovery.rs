@@ -17,6 +17,8 @@ pub(crate) fn class(cp: &Checkpoint) -> Option<&'static str> {
         ("publishing_revision", "push") => Some("publish"),
         ("acceptance_registration_retry", "rescope_executable_acceptance") => Some("registration"),
         ("retry_cycle_exhausted", "rescope_executable_acceptance") => Some("recovery"),
+        // #2408: a candidate outside its PR's lineage resumes on the PR lane.
+        ("candidate_provenance_diverged", "resume_preserved_pr") => Some("provenance"),
         _ => None,
     }
 }

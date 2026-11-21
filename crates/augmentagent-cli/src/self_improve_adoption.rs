@@ -404,6 +404,21 @@ pub(super) async fn preflight(repo_root: &Path, pr: u64, branch: &str) -> Result
     Ok(true)
 }
 
+/// #2408: a candidate that does not descend from the PR head its workflow is
+/// bound to. Provenance, never infrastructure: it is re-based by resuming on
+/// the PR lane's checkout of that head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CandidateProvenanceDiverged {
+    pub adopted_head: String,
+    pub candidate_head: String,
+}
+impl std::fmt::Display for CandidateProvenanceDiverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("candidate is not a descendant of trusted adopted head")
+    }
+}
+impl std::error::Error for CandidateProvenanceDiverged {}
+
 /// Authorize the actual local descendant, never invent historical providers.
 pub(super) async fn origin_for_candidate(
     worktree: &Path,
@@ -443,10 +458,13 @@ pub(super) async fn origin_for_candidate(
         worktree,
     )
     .await?;
-    anyhow::ensure!(
-        descendant,
-        "candidate is not a descendant of trusted adopted head"
-    );
+    if !descendant {
+        return Err(CandidateProvenanceDiverged {
+            adopted_head: owned.head.clone(),
+            candidate_head: head.into(),
+        }
+        .into());
+    }
     let receipt = WorkflowStore::open(&workflow::path())?.issue_imported_origin(
         &owned.repository,
         pr,
