@@ -1228,6 +1228,15 @@ async fn has_foreign_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     Ok(!linked_claims::foreign_claims(claims,own.as_ref()).is_empty())
 }
 
+/// #2408: the PR lane target for an issue whose own workflow is continuing on
+/// a PR it owns. None keeps the fresh issue pipeline.
+async fn own_pr_route(repo_root: &Path, issue: u64) -> Result<Option<(u64, String)>> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else {return Ok(None)};
+    let repository=workflow::canonical_repository(repo_root).await?;
+    let own=store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?;
+    Ok(linked_claims::own_pr_continuation(own.as_ref()))
+}
+
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
 /// Model tiers for the two-stage pipeline (#630). Defaults are pinned full
 /// model IDs per the #448 rule — `model: None` silently inherits whatever the
@@ -5079,6 +5088,16 @@ impl CiGateResult {
                 return Err(CiInfrastructureDeferred{workflow:workflow.id().to_owned(),eligible_at_ms}.into());
             }
         }
+        // #2408: a candidate outside its PR's lineage is provenance, never
+        // infrastructure. Reroute to the PR lane, which checks out the PR
+        // head, instead of retrying a check that can never pass.
+        if let Some(diverged)=error.downcast_ref::<adoption::CandidateProvenanceDiverged>().cloned() {
+            workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+                "kind":"candidate_provenance_diverged","adopted_head":diverged.adopted_head,
+                "candidate_head":diverged.candidate_head,"action":"resume_preserved_pr","shipping_authority":false}))?;
+            workflow.transition(crate::autoship_workflow::Stage::Reconcile,"candidate_provenance_diverged","resume_preserved_pr",0).await?;
+            return Err(error.context("candidate provenance diverged; resuming on the PR lane"));
+        }
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
             return Err(error);
@@ -8441,6 +8460,16 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         )));
     }
 
+    // #2408: an issue whose own workflow owns an open PR and is continuing
+    // runs on the PR lane. The issue checkout can be stale, and rebuilding
+    // there abandoned verified work and produced a candidate the PR could
+    // never accept.
+    if let Some((pr,pr_branch))=own_pr_route(repo_root,issue.number).await? {
+        info!(issue=issue.number,pr,"selected issue owns a continuing PR; resuming on the PR lane");
+        let reasoner=workflow_builder(repo_root,crate::autoship_workflow::submission::Target::Pr(pr)).await?;
+        return resume_draft_pr(repo_root,&reasoner,pr,issue.number,&pr_branch,dry_run,None).await
+            .map(|mut report|{report.resumed=true;report});
+    }
     match publication::claimed_after_reconcile(repo_root,issue.number,dry_run).await {
         Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
