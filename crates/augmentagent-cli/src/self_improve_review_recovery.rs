@@ -32,7 +32,11 @@ pub(super) fn observe(
     let Some(record) = record.filter(|record| record.pr == pr) else {
         return Ok(None);
     };
-    if record.head != head {
+    // #2383: the controller may integrate main into its own draft after the
+    // publication record (PR #2372: recorded 424b…, pushed dd17…). That exact
+    // head is still the protected workflow binding, which is the custody the
+    // reconciler below requires anyway. Any other head stays unproven.
+    if record.head != head && !controller_bound_head(path, repository, pr, head)? {
         info!(
             pr,
             outcome = "dependency_wait",
@@ -59,6 +63,16 @@ pub(super) fn observe(
     // controls and retained revisions) keep their existing admission path.
     // A review request never supersedes another recovery authority.
     store.reconcile_review_recovery(repository, pr, branch, head, readiness(), now)
+}
+
+fn controller_bound_head(path: &Path, repository: &str, pr: u64, head: &str) -> Result<bool> {
+    let store = WorkflowStore::open(path)?;
+    let Some(id) = store.resolve_pr(repository, pr)? else {
+        return Ok(false);
+    };
+    Ok(store
+        .snapshot(&id)?
+        .is_some_and(|snapshot| !head.is_empty() && snapshot.checkpoint.binding.head == head))
 }
 
 pub(super) fn filter(

@@ -476,6 +476,8 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
             if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
+                // #2373: never drop a candidate silently.
+                tracing::debug!(issue=number,"skip: excluded by gave-up, sliced or manual-engineering label");
                 return None;
             }
             if epics::is_epic(iss) {
@@ -1086,6 +1088,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
     let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
+    // #2373: the ranked order is the first thing to check when a due row is
+    // never selected; the picker stops at the first viable candidate.
+    info!(order=?candidates.iter().take(12).map(|issue|issue.number).collect::<Vec<_>>(),
+        total=candidates.len(),"picker candidate order");
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
