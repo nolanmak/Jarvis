@@ -83,6 +83,9 @@ mod picker_fairness_tests;
 #[path = "self_improve_epics.rs"]
 mod epics;
 #[cfg(test)]
+#[path = "self_improve_recovered_edits_tests.rs"]
+mod recovered_edits_tests;
+#[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
@@ -6851,6 +6854,25 @@ async fn recovered_revision_diff(worktree:&Path)->Result<String> {
     // head; newer main changes are checked after normal integration, not charged
     // to the interrupted editor as apparent deletions or reversions here.
     let (ok,diff,error)=run("git",&["diff","--cached","HEAD"],worktree).await?;
+    anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");
+    // #2394 (PR #2358): an interrupted merge with main stages everything main
+    // brings in. A staged path identical to a MERGE_HEAD that origin/main
+    // contains is main's change, not the editor's; every other path, including
+    // conflict resolutions, remains a recovered edit.
+    let (merging,_,_)=run("git",&["rev-parse","-q","--verify","MERGE_HEAD^{commit}"],worktree).await?;
+    if !merging {return Ok(diff);}
+    let (contained,_,_)=run("git",&["merge-base","--is-ancestor","MERGE_HEAD","refs/remotes/origin/main"],worktree).await?;
+    if !contained {return Ok(diff);}
+    let (listed,names,error)=run("git",&["diff","--cached","--name-only","-z","HEAD"],worktree).await?;
+    anyhow::ensure!(listed,"cannot list recovered edits: {error}");
+    let (compared,from_main,error)=run("git",&["diff","--cached","--name-only","-z","MERGE_HEAD"],worktree).await?;
+    anyhow::ensure!(compared,"cannot compare recovered edits with main: {error}");
+    let differs_from_main:std::collections::BTreeSet<&str>=from_main.split('\0').filter(|p|!p.is_empty()).collect();
+    let edited:Vec<&str>=names.split('\0').filter(|p|!p.is_empty() && differs_from_main.contains(p)).collect();
+    if edited.is_empty() {return Ok(String::new());}
+    let mut args=vec!["diff","--cached","HEAD","--"];
+    args.extend(edited.iter().map(|p|*p));
+    let (ok,diff,error)=run("git",&args,worktree).await?;
     anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");Ok(diff)
 }
 
