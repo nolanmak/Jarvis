@@ -232,18 +232,23 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
         format!(" WHERE {}", filters.join(" AND "))
     };
 
-    // Rows feeding the aggregate: (key, label, is_from_me, ts, platform).
+    // Rows feeding the aggregate: (key, label, is_from_me, ts, platform,
+    // unresolved). Unresolvedness is only meaningful for person keys, where it
+    // means no person page claims the handle; every other grouping keys on a
+    // category, so its source hardcodes `0` (#1427).
     let source = match req.group_by {
         GroupBy::Person => format!(
             "SELECT COALESCE(mp.person_key, mi.sender_handle) AS k, \
                     COALESCE(mp.person_key, mi.sender_label, mi.sender_handle) AS lbl, \
-                    0 AS mine, mi.ts_ms AS ts, mi.platform AS plat \
+                    0 AS mine, mi.ts_ms AS ts, mi.platform AS plat, \
+                    mp.person_key IS NULL AS unres \
                FROM message_index mi \
                LEFT JOIN message_people mp ON mp.handle = mi.sender_handle \
                {where_from_them} \
              UNION ALL \
              SELECT COALESCE(mp.person_key, cp.handle), \
-                    COALESCE(mp.person_key, cp.handle), 1, mi.ts_ms, mi.platform \
+                    COALESCE(mp.person_key, cp.handle), 1, mi.ts_ms, mi.platform, \
+                    mp.person_key IS NULL \
                FROM message_index mi \
                JOIN (SELECT conversation_id, MIN(handle) AS handle FROM conversation_people \
                       GROUP BY conversation_id) cp ON cp.conversation_id = mi.conversation_id \
@@ -283,7 +288,7 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
             };
             format!(
                 "SELECT {key_expr} AS k, {label_expr} AS lbl, mi.from_me AS mine, \
-                        mi.ts_ms AS ts, mi.platform AS plat \
+                        mi.ts_ms AS ts, mi.platform AS plat, 0 AS unres \
                    FROM message_index mi{where_clause}"
             )
         }
@@ -299,7 +304,8 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
         "SELECT k, MIN(lbl), COUNT(*) AS messages, SUM(mine) AS from_me, \
                 SUM(1 - mine) AS from_them, MIN(ts) AS first_ts, MAX(ts) AS last_ts, \
                 GROUP_CONCAT(DISTINCT plat), \
-                COUNT(DISTINCT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime')) \
+                COUNT(DISTINCT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime')), \
+                MAX(unres) AS unresolved \
            FROM ({source}) GROUP BY k"
     );
     let bound: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
@@ -312,12 +318,11 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
     let mut stmt = c.prepare(&sql)?;
     let rows: Vec<StatsRow> = stmt
         .query_map(bound.as_slice(), |r| {
-            let key: String = r.get(0)?;
             let platforms: Option<String> = r.get(7)?;
             Ok(StatsRow {
-                unresolved: key.contains(':') || key == "me",
+                unresolved: r.get::<_, i64>(9)? != 0,
+                key: r.get(0)?,
                 label: r.get::<_, Option<String>>(1)?,
-                key,
                 messages: r.get(2)?,
                 from_me: r.get(3)?,
                 from_them: r.get(4)?,
@@ -491,6 +496,87 @@ mod tests {
             r.rows.iter().all(|row| row.key != "me"),
             "the owner is never a person row"
         );
+    }
+
+    #[test]
+    fn unresolved_marks_unclaimed_person_handles_and_never_a_grouping_key() {
+        let (_d, _w, s) = fixture();
+        // A WhatsApp conversation id carries colons; that is key formatting,
+        // not a handle, and must not be read as unresolved (#1427).
+        s.upsert_email(&Email {
+            message_id: "w1".into(),
+            thread_id: Some("whatsapp-history:15555550199@lid".into()),
+            from: "15555550199@lid".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: vec![],
+            subject: "WhatsApp: Jordan Vale".into(),
+            body: "text".into(),
+            date: "2026-09-30T10:00:00Z".into(),
+            account_entity_id: Some("discord:900".into()),
+            platform: "whatsapp".into(),
+            kind: "dm".into(),
+        })
+        .unwrap();
+        drain(&s, 100, Duration::ZERO).unwrap();
+
+        let by_person = run(
+            &s,
+            StatsRequest {
+                limit: MAX_LIMIT,
+                ..Default::default()
+            },
+        );
+        let flag = |r: &StatsResponse, key: &str| {
+            r.rows
+                .iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .unresolved
+        };
+        assert!(!flag(&by_person, "alex-kim"), "a person page claims Alex");
+        assert!(
+            flag(&by_person, "discord:600"),
+            "no person page claims this handle"
+        );
+        assert!(
+            flag(&by_person, "whatsapp:15555550199@lid"),
+            "unclaimed WhatsApp sender"
+        );
+
+        for group_by in [
+            GroupBy::Conversation,
+            GroupBy::Platform,
+            GroupBy::Kind,
+            GroupBy::Day,
+            GroupBy::Week,
+            GroupBy::Month,
+        ] {
+            let r = run(
+                &s,
+                StatsRequest {
+                    group_by,
+                    limit: MAX_LIMIT,
+                    ..Default::default()
+                },
+            );
+            assert!(!r.rows.is_empty(), "{group_by:?} produced no rows");
+            for row in &r.rows {
+                assert!(
+                    !row.unresolved,
+                    "{group_by:?} key {} is a category, not a handle",
+                    row.key
+                );
+            }
+            if group_by == GroupBy::Conversation {
+                assert!(
+                    r.rows
+                        .iter()
+                        .any(|row| row.key == "whatsapp-history:15555550199@lid"),
+                    "the colon-bearing WhatsApp conversation is in scope"
+                );
+            }
+        }
     }
 
     #[test]
