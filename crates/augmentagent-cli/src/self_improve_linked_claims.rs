@@ -148,6 +148,29 @@ pub(super) async fn observe(repo: &Path, repository: &str, issue: u64) -> Result
     claims(&rows, repository, issue, &allowed)
 }
 
+/// #2396: claims other than the PR this issue's own durable workflow already
+/// owns while it continues work. Resuming onto that PR is not a duplicate;
+/// any other open PR for the issue still is, and a workflow that is scoping
+/// afresh, finished, or does not own a PR gains nothing here.
+pub(super) fn foreign_claims(
+    mut claims: BTreeSet<u64>,
+    own: Option<&crate::autoship_workflow::Snapshot>,
+) -> BTreeSet<u64> {
+    use crate::autoship_workflow::Stage;
+    let Some(own) = own else { return claims };
+    let Some(pr) = own.pr else { return claims };
+    let next = &own.checkpoint.next;
+    let continuing = match own.checkpoint.stage {
+        Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::Publish | Stage::AwaitChecks => true,
+        Stage::Held => crate::autoship_workflow::is_review_hold_reason(&next.reason) && next.action == "resume_preserved_work",
+        _ => false,
+    };
+    if continuing {
+        claims.remove(&pr);
+    }
+    claims
+}
+
 pub(super) async fn require_absence(repo: &Path, repository: &str, issue: u64) -> Result<()> {
     if !observe(repo, repository, issue).await?.is_empty() {
         return Err(Hold::Claimed.into());
@@ -158,6 +181,54 @@ pub(super) async fn require_absence(repo: &Path, repository: &str, issue: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autoship_workflow::{Binding, Checkpoint, NextAction, Snapshot, Stage};
+
+    fn own(stage: Stage, reason: &str, action: &str, pr: Option<u64>) -> Snapshot {
+        Snapshot {
+            workflow: "nolanmak/jarvis#2329".into(),
+            branch: "agent-fix/issue-2329".into(),
+            pr,
+            checkpoint: Checkpoint {
+                stage,
+                binding: Binding { head: "57ee".repeat(10), contract: "contract".into(), evidence_hash: "evidence".into() },
+                evidence: vec![],
+                next: NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: 0 },
+            },
+            attempts: 6, wall_ms: 0, model_calls: 0, tokens: 0,
+            heartbeat_at_ms: 0, progress_at_ms: 0, lease_until_ms: 0, generation: 6,
+        }
+    }
+
+    /// #2396 production shape: #2329's workflow at publish/publishing_revision/
+    /// push owns PR #2378, and the picker refused it as "open agent PR exists".
+    /// A workflow resuming onto its own bound PR is not a duplicate; any other
+    /// open PR for the issue, or a workflow that does not own one, still is.
+    #[test]
+    fn own_bound_pr_does_not_dedup_its_own_continuation() {
+        let claims = || BTreeSet::from([2378]);
+        for (stage, reason, action) in [
+            (Stage::Publish, "publishing_revision", "push"),
+            (Stage::Reconcile, "verification_infrastructure_retry", "retry_verification"),
+            (Stage::Reconcile, "integration_conflict", "reconcile_main"),
+            (Stage::Build, "recovering_interrupted_edits", "checkpoint_revision"),
+            (Stage::Review, "review-recovery-required", "complete_review_or_adjudication"),
+            (Stage::Held, "review-recovery-required", "resume_preserved_work"),
+        ] {
+            let snapshot = own(stage, reason, action, Some(2378));
+            assert!(foreign_claims(claims(), Some(&snapshot)).is_empty(), "{stage:?} {reason} resumes onto its own PR");
+            assert_eq!(foreign_claims(BTreeSet::from([2378, 2400]), Some(&snapshot)), BTreeSet::from([2400]),
+                "a second PR for the issue still blocks");
+        }
+        // No workflow, an unbound workflow, another PR, fresh scope or a
+        // finished workflow: the claim stays a duplicate.
+        assert_eq!(foreign_claims(claims(), None), claims());
+        assert_eq!(foreign_claims(claims(), Some(&own(Stage::Publish, "publishing_revision", "push", None))), claims());
+        assert_eq!(foreign_claims(claims(), Some(&own(Stage::Publish, "publishing_revision", "push", Some(2377)))), claims());
+        assert_eq!(foreign_claims(claims(), Some(&own(Stage::Scope, "scope_deferred", "retry_scope", Some(2378)))), claims());
+        assert_eq!(foreign_claims(claims(), Some(&own(Stage::Retired, "target_closed", "complete", Some(2378)))), claims());
+        assert_eq!(foreign_claims(claims(), Some(&own(Stage::Held, "resume_deferred", "resume_preserved_work", Some(2378)))), claims(),
+            "a non-review hold belongs to the adoption lane");
+    }
     fn row() -> serde_json::Value {
         serde_json::json!({"number":77,"isCrossRepository":false,"author":{"login":"owner"},
             "headRefName":"fix/widget","headRefOid":"a".repeat(40),"baseRefName":"main",
