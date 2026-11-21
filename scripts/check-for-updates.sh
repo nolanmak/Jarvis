@@ -20,6 +20,9 @@
 #   (never do that to pin a rollout) is reported as DEPLOY PINNED, alerted
 #   once, and the restart is skipped until the override is retired.
 #
+# Optional remote release builder: AUGMENTAGENT_REMOTE_BUILD_HOST opts in.
+# Setup, restricted SSH protocol and failure behavior: scripts/remote-builder/setup.sh.
+#
 # Build stamp (idempotency fix):
 #   Idempotency used to be keyed purely on `HEAD == origin/main`. If the
 #   checkout was reconciled to origin OUT OF BAND (e.g. a force-push / history
@@ -212,9 +215,10 @@ apply_update() {
 
   if [ "$NEEDS_REBUILD" -eq 1 ]; then
     # #903 — a release build is the second-largest memory user on the box;
-    # under pressure it would tip a host that is already struggling. Not a
+    # under pressure it would tip a host that is already struggling. Remote
+    # mode does no local compilation; keep the later restart guards. Not a
     # build failure: withhold the stamp so the next tick retries (#826).
-    if ! memory_pressure_ok; then
+    if [ -z "${AUGMENTAGENT_REMOTE_BUILD_HOST:-}" ] && ! memory_pressure_ok; then
       log "skipping rebuild + restart under memory pressure; stamp withheld, retry next tick"
       return 1
     fi
@@ -233,7 +237,7 @@ apply_update() {
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
     local build_status=0
-    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target"; then
+    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target" "$TARGET"; then
       :
     else
       build_status=$?
