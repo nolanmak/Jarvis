@@ -477,7 +477,20 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        // #2398 — a question the owner relayed through a trusted webhook.
+        // Decided first, from the webhook id alone, because the message is
+        // bot-authored and never carries the owner's id. `Some` only for a
+        // listed webhook posting in the query channel itself.
+        let relay = crate::relay::relayed_query(&crate::relay::trusted_ids(), crate::relay::Facts {
+            webhook_id: msg.webhook_id.map(|id| id.get()),
+            application_id: msg.application_id.map(|id| id.get()),
+            channel_id: msg.channel_id.get(),
+            is_dm: msg.guild_id.is_none(),
+            query_channel_id: self.state.query_channel_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()),
+            owner_configured: self.state.allowed_user_id.is_some(),
+        });
+        if msg.author.bot && relay.is_none() {
             if self.state.bot_user_id.get()==Some(&msg.author.id) {
                 if let Some(store)=self.state.store.as_ref() {
                     let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
@@ -499,7 +512,7 @@ impl EventHandler for Handler {
             return;
         };
 
-        if !is_authorized(self.state.allowed_user_id, msg.author.id) {
+        if relay.is_none() && !is_authorized(self.state.allowed_user_id, msg.author.id) {
             debug!(
                 "ignoring message from unauthorized user {} (allowlist configured: {})",
                 msg.author.id.get(),
@@ -515,6 +528,23 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #2398 — a relayed message is a question and nothing else. Text that
+        // would be an owner command is refused here, before any dispatcher,
+        // and every dispatcher below is also skipped for it.
+        if let Some(webhook_id) = relay {
+            info!(via_relay = true, webhook_id, channel_id = %msg.channel_id, msg_id = %msg.id,
+                "discord query relayed through trusted webhook");
+            if crate::relay::is_command_like(&user_text) {
+                info!(via_relay = true, webhook_id, "relayed command refused");
+                let builder = CreateMessage::new().content(crate::relay::NO_COMMANDS)
+                    .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+                if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                    warn!("failed to post relay command refusal");
+                }
+                return;
+            }
+        }
+        let relayed = relay.is_some();
         // #2219 — the yolo-thread gate. In a yolo thread only `/yolo`,
         // `/search` and plain text (a yolo turn) are handled; no other owner
         // command runs there. An unreadable registry pauses every thread under
@@ -539,7 +569,7 @@ impl EventHandler for Handler {
             author: msg.author.id.get(), channel: msg.channel_id.get(), message: msg.id.get(),
             guild: msg.guild_id.map(|id| id.get()),
         };
-        if !yolo_thread {
+        if !yolo_thread && !relayed {
         match crate::autoship::dispatch(handler.as_ref(), &crate::autoship::DiscordTransport(Arc::clone(&ctx.http)),
             &autoship_context, &user_text).await {
             Ok(false) => {},
@@ -556,7 +586,7 @@ impl EventHandler for Handler {
             author_id: msg.author.id.get(),
             message_id: msg.id.get(),
         };
-        let phone_reply = if yolo_thread { None } else {
+        let phone_reply = if yolo_thread || relayed { None } else {
             crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await
         };
         if let Some(reply) = phone_reply {
@@ -570,7 +600,7 @@ impl EventHandler for Handler {
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        let model_reply = if yolo_thread { None } else {
+        let model_reply = if yolo_thread || relayed { None } else {
             crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await
         };
         if let Some(reply) = model_reply {
@@ -591,7 +621,8 @@ impl EventHandler for Handler {
             is_query_channel: is_query_root,
             query_channel_id: self.state.query_channel_id.map(|channel| channel.get()),
         };
-        if let Some(outcome) = handler.owner_text_command(command_ctx, &user_text).await {
+        let owner_command = if relayed { None } else { handler.owner_text_command(command_ctx, &user_text).await };
+        if let Some(outcome) = owner_command {
             let reply = match outcome {
                 crate::owner_text::OwnerCommandOutcome::Reply(reply) => reply,
                 crate::owner_text::OwnerCommandOutcome::OpenYoloThread { intro } => {
@@ -651,7 +682,7 @@ impl EventHandler for Handler {
         // `!journal` — ShadowNote journaling write-back (#428).
         // Handled inline, never routed to wiki-ask. The slow
         // path (compose LLM call + KMS + AppSync) runs off the event loop.
-        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text) {
+        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text).filter(|_| !relayed) {
             use crate::journal_cmd::{JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
             let ops = self.state.journal_ops.clone();
             let ctx_for_history = ctx.clone();
@@ -709,7 +740,7 @@ impl EventHandler for Handler {
         // refusal in `process_loops::handle` covers the no-allowlist case
         // (without an allowlist, *anyone* DMing the bot could kill host
         // processes — refuse the command entirely in that mode).
-        if user_text == "!loops" || user_text.starts_with("!loops ") {
+        if !relayed && (user_text == "!loops" || user_text.starts_with("!loops ")) {
             let allowlist_active = self.state.allowed_user_id.is_some();
             let text = user_text.clone();
             let http = ctx.http.clone();
@@ -734,7 +765,7 @@ impl EventHandler for Handler {
         // inline; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
         // as long as it's word-bounded (so `loops are nice` isn't matched).
-        if !yolo_thread && crate::loops::match_loop_prefix(&user_text).is_some() {
+        if !yolo_thread && !relayed && crate::loops::match_loop_prefix(&user_text).is_some() {
             let owner = msg.author.id.get().to_string();
             let channel_ref = msg.channel_id.get().to_string();
             let subcommand = crate::loops::match_loop_prefix(&user_text)
@@ -807,7 +838,9 @@ impl EventHandler for Handler {
             // attachments are registered under the wiki, which normal turns
             // read, and the model is text-only.
             let had_attachments = !images.is_empty() || !text_files.is_empty() || !docs.is_empty();
-            let (images, text_files, docs) = if yolo_thread {
+            // #2398 — nor does a relayed query: documents are registered
+            // under the wiki, which is a change the owner did not make.
+            let (images, text_files, docs) = if yolo_thread || relayed {
                 (Vec::new(), Vec::new(), Vec::new())
             } else {
                 (images, text_files, docs)
@@ -821,6 +854,12 @@ impl EventHandler for Handler {
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
             if yolo_thread && had_attachments {
                 current.push_str("\n[attachments are not available in a yolo thread]");
+            }
+            if let Some(webhook_id) = relay {
+                if had_attachments {
+                    current.push_str("\n[attachments on a relayed message are not read]");
+                }
+                current = format!("{}{current}", crate::relay::prompt_note(webhook_id));
             }
             for notice in &extracted_docs.notices {
                 current.push('\n');
@@ -863,7 +902,12 @@ impl EventHandler for Handler {
                     crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current)))),
             ).await;
             // Every message posted for a yolo turn starts with this line.
-            let yolo_tag = yolo_thread.then(|| handler.yolo_tag());
+            // A reply to a relayed query says so on its first line.
+            let yolo_tag = if yolo_thread {
+                Some(handler.yolo_tag())
+            } else {
+                relayed.then(|| crate::relay::REPLY_TAG.to_string())
+            };
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
