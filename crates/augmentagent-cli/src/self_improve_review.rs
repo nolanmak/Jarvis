@@ -196,10 +196,37 @@ fn structured_review_fallback(
     head: &str,
     selected: augmentagent_channel_core::ProviderKind,
 ) -> augmentagent_channel_core::ProviderKind {
-    let pool = reviewer_pool();
+    structured_review_fallback_with(guard, head, selected, &reviewer_pool(), reviewer_status)
+}
+
+fn structured_review_fallback_with(
+    guard: &workflow::WorkflowGuard,
+    head: &str,
+    selected: augmentagent_channel_core::ProviderKind,
+    pool: &[augmentagent_channel_core::ProviderKind],
+    status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
+) -> augmentagent_channel_core::ProviderKind {
     let counts: Vec<_> = pool.iter().map(|p| (*p, structured_failures(guard, head, *p))).collect();
     let count = |p| counts.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
-    let Some(alternate) = review_capacity::structured_fallback(&pool, selected, count, reviewer_status) else {
+    let Some(alternate) = review_capacity::structured_fallback(pool, selected, count, &status) else {
+        // #2418: a due fallback that cannot switch must be visible, never
+        // indistinguishable from "not due yet".
+        if count(selected) >= review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK {
+            let candidates: serde_json::Map<String, serde_json::Value> = pool.iter().filter(|p| **p != selected)
+                .map(|p| (p.name().to_owned(), serde_json::Value::from(match status(*p) {
+                    ReviewerStatus::Ready if count(*p) >= count(selected) => "no_fewer_failures",
+                    ReviewerStatus::Ready => "not_native",
+                    ReviewerStatus::Latched(_) => "latched",
+                    ReviewerStatus::NotConfigured(_) => "unconfigured",
+                }))).collect();
+            let payload = serde_json::json!({"actor":"controller","kind":"review_fallback_unavailable","head":head,
+                "from":selected.name(),"failures":count(selected),"candidates":candidates,
+                "bound":review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK,"reason":"structured_review_validation"});
+            if let Err(error) = guard.audit_logger().record_controller(payload.clone()) {
+                warn!("review fallback audit unavailable: {error:#}");
+            }
+            warn!(head, fallback = %payload, "independent review fallback is due but no alternate reviewer can serve");
+        }
         return selected;
     };
     let payload = serde_json::json!({"actor":"controller","kind":"review_fallback","head":head,
@@ -1498,6 +1525,45 @@ mod tests {
         fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
         let err = candidate_snapshot(dir.path()).await.err().unwrap();
         assert!(err.to_string().contains("integrate current main"));
+    }
+
+    /// #2418: the #2386 counter end to end through the durable guard, in the
+    /// production shape (pool codex,cerebras,claude; cerebras unconfigured;
+    /// two codex structured failures on head b260fb89). The next review runs
+    /// on claude with an audited `review_fallback`; another head starts at
+    /// zero. When the bound is reached but no alternate can serve, that is
+    /// audited as `review_fallback_unavailable` instead of passing silently.
+    #[tokio::test]
+    async fn structured_failures_switch_reviewer_or_audit_why_not() {
+        use augmentagent_channel_core::ProviderKind::{Cerebras, Claude, Codex};
+        let dir=candidate_fixture();
+        let control=tempfile::Builder::new().prefix("review-fallback-control-").tempdir_in("/tmp").unwrap();
+        let state=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&state,workflow::Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(2329),
+            pr:Some(2378),branch:"agent-fix/issue-2329",contract:"original owner contract",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let head="b260fb89e6fc8217e132623cc63b41348890935e";
+        let pool=[Codex,Cerebras,Claude];
+        let ready=|p| match p {Cerebras=>ReviewerStatus::NotConfigured("no key".into()),_=>ReviewerStatus::Ready};
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Codex,"no failures yet");
+        record_structured_failure(&guard,head,Codex);
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Codex,"one failure is not the bound");
+        record_structured_failure(&guard,head,Codex);
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Claude,"the 3rd review runs on claude");
+        assert_eq!(structured_review_fallback_with(&guard,&"c".repeat(40),Codex,&pool,ready),Codex,"failures are per head");
+        let latched=|p| match p {Claude=>ReviewerStatus::Latched(None),other=>ready(other)};
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,latched),Codex);
+        let records:Vec<serde_json::Value>=std::fs::read_to_string(guard.audit_logger().path()).unwrap().lines()
+            .map(|line|serde_json::from_str(line).unwrap()).collect();
+        let fallback:Vec<_>=records.iter().filter(|r|r["kind"]=="review_fallback").collect();
+        assert_eq!(fallback.len(),1);
+        assert_eq!((fallback[0]["from"].as_str(),fallback[0]["to"].as_str(),fallback[0]["head"].as_str()),(Some("codex"),Some("claude"),Some(head)));
+        let unavailable:Vec<_>=records.iter().filter(|r|r["kind"]=="review_fallback_unavailable").collect();
+        assert_eq!(unavailable.len(),1,"a due fallback that cannot switch must be visible");
+        assert_eq!(unavailable[0]["from"].as_str(),Some("codex"));
+        assert_eq!(unavailable[0]["candidates"]["claude"].as_str(),Some("latched"));
+        assert_eq!(unavailable[0]["candidates"]["cerebras"].as_str(),Some("unconfigured"));
     }
 
     #[tokio::test]
