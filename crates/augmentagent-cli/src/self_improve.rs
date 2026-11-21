@@ -1164,7 +1164,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None).await.ok();
             continue;
         }
-        if has_open_agent_pr(repo_root, number).await? {
+        if has_foreign_agent_pr(repo_root, number).await? {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
         }
@@ -1210,6 +1210,22 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     let repository=workflow::canonical_repository(repo_root).await
         .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
     Ok(!linked_claims::observe(repo_root,&repository,issue).await?.is_empty())
+}
+
+/// #2396: the fresh-work dedup, except for the PR this issue's own durable
+/// workflow already owns while it continues (publish, reconcile, review…).
+/// A pending publication still belongs to its free reconciler.
+async fn has_foreign_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
+    if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
+    let claims=linked_claims::observe(repo_root,&repository,issue).await?;
+    if claims.is_empty() { return Ok(false); }
+    let own=match crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? {
+        Some(store)=>store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?,
+        None=>None,
+    };
+    Ok(!linked_claims::foreign_claims(claims,own.as_ref()).is_empty())
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
