@@ -11,8 +11,12 @@ pub(crate) mod command_fairness;
 pub(crate) mod owner_requalification;
 #[path="autoship_scope_policy.rs"]
 pub(crate) mod scope_policy;
+#[path="autoship_terminal_parks.rs"]
+pub(crate) mod terminal_parks;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
+#[path = "autoship_checkout_continuity.rs"]
+pub(crate) mod checkout_continuity;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
 use anyhow::{bail, ensure, Context, Result};
@@ -33,6 +37,9 @@ pub(crate) mod family_budget;
 #[cfg(test)]
 #[path = "autoship_family_budget_tests.rs"]
 mod family_budget_tests;
+#[cfg(test)]
+#[path = "autoship_park_guard_tests.rs"]
+mod park_guard_tests;
 #[path = "autoship_activity_observation.rs"]
 mod activity_observation;
 #[path = "autoship_idle_recovery.rs"]
@@ -240,14 +247,20 @@ pub struct Snapshot {
 /// Shared wait shape for acquisition and dispatch. Recovery evidence still
 /// requires separate authentication and grants no builder or merge approval.
 pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
-    checkpoint.stage==Stage::Scope && matches!(
-        (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-        ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
-        ("acceptance_strategies_exhausted","await_new_execution_inputs")|
-        ("readiness_assessment_invalid","await_readiness_input_change")|
-        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
-        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
+    checkpoint.stage==Stage::Scope && INITIAL_INPUT_WAITS.iter().any(|(reason,action)|
+        checkpoint.next.reason==*reason && checkpoint.next.action==*action)
 }
+/// Every reason → await pair an initial verifier hold can produce. #2370's
+/// guard proves each one leaves automatically; none waits on a human.
+pub(crate) const INITIAL_INPUT_WAITS:&[(&str,&str)]=&[
+    ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+    ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
+    ("acceptance_contract_invalid","await_acceptance_input_change"),
+    ("acceptance_strategies_exhausted","await_new_execution_inputs"),
+    ("readiness_assessment_invalid","await_readiness_input_change"),
+    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+];
 
 /// Shape only; the unpaid consumer separately authenticates the exact private
 /// decline and original source before a transaction can queue reconsideration.
@@ -335,7 +348,7 @@ mod acceptance_input_wait_claim_tests {
                 checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
-                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid");
+                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid");
                 let mut planning_claims=0;
                 for now in [6,86_400_001,2*86_400_000] {
                     if recoverable {
@@ -408,6 +421,15 @@ pub(crate) struct NativeScopeAdmissionData {
     pub binding:Binding,
 }
 
+/// An identical content-addressed response produced again after a recovery
+/// cutover is a fresh fact for the new episode; index it past the cutover.
+fn reindex_after_cutover(tx:&Transaction<'_>,lease:&Lease,key:&str,now:i64)->Result<()> {
+    let cutover=owner_checkout_recovery::cutover_seq(tx,&lease.workflow)?;
+    if cutover==0 {return Ok(());}
+    let indexed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?3)",params![lease.workflow,cutover,key],|r|r.get(0))?;
+    if !indexed {event(tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;}
+    Ok(())
+}
 fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeCustody>> {
     Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
 }
@@ -544,7 +566,7 @@ impl WorkflowStore {
         ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
         let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");} else {
+        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");reindex_after_cutover(&tx,lease,key,now)?;} else {
             tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,response])?;
             event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
         }tx.commit()?;Ok(())

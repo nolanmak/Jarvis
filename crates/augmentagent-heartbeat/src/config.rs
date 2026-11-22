@@ -6,11 +6,16 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Days, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
-pub const MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Local time of the daily sweep (#2285), minutes since midnight.
+pub const DEFAULT_SWEEP_AT_MIN: u32 = 9 * 60;
+/// Items surfaced per sweep at most.
+pub const DEFAULT_MAX_ITEMS: usize = 5;
+/// `heartbeat status --check` alarms when no run was attempted in this long
+/// while the window is open: one day plus grace for a late start.
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::hours(26);
 pub const DEFAULT_DAILY_CAP: u32 = 6;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -71,7 +76,10 @@ impl std::fmt::Display for ActiveHours {
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
     pub enabled: bool,
-    pub interval: Duration,
+    /// Local time of the daily sweep, minutes since midnight.
+    pub sweep_at_min: u32,
+    /// Items surfaced per sweep at most.
+    pub max_items: usize,
     /// `None` = always active.
     pub active_hours: Option<ActiveHours>,
     /// `None` = the host's local zone.
@@ -89,7 +97,8 @@ impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval: DEFAULT_INTERVAL,
+            sweep_at_min: DEFAULT_SWEEP_AT_MIN,
+            max_items: DEFAULT_MAX_ITEMS,
             active_hours: None,
             tz: None,
             daily_cap: DEFAULT_DAILY_CAP,
@@ -118,17 +127,27 @@ impl HeartbeatConfig {
             ..Self::default()
         };
 
-        if let Some(raw) = get("AUGMENTAGENT_HEARTBEAT_INTERVAL") {
-            match augmentagent_approval_discord::parse_interval(&raw).filter(|s| *s > 0) {
-                Some(secs) if Duration::from_secs(secs as u64) < MIN_INTERVAL => {
-                    c.interval = MIN_INTERVAL;
-                    c.warnings.push(format!(
-                        "AUGMENTAGENT_HEARTBEAT_INTERVAL `{raw}` is below the 5m floor; using 5m"
-                    ));
-                }
-                Some(secs) => c.interval = Duration::from_secs(secs as u64),
+        // #2285: the 30-minute pass is gone; a leftover setting is harmless.
+        if get("AUGMENTAGENT_HEARTBEAT_INTERVAL").is_some() {
+            c.warnings.push(
+                "AUGMENTAGENT_HEARTBEAT_INTERVAL is no longer used: the heartbeat runs once a day at AUGMENTAGENT_HEARTBEAT_SWEEP_AT".into(),
+            );
+        }
+
+        if let Some(raw) = get("AUGMENTAGENT_HEARTBEAT_SWEEP_AT") {
+            match clock_minutes(&raw).filter(|m| *m < 24 * 60) {
+                Some(m) => c.sweep_at_min = m,
                 None => c.warnings.push(format!(
-                    "AUGMENTAGENT_HEARTBEAT_INTERVAL `{raw}` is not an interval; using 30m"
+                    "AUGMENTAGENT_HEARTBEAT_SWEEP_AT `{raw}` is not HH:MM; using 09:00"
+                )),
+            }
+        }
+
+        if let Some(raw) = get("AUGMENTAGENT_HEARTBEAT_MAX_ITEMS") {
+            match raw.parse::<usize>() {
+                Ok(n) if n > 0 => c.max_items = n,
+                _ => c.warnings.push(format!(
+                    "AUGMENTAGENT_HEARTBEAT_MAX_ITEMS `{raw}` is not a positive count; using {DEFAULT_MAX_ITEMS}"
                 )),
             }
         }
@@ -185,18 +204,34 @@ impl HeartbeatConfig {
         window.contains(hour * 60 + minute)
     }
 
-    /// Liveness probe for `heartbeat status --check`: enabled, and no
-    /// attempt within three intervals while the window has been open for
-    /// at least that long. A heartbeat that has never run is stale too.
+    /// Liveness probe for `heartbeat status --check`: enabled, inside the
+    /// window, and no attempt for [`STALE_AFTER`]. A daily sweep that has
+    /// never run is stale too.
     pub fn is_stale(&self, last_attempt_ms: Option<i64>, now: DateTime<Utc>) -> bool {
-        if !self.enabled {
+        if !self.enabled || !self.is_active_at(now) {
             return false;
         }
-        let grace = chrono::Duration::from_std(self.interval * 3).unwrap_or(chrono::Duration::MAX);
-        if !self.is_active_at(now) || !self.is_active_at(now - grace) {
-            return false;
+        last_attempt_ms
+            .is_none_or(|last| now.timestamp_millis() - last > STALE_AFTER.num_milliseconds())
+    }
+
+    /// The most recent sweep time at or before `now`: today's
+    /// `sweep_at` in the configured zone, or yesterday's when that is still
+    /// ahead. A sweep time skipped by a DST jump falls an hour later.
+    pub fn latest_slot(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        match self.tz {
+            Some(tz) => slot_in(&tz, self.sweep_at_min, now),
+            None => slot_in(&chrono::Local, self.sweep_at_min, now),
         }
-        last_attempt_ms.is_none_or(|last| now.timestamp_millis() - last > grace.num_milliseconds())
+    }
+
+    /// `09:00`, for status output.
+    pub fn sweep_at_label(&self) -> String {
+        format!(
+            "{:02}:{:02}",
+            self.sweep_at_min / 60,
+            self.sweep_at_min % 60
+        )
     }
 
     /// `2026-09-29 08:15 EDT (Tuesday)` in the configured zone, for prompts.
@@ -206,6 +241,32 @@ impl HeartbeatConfig {
             Some(tz) => now.with_timezone(&tz).format(FORMAT).to_string(),
             None => now.with_timezone(&chrono::Local).format(FORMAT).to_string(),
         }
+    }
+}
+
+fn slot_in<Z: TimeZone>(tz: &Z, minute_of_day: u32, now: DateTime<Utc>) -> DateTime<Utc> {
+    let local_now = now.with_timezone(tz);
+    let time = NaiveTime::from_hms_opt(minute_of_day / 60, minute_of_day % 60, 0)
+        .unwrap_or(NaiveTime::MIN);
+    let at = |date: chrono::NaiveDate| -> DateTime<Utc> {
+        let naive = date.and_time(time);
+        tz.from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| {
+                tz.from_local_datetime(&(naive + chrono::Duration::hours(1)))
+                    .earliest()
+            })
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or(now)
+    };
+    let today = at(local_now.date_naive());
+    if today <= now {
+        today
+    } else {
+        local_now
+            .date_naive()
+            .checked_sub_days(Days::new(1))
+            .map_or(today, at)
     }
 }
 
@@ -270,7 +331,8 @@ mod tests {
     fn defaults_when_nothing_is_set() {
         let c = cfg(&[]);
         assert!(!c.enabled);
-        assert_eq!(c.interval, DEFAULT_INTERVAL);
+        assert_eq!(c.sweep_at_min, 9 * 60);
+        assert_eq!(c.max_items, 5);
         assert_eq!(c.active_hours, None);
         assert_eq!(c.tz, None);
         assert_eq!(c.daily_cap, DEFAULT_DAILY_CAP);
@@ -292,15 +354,40 @@ mod tests {
     }
 
     #[test]
-    fn interval_parses_clamps_and_falls_back() {
-        let c = cfg(&[("AUGMENTAGENT_HEARTBEAT_INTERVAL", "2h")]);
-        assert_eq!(c.interval, Duration::from_secs(7200));
-        let c = cfg(&[("AUGMENTAGENT_HEARTBEAT_INTERVAL", "1m")]);
-        assert_eq!(c.interval, MIN_INTERVAL);
+    fn sweep_time_and_item_cap_parse_and_fall_back() {
+        let c = cfg(&[
+            ("AUGMENTAGENT_HEARTBEAT_SWEEP_AT", "07:30"),
+            ("AUGMENTAGENT_HEARTBEAT_MAX_ITEMS", "3"),
+        ]);
+        assert_eq!((c.sweep_at_min, c.max_items), (7 * 60 + 30, 3));
+        assert_eq!(c.sweep_at_label(), "07:30");
+        assert!(c.warnings.is_empty());
+        let c = cfg(&[
+            ("AUGMENTAGENT_HEARTBEAT_SWEEP_AT", "9am"),
+            ("AUGMENTAGENT_HEARTBEAT_MAX_ITEMS", "0"),
+        ]);
+        assert_eq!((c.sweep_at_min, c.max_items), (9 * 60, 5));
+        assert_eq!(c.warnings.len(), 2);
+    }
+
+    #[test]
+    fn the_old_interval_setting_only_warns() {
+        let c = cfg(&[("AUGMENTAGENT_HEARTBEAT_INTERVAL", "30m")]);
         assert_eq!(c.warnings.len(), 1);
-        let c = cfg(&[("AUGMENTAGENT_HEARTBEAT_INTERVAL", "soon")]);
-        assert_eq!(c.interval, DEFAULT_INTERVAL);
-        assert_eq!(c.warnings.len(), 1);
+        assert!(c.warnings[0].contains("no longer used"), "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn latest_slot_is_todays_sweep_once_past_it_else_yesterdays() {
+        let c = cfg(&[("AUGMENTAGENT_HEARTBEAT_TZ", "America/New_York")]);
+        // 09:00 EDT is 13:00Z.
+        let at = |h, m| Utc.with_ymd_and_hms(2026, 9, 29, h, m, 0).unwrap();
+        assert_eq!(c.latest_slot(at(13, 0)), at(13, 0));
+        assert_eq!(c.latest_slot(at(20, 0)), at(13, 0));
+        assert_eq!(
+            c.latest_slot(at(12, 59)),
+            Utc.with_ymd_and_hms(2026, 9, 28, 13, 0, 0).unwrap()
+        );
     }
 
     #[test]
@@ -342,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn staleness_needs_enabled_three_missed_intervals_and_an_open_window() {
+    fn staleness_needs_enabled_an_open_window_and_a_missed_day() {
         let now = Utc.with_ymd_and_hms(2026, 9, 29, 15, 0, 0).unwrap();
         let ms = |h: i64| now.timestamp_millis() - h * 60 * 60_000;
         let mut c = cfg(&[("AUGMENTAGENT_HEARTBEAT_TZ", "UTC")]);
@@ -350,14 +437,11 @@ mod tests {
 
         c.enabled = true;
         assert!(c.is_stale(None, now), "enabled but never run");
-        assert!(!c.is_stale(Some(ms(1)), now), "1h < 3 x 30m");
-        assert!(c.is_stale(Some(ms(2)), now), "2h > 3 x 30m");
+        assert!(!c.is_stale(Some(ms(20)), now), "inside a day");
+        assert!(c.is_stale(Some(ms(30)), now), "missed a day");
 
-        // Window opened at 14:00; 3 intervals back (13:30) was still quiet.
-        c.active_hours = Some(ActiveHours::parse("14:00-22:00").unwrap());
-        assert!(!c.is_stale(Some(ms(12)), now));
-        c.active_hours = Some(ActiveHours::parse("08:00-22:00").unwrap());
-        assert!(c.is_stale(Some(ms(12)), now));
+        c.active_hours = Some(ActiveHours::parse("16:00-22:00").unwrap());
+        assert!(!c.is_stale(Some(ms(48)), now), "outside the window");
         c.active_hours = Some(ActiveHours::parse("09:00-09:00").unwrap());
         assert!(!c.is_stale(None, now), "never-active window never alarms");
     }

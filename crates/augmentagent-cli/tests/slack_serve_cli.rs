@@ -859,20 +859,28 @@ async fn serve_runs_owner_turns_through_the_harness_with_sessions_cancel_and_fil
 // #1289 — approvals on Slack, through the built `serve`
 // ---------------------------------------------------------------------------
 
-/// Every call to one Slack Web API method, recorded, answered `ok`.
+/// Bumped after every recorded Web API call, so a test waits for the call
+/// it expects instead of polling against a wall-clock budget.
+type CallSignal = std::sync::Arc<tokio::sync::watch::Sender<u64>>;
+
+/// Every call to one Slack Web API method, recorded, answered `ok`, and
+/// announced on `signal` once it is recorded.
 async fn record_method(
     server: &mut mockito::ServerGuard,
     method: &str,
+    signal: &CallSignal,
 ) -> std::sync::Arc<std::sync::Mutex<Vec<Value>>> {
     use std::sync::{Arc, Mutex};
     let calls: Arc<Mutex<Vec<Value>>> = Arc::default();
     let recorded = Arc::clone(&calls);
+    let signal = Arc::clone(signal);
     server
         .mock("POST", format!("/{method}").as_str())
         .with_body_from_request(move |req| {
             let body: Value = serde_json::from_slice(req.body().unwrap()).unwrap_or(Value::Null);
             let mut all = recorded.lock().unwrap();
             all.push(body.clone());
+            signal.send_modify(|n| *n += 1);
             let ts = body["ts"]
                 .as_str()
                 .map(str::to_string)
@@ -884,6 +892,44 @@ async fn record_method(
         .create_async()
         .await;
     calls
+}
+
+/// Wait until `check` holds, re-checking on every recorded Web API call
+/// rather than on a timer. `within` only bounds a daemon that never answers,
+/// so it can be generous without slowing a passing run. False on timeout.
+async fn until_call(
+    signal: &CallSignal,
+    within: Duration,
+    mut check: impl FnMut() -> bool,
+) -> bool {
+    // Subscribe before the first check: a call recorded in between still
+    // marks the receiver changed, so no wakeup is lost.
+    let mut calls = signal.subscribe();
+    tokio::time::timeout(within, async {
+        while !check() {
+            if calls.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok()
+        && check()
+}
+
+/// The owner was answered with `text`: an ephemeral reply, or, when the
+/// daemon judged the click late (Slack's 3 s trigger window, measured from
+/// the click's `action_ts`), a fresh DM message that starts with the same
+/// answer and adds a lateness note. A loaded runner can deliver a click
+/// late, so either form is the answer.
+fn owner_answered(ephemerals: &[Value], posts: &[Value], text: &str) -> bool {
+    ephemerals.iter().any(|e| e["text"] == json!(text))
+        || posts.iter().any(|p| {
+            p["channel"] == json!(OWNER_DM)
+                && p["text"]
+                    .as_str()
+                    .is_some_and(|t| t == text || t.starts_with(&format!("{text}\n")))
+        })
 }
 
 fn interactive_click(
@@ -921,9 +967,14 @@ async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once
     let mut socket = fake_socket().await;
     let mut server = mockito::Server::new_async().await;
     mock_slack(&mut server, socket.port).await;
-    let posts = record_method(&mut server, "chat.postMessage").await;
-    let updates = record_method(&mut server, "chat.update").await;
-    let ephemerals = record_method(&mut server, "chat.postEphemeral").await;
+    let signal: CallSignal = std::sync::Arc::new(tokio::sync::watch::channel(0).0);
+    let posts = record_method(&mut server, "chat.postMessage", &signal).await;
+    let updates = record_method(&mut server, "chat.update", &signal).await;
+    let ephemerals = record_method(&mut server, "chat.postEphemeral", &signal).await;
+    let answered =
+        |text: &str| owner_answered(&ephemerals.lock().unwrap(), &posts.lock().unwrap(), text);
+    // Generous: only reached when the daemon never answers.
+    let answer_within = Duration::from_secs(60);
 
     let mut composio = mockito::Server::new_async().await;
     composio
@@ -1051,15 +1102,23 @@ async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once
         // and persisted by the daemon. Wait for that durable publication
         // receipt before generating the owner's approval click.
         let mut published = None;
-        eventually("durable approval card receipt", Duration::from_secs(30), || {
-            let conn = rusqlite::Connection::open(env.db()).unwrap();
-            published = conn.query_row(
-                "SELECT message_id FROM surface_approval_cards WHERE action_id = ?1",
-                [&action_id],
-                |r| r.get::<_, String>(0),
-            ).optional().unwrap();
-            published.is_some()
-        }).await;
+        eventually(
+            "durable approval card receipt",
+            Duration::from_secs(30),
+            || {
+                let conn = rusqlite::Connection::open(env.db()).unwrap();
+                published = conn
+                    .query_row(
+                        "SELECT message_id FROM surface_approval_cards WHERE action_id = ?1",
+                        [&action_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .unwrap();
+                published.is_some()
+            },
+        )
+        .await;
         published.unwrap()
     };
     eventually("connected", Duration::from_secs(30), || {
@@ -1079,14 +1138,14 @@ async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once
         ))
         .unwrap();
     assert_eq!(socket.ack().await, "env-a1");
-    eventually("approve answered", Duration::from_secs(15), || {
-        ephemerals
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| e["text"] == json!("Approved — sending."))
-    })
-    .await;
+    if !until_call(&signal, answer_within, || answered("Approved — sending.")).await {
+        panic!(
+            "timed out waiting for: approve answered\nephemerals: {:?}\nposts: {:?}\n{}",
+            ephemerals.lock().unwrap(),
+            posts.lock().unwrap(),
+            logs(serve)
+        );
+    }
     assert!(contact_send.matched(), "the contact reply was sent");
     assert!(
         updates
@@ -1109,14 +1168,14 @@ async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once
         ))
         .unwrap();
     assert_eq!(socket.ack().await, "env-a2");
-    eventually("second click answered", Duration::from_secs(15), || {
-        ephemerals
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| e["text"] == json!("Already sent."))
-    })
-    .await;
+    if !until_call(&signal, answer_within, || answered("Already sent.")).await {
+        panic!(
+            "timed out waiting for: second click answered\nephemerals: {:?}\nposts: {:?}\n{}",
+            ephemerals.lock().unwrap(),
+            posts.lock().unwrap(),
+            logs(serve)
+        );
+    }
 
     interrupt(&serve);
     let exit = wait_exit(&mut serve, Duration::from_secs(20));

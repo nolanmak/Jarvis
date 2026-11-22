@@ -34,6 +34,8 @@ fn prioritize_at(
         if turn.is_some_and(|(last, n)| {
             now < last.saturating_add(owner_requalification::cooldown_ms(n))
         }) {
+            // #2373: never drop a candidate silently.
+            tracing::debug!(issue = issue.number, "skip: owner recovery turn is cooling down");
             continue;
         }
         // Existing lease/continuity filters precede this stable sort. Never-tried

@@ -113,6 +113,11 @@ the AWS CLI and explicit `--s3-bucket YOUR_PRIVATE_BUCKET`, optionally with
 the repo. Attachments already exported without S3 are not retroactively uploaded
 by this command; `backfill.py` covers earlier history.
 
+HEIC and HEIF photos (the iPhone default) are uploaded as JPEG copies, because
+the drafting models cannot open HEIC. The conversion uses macOS `sips`; if it
+fails, the original file is uploaded unchanged. Photos uploaded before this
+was added stay HEIC.
+
 ### Setting up the bucket
 
 Attachment upload is opt-in and needs a private bucket plus credentials that can

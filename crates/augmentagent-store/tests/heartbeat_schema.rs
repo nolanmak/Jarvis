@@ -17,11 +17,17 @@ fn migrate_creates_heartbeat_tables_idempotently() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     let first = Store::open(&path).unwrap();
-    assert_eq!(tables(&first), ["heartbeat_lease", "heartbeat_runs"]);
+    assert_eq!(
+        tables(&first),
+        ["heartbeat_items", "heartbeat_lease", "heartbeat_runs"]
+    );
     drop(first);
 
     let reopened = Store::open(&path).unwrap();
-    assert_eq!(tables(&reopened), ["heartbeat_lease", "heartbeat_runs"]);
+    assert_eq!(
+        tables(&reopened),
+        ["heartbeat_items", "heartbeat_lease", "heartbeat_runs"]
+    );
 }
 
 #[test]

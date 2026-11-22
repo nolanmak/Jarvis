@@ -37,7 +37,7 @@ pub(super) fn prepare_card(
 /// unscheduled compose cards (the synthetic
 /// `compose:socialapi:dm:<conversation>` identity, with or without the
 /// per-card suffix) for the action's own conversation. Never the triage card
-/// for an inbound message, and never a card already carrying a send time.
+/// for an inbound message, and never a card already armed with a send time.
 /// Selection and retirement share the predicate so they cannot disagree on
 /// which cards are in scope.
 const COMPOSE_CARD_SCOPE: &str = "FROM actions a JOIN emails e ON e.messageId = a.messageId
@@ -51,7 +51,7 @@ const COMPOSE_CARD_SCOPE: &str = "FROM actions a JOIN emails e ON e.messageId = 
 ///
 /// #2350 — cards composed inside one millisecond share `createdAt`, so the
 /// tie-break is insertion order (`rowid`); the action id is a random UUID and
-/// would order them arbitrarily.
+/// ordering by it shuffled them.
 pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
     Ok(store.with_conn(|conn| {
         let mut statement = conn.prepare(&format!(

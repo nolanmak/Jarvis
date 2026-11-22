@@ -135,7 +135,14 @@ impl FreshIssueControls {
             let Some(context)=store.recovery_context(&id,&snapshot.checkpoint.binding)? else {return Ok(())};
             anyhow::ensure!(context.workflow==id && context.repository.eq_ignore_ascii_case(repository)
                 && context.binding==snapshot.checkpoint.binding,"selection checkout context differs");
-            checkout_identity::check_recorded(&self.state,&id,&context.worktree,repository,&snapshot.branch)
+            let Err(error)=checkout_identity::check_recorded(&self.state,&id,&context.worktree,repository,&snapshot.branch) else {return Ok(())};
+            // #2349 — scope-stage work whose recorded checkout path is gone is
+            // selectable; productive preparation re-establishes continuity.
+            if checkout_continuity::selectable(store,&self.state,&id,repository,&error) {
+                info!(issue,reason=%error,"checkout continuity lost on scope-stage work; select to re-establish from current main");
+                return Ok(());
+            }
+            Err(error)
         })().map_err(classify_issue_history_error)
     }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
@@ -1001,6 +1008,8 @@ impl WorkflowGuard {
         Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
     async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
+        // #2354: never claim the next workflow with a deploy pending.
+        crate::autoship_worker::safe_point().await;
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -2078,6 +2087,10 @@ impl WorkflowGuard {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
     }
+    /// #2373: audited, once per key. True when this call recorded it.
+    pub(super) fn record_reviewer_fallback(&self,key:&str,payload:&serde_json::Value)->Result<bool> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_reviewer_fallback(&self.lease,&self.binding,key,payload,millis())
+    }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
     }
@@ -2315,7 +2328,14 @@ impl WorkflowGuard {
             .checkpoint
             .evidence;
         self.checkpoint(stage, reason, action, eligible_at_ms, &evidence)
-            .await
+            .await?;
+        // #2354: the checkpoint is durable and the next step is not yet
+        // claimed, so a pending deploy may restart the worker here. Waiting
+        // and terminal stages end their tick normally instead.
+        if !matches!(stage,Stage::Merged|Stage::Retired|Stage::Held|Stage::AwaitChecks) {
+            crate::autoship_worker::safe_point().await;
+        }
+        Ok(())
     }
 
     /// Publish detached resumed work with a remote-head precondition. A lost
@@ -3312,6 +3332,45 @@ mod tests {
             logger.model_call_admitted("claude").is_err(),
             "released workflow cannot admit unaccounted spend"
         );
+    }
+
+    /// #2354: a productive stage transition is a restart-safe point. With a
+    /// deploy pending, the checkpoint is durably written first and only then
+    /// does the tick park, before the next step starts. Waiting and terminal
+    /// transitions finish their tick normally.
+    #[tokio::test]
+    async fn a_productive_transition_parks_for_a_deploy_after_its_checkpoint() {
+        let dir = repo();
+        // A canonical (non-symlinked) private directory, so the fixture also
+        // runs where /tmp is a symlink.
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let points = crate::autoship_worker::SafePoints::new(
+            Arc::new(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp)),
+            tokio_util::sync::CancellationToken::new());
+        let start = || Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(7), pr: None, branch: "fix/seven", contract: "C1", environment: "rust-a",
+        };
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis()).await.unwrap().unwrap();
+        let id = guard.id().to_owned();
+        points.scope(guard.transition(Stage::Build, "scoped", "build", 0)).await
+            .expect("no deploy pending: the transition completes");
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        points.scope(guard.transition(Stage::Held, "provider_capacity", "retry", 0)).await
+            .expect("a waiting transition ends its tick normally");
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(2),
+            points.scope(guard.transition(Stage::Review, "candidate_verified", "review", 0))).await;
+        assert!(parked.is_err(), "a productive transition with a deploy pending must park the tick");
+        tokio::time::timeout(std::time::Duration::from_secs(1), points.parked()).await
+            .expect("the worker is told the tick parked");
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage, Stage::Review,
+            "the checkpoint is durable before the tick parks");
     }
 
     #[tokio::test]
@@ -4624,7 +4683,8 @@ mod initial_acceptance_hold_tests {
                 let mut planning_claims = 0;
                 for offset in [1000,86_400_000,2*86_400_000] {
                     let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
-                    if reason=="acceptance_verifier_repair_exhausted" && pr.is_none() {
+                    // #2370: a declined amendment enters the same ladder.
+                    if matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined") && pr.is_none() {
                         let planning=next.expect("unpublished exhausted hold did not admit planning");
                         // A lease is an attempt even when no model work is done.
                         // Recovery must retain all paid work and the exhausted

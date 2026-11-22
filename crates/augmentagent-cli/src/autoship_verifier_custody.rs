@@ -160,13 +160,14 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
         let old:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if let Some(old)=old {ensure!(old==body,"verifier evidence is immutable");}
+        if let Some(old)=old {ensure!(old==body,"verifier evidence is immutable");super::reindex_after_cutover(&tx,lease,key,now)?;}
         else {
             tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,body])?;
             event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
         }
         let hash=format!("{:x}",Sha256::digest(body.as_bytes()));
-        let indexed:Option<String>=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![lease.workflow,key,kind],|r|r.get(0)).optional()?;
+        let cutover=owner_checkout_recovery::cutover_seq(&tx,&lease.workflow)?;
+        let indexed:Option<String>=tx.query_row("SELECT json_extract(payload,'$.sha256') FROM workflow_event WHERE workflow=?1 AND seq>?4 AND kind='verifier_evidence_recorded' AND json_extract(payload,'$.key')=?2 AND json_extract(payload,'$.kind')=?3 ORDER BY seq DESC LIMIT 1",params![lease.workflow,key,kind,cutover],|r|r.get(0)).optional()?;
         if let Some(indexed)=indexed {ensure!(indexed==hash,"verifier evidence history changed");}
         else {event(&tx,&lease.workflow,lease.generation,"verifier_evidence_recorded",&serde_json::json!({"key":key,"kind":kind,"sha256":hash}).to_string(),now)?;}
         tx.commit()?;Ok(())

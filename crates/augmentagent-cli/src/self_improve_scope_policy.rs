@@ -9,10 +9,16 @@ pub(super) async fn migrate(root:&Path,dry_run:bool)->Result<usize> {
     let mut store=WorkflowStore::open(&state)?;
     let count=store.migrate_scope_policy(&repository,chrono::Utc::now().timestamp_millis())?;
     if count>0 {info!(count,"reconsidered legacy scope holds under safe-default policy without model calls");}
-    // #2317: holds parked before #2301's never-give-up ladder enter it once.
+    // #2317/#2370: repair-exhausted and declined-amendment holds enter the ladder once.
     let ladder=store.migrate_repair_exhausted_to_ladder(&repository,chrono::Utc::now().timestamp_millis())?;
-    if ladder>0 {info!(count=ladder,"moved legacy repair-exhausted holds into the acceptance strategy ladder without model calls");}
-    Ok(count+ladder)
+    if ladder>0 {info!(count=ladder,"moved repair-exhausted and declined-amendment holds into the acceptance strategy ladder without model calls");}
+    // #2356: the last two terminal parks never wait on a human.
+    let readiness=store.migrate_readiness_invalid_to_ladder(&repository,chrono::Utc::now().timestamp_millis())?;
+    if readiness>0 {info!(count=readiness,"moved invalid-readiness holds into the readiness retry ladder without model calls");}
+    let unrecoverable=store.reverify_unrecoverable_original_evidence(&repository,chrono::Utc::now().timestamp_millis(),
+        |worktree|worktree.try_exists().unwrap_or(false))?;
+    if unrecoverable>0 {info!(count=unrecoverable,"original verifier evidence unrecoverable; re-verifying from scratch under current policy");}
+    Ok(count+ladder+readiness+unrecoverable)
 }
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
@@ -26,7 +32,8 @@ pub(super) fn retries(state: &Path, repository: &str) -> Result<std::collections
         return Ok(Default::default());
     };
     let mut retries=store.scope_policy_retries(repository)?;
-    retries.extend(store.acceptance_escalation_retries(repository)?);Ok(retries)
+    retries.extend(store.acceptance_escalation_retries(repository)?);
+    retries.extend(store.terminal_park_retries(repository,chrono::Utc::now().timestamp_millis())?);Ok(retries)
 }
 pub(super) async fn readiness_blocked(
     root: &Path,

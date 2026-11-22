@@ -218,7 +218,16 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
         Ok(true)=>return Ok(()),
         Ok(false)=>{},
         Err(error) if retained.is_some()=>return Err(error),
-        Err(_)=>warn!("retained source unavailable; existing original-verifier recovery authority remains required"),
+        Err(_)=>{
+            // #2356: without retained history or a replayable original plan,
+            // the original can never be recovered. Stop waiting: audit the
+            // loss and re-verify from scratch under current policy.
+            if store.mark_original_evidence_unrecoverable(&snapshot,"retained_source_unavailable",chrono::Utc::now().timestamp_millis())? {
+                warn!(workflow=%snapshot.workflow,"retained source unavailable; original evidence unrecoverable, re-verifying from scratch");
+                return Ok(());
+            }
+            warn!("retained source unavailable; replaying the retained original-verifier plan");
+        },
     }
     if !exact_inputs {return Ok(());}
     drop(store);

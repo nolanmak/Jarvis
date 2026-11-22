@@ -15,6 +15,8 @@ fn target(cp: &Checkpoint) -> bool {
         && (matches!(
             cp.next.reason.as_str(),
             "acceptance_verifier_repair_exhausted"
+                // #2370: a declined amendment is a planning failure too.
+                | "acceptance_verifier_amendment_declined"
                 | "acceptance_contract_invalid"
                 | "acceptance_failed"
                 // #2289: the old terminal summary state is never permanent.
@@ -100,16 +102,49 @@ fn start_material(tx: &Connection, id: &str, cp: &Checkpoint) -> Result<Material
 
 /// #2317 one-time audit tag for holds parked before #2301.
 pub(crate) const LADDER_MIGRATION: &str = "repair-exhausted-ladder-v1";
+/// #2370 one-time audit tag for declined-amendment holds.
+pub(crate) const AMENDMENT_LADDER_MIGRATION: &str = "amendment-declined-ladder-v1";
 /// Bounded per sweep, like #2274's scope-policy migration.
 const LADDER_MIGRATION_BATCH: usize = 8;
 
 impl WorkflowStore {
+    /// #2373: the acceptance ladder proceeded without one or more reviewers
+    /// (never configured, or latched past the bounded wait). Audited once per
+    /// key so a retried rung cannot duplicate it. True when newly recorded.
+    pub(crate) fn record_reviewer_fallback(
+        &mut self,
+        lease: &Lease,
+        binding: &Binding,
+        key: &str,
+        payload: &serde_json::Value,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(key.len() == 64, "invalid reviewer fallback key");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx, lease, binding, now)?;
+        let seen: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='reviewer_fallback'
+             AND json_valid(payload) AND json_extract(payload,'$.key')=?2)",
+            params![lease.workflow, key],
+            |r| r.get(0),
+        )?;
+        if !seen {
+            let mut payload = payload.clone();
+            payload["key"] = key.into();
+            event(&tx, &lease.workflow, lease.generation, "reviewer_fallback", &payload.to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(!seen)
+    }
     /// Free worker maintenance (#2317). A repair-exhausted hold parked before
     /// #2301 still waits on `await_acceptance_input_change`, which nothing will
     /// ever supply. Enter it into the never-give-up ladder at cycle 0 with an
     /// audit event holding the complete prior checkpoint. Binding, evidence,
     /// generation, attempts, spend, owner control and leases are untouched;
-    /// this grants planning eligibility only, never acceptance.
+    /// this grants planning eligibility only, never acceptance. #2370: a
+    /// declined-amendment hold is the same terminal park and migrates too.
     pub(crate) fn migrate_repair_exhausted_to_ladder(
         &mut self,
         repository: &str,
@@ -124,7 +159,7 @@ impl WorkflowStore {
                 "SELECT id,checkpoint,generation FROM workflow WHERE pr IS NULL AND lease_until<=?1
                  AND substr(id,1,length(?2))=?2 AND json_valid(checkpoint)
                  AND json_extract(checkpoint,'$.stage')='scope'
-                 AND json_extract(checkpoint,'$.next.reason')='acceptance_verifier_repair_exhausted'
+                 AND json_extract(checkpoint,'$.next.reason') IN ('acceptance_verifier_repair_exhausted','acceptance_verifier_amendment_declined')
                  AND json_extract(checkpoint,'$.next.action')='await_acceptance_input_change'
                  ORDER BY heartbeat_at,id LIMIT 64",
             )?
@@ -149,7 +184,12 @@ impl WorkflowStore {
                     continue;
                 }
             };
-            let audit = serde_json::json!({"version":1,"migration":LADDER_MIGRATION,
+            let migration = if cp.next.reason == "acceptance_verifier_amendment_declined" {
+                AMENDMENT_LADDER_MIGRATION
+            } else {
+                LADDER_MIGRATION
+            };
+            let audit = serde_json::json!({"version":1,"migration":migration,
                 "prior_checkpoint":serde_json::to_string(&cp)?,"original_evidence":"preserved"});
             event(&tx, &id, generation, "acceptance_ladder_migrated", &audit.to_string(), now)?;
             event(
@@ -602,6 +642,61 @@ mod tests {
             .filter(|(_, kind, _, _)| kind == "acceptance_strategy_started")
             .count();
         assert_eq!(started, 1, "claim restarted the strategy instead of resuming it");
+    }
+    #[test]
+    fn declined_verifier_amendment_enters_the_strategy_ladder_not_an_issue_edit_park() {
+        // #2370 (nolanmak/jarvis#2361): a declined amendment parked forever on
+        // await_acceptance_input_change. It is a planning failure like
+        // repair exhaustion and must enter #2301's ladder on the next claim.
+        let (_dir, mut store, id, binding) = held("acceptance_verifier_amendment_declined");
+        let before = store.snapshot(&id).unwrap().unwrap();
+        assert!(store.acceptance_escalation_pending(&id).unwrap(), "declined amendment is not ladder-eligible");
+        assert!(store.acceptance_escalation_retries("owner/repo").unwrap().contains(&1766));
+        let lease = store
+            .claim_productive_for_binding(&id, "ladder", 5, 100, &binding)
+            .unwrap()
+            .expect("declined amendment still waits for a human issue edit");
+        let material = store
+            .begin_acceptance_escalation(&lease, &binding, 6)
+            .unwrap()
+            .expect("declined amendment did not start a strategy cycle");
+        assert_eq!(material.original, before.checkpoint);
+        let after = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        assert_eq!((after.next.reason.as_str(), after.next.action.as_str()), ("acceptance_strategy_escalation", ACTION));
+        assert_eq!((after.binding, after.evidence), (before.checkpoint.binding, before.checkpoint.evidence));
+    }
+    #[test]
+    fn existing_declined_amendment_rows_migrate_once_into_the_ladder_with_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id = "owner/repo#2361".to_string();
+        let binding = park(&mut store, &id, "acceptance_verifier_amendment_declined", 1);
+        let paused = "owner/repo#2362".to_string();
+        park(&mut store, &paused, "acceptance_verifier_amendment_declined", 1);
+        let control = store.owner_control(&paused).unwrap().map_or(0, |c| c.revision);
+        store.set_owner_pause(&paused, "owner", control, true, 5).unwrap();
+        let held_before = (store.snapshot(&paused).unwrap().unwrap(), store.events(&paused).unwrap());
+        let before = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("owner/repo", 50).unwrap(), 1);
+        let after = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()), ("acceptance_strategy_escalation", ACTION));
+        assert!(!awaits_initial_input(&after.checkpoint));
+        assert_eq!((after.generation, after.attempts, after.model_calls), (before.generation, before.attempts, before.model_calls));
+        let audit = store.events(&id).unwrap().into_iter()
+            .find(|(_, kind, _, _)| kind == "acceptance_ladder_migrated")
+            .expect("migration must leave an audit event");
+        let audit: serde_json::Value = serde_json::from_str(&audit.2).unwrap();
+        assert_eq!(audit["migration"], AMENDMENT_LADDER_MIGRATION);
+        let prior: Checkpoint = serde_json::from_str(audit["prior_checkpoint"].as_str().unwrap()).unwrap();
+        assert_eq!(prior, before.checkpoint, "audit lost the original hold");
+        // The owner's explicit pause is legitimate and stays untouched.
+        assert_eq!((store.snapshot(&paused).unwrap().unwrap(), store.events(&paused).unwrap()), held_before);
+        let settled = store.events(&id).unwrap();
+        assert_eq!(store.migrate_repair_exhausted_to_ladder("owner/repo", 60).unwrap(), 0);
+        assert_eq!(store.events(&id).unwrap(), settled);
+        let lease = store.claim_productive_for_binding(&id, "ladder", 70, 100, &binding).unwrap().unwrap();
+        let material = store.begin_acceptance_escalation(&lease, &binding, 71).unwrap().unwrap();
+        assert_eq!(material.original, before.checkpoint);
     }
     #[test]
     fn ladder_migration_leaves_leased_and_published_rows_alone() {
