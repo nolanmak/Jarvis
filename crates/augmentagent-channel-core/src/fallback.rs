@@ -171,11 +171,8 @@ pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
     match crate::model_router::current() {
         Err(_) => Some("invalid model router configuration".into()),
         Ok(Some(config)) if config.enabled() => {
-            if config.allows(kind) {
-                gateway_ineligible_reason(kind)
-            } else {
-                Some("excluded by selected model route".into())
-            }
+            if config.allows(kind) { gateway_ineligible_reason(kind) }
+            else { Some("excluded by selected model route".into()) }
         }
         _ => native_ineligible_reason(kind),
     }
@@ -215,53 +212,32 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
             }
             None
         }
-        ProviderKind::Qwen | ProviderKind::Glm => {
-            Some("Runpod profile requires a configured model gateway".into())
-        }
+        ProviderKind::Qwen | ProviderKind::Glm => Some("Runpod profile requires a configured model gateway".into()),
         // Never a chain member or an independent reviewer.
         ProviderKind::Yolo => Some("yolo runs only in yolo threads".into()),
     }
 }
 
 /// Native reviewer eligibility inside an explicitly required workflow only.
-pub fn workflow_native_ineligible_reason(kind: ProviderKind) -> Option<String> {
-    if !matches!(kind, ProviderKind::Codex | ProviderKind::Claude) {
-        return Some("provider has no declared native VM identity".into());
-    }
-    if let Some(reason) = gateway_ineligible_reason(kind) {
-        return Some(reason);
-    }
-    let report = crate::native_vm::readiness::credentials(kind.name());
-    if !report.permits_attempt() {
-        return Some(format!(
-            "native-provider:{}:{}",
-            kind.name(),
-            report.reason()
-        ));
-    }
-    let runtime = crate::native_vm::readiness::runtime::provider_runtime(kind.name());
-    (runtime.status != "executable-compatible")
-        .then(|| format!("native-provider:{}:{}", kind.name(), runtime.status))
+pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
+    if !matches!(kind,ProviderKind::Codex|ProviderKind::Claude) {return Some("provider has no declared native VM identity".into());}
+    if let Some(reason)=gateway_ineligible_reason(kind){return Some(reason);}
+    let report=crate::native_vm::readiness::credentials(kind.name());
+    if !report.permits_attempt() {return Some(format!("native-provider:{}:{}",kind.name(),report.reason()));}
+    let runtime=crate::native_vm::readiness::runtime::provider_runtime(kind.name());
+    (runtime.status!="executable-compatible").then(||format!("native-provider:{}:{}",kind.name(),runtime.status))
 }
 fn workflow_route_auth(kind: ProviderKind, routed: bool) -> bool {
-    let auth = if routed {
-        crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false)
-    } else {
-        crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false)
-    };
-    auth && crate::native_vm::readiness::runtime::provider_runtime(kind.name()).status
-        == "executable-compatible"
+    let auth=if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
+        else { crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false) };
+    auth && crate::native_vm::readiness::runtime::provider_runtime(kind.name()).status=="executable-compatible"
 }
 
-fn workflow_entry_for(kind: ProviderKind) -> Option<Entry> {
-    workflow_native_ineligible_reason(kind)
-        .is_none()
-        .then(|| unchecked_entry(kind))
+fn workflow_entry_for(kind:ProviderKind)->Option<Entry> {
+    workflow_native_ineligible_reason(kind).is_none().then(||unchecked_entry(kind))
 }
-fn workflow_gateway_entry_for(kind: ProviderKind) -> Option<Entry> {
-    (gateway_ineligible_reason(kind).is_none()
-        && crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false))
-    .then(|| unchecked_entry(kind))
+fn workflow_gateway_entry_for(kind:ProviderKind)->Option<Entry> {
+    (gateway_ineligible_reason(kind).is_none() && crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false)).then(||unchecked_entry(kind))
 }
 
 /// Construct the entry for one provider, or `None` when it is not eligible.
@@ -275,9 +251,7 @@ fn entry_for(kind: ProviderKind) -> Option<Entry> {
 
 /// Gateway credentials authenticate inference; only the local CLI is required.
 fn gateway_entry_for(kind: ProviderKind) -> Option<Entry> {
-    gateway_ineligible_reason(kind)
-        .is_none()
-        .then(|| unchecked_entry(kind))
+    gateway_ineligible_reason(kind).is_none().then(|| unchecked_entry(kind))
 }
 
 fn gateway_ineligible_reason(kind: ProviderKind) -> Option<String> {
@@ -293,9 +267,7 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
     let reasoner: Arc<dyn Reasoner> = match kind {
         ProviderKind::Claude => Arc::new(ClaudeCliReasoner::new()),
         ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
-        ProviderKind::Qwen | ProviderKind::Glm => {
-            Arc::new(crate::codex::CodexCliReasoner::runpod(kind))
-        }
+        ProviderKind::Qwen | ProviderKind::Glm => Arc::new(crate::codex::CodexCliReasoner::runpod(kind)),
         ProviderKind::Gemini => Arc::new(crate::gemini::GeminiCliReasoner::new()),
         ProviderKind::Yolo => Arc::new(crate::codex::CodexCliReasoner::yolo()),
         // Thin chat-completions client (#663 plan B — codex ≥0.148 removed
@@ -310,39 +282,19 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
 /// Eligibility is checked once per construction: a fallback CLI that is not
 /// installed (or has no resolvable auth) is dropped from the chain with one
 /// log line instead of erroring on every call.
-pub fn build_reasoner() -> Arc<FallbackReasoner> {
-    build_reasoner_inner(false)
-}
-pub fn build_workflow_reasoner() -> Arc<FallbackReasoner> {
-    build_reasoner_inner(true)
-}
-fn build_reasoner_inner(workflow: bool) -> Arc<FallbackReasoner> {
-    let entry_for = if workflow {
-        workflow_entry_for
-    } else {
-        entry_for
-    };
-    let gateway_entry_for = if workflow {
-        workflow_gateway_entry_for
-    } else {
-        gateway_entry_for
-    };
+pub fn build_reasoner() -> Arc<FallbackReasoner> { build_reasoner_inner(false) }
+pub fn build_workflow_reasoner()->Arc<FallbackReasoner> {build_reasoner_inner(true)}
+fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
+    let entry_for=if workflow {workflow_entry_for} else {entry_for};
+    let gateway_entry_for=if workflow {workflow_gateway_entry_for} else {gateway_entry_for};
     let mut entries: Vec<Entry> = chain_from_env().into_iter().filter_map(entry_for).collect();
     let mut gateway_only = Vec::new();
     // Pre-register gateway adapters while configured, even in direct mode,
     // so the dashboard can enable routing without restarting the daemon.
     if crate::model_router::load().ok().flatten().is_some() {
-        for kind in [
-            ProviderKind::Claude,
-            ProviderKind::Codex,
-            ProviderKind::Qwen,
-            ProviderKind::Glm,
-        ] {
+        for kind in [ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
             if !entries.iter().any(|e| e.kind == kind) {
-                if let Some(entry) = gateway_entry_for(kind) {
-                    gateway_only.push(kind);
-                    entries.push(entry);
-                }
+                if let Some(entry) = gateway_entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
             }
         }
     } else {
@@ -400,60 +352,40 @@ fn build_reasoner_inner(workflow: bool) -> Arc<FallbackReasoner> {
 /// Deliberately returns `None` rather than falling back: a caller that
 /// cannot get the provider it asked for must be able to tell, and must fail
 /// closed. There is no chain here, so failover cannot silently occur either.
-pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    build_pinned_inner(kind, false)
-}
-pub fn build_workflow_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    build_pinned_inner(kind, true)
-}
+pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> { build_pinned_inner(kind,false) }
+pub fn build_workflow_pinned(kind:ProviderKind)->Option<Arc<FallbackReasoner>> {build_pinned_inner(kind,true)}
 /// An explicit workflow builder selection is immutable for this instance. It
 /// overrides the interactive selection only during its own calls; independently
 /// constructed reviewers and adjudicators retain their separate selection.
 pub fn build_workflow_builder(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    if !matches!(kind, ProviderKind::Claude | ProviderKind::Codex) {
-        return None;
-    }
+    if !matches!(kind, ProviderKind::Claude | ProviderKind::Codex) { return None; }
     let mut builder = build_pinned_inner(kind, true)?;
     Arc::get_mut(&mut builder)?.builder_pin = Some(kind);
     Some(builder)
 }
 
-fn build_pinned_inner(kind: ProviderKind, workflow: bool) -> Option<Arc<FallbackReasoner>> {
-    let native = if workflow {
-        workflow_entry_for(kind)
-    } else {
-        entry_for(kind)
-    };
-    let gateway_only = if native.is_none() {
-        vec![kind]
-    } else {
-        Vec::new()
-    };
-    native
-        .or_else(|| {
-            if workflow {
-                return None;
-            }
-            let config = crate::model_router::load().ok().flatten()?;
-            (config.enabled() && config.allows(kind))
-                .then(|| gateway_entry_for(kind))
-                .flatten()
+fn build_pinned_inner(kind:ProviderKind,workflow:bool)->Option<Arc<FallbackReasoner>> {
+    let native = if workflow {workflow_entry_for(kind)} else {entry_for(kind)};
+    let gateway_only = if native.is_none() { vec![kind] } else { Vec::new() };
+    native.or_else(|| {
+        if workflow {return None;}
+        let config = crate::model_router::load().ok().flatten()?;
+        (config.enabled() && config.allows(kind)).then(|| gateway_entry_for(kind)).flatten()
+    }).map(|entry| {
+        Arc::new(FallbackReasoner {
+            entries: vec![entry],
+            profile_enabled: crate::model_selection::runtime_profile_enabled,
+        builder_pin: None,
+            gateway_only,
+            latch: CooldownLatch::system(),
+            usage: std::sync::Mutex::new(Vec::new()),
+            mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: workflow,
+            workflow_audit: std::sync::Mutex::new(None),
+            review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
+            handoff_root: crate::handoff::system_root(),
         })
-        .map(|entry| {
-            Arc::new(FallbackReasoner {
-                entries: vec![entry],
-                profile_enabled: crate::model_selection::runtime_profile_enabled,
-                builder_pin: None,
-                gateway_only,
-                latch: CooldownLatch::system(),
-                usage: std::sync::Mutex::new(Vec::new()),
-                mutation_providers: std::sync::Mutex::new(Vec::new()),
-                workflow_native_only: workflow,
-                workflow_audit: std::sync::Mutex::new(None),
-                review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
-                handoff_root: crate::handoff::system_root(),
-            })
-        })
+    })
 }
 
 /// #1030 — whether the chain can serve a capability class, and if not, which
@@ -471,9 +403,7 @@ pub enum LaneAvailability {
 }
 
 impl FallbackReasoner {
-    pub fn builder_provider_pin(&self) -> Option<ProviderKind> {
-        self.builder_pin
-    }
+    pub fn builder_provider_pin(&self) -> Option<ProviderKind> { self.builder_pin }
 
     fn selected_profile(&self) -> anyhow::Result<Option<ProviderKind>> {
         Ok(self.builder_pin.or(crate::model_selection::current()?))
@@ -485,7 +415,7 @@ impl FallbackReasoner {
         FallbackReasoner {
             gateway_only: Vec::new(),
             profile_enabled: crate::model_selection::runtime_profile_enabled,
-            builder_pin: None,
+        builder_pin: None,
             entries: vec![Entry {
                 kind: ProviderKind::Claude,
                 reasoner: Arc::new(ClaudeCliReasoner::new()),
@@ -501,7 +431,10 @@ impl FallbackReasoner {
     }
 
     /// Test constructor: explicit (kind, reasoner) chain + latch path.
-    pub fn for_tests(chain: Vec<(ProviderKind, Arc<dyn Reasoner>)>, latch: CooldownLatch) -> Self {
+    pub fn for_tests(
+        chain: Vec<(ProviderKind, Arc<dyn Reasoner>)>,
+        latch: CooldownLatch,
+    ) -> Self {
         FallbackReasoner {
             gateway_only: Vec::new(),
             profile_enabled: |_| true,
@@ -529,75 +462,42 @@ impl FallbackReasoner {
     /// eligible at all is a CONFIGURATION fault — a chain that cannot serve
     /// this preset will never serve it, and reporting that as a pause masks a
     /// deployment problem as a normal wait.
-    pub fn lane_availability(&self, class: crate::providers::CapabilityClass) -> LaneAvailability {
+    pub fn lane_availability(
+        &self,
+        class: crate::providers::CapabilityClass,
+    ) -> LaneAvailability {
         let providers = self.lane_provider_availability(class);
         if providers.iter().any(|(_, until)| until.is_none()) {
             LaneAvailability::Available
         } else if providers.is_empty() {
             LaneAvailability::NoEligibleProvider
         } else {
-            LaneAvailability::AllLatched(
-                providers
-                    .into_iter()
-                    .map(|(kind, until)| (kind.name().to_string(), until))
-                    .collect(),
-            )
+            LaneAvailability::AllLatched(providers.into_iter().map(|(kind, until)| (kind.name().to_string(), until)).collect())
         }
     }
 
     /// Same routing, capability and credential admission as lane availability,
     /// with identities retained for read-only workflow role checks.
-    pub fn lane_provider_availability(
-        &self,
-        class: crate::providers::CapabilityClass,
-    ) -> Vec<(ProviderKind, Option<chrono::DateTime<chrono::Utc>>)> {
-        let Ok(selected) = self.selected_profile() else {
-            return vec![];
-        };
-        let Ok(config) = crate::model_router::current() else {
-            return vec![];
-        };
-        let required = self.workflow_native_only
-            || self
-                .workflow_audit
-                .lock()
-                .ok()
-                .and_then(|logger| logger.clone())
-                .is_some_and(|logger| logger.run_resources_required());
-        let Ok(routing) =
-            crate::model_router::select_profile_for_workflow(config, selected, required)
-        else {
-            return vec![];
-        };
+    pub fn lane_provider_availability(&self, class: crate::providers::CapabilityClass)
+        -> Vec<(ProviderKind, Option<chrono::DateTime<chrono::Utc>>)> {
+        let Ok(selected) = self.selected_profile() else { return vec![]; };
+        let Ok(config) = crate::model_router::current() else { return vec![]; };
+        let required=self.workflow_native_only || self.workflow_audit.lock().ok().and_then(|logger|logger.clone()).is_some_and(|logger|logger.run_resources_required());
+        let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return vec![]; };
         let mut providers = Vec::new();
         for entry in &self.entries {
-            if selected.is_some_and(|profile| entry.kind != profile) {
-                continue;
-            }
-            if !(self.profile_enabled)(entry.kind) {
-                continue;
-            }
+            if selected.is_some_and(|profile| entry.kind != profile) { continue; }
+            if !(self.profile_enabled)(entry.kind) { continue; }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
-                || (selected.is_none()
-                    && !routing.as_ref().is_some_and(|r| r.enabled())
-                    && self.gateway_only.contains(&entry.kind))
-            {
+                || (selected.is_none() && !routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
                 continue;
             }
-            if required
-                && (self.workflow_native_only || entry.reasoner.defers_model_admission())
-                && !workflow_route_auth(entry.kind, routing.as_ref().is_some_and(|r| r.enabled()))
-            {
+            if required && (self.workflow_native_only || entry.reasoner.defers_model_admission())
+                && !workflow_route_auth(entry.kind, routing.as_ref().is_some_and(|r| r.enabled())) {
                 continue;
             }
-            if !allowed_for(entry.kind, class) {
-                continue;
-            }
-            let until = if routing.as_ref().is_some_and(|r| r.enabled()) {
-                None
-            } else {
-                self.latch.latched_until(entry.kind.name())
-            };
+            if !allowed_for(entry.kind, class) { continue; }
+            let until = if routing.as_ref().is_some_and(|r| r.enabled()) { None } else { self.latch.latched_until(entry.kind.name()) };
             providers.push((entry.kind, until));
         }
         providers
@@ -615,39 +515,18 @@ impl FallbackReasoner {
     /// builders only, because it builds from `main`; the branch record keeps
     /// every earlier author as well until [`Self::supersede_review_history`]
     /// says the attempt's push replaced the branch.
-    pub fn track_review_history(
-        &self,
-        repository: &std::path::Path,
-        branch: &str,
-        resuming: bool,
-    ) -> anyhow::Result<()> {
-        let mut bound = self
-            .review_history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(
-            !bound.admitted,
-            "review history must be bound before reasoning starts"
-        );
+    pub fn track_review_history(&self, repository: &std::path::Path, branch: &str, resuming: bool) -> anyhow::Result<()> {
+        let mut bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!bound.admitted, "review history must be bound before reasoning starts");
         anyhow::ensure!(bound.path.is_none(), "review history already bound");
-        let root = self
-            .handoff_root
-            .as_ref()
-            .and_then(|p| p.parent())
-            .ok_or_else(|| anyhow::anyhow!("private review history storage unavailable"))?
-            .join("review-history");
+        let root = self.handoff_root.as_ref().and_then(|p| p.parent())
+            .ok_or_else(|| anyhow::anyhow!("private review history storage unavailable"))?.join("review-history");
         let repository = repository.canonicalize()?;
         let repository = repository.to_string_lossy();
         if resuming {
-            bound.path = Some(crate::review_history::initialize(
-                &root,
-                &repository,
-                branch,
-                true,
-            )?);
+            bound.path = Some(crate::review_history::initialize(&root, &repository, branch, true)?);
         } else {
-            let (branch_record, attempt) =
-                crate::review_history::begin_attempt(&root, &repository, branch)?;
+            let (branch_record, attempt) = crate::review_history::begin_attempt(&root, &repository, branch)?;
             bound.path = Some(attempt);
             bound.branch = Some(branch_record);
         }
@@ -663,10 +542,7 @@ impl FallbackReasoner {
     /// this; a resumed draft appends to the branch it found and never replaces
     /// its authors.
     pub fn supersede_review_history(&self) -> anyhow::Result<()> {
-        let mut bound = self
-            .review_history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
         let (Some(attempt), Some(branch)) = (bound.path.clone(), bound.branch.clone()) else {
             anyhow::bail!("only a fresh attempt's review history can supersede a branch");
         };
@@ -678,12 +554,7 @@ impl FallbackReasoner {
 
     /// `None` means unknown provenance, not an empty list of authors.
     pub fn review_authors(&self) -> anyhow::Result<Option<Vec<ProviderKind>>> {
-        let path = self
-            .review_history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .path
-            .clone();
+        let path = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).path.clone();
         match path {
             Some(path) => crate::review_history::authors(&path),
             None => Ok(None),
@@ -692,14 +563,8 @@ impl FallbackReasoner {
 
     /// Revise an existing draft without recruiting its independent reviewer
     /// into the builder role. Unknown provenance cannot authorize revisions.
-    pub async fn call_revision(
-        &self,
-        opts: &ReasonerOpts,
-        message: &str,
-    ) -> anyhow::Result<String> {
-        let authors = self
-            .review_authors()?
-            .filter(|authors| !authors.is_empty())
+    pub async fn call_revision(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+        let authors = self.review_authors()?.filter(|authors| !authors.is_empty())
             .ok_or_else(|| anyhow::anyhow!("revision requires known builder provenance"))?;
         self.dispatch(opts, message, false, Some(&authors)).await
     }
@@ -710,10 +575,7 @@ impl FallbackReasoner {
     /// selection must exclude every such provider, not just the final one.
     /// Callers resuming a draft must also load its persisted authorship.
     pub fn mutation_providers(&self) -> Vec<ProviderKind> {
-        self.mutation_providers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// One more call dispatched to `name` (before the provider runs).
@@ -756,26 +618,16 @@ impl FallbackReasoner {
 
     /// Harness-owned workflow sink overrides global preset logging without
     /// changing which provider actually serves or is attributed to the call.
-    pub fn set_workflow_audit(
-        &self,
-        logger: std::sync::Arc<crate::tool_audit::AuditLogger>,
-    ) -> anyhow::Result<()> {
+    pub fn set_workflow_audit(&self, logger: std::sync::Arc<crate::tool_audit::AuditLogger>) -> anyhow::Result<()> {
         logger.protected_health()?;
-        *self
-            .workflow_audit
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))? = Some(logger);
+        *self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))? = Some(logger);
         Ok(())
     }
 
-    pub fn uses_isolated_command_storage(&self, opts: &ReasonerOpts) -> anyhow::Result<bool> {
-        let mut effective = opts.clone();
-        effective.audit_logger = self
-            .workflow_audit
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?
-            .clone()
-            .or_else(|| opts.audit_logger.clone());
+    pub fn uses_isolated_command_storage(&self,opts:&ReasonerOpts)->anyhow::Result<bool> {
+        let mut effective=opts.clone();
+        effective.audit_logger=self.workflow_audit.lock().map_err(|_|anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
+            .or_else(||opts.audit_logger.clone());
         Ok(crate::codex_tools::isolated_command_storage(&effective))
     }
 
@@ -786,11 +638,7 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
-        let logger = self
-            .workflow_audit
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?
-            .clone()
+        let logger = self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
             .or_else(|| opts.audit_logger.clone());
         let mut effective_opts = opts.clone();
         if let Some(logger) = &logger {
@@ -798,14 +646,8 @@ impl FallbackReasoner {
             effective_opts.audit_logger = Some(logger.clone());
         }
         let opts = &effective_opts;
-        let required = opts
-            .audit_logger
-            .as_ref()
-            .is_some_and(|logger| logger.run_resources_required());
-        anyhow::ensure!(
-            !self.workflow_native_only || required,
-            "workflow-native reasoner requires protected workflow policy"
-        );
+        let required=opts.audit_logger.as_ref().is_some_and(|logger|logger.run_resources_required());
+        anyhow::ensure!(!self.workflow_native_only || required,"workflow-native reasoner requires protected workflow policy");
         // Respect a caller-pinned routing snapshot (including native phone turns).
         // Unscoped dispatch still reloads configuration for the next request.
         // Bind the selected profile and router mode together for this logical
@@ -824,70 +666,40 @@ impl FallbackReasoner {
         };
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
-        let outcome = crate::model_selection::SELECTED_PROFILE
-            .scope(
-                selected,
-                crate::model_router::SNAPSHOT.scope(
-                    config,
-                    self.dispatch_snapshot(opts, user_message, transcript, revision_authors),
-                ),
-            )
-            .await;
-        if let Some(logger) = logger {
-            logger.drain_checked().await?;
-        }
+        let outcome = crate::model_selection::SELECTED_PROFILE.scope(selected,
+            crate::model_router::SNAPSHOT.scope(config,
+                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await;
+        if let Some(logger) = logger { logger.drain_checked().await?; }
         outcome
     }
 
     async fn dispatch_snapshot(
-        &self,
-        opts: &ReasonerOpts,
-        user_message: &str,
-        transcript: bool,
+        &self, opts: &ReasonerOpts, user_message: &str, transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
         let selected = crate::model_selection::current()?;
-        let routing = if selected == Some(ProviderKind::Yolo) {
-            None
-        } else {
-            crate::model_router::current()?
-        };
+        let routing = if selected == Some(ProviderKind::Yolo) { None } else { crate::model_router::current()? };
         if let Some(profile) = selected {
             if !(self.profile_enabled)(profile) {
                 return Err(ReasonerError::Local {
-                    message: format!(
-                        "{} is paused by the operator; no inference was started",
-                        profile.name()
-                    ),
-                }
-                .into());
+                    message: format!("{} is paused by the operator; no inference was started", profile.name()),
+                }.into());
             }
         }
         // Binding and admission share one lock. Once admitted, no caller can
         // retrofit a history that misses an earlier mutating dispatch.
-        self.review_history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .admitted = true;
+        self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
         let class = classify(opts);
         // restrict_env selects a strong transport capability, not permission to
         // mutate. A supplied-evidence fresh review must never gain a journal
         // (and its previous conversation) merely because its env is restricted.
         let fresh_review = crate::native_session::is_fresh_review();
-        if fresh_review
-            && (!opts.allowed_tools.is_empty()
-                || opts.settings_json.is_some()
-                || opts.handoff_path.is_some())
-        {
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
             return Err(ReasonerError::Local { message:
                 "fresh review requires supplied evidence without tools, settings or handoff history".into() }.into());
         }
-        let mutating = !fresh_review
-            && matches!(
-                class,
-                crate::providers::CapabilityClass::WriteTools
-                    | crate::providers::CapabilityClass::FullAgentic
-            );
+        let mutating = !fresh_review && matches!(class,
+            crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic);
         let mut request_opts = opts.clone();
         if request_opts.handoff_path.is_none() && mutating {
             if let Some(root) = &self.handoff_root {
@@ -902,10 +714,7 @@ impl FallbackReasoner {
         if mutating {
             if let Some(journal) = &opts.handoff_path {
                 if let Some(verdict) = crate::handoff_outcome::recorded(journal)? {
-                    info!(
-                        completed = verdict.completed,
-                        "request already completed without a summary; not dispatching it again"
-                    );
+                    info!(completed = verdict.completed, "request already completed without a summary; not dispatching it again");
                     return Err(anyhow::Error::new(verdict));
                 }
             }
@@ -920,13 +729,8 @@ impl FallbackReasoner {
             dispatch_entries.retain(|entry| entry.kind == profile);
         }
         // No other turn ever reaches Yolo, in any routing mode.
-        dispatch_entries.retain(|entry| {
-            entry.kind != ProviderKind::Yolo || selected == Some(ProviderKind::Yolo)
-        });
-        let primary = dispatch_entries
-            .iter()
-            .find(|e| routing.as_ref().is_none_or(|r| r.allows(e.kind)))
-            .map(|e| e.kind);
+        dispatch_entries.retain(|entry| entry.kind != ProviderKind::Yolo || selected == Some(ProviderKind::Yolo));
+        let primary = dispatch_entries.iter().find(|e| routing.as_ref().is_none_or(|r| r.allows(e.kind))).map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
         // the whole chain fails (#655 review): a trailing Local fault from a
         // misconfigured fallback would otherwise mask the rate limit and
@@ -949,16 +753,10 @@ impl FallbackReasoner {
             // Account cooldowns belong to the model gateway. Native-login cooldowns must
             // neither block a fresh account pool nor be cleared by its success.
             let routed = routing.as_ref().is_some_and(|r| r.enabled());
-            if opts
-                .audit_logger
-                .as_ref()
-                .is_some_and(|logger| logger.run_resources_required())
+            if opts.audit_logger.as_ref().is_some_and(|logger| logger.run_resources_required())
                 && (self.workflow_native_only || entry.reasoner.defers_model_admission())
-                && !workflow_route_auth(entry.kind, routed)
-            {
-                diagnostics.push(format!(
-                    "{name}: selected route lacks declared workflow credentials"
-                ));
+                && !workflow_route_auth(entry.kind, routed) {
+                diagnostics.push(format!("{name}: selected route lacks declared workflow credentials"));
                 continue;
             }
             if revision_authors.is_some_and(|authors| !authors.contains(&entry.kind)) {
@@ -969,11 +767,7 @@ impl FallbackReasoner {
                 diagnostics.push(format!("{name}: skipped ({class:?} unsupported)"));
                 continue;
             }
-            if let Some(until) = if routed {
-                None
-            } else {
-                self.latch.latched_until(name)
-            } {
+            if let Some(until) = if routed { None } else { self.latch.latched_until(name) } {
                 skipped_latched += 1;
                 diagnostics.push(format!("{name}: skipped (cooldown)"));
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
@@ -983,21 +777,13 @@ impl FallbackReasoner {
                 Some(path) => crate::handoff::resume_message(path, user_message)?,
                 None => user_message.to_string(),
             };
-            let calibrated_model = crate::triage_capture::append(
-                entry.kind == ProviderKind::Claude && !routed,
-                &mut resumed_message,
-            );
+            let calibrated_model = crate::triage_capture::append(entry.kind == ProviderKind::Claude && !routed, &mut resumed_message);
             let mut entry_opts = opts.clone();
-            if let Some(model) = calibrated_model {
-                entry_opts.model = Some(model);
-            }
-            let opts = &entry_opts;
+            if let Some(model) = calibrated_model { entry_opts.model=Some(model); }
+            let opts=&entry_opts;
             if mutating {
                 let (history, branch_record) = {
-                    let bound = self
-                        .review_history
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
                     (bound.path.clone(), bound.branch.clone())
                 };
                 // #1037 — the branch record first: if the attempt's write then
@@ -1009,18 +795,11 @@ impl FallbackReasoner {
                 if let Some(path) = history {
                     crate::review_history::record(&path, entry.kind)?;
                 }
-                let mut authors = self
-                    .mutation_providers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if !authors.contains(&entry.kind) {
-                    authors.push(entry.kind);
-                }
+                let mut authors = self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner());
+                if !authors.contains(&entry.kind) { authors.push(entry.kind); }
             }
             if !entry.reasoner.defers_model_admission() {
-                if let Some(logger) = &opts.audit_logger {
-                    logger.model_call_admitted(name)?;
-                }
+                if let Some(logger) = &opts.audit_logger { logger.model_call_admitted(name)?; }
             }
             self.note_call(name);
             let res = if transcript {
@@ -1028,16 +807,8 @@ impl FallbackReasoner {
             } else {
                 entry.reasoner.call(opts, &resumed_message).await
             };
-            if opts
-                .audit_logger
-                .as_ref()
-                .is_some_and(|logger| logger.resource_capacity_seen())
-            {
-                return Err(ReasonerError::ResourceCapacity {
-                    provider: name.into(),
-                    message: "shared run capacity requires reconciliation before retry".into(),
-                }
-                .into());
+            if opts.audit_logger.as_ref().is_some_and(|logger|logger.resource_capacity_seen()) {
+                return Err(ReasonerError::ResourceCapacity {provider:name.into(),message:"shared run capacity requires reconciliation before retry".into()}.into());
             }
             match res {
                 Ok(text) => {
@@ -1049,100 +820,88 @@ impl FallbackReasoner {
                             primary.map(|p| p.name()).unwrap_or("primary")
                         );
                     }
-                    if !routed {
-                        self.latch.clear(name);
-                    }
+                    if !routed { self.latch.clear(name); }
                     return Ok(text);
                 }
-                Err(err) => {
-                    match ReasonerError::find_in(&err) {
-                        Some(re) if re.is_provider_side() => {
-                            let outcome = match re {
-                                ReasonerError::RateLimited { .. } => "quota",
-                                ReasonerError::Timeout { .. } => "timeout",
-                                _ => "provider unavailable",
+                Err(err) => match ReasonerError::find_in(&err) {
+                    Some(re) if re.is_provider_side() => {
+                        let outcome = match re {
+                            ReasonerError::RateLimited { .. } => "quota",
+                            ReasonerError::Timeout { .. } => "timeout",
+                            _ => "provider unavailable",
+                        };
+                        diagnostics.push(format!("{name}: attempted ({outcome})"));
+                        // Timeout on an agentic/write run is "this one call
+                        // ran long", not "provider down" (#655 review) —
+                        // don't take unrelated triage/draft calls down with
+                        // a latch; still try the rest of the chain.
+                        let latchworthy = !matches!(re, ReasonerError::Timeout { .. })
+                            || matches!(
+                                class,
+                                crate::providers::CapabilityClass::TextOnly
+                                    | crate::providers::CapabilityClass::ReadTools
+                            );
+                        if latchworthy && !routed {
+                            let until = match re {
+                                ReasonerError::RateLimited {
+                                    reset_at: Some(at), ..
+                                } => {
+                                    // Clamp even a parsed reset (#655 review
+                                    // — belt to parse_reset_hint's suspenders).
+                                    (*at).min(Utc::now() + max_ratelimit_latch(entry.kind))
+                                }
+                                ReasonerError::RateLimited { .. } => {
+                                    Utc::now() + default_ratelimit_cooldown()
+                                }
+                                _ => Utc::now() + default_unavailable_cooldown(),
                             };
-                            diagnostics.push(format!("{name}: attempted ({outcome})"));
-                            // Timeout on an agentic/write run is "this one call
-                            // ran long", not "provider down" (#655 review) —
-                            // don't take unrelated triage/draft calls down with
-                            // a latch; still try the rest of the chain.
-                            let latchworthy = !matches!(re, ReasonerError::Timeout { .. })
-                                || matches!(
-                                    class,
-                                    crate::providers::CapabilityClass::TextOnly
-                                        | crate::providers::CapabilityClass::ReadTools
-                                );
-                            if latchworthy && !routed {
-                                let until = match re {
-                                    ReasonerError::RateLimited {
-                                        reset_at: Some(at), ..
-                                    } => {
-                                        // Clamp even a parsed reset (#655 review
-                                        // — belt to parse_reset_hint's suspenders).
-                                        (*at).min(Utc::now() + max_ratelimit_latch(entry.kind))
-                                    }
-                                    ReasonerError::RateLimited { .. } => {
-                                        Utc::now() + default_ratelimit_cooldown()
-                                    }
-                                    _ => Utc::now() + default_unavailable_cooldown(),
-                                };
-                                warn!(
-                                    provider = name,
-                                    %until,
-                                    "provider failed provider-side ({re}); latched, trying next in chain"
-                                );
-                                self.latch.latch(name, until, &re.to_string());
-                            } else if !latchworthy {
-                                warn!(
-                                    provider = name,
-                                    "provider timed out on a long-running {class:?} call; \
+                            warn!(
+                                provider = name,
+                                %until,
+                                "provider failed provider-side ({re}); latched, trying next in chain"
+                            );
+                            self.latch.latch(name, until, &re.to_string());
+                        } else if !latchworthy {
+                            warn!(
+                                provider = name,
+                                "provider timed out on a long-running {class:?} call; \
                                  NOT latching (one slow call is not an outage)"
-                                );
-                            }
-                            if first_provider_err.is_none() {
-                                first_provider_err = Some(err);
-                            } else {
-                                last_err = Some(err);
-                            }
-                            continue;
+                            );
                         }
-                        Some(ReasonerError::Local { .. } | ReasonerError::GateTimeout { .. }) => {
-                            let outcome = if matches!(
-                                ReasonerError::find_in(&err),
-                                Some(ReasonerError::GateTimeout { .. })
-                            ) {
-                                "CLI gate timeout"
-                            } else {
-                                "local readiness failure"
-                            };
-                            diagnostics.push(format!("{name}: attempted ({outcome})"));
-                            // Our fault, not the provider's — a bad local config or
-                            // (#954) a jammed CLI gate. Eligible for the next
-                            // provider (cerebras is HTTP, ungated), never latched.
-                            warn!(provider = name, "local fault ({err}); trying next");
-                            if last_err.is_none() {
-                                last_err = Some(err);
-                            }
-                            continue;
+                        if first_provider_err.is_none() {
+                            first_provider_err = Some(err);
+                        } else {
+                            last_err = Some(err);
                         }
-                        // CleanupUncertain: typed, and it stops the chain.
-                        Some(_) => return Err(err),
-                        // Untyped: the turn ended on its own content (no final
-                        // text, a content-level turn.failed), a failure nothing
-                        // recognised on a write-capable call, or an error from
-                        // above the provider layer. Never failed over.
-                        None => {
-                            use crate::turn_failure::{FailureClass, TurnFailure};
-                            match err
-                                .downcast_ref::<TurnFailure>()
-                                .map(|failure| failure.class)
-                            {
-                                // #1040 C3: a mutating call that finished its work
-                                // without a summary is never dispatched again.
-                                Some(FailureClass::Content) if mutating => {
-                                    if let Some(journal) = &opts.handoff_path {
-                                        match crate::handoff_outcome::settle(journal) {
+                        continue;
+                    }
+                    Some(ReasonerError::Local { .. } | ReasonerError::GateTimeout { .. }) => {
+                        let outcome = if matches!(ReasonerError::find_in(&err), Some(ReasonerError::GateTimeout { .. })) {
+                            "CLI gate timeout"
+                        } else { "local readiness failure" };
+                        diagnostics.push(format!("{name}: attempted ({outcome})"));
+                        // Our fault, not the provider's — a bad local config or
+                        // (#954) a jammed CLI gate. Eligible for the next
+                        // provider (cerebras is HTTP, ungated), never latched.
+                        warn!(provider = name, "local fault ({err}); trying next");
+                        if last_err.is_none() {
+                            last_err = Some(err);
+                        }
+                        continue;
+                    }
+                    // CleanupUncertain: typed, and it stops the chain.
+                    Some(_) => return Err(err),
+                    // Untyped: the turn ended on its own content (no final
+                    // text, a content-level turn.failed), a failure nothing
+                    // recognised on a write-capable call, or an error from
+                    // above the provider layer. Never failed over.
+                    None => {
+                        use crate::turn_failure::{FailureClass, TurnFailure};
+                        match err.downcast_ref::<TurnFailure>().map(|failure| failure.class) {
+                            // #1040 C3: a mutating call that finished its work
+                            // without a summary is never dispatched again.
+                            Some(FailureClass::Content) if mutating => if let Some(journal) = &opts.handoff_path {
+                                match crate::handoff_outcome::settle(journal) {
                                     Ok(crate::handoff_outcome::Settlement::Completed(verdict)) => {
                                         warn!(provider = name, completed = verdict.completed,
                                             "call ended without a summary after completing operations; \
@@ -1161,28 +920,25 @@ impl FallbackReasoner {
                                     Err(error) => warn!(provider = name,
                                         "operation journal unreadable after a content-level ending ({error:#})"),
                                 }
-                                    }
-                                }
-                                // #1069 review H1: never re-dispatched, but a run
-                                // of them is an outage the table does not know.
-                                Some(FailureClass::Unrecognised) if !routed => {
-                                    let strikes =
-                                        self.latch.strike(name, unrecognised_strike_window());
-                                    if strikes >= UNRECOGNISED_STRIKE_LIMIT {
-                                        let until = Utc::now() + default_unavailable_cooldown();
-                                        warn!(provider = name, strikes, %until,
+                            },
+                            // #1069 review H1: never re-dispatched, but a run
+                            // of them is an outage the table does not know.
+                            Some(FailureClass::Unrecognised) if !routed => {
+                                let strikes = self.latch.strike(name, unrecognised_strike_window());
+                                if strikes >= UNRECOGNISED_STRIKE_LIMIT {
+                                    let until = Utc::now() + default_unavailable_cooldown();
+                                    warn!(provider = name, strikes, %until,
                                         "consecutive unrecognised failures; latched for the outage cooldown \
                                          (the failed calls are not re-dispatched)");
-                                        self.latch.latch(name, until,
+                                    self.latch.latch(name, until,
                                         &format!("{name}: {strikes} consecutive unrecognised failures"));
-                                    }
                                 }
-                                _ => {}
                             }
-                            return Err(err);
+                            _ => {}
                         }
+                        return Err(err);
                     }
-                }
+                },
             }
         }
 
@@ -1203,28 +959,14 @@ impl FallbackReasoner {
         // Keep the original typed error available to retry/cooldown callers.
         // The display context contains only classifications, never prompts,
         // settings, stderr, tool arguments, or credentials.
-        Err(error.context(format!(
-            "reasoner chain exhausted for {class:?}: {}",
-            diagnostics.join("; ")
-        )))
+        Err(error.context(format!("reasoner chain exhausted for {class:?}: {}", diagnostics.join("; "))))
     }
 }
 
 #[async_trait]
 impl Reasoner for FallbackReasoner {
-    async fn call_calibrated(
-        &self,
-        opts: &ReasonerOpts,
-        user_message: &str,
-        supplement: &str,
-        serving_model: &str,
-    ) -> anyhow::Result<String> {
-        crate::triage_capture::with_supplement(
-            supplement,
-            serving_model,
-            self.dispatch(opts, user_message, false, None),
-        )
-        .await
+    async fn call_calibrated(&self,opts:&ReasonerOpts,user_message:&str,supplement:&str,serving_model:&str)->anyhow::Result<String>{
+        crate::triage_capture::with_supplement(supplement,serving_model,self.dispatch(opts,user_message,false,None)).await
     }
 
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
@@ -1251,86 +993,32 @@ mod tests {
     #[tokio::test]
     async fn workflow_builder_pin_overrides_selection_without_affecting_reviewer() {
         let dir = tempfile::tempdir().unwrap();
-        let claude = Scripted::ok("claude");
-        let codex = Scripted::ok("codex");
-        let mut builder = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, claude.clone()),
-                (ProviderKind::Codex, codex.clone()),
-            ],
-            latch_in(&dir),
-        );
+        let claude = Scripted::ok("claude"); let codex = Scripted::ok("codex");
+        let mut builder = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
         builder.builder_pin = Some(ProviderKind::Codex);
-        let reviewer = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, claude.clone()),
-                (ProviderKind::Codex, codex.clone()),
-            ],
-            latch_in(&dir),
-        );
-        crate::model_selection::SELECTED_PROFILE
-            .scope(
-                Some(ProviderKind::Claude),
-                crate::model_router::SNAPSHOT.scope(None, async {
-                    assert_eq!(
-                        builder.call(&text_only_opts(), "build").await.unwrap(),
-                        "codex"
-                    );
-                    assert_eq!(
-                        builder
-                            .lane_provider_availability(crate::providers::CapabilityClass::TextOnly)
-                            .iter()
-                            .map(|(p, _)| *p)
-                            .collect::<Vec<_>>(),
-                        vec![ProviderKind::Codex]
-                    );
-                    assert_eq!(
-                        crate::model_selection::current().unwrap(),
-                        Some(ProviderKind::Claude)
-                    );
-                    assert_eq!(
-                        reviewer.call(&text_only_opts(), "review").await.unwrap(),
-                        "claude"
-                    );
-                }),
-            )
-            .await;
-        assert_eq!(codex.count(), 1);
-        assert_eq!(claude.count(), 1);
+        let reviewer = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
+        crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Claude), crate::model_router::SNAPSHOT.scope(None, async {
+            assert_eq!(builder.call(&text_only_opts(), "build").await.unwrap(), "codex");
+            assert_eq!(builder.lane_provider_availability(crate::providers::CapabilityClass::TextOnly).iter().map(|(p,_)|*p).collect::<Vec<_>>(),vec![ProviderKind::Codex]);
+            assert_eq!(crate::model_selection::current().unwrap(), Some(ProviderKind::Claude));
+            assert_eq!(reviewer.call(&text_only_opts(), "review").await.unwrap(), "claude");
+        })).await;
+        assert_eq!(codex.count(),1); assert_eq!(claude.count(),1);
     }
 
     #[tokio::test]
     async fn workflow_builder_pin_never_falls_back_on_failure_or_pause() {
-        for paused in [false, true] {
+        for paused in [false,true] {
             let dir = tempfile::tempdir().unwrap();
             let claude = Scripted::ok("must not be used");
-            let codex = Scripted::err(|| {
-                anyhow::Error::new(ReasonerError::Unavailable {
-                    provider: "codex".into(),
-                    message: "fixture unavailable".into(),
-                })
-            });
-            let mut builder = FallbackReasoner::for_tests(
-                vec![
-                    (ProviderKind::Claude, claude.clone()),
-                    (ProviderKind::Codex, codex.clone()),
-                ],
-                latch_in(&dir),
-            );
+            let codex = Scripted::err(|| anyhow::Error::new(ReasonerError::Unavailable {provider:"codex".into(),message:"fixture unavailable".into()}));
+            let mut builder = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
             builder.builder_pin = Some(ProviderKind::Codex);
-            if paused {
-                builder.profile_enabled = |kind| kind != ProviderKind::Codex;
-            }
-            let result = crate::model_selection::SELECTED_PROFILE
-                .scope(
-                    None,
-                    crate::model_router::SNAPSHOT
-                        .scope(None, builder.call(&text_only_opts(), "build")),
-                )
-                .await;
+            if paused { builder.profile_enabled = |kind|kind != ProviderKind::Codex; }
+            let result = crate::model_selection::SELECTED_PROFILE.scope(None, crate::model_router::SNAPSHOT.scope(None,
+                builder.call(&text_only_opts(), "build"))).await;
             assert!(result.is_err(), "pinned builder silently used fallback");
-            assert_eq!(claude.count(), 0);
-            assert_eq!(codex.count(), usize::from(!paused));
+            assert_eq!(claude.count(),0); assert_eq!(codex.count(),usize::from(!paused));
         }
     }
 
@@ -1347,36 +1035,23 @@ mod tests {
                 .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", selection)
                 .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", router)
                 .output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::model_selection::SelectionStore::new(crate::model_selection::config_path());
+        let store = crate::model_selection::SelectionStore::new(
+            crate::model_selection::config_path());
         store.set(None, Some(ProviderKind::Qwen)).unwrap();
         let qwen = Scripted::ok("qwen answer");
         let codex = Scripted::ok("codex answer");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Qwen, qwen.clone()),
-                (ProviderKind::Codex, codex.clone()),
-            ],
-            latch_in(&dir),
-        );
-        let answer = AFTER_ROUTE_SELECTION
-            .scope(
-                Arc::new(move || {
-                    store.set(None, Some(ProviderKind::Codex)).unwrap();
-                }),
-                chain.call(&text_only_opts(), "synthetic request"),
-            )
-            .await
-            .unwrap();
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Qwen, qwen.clone()),
+            (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
+        let answer = AFTER_ROUTE_SELECTION.scope(Arc::new(move || {
+            store.set(None, Some(ProviderKind::Codex)).unwrap();
+        }), chain.call(&text_only_opts(), "synthetic request")).await.unwrap();
         assert_eq!(answer, "qwen answer");
         assert_eq!(qwen.count(), 1);
         assert_eq!(codex.count(), 0);
@@ -1387,26 +1062,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = Scripted::ok("wrong provider");
         let qwen = Scripted::ok("qwen answer");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, claude.clone()),
-                (ProviderKind::Qwen, qwen.clone()),
-            ],
-            latch_in(&dir),
-        );
-        let mut config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude.clone()),
+            (ProviderKind::Qwen, qwen.clone()),
+        ], latch_in(&dir));
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         config.mode = "qwen".into();
-        let answer = crate::model_selection::SELECTED_PROFILE
-            .scope(
-                Some(ProviderKind::Qwen),
-                crate::model_router::SNAPSHOT.scope(
-                    Some(config),
-                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None),
-                ),
-            )
-            .await
-            .unwrap();
+        let answer = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Qwen),
+            crate::model_router::SNAPSHOT.scope(Some(config),
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await.unwrap();
         assert_eq!(answer, "qwen answer");
         assert_eq!(claude.count(), 0);
         assert_eq!(qwen.count(), 1);
@@ -1415,32 +1079,20 @@ mod tests {
     #[tokio::test]
     async fn selected_runpod_failure_never_silently_falls_back_to_codex() {
         let dir = tempfile::tempdir().unwrap();
-        let qwen = Scripted::err(|| {
-            anyhow::Error::new(ReasonerError::Unavailable {
-                provider: "qwen".into(),
-                message: "synthetic upstream failure".into(),
-            })
-        });
+        let qwen = Scripted::err(|| anyhow::Error::new(ReasonerError::Unavailable {
+            provider: "qwen".into(),
+            message: "synthetic upstream failure".into(),
+        }));
         let codex = Scripted::ok("wrong provider");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Qwen, qwen.clone()),
-                (ProviderKind::Codex, codex.clone()),
-            ],
-            latch_in(&dir),
-        );
-        let mut config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Qwen, qwen.clone()),
+            (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         config.mode = "qwen".into();
-        let result = crate::model_selection::SELECTED_PROFILE
-            .scope(
-                Some(ProviderKind::Qwen),
-                crate::model_router::SNAPSHOT.scope(
-                    Some(config),
-                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None),
-                ),
-            )
-            .await;
+        let result = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Qwen),
+            crate::model_router::SNAPSHOT.scope(Some(config),
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
         assert!(result.is_err());
         assert_eq!(qwen.count(), 1);
         assert_eq!(codex.count(), 0);
@@ -1453,36 +1105,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paused = Scripted::ok("paused model was called");
             let codex = Scripted::ok("silent fallback");
-            let mut chain = FallbackReasoner::for_tests(
-                vec![
-                    (profile, paused.clone()),
-                    (ProviderKind::Codex, codex.clone()),
-                ],
-                latch_in(&dir),
-            );
+            let mut chain = FallbackReasoner::for_tests(vec![
+                (profile, paused.clone()),
+                (ProviderKind::Codex, codex.clone()),
+            ], latch_in(&dir));
             chain.profile_enabled = |kind| !matches!(kind, ProviderKind::Qwen | ProviderKind::Glm);
-            let mut config =
-                crate::model_router::parse(&crate::model_router::tests::fixture().to_string())
-                    .unwrap();
+            let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
             config.mode = profile.name().into();
-            let result = crate::model_selection::SELECTED_PROFILE
-                .scope(
-                    Some(profile),
-                    crate::model_router::SNAPSHOT.scope(Some(config), async {
-                        assert_eq!(
-                            chain.lane_availability(crate::providers::CapabilityClass::TextOnly),
-                            LaneAvailability::NoEligibleProvider
-                        );
-                        chain
-                            .dispatch_snapshot(&text_only_opts(), "question", false, None)
-                            .await
-                    }),
-                )
-                .await;
-            assert!(
-                result.is_err(),
-                "paused {profile:?} selection must fail before inference"
-            );
+            let result = crate::model_selection::SELECTED_PROFILE.scope(Some(profile),
+                crate::model_router::SNAPSHOT.scope(Some(config), async {
+                    assert_eq!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly),
+                        LaneAvailability::NoEligibleProvider);
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None).await
+                })).await;
+            assert!(result.is_err(), "paused {profile:?} selection must fail before inference");
             assert_eq!(paused.count(), 0);
             assert_eq!(codex.count(), 0);
             assert_eq!(chain.calls(), 0);
@@ -1492,8 +1128,7 @@ mod tests {
     // ---- #2213: Yolo is dispatched only when it is the selected profile ----
 
     fn router_snapshots() -> Vec<Option<crate::model_router::RouterConfig>> {
-        let mut enabled =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let mut enabled = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         enabled.mode = "auto".into();
         vec![None, Some(enabled)]
     }
@@ -1502,40 +1137,21 @@ mod tests {
     async fn yolo_is_never_a_fallback_for_another_provider() {
         for snapshot in router_snapshots() {
             let dir = tempfile::tempdir().unwrap();
-            let claude = Scripted::err(|| {
-                ReasonerError::Timeout {
-                    provider: "claude".into(),
-                    secs: 1,
-                }
-                .into()
-            });
+            let claude = Scripted::err(|| ReasonerError::Timeout { provider: "claude".into(), secs: 1 }.into());
             let yolo = Scripted::ok("yolo answered");
             let codex = Scripted::ok("codex answered");
-            let chain = FallbackReasoner::for_tests(
-                vec![
-                    (ProviderKind::Claude, claude.clone()),
-                    (ProviderKind::Yolo, yolo.clone()),
-                    (ProviderKind::Codex, codex.clone()),
-                ],
-                latch_in(&dir),
-            );
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, claude.clone()),
+                (ProviderKind::Yolo, yolo.clone()),
+                (ProviderKind::Codex, codex.clone()),
+            ], latch_in(&dir));
             let routed = snapshot.is_some();
-            let answer = crate::model_selection::SELECTED_PROFILE
-                .scope(
-                    None,
-                    crate::model_router::SNAPSHOT.scope(
-                        snapshot,
-                        chain.dispatch_snapshot(&text_only_opts(), "question", false, None),
-                    ),
-                )
-                .await;
+            let answer = crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::SNAPSHOT.scope(snapshot,
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
             assert_eq!(answer.unwrap(), "codex answered", "routed={routed}");
             assert_eq!(claude.count(), 1, "routed={routed}");
-            assert_eq!(
-                yolo.count(),
-                0,
-                "a failed Claude turn must never be answered by Yolo (routed={routed})"
-            );
+            assert_eq!(yolo.count(), 0, "a failed Claude turn must never be answered by Yolo (routed={routed})");
         }
     }
 
@@ -1545,24 +1161,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let claude = Scripted::ok("claude answered");
             let yolo = Scripted::ok("yolo answered");
-            let chain = FallbackReasoner::for_tests(
-                vec![
-                    (ProviderKind::Claude, claude.clone()),
-                    (ProviderKind::Yolo, yolo.clone()),
-                ],
-                latch_in(&dir),
-            );
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, claude.clone()),
+                (ProviderKind::Yolo, yolo.clone()),
+            ], latch_in(&dir));
             let routed = snapshot.is_some();
             // The gateway's mode does not list yolo; a yolo turn is not routed.
-            let answer = crate::model_selection::SELECTED_PROFILE
-                .scope(
-                    Some(ProviderKind::Yolo),
-                    crate::model_router::SNAPSHOT.scope(
-                        snapshot,
-                        chain.dispatch_snapshot(&text_only_opts(), "question", false, None),
-                    ),
-                )
-                .await;
+            let answer = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+                crate::model_router::SNAPSHOT.scope(snapshot,
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
             assert_eq!(answer.unwrap(), "yolo answered", "routed={routed}");
             assert_eq!((claude.count(), yolo.count()), (0, 1), "routed={routed}");
         }
@@ -1572,49 +1179,21 @@ mod tests {
     async fn a_failed_or_paused_yolo_turn_is_never_answered_by_another_model() {
         let dir = tempfile::tempdir().unwrap();
         let claude = Scripted::ok("claude answered");
-        let yolo = Scripted::err(|| {
-            ReasonerError::Timeout {
-                provider: "yolo".into(),
-                secs: 1,
-            }
-            .into()
-        });
-        let mut chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Yolo, yolo.clone()),
-                (ProviderKind::Claude, claude.clone()),
-            ],
-            latch_in(&dir),
-        );
-        let failed = crate::model_selection::SELECTED_PROFILE
-            .scope(
-                Some(ProviderKind::Yolo),
-                crate::model_router::without_router(chain.dispatch_snapshot(
-                    &text_only_opts(),
-                    "question",
-                    false,
-                    None,
-                )),
-            )
-            .await;
+        let yolo = Scripted::err(|| ReasonerError::Timeout { provider: "yolo".into(), secs: 1 }.into());
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Yolo, yolo.clone()),
+            (ProviderKind::Claude, claude.clone()),
+        ], latch_in(&dir));
+        let failed = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+            crate::model_router::without_router(
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
         assert!(failed.is_err());
         assert_eq!((yolo.count(), claude.count()), (1, 0));
         chain.profile_enabled = |kind| kind != ProviderKind::Yolo;
-        let paused = crate::model_selection::SELECTED_PROFILE
-            .scope(
-                Some(ProviderKind::Yolo),
-                crate::model_router::without_router(chain.dispatch_snapshot(
-                    &text_only_opts(),
-                    "question",
-                    false,
-                    None,
-                )),
-            )
-            .await;
-        assert!(paused
-            .unwrap_err()
-            .to_string()
-            .contains("paused by the operator"));
+        let paused = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Yolo),
+            crate::model_router::without_router(
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+        assert!(paused.unwrap_err().to_string().contains("paused by the operator"));
         assert_eq!((yolo.count(), claude.count()), (1, 0));
     }
 
@@ -1623,10 +1202,7 @@ mod tests {
         assert!(native_ineligible_reason(ProviderKind::Yolo).is_some());
         assert!(workflow_native_ineligible_reason(ProviderKind::Yolo).is_some());
         assert!(gateway_ineligible_reason(ProviderKind::Yolo).is_some());
-        assert_eq!(
-            max_ratelimit_latch(ProviderKind::Yolo),
-            chrono::Duration::hours(1)
-        );
+        assert_eq!(max_ratelimit_latch(ProviderKind::Yolo), chrono::Duration::hours(1));
     }
 
     // ---- #828: single-provider pinning for the independent review ----
@@ -1636,16 +1212,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut fb = FallbackReasoner::for_tests(vec![], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
-        assert!(fb
-            .call(&text_only_opts(), "synthetic request")
-            .await
-            .is_err());
+        assert!(fb.call(&text_only_opts(), "synthetic request").await.is_err());
         assert_eq!(fb.calls(), 0);
-        assert!(
-            fb.track_review_history(dir.path(), "synthetic-late-binding", false)
-                .is_err(),
-            "admission must seal history before provider selection or execution"
-        );
+        assert!(fb.track_review_history(dir.path(), "synthetic-late-binding", false).is_err(),
+            "admission must seal history before provider selection or execution");
     }
 
     #[test]
@@ -1653,33 +1223,24 @@ mod tests {
         for _ in 0..32 {
             let dir = tempfile::tempdir().unwrap();
             let primary = Scripted::ok("synthetic change");
-            let mut fb = FallbackReasoner::for_tests(
-                vec![(ProviderKind::Claude, primary as Arc<dyn Reasoner>)],
-                latch_in(&dir),
-            );
+            let mut fb = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, primary as Arc<dyn Reasoner>),
+            ], latch_in(&dir));
             fb.handoff_root = Some(dir.path().join("private/handoffs"));
             let barrier = std::sync::Barrier::new(2);
             std::thread::scope(|scope| {
                 let dispatch = scope.spawn(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                     let mut opts = text_only_opts();
                     opts.allowed_tools = vec!["Write".into()];
                     barrier.wait();
-                    runtime
-                        .block_on(fb.call(&opts, "synthetic mutation"))
-                        .unwrap();
+                    runtime.block_on(fb.call(&opts, "synthetic mutation")).unwrap();
                 });
                 barrier.wait();
                 let bound = fb.track_review_history(dir.path(), "synthetic-racing-bind", false);
                 dispatch.join().unwrap();
                 if bound.is_ok() {
-                    assert_eq!(
-                        fb.review_authors().unwrap(),
-                        Some(vec![ProviderKind::Claude])
-                    );
+                    assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Claude]));
                 } else {
                     assert!(fb.review_authors().unwrap().is_none());
                 }
@@ -1692,30 +1253,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::ok("primary must remain independent");
         let builder = Scripted::ok("revision");
-        let mut fb = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
-                (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
-            ],
-            latch_in(&dir),
-        );
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
-        fb.track_review_history(dir.path(), "synthetic-revision", false)
-            .unwrap();
+        fb.track_review_history(dir.path(), "synthetic-revision", false).unwrap();
         let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         crate::review_history::record(&path, ProviderKind::Codex).unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
-        assert_eq!(
-            fb.call_revision(&opts, "repair regression").await.unwrap(),
-            "revision"
-        );
+        assert_eq!(fb.call_revision(&opts, "repair regression").await.unwrap(), "revision");
         assert_eq!(primary.count(), 0);
         assert_eq!(builder.count(), 1);
-        assert_eq!(
-            fb.review_authors().unwrap(),
-            Some(vec![ProviderKind::Codex])
-        );
+        assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
     }
 
     #[tokio::test]
@@ -1723,45 +1274,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reviewer = Scripted::ok("must remain independent");
         let builder = Scripted::err(rate_limited);
-        let mut fb = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
-                (ProviderKind::Claude, reviewer.clone() as Arc<dyn Reasoner>),
-            ],
-            latch_in(&dir),
-        );
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, reviewer.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
-        fb.track_review_history(dir.path(), "synthetic-unavailable-builder", false)
-            .unwrap();
+        fb.track_review_history(dir.path(), "synthetic-unavailable-builder", false).unwrap();
         let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         crate::review_history::record(&path, ProviderKind::Codex).unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
         assert!(fb.call_revision(&opts, "repair").await.is_err());
-        assert!(fb
-            .call_revision(&opts, "retry while latched")
-            .await
-            .is_err());
+        assert!(fb.call_revision(&opts, "retry while latched").await.is_err());
         assert_eq!(builder.count(), 1);
         assert_eq!(reviewer.count(), 0);
-        assert_eq!(
-            fb.review_authors().unwrap(),
-            Some(vec![ProviderKind::Codex])
-        );
+        assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
     }
 
     #[tokio::test]
     async fn revision_refuses_unknown_or_empty_authorship() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::ok("must not run");
-        let mut fb = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
         assert!(fb.call_revision(&text_only_opts(), "repair").await.is_err());
-        fb.track_review_history(dir.path(), "synthetic-empty", false)
-            .unwrap();
+        fb.track_review_history(dir.path(), "synthetic-empty", false).unwrap();
         assert!(fb.call_revision(&text_only_opts(), "repair").await.is_err());
         assert_eq!(primary.count(), 0);
     }
@@ -1770,37 +1309,23 @@ mod tests {
     async fn durable_authorship_is_required_before_a_bound_builder_runs() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::ok("synthetic change");
-        let mut fb = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
-        fb.track_review_history(dir.path(), "synthetic-branch", false)
-            .unwrap();
+        fb.track_review_history(dir.path(), "synthetic-branch", false).unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
         fb.call(&opts, "synthetic build").await.unwrap();
-        assert_eq!(
-            fb.review_authors().unwrap(),
-            Some(vec![ProviderKind::Claude])
-        );
+        assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Claude]));
         let mut resumed = FallbackReasoner::for_tests(vec![], latch_in(&dir));
         resumed.handoff_root = fb.handoff_root.clone();
-        resumed
-            .track_review_history(dir.path(), "synthetic-branch", true)
-            .unwrap();
-        assert_eq!(
-            resumed.review_authors().unwrap(),
-            Some(vec![ProviderKind::Claude])
-        );
+        resumed.track_review_history(dir.path(), "synthetic-branch", true).unwrap();
+        assert_eq!(resumed.review_authors().unwrap(), Some(vec![ProviderKind::Claude]));
         let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         std::fs::write(&path, b"invalid").unwrap();
         assert!(fb.call(&opts, "synthetic revision").await.is_err());
-        assert_eq!(
-            primary.count(),
-            1,
-            "no provider runs without durable attribution"
-        );
+        assert_eq!(primary.count(), 1, "no provider runs without durable attribution");
         assert_eq!(fb.calls(), 1);
     }
 
@@ -1818,26 +1343,16 @@ mod tests {
         opts.allowed_tools = vec!["Write".into()];
 
         // Earlier attempt: Claude timed out mid-build, Codex finished.
-        let claude_timeout = Scripted::err(|| {
-            anyhow::Error::new(ReasonerError::Timeout {
-                provider: "claude".into(),
-                secs: 1,
-            })
-        });
-        let mut earlier = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, claude_timeout as Arc<dyn Reasoner>),
-                (
-                    ProviderKind::Codex,
-                    Scripted::ok("built") as Arc<dyn Reasoner>,
-                ),
-            ],
-            latch_in(&dir),
-        );
+        let claude_timeout = Scripted::err(|| anyhow::Error::new(ReasonerError::Timeout {
+            provider: "claude".into(),
+            secs: 1,
+        }));
+        let mut earlier = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude_timeout as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, Scripted::ok("built") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         earlier.handoff_root = Some(handoffs.clone());
-        earlier
-            .track_review_history(dir.path(), "synthetic-superseded", false)
-            .unwrap();
+        earlier.track_review_history(dir.path(), "synthetic-superseded", false).unwrap();
         earlier.call(&opts, "synthetic build").await.unwrap();
         earlier.supersede_review_history().unwrap();
         let resume = |label: &str| {
@@ -1847,59 +1362,33 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{label}: {e:#}"));
             r.review_authors().unwrap()
         };
-        assert_eq!(
-            resume("published earlier attempt"),
-            Some(vec![ProviderKind::Claude, ProviderKind::Codex])
-        );
+        assert_eq!(resume("published earlier attempt"),
+            Some(vec![ProviderKind::Claude, ProviderKind::Codex]));
 
         // A fresh attempt on the same branch, built by Codex alone.
-        let mut fresh = FallbackReasoner::for_tests(
-            vec![(
-                ProviderKind::Codex,
-                Scripted::ok("rebuilt") as Arc<dyn Reasoner>,
-            )],
-            latch_in(&dir),
-        );
+        let mut fresh = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, Scripted::ok("rebuilt") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fresh.handoff_root = Some(handoffs.clone());
-        fresh
-            .track_review_history(dir.path(), "synthetic-superseded", false)
-            .unwrap();
-        fresh
-            .call(&opts, "synthetic rebuild from main")
-            .await
-            .unwrap();
-        assert_eq!(
-            fresh.review_authors().unwrap(),
-            Some(vec![ProviderKind::Codex]),
-            "the attempt's own review judges work only Codex wrote"
-        );
-        assert_eq!(
-            resume("before the push lands"),
+        fresh.track_review_history(dir.path(), "synthetic-superseded", false).unwrap();
+        fresh.call(&opts, "synthetic rebuild from main").await.unwrap();
+        assert_eq!(fresh.review_authors().unwrap(), Some(vec![ProviderKind::Codex]),
+            "the attempt's own review judges work only Codex wrote");
+        assert_eq!(resume("before the push lands"),
             Some(vec![ProviderKind::Claude, ProviderKind::Codex]),
-            "unpublished: the remote may still hold the old work, so fail closed"
-        );
+            "unpublished: the remote may still hold the old work, so fail closed");
 
         fresh.supersede_review_history().unwrap();
-        assert_eq!(
-            resume("after the push superseded the branch"),
-            Some(vec![ProviderKind::Codex]),
-            "published: the stale Claude attribution is gone and Claude may review"
-        );
-        assert_eq!(
-            fresh.review_authors().unwrap(),
-            Some(vec![ProviderKind::Codex])
-        );
+        assert_eq!(resume("after the push superseded the branch"), Some(vec![ProviderKind::Codex]),
+            "published: the stale Claude attribution is gone and Claude may review");
+        assert_eq!(fresh.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
 
         // Only a fresh attempt replaces anything; a resumed draft never does.
         let mut resumed = FallbackReasoner::for_tests(vec![], latch_in(&dir));
         resumed.handoff_root = Some(handoffs);
-        resumed
-            .track_review_history(dir.path(), "synthetic-superseded", true)
-            .unwrap();
-        assert!(
-            resumed.supersede_review_history().is_err(),
-            "a resume appends to the branch it found; it never replaces its authors"
-        );
+        resumed.track_review_history(dir.path(), "synthetic-superseded", true).unwrap();
+        assert!(resumed.supersede_review_history().is_err(),
+            "a resume appends to the branch it found; it never replaces its authors");
     }
 
     #[tokio::test]
@@ -1907,9 +1396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::err(|| anyhow::anyhow!("synthetic interrupted build"));
         let fb = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Claude, primary as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+            vec![(ProviderKind::Claude, primary as Arc<dyn Reasoner>)], latch_in(&dir));
         let mut opts = text_only_opts();
         let _ = fb.call(&opts, "synthetic scope").await;
         assert!(fb.mutation_providers().is_empty());
@@ -1924,16 +1411,10 @@ mod tests {
     async fn excluded_or_latched_providers_are_not_recorded_as_builders() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::err(rate_limited);
-        let fb = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary as Arc<dyn Reasoner>),
-                (
-                    ProviderKind::Gemini,
-                    Scripted::ok("scope") as Arc<dyn Reasoner>,
-                ),
-            ],
-            latch_in(&dir),
-        );
+        let fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary as Arc<dyn Reasoner>),
+            (ProviderKind::Gemini, Scripted::ok("scope") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         fb.call(&text_only_opts(), "synthetic scope").await.unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
@@ -1953,22 +1434,16 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let started = Arc::new(tokio::sync::Notify::new());
-        let fb = Arc::new(FallbackReasoner::for_tests(
-            vec![(
-                ProviderKind::Claude,
-                Arc::new(InterruptedBuilder(started.clone())) as Arc<dyn Reasoner>,
-            )],
-            latch_in(&dir),
-        ));
+        let fb = Arc::new(FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, Arc::new(InterruptedBuilder(started.clone())) as Arc<dyn Reasoner>),
+        ], latch_in(&dir)));
         let builder = fb.clone();
         let task = tokio::spawn(async move {
             let mut opts = text_only_opts();
             opts.allowed_tools = vec!["Bash(cargo *)".into()];
             builder.call(&opts, "synthetic build").await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(fb.mutation_providers(), vec![ProviderKind::Claude]);
@@ -1989,11 +1464,7 @@ mod tests {
         fb.call(&opts, "hi").await.unwrap();
         fb.call(&opts, "again").await.unwrap();
         assert_eq!(fb.calls(), 2, "two calls attempted");
-        assert_eq!(
-            fb.usage(),
-            vec![("claude", 2, 2)],
-            "(provider, attempted, served)"
-        );
+        assert_eq!(fb.usage(), vec![("claude", 2, 2)], "(provider, attempted, served)");
         assert_eq!(fb.usage_summary(), "claude 2/2");
         // A provider that errors counts an attempt and no serve.
         let dir2 = tempfile::tempdir().unwrap();
@@ -2127,15 +1598,9 @@ mod tests {
                 let ticket = logger.begin_write()?;
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    let record = crate::tool_audit::build_audit_record(
-                        ProviderKind::Claude,
-                        "synthetic-time".into(),
-                        "actual-claude-session".into(),
-                        "Read".into(),
-                        serde_json::json!({"file_path":"synthetic.txt"}),
-                        "synthetic",
-                        false,
-                    );
+                    let record = crate::tool_audit::build_audit_record(ProviderKind::Claude,
+                        "synthetic-time".into(), "actual-claude-session".into(), "Read".into(),
+                        serde_json::json!({"file_path":"synthetic.txt"}), "synthetic", false);
                     logger.record(&record).await;
                     ticket.complete();
                 });
@@ -2145,201 +1610,99 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();
         std::fs::create_dir(dir.path().join("anchors")).unwrap();
-        let logger = Arc::new(
-            crate::tool_audit::AuditLogger::protected(
-                dir.path().join("logs/workflow.log"),
-                dir.path().join("anchors/workflow.json"),
-                &[],
-            )
-            .unwrap(),
-        );
-        let fallback = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Claude, Arc::new(AuditedProvider))],
-            latch_in(&dir),
-        );
+        let logger = Arc::new(crate::tool_audit::AuditLogger::protected(dir.path().join("logs/workflow.log"),
+            dir.path().join("anchors/workflow.json"), &[]).unwrap());
+        let fallback = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Arc::new(AuditedProvider))], latch_in(&dir));
         fallback.set_workflow_audit(logger.clone()).unwrap();
-        crate::model_router::native_reviewer_scope(
-            ProviderKind::Claude,
-            fallback.call(&text_only_opts(), "synthetic"),
-        )
-        .await
-        .unwrap();
+        crate::model_router::native_reviewer_scope(ProviderKind::Claude,
+            fallback.call(&text_only_opts(), "synthetic")).await.unwrap();
         let rows = std::fs::read_to_string(logger.path()).unwrap();
-        assert!(rows
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .any(
-                |row| row.get("provider").and_then(|v| v.as_str()) == Some("claude")
-                    && row.get("session_id").and_then(|v| v.as_str())
-                        == Some("actual-claude-session")
-            ));
+        assert!(rows.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row.get("provider").and_then(|v|v.as_str()) == Some("claude")
+                && row.get("session_id").and_then(|v|v.as_str()) == Some("actual-claude-session")));
         logger.protected_health().unwrap();
     }
 
     #[tokio::test]
     async fn required_native_review_uses_declared_credential_without_host_login() {
         if std::env::var_os("AUTOSHIP_DECLARED_AUTH_FIXTURE").is_none() {
-            let home = tempfile::tempdir().unwrap();
-            let auth = home.path().join("service-auth.json");
+            let home=tempfile::tempdir().unwrap();
+            let auth=home.path().join("service-auth.json");
             std::fs::write(&auth,r#"{"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let executable = home.path().join("codex");
-            augmentagent_test_support::write_executable(&executable, b"#!/bin/sh\nexit 0\n")
-                .unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let guest = home.path().join("guest");
-            std::fs::create_dir(&guest).unwrap();
-            std::fs::set_permissions(&guest, std::fs::Permissions::from_mode(0o700)).unwrap();
-            std::fs::write(guest.join("companion"), b"companion fixture").unwrap();
-            use sha2::{Digest, Sha256};
-            let digest = format!("{:x}", Sha256::digest(std::fs::read(&executable).unwrap()));
-            let companion = format!("{:x}", Sha256::digest(b"companion fixture"));
-            let manifest = guest.join("manifest.json");
+            std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let executable=home.path().join("codex");
+            augmentagent_test_support::write_executable(&executable,b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let guest=home.path().join("guest");std::fs::create_dir(&guest).unwrap();
+            std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(guest.join("companion"),b"companion fixture").unwrap();
+            use sha2::{Digest,Sha256};
+            let digest=format!("{:x}",Sha256::digest(std::fs::read(&executable).unwrap()));
+            let companion=format!("{:x}",Sha256::digest(b"companion fixture"));
+            let manifest=guest.join("manifest.json");
             std::fs::write(&manifest,serde_json::json!({"version":1,"files":[{"path":"companion","sha256":companion}],
                 "native_companions":{digest:[{"name":"codex-code-mode-host","path":"companion","sha256":companion}]}}).to_string()).unwrap();
-            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let policy = home.path().join("policy.json");
+            std::fs::set_permissions(&manifest,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let policy=home.path().join("policy.json");
             std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":guest,"state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
                 "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json","environment":[]}}})).unwrap()).unwrap();
-            std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
             let status=std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","fallback::tests::required_native_review_uses_declared_credential_without_host_login","--nocapture"])
                 .env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path())
                 .env("XDG_STATE_HOME",home.path().join("state")).env("CODEX_CLI",executable)
                 .env("AUGMENTAGENT_NATIVE_VM_POLICY",policy).env("AUTOSHIP_DECLARED_AUTH_FIXTURE","1")
                 .status().unwrap();
-            assert!(status.success());
-            return;
+            assert!(status.success());return;
         }
         assert!(!crate::codex::codex_auth_available());
         assert!(build_pinned(ProviderKind::Codex).is_none());
         assert!(build_workflow_pinned(ProviderKind::Codex).is_some());
-        let temp = tempfile::Builder::new()
-            .prefix("native-auth-fixture-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let logs = temp.path().join("logs");
-        let anchors = temp.path().join("anchors");
-        std::fs::create_dir(&logs).unwrap();
-        std::fs::create_dir(&anchors).unwrap();
+        let temp=tempfile::Builder::new().prefix("native-auth-fixture-").tempdir_in("/tmp").unwrap();
+        let logs=temp.path().join("logs");let anchors=temp.path().join("anchors");
+        std::fs::create_dir(&logs).unwrap();std::fs::create_dir(&anchors).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        for path in [&logs, &anchors] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let logger = Arc::new(
-            crate::tool_audit::AuditLogger::protected(
-                logs.join("audit"),
-                anchors.join("anchor"),
-                &[],
-            )
-            .unwrap(),
-        );
+        for path in [&logs,&anchors] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("audit"),anchors.join("anchor"),&[]).unwrap());
         logger.require_run_resources().unwrap();
-        let scripted = Scripted::ok("supplied-evidence fixture");
-        let mut chain = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, scripted.clone())],
-            latch_in(&temp),
-        );
-        chain.workflow_native_only = true;
-        let mut opts = text_only_opts();
-        opts.audit_logger = Some(logger.clone());
+        let scripted=Scripted::ok("supplied-evidence fixture");
+        let mut chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,scripted.clone())],latch_in(&temp));
+        chain.workflow_native_only=true;
+        let mut opts=text_only_opts();opts.audit_logger=Some(logger.clone());
         chain.set_workflow_audit(logger.clone()).unwrap();
-        let routed =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
-        crate::model_router::SNAPSHOT
-            .scope(Some(routed), async {
-                assert!(matches!(
-                    chain.lane_availability(crate::providers::CapabilityClass::TextOnly),
-                    LaneAvailability::NoEligibleProvider
-                ));
-                assert!(chain
-                    .call(&opts, "must not dispatch routed call")
-                    .await
-                    .is_err());
-                assert_eq!(
-                    scripted.count(),
-                    0,
-                    "native credentials cannot authorize the selected router route"
-                );
-            })
-            .await;
-        let result = crate::model_router::native_reviewer_scope(
-            ProviderKind::Codex,
-            chain.call(&opts, "candidate"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, "supplied-evidence fixture");
-        assert_eq!(scripted.count(), 1);
-        let executable = std::path::PathBuf::from(std::env::var_os("CODEX_CLI").unwrap());
-        let original = std::fs::read(&executable).unwrap();
-        augmentagent_test_support::write_executable(
-            &executable,
-            b"#!/bin/sh\n# updated executable\nexit 0\n",
-        )
-        .unwrap();
+        let routed=crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        crate::model_router::SNAPSHOT.scope(Some(routed), async {
+            assert!(matches!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::NoEligibleProvider));
+            assert!(chain.call(&opts,"must not dispatch routed call").await.is_err());
+            assert_eq!(scripted.count(),0,"native credentials cannot authorize the selected router route");
+        }).await;
+        let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
+        assert_eq!(result,"supplied-evidence fixture");
+        assert_eq!(scripted.count(),1);
+        let executable=std::path::PathBuf::from(std::env::var_os("CODEX_CLI").unwrap());
+        let original=std::fs::read(&executable).unwrap();
+        augmentagent_test_support::write_executable(&executable,b"#!/bin/sh\n# updated executable\nexit 0\n").unwrap();
         assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
-        assert_eq!(
-            workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),
-            Some("native-provider:codex:provider-runtime-companion-missing")
-        );
-        assert!(crate::model_router::native_reviewer_scope(
-            ProviderKind::Codex,
-            chain.call(&opts, "stale runtime must not dispatch")
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            scripted.count(),
-            1,
-            "a binary update cannot spend another call against a stale runtime"
-        );
-        std::fs::write(executable, original).unwrap();
+        assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:provider-runtime-companion-missing"));
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"stale runtime must not dispatch")).await.is_err());
+        assert_eq!(scripted.count(),1,"a binary update cannot spend another call against a stale runtime");
+        std::fs::write(executable,original).unwrap();
         // Recheck the credential at dispatch, even for an already-built chain.
-        let policy: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap()).unwrap(),
-        )
-        .unwrap();
-        let auth = policy["providers"]["codex"]["auth_file"].as_str().unwrap();
+        let policy:serde_json::Value=serde_json::from_slice(&std::fs::read(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap()).unwrap()).unwrap();
+        let auth=policy["providers"]["codex"]["auth_file"].as_str().unwrap();
         let expired_fixture = ["e30", "eyJleHAiOjF9", "signature"].join(".");
-        std::fs::write(
-            auth,
-            serde_json::json!({"tokens":{"access_token":expired_fixture,
-            "refresh_token":"synthetic-refresh","id_token":"synthetic-id"}})
-            .to_string(),
-        )
-        .unwrap();
+        std::fs::write(auth,serde_json::json!({"tokens":{"access_token":expired_fixture,
+            "refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}).to_string()).unwrap();
         assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
-        assert_eq!(
-            workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),
-            Some("native-provider:codex:credential-expired")
-        );
-        assert!(crate::model_router::native_reviewer_scope(
-            ProviderKind::Codex,
-            chain.call(&opts, "expired credential must not dispatch")
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            scripted.count(),
-            1,
-            "expired credentials cannot spend another model call"
-        );
-        opts.audit_logger = None;
-        chain.workflow_native_only = false;
-        *chain.workflow_audit.lock().unwrap() = None;
-        assert!(crate::model_router::native_reviewer_scope(
-            ProviderKind::Codex,
-            chain.call(&opts, "candidate")
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            scripted.count(),
-            1,
-            "interactive native eligibility must not borrow service credentials"
-        );
+        assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:credential-expired"));
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"expired credential must not dispatch")).await.is_err());
+        assert_eq!(scripted.count(),1,"expired credentials cannot spend another model call");
+        opts.audit_logger=None;
+        chain.workflow_native_only=false;
+        *chain.workflow_audit.lock().unwrap()=None;
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.is_err());
+        assert_eq!(scripted.count(),1,"interactive native eligibility must not borrow service credentials");
     }
 
     #[tokio::test]
@@ -2349,19 +1712,12 @@ mod tests {
         if std::env::var_os("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE").is_none() {
             let home = tempfile::tempdir().unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "fallback::tests::restricted_fresh_review_never_inherits_mutation_journal",
-                    "--nocapture",
-                ])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", home.path())
-                .env("CODEX_HOME", home.path().join("codex"))
+                .args(["--exact", "fallback::tests::restricted_fresh_review_never_inherits_mutation_journal", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin")
+                .env("HOME", home.path()).env("CODEX_HOME", home.path().join("codex"))
                 .env("XDG_STATE_HOME", home.path().join("state"))
                 .env("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE", "1")
-                .status()
-                .unwrap();
+                .status().unwrap();
             assert!(status.success());
             return;
         }
@@ -2372,70 +1728,36 @@ mod tests {
             async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
                 assert!(opts.restrict_env);
                 assert!(opts.allowed_tools.is_empty());
-                assert!(
-                    opts.handoff_path.is_none(),
-                    "environment restriction injected old history"
-                );
+                assert!(opts.handoff_path.is_none(), "environment restriction injected old history");
                 assert_eq!(message, "supplied candidate");
                 Ok("review completed".into())
             }
         }
         let dir = tempfile::tempdir().unwrap();
         let mut fallback = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, Arc::new(SuppliedEvidence))],
-            latch_in(&dir),
-        );
+            vec![(ProviderKind::Codex, Arc::new(SuppliedEvidence))], latch_in(&dir));
         fallback.handoff_root = Some(dir.path().join("handoffs"));
         let mut opts = text_only_opts();
         opts.restrict_env = true;
-        let output = crate::native_session::FRESH_REVIEW
-            .scope(
-                true,
-                crate::model_selection::SELECTED_PROFILE.scope(
-                    None,
-                    crate::model_router::without_router(fallback.dispatch_snapshot(
-                        &opts,
-                        "supplied candidate",
-                        false,
-                        None,
-                    )),
-                ),
-            )
-            .await
-            .unwrap();
+        let output = crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.unwrap();
         assert_eq!(output, "review completed");
         assert!(!dir.path().join("handoffs").exists());
         assert!(fallback.mutation_providers().is_empty());
         opts.allowed_tools = vec!["Write".into()];
-        assert!(crate::native_session::FRESH_REVIEW
-            .scope(
-                true,
-                crate::model_selection::SELECTED_PROFILE.scope(
-                    None,
-                    crate::model_router::without_router(fallback.dispatch_snapshot(
-                        &opts,
-                        "supplied candidate",
-                        false,
-                        None
-                    ))
-                )
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            fallback.calls(),
-            1,
-            "invalid fresh-review capability never dispatches"
-        );
+        assert!(crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.is_err());
+        assert_eq!(fallback.calls(), 1, "invalid fresh-review capability never dispatches");
         assert!(latch_in(&dir).latched_until("codex").is_none());
     }
 
     #[tokio::test]
     async fn fallback_receives_primary_receipts_and_same_journal() {
-        struct CheckpointProvider {
-            primary: bool,
-            expected: std::path::PathBuf,
-        }
+        struct CheckpointProvider { primary: bool, expected: std::path::PathBuf }
         #[async_trait]
         impl Reasoner for CheckpointProvider {
             async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
@@ -2444,10 +1766,7 @@ mod tests {
                     use std::io::Write;
                     use std::os::unix::fs::OpenOptionsExt;
                     assert_eq!(message, "synthetic request");
-                    let mut file = std::fs::OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .mode(0o600)
+                    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
                         .open(&self.expected)?;
                     file.write_all(serde_json::to_string(&serde_json::json!({"version":1,"operations":[
                         {"tool":"mcp__fixture__create","arguments":{},"status":"completed","result":"synthetic-42"}
@@ -2466,29 +1785,11 @@ mod tests {
         // Exercise checkpoint propagation independently of capability selection.
         // Production-shaped routing has its own regression.
         opts.handoff_path = Some(path.clone());
-        let fb = FallbackReasoner::for_tests(
-            vec![
-                (
-                    ProviderKind::Claude,
-                    Arc::new(CheckpointProvider {
-                        primary: true,
-                        expected: path.clone(),
-                    }),
-                ),
-                (
-                    ProviderKind::Codex,
-                    Arc::new(CheckpointProvider {
-                        primary: false,
-                        expected: path,
-                    }),
-                ),
-            ],
-            latch_in(&dir),
-        );
-        assert_eq!(
-            fb.call(&opts, "synthetic request").await.unwrap(),
-            "resumed with known progress"
-        );
+        let fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, Arc::new(CheckpointProvider { primary:true, expected:path.clone() })),
+            (ProviderKind::Codex, Arc::new(CheckpointProvider { primary:false, expected:path })),
+        ], latch_in(&dir));
+        assert_eq!(fb.call(&opts, "synthetic request").await.unwrap(), "resumed with known progress");
     }
 
     #[tokio::test]
@@ -2514,197 +1815,95 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = Scripted::err(rate_limited);
         let codex = Scripted::ok("must not run in direct mode");
-        let mut chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, claude),
-                (ProviderKind::Codex, codex.clone()),
-            ],
-            latch_in(&dir),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude), (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
         chain.gateway_only.push(ProviderKind::Codex);
-        let mut config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         config.mode = "direct".into();
-        assert!(crate::model_router::SNAPSHOT
-            .scope(
-                Some(config.clone()),
-                chain.dispatch_snapshot(&text_only_opts(), "test", false, None)
-            )
-            .await
-            .is_err());
+        assert!(crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+            chain.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.is_err());
         assert_eq!(codex.count(), 0);
-        assert!(
-            chain.call(&text_only_opts(), "test").await.is_err(),
-            "removing configuration also excludes gateway-only adapters"
-        );
+        assert!(chain.call(&text_only_opts(), "test").await.is_err(), "removing configuration also excludes gateway-only adapters");
         assert_eq!(codex.count(), 0);
-        let pinned = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, codex.clone())],
-            latch_in(&tempfile::tempdir().unwrap()),
-        );
-        crate::model_router::SNAPSHOT
-            .scope(
-                Some(config),
-                pinned.dispatch_snapshot(&text_only_opts(), "test", false, None),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            codex.count(),
-            1,
-            "an explicitly pinned reviewer is not filtered by the global native chain"
-        );
+        let pinned = FallbackReasoner::for_tests(vec![(ProviderKind::Codex, codex.clone())], latch_in(&tempfile::tempdir().unwrap()));
+        crate::model_router::SNAPSHOT.scope(Some(config),
+            pinned.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.unwrap();
+        assert_eq!(codex.count(), 1, "an explicitly pinned reviewer is not filtered by the global native chain");
     }
 
     #[tokio::test]
     async fn router_accounts_are_ready_even_when_native_login_is_latched() {
         let dir = tempfile::tempdir().unwrap();
         let latch = latch_in(&dir);
-        latch.latch(
-            "claude",
-            Utc::now() + chrono::Duration::minutes(5),
-            "native exhausted",
-        );
-        let chain =
-            FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Scripted::ok("ok"))], latch);
-        let config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
-        crate::model_router::SNAPSHOT
-            .scope(Some(config), async {
-                assert_eq!(
-                    chain.lane_availability(crate::providers::CapabilityClass::TextOnly),
-                    LaneAvailability::Available
-                );
-            })
-            .await;
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "native exhausted");
+        let chain = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Scripted::ok("ok"))], latch);
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        crate::model_router::SNAPSHOT.scope(Some(config), async {
+            assert_eq!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::Available);
+        }).await;
     }
 
     #[tokio::test]
     async fn unrecognised_router_failures_never_strike_or_latch_native_accounts() {
         let dir = tempfile::tempdir().unwrap();
-        let reasoner = Scripted::err(|| {
-            crate::turn_failure::turn_error(
-                "claude",
-                crate::turn_failure::FailureClass::Unrecognised,
-                crate::providers::CapabilityClass::WriteTools,
-                "synthetic unknown failure".into(),
-            )
-        });
-        let chain =
-            FallbackReasoner::for_tests(vec![(ProviderKind::Claude, reasoner)], latch_in(&dir));
-        let config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let reasoner = Scripted::err(|| crate::turn_failure::turn_error("claude",
+            crate::turn_failure::FailureClass::Unrecognised,
+            crate::providers::CapabilityClass::WriteTools, "synthetic unknown failure".into()));
+        let chain = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, reasoner)], latch_in(&dir));
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         for _ in 0..3 {
-            assert!(crate::model_router::SNAPSHOT
-                .scope(
-                    Some(config.clone()),
-                    chain.dispatch_snapshot(&text_only_opts(), "test", false, None)
-                )
-                .await
-                .is_err());
+            assert!(crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+                chain.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.is_err());
         }
         assert!(chain.latch.latched_until("claude").is_none());
-        assert_eq!(
-            chain.latch.strike("claude", unrecognised_strike_window()),
-            1
-        );
+        assert_eq!(chain.latch.strike("claude", unrecognised_strike_window()), 1);
     }
 
     #[tokio::test]
     async fn router_selection_is_strict_and_auto_fails_over_without_native_cooldowns() {
         let dir = tempfile::tempdir().unwrap();
         let latch = latch_in(&dir);
-        latch.latch(
-            "claude",
-            Utc::now() + chrono::Duration::minutes(5),
-            "native account exhausted",
-        );
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "native account exhausted");
         let claude = Scripted::err(rate_limited);
         let codex = Scripted::ok("codex answer");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Codex, codex.clone()),
-                (ProviderKind::Claude, claude.clone()),
-            ],
-            latch,
-        );
-        let config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, codex.clone()), (ProviderKind::Claude, claude.clone()),
+        ], latch);
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
         let opts = text_only_opts();
-        let answer = crate::model_router::SNAPSHOT
-            .scope(
-                Some(config.clone()),
-                chain.dispatch_snapshot(&opts, "test", false, None),
-            )
-            .await
-            .unwrap();
+        let answer = crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.unwrap();
         assert_eq!(answer, "codex answer");
-        assert_eq!(
-            claude.count(),
-            1,
-            "auto starts with Claude despite a native cooldown"
-        );
+        assert_eq!(claude.count(), 1, "auto starts with Claude despite a native cooldown");
         assert_eq!(codex.count(), 1);
-        let mut only_claude = config.clone();
-        only_claude.mode = "claude".into();
-        assert!(crate::model_router::SNAPSHOT
-            .scope(
-                Some(only_claude),
-                chain.dispatch_snapshot(&opts, "test", false, None)
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            codex.count(),
-            1,
-            "Claude-only never silently switches provider"
-        );
-        let mut only_codex = config;
-        only_codex.mode = "codex".into();
-        crate::model_router::SNAPSHOT
-            .scope(
-                Some(only_codex),
-                chain.dispatch_snapshot(&opts, "test", false, None),
-            )
-            .await
-            .unwrap();
+        let mut only_claude = config.clone(); only_claude.mode = "claude".into();
+        assert!(crate::model_router::SNAPSHOT.scope(Some(only_claude),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.is_err());
+        assert_eq!(codex.count(), 1, "Claude-only never silently switches provider");
+        let mut only_codex = config; only_codex.mode = "codex".into();
+        crate::model_router::SNAPSHOT.scope(Some(only_codex),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.unwrap();
         assert_eq!(claude.count(), 2);
         assert_eq!(codex.count(), 2);
-        assert!(
-            chain.latch.latched_until("claude").is_some(),
-            "routing must preserve the native login cooldown"
-        );
+        assert!(chain.latch.latched_until("claude").is_some(), "routing must preserve the native login cooldown");
     }
 
     #[tokio::test]
     async fn exhausted_chain_explains_cooldown_and_capability_exclusion() {
         let dir = tempfile::tempdir().unwrap();
         let latch = latch_in(&dir);
-        latch.latch(
-            "claude",
-            Utc::now() + chrono::Duration::minutes(5),
-            "synthetic quota",
-        );
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "synthetic quota");
         let primary = Scripted::ok("must not spawn");
         let backup = Scripted::ok("must not spawn");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary.clone()),
-                (ProviderKind::Cerebras, backup.clone()),
-            ],
-            latch,
-        );
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone()), (ProviderKind::Cerebras, backup.clone()),
+        ], latch);
         let opts = crate::reasoner::ask_opts(dir.path().into(), dir.path().into());
-        let error = chain
-            .call(&opts, "PRIVATE_SYNTHETIC_PROMPT")
-            .await
-            .unwrap_err();
+        let error = chain.call(&opts, "PRIVATE_SYNTHETIC_PROMPT").await.unwrap_err();
         let display = error.to_string();
         assert!(display.contains("claude: skipped (cooldown)"), "{display}");
-        assert!(
-            display.contains("cerebras: skipped (FullAgentic unsupported)"),
-            "{display}"
-        );
+        assert!(display.contains("cerebras: skipped (FullAgentic unsupported)"), "{display}");
         assert!(!display.contains("PRIVATE_SYNTHETIC_PROMPT"));
         assert_eq!(primary.count() + backup.count(), 0);
     }
@@ -2713,33 +1912,15 @@ mod tests {
     async fn exhaustion_keeps_original_quota_type_and_reports_local_backup_failure() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::err(rate_limited);
-        let backup = Scripted::err(|| {
-            ReasonerError::Local {
-                message: "PRIVATE_SYNTHETIC_CONFIG".into(),
-            }
-            .into()
-        });
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary),
-                (ProviderKind::Codex, backup),
-            ],
-            latch_in(&dir),
-        );
-        let error = chain
-            .call(&text_only_opts(), "synthetic request")
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            ReasonerError::find_in(&error),
-            Some(ReasonerError::RateLimited { .. })
-        ));
+        let backup = Scripted::err(|| ReasonerError::Local { message:"PRIVATE_SYNTHETIC_CONFIG".into() }.into());
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, backup),
+        ], latch_in(&dir));
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::RateLimited { .. })));
         let display = error.to_string();
         assert!(display.contains("claude: attempted (quota)"), "{display}");
-        assert!(
-            display.contains("codex: attempted (local readiness failure)"),
-            "{display}"
-        );
+        assert!(display.contains("codex: attempted (local readiness failure)"), "{display}");
         assert!(!display.contains("PRIVATE_SYNTHETIC_CONFIG"));
     }
 
@@ -2780,10 +1961,7 @@ mod tests {
         let wiki = dir.path().join("wiki");
         std::fs::create_dir(&wiki).unwrap();
         let opts = crate::reasoner::ask_opts(wiki, dir.path().to_path_buf());
-        assert_eq!(
-            classify(&opts),
-            crate::providers::CapabilityClass::FullAgentic
-        );
+        assert_eq!(classify(&opts), crate::providers::CapabilityClass::FullAgentic);
         let primary = Scripted::err(rate_limited);
         let backup = Scripted::ok("tool-capable backup response");
         let chain = FallbackReasoner::for_tests(
@@ -2794,13 +1972,8 @@ mod tests {
             latch_in(&dir),
         );
         for _ in 0..2 {
-            assert_eq!(
-                chain
-                    .call(&opts, "Read the synthetic project note")
-                    .await
-                    .unwrap(),
-                "tool-capable backup response"
-            );
+            assert_eq!(chain.call(&opts, "Read the synthetic project note").await.unwrap(),
+                "tool-capable backup response");
         }
         assert_eq!(primary.count(), 1);
         assert_eq!(backup.count(), 2);
@@ -2817,8 +1990,7 @@ mod tests {
             {
                 // WriteTools row: strip the #1094 hook (hooks ⇒ FullAgentic,
                 // already covered by the ask row below).
-                let mut o =
-                    crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki.clone());
+                let mut o = crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki.clone());
                 o.settings_json = None;
                 o
             },
@@ -2826,33 +1998,16 @@ mod tests {
         ];
         for (index, opts) in profiles.iter().enumerate() {
             for primary_available in [true, false] {
-                let primary = if primary_available {
-                    Scripted::ok("primary")
-                } else {
-                    Scripted::err(rate_limited)
-                };
+                let primary = if primary_available { Scripted::ok("primary") } else { Scripted::err(rate_limited) };
                 let backup = Scripted::ok("backup");
-                let latch = CooldownLatch::at(
-                    fixture
-                        .path()
-                        .join(format!("{index}-{primary_available}.json")),
-                );
-                let chain = FallbackReasoner::for_tests(
-                    vec![
-                        (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
-                        (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
-                    ],
-                    latch,
-                );
+                let latch = CooldownLatch::at(fixture.path().join(format!("{index}-{primary_available}.json")));
+                let chain = FallbackReasoner::for_tests(vec![
+                    (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+                    (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
+                ], latch);
                 for _ in 0..2 {
-                    assert_eq!(
-                        chain.call_transcript(opts, "Synthetic task").await.unwrap(),
-                        if primary_available {
-                            "primary"
-                        } else {
-                            "backup"
-                        }
-                    );
+                    assert_eq!(chain.call_transcript(opts, "Synthetic task").await.unwrap(),
+                        if primary_available { "primary" } else { "backup" });
                 }
                 assert_eq!(primary.count(), if primary_available { 2 } else { 1 });
                 assert_eq!(backup.count(), if primary_available { 0 } else { 2 });
@@ -2924,29 +2079,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_capacity_exhaustion_never_fans_out_or_latches_provider() {
-        let dir = tempfile::tempdir().unwrap();
-        let latch = latch_in(&dir);
-        let primary = Scripted::err(|| {
-            ReasonerError::ResourceCapacity {
-                provider: "codex".into(),
-                message: "synthetic PID ceiling".into(),
-            }
-            .into()
-        });
-        let fallback = Scripted::ok("must not run");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Codex, primary),
-                (ProviderKind::Claude, fallback.clone()),
-            ],
-            latch.clone(),
-        );
-        let error = chain.call(&text_only_opts(), "request").await.unwrap_err();
-        assert!(matches!(
-            ReasonerError::find_in(&error),
-            Some(ReasonerError::ResourceCapacity { .. })
-        ));
-        assert_eq!(fallback.count(), 0);
+        let dir=tempfile::tempdir().unwrap();let latch=latch_in(&dir);
+        let primary=Scripted::err(||ReasonerError::ResourceCapacity {provider:"codex".into(),message:"synthetic PID ceiling".into()}.into());
+        let fallback=Scripted::ok("must not run");
+        let chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,primary),(ProviderKind::Claude,fallback.clone())],latch.clone());
+        let error=chain.call(&text_only_opts(),"request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error),Some(ReasonerError::ResourceCapacity {..})));
+        assert_eq!(fallback.count(),0);
         assert!(latch.latched_until("codex").is_none());
     }
 
@@ -2954,28 +2093,13 @@ mod tests {
     async fn unverified_process_cleanup_blocks_fallback_without_latching() {
         let dir = tempfile::tempdir().unwrap();
         let latch = latch_in(&dir);
-        let primary = Scripted::err(|| {
-            ReasonerError::CleanupUncertain {
-                provider: "claude".into(),
-            }
-            .into()
-        });
+        let primary = Scripted::err(|| ReasonerError::CleanupUncertain { provider:"claude".into() }.into());
         let fallback = Scripted::ok("must not run while old tools may be alive");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary),
-                (ProviderKind::Codex, fallback.clone()),
-            ],
-            latch.clone(),
-        );
-        let error = chain
-            .call(&text_only_opts(), "synthetic request")
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            ReasonerError::find_in(&error),
-            Some(ReasonerError::CleanupUncertain { .. })
-        ));
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, fallback.clone()),
+        ], latch.clone());
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::CleanupUncertain { .. })));
         assert_eq!(fallback.count(), 0);
         assert!(latch.latched_until("claude").is_none());
     }
@@ -2989,24 +2113,11 @@ mod tests {
         let latch = latch_in(&dir);
         let primary = Scripted::err(|| crate::reasoner::interrupted_error("claude", 15));
         let fallback = Scripted::ok("must not run inside a dying unit");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary),
-                (ProviderKind::Codex, fallback.clone()),
-            ],
-            latch.clone(),
-        );
-        let error = chain
-            .call(&text_only_opts(), "synthetic request")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                ReasonerError::find_in(&error),
-                Some(ReasonerError::Interrupted { signal: 15, .. })
-            ),
-            "{error:#}"
-        );
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, fallback.clone()),
+        ], latch.clone());
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Interrupted { signal: 15, .. })), "{error:#}");
         assert_eq!(fallback.count(), 0);
         assert!(latch.latched_until("claude").is_none());
     }
@@ -3020,76 +2131,38 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let cases = [
-            (
-                "empty",
-                r#"echo '{"type":"turn.started"}'
+            ("empty", r#"echo '{"type":"turn.started"}'
 echo '{"type":"turn.completed","usage":{"input_tokens":1}}'
-"#,
-                false,
-            ),
-            (
-                "context-window",
-                r#"echo '{"type":"turn.started"}'
+"#, false),
+            ("context-window", r#"echo '{"type":"turn.started"}'
 echo '{"type":"turn.failed","error":{"message":"Codex ran out of room in the model context window. Start a new thread."}}'
 exit 1
-"#,
-                false,
-            ),
-            (
-                "usage-limit",
-                r#"echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
+"#, false),
+            ("usage-limit", r#"echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
 exit 1
-"#,
-                true,
-            ),
-            (
-                "stream-disconnected",
-                r#"echo '{"type":"turn.started"}'
+"#, true),
+            ("stream-disconnected", r#"echo '{"type":"turn.started"}'
 echo '{"type":"turn.failed","error":{"message":"stream disconnected before completion: error sending request"}}'
 exit 1
-"#,
-                true,
-            ),
+"#, true),
         ];
         for (name, body, provider_side) in cases {
             let bin = dir.path().join(format!("fake-codex-{name}"));
-            augmentagent_test_support::write_executable(
-                &bin,
-                format!("#!/usr/bin/env bash\ncat >/dev/null\n{body}"),
-            )
-            .unwrap();
+            augmentagent_test_support::write_executable(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\n{body}")).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let latch = CooldownLatch::at(dir.path().join(format!("{name}-cooldowns.json")));
             let backup = Scripted::ok("served by the next provider");
-            let codex =
-                crate::codex::CodexCliReasoner::with_bin(bin.to_string_lossy().into_owned());
-            let chain = FallbackReasoner::for_tests(
-                vec![
-                    (ProviderKind::Codex, Arc::new(codex) as Arc<dyn Reasoner>),
-                    (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
-                ],
-                latch.clone(),
-            );
+            let codex = crate::codex::CodexCliReasoner::with_bin(bin.to_string_lossy().into_owned());
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Codex, Arc::new(codex) as Arc<dyn Reasoner>),
+                (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+            ], latch.clone());
             let result = chain.call(&text_only_opts(), "synthetic request").await;
-            assert_eq!(
-                latch.latched_until("codex").is_some(),
-                provider_side,
-                "{name}: latch"
-            );
-            assert_eq!(
-                backup.count(),
-                usize::from(provider_side),
-                "{name}: chain advance"
-            );
+            assert_eq!(latch.latched_until("codex").is_some(), provider_side, "{name}: latch");
+            assert_eq!(backup.count(), usize::from(provider_side), "{name}: chain advance");
             match result {
-                Ok(text) => assert!(
-                    provider_side && text == "served by the next provider",
-                    "{name}: {text}"
-                ),
-                Err(err) => assert!(
-                    !provider_side && ReasonerError::find_in(&err).is_none(),
-                    "{name}: {err:#}"
-                ),
+                Ok(text) => assert!(provider_side && text == "served by the next provider", "{name}: {text}"),
+                Err(err) => assert!(!provider_side && ReasonerError::find_in(&err).is_none(), "{name}: {err:#}"),
             }
         }
     }
@@ -3105,11 +2178,7 @@ exit 1
 
     impl Journaling {
         fn new(operations: serde_json::Value, outcome: fn() -> anyhow::Error) -> Arc<Self> {
-            Arc::new(Self {
-                operations,
-                outcome,
-                messages: std::sync::Mutex::new(Vec::new()),
-            })
+            Arc::new(Self { operations, outcome, messages: std::sync::Mutex::new(Vec::new()) })
         }
         fn count(&self) -> usize {
             self.messages.lock().unwrap().len()
@@ -3122,21 +2191,10 @@ exit 1
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             self.messages.lock().unwrap().push(message.to_string());
-            let path = opts
-                .handoff_path
-                .as_ref()
-                .expect("mutating calls carry an operation journal");
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)?;
-            file.write_all(
-                serde_json::json!({"version": 1, "operations": self.operations})
-                    .to_string()
-                    .as_bytes(),
-            )?;
+            let path = opts.handoff_path.as_ref().expect("mutating calls carry an operation journal");
+            let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true)
+                .mode(0o600).open(path)?;
+            file.write_all(serde_json::json!({"version": 1, "operations": self.operations}).to_string().as_bytes())?;
             Err((self.outcome)())
         }
     }
@@ -3158,10 +2216,7 @@ exit 1
         let mut opts = crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki);
         opts.settings_json = None; // #1094 hook ⇒ FullAgentic; this test wants the WriteTools shape
         opts.session_id = Some("synthetic-turn-1040".into());
-        assert_eq!(
-            classify(&opts),
-            crate::providers::CapabilityClass::WriteTools
-        );
+        assert_eq!(classify(&opts), crate::providers::CapabilityClass::WriteTools);
         opts
     }
 
@@ -3174,51 +2229,26 @@ exit 1
         let latch = latch_in(&dir);
         let primary = Journaling::new(completed_operation(), no_summary);
         let backup = Scripted::ok("must not repeat the completed write");
-        let mut chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
-                (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
-            ],
-            latch.clone(),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+        ], latch.clone());
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
         let expected = crate::handoff_outcome::CompletedWithoutSummary { completed: 1 };
         for attempt in 0..3 {
-            let err = chain
-                .call(&opts, "Synthetic ingest request")
-                .await
-                .unwrap_err();
-            assert!(
-                ReasonerError::find_in(&err).is_none(),
-                "attempt {attempt} must stay untyped: {err:#}"
-            );
-            assert_eq!(
-                err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>(),
-                Some(&expected),
-                "attempt {attempt}: {err:#}"
-            );
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "attempt {attempt} must stay untyped: {err:#}");
+            assert_eq!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>(), Some(&expected),
+                "attempt {attempt}: {err:#}");
             if attempt == 0 {
-                assert!(
-                    format!("{err:#}").contains("codex produced no assistant text"),
-                    "the provider's own ending stays in the chain: {err:#}"
-                );
+                assert!(format!("{err:#}").contains("codex produced no assistant text"),
+                    "the provider's own ending stays in the chain: {err:#}");
             }
         }
-        assert_eq!(
-            primary.count(),
-            1,
-            "a caller retry must not re-dispatch completed work"
-        );
-        assert_eq!(
-            backup.count(),
-            0,
-            "the chain must not re-run completed work elsewhere"
-        );
-        assert!(
-            latch.active().is_empty(),
-            "a content-level ending latches nothing"
-        );
+        assert_eq!(primary.count(), 1, "a caller retry must not re-dispatch completed work");
+        assert_eq!(backup.count(), 0, "the chain must not re-run completed work elsewhere");
+        assert!(latch.active().is_empty(), "a content-level ending latches nothing");
     }
 
     /// #1069 review M1(b) — the journal sweep removes a request's journal
@@ -3229,47 +2259,21 @@ exit 1
     async fn a_verdict_that_outlives_its_journal_still_refuses_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Journaling::new(completed_operation(), no_summary);
-        let mut chain = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
-        let first = chain
-            .call(&opts, "Synthetic ingest request")
-            .await
-            .unwrap_err();
-        assert!(
-            first
-                .downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>()
-                .is_some(),
-            "{first:#}"
-        );
-        let journal =
-            crate::handoff::request_path(chain.handoff_root.as_ref().unwrap(), &opts).unwrap();
+        let first = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+        assert!(first.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_some(), "{first:#}");
+        let journal = crate::handoff::request_path(chain.handoff_root.as_ref().unwrap(), &opts).unwrap();
         std::fs::remove_file(&journal).unwrap();
-        let replay = chain
-            .call(&opts, "Synthetic ingest request")
-            .await
-            .unwrap_err();
-        assert!(
-            replay
-                .downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>()
-                .is_some(),
-            "{replay:#}"
-        );
-        assert_eq!(
-            primary.count(),
-            1,
-            "a half-swept request is not dispatched again"
-        );
+        let replay = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+        assert!(replay.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_some(), "{replay:#}");
+        assert_eq!(primary.count(), 1, "a half-swept request is not dispatched again");
         std::fs::remove_file(journal.with_file_name(crate::handoff::VERDICT_FILE)).unwrap();
         let _ = chain.call(&opts, "Synthetic ingest request").await;
-        assert_eq!(
-            primary.count(),
-            2,
-            "with the verdict gone too, a replay runs the request again in full"
-        );
+        assert_eq!(primary.count(), 2, "with the verdict gone too, a replay runs the request again in full");
     }
 
     /// #1040 C3 negative control: with no completed operation there is
@@ -3279,50 +2283,31 @@ exit 1
     async fn content_level_end_without_completed_operations_stays_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Journaling::new(serde_json::json!([]), no_summary);
-        let mut chain = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
         for _ in 0..2 {
-            let err = chain
-                .call(&opts, "Synthetic ingest request")
-                .await
-                .unwrap_err();
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
             assert_eq!(err.to_string(), "codex produced no assistant text");
-            assert!(err
-                .downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>()
-                .is_none());
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none());
         }
         assert_eq!(primary.count(), 2);
     }
 
     /// A stub CLI that records one line per spawn in the returned file.
-    fn counting_stub(
-        dir: &tempfile::TempDir,
-        name: &str,
-        body: &str,
-    ) -> (String, std::path::PathBuf) {
+    fn counting_stub(dir: &tempfile::TempDir, name: &str, body: &str) -> (String, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.path().join(name);
         let count = dir.path().join(format!("{name}.count"));
-        augmentagent_test_support::write_executable(
-            &bin,
-            format!(
-                "#!/usr/bin/env bash\ncat >/dev/null\necho spawn >> '{}'\n{body}",
-                count.display()
-            ),
-        )
-        .unwrap();
+        augmentagent_test_support::write_executable(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\necho spawn >> '{}'\n{body}", count.display())).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         (bin.to_string_lossy().into_owned(), count)
     }
 
     fn spawns(count: &std::path::Path) -> usize {
-        std::fs::read_to_string(count)
-            .map(|text| text.lines().count())
-            .unwrap_or(0)
+        std::fs::read_to_string(count).map(|text| text.lines().count()).unwrap_or(0)
     }
 
     /// A turn that began and failed with text the table does not recognise
@@ -3342,37 +2327,18 @@ exit 1
         let mut read = text_only_opts();
         read.allowed_tools = vec!["Read".into(), "Grep".into()];
         for (label, opts) in [("text", text_only_opts()), ("read", read)] {
-            let (bin, count) =
-                counting_stub(&dir, &format!("fake-codex-{label}"), UNRECOGNISED_TURN);
+            let (bin, count) = counting_stub(&dir, &format!("fake-codex-{label}"), UNRECOGNISED_TURN);
             let latch = CooldownLatch::at(dir.path().join(format!("{label}-cooldowns.json")));
             let backup = Scripted::ok("served by the next provider");
-            let chain = FallbackReasoner::for_tests(
-                vec![
-                    (
-                        ProviderKind::Codex,
-                        Arc::new(crate::codex::CodexCliReasoner::with_bin(bin))
-                            as Arc<dyn Reasoner>,
-                    ),
-                    (ProviderKind::Gemini, backup.clone() as Arc<dyn Reasoner>),
-                ],
-                latch.clone(),
-            );
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Codex, Arc::new(crate::codex::CodexCliReasoner::with_bin(bin)) as Arc<dyn Reasoner>),
+                (ProviderKind::Gemini, backup.clone() as Arc<dyn Reasoner>),
+            ], latch.clone());
             for _ in 0..3 {
-                assert_eq!(
-                    chain.call(&opts, "synthetic triage").await.unwrap(),
-                    "served by the next provider",
-                    "{label}"
-                );
+                assert_eq!(chain.call(&opts, "synthetic triage").await.unwrap(), "served by the next provider", "{label}");
             }
-            assert!(
-                latch.latched_until("codex").is_some(),
-                "{label}: codex must be latched"
-            );
-            assert_eq!(
-                spawns(&count),
-                1,
-                "{label}: a latched codex is not respawned per call"
-            );
+            assert!(latch.latched_until("codex").is_some(), "{label}: codex must be latched");
+            assert_eq!(spawns(&count), 1, "{label}: a latched codex is not respawned per call");
             assert_eq!(backup.count(), 3, "{label}");
         }
     }
@@ -3388,44 +2354,18 @@ exit 1
         let (bin, count) = counting_stub(&dir, "fake-codex-write", UNRECOGNISED_TURN);
         let latch = latch_in(&dir);
         let backup = Scripted::ok("a new request served elsewhere");
-        let chain = FallbackReasoner::for_tests(
-            vec![
-                (
-                    ProviderKind::Codex,
-                    Arc::new(crate::codex::CodexCliReasoner::with_bin(bin)) as Arc<dyn Reasoner>,
-                ),
-                (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
-            ],
-            latch.clone(),
-        );
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, Arc::new(crate::codex::CodexCliReasoner::with_bin(bin)) as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+        ], latch.clone());
         let opts = write_request(&dir);
         for strike in 1..=3 {
-            let err = chain
-                .call(&opts, "Synthetic ingest request")
-                .await
-                .unwrap_err();
-            assert!(
-                ReasonerError::find_in(&err).is_none(),
-                "strike {strike}: {err:#}"
-            );
-            assert_eq!(
-                backup.count(),
-                0,
-                "strike {strike}: the failed write is never re-run elsewhere"
-            );
-            assert_eq!(
-                latch.latched_until("codex").is_some(),
-                strike == 3,
-                "strike {strike}: latch"
-            );
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "strike {strike}: {err:#}");
+            assert_eq!(backup.count(), 0, "strike {strike}: the failed write is never re-run elsewhere");
+            assert_eq!(latch.latched_until("codex").is_some(), strike == 3, "strike {strike}: latch");
         }
-        assert_eq!(
-            chain
-                .call(&opts, "Another synthetic ingest request")
-                .await
-                .unwrap(),
-            "a new request served elsewhere"
-        );
+        assert_eq!(chain.call(&opts, "Another synthetic ingest request").await.unwrap(), "a new request served elsewhere");
         assert_eq!(spawns(&count), 3, "a backed-off codex is not respawned");
     }
 
@@ -3448,62 +2388,28 @@ exit 1
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                let path = opts
-                    .handoff_path
-                    .as_ref()
-                    .expect("mutating calls carry an operation journal");
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(path)?
-                    .write_all(
-                        serde_json::json!({"version": 1, "operations": completed_operation()})
-                            .to_string()
-                            .as_bytes(),
-                    )?;
+                let path = opts.handoff_path.as_ref().expect("mutating calls carry an operation journal");
+                std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path)?
+                    .write_all(serde_json::json!({"version": 1, "operations": completed_operation()}).to_string().as_bytes())?;
                 self.inner.call(opts, message).await
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let (bin, count) = counting_stub(
-            &dir,
-            "fake-codex-killed",
-            "echo '{\"type\":\"turn.started\"}'\nkill -SEGV $$\n",
-        );
-        let primary = Arc::new(EffectThenKilled {
-            inner: crate::codex::CodexCliReasoner::with_bin(bin),
-            calls: AtomicUsize::new(0),
-        });
-        let mut chain = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let (bin, count) = counting_stub(&dir, "fake-codex-killed", "echo '{\"type\":\"turn.started\"}'\nkill -SEGV $$\n");
+        let primary = Arc::new(EffectThenKilled { inner: crate::codex::CodexCliReasoner::with_bin(bin), calls: AtomicUsize::new(0) });
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
         for attempt in 0..2 {
-            let err = chain
-                .call(&opts, "Synthetic ingest request")
-                .await
-                .unwrap_err();
-            assert!(
-                err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>()
-                    .is_none(),
-                "attempt {attempt}: an unfinished request is not completed: {err:#}"
-            );
-            assert_eq!(
-                err.downcast_ref::<crate::turn_failure::TurnFailure>()
-                    .map(|f| f.class),
-                Some(crate::turn_failure::FailureClass::Unrecognised),
-                "attempt {attempt}"
-            );
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none(),
+                "attempt {attempt}: an unfinished request is not completed: {err:#}");
+            assert_eq!(err.downcast_ref::<crate::turn_failure::TurnFailure>().map(|f| f.class),
+                Some(crate::turn_failure::FailureClass::Unrecognised), "attempt {attempt}");
         }
-        assert_eq!(
-            primary.calls.load(Ordering::SeqCst),
-            2,
-            "the unfinished request is dispatched again"
-        );
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 2, "the unfinished request is dispatched again");
         assert_eq!(spawns(&count), 2);
     }
 
@@ -3517,32 +2423,19 @@ exit 1
         rows.as_array_mut().unwrap().push(serde_json::json!(
             {"tool": "mcp__fixture__update", "arguments": {}, "status": "started"}));
         let primary = Journaling::new(rows, no_summary);
-        let mut chain = FallbackReasoner::for_tests(
-            vec![(ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>)],
-            latch_in(&dir),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
         for attempt in 0..2 {
-            let err = chain
-                .call(&opts, "Synthetic ingest request")
-                .await
-                .unwrap_err();
-            assert!(
-                err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>()
-                    .is_none(),
-                "attempt {attempt}: {err:#}"
-            );
-            assert!(
-                format!("{err:#}").contains("reconciliation"),
-                "attempt {attempt}: {err:#}"
-            );
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none(),
+                "attempt {attempt}: {err:#}");
+            assert!(format!("{err:#}").contains("reconciliation"), "attempt {attempt}: {err:#}");
         }
         assert_eq!(primary.count(), 2);
-        assert!(
-            primary.messages.lock().unwrap()[1].contains("started"),
-            "the retry carries the uncertain receipt"
-        );
+        assert!(primary.messages.lock().unwrap()[1].contains("started"), "the retry carries the uncertain receipt");
     }
 
     /// #1040 keeps the #1021 handoff contract: a provider-side interruption
@@ -3562,26 +2455,18 @@ exit 1
         let dir = tempfile::tempdir().unwrap();
         let primary = Journaling::new(completed_operation(), rate_limited);
         let backup = Arc::new(Resuming(std::sync::Mutex::new(Vec::new())));
-        let mut chain = FallbackReasoner::for_tests(
-            vec![
-                (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
-                (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
-            ],
-            latch_in(&dir),
-        );
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
-        assert_eq!(
-            chain.call(&opts, "Synthetic ingest request").await.unwrap(),
-            "resumed from receipts"
-        );
+        assert_eq!(chain.call(&opts, "Synthetic ingest request").await.unwrap(), "resumed from receipts");
         assert_eq!(primary.count(), 1);
         let handed = backup.0.lock().unwrap().clone();
         assert_eq!(handed.len(), 1);
-        assert!(
-            handed[0].starts_with("Synthetic ingest request") && handed[0].contains("synthetic-42"),
-            "the next provider must receive the completed receipt: {handed:?}"
-        );
+        assert!(handed[0].starts_with("Synthetic ingest request") && handed[0].contains("synthetic-42"),
+            "the next provider must receive the completed receipt: {handed:?}");
     }
 
     #[tokio::test]
@@ -3663,5 +2548,5 @@ exit 1
 }
 
 #[cfg(test)]
-#[path = "fallback_review_recovery_tests.rs"]
+#[path="fallback_review_recovery_tests.rs"]
 mod review_recovery_tests;

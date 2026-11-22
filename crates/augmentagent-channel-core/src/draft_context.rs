@@ -157,8 +157,7 @@ fn load_seed_at(
         gaps: Vec::new(),
     };
     let cutoff = augmentagent_store::conversation_context::conversation_timestamp_ms(
-        &current.platform,
-        &current.date,
+        &current.platform, &current.date,
     );
     if cutoff.is_none() {
         seed.gaps.push(
@@ -230,17 +229,9 @@ fn load_seed_at(
                 message.message_id
             ));
         }
-        if message
-            .timestamp
-            .as_deref()
-            .and_then(|raw| {
-                augmentagent_store::conversation_context::conversation_timestamp_ms(
-                    &message.platform,
-                    raw,
-                )
-            })
-            .is_none()
-        {
+        if message.timestamp.as_deref().and_then(|raw|
+            augmentagent_store::conversation_context::conversation_timestamp_ms(&message.platform, raw)
+        ).is_none() {
             seed.gaps.push(format!(
                 "Message timestamp unavailable: {}",
                 message.message_id

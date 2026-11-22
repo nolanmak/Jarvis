@@ -301,9 +301,7 @@ mod tests {
             r.call(&o, "hi").await.unwrap();
             let want = model_for(ProviderKind::Cerebras, tier);
             assert!(
-                seen.await
-                    .unwrap()
-                    .contains(&format!(r#""model":"{want}""#)),
+                seen.await.unwrap().contains(&format!(r#""model":"{want}""#)),
                 "cerebras must post model {want}"
             );
         }
@@ -313,14 +311,8 @@ mod tests {
     async fn http_429_maps_to_rate_limited_and_402_too() {
         std::env::set_var("CEREBRAS_API_KEY", "test-key");
         for (status, body) in [
-            (
-                "429 Too Many Requests",
-                r#"{"message":"tokens per minute exceeded"}"#,
-            ),
-            (
-                "402 Payment Required",
-                r#"{"message":"insufficient credits"}"#,
-            ),
+            ("429 Too Many Requests", r#"{"message":"tokens per minute exceeded"}"#),
+            ("402 Payment Required", r#"{"message":"insufficient credits"}"#),
         ] {
             let (base, _seen) = one_shot_server(status, body).await;
             let r = CerebrasHttpReasoner::with_base(base);
@@ -345,10 +337,7 @@ mod tests {
         let got = list_models(&reqwest::Client::new(), &base, "test-key")
             .await
             .unwrap();
-        assert_eq!(
-            got,
-            vec!["gpt-oss-120b".to_string(), "gemma-4-31b".to_string()]
-        );
+        assert_eq!(got, vec!["gpt-oss-120b".to_string(), "gemma-4-31b".to_string()]);
     }
 
     #[tokio::test]
@@ -358,10 +347,7 @@ mod tests {
         let err = list_models(&reqwest::Client::new(), &base, "sk-not-a-real-key")
             .await
             .unwrap_err();
-        assert!(
-            err.contains("auth"),
-            "401 must read as an auth failure: {err}"
-        );
+        assert!(err.contains("auth"), "401 must read as an auth failure: {err}");
         assert!(
             !err.contains("sk-not-a-real-key"),
             "the key must never reach a doctor finding: {err}"

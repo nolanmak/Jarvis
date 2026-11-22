@@ -447,7 +447,10 @@ impl Hold {
     pub fn supervisor(&self) -> &Path {
         self.supervisor.as_ref().unwrap().path()
     }
-    pub fn bind(&mut self, admission: &crate::run_resources::CommandAdmission) -> Result<()> {
+    pub fn bind(
+        &mut self,
+        admission: &crate::run_resources::CommandAdmission,
+    ) -> Result<()> {
         self.record.supervisor.unchanged()?;
         for protected in &self.record.protected {
             protected.unchanged()?;

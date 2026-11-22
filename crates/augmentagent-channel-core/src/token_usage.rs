@@ -115,9 +115,7 @@ pub fn codex_turn_usage(event: &serde_json::Value) -> Option<TokenUsage> {
     let cache_read = n("cached_input_tokens");
     let cache_creation = n("cache_write_input_tokens");
     let usage = TokenUsage {
-        input: n("input_tokens")
-            .saturating_sub(cache_read)
-            .saturating_sub(cache_creation),
+        input: n("input_tokens").saturating_sub(cache_read).saturating_sub(cache_creation),
         output: n("output_tokens"),
         cache_creation,
         cache_read,
@@ -307,15 +305,7 @@ impl UnfinishedCallGuard {
         class: crate::providers::CapabilityClass,
         started: std::time::Instant,
     ) -> Self {
-        Self {
-            logger,
-            provider,
-            model: model.into(),
-            class,
-            started,
-            armed: true,
-            observed_usage: None,
-        }
+        Self { logger, provider, model: model.into(), class, started, armed: true, observed_usage: None }
     }
 
     /// Retain the latest cumulative report if execution later yields or aborts.
@@ -406,8 +396,10 @@ pub fn rollup(ndjson: &str) -> Vec<DayTotals> {
     }
     days.into_iter()
         .map(|(day, (calls, usage, models, providers))| {
-            let mut by_model: Vec<(String, u64, u64)> =
-                models.into_iter().map(|(m, (c, t))| (m, c, t)).collect();
+            let mut by_model: Vec<(String, u64, u64)> = models
+                .into_iter()
+                .map(|(m, (c, t))| (m, c, t))
+                .collect();
             // Biggest consumer first; ties by name so the output is stable.
             by_model.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
             DayTotals {
@@ -427,11 +419,7 @@ fn rank_providers(
 ) -> Vec<ProviderTotals> {
     let mut ranked: Vec<ProviderTotals> = providers
         .into_iter()
-        .map(|(provider, (calls, usage))| ProviderTotals {
-            provider,
-            calls,
-            usage,
-        })
+        .map(|(provider, (calls, usage))| ProviderTotals { provider, calls, usage })
         .collect();
     ranked.sort_by(|a, b| {
         b.usage
@@ -592,16 +580,7 @@ mod tests {
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3}}"#,
         ).unwrap();
         let u = codex_turn_usage(&old).unwrap();
-        assert_eq!(
-            (
-                u.input,
-                u.cache_read,
-                u.cache_creation,
-                u.output,
-                u.reasoning_output
-            ),
-            (6, 4, 0, 3, 0)
-        );
+        assert_eq!((u.input, u.cache_read, u.cache_creation, u.output, u.reasoning_output), (6, 4, 0, 3, 0));
         // A malformed report (cache larger than input) never underflows.
         let odd: serde_json::Value = serde_json::from_str(
             r#"{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":5,"output_tokens":1}}"#,
@@ -632,10 +611,7 @@ mod tests {
         assert_eq!(rec.usage.reasoning_output, 0);
         assert_eq!(rec.usage.total(), 22);
         let claude_line = serde_json::to_string(&rec).unwrap();
-        assert!(
-            !claude_line.contains("reasoning_output"),
-            "a zero breakdown is not written: {claude_line}"
-        );
+        assert!(!claude_line.contains("reasoning_output"), "a zero breakdown is not written: {claude_line}");
         let mut codex = rec.clone();
         codex.provider = "codex".into();
         codex.usage.reasoning_output = 2;
@@ -647,11 +623,7 @@ mod tests {
 
     #[test]
     fn a_call_record_names_its_provider_model_and_class() {
-        let usage = TokenUsage {
-            input: 1,
-            output: 2,
-            ..Default::default()
-        };
+        let usage = TokenUsage { input: 1, output: 2, ..Default::default() };
         let rec = UsageRecord::for_call(
             crate::providers::ProviderKind::Codex,
             "gpt-synthetic",
@@ -659,25 +631,13 @@ mod tests {
             usage,
             std::time::Instant::now(),
         );
-        assert_eq!(
-            (
-                rec.provider.as_str(),
-                rec.model.as_str(),
-                rec.class.as_str()
-            ),
-            ("codex", "gpt-synthetic", "WriteTools")
-        );
+        assert_eq!((rec.provider.as_str(), rec.model.as_str(), rec.class.as_str()), ("codex", "gpt-synthetic", "WriteTools"));
         assert_eq!(rec.usage, usage);
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(&rec.ts).is_ok(),
-            "{}",
-            rec.ts
-        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&rec.ts).is_ok(), "{}", rec.ts);
     }
 
     fn rec_for(provider: &str, ts: &str, model: &str, input: u64, output: u64) -> String {
-        let mut v: serde_json::Value =
-            serde_json::from_str(&rec(ts, model, input, output)).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&rec(ts, model, input, output)).unwrap();
         v["provider"] = serde_json::json!(provider);
         v.to_string()
     }
@@ -697,49 +657,20 @@ mod tests {
         let days = rollup(&log);
         assert_eq!(days[0].by_provider.len(), 2);
         assert_eq!(days[0].by_provider[0].provider, "claude", "biggest first");
-        assert_eq!(
-            (
-                days[0].by_provider[0].calls,
-                days[0].by_provider[0].usage.total()
-            ),
-            (1, 110)
-        );
+        assert_eq!((days[0].by_provider[0].calls, days[0].by_provider[0].usage.total()), (1, 110));
         assert_eq!(days[1].by_provider[0].provider, "codex");
-        assert_eq!(
-            (
-                days[1].by_provider[0].calls,
-                days[1].by_provider[0].usage.total()
-            ),
-            (2, 340)
-        );
+        assert_eq!((days[1].by_provider[0].calls, days[1].by_provider[0].usage.total()), (2, 340));
         let out = format_report(&days);
-        let section = out
-            .split("by provider")
-            .nth(1)
-            .unwrap_or_else(|| panic!("no provider section: {out}"));
-        let line = |name: &str| {
-            section
-                .lines()
-                .find(|l| l.trim_start().starts_with(name))
-                .unwrap_or_else(|| panic!("no {name} line: {out}"))
-                .to_string()
-        };
+        let section = out.split("by provider").nth(1).unwrap_or_else(|| panic!("no provider section: {out}"));
+        let line = |name: &str| section.lines().find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line: {out}")).to_string();
         // Every column that makes up the total is printed.
-        assert!(
-            section.contains("cache_wr") && section.contains("cache_rd"),
-            "{out}"
-        );
+        assert!(section.contains("cache_wr") && section.contains("cache_rd"), "{out}");
         // Totals over every day in the report, not just the last.
         let codex = line("codex");
-        assert!(
-            codex.contains(" 3 calls") && codex.ends_with(" 384"),
-            "{codex}"
-        );
+        assert!(codex.contains(" 3 calls") && codex.ends_with(" 384"), "{codex}");
         let claude = line("claude");
-        assert!(
-            claude.contains(" 2 calls") && claude.ends_with(" 121"),
-            "{claude}"
-        );
+        assert!(claude.contains(" 2 calls") && claude.ends_with(" 121"), "{claude}");
         // And the --json shape carries it too.
         let json = serde_json::to_value(&days).unwrap();
         assert_eq!(json[1]["by_provider"][0]["provider"], "codex");
@@ -828,15 +759,8 @@ mod tests {
         logger.append(&serde_json::from_str(&rec("2020-01-01T00:00:00Z", "m", 5, 5)).unwrap());
         logger.append(&serde_json::from_str(&rec("2020-01-02T00:00:00Z", "m", 5, 5)).unwrap());
         let back = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            back.lines().count(),
-            2,
-            "an explicit logger never deletes: {back}"
-        );
-        assert!(
-            UsageLogger::global().manages_retention,
-            "the daemon log does"
-        );
+        assert_eq!(back.lines().count(), 2, "an explicit logger never deletes: {back}");
+        assert!(UsageLogger::global().manages_retention, "the daemon log does");
     }
 
     #[test]
@@ -876,15 +800,10 @@ mod tests {
         );
         assert!(p.to_string_lossy().ends_with("token-usage.jsonl"));
         std::env::set_var("AUGMENTAGENT_TOKEN_USAGE_LOG", "/tmp/aa-usage-test.jsonl");
-        assert_eq!(
-            default_usage_log_path(),
-            PathBuf::from("/tmp/aa-usage-test.jsonl")
-        );
+        assert_eq!(default_usage_log_path(), PathBuf::from("/tmp/aa-usage-test.jsonl"));
         // An empty override falls back rather than writing to "".
         std::env::set_var("AUGMENTAGENT_TOKEN_USAGE_LOG", "  ");
-        assert!(default_usage_log_path()
-            .to_string_lossy()
-            .ends_with("token-usage.jsonl"));
+        assert!(default_usage_log_path().to_string_lossy().ends_with("token-usage.jsonl"));
         match prev {
             Some(v) => std::env::set_var("AUGMENTAGENT_TOKEN_USAGE_LOG", v),
             None => std::env::remove_var("AUGMENTAGENT_TOKEN_USAGE_LOG"),
@@ -971,10 +890,8 @@ mod tests {
         finished.finish();
         drop(finished);
         let raw = std::fs::read_to_string(logger.path()).unwrap();
-        let rows: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let rows: Vec<serde_json::Value> =
+            raw.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(rows.len(), 1, "{raw}");
         assert_eq!(rows[0]["outcome"], "unfinished");
         assert_eq!(rows[0]["model"], "claude-opus-4-8");

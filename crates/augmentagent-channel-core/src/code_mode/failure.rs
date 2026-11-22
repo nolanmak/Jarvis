@@ -315,9 +315,8 @@ pub async fn handle_code_mode_failure(
         // #1779 D3 — a host-signal stop (deploy restart) or an unverified
         // cleanup skips repair too: the repair call would spawn inside the
         // dying daemon, or on top of a tree nobody proved reaped.
-        if let Some(
-            re @ (ReasonerError::Interrupted { .. } | ReasonerError::CleanupUncertain { .. }),
-        ) = ReasonerError::find_in(inner)
+        if let Some(re @ (ReasonerError::Interrupted { .. } | ReasonerError::CleanupUncertain { .. })) =
+            ReasonerError::find_in(inner)
         {
             warn!(
                 message_id = %ctx.email.message_id,
@@ -869,7 +868,7 @@ mod tests {
         email: Email,
     ) -> FailureCtx<'a> {
         FailureCtx {
-            draft_context: None,
+                            draft_context: None,
             reasoner,
             opts: ReasonerOpts {
                 system_prompt: String::new(),
@@ -982,9 +981,7 @@ mod tests {
     async fn interrupted_or_cleanup_uncertain_skips_self_repair() {
         for err in [
             crate::reasoner::interrupted_error("claude", 15),
-            anyhow::Error::new(crate::reasoner::ReasonerError::CleanupUncertain {
-                provider: "claude".into(),
-            }),
+            anyhow::Error::new(crate::reasoner::ReasonerError::CleanupUncertain { provider: "claude".into() }),
         ] {
             let store = tmp_store();
             let broker: Arc<dyn ApprovalBroker> = Arc::new(NoopBroker);
@@ -996,22 +993,11 @@ mod tests {
             match handle_code_mode_failure(&ctx, "", &failed, FailureStage::CallCodeMode).await {
                 DraftOutcome::ClassicNeeded(rec) => {
                     assert!(rec.repair_source.is_none(), "{label}");
-                    assert!(
-                        rec.repair_error
-                            .as_deref()
-                            .unwrap_or("")
-                            .contains("skipped"),
-                        "{label}: {:?}",
-                        rec.repair_error
-                    );
+                    assert!(rec.repair_error.as_deref().unwrap_or("").contains("skipped"), "{label}: {:?}", rec.repair_error);
                 }
                 other => panic!("{label}: expected ClassicNeeded, got {other:?}"),
             }
-            assert_eq!(
-                r.responses.lock().unwrap().len(),
-                1,
-                "{label}: repair must not fire"
-            );
+            assert_eq!(r.responses.lock().unwrap().len(), 1, "{label}: repair must not fire");
         }
     }
 

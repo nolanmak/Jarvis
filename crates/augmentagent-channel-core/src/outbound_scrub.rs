@@ -164,10 +164,7 @@ mod tests {
         assert!(!out.body.contains("Quarterly planning"));
 
         let crlf = format!("Line one\r\n{hint}\r\nLine two\r\n");
-        assert_eq!(
-            scrub_internal_context(&crlf).body,
-            "Line one\r\nLine two\r\n"
-        );
+        assert_eq!(scrub_internal_context(&crlf).body, "Line one\r\nLine two\r\n");
     }
 
     /// The #1579 leak as it was delivered: the reply's closing paragraph was
@@ -180,10 +177,7 @@ mod tests {
                     - The owner keeps notes of their own on this topic: \"Venue shortlist\". \
                     Treat it as a topic they are actively tracking.\n";
         let out = scrub_internal_context(body);
-        assert_eq!(
-            out.body,
-            "Thanks for the nudge — Thursday at 2 works on my end.\n\n"
-        );
+        assert_eq!(out.body, "Thanks for the nudge — Thursday at 2 works on my end.\n\n");
         assert!(!out.is_empty());
     }
 
@@ -232,17 +226,10 @@ mod tests {
     /// leaving an echo of it unguarded.
     #[test]
     fn every_block_tag_is_one_a_prompt_still_renders() {
-        let renderers = [
-            include_str!("prompt.rs"),
-            include_str!("archetype.rs"),
-            include_str!("resolve.rs"),
-        ];
+        let renderers = [include_str!("prompt.rs"), include_str!("archetype.rs"), include_str!("resolve.rs")];
         for (name, tag) in BLOCK_TAGS {
             let opened = format!("<{tag}");
-            assert!(
-                renderers.iter().any(|s| s.contains(&opened)),
-                "{name} is no longer rendered"
-            );
+            assert!(renderers.iter().any(|s| s.contains(&opened)), "{name} is no longer rendered");
         }
     }
 

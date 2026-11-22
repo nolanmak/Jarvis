@@ -36,10 +36,7 @@ pub const STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 
 /// Pure resolution rule, separated from the environment so it can be pinned.
 pub fn resolve(state_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    if let Some(dir) = state_home
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-    {
+    if let Some(dir) = state_home.map(PathBuf::from).filter(|dir| dir.is_absolute()) {
         return Some(dir.join("augmentagent"));
     }
     home.map(|home| PathBuf::from(home).join(".local/state/augmentagent"))
@@ -71,8 +68,7 @@ pub fn state_dir_or(home_fallback: &str) -> PathBuf {
 #[cfg(test)]
 fn unit_test_state_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| scratch("augmentagent-unit-state-").join("augmentagent"))
-        .clone()
+    DIR.get_or_init(|| scratch("augmentagent-unit-state-").join("augmentagent")).clone()
 }
 
 /// A private (0700) scratch directory that lives until the process exits,
@@ -95,10 +91,7 @@ fn scratch(prefix: &str) -> PathBuf {
         .tempdir()
         .expect("create a private scratch state directory")
         .keep();
-    CREATED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(dir.clone());
+    CREATED.lock().unwrap_or_else(|e| e.into_inner()).push(dir.clone());
     REGISTER.call_once(|| {
         // SAFETY: registers a plain `extern "C"` function with no captures.
         unsafe { libc::atexit(remove_created) };
@@ -109,9 +102,7 @@ fn scratch(prefix: &str) -> PathBuf {
 /// Every state path this crate resolves without a caller-supplied location.
 fn channel_core_state_paths() -> Vec<PathBuf> {
     let mut paths = vec![
-        crate::cooldown::CooldownLatch::system()
-            .path()
-            .to_path_buf(),
+        crate::cooldown::CooldownLatch::system().path().to_path_buf(),
         crate::tool_audit::default_audit_log_path(),
         crate::token_usage::default_usage_log_path(),
         crate::memory_nudge::default_cycles_root(),
@@ -177,11 +168,7 @@ mod tests {
         let fallback = Some(PathBuf::from("/synthetic/home/.local/state/augmentagent"));
         assert_eq!(resolve(None, home()), fallback);
         assert_eq!(resolve(Some("".into()), home()), fallback, "empty is unset");
-        assert_eq!(
-            resolve(Some("relative".into()), home()),
-            fallback,
-            "XDG ignores relative"
-        );
+        assert_eq!(resolve(Some("relative".into()), home()), fallback, "XDG ignores relative");
         assert_eq!(resolve(None, None), None);
     }
 
@@ -231,40 +218,23 @@ mod tests {
             let fixture = tempfile::tempdir().unwrap();
             let home = fixture.path().join("home");
             std::fs::create_dir(&home).unwrap();
-            in_child(
-                "state_dir::tests::every_state_path_and_write_follows_the_state_home_override",
-                |child| {
-                    child
-                        .env("HOME", &home)
-                        .env(STATE_HOME_ENV, fixture.path().join("scratch"));
-                },
-            );
-            assert!(
-                !home.join(".local").exists(),
-                "a write reached HOME's state dir"
-            );
+            in_child("state_dir::tests::every_state_path_and_write_follows_the_state_home_override", |child| {
+                child.env("HOME", &home).env(STATE_HOME_ENV, fixture.path().join("scratch"));
+            });
+            assert!(!home.join(".local").exists(), "a write reached HOME's state dir");
             assert!(fixture.path().join("scratch/augmentagent").is_dir());
             return;
         }
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let state = PathBuf::from(std::env::var_os(STATE_HOME_ENV).unwrap()).join("augmentagent");
         assert_eq!(state_dir(), Some(state.clone()));
-        assert_eq!(
-            crate::handoff::system_root(),
-            Some(state.join("reasoner-handoffs"))
-        );
+        assert_eq!(crate::handoff::system_root(), Some(state.join("reasoner-handoffs")));
         assert_eq!(
             crate::cooldown::CooldownLatch::system().path(),
             state.join("reasoner-cooldowns.json").as_path()
         );
-        assert_eq!(
-            crate::tool_audit::default_audit_log_path(),
-            state.join("tool-audit.log")
-        );
-        assert_eq!(
-            crate::token_usage::default_usage_log_path(),
-            state.join("token-usage.jsonl")
-        );
+        assert_eq!(crate::tool_audit::default_audit_log_path(), state.join("tool-audit.log"));
+        assert_eq!(crate::token_usage::default_usage_log_path(), state.join("token-usage.jsonl"));
         assert_eq!(crate::memory_nudge::default_cycles_root(), state);
 
         crate::cooldown::CooldownLatch::system().latch(
@@ -278,8 +248,7 @@ mod tests {
             .unwrap();
         let mut opts = crate::reasoner::loop_parse_opts();
         opts.session_id = Some("synthetic-turn".into());
-        let journal =
-            crate::handoff::request_path(&crate::handoff::system_root().unwrap(), &opts).unwrap();
+        let journal = crate::handoff::request_path(&crate::handoff::system_root().unwrap(), &opts).unwrap();
         crate::tool_audit::AuditLogger::global()
             .record(&crate::tool_audit::build_audit_record(
                 crate::providers::ProviderKind::Codex,
@@ -306,10 +275,7 @@ mod tests {
         assert!(journal.starts_with(state.join("reasoner-handoffs").canonicalize().unwrap()));
         assert!(state.join("tool-audit.log").is_file());
         assert!(state.join("token-usage.jsonl").is_file());
-        assert!(
-            !home.join(".local").exists(),
-            "a write reached HOME's state dir"
-        );
+        assert!(!home.join(".local").exists(), "a write reached HOME's state dir");
     }
 
     /// The harness helper replaces a missing or real-dir `XDG_STATE_HOME`
@@ -323,37 +289,24 @@ mod tests {
             let name = "state_dir::tests::isolate_for_tests_moves_state_off_the_real_dir";
             // Unset, and explicitly pointed at the real state dir: both replaced.
             in_child(name, |child| {
-                child
-                    .env("HOME", &home)
-                    .env("TMPDIR", fixture.path())
-                    .env_remove(STATE_HOME_ENV)
-                    .env("EXPECT", "scratch");
+                child.env("HOME", &home).env("TMPDIR", fixture.path())
+                    .env_remove(STATE_HOME_ENV).env("EXPECT", "scratch");
             });
             in_child(name, |child| {
-                child
-                    .env("HOME", &home)
-                    .env("TMPDIR", fixture.path())
-                    .env(STATE_HOME_ENV, home.join(".local/state"))
-                    .env("EXPECT", "scratch");
+                child.env("HOME", &home).env("TMPDIR", fixture.path())
+                    .env(STATE_HOME_ENV, home.join(".local/state")).env("EXPECT", "scratch");
             });
             let explicit = fixture.path().join("explicit");
             in_child(name, |child| {
-                child
-                    .env("HOME", &home)
-                    .env("TMPDIR", fixture.path())
-                    .env(STATE_HOME_ENV, &explicit)
-                    .env("EXPECT", "explicit");
+                child.env("HOME", &home).env("TMPDIR", fixture.path())
+                    .env(STATE_HOME_ENV, &explicit).env("EXPECT", "explicit");
             });
             assert!(!home.join(".local/state/augmentagent").exists());
-            let leftovers: Vec<_> = std::fs::read_dir(fixture.path())
-                .unwrap()
+            let leftovers: Vec<_> = std::fs::read_dir(fixture.path()).unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|name| name.starts_with("augmentagent-test-state-"))
                 .collect();
-            assert!(
-                leftovers.is_empty(),
-                "scratch dirs must be removed at exit: {leftovers:?}"
-            );
+            assert!(leftovers.is_empty(), "scratch dirs must be removed at exit: {leftovers:?}");
             return;
         }
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
@@ -371,12 +324,7 @@ mod tests {
             assert_ne!(std::env::var_os(STATE_HOME_ENV), before);
         }
         for path in channel_core_state_paths() {
-            assert!(
-                path.starts_with(&dir),
-                "{} escaped {}",
-                path.display(),
-                dir.display()
-            );
+            assert!(path.starts_with(&dir), "{} escaped {}", path.display(), dir.display());
         }
         assert_eq!(isolate_for_tests(), dir, "idempotent per process");
     }
@@ -390,9 +338,7 @@ mod tests {
         fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
             attrs.iter().any(|attr| {
                 attr.path().is_ident("cfg")
-                    && attr
-                        .parse_args::<syn::Meta>()
-                        .is_ok_and(|meta| meta.path().is_ident("test"))
+                    && attr.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test"))
             })
         }
         impl<'ast> Visit<'ast> for Scan {
@@ -445,11 +391,7 @@ mod tests {
             fn log_path(home: &str) -> String { format!("{home}/.local/state/augmentagent/x.log") }
             fn joined(home: &std::path::Path) -> std::path::PathBuf { home.join(".local/state/augmentagent") }
         "#;
-        assert_eq!(
-            hand_built_state_paths(production).len(),
-            2,
-            "production literals, including format! args, are flagged"
-        );
+        assert_eq!(hand_built_state_paths(production).len(), 2, "production literals, including format! args, are flagged");
         let fixtures = r#"
             // docs: ~/.local/state/augmentagent is resolved by state_dir
             /// Writes `~/.local/state/augmentagent/x.log` by default.
@@ -462,10 +404,7 @@ mod tests {
             #[cfg(test)]
             fn helper() -> &'static str { "/home/op/.local/state/augmentagent" }
         "#;
-        assert!(
-            hand_built_state_paths(fixtures).is_empty(),
-            "comments and #[cfg(test)] fixtures are not state resolution"
-        );
+        assert!(hand_built_state_paths(fixtures).is_empty(), "comments and #[cfg(test)] fixtures are not state resolution");
     }
 
     /// Structural pin: no crate resolves `~/.local/state/augmentagent` by
@@ -500,11 +439,7 @@ mod tests {
                 if path.extension().is_none_or(|ext| ext != "rs") {
                     continue;
                 }
-                let relative = path
-                    .strip_prefix(crates)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
+                let relative = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
                 if EXEMPT.contains(&relative.as_str()) {
                     continue;
                 }
@@ -513,9 +448,6 @@ mod tests {
                 }
             }
         }
-        assert!(
-            offenders.is_empty(),
-            "resolve state paths via state_dir::state_dir(): {offenders:#?}"
-        );
+        assert!(offenders.is_empty(), "resolve state paths via state_dir::state_dir(): {offenders:#?}");
     }
 }

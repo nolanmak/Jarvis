@@ -232,10 +232,7 @@ mod tests {
             assert!(name.starts_with("aa-img-"), "{name}");
         }
         drop(images);
-        assert!(
-            seen.iter().all(|path| !path.exists()),
-            "files are removed on drop"
-        );
+        assert!(seen.iter().all(|path| !path.exists()), "files are removed on drop");
     }
 
     #[test]
@@ -244,11 +241,7 @@ mod tests {
         let not_image = dir.path().join("notes.txt");
         std::fs::write(&not_image, "text").unwrap();
         let missing = dir.path().join("gone.png");
-        let msg = format!(
-            "IMAGE: {}\nIMAGE: {}",
-            not_image.display(),
-            missing.display()
-        );
+        let msg = format!("IMAGE: {}\nIMAGE: {}", not_image.display(), missing.display());
         let got = extract_image_markers(&msg);
         assert!(got.images.is_empty());
         assert_eq!(got.text.lines().count(), 2, "both bad markers kept as text");

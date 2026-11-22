@@ -38,76 +38,31 @@ pub fn enabled() -> bool {
 
 /// Words that mark a link as doing something rather than showing something.
 const ACTION_WORDS: &[&str] = &[
-    "unsubscribe",
-    "optout",
-    "confirm",
-    "verify",
-    "verification",
-    "activate",
-    "accept",
-    "decline",
-    "rsvp",
-    "approve",
-    "reject",
-    "login",
-    "signin",
-    "logout",
-    "signup",
-    "register",
-    "reset",
-    "password",
-    "magic",
-    "token",
-    "auth",
-    "oauth",
-    "sso",
-    "invite",
-    "checkout",
-    "pay",
-    "payment",
-    "delete",
-    "remove",
-    "cancel",
-    "track",
-    "click",
+    "unsubscribe", "optout", "confirm", "verify", "verification", "activate", "accept",
+    "decline", "rsvp", "approve", "reject", "login", "signin", "logout", "signup",
+    "register", "reset", "password", "magic", "token", "auth", "oauth", "sso", "invite",
+    "checkout", "pay", "payment", "delete", "remove", "cancel", "track", "click",
     "redirect",
 ];
 
 /// Query keys that carry a credential or a one-time code.
 const SECRET_KEYS: &[&str] = &[
-    "token",
-    "access_token",
-    "id_token",
-    "auth",
-    "key",
-    "apikey",
-    "api_key",
-    "code",
-    "sig",
-    "signature",
-    "secret",
-    "password",
-    "pwd",
-    "otp",
-    "session",
-    "sid",
-    "ticket",
-    "hash",
+    "token", "access_token", "id_token", "auth", "key", "apikey", "api_key", "code", "sig",
+    "signature", "secret", "password", "pwd", "otp", "session", "sid", "ticket", "hash",
 ];
 
 /// File types that are not readable pages.
 const BINARY_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf", "zip", "gz", "tar", "dmg", "exe",
-    "mp3", "mp4", "mov", "avi", "wav", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ics", "csv",
-    "apk", "iso",
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf", "zip", "gz", "tar", "dmg",
+    "exe", "mp3", "mp4", "mov", "avi", "wav", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "ics", "csv", "apk", "iso",
 ];
 
 /// Whether this link is safe to open unasked: a plain page, not an action and
 /// not a link holding a credential.
 pub fn openable(url: &reqwest::Url) -> bool {
     // Tests serve pages from 127.0.0.1 over http; nothing else is ever http.
-    let test_server =
-        ALLOW_LOOPBACK_HTTP && url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+    let test_server = ALLOW_LOOPBACK_HTTP && url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
     if url.scheme() != "https" && !test_server {
         return false;
     }
@@ -145,17 +100,10 @@ pub fn openable(url: &reqwest::Url) -> bool {
 /// The links of a message worth opening, in order, without repeats.
 pub fn candidate_urls(text: &str) -> Vec<reqwest::Url> {
     let mut found: Vec<reqwest::Url> = Vec::new();
-    for token in text.split(|c: char| {
-        c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')
-    }) {
-        let Some(start) = token.find("http") else {
-            continue;
-        };
-        let raw = token[start..]
-            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_'));
-        let Ok(mut url) = reqwest::Url::parse(raw) else {
-            continue;
-        };
+    for token in text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')) {
+        let Some(start) = token.find("http") else { continue };
+        let raw = token[start..].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_'));
+        let Ok(mut url) = reqwest::Url::parse(raw) else { continue };
         url.set_fragment(None);
         if openable(&url) && !found.contains(&url) {
             found.push(url);
@@ -182,11 +130,7 @@ pub fn page_text(html: &str) -> (String, String) {
     let title = lower
         .find("<title")
         .and_then(|open| lower[open..].find('>').map(|gt| open + gt + 1))
-        .and_then(|start| {
-            lower[start..]
-                .find("</title")
-                .map(|end| &html[start..start + end])
-        })
+        .and_then(|start| lower[start..].find("</title").map(|end| &html[start..start + end]))
         .map(|raw| collapse(&decode(raw)))
         .unwrap_or_default();
     let mut out = String::with_capacity(html.len() / 2);
@@ -200,25 +144,18 @@ pub fn page_text(html: &str) -> (String, String) {
         out.push_str(&rest[..lt]);
         let after = &rest_lower[lt..];
         // Elements whose content is never visible text.
-        let skipped = [
-            "script", "style", "head", "title", "noscript", "svg", "template",
-        ]
-        .iter()
-        .find(|name| {
-            after[1..].starts_with(**name)
-                && after[1 + name.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
-        });
+        let skipped = ["script", "style", "head", "title", "noscript", "svg", "template"]
+            .iter()
+            .find(|name| {
+                after[1..].starts_with(**name)
+                    && after[1 + name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+            });
         let advance = match skipped {
             Some(name) => match after.find(&format!("</{name}")) {
-                Some(close) => {
-                    close
-                        + after[close..]
-                            .find('>')
-                            .map_or(after.len() - close, |gt| gt + 1)
-                }
+                Some(close) => close + after[close..].find('>').map_or(after.len() - close, |gt| gt + 1),
                 None => after.len(),
             },
             None => after.find('>').map_or(after.len(), |gt| gt + 1),
@@ -277,11 +214,7 @@ pub async fn fetch(url: &reqwest::Url) -> Option<Page> {
             .await
             .ok()?;
         if response.status().is_redirection() {
-            let next = response
-                .headers()
-                .get(reqwest::header::LOCATION)?
-                .to_str()
-                .ok()?;
+            let next = response.headers().get(reqwest::header::LOCATION)?.to_str().ok()?;
             current = current.join(next).ok()?;
             continue;
         }
@@ -294,8 +227,7 @@ pub async fn fetch(url: &reqwest::Url) -> Option<Page> {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let html =
-            content_type.starts_with("text/html") || content_type.starts_with("application/xhtml");
+        let html = content_type.starts_with("text/html") || content_type.starts_with("application/xhtml");
         if !html && !content_type.starts_with("text/plain") {
             return None;
         }
@@ -308,19 +240,11 @@ pub async fn fetch(url: &reqwest::Url) -> Option<Page> {
             }
         }
         let raw = String::from_utf8_lossy(&body);
-        let (title, text) = if html {
-            page_text(&raw)
-        } else {
-            (String::new(), collapse(&raw))
-        };
+        let (title, text) = if html { page_text(&raw) } else { (String::new(), collapse(&raw)) };
         if text.is_empty() {
             return None;
         }
-        return Some(Page {
-            url: current.to_string(),
-            title,
-            text: excerpt(&text),
-        });
+        return Some(Page { url: current.to_string(), title, text: excerpt(&text) });
     }
     None
 }
@@ -383,8 +307,7 @@ mod tests {
         assert!(urls("http://example.com/page").is_empty());
         // At most three.
         assert_eq!(
-            urls("https://a.example/1 https://a.example/2 https://a.example/3 https://a.example/4")
-                .len(),
+            urls("https://a.example/1 https://a.example/2 https://a.example/3 https://a.example/4").len(),
             MAX_LINKS
         );
     }
@@ -434,18 +357,14 @@ mod tests {
 
     /// Serve canned HTTP responses on loopback; returns the base URL and the
     /// request lines seen.
-    async fn serve(
-        routes: Vec<(&'static str, String)>,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    async fn serve(routes: Vec<(&'static str, String)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
+                let Ok((mut socket, _)) = listener.accept().await else { break };
                 let mut buffer = vec![0u8; 4096];
                 let read = socket.read(&mut buffer).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -456,9 +375,7 @@ mod tests {
                     .iter()
                     .find(|(route, _)| *route == path)
                     .map(|(_, response)| response.clone())
-                    .unwrap_or_else(|| {
-                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into()
-                    });
+                    .unwrap_or_else(|| "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into());
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.shutdown().await;
             }
@@ -481,13 +398,7 @@ mod tests {
     async fn a_linked_page_becomes_a_marked_excerpt_in_the_prompt() {
         let long = "word ".repeat(1000);
         let (base, seen) = serve(vec![
-            (
-                "/post",
-                ok(
-                    "text/html; charset=utf-8",
-                    "<title>Launch notes</title><p>We ship on Tuesday.</p>",
-                ),
-            ),
+            ("/post", ok("text/html; charset=utf-8", "<title>Launch notes</title><p>We ship on Tuesday.</p>")),
             ("/moved", redirect("/post")),
             ("/long", ok("text/plain", &long)),
             ("/image", ok("image/png", "not text")),
@@ -499,39 +410,21 @@ mod tests {
         assert!(block.contains("untrusted"), "{block}");
         assert!(block.contains("Title: Launch notes"));
         assert!(block.contains("Text: We ship on Tuesday."));
-        assert!(
-            block.contains(&format!("[link 2] {base}/post")),
-            "a redirect is followed: {block}"
-        );
+        assert!(block.contains(&format!("[link 2] {base}/post")), "a redirect is followed: {block}");
 
         // Long pages are cut to the excerpt size.
-        let page = fetch(&reqwest::Url::parse(&format!("{base}/long")).unwrap())
-            .await
-            .unwrap();
+        let page = fetch(&reqwest::Url::parse(&format!("{base}/long")).unwrap()).await.unwrap();
         assert_eq!(page.text.chars().count(), EXCERPT_CHARS + 1);
         // Not a text page.
-        assert_eq!(
-            fetch(&reqwest::Url::parse(&format!("{base}/image")).unwrap()).await,
-            None
-        );
+        assert_eq!(fetch(&reqwest::Url::parse(&format!("{base}/image")).unwrap()).await, None);
         // Missing page.
-        assert_eq!(
-            fetch(&reqwest::Url::parse(&format!("{base}/missing")).unwrap()).await,
-            None
-        );
+        assert_eq!(fetch(&reqwest::Url::parse(&format!("{base}/missing")).unwrap()).await, None);
 
         // A plain link that redirects to an action is abandoned before the
         // action is requested.
-        assert_eq!(
-            fetch(&reqwest::Url::parse(&format!("{base}/to-action")).unwrap()).await,
-            None
-        );
+        assert_eq!(fetch(&reqwest::Url::parse(&format!("{base}/to-action")).unwrap()).await, None);
         assert!(
-            !seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|line| line.contains("/confirm/now")),
+            !seen.lock().unwrap().iter().any(|line| line.contains("/confirm/now")),
             "the action link was requested: {:?}",
             seen.lock().unwrap()
         );

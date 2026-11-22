@@ -207,9 +207,7 @@ impl Drop for CallGuard<'_> {
         if self.armed {
             self.cancelled.store(true, Ordering::SeqCst);
             if let Some(deadline) = self.cleanup_deadline {
-                deadline
-                    .lock()
-                    .expect("compute cleanup deadline")
+                deadline.lock().expect("compute cleanup deadline")
                     .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
                 self.owner.terminate();
             } else {
@@ -308,7 +306,10 @@ impl ComputeService {
         cancellation: impl std::future::Future<Output = ()>,
         linux: bool,
     ) -> Result<Arc<Self>> {
-        anyhow::ensure!(linux, "sandbox_unavailable: compute requires Linux KVM");
+        anyhow::ensure!(
+            linux,
+            "sandbox_unavailable: compute requires Linux KVM"
+        );
         anyhow::ensure!(
             (1..=900).contains(&config.policy.call_timeout.as_secs())
                 && (1..=3600).contains(&config.policy.task_timeout.as_secs()),
@@ -410,10 +411,8 @@ impl ComputeService {
         let remaining = budget.remaining().unwrap_or(Duration::ZERO);
         let initialize = async {
             let ready = read_frame(&mut stdout).await?;
-            anyhow::ensure!(
-                ready["ready"] == true,
-                "sandbox_unavailable: compute helper rejected its policy"
-            );
+            anyhow::ensure!(ready["ready"] == true,
+                "sandbox_unavailable: compute helper rejected its policy");
             serde_json::from_value::<BTreeMap<String, String>>(ready["inputs"].clone())
                 .context("invalid compute input capabilities")
         };
@@ -440,17 +439,13 @@ impl ComputeService {
                 // verify even a SIGSTOPped helper within one cleanup allowance.
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 owner.terminate();
-                let exited =
-                    match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
-                        Ok(result) => result.is_ok(),
-                        Err(_) => {
-                            owner.kill();
-                            matches!(
-                                tokio::time::timeout_at(deadline, child.wait()).await,
-                                Ok(Ok(_))
-                            )
-                        }
-                    };
+                let exited = match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
+                    Ok(result) => result.is_ok(),
+                    Err(_) => {
+                        owner.kill();
+                        matches!(tokio::time::timeout_at(deadline, child.wait()).await, Ok(Ok(_)))
+                    }
+                };
                 guard.armed = false;
                 drop(guard);
                 let cleanup_verified = if exited {
@@ -460,14 +455,9 @@ impl ComputeService {
                     false
                 };
                 return Err(StartupFailure {
-                    code: if cleanup_verified {
-                        code
-                    } else {
-                        "cleanup_unverified"
-                    },
+                    code: if cleanup_verified { code } else { "cleanup_unverified" },
                     cleanup_verified,
-                }
-                .into());
+                }.into());
             }
         };
         guard.armed = false;
@@ -505,9 +495,7 @@ impl ComputeService {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        self.cleanup_deadline
-            .lock()
-            .expect("compute cleanup deadline")
+        self.cleanup_deadline.lock().expect("compute cleanup deadline")
             .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
         self.owner.terminate();
     }
@@ -615,9 +603,7 @@ impl ComputeService {
                 let status = if cancelled {
                     // Leave two seconds of the same allowance for the VM
                     // supervisor's parent-death cleanup after escalation.
-                    match tokio::time::timeout_at(deadline - Duration::from_secs(2), child.wait())
-                        .await
-                    {
+                    match tokio::time::timeout_at(deadline - Duration::from_secs(2), child.wait()).await {
                         Ok(status) => status?,
                         Err(_) => {
                             self.owner.kill();
@@ -687,11 +673,8 @@ mod platform_tests {
         let sentinel = root.path().join("sentinel");
         std::fs::write(&sentinel, b"unchanged").unwrap();
         let config = ServiceConfig {
-            policy: ComputePolicy {
-                enabled: true,
-                call_timeout: Duration::from_secs(600),
-                task_timeout: Duration::from_secs(1800),
-            },
+            policy: ComputePolicy { enabled: true, call_timeout: Duration::from_secs(600),
+                task_timeout: Duration::from_secs(1800) },
             runtime: root.path().join("missing-runtime"),
             scratch_root: root.path().join("must-not-create-scratch"),
             artifact_root: root.path().join("must-not-create-artifacts"),
@@ -700,18 +683,10 @@ mod platform_tests {
             scratch_limits: None,
         };
         let error = ComputeService::start_on_platform(config, std::future::pending(), false)
-            .await
-            .err()
-            .expect("unsupported platform must be refused");
-        assert_eq!(
-            error.to_string(),
-            "sandbox_unavailable: compute requires Linux KVM"
-        );
+            .await.err().expect("unsupported platform must be refused");
+        assert_eq!(error.to_string(), "sandbox_unavailable: compute requires Linux KVM");
         assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
-        assert_eq!(
-            std::fs::read_dir(root.path()).unwrap().count(),
-            1,
-            "unsupported-platform startup created runtime files"
-        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1,
+            "unsupported-platform startup created runtime files");
     }
 }

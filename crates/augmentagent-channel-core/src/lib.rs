@@ -10,14 +10,15 @@
 pub mod archetype;
 pub mod audit_chain;
 pub mod autoship_scope;
-pub mod autoship_workflow_contract;
 pub mod autoship_write_scope;
+pub mod autoship_workflow_contract;
 pub mod build_scratch;
 pub mod cerebras;
 pub mod cli_gate;
 pub mod code_mode;
 pub mod codex;
 pub mod codex_tools;
+mod native_tool_readiness;
 pub mod cooldown;
 pub mod decision;
 pub mod draft_context;
@@ -29,21 +30,20 @@ pub mod gemini;
 pub mod governor;
 pub mod handoff;
 mod handoff_outcome;
+mod review_history;
+mod process_tree;
 pub mod images;
-pub mod ingest;
 pub mod link_context;
+pub mod ingest;
 pub mod mcp;
 pub mod memory_nudge;
-mod native_tool_readiness;
 pub mod outbound_scrub;
-mod process_tree;
 pub mod prompt;
-pub mod providers;
 pub mod public_net;
+pub mod providers;
 pub mod public_report;
 pub mod reasoner;
 pub mod resolve;
-mod review_history;
 pub mod run_resources;
 pub mod secret_loader;
 pub mod skills;
@@ -64,8 +64,8 @@ pub mod storage_reservations;
 pub mod storage_leases {
     pub use crate::storage_coordination::{ProfileDirs, TargetLeases};
 }
-pub mod log_retention;
 pub mod timeparse;
+pub mod log_retention;
 pub mod token_usage;
 pub mod tool_audit;
 pub mod trigger;
@@ -75,33 +75,30 @@ pub use decision::{Decision, DecisionKind};
 pub use engagement::{
     auto_post_mode_for, AutoPostMode, PostPublisher, PublishOutcome, ScheduledPostEngine,
 };
+pub use resolve::{
+    default_resolvers, detect_asks_shadow, live_resolvers, resolve_asks, resolve_asks_block,
+    resolved_asks_block, AskResolveMode, AskResolver, BusyInterval, ComposioResolveClient,
+    DetectedAsk, DriveHit, DriveSearchApi, FreeBusyApi, ResolveCtx, ResolveOutcome,
+    ResolvedFill, ResolverKind, UnresolvedAsk,
+};
 pub use governor::{
-    lookup_limit, next_action_delay, quiet_hours_until, requires_approval, scale_cap, warmup_curve,
-    ActionKind, ActionRequest, Clock, Denial, HaltReason, HaltState, Outcome, Permit, Platform,
-    RateCaps, RateGovernor, RateLimit, Risk, SqliteGovernor, SystemClock, TargetAttrs,
-    WindowedCounter, RATE_TABLE,
+    lookup_limit, next_action_delay, quiet_hours_until, requires_approval, scale_cap,
+    warmup_curve, ActionKind, ActionRequest, Clock, Denial, HaltReason, HaltState, Outcome,
+    Permit, Platform, RateCaps, RateGovernor, RateLimit, Risk, SqliteGovernor, SystemClock,
+    TargetAttrs, WindowedCounter, RATE_TABLE,
 };
 pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurface};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
-pub use resolve::{
-    default_resolvers, detect_asks_shadow, live_resolvers, resolve_asks, resolve_asks_block,
-    resolved_asks_block, AskResolveMode, AskResolver, BusyInterval, ComposioResolveClient,
-    DetectedAsk, DriveHit, DriveSearchApi, FreeBusyApi, ResolveCtx, ResolveOutcome, ResolvedFill,
-    ResolverKind, UnresolvedAsk,
-};
 // #655 — multi-provider failover: one Reasoner seam, N provider adapters.
 pub use cooldown::CooldownLatch;
-pub use fallback::{
-    build_pinned, build_reasoner, build_workflow_builder, build_workflow_pinned,
-    build_workflow_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability,
-};
+pub use fallback::{build_workflow_builder, build_workflow_pinned, build_workflow_reasoner, build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
 // #1040 — content-level endings and the completed-work re-dispatch guard.
 pub use handoff_outcome::CompletedWithoutSummary;
+pub use turn_failure::{FailureClass, TurnFailure};
 pub use images::{extract_image_markers, image_marker_line, IMAGE_MARKER_PREFIX};
 pub use providers::{CapabilityClass, ModelTier, ProviderKind};
 pub use skills::{SkillEntry, SkillRegistry};
-pub use turn_failure::{FailureClass, TurnFailure};
 // #501 — deterministic send-time parsing for scheduled sends (shared with
 // the query-mode `--send-at` flag, #502).
 pub use timeparse::{
@@ -118,10 +115,10 @@ pub use trigger::{
 
 pub mod model_router;
 pub mod model_selection;
-pub mod native_session;
-pub mod native_vm;
 pub mod yolo;
 pub mod yolo_preset;
+pub mod native_session;
+pub mod native_vm;
 // #1288 — the transport-neutral conversation turn (native sessions, turn
 // claims, cancellation) shared by Discord and Slack, and its conformance
 // fixtures.
@@ -130,7 +127,7 @@ pub mod surface_turn;
 
 pub mod phone_agent;
 pub mod phone_attention;
-pub mod phone_fast;
 mod phone_timing;
+pub mod phone_fast;
 
 pub mod triage_capture;

@@ -780,10 +780,7 @@ pub fn split_redraft_subject(redraft: &str) -> (Option<String>, String) {
     let Some(first_char) = redraft.find(|c: char| !c.is_whitespace()) else {
         return (None, redraft.to_string());
     };
-    let line_start = redraft[..first_char]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let line_start = redraft[..first_char].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let (first_line, rest) = match redraft[line_start..].split_once('\n') {
         Some((line, rest)) => (line, rest),
         None => (&redraft[line_start..], ""),
@@ -1059,10 +1056,7 @@ mod tests {
         // Same system prompt as the first draft, so a v2 draft may re-emit
         // the marker; the "no commentary" rule must not suppress it.
         let got = redraft_message(&email(), "the previous draft", "make it shorter");
-        assert!(
-            got.contains("`<!--aa:assumes …-->`"),
-            "redraft tail:\n{got}"
-        );
+        assert!(got.contains("`<!--aa:assumes …-->`"), "redraft tail:\n{got}");
     }
 
     #[test]
@@ -1076,8 +1070,7 @@ mod tests {
         );
         let mut composed_email = email();
         composed_email.kind = "compose".into();
-        assert!(redraft_message(&composed_email, "draft", "change subject")
-            .contains("Subject: <new subject>"));
+        assert!(redraft_message(&composed_email, "draft", "change subject").contains("Subject: <new subject>"));
         let mut chat = email();
         chat.platform = "slack".into();
         let got = redraft_message(&chat, "the previous draft", "call it Invoice for July");
@@ -1122,10 +1115,7 @@ mod tests {
         // Code-mode is the production rail and does NOT load SKILL.md, so the
         // rule has to be self-contained in its system prompt.
         let sys = code_mode_system(&crate::code_mode::manifest_v1());
-        assert!(
-            sys.contains("8. Insufficiency check."),
-            "missing rule 8:\n{sys}"
-        );
+        assert!(sys.contains("8. Insufficiency check."), "missing rule 8:\n{sys}");
         assert!(sys.contains("<!--aa:assumes"));
         assert!(sys.contains("five maximum"));
     }
@@ -1278,9 +1268,7 @@ mod tests {
             ("second@x.example.com".into(), "d2".into(), "latest".into()),
         ];
         let out = format_thread_history(&msgs);
-        assert!(
-            out.find("first@x.example.com").unwrap() < out.find("second@x.example.com").unwrap()
-        );
+        assert!(out.find("first@x.example.com").unwrap() < out.find("second@x.example.com").unwrap());
     }
 
     // --- Code-Mode prompt builders (I5) ---

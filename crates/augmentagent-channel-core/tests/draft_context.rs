@@ -70,8 +70,8 @@ fn owner_requested_context_retargets_messages_that_arrived_after_the_trigger() {
     for row in [&original, &message(3), &message(4)] {
         store.upsert_email_backfill(row, 1).unwrap();
     }
-    let seed = augmentagent_channel_core::draft_context::load_latest_seed(&store, &original, None)
-        .unwrap();
+    let seed =
+        augmentagent_channel_core::draft_context::load_latest_seed(&store, &original, None).unwrap();
     assert_eq!(target_ids(&seed), ["m02", "m03", "m04"]);
 }
 
@@ -107,10 +107,7 @@ fn the_prompt_asks_for_an_answer_to_every_retained_unanswered_turn() {
     let prompt = seed.prompt();
     assert!(prompt.contains("awaiting an answer"));
     for id in &retained {
-        assert!(
-            prompt.contains(id.as_str()),
-            "target {id} is not in the prompt"
-        );
+        assert!(prompt.contains(id.as_str()), "target {id} is not in the prompt");
     }
 }
 

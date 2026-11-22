@@ -42,10 +42,7 @@ impl QueryHandler for Agent {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
         assert!(ctx.owner_authorized);
         if question.contains("phone question") {
-            assert!(
-                augmentagent_channel_core::model_router::current()?.is_none(),
-                "phone must bypass the optional model gateway"
-            );
+            assert!(augmentagent_channel_core::model_router::current()?.is_none(), "phone must bypass the optional model gateway");
         }
         let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
         opts.session_id = Some(ctx.session_id.clone());
@@ -239,91 +236,34 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
     std::fs::create_dir(&wiki).unwrap();
     let presets = vec![
         ("triage_opts", triage_opts(Some(wiki.clone()))),
-        (
-            "draft_opts",
-            draft_opts("Synthetic instructions".into(), Some(wiki.clone())),
-        ),
-        (
-            "socialapi_draft_opts",
-            socialapi_draft_opts("Synthetic instructions".into(), Some(wiki.clone())),
-        ),
+        ("draft_opts", draft_opts("Synthetic instructions".into(), Some(wiki.clone()))),
+        ("socialapi_draft_opts", socialapi_draft_opts("Synthetic instructions".into(), Some(wiki.clone()))),
         ("digest_opts", digest_opts(Some(wiki.clone()))),
-        (
-            "lint_opts",
-            lint_opts("Synthetic instructions".into(), wiki.clone()),
-        ),
-        (
-            "wiki_migrate_opts",
-            wiki_migrate_opts("Synthetic instructions".into(), wiki.clone()),
-        ),
-        (
-            "ingest_opts",
-            ingest_opts("Synthetic instructions".into(), wiki.clone()),
-        ),
+        ("lint_opts", lint_opts("Synthetic instructions".into(), wiki.clone())),
+        ("wiki_migrate_opts", wiki_migrate_opts("Synthetic instructions".into(), wiki.clone())),
+        ("ingest_opts", ingest_opts("Synthetic instructions".into(), wiki.clone())),
         ("resume_opts", resume_opts(wiki.clone())),
         ("ask_opts", ask_opts(wiki, dir.path().into())),
         ("tone_summarize_opts", tone_summarize_opts()),
-        (
-            "social_adapter_opts",
-            social_adapter_opts("Synthetic instructions".into()),
-        ),
+        ("social_adapter_opts", social_adapter_opts("Synthetic instructions".into())),
         ("loop_parse_opts", loop_parse_opts()),
         ("archetype_pick_opts", archetype_pick_opts()),
         ("autonomy_plan_opts", autonomy_plan_opts()),
     ];
-    let manifest: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
-    let expected: std::collections::BTreeSet<_> = manifest["presets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| {
-            entry["callsite"]
-                .as_str()
-                .unwrap()
-                .strip_prefix("crates/augmentagent-channel-core/src/reasoner.rs::")
-        })
-        .filter(|name| name.ends_with("_opts"))
-        .collect();
-    assert_eq!(
-        presets
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<std::collections::BTreeSet<_>>(),
-        expected,
-        "shared preset inventory changed: review phone authorization coverage"
-    );
+    let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
+    let expected: std::collections::BTreeSet<_> = manifest["presets"].as_array().unwrap().iter()
+        .filter_map(|entry| entry["callsite"].as_str().unwrap()
+            .strip_prefix("crates/augmentagent-channel-core/src/reasoner.rs::"))
+        .filter(|name| name.ends_with("_opts")).collect();
+    assert_eq!(presets.iter().map(|(name, _)| *name).collect::<std::collections::BTreeSet<_>>(), expected,
+        "shared preset inventory changed: review phone authorization coverage");
     for (name, mut preset) in presets {
-        assert!(
-            !preset
-                .allowed_tools
-                .iter()
-                .any(|tool| tool.starts_with("mcp__phone__")),
-            "{name}"
-        );
-        let settings: serde_json::Value =
-            serde_json::from_str(preset.settings_json.as_deref().unwrap_or("{}")).unwrap();
+        assert!(!preset.allowed_tools.iter().any(|tool| tool.starts_with("mcp__phone__")), "{name}");
+        let settings: serde_json::Value = serde_json::from_str(preset.settings_json.as_deref().unwrap_or("{}")).unwrap();
         assert!(settings["mcpServers"]["phone"].is_null(), "{name}");
-        let before = (
-            preset.allowed_tools.clone(),
-            preset.settings_json.clone(),
-            preset.system_prompt.clone(),
-        );
-        assert!(
-            attach_tools(&mut preset, &server, std::path::Path::new("/fixture/bin"))
-                .unwrap()
-                .is_none(),
-            "{name}"
-        );
-        assert_eq!(
-            (
-                preset.allowed_tools,
-                preset.settings_json,
-                preset.system_prompt
-            ),
-            before,
-            "{name}"
-        );
+        let before = (preset.allowed_tools.clone(), preset.settings_json.clone(), preset.system_prompt.clone());
+        assert!(attach_tools(&mut preset, &server, std::path::Path::new("/fixture/bin")).unwrap().is_none(), "{name}");
+        assert_eq!((preset.allowed_tools, preset.settings_json, preset.system_prompt), before, "{name}");
     }
     let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
     opts.settings_json =
@@ -352,10 +292,7 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
         .contains(&"mcp__phone__call_owner".into()));
     assert!(!opts.allowed_tools.contains(&"mcp__phone__speak".into()));
     // #1557 AC5: end_call belongs to the fast layer only, never the native path.
-    assert!(!opts
-        .allowed_tools
-        .iter()
-        .any(|tool| tool.contains("end_call")));
+    assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("end_call")));
     let settings: serde_json::Value =
         serde_json::from_str(opts.settings_json.as_ref().unwrap()).unwrap();
     assert_eq!(settings["mcpServers"]["existing"]["command"], "kept");
@@ -522,11 +459,7 @@ async fn phone_turn_streams_the_sanitized_answer_then_finishes() {
     ));
     let grant = service.authorize(&owner, &chat).unwrap();
     let receipt = service
-        .tool(
-            &grant,
-            "call_owner",
-            serde_json::json!({"request_id":"start"}),
-        )
+        .tool(&grant, "call_owner", serde_json::json!({"request_id":"start"}))
         .await
         .unwrap();
     let id = receipt["id"].as_str().unwrap();
@@ -557,19 +490,10 @@ async fn phone_turn_streams_the_sanitized_answer_then_finishes() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let speech = SpeechSender::new(tx, Arc::new(turn));
     let answer = bridge
-        .run(
-            &call,
-            "phone-stream",
-            "status?",
-            Some(speech.clone()),
-            CancellationToken::new(),
-        )
+        .run(&call, "phone-stream", "status?", Some(speech.clone()), CancellationToken::new())
         .await
         .unwrap();
-    assert!(
-        answer.contains("**Done.**"),
-        "chat mirror keeps the raw answer"
-    );
+    assert!(answer.contains("**Done.**"), "chat mirror keeps the raw answer");
     // What the ingress fallback would add afterwards is a no-op.
     assert!(speech.speak_partial(&answer).await.is_err());
     speech.finish().await.unwrap();
@@ -621,10 +545,7 @@ mod fast {
         pub fn new(rounds: Vec<Vec<FastEvent>>) -> Arc<Self> {
             Self::with_admission_delay(rounds, Duration::ZERO)
         }
-        fn with_admission_delay(
-            rounds: Vec<Vec<FastEvent>>,
-            admission_delay: Duration,
-        ) -> Arc<Self> {
+        fn with_admission_delay(rounds: Vec<Vec<FastEvent>>, admission_delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 rounds: Mutex::new(rounds.into()),
                 requests: Mutex::new(Vec::new()),
@@ -638,9 +559,7 @@ mod fast {
         async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
             // Model scheduling is outside the dispatch tool's causal contract.
             // Let the regression exercise a slow model admission deliberately.
-            if !self.admission_delay.is_zero() {
-                tokio::time::sleep(self.admission_delay).await;
-            }
+            if !self.admission_delay.is_zero() { tokio::time::sleep(self.admission_delay).await; }
             self.systems.lock().unwrap().push(request.system);
             self.requests
                 .lock()
@@ -766,11 +685,7 @@ mod fast {
         ));
         let grant = service.authorize(&owner, &chat).unwrap();
         let receipt = service
-            .tool(
-                &grant,
-                "call_owner",
-                serde_json::json!({"request_id":"start"}),
-            )
+            .tool(&grant, "call_owner", serde_json::json!({"request_id":"start"}))
             .await
             .unwrap();
         let id = receipt["id"].as_str().unwrap();
@@ -790,19 +705,10 @@ mod fast {
             call,
         }
     }
-    pub fn speech_for(
-        call_id: &str,
-        text: &str,
-    ) -> (
-        String,
-        SpeechSender,
-        tokio::sync::mpsc::Receiver<SpeechEvent>,
-    ) {
+    pub fn speech_for(call_id: &str, text: &str) -> (String, SpeechSender, tokio::sync::mpsc::Receiver<SpeechEvent>) {
         let mut session = RelaySession::new(call_id, "AC-test", "CA-test");
         session
-            .receive(
-                r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#,
-            )
+            .receive(r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#)
             .unwrap();
         let frame = serde_json::json!({"type":"prompt","voicePrompt":text,"last":true}).to_string();
         let RelayInput::Turn(turn) = session.receive(&frame).unwrap() else {
@@ -811,7 +717,11 @@ mod fast {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         (turn.id.clone(), SpeechSender::new(tx, Arc::new(turn)), rx)
     }
-    pub fn bridge(f: &Connected, heavy: Arc<dyn QueryHandler>, model: Arc<Scripted>) -> PhoneAgent {
+    pub fn bridge(
+        f: &Connected,
+        heavy: Arc<dyn QueryHandler>,
+        model: Arc<Scripted>,
+    ) -> PhoneAgent {
         PhoneAgent::new(
             f.store.clone(),
             f.service.clone(),
@@ -847,33 +757,22 @@ mod fast {
             release: Arc::new(Notify::new()),
             seen: Mutex::new(Vec::new()),
         });
-        let model = Scripted::with_admission_delay(
-            vec![
-                vec![tool(
-                    "dispatch_task",
-                    serde_json::json!({"description":"Draft a reply to the last Linear comment"}),
-                )],
-                vec![token("On it. "), token("The draft will land in chat.")],
-            ],
-            Duration::from_millis(150),
-        );
+        let model = Scripted::with_admission_delay(vec![
+            vec![tool(
+                "dispatch_task",
+                serde_json::json!({"description":"Draft a reply to the last Linear comment"}),
+            )],
+            vec![token("On it. "), token("The draft will land in chat.")],
+        ], Duration::from_millis(150));
         let bridge = bridge(&f, heavy.clone(), model.clone());
         let (turn_id, speech, _rx) = speech_for(&f.call.id, "draft a reply");
         // This is a deadlock watchdog, not a host/model latency assertion.
         // The heavy turn has no way to finish until this test releases it.
-        let answer = tokio::time::timeout(
-            Duration::from_secs(5),
-            bridge.answer(
-                &f.call,
-                &turn_id,
-                "draft a reply",
-                speech,
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("dispatch answer must return while the heavy turn remains blocked")
-        .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), bridge
+            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new()))
+            .await
+            .expect("dispatch answer must return while the heavy turn remains blocked")
+            .unwrap();
         assert_eq!(answer, "On it. The draft will land in chat.");
         {
             let requests = model.requests.lock().unwrap();
@@ -886,14 +785,8 @@ mod fast {
         tokio::time::timeout(Duration::from_secs(5), heavy.entered.notified())
             .await
             .expect("heavy turn started on the surface-turn path");
-        assert!(
-            sends(&f.store, &f.origin, &key).is_empty(),
-            "nothing before completion"
-        );
-        assert!(
-            provider.calls().is_empty(),
-            "native work cannot finish before its explicit release"
-        );
+        assert!(sends(&f.store, &f.origin, &key).is_empty(), "nothing before completion");
+        assert!(provider.calls().is_empty(), "native work cannot finish before its explicit release");
         heavy.release.notify_one();
         wait_for(|| !sends(&f.store, &f.origin, &key).is_empty()).await;
         let delivered = sends(&f.store, &f.origin, &key);
@@ -901,16 +794,11 @@ mod fast {
         // Spy: one native call through the session runner, with the existing
         // owner authorization and phone context (no call speech) attached.
         assert_eq!(provider.calls().len(), 1);
-        assert!(provider.calls()[0]
-            .prompt
-            .contains("Draft a reply to the last Linear comment"));
+        assert!(provider.calls()[0].prompt.contains("Draft a reply to the last Linear comment"));
         assert_eq!(*heavy.seen.lock().unwrap(), vec![(true, true, false)]);
         let dispatch_turn =
             SurfaceTurnRef::new(f.origin.conversation.clone(), key.as_str()).unwrap();
-        assert!(
-            f.store.claim_surface_turn(&dispatch_turn).is_err(),
-            "durable claim recorded"
-        );
+        assert!(f.store.claim_surface_turn(&dispatch_turn).is_err(), "durable claim recorded");
 
         // Simulated restart: a fresh store handle and bridge replay the same
         // dispatch. The durable claim refuses a second heavy run and the
@@ -934,34 +822,17 @@ mod fast {
         let bridge = super::fast::bridge(&restarted, heavy.clone(), replay);
         let (_, speech, _rx) = speech_for(&f.call.id, "draft a reply");
         bridge
-            .answer(
-                &f.call,
-                &turn_id,
-                "draft a reply",
-                speech,
-                CancellationToken::new(),
-            )
+            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new())
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(sends(&reopened, &f.origin, &key).len(), 1);
         assert_eq!(provider.calls().len(), 1, "dispatched work never re-runs");
         let (goodbye_id, speech, _rx) = speech_for(&f.call.id, "goodbye");
-        let goodbye = bridge
-            .answer(
-                &f.call,
-                &format!("{goodbye_id}-goodbye"),
-                "goodbye",
-                speech,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            goodbye,
-            augmentagent_phone::end_call::DEFAULT_GOODBYE,
-            "a duplicate must not leave phantom work blocking the deterministic goodbye"
-        );
+        let goodbye = bridge.answer(&f.call, &format!("{goodbye_id}-goodbye"), "goodbye", speech, CancellationToken::new()).await.unwrap();
+        assert_eq!(goodbye, augmentagent_phone::end_call::DEFAULT_GOODBYE,
+            "a duplicate must not leave phantom work blocking the deterministic goodbye");
+
     }
 
     /// Revokes the owner's authority while the model is answering, then asks
@@ -975,9 +846,7 @@ mod fast {
     impl FastModel for RevokingModel {
         async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
             if self.inner.requests.lock().unwrap().is_empty() {
-                self.store
-                    .unbind_surface_owner(self.owner.account())
-                    .unwrap();
+                self.store.unbind_surface_owner(self.owner.account()).unwrap();
             }
             self.inner.stream(request).await
         }
@@ -994,10 +863,7 @@ mod fast {
             seen: Mutex::new(Vec::new()),
         });
         let inner = Scripted::new(vec![
-            vec![tool(
-                "dispatch_task",
-                serde_json::json!({"description":"send the report"}),
-            )],
+            vec![tool("dispatch_task", serde_json::json!({"description":"send the report"}))],
             vec![token("I can't do that right now.")],
         ]);
         let model = Arc::new(RevokingModel {
@@ -1009,22 +875,14 @@ mod fast {
             f.store.clone(),
             f.service.clone(),
             heavy.clone(),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         )
         .with_fast_layer(model, FastLayerConfig::default());
         let (turn_id, speech, _rx) = speech_for(&f.call.id, "send the report");
         let _ = bridge
-            .answer(
-                &f.call,
-                &turn_id,
-                "send the report",
-                speech,
-                CancellationToken::new(),
-            )
+            .answer(&f.call, &turn_id, "send the report", speech, CancellationToken::new())
             .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         {
@@ -1151,21 +1009,14 @@ mod fast {
     #[tokio::test]
     async fn revoked_binding_cancels_recovered_task_without_executing_or_delivering() {
         let f = connected().await;
-        f.store
-            .phone_enqueue_dispatch(&f.call.id, "revoked-job", "Synthetic task")
-            .unwrap();
-        f.store
-            .unbind_surface_owner(f.origin.owner.account())
-            .unwrap();
+        f.store.phone_enqueue_dispatch(&f.call.id, "revoked-job", "Synthetic task").unwrap();
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
         let recovered = bridge(&f, Arc::new(MarkdownAgent), Scripted::new(vec![]));
         recovered.resume_task(&f.call, "revoked-job").await.unwrap();
         wait_for(|| f.store.phone_pending_dispatches().unwrap().is_empty()).await;
         assert!(sends(&f.store, &f.origin, "revoked-job").is_empty());
         let turn = SurfaceTurnRef::new(f.origin.conversation.clone(), "revoked-job").unwrap();
-        assert!(
-            f.store.claim_surface_turn(&turn).is_ok(),
-            "native turn was never claimed"
-        );
+        assert!(f.store.claim_surface_turn(&turn).is_ok(), "native turn was never claimed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1242,9 +1093,7 @@ mod fast {
             f.store.clone(),
             f.service.clone(),
             Arc::new(MarkdownAgent),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         );
@@ -1270,9 +1119,7 @@ mod fast {
             f.store.clone(),
             configured,
             Arc::new(MarkdownAgent),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         );
@@ -1289,15 +1136,11 @@ mod fast {
             f.store.clone(),
             f.service.clone(),
             Arc::new(MarkdownAgent),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         );
-        assert!(plain
-            .speculate(&f.call, "what's on my calendar tomorrow")
-            .is_none());
+        assert!(plain.speculate(&f.call, "what's on my calendar tomorrow").is_none());
         let model = Scripted::new(vec![vec![token("You're free tomorrow.")]]);
         let bridge = bridge(&f, Arc::new(MarkdownAgent), model.clone());
         let speculation = bridge
@@ -1306,14 +1149,7 @@ mod fast {
         let final_text = "what's on my calendar tomorrow?";
         let (turn_id, speech, _rx) = speech_for(&f.call.id, final_text);
         let answer = bridge
-            .answer_speculated(
-                &f.call,
-                &turn_id,
-                final_text,
-                speech,
-                CancellationToken::new(),
-                speculation,
-            )
+            .answer_speculated(&f.call, &turn_id, final_text, speech, CancellationToken::new(), speculation)
             .await
             .unwrap();
         assert_eq!(answer, "You're free tomorrow.");
@@ -1339,14 +1175,9 @@ mod fast {
     #[tokio::test]
     async fn step8_dispatched_turn_progress_reaches_the_call_but_not_the_chat() {
         let f = connected().await;
-        let heavy = Arc::new(ProgressHeavy {
-            accepted: Mutex::new(Vec::new()),
-        });
+        let heavy = Arc::new(ProgressHeavy { accepted: Mutex::new(Vec::new()) });
         let model = Scripted::new(vec![
-            vec![tool(
-                "dispatch_task",
-                serde_json::json!({"description":"draft the reply"}),
-            )],
+            vec![tool("dispatch_task", serde_json::json!({"description":"draft the reply"}))],
             vec![token("Started.")],
         ]);
         let bridge = bridge(&f, heavy.clone(), model);
@@ -1354,13 +1185,7 @@ mod fast {
         // The relay loop keeps its speech queue open for the whole call.
         let _call_open = speech.clone();
         bridge
-            .answer(
-                &f.call,
-                &turn_id,
-                "draft it",
-                speech,
-                CancellationToken::new(),
-            )
+            .answer(&f.call, &turn_id, "draft it", speech, CancellationToken::new())
             .await
             .unwrap();
         let key = format!("{turn_id}:dispatch");
@@ -1378,12 +1203,7 @@ mod fast {
                 announced.push(text);
             }
         }
-        assert!(
-            announced
-                .iter()
-                .any(|t| t.contains("Found the Linear thread.")),
-            "{announced:?}"
-        );
+        assert!(announced.iter().any(|t| t.contains("Found the Linear thread.")), "{announced:?}");
     }
 
     // ---------- #1552 post-call memory ----------
@@ -1396,21 +1216,11 @@ mod fast {
         assert!(f.store.phone_claim_call_summary(&f.call.id, 100).unwrap());
         let facts: Vec<_> = facts
             .iter()
-            .map(|(k, v)| NewProfileFact {
-                key: (*k).into(),
-                value: (*v).into(),
-                confidence: 0.9,
-            })
+            .map(|(k, v)| NewProfileFact { key: (*k).into(), value: (*v).into(), confidence: 0.9 })
             .collect();
         assert!(f
             .store
-            .phone_complete_call_summary(
-                &f.call.id,
-                "Planned the garden.\nDetails.",
-                "phone/calls/x.md",
-                &facts,
-                100
-            )
+            .phone_complete_call_summary(&f.call.id, "Planned the garden.\nDetails.", "phone/calls/x.md", &facts, 100)
             .unwrap());
     }
 
@@ -1420,14 +1230,7 @@ mod fast {
     #[tokio::test]
     async fn fast_prompt_carries_profile_and_forgotten_key_is_gone_next_turn() {
         let f = connected().await;
-        seed_profile(
-            &f,
-            &[
-                ("first_name", "Zorblat"),
-                ("pet", "a cat named Bix"),
-                ("city", "Springfield"),
-            ],
-        );
+        seed_profile(&f, &[("first_name", "Zorblat"), ("pet", "a cat named Bix"), ("city", "Springfield")]);
         let model = Scripted::new(vec![vec![token("Hi Zorblat.")], vec![token("Sure.")]]);
         let heavy = Arc::new(BlockedHeavy {
             provider: Arc::new(RecordingNativeProvider::new(ProviderKind::Claude)),
@@ -1437,53 +1240,25 @@ mod fast {
         });
         let agent = bridge(&f, heavy, model.clone());
         let (turn, speech, _rx) = speech_for(&f.call.id, "hello");
-        agent
-            .answer(&f.call, &turn, "hello", speech, CancellationToken::new())
-            .await
-            .unwrap();
+        agent.answer(&f.call, &turn, "hello", speech, CancellationToken::new()).await.unwrap();
         let reply = augmentagent_phone::commands::execute(
-            &f.service,
-            &f.origin.owner,
-            &f.origin.conversation,
-            "forget-1",
-            "profile forget pet",
+            &f.service, &f.origin.owner, &f.origin.conversation, "forget-1", "profile forget pet",
         )
         .await
         .unwrap();
         assert!(reply.contains("Forgot"), "{reply}");
         let (turn, speech, _rx) = speech_for(&f.call.id, "again");
-        agent
-            .answer(&f.call, &turn, "again", speech, CancellationToken::new())
-            .await
-            .unwrap();
+        agent.answer(&f.call, &turn, "again", speech, CancellationToken::new()).await.unwrap();
         let systems = model.systems.lock().unwrap();
-        assert!(
-            systems[0].contains("Owner first name: Zorblat"),
-            "{}",
-            systems[0]
-        );
-        assert!(
-            systems[0].contains("- pet: a cat named Bix"),
-            "{}",
-            systems[0]
-        );
-        assert!(
-            systems[0].contains("- Planned the garden."),
-            "{}",
-            systems[0]
-        );
+        assert!(systems[0].contains("Owner first name: Zorblat"), "{}", systems[0]);
+        assert!(systems[0].contains("- pet: a cat named Bix"), "{}", systems[0]);
+        assert!(systems[0].contains("- Planned the garden."), "{}", systems[0]);
         assert!(!systems[1].contains("pet"), "{}", systems[1]);
         assert!(systems[1].contains("- city: Springfield"), "{}", systems[1]);
     }
 
     struct SummaryReasoner {
-        seen: Mutex<
-            Vec<(
-                augmentagent_channel_core::reasoner::ReasonerOpts,
-                String,
-                bool,
-            )>,
-        >,
+        seen: Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts, String, bool)>>,
     }
     #[async_trait]
     impl Reasoner for SummaryReasoner {
@@ -1493,10 +1268,7 @@ mod fast {
             message: &str,
         ) -> anyhow::Result<String> {
             let phone_context = augmentagent_phone::context::current().is_some();
-            self.seen
-                .lock()
-                .unwrap()
-                .push((opts.clone(), message.into(), phone_context));
+            self.seen.lock().unwrap().push((opts.clone(), message.into(), phone_context));
             Ok(r#"{"summary":"Call.","facts":[]}"#.into())
         }
     }
@@ -1507,25 +1279,18 @@ mod fast {
     async fn summarization_runs_the_heavy_agent_once_with_no_tools() {
         use augmentagent_phone::memory::{SummaryRequest, FORBIDDEN_SUMMARY_TOOLS, SUMMARY_TOOLS};
         let f = connected().await;
-        let reasoner = Arc::new(SummaryReasoner {
-            seen: Mutex::new(Vec::new()),
-        });
+        let reasoner = Arc::new(SummaryReasoner { seen: Mutex::new(Vec::new()) });
         let wiki = tempfile::tempdir().unwrap();
         let agent = PhoneAgent::new(
             f.store.clone(),
             f.service.clone(),
             Arc::new(MarkdownAgent),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             wiki.path().to_path_buf(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         )
         .with_summary_reasoner(reasoner.clone());
-        let draft = agent
-            .summarize_call(&f.call, &SummaryRequest::new())
-            .await
-            .unwrap();
+        let draft = agent.summarize_call(&f.call, &SummaryRequest::new()).await.unwrap();
         assert_eq!(draft.wiki_root, wiki.path());
         assert!(draft.output.contains("Call."));
         let (opts, message, phone_context) = {
@@ -1541,11 +1306,7 @@ mod fast {
         }
         let settings: serde_json::Value =
             serde_json::from_str(opts.settings_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            settings["mcpServers"],
-            serde_json::json!({}),
-            "strict, empty MCP config"
-        );
+        assert_eq!(settings["mcpServers"], serde_json::json!({}), "strict, empty MCP config");
         let denied: Vec<&str> = settings["permissions"]["deny"]
             .as_array()
             .unwrap()
@@ -1559,13 +1320,8 @@ mod fast {
         assert!(!phone_context, "no phone grant is in scope");
         assert!(message.contains("owner: earlier chat line"), "{message}");
         // A revoked owner gets no summary run.
-        f.store
-            .unbind_surface_owner(f.origin.owner.account())
-            .unwrap();
-        assert!(agent
-            .summarize_call(&f.call, &SummaryRequest::new())
-            .await
-            .is_err());
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        assert!(agent.summarize_call(&f.call, &SummaryRequest::new()).await.is_err());
         assert_eq!(reasoner.seen.lock().unwrap().len(), 1);
     }
 
@@ -1589,28 +1345,16 @@ mod fast {
             f.store.clone(),
             f.service.clone(),
             questions.clone(),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         );
-        for (turn, text) in [
-            ("phone:turn-1", "first question"),
-            ("phone:turn-2", "second question"),
-        ] {
-            agent
-                .run(&f.call, turn, text, None, CancellationToken::new())
-                .await
-                .unwrap();
+        for (turn, text) in [("phone:turn-1", "first question"), ("phone:turn-2", "second question")] {
+            agent.run(&f.call, turn, text, None, CancellationToken::new()).await.unwrap();
         }
         let questions = questions.0.lock().unwrap();
         assert_eq!(questions.len(), 2);
-        assert!(
-            questions[0].contains("- pet: a cat named Bix"),
-            "{}",
-            questions[0]
-        );
+        assert!(questions[0].contains("- pet: a cat named Bix"), "{}", questions[0]);
         assert!(questions[0].contains("first question"));
         assert!(!questions[1].contains("pet"), "{}", questions[1]);
     }
@@ -1673,9 +1417,7 @@ mod queue {
         use augmentagent_phone::relay::{RelayInput, RelaySession};
         let mut session = RelaySession::new(call_id, "AC-test", "CA-test");
         session
-            .receive(
-                r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#,
-            )
+            .receive(r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#)
             .unwrap();
         let frame = serde_json::json!({"type":"prompt","voicePrompt":text,"last":true}).to_string();
         let RelayInput::Turn(turn) = session.receive(&frame).unwrap() else {
@@ -1707,13 +1449,7 @@ mod queue {
         let started = Instant::now();
         let answer = tokio::time::timeout(
             Duration::from_secs(1),
-            bridge.answer(
-                &f.call,
-                &turn_id,
-                "when is lunch",
-                speech,
-                CancellationToken::new(),
-            ),
+            bridge.answer(&f.call, &turn_id, "when is lunch", speech, CancellationToken::new()),
         )
         .await
         .expect("the fast turn must not wait for the text turn")
@@ -1721,19 +1457,9 @@ mod queue {
         assert_eq!(answer, "Sure. It's at noon.");
         assert!(started.elapsed() < Duration::from_secs(1));
         // Spy: still held by the text turn, and the phone turn never queued.
-        assert!(
-            queue.is_locked(),
-            "the mutex was held for the whole phone turn"
-        );
+        assert!(queue.is_locked(), "the mutex was held for the whole phone turn");
         assert_eq!(queue.entries(), 1, "only the text turn entered the queue");
-        let record = timer.record(
-            &f.call.id,
-            &turn_id,
-            timer.provider(),
-            TurnOutcome::Answered,
-            0,
-            None,
-        );
+        let record = timer.record(&f.call.id, &turn_id, timer.provider(), TurnOutcome::Answered, 0, None);
         assert_eq!(record.provider, TurnProvider::Fast);
         assert_eq!(record.queue_wait_ms, Some(0));
         text.await.unwrap();
@@ -1754,9 +1480,7 @@ mod queue {
             f.store.clone(),
             f.service.clone(),
             Arc::new(MarkdownAgent),
-            Arc::new(super::fast::OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(super::fast::OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         ));
@@ -1772,31 +1496,17 @@ mod queue {
         let (call, id, line) = (f.call.clone(), turn_id.clone(), speech.clone());
         let answer = tokio::spawn(async move {
             bridge
-                .run(
-                    &call,
-                    &id,
-                    "status?",
-                    Some(speech),
-                    CancellationToken::new(),
-                )
+                .run(&call, &id, "status?", Some(speech), CancellationToken::new())
                 .await
         });
-        LegacyTurn {
-            turn_id,
-            timer,
-            line,
-            events,
-            answer,
-        }
+        LegacyTurn { turn_id, timer, line, events, answer }
     }
     /// (at, utterance id) of every queue-wait notice.
     pub fn notices(events: &[(Duration, SpeechEvent)]) -> Vec<(Duration, String)> {
         events
             .iter()
             .filter_map(|(at, event)| match event {
-                SpeechEvent::Notice {
-                    utterance_id, text, ..
-                } => {
+                SpeechEvent::Notice { utterance_id, text, .. } => {
                     assert_eq!(text, augmentagent_channel_core::phone_agent::QUEUE_NOTICE);
                     Some((*at, utterance_id.clone()))
                 }
@@ -1823,20 +1533,13 @@ mod queue {
         }
         let turn = legacy_turn(&f, started);
         tokio::time::sleep(Duration::from_secs(18) - Duration::from_millis(1)).await;
-        assert!(
-            turn.answer.is_finished(),
-            "answered once the text turn released the queue"
-        );
+        assert!(turn.answer.is_finished(), "answered once the text turn released the queue");
         let answer = turn.answer.await.unwrap().unwrap();
         assert!(answer.contains("Done."));
         text.await.unwrap();
         let events = std::mem::take(&mut *turn.events.lock().unwrap());
         let notices = notices(&events);
-        assert_eq!(
-            notices.len(),
-            1,
-            "exactly one notice before 18 s: {notices:?}"
-        );
+        assert_eq!(notices.len(), 1, "exactly one notice before 18 s: {notices:?}");
         assert!(near(notices[0].0, Duration::from_secs(3)), "{notices:?}");
         // The answer follows the release; the notice is not part of it.
         let tokens: Vec<_> = events
@@ -1844,22 +1547,12 @@ mod queue {
             .filter_map(|(at, e)| matches!(e, SpeechEvent::Token { .. }).then_some(*at))
             .collect();
         assert!(!tokens.is_empty());
-        assert!(
-            tokens.iter().all(|at| *at >= Duration::from_secs(10)),
-            "{tokens:?}"
-        );
+        assert!(tokens.iter().all(|at| *at >= Duration::from_secs(10)), "{tokens:?}");
         // Nothing closed the call: its speech queue is still live.
         assert!(turn.line.line().is_live());
         let call = f.store.phone_provider_call(&f.call.id).unwrap();
         assert!(!call.stop_requested);
-        let record = turn.timer.record(
-            &f.call.id,
-            &turn.turn_id,
-            turn.timer.provider(),
-            TurnOutcome::Answered,
-            0,
-            None,
-        );
+        let record = turn.timer.record(&f.call.id, &turn.turn_id, turn.timer.provider(), TurnOutcome::Answered, 0, None);
         assert_eq!(record.provider, TurnProvider::Native);
         let waited = record.queue_wait_ms.expect("queue wait recorded");
         assert!((waited - 10_000).abs() <= 100, "{record:?}");
@@ -1927,13 +1620,7 @@ mod queue {
         let (turn_id, speech, _timer, _rx) = timed_speech(&f.call.id, "when is lunch");
         let answer = tokio::time::timeout(
             Duration::from_secs(1),
-            bridge.answer(
-                &f.call,
-                &turn_id,
-                "when is lunch",
-                speech,
-                CancellationToken::new(),
-            ),
+            bridge.answer(&f.call, &turn_id, "when is lunch", speech, CancellationToken::new()),
         )
         .await
         .expect("the fast turn must not wait for a CLI permit")
@@ -1945,28 +1632,16 @@ mod queue {
             f.store.clone(),
             f.service.clone(),
             gated,
-            Arc::new(super::fast::OutboxIo {
-                store: f.store.clone(),
-            }),
+            Arc::new(super::fast::OutboxIo { store: f.store.clone() }),
             "/fixture".into(),
             Arc::new(|_| Ok(Some(ProviderKind::Claude))),
         );
         let (turn_id, speech, _timer, _rx) = timed_speech(&f.call.id, "status?");
         legacy
-            .run(
-                &f.call,
-                &turn_id,
-                "status?",
-                Some(speech),
-                CancellationToken::new(),
-            )
+            .run(&f.call, &turn_id, "status?", Some(speech), CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(
-            gate.acquire_calls(),
-            before + 1,
-            "the spy sees the native path"
-        );
+        assert_eq!(gate.acquire_calls(), before + 1, "the spy sees the native path");
     }
 }
 
@@ -2091,10 +1766,7 @@ mod proposals {
         let posted = sends(&p.store, &p.origin, &key);
         assert_eq!(posted.len(), 1, "{posted:?}");
         assert!(posted[0].starts_with("I have 2 things to go over, call now?"));
-        assert!(
-            p.store.phone_latest_call("owner").unwrap().is_none(),
-            "no call yet"
-        );
+        assert!(p.store.phone_latest_call("owner").unwrap().is_none(), "no call yet");
     }
 
     // AC5, native path: the first turn of the accepted call opens with the agenda.
@@ -2105,23 +1777,12 @@ mod proposals {
         let agent = agent(&p, questions.clone());
         let call = accepted_call(&p, &agent).await;
         for (turn, text) in [("phone:turn-1", "hello"), ("phone:turn-2", "next")] {
-            agent
-                .run(&call, turn, text, None, CancellationToken::new())
-                .await
-                .unwrap();
+            agent.run(&call, turn, text, None, CancellationToken::new()).await.unwrap();
         }
         let questions = questions.0.lock().unwrap();
-        assert!(
-            questions[0].contains(AGENDA_INSTRUCTION),
-            "{}",
-            questions[0]
-        );
+        assert!(questions[0].contains(AGENDA_INSTRUCTION), "{}", questions[0]);
         assert!(questions[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
-        assert!(
-            !questions[1].contains("Reply to the venue"),
-            "{}",
-            questions[1]
-        );
+        assert!(!questions[1].contains("Reply to the venue"), "{}", questions[1]);
     }
 
     // AC5, fast path: the fast layer's first prompt carries the agenda.
@@ -2141,80 +1802,47 @@ mod proposals {
         assert!(systems[0].contains(AGENDA_INSTRUCTION), "{}", systems[0]);
         assert!(systems[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
     }
+
 }
 
 mod live_results {
-    use super::fast::{connected, OutboxIo};
     use super::*;
+    use super::fast::{connected, OutboxIo};
     use augmentagent_phone::ingress::ConversationAgent;
     #[tokio::test]
     async fn live_result_summary_is_tool_free_bounded_and_contains_only_result_data() {
-        struct SpokenReasoner(
-            Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts, String)>>,
-            Mutex<String>,
-        );
+        struct SpokenReasoner(Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts,String)>>,Mutex<String>);
         #[async_trait]
         impl Reasoner for SpokenReasoner {
-            async fn call(
-                &self,
-                opts: &augmentagent_channel_core::reasoner::ReasonerOpts,
-                message: &str,
-            ) -> anyhow::Result<String> {
-                self.0.lock().unwrap().push((opts.clone(), message.into()));
+            async fn call(&self,opts:&augmentagent_channel_core::reasoner::ReasonerOpts,message:&str)->anyhow::Result<String> {
+                self.0.lock().unwrap().push((opts.clone(),message.into()));
                 Ok(self.1.lock().unwrap().clone())
             }
         }
-        let f = connected().await;
-        let reasoner = Arc::new(SpokenReasoner(
-            Mutex::new(Vec::new()),
-            Mutex::new(
-                r#"{"spoken_summary":"There are three options. None has been booked."}"#.into(),
-            ),
-        ));
-        let agent = PhoneAgent::new(
-            f.store.clone(),
-            f.service.clone(),
-            Arc::new(MarkdownAgent),
-            Arc::new(OutboxIo {
-                store: f.store.clone(),
-            }),
-            "/fixture".into(),
-            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
-        )
-        .with_summary_reasoner(reasoner.clone());
-        let full = "Untrusted tool result. ".repeat(100);
-        assert_eq!(
-            agent.summarize_live_result(&f.call, &full).await.unwrap(),
-            "There are three options. None has been booked."
-        );
+        let f=connected().await;
+        let reasoner=Arc::new(SpokenReasoner(Mutex::new(Vec::new()),Mutex::new(r#"{"spoken_summary":"There are three options. None has been booked."}"#.into())));
+        let agent=PhoneAgent::new(f.store.clone(),f.service.clone(),Arc::new(MarkdownAgent),Arc::new(OutboxIo{store:f.store.clone()}),"/fixture".into(),Arc::new(|_|Ok(Some(ProviderKind::Claude)))).with_summary_reasoner(reasoner.clone());
+        let full="Untrusted tool result. ".repeat(100);
+        assert_eq!(agent.summarize_live_result(&f.call,&full).await.unwrap(),"There are three options. None has been booked.");
         {
-            let seen = reasoner.0.lock().unwrap();
-            assert_eq!(seen.len(), 1);
-            assert!(seen[0].0.model.is_some());
-            assert!(seen[0].0.allowed_tools.is_empty());
-            assert!(seen[0].0.add_dirs.is_empty());
-            let settings: serde_json::Value =
-                serde_json::from_str(seen[0].0.settings_json.as_ref().unwrap()).unwrap();
-            assert_eq!(settings["mcpServers"], serde_json::json!({}));
-            assert!(settings["permissions"]["deny"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("Bash")));
-            let data: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
-            assert_eq!(data, serde_json::json!({"completed_task_result":full}));
+        let seen=reasoner.0.lock().unwrap();
+        assert_eq!(seen.len(),1);
+        assert!(seen[0].0.model.is_some());
+        assert!(seen[0].0.allowed_tools.is_empty());
+        assert!(seen[0].0.add_dirs.is_empty());
+        let settings:serde_json::Value=serde_json::from_str(seen[0].0.settings_json.as_ref().unwrap()).unwrap();
+        assert_eq!(settings["mcpServers"],serde_json::json!({}));
+        assert!(settings["permissions"]["deny"].as_array().unwrap().contains(&serde_json::json!("Bash")));
+        let data:serde_json::Value=serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(data,serde_json::json!({"completed_task_result":full}));
         }
-        *reasoner.1.lock().unwrap() =
-            serde_json::json!({"spoken_summary":"x".repeat(501)}).to_string();
-        assert!(agent.summarize_live_result(&f.call, &full).await.is_err());
-        *reasoner.1.lock().unwrap() = "Not JSON".into();
-        assert!(agent.summarize_live_result(&f.call, &full).await.is_err());
-        f.store
-            .unbind_surface_owner(f.origin.owner.account())
-            .unwrap();
-        assert!(agent
-            .summarize_live_result(&f.call, "Private")
-            .await
-            .is_err());
-        assert_eq!(reasoner.0.lock().unwrap().len(), 3);
+        *reasoner.1.lock().unwrap()=serde_json::json!({"spoken_summary":"x".repeat(501)}).to_string();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        *reasoner.1.lock().unwrap()="Not JSON".into();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        assert!(agent.summarize_live_result(&f.call,"Private").await.is_err());
+        assert_eq!(reasoner.0.lock().unwrap().len(),3);
     }
+
 }

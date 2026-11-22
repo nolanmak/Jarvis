@@ -104,7 +104,11 @@ pub mod kind {
     pub fn is_engagement(k: &str) -> bool {
         matches!(
             k,
-            SCHEDULED_POST_FIRE | OWN_POST_COMMENT | FRIEND_POST | CONNECTION_REQUEST | WARM_TOUCH
+            SCHEDULED_POST_FIRE
+                | OWN_POST_COMMENT
+                | FRIEND_POST
+                | CONNECTION_REQUEST
+                | WARM_TOUCH
         )
     }
 }
@@ -133,7 +137,10 @@ pub trait Trigger: Send + Sync {
     /// Return any new work. Empty vec means "nothing to do this tick".
     /// `cancel` lets a caller interrupt a long-running fetch so the daemon
     /// can shut down promptly.
-    async fn next_work_items(&self, cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>>;
+    async fn next_work_items(
+        &self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<Vec<WorkItem>>;
 }
 
 /// Standard adapter: wrap an [`InboundSource`] into a [`Trigger`].
@@ -152,7 +159,10 @@ impl<S: InboundSource> InboundMessageTrigger<S> {
 
 #[async_trait]
 impl<S: InboundSource + 'static> Trigger for InboundMessageTrigger<S> {
-    async fn next_work_items(&self, _cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
+    async fn next_work_items(
+        &self,
+        _cancel: &CancellationToken,
+    ) -> anyhow::Result<Vec<WorkItem>> {
         self.source.fetch_new().await
     }
 }
@@ -298,7 +308,10 @@ impl<S: FriendFeedSource> FriendFeedTrigger<S> {
 
 #[async_trait]
 impl<S: FriendFeedSource + 'static> Trigger for FriendFeedTrigger<S> {
-    async fn next_work_items(&self, _cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
+    async fn next_work_items(
+        &self,
+        _cancel: &CancellationToken,
+    ) -> anyhow::Result<Vec<WorkItem>> {
         self.source.fetch_new_friend_posts().await
     }
 }
@@ -593,10 +606,7 @@ mod tests {
         let base = Duration::from_millis(500);
         for _ in 0..100 {
             let j = jittered(base);
-            assert!(
-                j <= Duration::from_millis(1000),
-                "jitter out of window: {j:?}"
-            );
+            assert!(j <= Duration::from_millis(1000), "jitter out of window: {j:?}");
         }
         assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
     }

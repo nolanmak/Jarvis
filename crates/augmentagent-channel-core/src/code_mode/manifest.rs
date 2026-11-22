@@ -256,10 +256,7 @@ mod tests {
     #[test]
     fn dts_contains_header_and_root_namespaces() {
         let dts = manifest_v1().to_dts();
-        assert!(
-            dts.contains("declare const tools"),
-            "missing header in:\n{dts}"
-        );
+        assert!(dts.contains("declare const tools"), "missing header in:\n{dts}");
         assert!(dts.contains("wiki:"), "missing wiki namespace in:\n{dts}");
         assert!(dts.contains("db:"), "missing db namespace in:\n{dts}");
         assert!(
@@ -273,10 +270,7 @@ mod tests {
         let dts = manifest_v1().to_dts();
         // One `/**` per leaf — six leaves total.
         let jsdoc_opens = dts.matches("/**").count();
-        assert_eq!(
-            jsdoc_opens, 6,
-            "expected 6 JSDoc blocks, got {jsdoc_opens} in:\n{dts}"
-        );
+        assert_eq!(jsdoc_opens, 6, "expected 6 JSDoc blocks, got {jsdoc_opens} in:\n{dts}");
     }
 
     #[test]
@@ -284,9 +278,7 @@ mod tests {
         let dts = manifest_v1().to_dts();
         // `draft` is a top-level tool — its signature should sit at root.
         assert!(
-            dts.contains(
-                "draft: (channel: Channel, body: string, reason: string) => Promise<void>;"
-            ),
+            dts.contains("draft: (channel: Channel, body: string, reason: string) => Promise<void>;"),
             "draft signature not rendered at root in:\n{dts}"
         );
     }

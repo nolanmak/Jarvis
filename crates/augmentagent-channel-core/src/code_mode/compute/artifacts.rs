@@ -200,23 +200,14 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
 /// Keep rollback ownership until the enclosing CLI operation has published its
 /// report. Dropping this batch removes only the destination files it created.
 #[cfg(unix)]
-pub fn export_pending(
-    root: &Path,
-    destination: &Directory,
-    entries: &[Artifact],
-) -> Result<ExportTransaction> {
+pub fn export_pending(root: &Path, destination: &Directory, entries: &[Artifact]) -> Result<ExportTransaction> {
     export_pending_checked(root, destination, entries, &|| Ok(()))
 }
 
 /// Host cancellation/deadline checks run between bounded chunks and before
 /// publication. An interrupted batch retains the same rollback guarantees.
 #[cfg(unix)]
-pub fn export_pending_checked(
-    root: &Path,
-    destination: &Directory,
-    entries: &[Artifact],
-    check: &dyn Fn() -> Result<()>,
-) -> Result<ExportTransaction> {
+pub fn export_pending_checked(root: &Path, destination: &Directory, entries: &[Artifact], check: &dyn Fn() -> Result<()>) -> Result<ExportTransaction> {
     check()?;
     let source = Directory::open(root, false)?;
     let mut names = BTreeSet::new();
@@ -275,15 +266,12 @@ pub fn export_audit(root: &Path, destination: &Directory) -> Result<()> {
                 }
                 let expected = format!("audit-{id}{suffix}.{stream}");
                 anyhow::ensure!(
-                    log["file"].as_str() == Some(expected.as_str())
-                        && names.insert(expected.clone()),
+                    log["file"].as_str() == Some(expected.as_str()) && names.insert(expected.clone()),
                     "invalid audit log filename"
                 );
                 let bytes = log["bytes"].as_u64().context("invalid audit log length")?;
                 total = total.checked_add(bytes).context("audit size overflow")?;
-                phase_bytes = phase_bytes
-                    .checked_add(bytes)
-                    .context("audit size overflow")?;
+                phase_bytes = phase_bytes.checked_add(bytes).context("audit size overflow")?;
                 anyhow::ensure!(
                     phase_bytes <= 8 * 1024 * 1024 && total <= 25 * 2 * 8 * 1024 * 1024,
                     "audit log size limit exceeded"
@@ -315,33 +303,21 @@ pub struct ExportTransaction {
 
 #[cfg(unix)]
 impl ExportTransaction {
-    pub fn commit(mut self) {
-        self.committed = true;
-    }
+    pub fn commit(mut self) { self.committed = true; }
 }
 
 #[cfg(unix)]
 impl Drop for ExportTransaction {
     fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
+        if self.committed { return; }
         for (name, file) in &self.created {
             // The retained descriptor prevents inode reuse. A concurrently
             // replaced name belongs to somebody else and must survive rollback.
-            let Ok(original) = file.metadata() else {
-                continue;
-            };
-            let Ok(current) = std::fs::symlink_metadata(self.destination.path().join(name)) else {
-                continue;
-            };
-            if original.dev() != current.dev() || original.ino() != current.ino() {
-                continue;
-            }
+            let Ok(original) = file.metadata() else { continue };
+            let Ok(current) = std::fs::symlink_metadata(self.destination.path().join(name)) else { continue };
+            if original.dev() != current.dev() || original.ino() != current.ino() { continue; }
             if let Ok(name) = std::ffi::CString::new(name.as_str()) {
-                unsafe {
-                    libc::unlinkat(self.destination.0.as_raw_fd(), name.as_ptr(), 0);
-                }
+                unsafe { libc::unlinkat(self.destination.0.as_raw_fd(), name.as_ptr(), 0); }
             }
         }
         let _ = self.destination.0.sync_all();
@@ -357,59 +333,55 @@ fn copy_verified(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<ExportTransaction> {
     let mut pending = ExportTransaction {
-        destination: Directory(destination.0.try_clone()?),
-        created: Vec::new(),
-        committed: false,
+        destination: Directory(destination.0.try_clone()?), created: Vec::new(), committed: false,
     };
-    for entry in entries {
-        check()?;
-        let mut input = source.open_file(&entry.id, false)?;
-        let before = input.metadata()?;
-        anyhow::ensure!(
-            before.is_file() && before.nlink() == 1 && before.len() == entry.bytes,
-            "invalid artifact storage"
-        );
-        if private {
+        for entry in entries {
+            check()?;
+            let mut input = source.open_file(&entry.id, false)?;
+            let before = input.metadata()?;
             anyhow::ensure!(
-                before.uid() == unsafe { libc::getuid() } && before.mode() & 0o777 == 0o600,
-                "audit log is not private"
+                before.is_file() && before.nlink() == 1 && before.len() == entry.bytes,
+                "invalid artifact storage"
             );
-        }
-        let mut bytes = Vec::new();
-        let mut limited = (&mut input).take(entry.bytes + 1);
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            check()?;
-            let count = limited.read(&mut chunk)?;
-            if count == 0 {
-                break;
+            if private {
+                anyhow::ensure!(
+                    before.uid() == unsafe { libc::getuid() } && before.mode() & 0o777 == 0o600,
+                    "audit log is not private"
+                );
             }
-            bytes.extend_from_slice(&chunk[..count]);
-        }
-        let after = input.metadata()?;
-        anyhow::ensure!(
-            bytes.len() as u64 == entry.bytes
-                && after.nlink() == 1
-                && before.mtime_nsec() == after.mtime_nsec()
-                && before.mtime() == after.mtime()
-                && format!("{:x}", Sha256::digest(&bytes)) == entry.sha256,
-            "artifact integrity verification failed"
-        );
-        check()?;
-        let output = destination.open_file(&entry.name, true)?;
-        pending.created.push((entry.name.clone(), output));
-        let output = &mut pending.created.last_mut().unwrap().1;
-        for chunk in bytes.chunks(64 * 1024) {
+            let mut bytes = Vec::new();
+            let mut limited = (&mut input).take(entry.bytes + 1);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                check()?;
+                let count = limited.read(&mut chunk)?;
+                if count == 0 { break; }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let after = input.metadata()?;
+            anyhow::ensure!(
+                bytes.len() as u64 == entry.bytes
+                    && after.nlink() == 1
+                    && before.mtime_nsec() == after.mtime_nsec()
+                    && before.mtime() == after.mtime()
+                    && format!("{:x}", Sha256::digest(&bytes)) == entry.sha256,
+                "artifact integrity verification failed"
+            );
             check()?;
-            output.write_all(chunk)?;
+            let output = destination.open_file(&entry.name, true)?;
+            pending.created.push((entry.name.clone(), output));
+            let output = &mut pending.created.last_mut().unwrap().1;
+            for chunk in bytes.chunks(64 * 1024) {
+                check()?;
+                output.write_all(chunk)?;
+            }
+            check()?;
+            output.sync_all()?;
         }
         check()?;
-        output.sync_all()?;
-    }
-    check()?;
-    destination.0.sync_all()?;
-    check()?;
-    Ok(pending)
+        destination.0.sync_all()?;
+        check()?;
+        Ok(pending)
 }
 
 #[cfg(all(test, unix))]
@@ -432,11 +404,7 @@ mod tests {
             .write_all(b"unselected snapshot canary")
             .unwrap();
         let preparation_name = format!("audit-{id}-prepare.stderr");
-        source
-            .open_file(&preparation_name, true)
-            .unwrap()
-            .write_all(b"private installer log")
-            .unwrap();
+        source.open_file(&preparation_name, true).unwrap().write_all(b"private installer log").unwrap();
         let audit = serde_json::json!({"schemaVersion":1,"closed":true,"cleanupVerified":true,"records":[{
             "executionId":id,"logs":{"stdout":{"file":log_name,"bytes":11,"sha256":format!("{:x}",Sha256::digest(b"private log"))}},
             "preparation":{"logs":{"stderr":{"file":preparation_name,"bytes":21,"sha256":format!("{:x}",Sha256::digest(b"private installer log"))}}}
@@ -449,10 +417,7 @@ mod tests {
             std::fs::read(target.path().join(&log_name)).unwrap(),
             b"private log"
         );
-        assert_eq!(
-            std::fs::read(target.path().join(&preparation_name)).unwrap(),
-            b"private installer log"
-        );
+        assert_eq!(std::fs::read(target.path().join(&preparation_name)).unwrap(), b"private installer log");
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 3);
         let mut forged = audit.clone();
         forged["records"][0]["logs"]["stdout"]["file"] = serde_json::json!("../outside");
@@ -464,27 +429,19 @@ mod tests {
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
         for phase in ["logs", "preparation"] {
             let mut forged = audit.clone();
-            let logs = if phase == "logs" {
-                &mut forged["records"][0]["logs"]
-            } else {
-                &mut forged["records"][0]["preparation"]["logs"]
-            };
-            logs["stderr"] =
-                serde_json::json!({"file":"../outside","bytes":1,"sha256":"a".repeat(64)});
+            let logs = if phase == "logs" { &mut forged["records"][0]["logs"] }
+                       else { &mut forged["records"][0]["preparation"]["logs"] };
+            logs["stderr"] = serde_json::json!({"file":"../outside","bytes":1,"sha256":"a".repeat(64)});
             std::fs::remove_file(root.path().join("audit.json")).unwrap();
             source.write_report("audit.json", &forged).unwrap();
             assert!(export_audit(root.path(), &destination).is_err());
             assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
         }
         let mut oversized = audit.clone();
-        oversized["records"][0]["preparation"]["logs"]["stderr"]["bytes"] =
-            serde_json::json!(8 * 1024 * 1024 + 1);
+        oversized["records"][0]["preparation"]["logs"]["stderr"]["bytes"] = serde_json::json!(8 * 1024 * 1024 + 1);
         std::fs::remove_file(root.path().join("audit.json")).unwrap();
         source.write_report("audit.json", &oversized).unwrap();
-        assert!(export_audit(root.path(), &destination)
-            .unwrap_err()
-            .to_string()
-            .contains("audit log size limit"));
+        assert!(export_audit(root.path(), &destination).unwrap_err().to_string().contains("audit log size limit"));
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
         std::fs::remove_file(root.path().join("audit.json")).unwrap();
         source.write_report("audit.json", &audit).unwrap();
@@ -547,9 +504,7 @@ mod tests {
         let entry = fixture(root.path(), "result.bin", &vec![42; 256 * 1024]);
         let observed = std::cell::Cell::new(0);
         let result = export_pending_checked(root.path(), &destination, &[entry], &|| {
-            let bytes = std::fs::metadata(out.path().join("result.bin"))
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let bytes = std::fs::metadata(out.path().join("result.bin")).map(|m| m.len()).unwrap_or(0);
             if bytes > 0 {
                 observed.set(bytes);
                 anyhow::bail!("cancelled fixture");
@@ -557,11 +512,7 @@ mod tests {
             Ok(())
         });
         assert!(result.is_err());
-        assert_eq!(
-            observed.get(),
-            64 * 1024,
-            "cancellation was not checked after one bounded chunk"
-        );
+        assert_eq!(observed.get(), 64 * 1024, "cancellation was not checked after one bounded chunk");
         assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
     }
 
@@ -581,10 +532,7 @@ mod tests {
         std::fs::remove_file(target.join("result.json")).unwrap();
         std::fs::write(target.join("result.json"), b"replacement sentinel").unwrap();
         drop(pending);
-        assert_eq!(
-            std::fs::read(target.join("result.json")).unwrap(),
-            b"replacement sentinel"
-        );
+        assert_eq!(std::fs::read(target.join("result.json")).unwrap(), b"replacement sentinel");
         std::fs::remove_file(target.join("result.json")).unwrap();
         let pending = export_pending(root.path(), &destination, &[entry.clone()]).unwrap();
         let moved = out.path().join("moved");
@@ -593,13 +541,8 @@ mod tests {
         std::fs::write(target.join("result.json"), b"new directory sentinel").unwrap();
         drop(pending);
         assert!(!moved.join("result.json").exists());
-        assert_eq!(
-            std::fs::read(target.join("result.json")).unwrap(),
-            b"new directory sentinel"
-        );
-        export_pending(root.path(), &destination, &[entry])
-            .unwrap()
-            .commit();
+        assert_eq!(std::fs::read(target.join("result.json")).unwrap(), b"new directory sentinel");
+        export_pending(root.path(), &destination, &[entry]).unwrap().commit();
         assert_eq!(std::fs::read(moved.join("result.json")).unwrap(), b"{}");
     }
 

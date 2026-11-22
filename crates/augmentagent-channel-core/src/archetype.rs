@@ -182,25 +182,27 @@ pub async fn resolve_archetype_block<R: Reasoner + ?Sized>(
         }
     };
     match &choice.id {
-        Some(id) if choice.confidence >= CONFIDENCE_FLOOR => match load_fragment(id) {
-            Some(frag) => {
-                tracing::info!(
-                    message_id = %email.message_id,
-                    archetype = %id,
-                    confidence = choice.confidence,
-                    "archetype picker: composing fragment"
-                );
-                fragment_block(id, &frag)
+        Some(id) if choice.confidence >= CONFIDENCE_FLOOR => {
+            match load_fragment(id) {
+                Some(frag) => {
+                    tracing::info!(
+                        message_id = %email.message_id,
+                        archetype = %id,
+                        confidence = choice.confidence,
+                        "archetype picker: composing fragment"
+                    );
+                    fragment_block(id, &frag)
+                }
+                None => {
+                    tracing::warn!(
+                        message_id = %email.message_id,
+                        archetype = %id,
+                        "archetype picker chose {id} but fragment missing; drafting without it"
+                    );
+                    String::new()
+                }
             }
-            None => {
-                tracing::warn!(
-                    message_id = %email.message_id,
-                    archetype = %id,
-                    "archetype picker chose {id} but fragment missing; drafting without it"
-                );
-                String::new()
-            }
-        },
+        }
         Some(id) => {
             tracing::info!(
                 message_id = %email.message_id,

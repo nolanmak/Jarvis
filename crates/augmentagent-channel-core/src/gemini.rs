@@ -94,10 +94,7 @@ impl GeminiCliReasoner {
             }
             Ok(r) => r,
             Err(_) => {
-                warn!(
-                    "gemini call exceeded the {}s watchdog; child killed",
-                    dur.as_secs()
-                );
+                warn!("gemini call exceeded the {}s watchdog; child killed", dur.as_secs());
                 Err(anyhow::Error::new(ReasonerError::Timeout {
                     provider: "gemini".into(),
                     secs: dur.as_secs(),
@@ -333,8 +330,7 @@ mod tests {
 
     fn stub(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
         let path = dir.path().join(name);
-        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}"))
-            .unwrap();
+        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
@@ -382,22 +378,10 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
         let got = r.call(&opts(vec![]), "summarize this").await.unwrap();
         assert_eq!(got, "a fine summary");
         let rec = std::fs::read_to_string(&record).unwrap();
-        assert!(
-            rec.contains("gemini-3.7-flash"),
-            "haiku-tier preset → fast tier: {rec}"
-        );
-        assert!(
-            rec.contains("SYSTEM_MD=set"),
-            "system prompt must travel via GEMINI_SYSTEM_MD"
-        );
-        assert!(
-            rec.contains("SETTINGS=set"),
-            "per-spawn settings must be pinned"
-        );
-        assert!(
-            !rec.contains("\nauto\n"),
-            "-m must never be left on gemini's floating default"
-        );
+        assert!(rec.contains("gemini-3.7-flash"), "haiku-tier preset → fast tier: {rec}");
+        assert!(rec.contains("SYSTEM_MD=set"), "system prompt must travel via GEMINI_SYSTEM_MD");
+        assert!(rec.contains("SETTINGS=set"), "per-spawn settings must be pinned");
+        assert!(!rec.contains("\nauto\n"), "-m must never be left on gemini's floating default");
     }
 
     /// #658 — the argv end of the tier map: `-m` carries exactly what
@@ -421,12 +405,9 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
             let mut o = opts(vec![]);
             o.model = Some(preset_model.into());
             GeminiCliReasoner {
-                bin,
-                gate: crate::cli_gate::CliGate::global(),
-            }
-            .call(&o, "hi")
-            .await
-            .unwrap();
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        }.call(&o, "hi").await.unwrap();
             let argv: Vec<String> = std::fs::read_to_string(&record)
                 .unwrap()
                 .lines()

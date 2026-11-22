@@ -30,11 +30,7 @@ pub fn declared_policy_for(kind: RunKind) -> Result<Option<serde_json::Value>> {
 /// A run is a builder only when the autoship scope asked for one. Everything
 /// else (triage, ingest, wiki, Discord/Slack/phone turns) is a text run.
 pub fn run_kind_for(opts: &crate::ReasonerOpts) -> RunKind {
-    if opts
-        .env
-        .iter()
-        .any(|(key, _)| key == crate::autoship_scope::SCOPE_ENV)
-    {
+    if opts.env.iter().any(|(key, _)| key == crate::autoship_scope::SCOPE_ENV) {
         RunKind::Builder
     } else {
         RunKind::Text
@@ -74,14 +70,9 @@ mod policy_tier_tests {
     //! pids/cpu, and the tier is chosen from the call, not the host.
     use super::*;
 
-    fn env(
-        pairs: &'static [(&'static str, &'static str)],
-    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
         move |key| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
+            pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
                 .ok_or(std::env::VarError::NotPresent)
         }
     }
@@ -94,18 +85,9 @@ mod policy_tier_tests {
         let builder = policy_from(RunKind::Builder, &declared).unwrap().unwrap();
         assert_eq!(text["memory_bytes"], GIB);
         assert_eq!(builder["memory_bytes"], 4 * GIB);
-        assert_eq!(
-            declared_policy()
-                .ok()
-                .flatten()
-                .map(|p| p["memory_bytes"].clone()),
-            if std::env::var("AUGMENTAGENT_RUN_RESOURCES").is_ok() {
-                Some((4 * GIB).into())
-            } else {
-                None
-            },
-            "declared_policy stays the builder tier"
-        );
+        assert_eq!(declared_policy().ok().flatten().map(|p| p["memory_bytes"].clone()),
+            if std::env::var("AUGMENTAGENT_RUN_RESOURCES").is_ok() { Some((4 * GIB).into()) } else { None },
+            "declared_policy stays the builder tier");
     }
 
     #[test]
@@ -115,58 +97,25 @@ mod policy_tier_tests {
             ("AUGMENTAGENT_RUN_MEMORY_BYTES", "6442450944"),
             ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "805306368"),
         ]);
-        assert_eq!(
-            policy_from(RunKind::Builder, &declared).unwrap().unwrap()["memory_bytes"],
-            6 * GIB
-        );
-        assert_eq!(
-            policy_from(RunKind::Text, &declared).unwrap().unwrap()["memory_bytes"],
-            768 * 1024 * 1024
-        );
-        let builder_only = env(&[
-            ("AUGMENTAGENT_RUN_RESOURCES", "1"),
-            ("AUGMENTAGENT_RUN_MEMORY_BYTES", "6442450944"),
-        ]);
-        assert_eq!(
-            policy_from(RunKind::Text, &builder_only).unwrap().unwrap()["memory_bytes"],
-            GIB,
-            "a builder override never shrinks or grows text runs"
-        );
-        let text_only = env(&[
-            ("AUGMENTAGENT_RUN_RESOURCES", "1"),
-            ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "805306368"),
-        ]);
-        assert_eq!(
-            policy_from(RunKind::Builder, &text_only).unwrap().unwrap()["memory_bytes"],
-            4 * GIB,
-            "a text override never caps builders"
-        );
-        assert!(policy_from(
-            RunKind::Text,
-            env(&[
-                ("AUGMENTAGENT_RUN_RESOURCES", "1"),
-                ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "lots")
-            ])
-        )
-        .is_err());
+        assert_eq!(policy_from(RunKind::Builder, &declared).unwrap().unwrap()["memory_bytes"], 6 * GIB);
+        assert_eq!(policy_from(RunKind::Text, &declared).unwrap().unwrap()["memory_bytes"], 768 * 1024 * 1024);
+        let builder_only = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_MEMORY_BYTES", "6442450944")]);
+        assert_eq!(policy_from(RunKind::Text, &builder_only).unwrap().unwrap()["memory_bytes"], GIB,
+            "a builder override never shrinks or grows text runs");
+        let text_only = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "805306368")]);
+        assert_eq!(policy_from(RunKind::Builder, &text_only).unwrap().unwrap()["memory_bytes"], 4 * GIB,
+            "a text override never caps builders");
+        assert!(policy_from(RunKind::Text, env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "lots")])).is_err());
     }
 
     #[test]
     fn pids_and_cpu_are_shared_and_no_declaration_means_no_policy() {
-        let declared = env(&[
-            ("AUGMENTAGENT_RUN_RESOURCES", "1"),
-            ("AUGMENTAGENT_RUN_PIDS", "64"),
-            ("AUGMENTAGENT_RUN_CPU_PERCENT", "150"),
-        ]);
+        let declared = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_PIDS", "64"), ("AUGMENTAGENT_RUN_CPU_PERCENT", "150")]);
         for kind in [RunKind::Text, RunKind::Builder] {
             let policy = policy_from(kind, &declared).unwrap().unwrap();
             assert_eq!(policy["pids"], 64);
             assert_eq!(policy["cpu_percent"], 150);
-            assert_eq!(
-                policy.as_object().unwrap().len(),
-                3,
-                "the supervisor rejects extra keys"
-            );
+            assert_eq!(policy.as_object().unwrap().len(), 3, "the supervisor rejects extra keys");
             assert!(policy_from(kind, env(&[])).unwrap().is_none());
             assert!(policy_from(kind, env(&[("AUGMENTAGENT_RUN_RESOURCES", "yes")])).is_err());
         }
@@ -178,59 +127,31 @@ mod policy_tier_tests {
         assert_eq!(run_kind_for(&triage), RunKind::Text);
         let mut discord = crate::reasoner::triage_opts(None);
         discord.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(augmentagent:*)".into()];
-        discord
-            .env
-            .push(("AUGMENTAGENT_SLACK_INBOUND_DIR".into(), "/state/x".into()));
-        assert_eq!(
-            run_kind_for(&discord),
-            RunKind::Text,
-            "tools alone do not make a builder"
-        );
+        discord.env.push(("AUGMENTAGENT_SLACK_INBOUND_DIR".into(), "/state/x".into()));
+        assert_eq!(run_kind_for(&discord), RunKind::Text, "tools alone do not make a builder");
         let mut builder = crate::reasoner::triage_opts(None);
-        builder
-            .env
-            .push((crate::autoship_scope::SCOPE_ENV.into(), "1".into()));
+        builder.env.push((crate::autoship_scope::SCOPE_ENV.into(), "1".into()));
         assert_eq!(run_kind_for(&builder), RunKind::Builder);
     }
 }
 
 /// The guest RAM declarations are additive: the host MCP build VM remains
 /// inside the native provider's cgroup. Never silently shrink either guest.
-pub(crate) fn composed_native_policy(native_mb: u64, build_mb: u64) -> Result<serde_json::Value> {
-    let explicit = std::env::var("AUGMENTAGENT_RUN_MEMORY_BYTES")
-        .ok()
-        .map(|v| v.parse::<u64>())
-        .transpose()?;
-    let overhead = std::env::var("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES")
-        .ok()
-        .map(|v| v.parse::<u64>())
-        .transpose()?
-        .unwrap_or(1024 * 1024 * 1024);
-    let memory = composed_memory(native_mb, build_mb, overhead, explicit)?;
-    let mut policy = declared_policy()?.context("required run resource policy missing")?;
-    policy["memory_bytes"] = memory.into();
+pub(crate) fn composed_native_policy(native_mb:u64, build_mb:u64)->Result<serde_json::Value> {
+    let explicit=std::env::var("AUGMENTAGENT_RUN_MEMORY_BYTES").ok().map(|v|v.parse::<u64>()).transpose()?;
+    let overhead=std::env::var("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES").ok()
+        .map(|v|v.parse::<u64>()).transpose()?.unwrap_or(1024*1024*1024);
+    let memory=composed_memory(native_mb,build_mb,overhead,explicit)?;
+    let mut policy=declared_policy()?.context("required run resource policy missing")?;
+    policy["memory_bytes"]=memory.into();
     Ok(policy)
 }
-fn composed_memory(
-    native_mb: u64,
-    build_mb: u64,
-    overhead: u64,
-    explicit: Option<u64>,
-) -> Result<u64> {
-    anyhow::ensure!(
-        (512..=4096).contains(&native_mb) && (build_mb == 0 || (512..=4096).contains(&build_mb)),
-        "invalid composed VM memory"
-    );
-    anyhow::ensure!(
-        overhead >= 256 * 1024 * 1024 && overhead <= 4 * 1024 * 1024 * 1024,
-        "host overhead must be declared between 256MiB and 4GiB"
-    );
-    let needed = (native_mb + build_mb) * 1024 * 1024 + overhead;
-    let memory = explicit.unwrap_or((4 * 1024 * 1024 * 1024).max(needed));
-    anyhow::ensure!(
-        memory >= needed,
-        "declared run memory cannot cover native and build guests plus host overhead"
-    );
+fn composed_memory(native_mb:u64,build_mb:u64,overhead:u64,explicit:Option<u64>)->Result<u64> {
+    anyhow::ensure!((512..=4096).contains(&native_mb) && (build_mb==0 || (512..=4096).contains(&build_mb)),"invalid composed VM memory");
+    anyhow::ensure!(overhead>=256*1024*1024 && overhead<=4*1024*1024*1024,"host overhead must be declared between 256MiB and 4GiB");
+    let needed=(native_mb+build_mb)*1024*1024+overhead;
+    let memory=explicit.unwrap_or((4*1024*1024*1024).max(needed));
+    anyhow::ensure!(memory>=needed,"declared run memory cannot cover native and build guests plus host overhead");
     Ok(memory)
 }
 #[cfg(test)]
@@ -238,58 +159,38 @@ mod composition_tests {
     use super::*;
     #[test]
     fn builds_reserve_both_guests_but_reviews_do_not() {
-        let gib = 1024 * 1024 * 1024;
-        assert_eq!(composed_memory(1024, 4096, gib, None).unwrap(), 6 * gib);
-        assert_eq!(composed_memory(1024, 0, gib, None).unwrap(), 4 * gib);
-        assert_eq!(
-            composed_memory(1024, 0, gib, Some(2 * gib)).unwrap(),
-            2 * gib
-        );
-        assert!(composed_memory(1024, 4096, gib, Some(4 * gib)).is_err());
-        assert_eq!(
-            composed_memory(1024, 4096, gib, Some(6 * gib)).unwrap(),
-            6 * gib
-        );
+        let gib=1024*1024*1024;
+        assert_eq!(composed_memory(1024,4096,gib,None).unwrap(),6*gib);
+        assert_eq!(composed_memory(1024,0,gib,None).unwrap(),4*gib);
+        assert_eq!(composed_memory(1024,0,gib,Some(2*gib)).unwrap(),2*gib);
+        assert!(composed_memory(1024,4096,gib,Some(4*gib)).is_err());
+        assert_eq!(composed_memory(1024,4096,gib,Some(6*gib)).unwrap(),6*gib);
     }
     #[test]
     fn insufficient_build_envelope_records_unpaid_durable_capacity() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let directory = tempfile::tempdir().unwrap();
-        for name in ["logs", "anchors"] {
-            let path = directory.path().join(name);
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let directory=tempfile::tempdir().unwrap();
+        for name in ["logs","anchors"] {
+            let path=directory.path().join(name); std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let logger = Arc::new(
-            crate::tool_audit::AuditLogger::protected(
-                directory.path().join("logs/audit.jsonl"),
-                directory.path().join("anchors/audit.json"),
-                &[],
-            )
-            .unwrap(),
-        );
-        let callbacks = Arc::new(AtomicUsize::new(0));
-        let count = callbacks.clone();
-        logger
-            .set_resource_capacity_observer(Arc::new(move |observation| {
-                assert_eq!(observation["phase"], "build_vm_memory_composition");
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }))
-            .unwrap();
-        let gib = 1024 * 1024 * 1024;
-        let policy = composed_memory(4096, 0, gib, Some(4 * gib))
-            .map(|memory| serde_json::json!({"memory_bytes":memory}));
-        let error = build_policy_or_defer(policy, Some(&logger)).unwrap_err();
-        assert!(matches!(
-            crate::reasoner::ReasonerError::find_in(&error),
-            Some(crate::reasoner::ReasonerError::ResourceCapacity { .. })
-        ));
-        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("logs/audit.jsonl"),
+            directory.path().join("anchors/audit.json"),&[]).unwrap());
+        let callbacks=Arc::new(AtomicUsize::new(0)); let count=callbacks.clone();
+        logger.set_resource_capacity_observer(Arc::new(move |observation| {
+            assert_eq!(observation["phase"],"build_vm_memory_composition");
+            count.fetch_add(1,Ordering::SeqCst); Ok(())
+        })).unwrap();
+        let gib=1024*1024*1024;
+        let policy=composed_memory(4096,0,gib,Some(4*gib)).map(|memory|serde_json::json!({"memory_bytes":memory}));
+        let error=build_policy_or_defer(policy,Some(&logger)).unwrap_err();
+        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity{..})));
+        assert_eq!(callbacks.load(Ordering::SeqCst),1);
         assert!(logger.resource_capacity_seen());
         logger.protected_health().unwrap();
     }
+
 }
 
 /// Required workflow enrollment cannot be disabled by omitting service env.
@@ -298,9 +199,7 @@ pub fn check_requirement(
     provider: &str,
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
 ) -> Result<()> {
-    if let Some(logger) = logger {
-        logger.dispatch_allowed()?;
-    }
+    if let Some(logger)=logger {logger.dispatch_allowed()?;}
     let Some(logger) = logger.filter(|logger| logger.run_resources_required()) else {
         return Ok(());
     };
@@ -322,11 +221,7 @@ pub(crate) fn admission_failed(
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
     phase: &str,
 ) -> Result<()> {
-    admission_failed_observation(
-        provider,
-        logger,
-        serde_json::json!({"phase":phase,"exhausted":true}),
-    )
+    admission_failed_observation(provider,logger,serde_json::json!({"phase":phase,"exhausted":true}))
 }
 
 /// Preserve controller-observed capacity details without exposing policy paths.
@@ -353,50 +248,23 @@ pub(crate) fn admission_failed_observation(
 pub fn verify_quiescent(identity: &serde_json::Value) -> Result<serde_json::Value> {
     use sha2::{Digest, Sha256};
     let host = format!("{:x}", Sha256::digest(std::fs::read("/etc/machine-id")?));
-    anyhow::ensure!(
-        identity["host_sha256"].as_str() == Some(host.as_str()),
-        "resource host identity unavailable or changed"
-    );
+    anyhow::ensure!(identity["host_sha256"].as_str() == Some(host.as_str()), "resource host identity unavailable or changed");
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let old_boot = identity["boot_id"]
-        .as_str()
-        .context("resource boot identity missing")?;
+    let old_boot = identity["boot_id"].as_str().context("resource boot identity missing")?;
     let path = std::path::Path::new(identity["path"].as_str().context("resource path missing")?);
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("resource group name missing")?;
-    anyhow::ensure!(
-        path.starts_with("/sys/fs/cgroup")
-            && name.len() == 36
-            && name.starts_with("run-")
-            && name[4..].bytes().all(|b| b.is_ascii_hexdigit())
-            && !path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir)),
-        "invalid resource group path"
-    );
-    let state = if old_boot != boot.trim() {
-        "host_rebooted"
-    } else {
+    let name = path.file_name().and_then(|s| s.to_str()).context("resource group name missing")?;
+    anyhow::ensure!(path.starts_with("/sys/fs/cgroup") && name.len() == 36 && name.starts_with("run-")
+        && name[4..].bytes().all(|b| b.is_ascii_hexdigit())
+        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir)), "invalid resource group path");
+    let state = if old_boot != boot.trim() { "host_rebooted" } else {
         match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "removed_empty_subtree",
             Err(e) => return Err(e.into()),
             Ok(meta) => {
                 use std::os::unix::fs::MetadataExt;
-                anyhow::ensure!(
-                    path.canonicalize()? == path
-                        && meta.ino()
-                            == identity["inode"]
-                                .as_u64()
-                                .context("resource inode missing")?,
-                    "resource identity changed"
-                );
+                anyhow::ensure!(path.canonicalize()? == path && meta.ino() == identity["inode"].as_u64().context("resource inode missing")?, "resource identity changed");
                 let events = std::fs::read_to_string(path.join("cgroup.events"))?;
-                anyhow::ensure!(
-                    events.lines().any(|line| line == "populated 0"),
-                    "resource descendants are still running"
-                );
+                anyhow::ensure!(events.lines().any(|line| line == "populated 0"), "resource descendants are still running");
                 // Remove the empty group to revoke a waiting supervisor's
                 // open cgroup.procs handle before it can release a child.
                 // A racing attachment makes rmdir fail, retaining the hold.
@@ -474,23 +342,11 @@ pub fn record_outcome(
 /// record outcome before accepting verifier output.
 pub struct CommandGuard(crate::process_tree::ProcessGroup);
 /// Non-deserializable evidence from this command's actual admission callback.
-pub struct CommandAdmission {
-    identity: serde_json::Value,
-}
-impl CommandAdmission {
-    pub fn identity(&self) -> &serde_json::Value {
-        &self.identity
-    }
-}
+pub struct CommandAdmission {identity:serde_json::Value}
+impl CommandAdmission {pub fn identity(&self)->&serde_json::Value {&self.identity}}
 /// Kernel-verified evidence correlated with the same immutable admission.
-pub struct CommandQuiescence {
-    evidence: serde_json::Value,
-}
-impl CommandQuiescence {
-    pub fn evidence(&self) -> &serde_json::Value {
-        &self.evidence
-    }
-}
+pub struct CommandQuiescence {evidence:serde_json::Value}
+impl CommandQuiescence {pub fn evidence(&self)->&serde_json::Value {&self.evidence}}
 impl CommandGuard {
     /// Confirm/audit readback and release the waiting command without billing
     /// a model call. Close child.stdin after this when no input is intended.
@@ -502,27 +358,12 @@ impl CommandGuard {
         self.0.admit_command(label, logger).await
     }
     /// Publish durable correlation before the supervisor may release the command.
-    pub async fn admit_with_observer<F>(
-        &self,
-        label: &str,
-        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-        mut observer: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&CommandAdmission) -> Result<()> + Send,
-    {
-        self.0
-            .admit_command_observed(label, logger, &mut |identity| {
-                observer(&CommandAdmission {
-                    identity: identity.clone(),
-                })
-            })
-            .await
+    pub async fn admit_with_observer<F>(&self,label:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,
+        mut observer:F)->Result<()> where F:FnMut(&CommandAdmission)->Result<()>+Send {
+        self.0.admit_command_observed(label,logger,&mut |identity|observer(&CommandAdmission {identity:identity.clone()})).await
     }
-    pub fn verified_quiescence(&self) -> Result<CommandQuiescence> {
-        Ok(CommandQuiescence {
-            evidence: self.0.verified_quiescence()?,
-        })
+    pub fn verified_quiescence(&self)->Result<CommandQuiescence> {
+        Ok(CommandQuiescence {evidence:self.0.verified_quiescence()?})
     }
     pub fn record_outcome(
         &self,
@@ -551,44 +392,25 @@ pub fn spawn_command(
 /// Launch a raw verifier with receipts owned by a durable cleanup hold. No VM
 /// composition or inherited storage capability is added. Only pre-spawn work
 /// may return an error; admission installs the resource audit before release.
-pub fn spawn_command_at(
-    command: &tokio::process::Command,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-    directory: &Path,
-) -> Result<(tokio::process::Child, CommandGuard)> {
-    check_requirement("verification", logger)?;
-    let (child, guard) = crate::process_tree::spawn_admitted_at(
-        command,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|l| l.run_resources_required()),
-        directory,
-    )?;
-    Ok((child, CommandGuard(guard)))
+pub fn spawn_command_at(command:&tokio::process::Command,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,directory:&Path)
+    ->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory)?;
+    Ok((child,CommandGuard(guard)))
 }
 
 /// Record raw output in a separately retained controller directory before the
 /// supervisor exits. The capability is stripped from the sandboxed child.
-pub fn spawn_recorded_command_at(
-    command: &tokio::process::Command,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-    directory: &Path,
-    capture: &Path,
-) -> Result<(tokio::process::Child, CommandGuard)> {
-    check_requirement("verification", logger)?;
-    let (child, guard) = crate::process_tree::spawn_admitted_recorded_at(
-        command,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|l| l.run_resources_required()),
-        directory,
-        capture,
-    )?;
-    Ok((child, CommandGuard(guard)))
+pub fn spawn_recorded_command_at(command:&tokio::process::Command,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,directory:&Path,capture:&Path)
+    ->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_recorded_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),directory,capture)?;
+    Ok((child,CommandGuard(guard)))
 }
 
-fn build_policy_or_defer(
-    policy: Result<serde_json::Value>,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-) -> Result<serde_json::Value> {
+fn build_policy_or_defer(policy: Result<serde_json::Value>, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> Result<serde_json::Value> {
     match policy {
         Ok(policy) => Ok(policy),
         Err(_) => {
@@ -600,54 +422,38 @@ fn build_policy_or_defer(
 
 /// CI VM adapter launch retaining the actual build and target flock descriptions
 /// through the supervisor. No environment-only parent proof grants inheritance.
-pub fn spawn_command_with_storage(
-    command: &tokio::process::Command,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-    files: &[std::fs::File],
-    build_memory_mb: u64,
-) -> Result<(tokio::process::Child, CommandGuard)> {
+pub fn spawn_command_with_storage(command: &tokio::process::Command,
+    logger: Option<&Arc<crate::tool_audit::AuditLogger>>, files: &[std::fs::File], build_memory_mb: u64)
+    -> Result<(tokio::process::Child, CommandGuard)> {
     check_requirement("verification", logger)?;
     let policy = build_policy_or_defer(composed_native_policy(build_memory_mb, 0), logger)?;
-    let (child, guard) = crate::process_tree::spawn_admitted_storage(
-        command,
+    let (child, guard) = crate::process_tree::spawn_admitted_storage(command,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|logger| logger.run_resources_required()),
-        files,
-        &policy,
-    )?;
+        logger.is_some_and(|logger| logger.run_resources_required()), files, &policy)?;
     guard.bind_resource_audit("verification", logger)?;
     Ok((child, CommandGuard(guard)))
 }
 
 /// CI owns this private directory across crashes; ProcessGroup never removes it.
-pub fn spawn_command_with_storage_at(
-    command: &tokio::process::Command,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
-    files: &[std::fs::File],
-    build_memory_mb: u64,
-    directory: &Path,
-) -> Result<(tokio::process::Child, CommandGuard)> {
-    check_requirement("verification", logger)?;
-    let policy = build_policy_or_defer(composed_native_policy(build_memory_mb, 0), logger)?;
-    let (child, guard) = crate::process_tree::spawn_admitted_storage_at(
-        command,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|l| l.run_resources_required()),
-        files,
-        &policy,
-        directory,
-    )?;
-    guard.bind_resource_audit("verification", logger)?;
-    Ok((child, CommandGuard(guard)))
+pub fn spawn_command_with_storage_at(command:&tokio::process::Command,
+    logger:Option<&Arc<crate::tool_audit::AuditLogger>>,files:&[std::fs::File],build_memory_mb:u64,
+    directory:&Path)->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let policy=build_policy_or_defer(composed_native_policy(build_memory_mb,0),logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_storage_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),
+        files,&policy,directory)?;
+    guard.bind_resource_audit("verification",logger)?;
+    Ok((child,CommandGuard(guard)))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os="linux")]
     #[ignore = "requires isolated delegated systemd service with daemon subgroup"]
     fn raw_verifier_cleanup_hold_survives_owner_drop_until_kernel_quiescence() {
-        crate::build_storage_ci_holds::with_test_registry(|root, _| {
+        crate::build_storage_ci_holds::with_test_registry(|root,_| {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
                 let source=root.join("source");let session=root.join("runtime");let target=root.join("target");
@@ -695,26 +501,16 @@ print(json.dumps(s.identity),flush=True)
 sys.stdin.readline()
 s.close();p.wait()
 "#;
-        let mut child = Command::new("python3")
-            .arg("-c")
-            .arg(script)
+        let mut child = Command::new("python3").arg("-c").arg(script)
             .arg(helper.path().join("run-resource-scope.py"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         let identity: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(super::verify_quiescent(&identity).is_err());
         child.stdin.take().unwrap().write_all(b"cleanup\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert_eq!(
-            super::verify_quiescent(&identity).unwrap()["verified_state"],
-            "removed_empty_subtree"
-        );
+        assert_eq!(super::verify_quiescent(&identity).unwrap()["verified_state"], "removed_empty_subtree");
         let mut forged = identity;
         forged["host_sha256"] = serde_json::json!("different-host");
         assert!(super::verify_quiescent(&forged).is_err());
@@ -762,10 +558,7 @@ s.close();p.wait()
             );
             return;
         }
-        let directory = tempfile::Builder::new()
-            .prefix("autoship-resource-policy-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let directory = tempfile::Builder::new().prefix("autoship-resource-policy-").tempdir_in("/tmp").unwrap();
         use std::os::unix::fs::PermissionsExt;
         for name in ["logs", "anchors"] {
             let path = directory.path().join(name);
@@ -818,17 +611,11 @@ pub struct Readiness {
     pub observation: Option<serde_json::Value>,
 }
 impl Readiness {
-    fn unavailable(status: &str) -> Self {
-        Self {
-            status: status.into(),
-            permits_attempt: false,
-            live_verified: false,
-            policy: None,
-            observation: None,
-        }
+    fn unavailable(status:&str)->Self {
+        Self{status:status.into(),permits_attempt:false,live_verified:false,policy:None,observation:None}
     }
-    pub fn preflight(&self) -> Result<()> {
-        anyhow::ensure!(self.permits_attempt, "workflow-resource:{}", self.status);
+    pub fn preflight(&self)->Result<()> {
+        anyhow::ensure!(self.permits_attempt,"workflow-resource:{}",self.status);
         Ok(())
     }
 
@@ -836,96 +623,58 @@ impl Readiness {
     /// reservation. This does not establish headroom or authorize a launch.
     /// A larger workflow's physical-capacity refusal may be deferred to that
     /// executor; invalid declarations, delegation and unknown inspection fail.
-    pub fn declaration_preflight(&self) -> Result<()> {
-        if self.permits_attempt {
-            return self.preflight();
-        }
-        let observation = self.observation.as_ref();
-        let capacity = observation.is_some_and(|value| {
-            value["status"] == "capacity-exhausted"
-                && value["permits_attempt"] == false
-                && value["live_verified"] == false
-                && value["refusal"]["phase"] == "admission_failed"
-                && value["refusal"]["exhausted"] == true
-                && matches!(
-                    value["refusal"]["refusal_code"].as_str(),
-                    Some("host_headroom" | "aggregate_reservations" | "ancestor_headroom")
-                )
-        });
-        anyhow::ensure!(
-            self.status == "capacity-exhausted"
-                && !self.live_verified
-                && self.policy.is_some()
-                && capacity,
-            "workflow-resource:{}",
-            self.status
-        );
+    pub fn declaration_preflight(&self)->Result<()> {
+        if self.permits_attempt {return self.preflight();}
+        let observation=self.observation.as_ref();
+        let capacity=observation.is_some_and(|value|
+            value["status"]=="capacity-exhausted" && value["permits_attempt"]==false
+                && value["live_verified"]==false
+                && value["refusal"]["phase"]=="admission_failed"
+                && value["refusal"]["exhausted"]==true
+                && matches!(value["refusal"]["refusal_code"].as_str(),
+                    Some("host_headroom"|"aggregate_reservations"|"ancestor_headroom")));
+        anyhow::ensure!(self.status=="capacity-exhausted" && !self.live_verified
+            && self.policy.is_some() && capacity,"workflow-resource:{}",self.status);
         Ok(())
     }
 }
 
-pub async fn readiness() -> Readiness {
+pub async fn readiness()->Readiness {
     match declared_policy() {
-        Ok(None) => return Readiness::unavailable("declaration-missing"),
-        Err(_) => return Readiness::unavailable("declaration-invalid"),
-        Ok(Some(_)) => (),
+        Ok(None)=>return Readiness::unavailable("declaration-missing"),
+        Err(_)=>return Readiness::unavailable("declaration-invalid"),
+        Ok(Some(_))=>(),
     }
-    let policy = match crate::native_vm::readiness::builder_resource_policy() {
-        Ok(policy) => policy,
-        Err(_) => return Readiness::unavailable("native-build-envelope-invalid"),
+    let policy=match crate::native_vm::readiness::builder_resource_policy() {
+        Ok(policy)=>policy,
+        Err(_)=>return Readiness::unavailable("native-build-envelope-invalid"),
     };
-    let mut report = Readiness::unavailable("inspection-unavailable");
-    report.policy = Some(policy.clone());
+    let mut report=Readiness::unavailable("inspection-unavailable");
+    report.policy=Some(policy.clone());
     // Execute only packaged controller code, isolated from Python environment
     // without writing a helper, credentials or workflow directory. Preparation
     // may reclaim file cache at a limiting ancestor, with a shared rate limit.
-    let mut command = tokio::process::Command::new("/usr/bin/python3");
-    command
-        .args([
-            "-I",
-            "-c",
-            include_str!("../../../scripts/run-resource-scope.py"),
-            "--prepare",
-        ])
-        .arg(policy.to_string())
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output =
-        match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
-            Ok(Ok(output)) if output.status.success() && output.stdout.len() <= 65536 => output,
-            Err(_) => {
-                report.status = "inspection-timeout".into();
-                return report;
-            }
-            _ => return report,
-        };
-    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-        Ok(value) => value,
-        Err(_) => return report,
+    let mut command=tokio::process::Command::new("/usr/bin/python3");
+    command.args(["-I","-c",include_str!("../../../scripts/run-resource-scope.py"),"--prepare"])
+        .arg(policy.to_string()).env_clear().stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let output=match tokio::time::timeout(std::time::Duration::from_secs(5),command.output()).await {
+        Ok(Ok(output)) if output.status.success() && output.stdout.len()<=65536=>output,
+        Err(_)=>{report.status="inspection-timeout".into();return report;},
+        _=>return report,
     };
-    if let Some(event) = value.get("reclaim") {
+    let value:serde_json::Value=match serde_json::from_slice(&output.stdout) {Ok(value)=>value,Err(_)=>return report};
+    if let Some(event)=value.get("reclaim") {
         tracing::info!(ancestor_reclaim=%event,"resource ancestor cache preparation");
     }
-    let Some(status) = value["status"].as_str() else {
-        return report;
+    let Some(status)=value["status"].as_str() else {return report};
+    let permits=match status {
+        "available"=>true,
+        "capacity-unverified" if value["reason"]=="controller-initialization-required"=>true,
+        "declaration-invalid"|"declaration-exceeds-service"|"delegation-unavailable"|
+        "inspection-busy"|"capacity-exhausted"|"inspection-unavailable"=>false,
+        _=>return report,
     };
-    let permits = match status {
-        "available" => true,
-        "capacity-unverified" if value["reason"] == "controller-initialization-required" => true,
-        "declaration-invalid"
-        | "declaration-exceeds-service"
-        | "delegation-unavailable"
-        | "inspection-busy"
-        | "capacity-exhausted"
-        | "inspection-unavailable" => false,
-        _ => return report,
-    };
-    if value["live_verified"] != false || value["permits_attempt"] != permits {
-        return report;
-    }
-    report.status = status.into();
-    report.permits_attempt = permits;
-    report.observation = Some(value);
+    if value["live_verified"]!=false || value["permits_attempt"]!=permits {return report;}
+    report.status=status.into();report.permits_attempt=permits;report.observation=Some(value);
     report
 }

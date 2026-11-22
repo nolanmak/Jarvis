@@ -174,18 +174,15 @@ impl Reservation {
         Ok(result)
     }
     pub fn inherited_file(&self) -> Result<File> {
-        let file = self.uncommitted_file()?;
+        let file=self.uncommitted_file()?;
         self.commit_export();
         Ok(file)
     }
     /// Duplicate for a not-yet-started worker without changing Drop behavior.
-    pub fn uncommitted_file(&self) -> Result<File> {
-        Ok(self.file.try_clone()?)
-    }
+    pub fn uncommitted_file(&self)->Result<File> {Ok(self.file.try_clone()?)}
     /// Preserve the reservation until the worker's final descriptor closes.
     pub fn commit_export(&self) {
-        self.exported
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.exported.store(true,std::sync::atomic::Ordering::Release);
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -299,24 +296,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let admission = Admission::lock().unwrap();
         let mut reservation = Reservation::new(&admission, root.path(), false).unwrap();
-        reservation
-            .publish(&admission, &[root.path().to_path_buf()], 1234)
-            .unwrap();
+        reservation.publish(&admission, &[root.path().to_path_buf()], 1234).unwrap();
         let path = reservation.path.clone();
         let worker = reservation.inherited_file().unwrap();
         drop(reservation);
         assert!(path.exists());
-        assert!(admission
-            .claims(None)
-            .unwrap()
-            .has_normal_writer(root.path())
-            .unwrap());
+        assert!(admission.claims(None).unwrap().has_normal_writer(root.path()).unwrap());
         drop(worker);
-        assert!(!admission
-            .claims(None)
-            .unwrap()
-            .has_normal_writer(root.path())
-            .unwrap());
+        assert!(!admission.claims(None).unwrap().has_normal_writer(root.path()).unwrap());
         assert!(!path.exists());
     }
 

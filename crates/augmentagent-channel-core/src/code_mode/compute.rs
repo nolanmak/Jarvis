@@ -1,7 +1,7 @@
 //! Host-owned policy for dependency-enabled Code Mode computation.
 pub mod artifacts;
-mod dispatch;
 pub mod retention;
+mod dispatch;
 pub mod service;
 pub use dispatch::ComputeDispatcher;
 pub use service::{ComputeService, RequestError, ServiceConfig};

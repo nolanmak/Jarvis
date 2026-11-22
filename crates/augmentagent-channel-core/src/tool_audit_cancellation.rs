@@ -230,11 +230,7 @@ mod tests {
         let mut command = tokio::process::Command::new("/usr/bin/python3");
         // Publish readiness only after close/flush. A created-but-empty file
         // was observable on hosted CI before the writer buffered the PID.
-        command
-            .args([
-                "-I",
-                "-c",
-                r#"import os,sys,time
+        command.args(["-I", "-c", r#"import os,sys,time
 child=os.fork()
 if child==0:
  os.setsid()
@@ -244,9 +240,7 @@ else:
   ready.write(str(child))
  os.replace(sys.argv[1]+'.tmp',sys.argv[1])
  time.sleep(60)
-"#,
-            ])
-            .arg(&pidfile);
+"#]).arg(&pidfile);
         let (mut child, guard) =
             crate::run_resources::spawn_command(&command, Some(logger)).unwrap();
         guard.admit("fixture", Some(logger)).await.unwrap();

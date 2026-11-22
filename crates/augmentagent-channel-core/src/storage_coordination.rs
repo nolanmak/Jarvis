@@ -85,9 +85,7 @@ impl Admission {
         }
         let admission = Self(file);
         crate::build_storage_ci_holds::reconcile_before_admission().map_err(|error| {
-            Busy(format!(
-                "unverified CI cleanup prevents storage admission: {error:#}"
-            ))
+            Busy(format!("unverified CI cleanup prevents storage admission: {error:#}"))
         })?;
         Ok(admission)
     }
@@ -112,9 +110,7 @@ impl Drop for Held {
         // exec. Such unrelated children must not delay ordinary retention locks.
         // Explicitly exported build leases, however, belong to descendants too.
         if !self.exported.load(Ordering::Acquire) {
-            unsafe {
-                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-            }
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN); }
         }
     }
 }
@@ -132,25 +128,20 @@ pub struct TargetLeases(Vec<Held>);
 
 impl TargetLeases {
     pub fn inherited_files(&self) -> Result<Vec<File>> {
-        let files = self.uncommitted_files()?;
+        let files=self.uncommitted_files()?;
         self.commit_export();
         Ok(files)
     }
 
     /// Prepare duplicates without claiming an OS worker received them.
-    pub fn uncommitted_files(&self) -> Result<Vec<File>> {
-        self.0
-            .iter()
-            .map(|held| held.file.try_clone().map_err(Into::into))
-            .collect()
+    pub fn uncommitted_files(&self)->Result<Vec<File>> {
+        self.0.iter().map(|held|held.file.try_clone().map_err(Into::into)).collect()
     }
 
     /// Monotonic export after successful OS spawn; failed attempts cannot
     /// release descriptions already owned by a live descendant.
     pub fn commit_export(&self) {
-        for held in &self.0 {
-            held.exported.store(true, Ordering::Release);
-        }
+        for held in &self.0 {held.exported.store(true,Ordering::Release);}
     }
 
     pub fn directory_fd(&self, root: &Path) -> Result<i32> {
@@ -198,19 +189,13 @@ impl TargetLeases {
     }
 
     pub fn try_release_root(root: &Path) -> Result<Option<Self>> {
-        Self::try_paths(
-            vec![(root.to_path_buf(), true), (root.join("release"), false)],
-            None,
-        )
+        Self::try_paths(vec![(root.to_path_buf(), true), (root.join("release"), false)], None)
     }
 
     /// Pressure cleanup holds only the selected physical profile plus its
     /// root, so an unrelated linked debug volume need not block release cleanup.
     pub fn try_profile(root: &Path, profile: &Path, held: Option<&Self>) -> Result<Option<Self>> {
-        Self::try_paths(
-            vec![(root.to_path_buf(), true), (profile.to_path_buf(), true)],
-            held,
-        )
+        Self::try_paths(vec![(root.to_path_buf(), true), (profile.to_path_buf(), true)], held)
     }
 
     fn try_paths(paths: Vec<(PathBuf, bool)>, held: Option<&Self>) -> Result<Option<Self>> {
@@ -363,11 +348,8 @@ mod tests {
         let lease = TargetLeases::try_directory(root.path()).unwrap().unwrap();
         // dup shares the same open-file description as the descriptor inherited
         // by an unrelated child between fork and exec, without a timing race.
-        let incidental: Vec<_> = lease
-            .0
-            .iter()
-            .map(|held| held.file.try_clone().unwrap())
-            .collect();
+        let incidental: Vec<_> = lease.0.iter()
+            .map(|held| held.file.try_clone().unwrap()).collect();
         assert!(TargetLeases::try_directory(root.path()).unwrap().is_none());
         drop(lease);
         assert!(TargetLeases::try_directory(root.path()).unwrap().is_some());
@@ -416,10 +398,9 @@ mod tests {
         let target = t.path().join("cache");
         std::fs::create_dir(&target).unwrap();
         let meta = std::fs::metadata(&target).unwrap();
-        let path =
-            lock_directory()
-                .unwrap()
-                .join(format!("inode-{}-{}.lock", meta.dev(), meta.ino()));
+        let path = lock_directory()
+            .unwrap()
+            .join(format!("inode-{}-{}.lock", meta.dev(), meta.ino()));
         let lease = TargetLeases::try_directory(&target).unwrap().unwrap();
         std::fs::remove_dir(&target).unwrap();
         assert!(path.exists());

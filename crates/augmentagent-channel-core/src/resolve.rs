@@ -434,7 +434,8 @@ fn first_open_slots(
     let minute = cursor.format("%M").to_string().parse::<i64>().unwrap_or(0);
     let bump = (STEP_MIN - (minute % STEP_MIN)) % STEP_MIN;
     cursor += ChronoDuration::minutes(bump);
-    cursor = cursor - ChronoDuration::seconds(cursor.format("%S").to_string().parse().unwrap_or(0));
+    cursor = cursor
+        - ChronoDuration::seconds(cursor.format("%S").to_string().parse().unwrap_or(0));
     while cursor < horizon && out.len() < MAX_SLOTS {
         let wd = cursor.weekday();
         let hour = cursor.hour_u32();
@@ -442,15 +443,16 @@ fn first_open_slots(
         let is_business = !matches!(wd, Weekday::Sat | Weekday::Sun);
         // The whole meeting must fit inside working hours — check the END
         // lands at/under WORK_END_HOUR on the same business day.
-        let end_ok = slot_end
-            <= cursor
-                .date_naive()
-                .and_hms_opt(WORK_END_HOUR, 0, 0)
-                .map(|nd| chrono::TimeZone::from_utc_datetime(&Utc, &nd))
-                .unwrap_or(slot_end);
+        let end_ok = slot_end <= cursor
+            .date_naive()
+            .and_hms_opt(WORK_END_HOUR, 0, 0)
+            .map(|nd| chrono::TimeZone::from_utc_datetime(&Utc, &nd))
+            .unwrap_or(slot_end);
         let in_hours = hour >= WORK_START_HOUR && end_ok;
         if is_business && in_hours {
-            let clashes = busy.iter().any(|b| cursor < b.end && slot_end > b.start);
+            let clashes = busy
+                .iter()
+                .any(|b| cursor < b.end && slot_end > b.start);
             if !clashes {
                 out.push(cursor);
             }
@@ -489,7 +491,9 @@ impl AskResolver for SchedulingResolver {
         };
         let now = Utc::now();
         let horizon = now + ChronoDuration::days(9);
-        let busy = fb.busy(entity, &self.ctx.calendar_id, now, horizon).await?;
+        let busy = fb
+            .busy(entity, &self.ctx.calendar_id, now, horizon)
+            .await?;
         let duration = requested_duration_min(&ask.text);
         let slots = first_open_slots(now, &busy, 9, duration);
         if slots.is_empty() {
@@ -532,9 +536,7 @@ impl CalendlyResolver {
 }
 
 fn find_booking_url(haystack: &str) -> Option<String> {
-    for token in haystack.split(|c: char| {
-        c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>' || c == '"'
-    }) {
+    for token in haystack.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>' || c == '"') {
         let t = token.trim_end_matches(['.', ',', ';', ']', ')']);
         let low = t.to_ascii_lowercase();
         if (low.starts_with("https://calendly.com/")
@@ -686,9 +688,9 @@ impl ShareDocResolver {
 /// a tight paraphrase so this is mostly cleanup.
 fn doc_query(ask_text: &str) -> String {
     const STOP: &[&str] = &[
-        "can", "you", "the", "a", "an", "me", "please", "send", "share", "get", "could", "would",
-        "i", "to", "of", "for", "with", "your", "my", "do", "have", "is", "it", "that", "this",
-        "and", "or", "over", "us",
+        "can", "you", "the", "a", "an", "me", "please", "send", "share", "get",
+        "could", "would", "i", "to", "of", "for", "with", "your", "my", "do",
+        "have", "is", "it", "that", "this", "and", "or", "over", "us",
     ];
     let kept: Vec<&str> = ask_text
         .split(|c: char| !c.is_alphanumeric())
@@ -1052,7 +1054,11 @@ pub async fn resolve_asks<R: Reasoner + ?Sized>(
         return ResolveOutcome::default();
     }
     let resolvers = live_resolvers(ctx);
-    let fills = match tokio::time::timeout(RESOLVE_BUDGET, resolve_all(&resolvers, &eligible)).await
+    let fills = match tokio::time::timeout(
+        RESOLVE_BUDGET,
+        resolve_all(&resolvers, &eligible),
+    )
+    .await
     {
         Ok(v) => v,
         Err(_) => {
@@ -1125,7 +1131,8 @@ async fn resolve_all(
         [] => Vec::new(),
         [a] => resolve_one(resolvers, a).await.into_iter().collect(),
         [a, b] => {
-            let (ra, rb) = tokio::join!(resolve_one(resolvers, a), resolve_one(resolvers, b));
+            let (ra, rb) =
+                tokio::join!(resolve_one(resolvers, a), resolve_one(resolvers, b));
             [ra, rb].into_iter().flatten().collect()
         }
         [a, b, c] => {
@@ -1152,7 +1159,9 @@ async fn resolve_all(
             for a in many {
                 let rs = resolvers.to_vec();
                 let ask = (*a).clone();
-                handles.push(tokio::spawn(async move { resolve_one(&rs, &ask).await }));
+                handles.push(tokio::spawn(async move {
+                    resolve_one(&rs, &ask).await
+                }));
             }
             let mut out = Vec::new();
             for h in handles {
@@ -1219,7 +1228,8 @@ impl ComposioResolveClient {
                     if status.is_success() {
                         return Ok(resp.json::<serde_json::Value>().await?);
                     }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let retryable =
+                        status.as_u16() == 429 || status.is_server_error();
                     let text = resp.text().await.unwrap_or_default();
                     if retryable && attempt < MAX_ATTEMPTS {
                         warn!(action, %status, attempt, "composio retryable; backing off");
@@ -1250,7 +1260,10 @@ async fn backoff(attempt: u32) {
 
 /// Recursively find the first array under any of `keys` (tolerates Composio's
 /// variable `data` / `data.response_data` nesting).
-fn find_array<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a Vec<serde_json::Value>> {
+fn find_array<'a>(
+    v: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
     match v {
         serde_json::Value::Object(m) => {
             for k in keys {
@@ -1309,7 +1322,11 @@ impl FreeBusyApi for ComposioResolveClient {
 
 #[async_trait]
 impl DriveSearchApi for ComposioResolveClient {
-    async fn search(&self, entity_id: &str, query: &str) -> anyhow::Result<Vec<DriveHit>> {
+    async fn search(
+        &self,
+        entity_id: &str,
+        query: &str,
+    ) -> anyhow::Result<Vec<DriveHit>> {
         // Composio's GOOGLEDRIVE_FIND_FILE takes a `query` (Drive `q` syntax
         // or fulltext). We pass a fulltext `name contains` style query.
         let args = serde_json::json!({
@@ -1470,10 +1487,7 @@ mod tests {
         let slots = first_open_slots(now, &busy, 9, 30);
         assert_eq!(slots.len(), 3);
         // First free slot is Fri 16:00 (after the busy block, before 17:00).
-        assert_eq!(
-            slots[0],
-            Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap()
-        );
+        assert_eq!(slots[0], Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap());
         // No slot may fall on Sat/Sun.
         for s in &slots {
             assert!(!matches!(s.weekday(), Weekday::Sat | Weekday::Sun));
@@ -1537,10 +1551,7 @@ mod tests {
     async fn calendly_resolver_env_then_wiki() {
         let _env = env_lock();
         let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
-        let _u = set(
-            "AUGMENTAGENT_CALENDLY_URL",
-            "https://calendly.com/nolan/30min",
-        );
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/nolan/30min");
         let r = CalendlyResolver::new(ResolveCtx::default());
         let f = r.try_resolve(&ask("calendly", 0.9)).await.unwrap().unwrap();
         assert!(f.fill.contains("calendly.com/nolan/30min"));
@@ -1697,13 +1708,8 @@ mod tests {
             r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
         ));
         assert_eq!(
-            resolve_asks_block(
-                &r2,
-                AskResolveMode::Shadow,
-                "book me",
-                ResolveCtx::default()
-            )
-            .await,
+            resolve_asks_block(&r2, AskResolveMode::Shadow, "book me", ResolveCtx::default())
+                .await,
             ""
         );
     }
@@ -1718,13 +1724,8 @@ mod tests {
         ));
         // 0.4 < 0.7 floor ⇒ nothing.
         assert_eq!(
-            resolve_asks_block(
-                &r,
-                AskResolveMode::Live,
-                "got a calendly?",
-                ResolveCtx::default()
-            )
-            .await,
+            resolve_asks_block(&r, AskResolveMode::Live, "got a calendly?", ResolveCtx::default())
+                .await,
             ""
         );
     }
@@ -1761,19 +1762,13 @@ mod tests {
         ] {
             assert_eq!(ResolverKind::parse(k.as_str()), k);
         }
-        assert_eq!(
-            ResolverKind::parse("meetinglink"),
-            ResolverKind::MeetingLink
-        );
+        assert_eq!(ResolverKind::parse("meetinglink"), ResolverKind::MeetingLink);
         assert_eq!(ResolverKind::parse("weird"), ResolverKind::None);
     }
 
     #[test]
     fn doc_query_strips_stopwords() {
-        assert_eq!(
-            doc_query("can you send me the Q4 investor deck"),
-            "Q4 investor deck"
-        );
+        assert_eq!(doc_query("can you send me the Q4 investor deck"), "Q4 investor deck");
     }
 
     #[test]
@@ -1940,13 +1935,8 @@ mod tests {
         let r2 = reasoner(Some(
             r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
         ));
-        let out2 = resolve_asks(
-            &r2,
-            AskResolveMode::Shadow,
-            "book me",
-            ResolveCtx::default(),
-        )
-        .await;
+        let out2 =
+            resolve_asks(&r2, AskResolveMode::Shadow, "book me", ResolveCtx::default()).await;
         assert!(out2.block.is_empty());
         assert!(out2.unresolved.is_empty());
     }
@@ -2034,7 +2024,9 @@ mod tests {
             platform: "gmail".into(),
             kind: "dm".into(),
         };
-        let with_outcome = crate::prompt::draft_user_message(&email, "", "", "", "", &out.block);
+        let with_outcome = crate::prompt::draft_user_message(
+            &email, "", "", "", "", &out.block,
+        );
         let legacy = crate::prompt::draft_user_message(&email, "", "", "", "", "");
         assert_eq!(with_outcome, legacy);
         assert!(!with_outcome.contains("<resolved_asks>"));

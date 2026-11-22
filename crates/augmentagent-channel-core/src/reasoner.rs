@@ -283,9 +283,7 @@ pub enum ReasonerError {
     /// restart SIGTERMs the whole unit cgroup, the OOM killer SIGKILLs). The
     /// provider said nothing, so this is never latched, and it stops the
     /// chain: the next provider would be spawned into the dying cgroup.
-    #[error(
-        "{provider} was stopped by signal {signal} (daemon restart or kill), not by the provider"
-    )]
+    #[error("{provider} was stopped by signal {signal} (daemon restart or kill), not by the provider")]
     Interrupted { provider: String, signal: i32 },
 }
 
@@ -582,18 +580,13 @@ fn month_number(token: &str) -> Option<u32> {
 pub fn interrupted_by_signal(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     const HOST_STOPS: [i32; 4] = [1, 2, 9, 15];
-    let signal = status
-        .signal()
-        .or_else(|| status.code().and_then(|code| code.checked_sub(128)))?;
+    let signal = status.signal().or_else(|| status.code().and_then(|code| code.checked_sub(128)))?;
     HOST_STOPS.contains(&signal).then_some(signal)
 }
 
 /// The typed error for a provider CLI our host stopped (#1774).
 pub fn interrupted_error(provider: &str, signal: i32) -> anyhow::Error {
-    anyhow::Error::new(ReasonerError::Interrupted {
-        provider: provider.to_string(),
-        signal,
-    })
+    anyhow::Error::new(ReasonerError::Interrupted { provider: provider.to_string(), signal })
 }
 
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
@@ -766,21 +759,14 @@ impl ReasonerOpts {
 pub trait Reasoner: Send + Sync {
     /// Native adapters admit the model only after resource/launch readiness.
     /// HTTP implementations and test doubles retain fallback-owned admission.
-    fn defers_model_admission(&self) -> bool {
-        false
-    }
+    fn defers_model_admission(&self) -> bool { false }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
     /// Optional calibrated guidance is admitted only by a transport that proves
     /// the replayed native route. Unknown adapters keep the original prompt.
-    async fn call_calibrated(
-        &self,
-        opts: &ReasonerOpts,
-        user_message: &str,
-        _supplement: &str,
-        _serving_model: &str,
-    ) -> anyhow::Result<String> {
-        self.call(opts, user_message).await
+    async fn call_calibrated(&self, opts:&ReasonerOpts, user_message:&str, _supplement:&str, _serving_model:&str)->anyhow::Result<String> {
+        self.call(opts,user_message).await
     }
+
 
     /// Like [`call`](Reasoner::call), but returns **everything the model said**
     /// across the turn rather than just its final text block.
@@ -918,23 +904,16 @@ impl ClaudeCliReasoner {
                     message.lines().next().unwrap_or_default());
                 direct.mode = "direct".into();
                 let retried = crate::model_router::SNAPSHOT
-                    .scope(
-                        Some(direct),
-                        self.call_once_timed(opts, user_message, capture),
-                    )
+                    .scope(Some(direct), self.call_once_timed(opts, user_message, capture))
                     .await;
                 match retried {
                     Ok(text) => Ok(text),
                     Err(CallError::ApiError { message, .. }) => Err(api_unavailable(&message)),
-                    Err(CallError::RateLimited { message }) => {
-                        Err(rate_limited_error("claude", message))
-                    }
-                    Err(CallError::Timeout { secs }) => {
-                        Err(anyhow::Error::new(ReasonerError::Timeout {
-                            provider: "claude".into(),
-                            secs,
-                        }))
-                    }
+                    Err(CallError::RateLimited { message }) => Err(rate_limited_error("claude", message)),
+                    Err(CallError::Timeout { secs }) => Err(anyhow::Error::new(ReasonerError::Timeout {
+                        provider: "claude".into(),
+                        secs,
+                    })),
                     Err(CallError::GateTimeout { waited_secs }) => {
                         Err(anyhow::Error::new(ReasonerError::GateTimeout {
                             provider: "claude".into(),
@@ -1099,9 +1078,7 @@ fn rate_limited_error(provider: &str, message: String) -> anyhow::Error {
 
 #[async_trait]
 impl Reasoner for ClaudeCliReasoner {
-    fn defers_model_admission(&self) -> bool {
-        true
-    }
+    fn defers_model_admission(&self) -> bool { true }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.call_with_capture(opts, user_message, TextCapture::LastBlock)
             .await
@@ -1222,14 +1199,8 @@ fn tool_scope_args(opts: &ReasonerOpts) -> Vec<String> {
     // Evidence selection and other text-only transforms execute reads
     // through their coordinator, never through ambient CLI tools/MCP.
     if crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
-        return vec![
-            "--tools".into(),
-            "".into(),
-            "--strict-mcp-config".into(),
-            "--mcp-config".into(),
-            r#"{"mcpServers":{}}"#.into(),
-            "--disable-slash-commands".into(),
-        ];
+        return vec!["--tools".into(), "".into(), "--strict-mcp-config".into(),
+            "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()];
     }
     // #2287 — `--allowedTools` only grants permission; Claude Code still
     // loads every built-in tool, plus the host's own skills, slash commands
@@ -1252,11 +1223,7 @@ fn builtin_scope_args<'a>(allowed_tools: impl Iterator<Item = &'a String>) -> Ve
     let mut args = vec!["--tools".into(), builtins.join(",")];
     // The Skill tool serves skills from the host's settings sources.
     if !builtins.contains(&"Skill") {
-        args.extend([
-            "--setting-sources".into(),
-            "".into(),
-            "--disable-slash-commands".into(),
-        ]);
+        args.extend(["--setting-sources".into(), "".into(), "--disable-slash-commands".into()]);
     }
     args
 }
@@ -1297,16 +1264,9 @@ fn tool_scope_args_with_images(opts: &ReasonerOpts, grants: &[String]) -> Vec<St
     if crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
         // Still no MCP servers, skills or host settings: only `Read`, and
         // only on the granted files.
-        return vec![
-            "--tools".into(),
-            "Read".into(),
-            "--strict-mcp-config".into(),
-            "--mcp-config".into(),
-            r#"{"mcpServers":{}}"#.into(),
-            "--setting-sources".into(),
-            "".into(),
-            "--disable-slash-commands".into(),
-        ];
+        return vec!["--tools".into(), "Read".into(), "--strict-mcp-config".into(),
+            "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(),
+            "--setting-sources".into(), "".into(), "--disable-slash-commands".into()];
     }
     builtin_scope_args(opts.allowed_tools.iter().chain(grants))
 }
@@ -1323,22 +1283,13 @@ impl ClaudeCliReasoner {
         clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
         let fresh_review = crate::native_session::is_fresh_review();
-        if fresh_review
-            && (!opts.allowed_tools.is_empty()
-                || opts.settings_json.is_some()
-                || opts.handoff_path.is_some())
-        {
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
             return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
         }
-        let review_directory = if fresh_review {
-            Some(tempfile::tempdir()?)
-        } else {
-            None
-        };
-        let mut native_lease =
-            crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
-                .map(|session| session.begin(crate::providers::ProviderKind::Claude))
-                .transpose()?;
+        let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
+        let mut native_lease = crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
+            .map(|session| session.begin(crate::providers::ProviderKind::Claude))
+            .transpose()?;
         let mut args: Vec<String> = vec![
             "-p".into(),
             "--output-format".into(),
@@ -1348,66 +1299,38 @@ impl ClaudeCliReasoner {
             opts.permission_mode.clone(),
         ];
         if fresh_review {
-            args.extend([
-                "--safe-mode".into(),
-                "--tools".into(),
-                "".into(),
-                "--setting-sources".into(),
-                "".into(),
-                "--strict-mcp-config".into(),
-                "--mcp-config".into(),
-                r#"{"mcpServers":{}}"#.into(),
-                "--disable-slash-commands".into(),
-            ]);
+            args.extend(["--safe-mode".into(), "--tools".into(), "".into(),
+                "--setting-sources".into(), "".into(), "--strict-mcp-config".into(),
+                "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
         }
         if let Some(lease) = &native_lease {
             match lease.launch() {
-                crate::native_session::Launch::Create {
-                    requested_id: Some(id),
-                } => {
+                crate::native_session::Launch::Create { requested_id: Some(id) } => {
                     args.extend(["--session-id".into(), id]);
                 }
                 crate::native_session::Launch::Resume { id } => {
                     args.extend(["--resume".into(), id]);
                 }
                 crate::native_session::Launch::Create { requested_id: None } => {
-                    return Err(CallError::Other(anyhow::anyhow!(
-                        "Claude session ID was not assigned"
-                    )));
+                    return Err(CallError::Other(anyhow::anyhow!("Claude session ID was not assigned")));
                 }
             }
         }
 
-        let launch_audit = opts.audit_logger.clone().or_else(default_audit_logger);
+        let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
         let vm_required = crate::native_vm::required(launch_audit.as_ref());
         let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
         let claude_bridge = if native_scope.is_some() {
             Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
-        } else {
-            None
-        };
+        } else { None };
         if let Some(bridge) = &claude_bridge {
-            bridge
-                .bridge
-                .preflight_builds("claude", launch_audit.as_ref())
-                .await?;
+            bridge.bridge.preflight_builds("claude",launch_audit.as_ref()).await?;
             args.extend(bridge.args());
         } else {
             // A fresh review uses supplied evidence only and never reads files.
-            let image_grants = if fresh_review {
-                Vec::new()
-            } else {
-                image_read_grants(opts, user_message)
-            };
+            let image_grants = if fresh_review { Vec::new() } else { image_read_grants(opts, user_message) };
             args.push("--allowedTools".into());
-            args.push(
-                opts.allowed_tools
-                    .iter()
-                    .chain(&image_grants)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            args.push(opts.allowed_tools.iter().chain(&image_grants).cloned().collect::<Vec<_>>().join(" "));
             if !fresh_review {
                 args.extend(tool_scope_args_with_images(opts, &image_grants));
             }
@@ -1423,18 +1346,11 @@ impl ClaudeCliReasoner {
         args.push("--system-prompt".into());
         let effective_system = if claude_bridge.is_some() {
             format!("{effective_system}\n\nAll file and command tools are guarded jarvis MCP tools. Relative paths resolve in {}. Use mcp__jarvis__Read/Write/Edit/Glob/Grep/Bash as available. Commands accept one executable and arguments; split compound shell operations. Build with cargo/npm through the bridge; it owns build isolation and storage. Native shell/file/web tools are disabled.", opts.cwd.as_ref().map(|p|p.display().to_string()).unwrap_or_default())
-        } else {
-            effective_system.to_owned()
-        };
+        } else { effective_system.to_owned() };
         args.push(effective_system);
 
         let router = crate::model_router::current()?.filter(|r| r.enabled());
-        let routed_model = router.as_ref().and_then(|r| {
-            r.model(
-                crate::providers::ProviderKind::Claude,
-                crate::providers::tier_of(opts),
-            )
-        });
+        let routed_model = router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts)));
         if let Some(m) = routed_model.as_ref().or(opts.model.as_ref()) {
             args.push("--model".into());
             args.push(m.clone());
@@ -1458,11 +1374,7 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        let handoff_hooks = if claude_bridge.is_none() {
-            crate::handoff::ClaudeHooks::prepare(opts)?
-        } else {
-            None
-        };
+        let handoff_hooks = if claude_bridge.is_none() { crate::handoff::ClaudeHooks::prepare(opts)? } else { None };
         let effective_settings = handoff_hooks
             .as_ref()
             .map(|launch| &launch.settings_json)
@@ -1477,8 +1389,7 @@ impl ClaudeCliReasoner {
                 args.push("--mcp-config".into());
                 let has_voice = serde_json::from_str::<serde_json::Value>(&mcp_json)
                     .map_err(anyhow::Error::from)?
-                    .pointer("/mcpServers/voice")
-                    .is_some();
+                    .pointer("/mcpServers/voice").is_some();
                 if has_voice {
                     let file = tempfile::NamedTempFile::new()?;
                     std::fs::write(file.path(), mcp_json)?;
@@ -1494,6 +1405,7 @@ impl ClaudeCliReasoner {
                 args.push(s);
             }
         }
+
 
         let mut cmd = match &native_scope {
             Some(scope) if !vm_required => scope.command(&self.bin),
@@ -1539,51 +1451,29 @@ impl ClaudeCliReasoner {
         if !opts.env.is_empty() {
             cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
-        if let Some(router) = &router {
-            router.configure_claude(&mut cmd);
-        }
+        if let Some(router) = &router { router.configure_claude(&mut cmd); }
         // Bank credentials belong to the importer, never to model subprocesses.
         for (key, _) in std::env::vars().chain(opts.env.iter().cloned()) {
             if key.starts_with("PLAID_") {
                 cmd.env_remove(key);
             }
         }
-        if !vm_required {
-            if let Some(scope) = &native_scope {
-                scope.configure(&mut cmd);
-            }
-        }
-        crate::run_resources::check_requirement("claude", launch_audit.as_ref())?;
-        let native_launch = native_lease.as_ref().map(|lease| lease.launch());
+        if !vm_required { if let Some(scope) = &native_scope { scope.configure(&mut cmd); } }
+        crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
+        let native_launch = native_lease.as_ref().map(|lease|lease.launch());
         // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
-        let run_policy =
-            crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
         let mut native_vm = if vm_required {
-            Some(crate::native_vm::Launch::prepare(
-                "claude",
-                opts,
-                &cmd,
-                claude_bridge.as_ref().map(|bridge| &bridge.bridge),
-                native_launch.as_ref(),
-            )?)
-        } else {
-            None
-        };
-        if let (Some(vm), Some(lease)) = (&native_vm, &native_lease) {
-            vm.register_retirement(lease);
-        }
+            Some(crate::native_vm::Launch::prepare("claude", opts, &cmd,
+                claude_bridge.as_ref().map(|bridge|&bridge.bridge), native_launch.as_ref())?)
+        } else { None };
+        if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &mut native_vm {
             Some(vm) => vm.spawn_admitted(clean, opts.handoff_path.as_deref()),
-            None => crate::process_tree::spawn_admitted_with_policy(
-                &cmd,
-                clear_environment,
-                clean,
-                opts.handoff_path.as_deref(),
-                false,
-                run_policy.as_ref(),
-            ),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
         };
-        let (mut child, process_group) = spawned.map_err(|error| {
+        let (mut child, process_group) = spawned
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 CallError::Other(
                     ReasonerError::CleanupUncertain {
@@ -1596,21 +1486,15 @@ impl ClaudeCliReasoner {
             }
         })?;
 
-        process_group
-            .admit_model("claude", launch_audit.as_ref())
-            .await?;
+        process_group.admit_model("claude",launch_audit.as_ref()).await?;
         crate::phone_timing::spawned("claude");
 
         if let Some(mut stdin) = child.stdin.take() {
             // #1626 — from the first byte on, the CLI may have the turn.
-            if let Some(lease) = native_lease.as_ref() {
-                lease.mark_submitting();
-            }
+            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
-            if let Some(lease) = native_lease.as_ref() {
-                lease.observe_native_submission();
-            }
+            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
         }
 
         let stdout = child
@@ -1630,14 +1514,7 @@ impl ClaudeCliReasoner {
         let audit_logger = opts.audit_logger.clone().or_else(default_audit_logger);
         let audit_active = audit_logger.is_some() || opts.audit_notifier.is_some();
         let audit_session = opts.session_id.clone().unwrap_or_else(|| "-".to_string());
-        let mut pending_tool_uses: HashMap<
-            String,
-            (
-                String,
-                serde_json::Value,
-                Option<crate::tool_audit::AuditWriteGuard>,
-            ),
-        > = HashMap::new();
+        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
 
         // Every non-empty text block the model emitted, in stream order, plus
         // the terminal `result` payload. Reducing these to one string is
@@ -1656,23 +1533,12 @@ impl ClaudeCliReasoner {
         let mut unfinished = crate::token_usage::UnfinishedCallGuard::new(
             crate::token_usage::UsageLogger::global(),
             crate::providers::ProviderKind::Claude,
-            routed_model
-                .clone()
-                .or_else(|| opts.model.clone())
-                .unwrap_or_else(|| "(inherited)".into()),
+            routed_model.clone().or_else(|| opts.model.clone()).unwrap_or_else(|| "(inherited)".into()),
             crate::providers::classify(opts),
             call_started,
         );
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
-        crate::triage_capture::start(
-            &audit_session,
-            routed_model
-                .as_ref()
-                .or(opts.model.as_ref())
-                .map(String::as_str)
-                .unwrap_or(""),
-            router.is_none(),
-        );
+        crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -1684,51 +1550,40 @@ impl ClaudeCliReasoner {
                         || value["type"] == "result"
                     {
                         if let Some(id) = value["session_id"].as_str() {
-                            if let Some(vm) = &native_vm {
-                                vm.observe_session(id)?;
-                            }
+                            if let Some(vm) = &native_vm { vm.observe_session(id)?; }
                             lease.observe(id)?;
                         }
                     }
                 }
             }
-            crate::triage_capture::line(&audit_session, &line);
+            crate::triage_capture::line(&audit_session,&line);
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
                 unfinished.observe_usage(u);
             }
             tools_ran = tools_ran || line_has_tool_use(&line);
-            let mut tool_readiness = None;
+            let mut tool_readiness=None;
             if audit_active {
-                tool_readiness = audit_stream_line_with_readiness(
+                tool_readiness=audit_stream_line_with_readiness(
                     &line,
                     &mut pending_tool_uses,
                     &audit_session,
-                    routed_model
-                        .as_ref()
-                        .or(opts.model.as_ref())
-                        .map(String::as_str),
+                    routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str),
                     audit_logger.as_ref(),
                     opts.audit_notifier.as_ref(),
-                    audit_logger
-                        .as_ref()
-                        .is_some_and(|logger| logger.is_protected()),
+                    audit_logger.as_ref().is_some_and(|logger|logger.is_protected()),
                 );
             }
-            if let Some(refused) = tool_readiness {
+            if let Some(refused)=tool_readiness {
                 // The supervisor owns detached descendants and publishes the
                 // same checked cleanup receipt used by watchdog/caller aborts.
                 // Do not turn a capacity refusal into another provider retry.
                 drop(process_group);
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(4), child.wait()).await;
+                let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
                 pending_tool_uses.clear();
-                if let Some(logger) = &audit_logger {
-                    logger.drain_checked().await?;
-                }
-                refused.fail("claude", audit_logger.as_ref())?;
-                return Err(CallError::Other(anyhow::anyhow!(
-                    "native tool readiness refused"
-                )));
+                if let Some(logger)=&audit_logger {logger.drain_checked().await?;}
+                refused.fail("claude",audit_logger.as_ref())?;
+                return Err(CallError::Other(anyhow::anyhow!("native tool readiness refused")));
             }
             match serde_json::from_str::<StreamEvent>(&line) {
                 Ok(StreamEvent::Assistant { message }) => {
@@ -1763,10 +1618,7 @@ impl ClaudeCliReasoner {
             crate::token_usage::UsageLogger::global().append(
                 &crate::token_usage::UsageRecord::for_call(
                     crate::providers::ProviderKind::Claude,
-                    routed_model
-                        .clone()
-                        .or_else(|| opts.model.clone())
-                        .unwrap_or_else(|| "(inherited)".into()),
+                    routed_model.clone().or_else(|| opts.model.clone()).unwrap_or_else(|| "(inherited)".into()),
                     crate::providers::classify(opts),
                     usage,
                     call_started,
@@ -1825,14 +1677,8 @@ impl ClaudeCliReasoner {
             // text says. Quota and auth refusals fall through to their typed
             // errors below.
             if !is_rate_limited(&final_text) && !is_auth_refusal(&final_text) {
-                let first_line: String = final_text
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(200)
-                    .collect();
+                let first_line: String =
+                    final_text.trim().lines().next().unwrap_or_default().chars().take(200).collect();
                 return Err(CallError::Other(anyhow::anyhow!(
                     "claude exited non-zero: {status:?}: {first_line}"
                 )));
@@ -1845,10 +1691,7 @@ impl ClaudeCliReasoner {
         // whose text is the CLI's error. Typed per the #1040 table (Auth →
         // Unavailable) so the chain latches claude and fails over.
         if is_auth_refusal(&final_text) {
-            warn!(
-                "claude REFUSED ON AUTH (login expired or missing): {}",
-                final_text.trim()
-            );
+            warn!("claude REFUSED ON AUTH (login expired or missing): {}", final_text.trim());
             if let Some(lease) = native_lease {
                 let _ = lease.finish();
             }
@@ -1888,52 +1731,33 @@ impl ClaudeCliReasoner {
 #[cfg(test)]
 pub(crate) fn audit_stream_line(
     line: &str,
-    pending: &mut HashMap<
-        String,
-        (
-            String,
-            serde_json::Value,
-            Option<crate::tool_audit::AuditWriteGuard>,
-        ),
-    >,
+    pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
     session_id: &str,
     model: Option<&str>,
     logger: Option<&Arc<AuditLogger>>,
     notifier: Option<&Arc<dyn AuditNotifier>>,
 ) {
-    let _ =
-        audit_stream_line_with_readiness(line, pending, session_id, model, logger, notifier, false);
+    let _=audit_stream_line_with_readiness(line,pending,session_id,model,logger,notifier,false);
 }
 
 fn audit_stream_line_with_readiness(
     line: &str,
-    pending: &mut HashMap<
-        String,
-        (
-            String,
-            serde_json::Value,
-            Option<crate::tool_audit::AuditWriteGuard>,
-        ),
-    >,
+    pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
     session_id: &str,
     model: Option<&str>,
     logger: Option<&Arc<AuditLogger>>,
     notifier: Option<&Arc<dyn AuditNotifier>>,
-    stop_on_readiness: bool,
+    stop_on_readiness:bool,
 ) -> Option<crate::native_tool_readiness::Refusal> {
-    let mut refused = None;
+    let mut refused=None;
     for ev in parse_stream_event(line) {
         crate::phone_timing::claude_event(&ev);
         match ev {
             ToolEvent::Use { id, name, input } => {
-                let intent = logger
-                    .filter(|logger| logger.is_protected())
-                    .and_then(|logger| match logger.begin_write() {
+                let intent = logger.filter(|logger| logger.is_protected()).and_then(|logger|
+                    match logger.begin_write() {
                         Ok(ticket) => Some(ticket),
-                        Err(error) => {
-                            warn!("native tool intent audit failed: {error:#}");
-                            None
-                        }
+                        Err(error) => { warn!("native tool intent audit failed: {error:#}"); None }
                     });
                 pending.insert(id, (name, input, intent));
             }
@@ -1947,8 +1771,7 @@ fn audit_stream_line_with_readiness(
                     continue;
                 };
                 if stop_on_readiness && refused.is_none() {
-                    refused =
-                        crate::native_tool_readiness::Refusal::tool(&name, is_error, &content);
+                    refused=crate::native_tool_readiness::Refusal::tool(&name,is_error,&content);
                 }
                 let mut record = build_audit_record(
                     crate::providers::ProviderKind::Claude,
@@ -1968,9 +1791,7 @@ fn audit_stream_line_with_readiness(
                             let rec = record.clone();
                             tokio::spawn(async move {
                                 logger.record(&rec).await;
-                                if let Some(intent) = intent {
-                                    intent.complete();
-                                }
+                                if let Some(intent) = intent { intent.complete(); }
                                 ticket.complete();
                             });
                         }
@@ -2015,13 +1836,7 @@ fn line_has_tool_use(line: &str) -> bool {
 fn api_unavailable(message: &str) -> anyhow::Error {
     anyhow::Error::new(ReasonerError::Unavailable {
         provider: "claude".into(),
-        message: message
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(300)
-            .collect(),
+        message: message.lines().next().unwrap_or_default().chars().take(300).collect(),
     })
 }
 
@@ -2110,7 +1925,8 @@ pub(crate) fn is_auth_refusal(text: &str) -> bool {
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix));
-    anchored && crate::turn_failure::classify(t, true) == crate::turn_failure::FailureClass::Auth
+    anchored
+        && crate::turn_failure::classify(t, true) == crate::turn_failure::FailureClass::Auth
 }
 
 /// Locate the most recent `.claude.json.backup.*` file under
@@ -2510,10 +2326,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
     let bash_message_context_abs = format!("Bash({} messages context *)", bin.display());
     let bash_message_context_bare = "Bash(augmentagent messages context *)".to_string();
-    let bash_message_context_attach_abs =
-        format!("Bash({} messages context-attach *)", bin.display());
-    let bash_message_context_attach_bare =
-        "Bash(augmentagent messages context-attach *)".to_string();
+    let bash_message_context_attach_abs = format!("Bash({} messages context-attach *)", bin.display());
+    let bash_message_context_attach_bare = "Bash(augmentagent messages context-attach *)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2642,15 +2456,9 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         }
     }
     // The compose subprocess must use the daemon's existing bundle and gate.
-    for key in [
-        "AUGMENTAGENT_IMESSAGE_REPO_DIR",
-        "AUGMENTAGENT_IMESSAGE_SEND_ENABLED",
-        "AUGMENTAGENT_DRAFT_CONTEXT_PLATFORMS",
-    ] {
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED", "AUGMENTAGENT_DRAFT_CONTEXT_PLATFORMS"] {
         if let Ok(value) = std::env::var(key) {
-            if !value.trim().is_empty() {
-                env.push((key.into(), value));
-            }
+            if !value.trim().is_empty() { env.push((key.into(), value)); }
         }
     }
     // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
@@ -2790,7 +2598,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_imessage_allowlist_abs,
             bash_imessage_allowlist_bare,
             // Owner-declared priority only: no configure, approve or sender tools.
-            format!("Bash({} imessage alerts priority *)", bin.display()),
+            format!("Bash({} imessage alerts priority *)",bin.display()),
             "Bash(augmentagent imessage alerts priority *)".into(),
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
@@ -3354,33 +3162,16 @@ mod tests {
         let logger = Arc::new(AuditLogger::protected(path.clone(), anchor.clone(), &[]).unwrap());
         let use_event = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"pending-write","name":"mcp__jarvis__Write","input":{"file_path":"fixture.rs","content":"synthetic"}}]}}"#;
         let mut pending = HashMap::new();
-        audit_stream_line(
-            use_event,
-            &mut pending,
-            "session",
-            Some("synthetic-model"),
-            Some(&logger),
-            None,
-        );
+        audit_stream_line(use_event, &mut pending, "session", Some("synthetic-model"), Some(&logger), None);
         assert_eq!(pending.len(), 1);
         drop(pending); // Process death before the matching result.
         assert!(logger.drain_checked().await.is_err());
         drop(logger);
         let reopened = AuditLogger::protected(path, anchor, &[]).unwrap();
-        assert!(
-            reopened.drain_checked().await.is_err(),
-            "restart cannot erase uncertain side effects"
-        );
+        assert!(reopened.drain_checked().await.is_err(), "restart cannot erase uncertain side effects");
         let interactive = Arc::new(AuditLogger::new(dir.path().join("interactive.log")));
         let mut pending = HashMap::new();
-        audit_stream_line(
-            use_event,
-            &mut pending,
-            "interactive",
-            None,
-            Some(&interactive),
-            None,
-        );
+        audit_stream_line(use_event, &mut pending, "interactive", None, Some(&interactive), None);
         drop(pending);
         interactive.drain_checked().await.unwrap();
     }
@@ -3396,14 +3187,7 @@ mod tests {
         let typed: Arc<CountingNotifier> = Arc::new(CountingNotifier::default());
         let notifier: Arc<dyn AuditNotifier> = typed.clone();
 
-        let mut pending: HashMap<
-            String,
-            (
-                String,
-                serde_json::Value,
-                Option<crate::tool_audit::AuditWriteGuard>,
-            ),
-        > = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let session = "ch:123";
         // 1) High-risk Write: tool_use then tool_result.
         let write_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_w","name":"Write","input":{"file_path":"/tmp/x.txt","content":"hi"}}]}}"#;
@@ -3489,14 +3273,7 @@ mod tests {
         // Empty pending + None logger/notifier — should be a no-op even on a
         // tool_use line. Guard against future refactors that accidentally
         // pay parse cost on the no-audit path.
-        let mut pending: HashMap<
-            String,
-            (
-                String,
-                serde_json::Value,
-                Option<crate::tool_audit::AuditWriteGuard>,
-            ),
-        > = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"Write","input":{}}]}}"#;
         audit_stream_line(line, &mut pending, "s", None, None, None);
         // Pending gains one entry because the use was parsed; that's fine —
@@ -3555,11 +3332,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "reasoner::tests::scoped_provider_supervisor_does_not_restore_ambient_credentials", "--nocapture"])
                 .env(PROBE, "synthetic-only").output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             return;
         }
         let mut opts = dummy_opts();
@@ -3571,19 +3344,11 @@ mod tests {
         command.env_clear().env("DECLARED_PROVIDER_AUTH_PROBE", "synthetic-only")
             .args(["-I", "-c", "import os; assert 'AUTOSHIP_SYNTHETIC_AMBIENT_CREDENTIAL' not in os.environ; assert os.environ['DECLARED_PROVIDER_AUTH_PROBE']=='synthetic-only'; print('SCOPED_ENV_OK')"]);
         let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (child, group) =
-            crate::process_tree::spawn_supervised(&command, clear, clean, None).unwrap();
+        let (child, group) = crate::process_tree::spawn_supervised(&command, clear, clean, None).unwrap();
         let output = child.wait_with_output().await.unwrap();
         drop(group);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "SCOPED_ENV_OK"
-        );
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SCOPED_ENV_OK");
     }
 
     #[tokio::test]
@@ -3593,10 +3358,7 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
             // A separately spawned provider call must retain normal configuration.
-            assert_eq!(
-                tokio::spawn(async { reasoner_timeout() }).await.unwrap(),
-                ambient
-            );
+            assert_eq!(tokio::spawn(async { reasoner_timeout() }).await.unwrap(), ambient);
             tokio::task::yield_now().await;
             assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
         });
@@ -3835,18 +3597,13 @@ mod tests {
                 "ask",
                 ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf()),
             ),
-            (
-                "ingest",
-                ingest_opts("sys".into(), wiki.path().to_path_buf()),
-            ),
+            ("ingest", ingest_opts("sys".into(), wiki.path().to_path_buf())),
             ("resume", resume_opts(wiki.path().to_path_buf())),
         ];
         let canonical = std::fs::canonicalize(wiki.path()).unwrap();
         for (name, opts) in presets {
             assert!(
-                opts.allowed_tools
-                    .iter()
-                    .any(|t| t == "Write" || t == "Edit"),
+                opts.allowed_tools.iter().any(|t| t == "Write" || t == "Edit"),
                 "{name}: expected a write-capable preset"
             );
             let settings = opts.settings_json.as_deref().unwrap_or_else(|| {
@@ -4219,17 +3976,11 @@ mod tests {
         let wiki = tempfile::tempdir().unwrap();
         let opts = ask_opts(wiki.path().into(), repo.path().into());
         for verb in ["accounts", "search", "get", "read", "upload"] {
-            assert!(opts
-                .allowed_tools
-                .contains(&format!("Bash(augmentagent gdrive {verb} *)")));
-            assert!(opts.allowed_tools.contains(&format!(
-                "Bash({} gdrive {verb} *)",
-                repo.path().join("target/release/augmentagent").display()
-            )));
+            assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent gdrive {verb} *)")));
+            assert!(opts.allowed_tools.contains(&format!("Bash({} gdrive {verb} *)",
+                repo.path().join("target/release/augmentagent").display())));
         }
-        assert!(!opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent gdrive *)".into()));
+        assert!(!opts.allowed_tools.contains(&"Bash(augmentagent gdrive *)".into()));
     }
 
     /// #2039 AC10 — the agent can propose a move (card only), and no
@@ -4239,16 +3990,12 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let wiki = tempfile::tempdir().unwrap();
         let opts = ask_opts(wiki.path().into(), repo.path().into());
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent calendar reschedule *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent calendar reschedule *)".into()));
         assert!(opts.allowed_tools.contains(&format!(
             "Bash({} calendar reschedule *)",
             repo.path().join("target/release/augmentagent").display()
         )));
-        assert!(!opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent calendar *)".into()));
+        assert!(!opts.allowed_tools.contains(&"Bash(augmentagent calendar *)".into()));
     }
 
     #[test]
@@ -4270,21 +4017,12 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().to_str().unwrap()));
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent doc sign *)".into()));
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent doc sign-lines *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign-lines *)".into()));
         assert!(opts.system_prompt.contains("doc sign-lines"));
         assert!(opts.system_prompt.contains("--anchor-text"));
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent doc signatures)".into()));
-        assert!(!opts
-            .allowed_tools
-            .iter()
-            .any(|tool| tool.contains("signature-install")));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc signatures)".into()));
+        assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("signature-install")));
         assert!(opts.system_prompt.contains("augmentagent doc sign"));
         assert!(opts.system_prompt.contains("augmentagent doc render-pdf"));
         assert!(opts
@@ -4294,40 +4032,18 @@ mod tests {
 
     #[test]
     fn ask_opts_forwards_imessage_compose_environment_without_send_tools() {
-        let wiki = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set(
-            "AUGMENTAGENT_IMESSAGE_REPO_DIR",
-            "/synthetic/imessage-bundle",
-        );
-        let prior = std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
-        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED", "1");
-        let opts = ask_opts(wiki.path().into(), repo.path().into());
-        match prior {
-            Some(v) => std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED", v),
-            None => std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED"),
-        }
-        assert!(opts.env.contains(&(
-            "AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),
-            "/synthetic/imessage-bundle".into()
-        )));
-        assert!(opts
-            .env
-            .contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(), "1".into())));
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent imessage compose *)".into()));
-        assert!(opts
-            .allowed_tools
-            .contains(&"Bash(augmentagent imessage alerts priority *)".into()));
-        assert!(!opts
-            .allowed_tools
-            .iter()
-            .any(|t| t.contains("imessage alerts *") || t.contains("imessage alerts configure")));
-        assert!(!opts
-            .allowed_tools
-            .iter()
-            .any(|t| t.contains("imessage approve") || t.contains("imessage *")));
+        let wiki=tempfile::tempdir().unwrap();let repo=tempfile::tempdir().unwrap();
+        let _guard=EnvGuard::set("AUGMENTAGENT_IMESSAGE_REPO_DIR", "/synthetic/imessage-bundle");
+        let prior=std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED","1");
+        let opts=ask_opts(wiki.path().into(),repo.path().into());
+        match prior { Some(v)=>std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED",v),None=>std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED") }
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage alerts priority *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage alerts *") || t.contains("imessage alerts configure")));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
@@ -4399,10 +4115,7 @@ mod tests {
 
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
         let env = |o: &ReasonerOpts, k: &str| {
-            o.env
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.clone())
+            o.env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
         };
         let joined = opts.allowed_tools.join("\n");
         for needle in [
@@ -4412,10 +4125,7 @@ mod tests {
                 repo.path().join("target/release/augmentagent").display()
             ),
         ] {
-            assert!(
-                opts.allowed_tools.contains(&needle),
-                "missing {needle}; got:\n{joined}"
-            );
+            assert!(opts.allowed_tools.contains(&needle), "missing {needle}; got:\n{joined}");
         }
         assert!(
             !joined.contains("apple-notes *"),
@@ -5667,8 +5377,7 @@ mod failover_error_tests {
     fn stub_cli(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.path().join(name);
-        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}"))
-            .unwrap();
+        augmentagent_test_support::write_executable(&path, format!("#!/usr/bin/env bash\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
@@ -5755,36 +5464,21 @@ mod failover_error_tests {
         let bin = stub_cli(&dir, "fake-claude-voice-config", &format!(
             "printf '%s\\n' \"$@\" > {}\nprevious=''\nfor argument in \"$@\"; do\n  if [ \"$previous\" = '--mcp-config' ]; then cp \"$argument\" {}; fi\n  previous=\"$argument\"\ndone\ncat >/dev/null\n{RESULT_OK}\n",
             args_path.display(), config_path.display()));
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let mut opts = dummy_opts();
         opts.allowed_tools.push("mcp__voice__voice_status".into());
-        opts.settings_json = Some(
-            serde_json::json!({"mcpServers":{"voice":{
-                "command":"/fixture/augmentagent","args":["voice-tool"],
-                "env":{"AUGMENTAGENT_VOICE_TOOL_SOCKET":"/fixture/voice.sock",
-                    "AUGMENTAGENT_VOICE_TOOL_GRANT":"SYNTHETIC_PRIVATE_GRANT"}
-            }}})
-            .to_string(),
-        );
-        assert_eq!(
-            reasoner
-                .call(&opts, "synthetic voice request")
-                .await
-                .unwrap(),
-            "ok"
-        );
+        opts.settings_json = Some(serde_json::json!({"mcpServers":{"voice":{
+            "command":"/fixture/augmentagent","args":["voice-tool"],
+            "env":{"AUGMENTAGENT_VOICE_TOOL_SOCKET":"/fixture/voice.sock",
+                "AUGMENTAGENT_VOICE_TOOL_GRANT":"SYNTHETIC_PRIVATE_GRANT"}
+        }}}).to_string());
+        assert_eq!(reasoner.call(&opts, "synthetic voice request").await.unwrap(), "ok");
         let args = std::fs::read_to_string(args_path).unwrap();
         assert!(args.contains("--mcp-config"));
         assert!(!args.contains("SYNTHETIC_PRIVATE_GRANT"));
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["mcpServers"]["voice"]["env"]["AUGMENTAGENT_VOICE_TOOL_GRANT"],
-            "SYNTHETIC_PRIVATE_GRANT"
-        );
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["voice"]["env"]["AUGMENTAGENT_VOICE_TOOL_GRANT"],
+            "SYNTHETIC_PRIVATE_GRANT");
     }
 
     #[tokio::test]
@@ -5792,11 +5486,7 @@ mod failover_error_tests {
         let dir = tempfile::tempdir().unwrap();
         let args_path = dir.path().join("argv.txt");
         let cwd_path = dir.path().join("cwd.txt");
-        let bin = stub_cli(
-            &dir,
-            "fake-fresh-claude",
-            &format!(
-                r#"
+        let bin = stub_cli(&dir, "fake-fresh-claude", &format!(r#"
 printf '%s\n' "$@" > '{}'
 pwd > '{}'
 session=''
@@ -5808,89 +5498,40 @@ done
 cat >/dev/null
 echo "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}}"
 echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}}"
-"#,
-                args_path.display(),
-                cwd_path.display()
-            ),
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+"#, args_path.display(), cwd_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let provider = crate::providers::ProviderKind::Claude;
-        let builder =
-            crate::native_session::NativeSession::from_id(provider, Some("builder-session".into()))
-                .unwrap();
+        let builder = crate::native_session::NativeSession::from_id(provider, Some("builder-session".into())).unwrap();
         let mut opts = dummy_opts();
         opts.cwd = Some(dir.path().to_owned());
         opts.add_dirs = vec![dir.path().to_owned()];
-        let (answer, native_id) = crate::native_session::CURRENT
-            .scope(
-                builder.clone(),
-                crate::native_session::fresh_review_scope(
-                    provider,
-                    reasoner.call(&opts, "review supplied evidence"),
-                ),
-            )
-            .await
-            .unwrap();
+        let (answer, native_id) = crate::native_session::CURRENT.scope(builder.clone(),
+            crate::native_session::fresh_review_scope(provider, reasoner.call(&opts, "review supplied evidence"))).await.unwrap();
         assert_eq!(answer, "reviewed");
         assert_ne!(native_id, "builder-session");
         assert_eq!(builder.id().as_deref(), Some("builder-session"));
         let argv = std::fs::read_to_string(args_path).unwrap();
-        for required in [
-            "--safe-mode",
-            "--tools\n\n",
-            "--setting-sources\n\n",
-            "--strict-mcp-config",
-            "--disable-slash-commands",
-        ] {
+        for required in ["--safe-mode", "--tools\n\n", "--setting-sources\n\n", "--strict-mcp-config", "--disable-slash-commands"] {
             assert!(argv.contains(required), "missing {required}: {argv}");
         }
-        assert!(
-            !argv.contains("--resume")
-                && !argv.contains("builder-session")
-                && !argv.contains("--add-dir")
-        );
-        assert_ne!(
-            std::fs::read_to_string(cwd_path).unwrap().trim(),
-            dir.path().to_str().unwrap()
-        );
+        assert!(!argv.contains("--resume") && !argv.contains("builder-session") && !argv.contains("--add-dir"));
+        assert_ne!(std::fs::read_to_string(cwd_path).unwrap().trim(), dir.path().to_str().unwrap());
     }
 
     /// Runs `opts` through a stub CLI and returns the argv it was spawned with.
     async fn spawned_argv(opts: &ReasonerOpts) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let args_path = dir.path().join("argv.txt");
-        let bin = stub_cli(
-            &dir,
-            "fake-claude-argv",
-            &format!(
-                "printf '%s\\0' \"$@\" > '{}'\ncat >/dev/null\n{RESULT_OK}\n",
-                args_path.display()
-            ),
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
-        assert_eq!(
-            reasoner.call(opts, "synthetic question").await.unwrap(),
-            "ok"
-        );
+        let bin = stub_cli(&dir, "fake-claude-argv", &format!(
+            "printf '%s\\0' \"$@\" > '{}'\ncat >/dev/null\n{RESULT_OK}\n", args_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_eq!(reasoner.call(opts, "synthetic question").await.unwrap(), "ok");
         let raw = std::fs::read_to_string(args_path).unwrap();
-        raw.strip_suffix('\0')
-            .unwrap_or(&raw)
-            .split('\0')
-            .map(str::to_owned)
-            .collect()
+        raw.strip_suffix('\0').unwrap_or(&raw).split('\0').map(str::to_owned).collect()
     }
 
     fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
-        argv.iter()
-            .position(|a| a == flag)
-            .and_then(|i| argv.get(i + 1))
-            .map(String::as_str)
+        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).map(String::as_str)
     }
 
     /// #2287 — `--allowedTools` only grants permission; without `--tools`
@@ -5904,42 +5545,16 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         std::fs::write(repo.path().join("data.db"), b"").unwrap();
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
         let argv = spawned_argv(&opts).await;
-        let tools: Vec<&str> = flag_value(&argv, "--tools")
-            .expect("--tools passed")
-            .split(',')
-            .collect();
-        assert_eq!(
-            tools,
-            [
-                "Read",
-                "Grep",
-                "Glob",
-                "Write",
-                "Edit",
-                "WebSearch",
-                "WebFetch",
-                "Bash"
-            ]
-        );
+        let tools: Vec<&str> = flag_value(&argv, "--tools").expect("--tools passed").split(',').collect();
+        assert_eq!(tools, ["Read", "Grep", "Glob", "Write", "Edit", "WebSearch", "WebFetch", "Bash"]);
         assert_eq!(flag_value(&argv, "--setting-sources"), Some(""));
-        assert!(
-            argv.iter().any(|a| a == "--disable-slash-commands"),
-            "{argv:?}"
-        );
+        assert!(argv.iter().any(|a| a == "--disable-slash-commands"), "{argv:?}");
         // Permissions and MCP servers are unchanged: patterns stay in
         // --allowedTools and the memory server still comes from --mcp-config.
         let allowed = flag_value(&argv, "--allowedTools").unwrap();
-        assert!(
-            allowed.contains("Bash(augmentagent finance status)")
-                && allowed.contains("mcp__memory__memory_search")
-        );
-        assert!(flag_value(&argv, "--mcp-config")
-            .unwrap()
-            .contains("\"memory\""));
-        assert!(
-            flag_value(&argv, "--settings").is_some(),
-            "per-call hook settings must still be passed"
-        );
+        assert!(allowed.contains("Bash(augmentagent finance status)") && allowed.contains("mcp__memory__memory_search"));
+        assert!(flag_value(&argv, "--mcp-config").unwrap().contains("\"memory\""));
+        assert!(flag_value(&argv, "--settings").is_some(), "per-call hook settings must still be passed");
     }
 
     #[test]
@@ -5949,15 +5564,9 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         std::fs::write(repo.path().join("data.db"), b"").unwrap();
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
         let argv = tool_scope_args(&opts);
-        assert_eq!(
-            flag_value(&argv, "--tools"),
-            Some("Read,Grep,Glob,Write,Edit,WebSearch,WebFetch,Bash")
-        );
+        assert_eq!(flag_value(&argv, "--tools"), Some("Read,Grep,Glob,Write,Edit,WebSearch,WebFetch,Bash"));
         assert_eq!(flag_value(&argv, "--setting-sources"), Some(""));
-        assert!(
-            argv.iter().any(|a| a == "--disable-slash-commands"),
-            "{argv:?}"
-        );
+        assert!(argv.iter().any(|a| a == "--disable-slash-commands"), "{argv:?}");
         // MCP servers still come from the settings split in call_once.
         assert!(!argv.iter().any(|a| a == "--mcp-config"), "{argv:?}");
     }
@@ -5965,25 +5574,10 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
     #[test]
     fn tool_scope_names_builtins_from_permission_patterns_only() {
         let mut opts = dummy_opts();
-        opts.allowed_tools = vec![
-            "Read(//fixture/**)".into(),
-            "Grep".into(),
-            "Read".into(),
-            "Bash(git status*)".into(),
-            "Bash(ls *)".into(),
-            "mcp__fixture__search".into(),
-        ];
+        opts.allowed_tools = vec!["Read(//fixture/**)".into(), "Grep".into(), "Read".into(),
+            "Bash(git status*)".into(), "Bash(ls *)".into(), "mcp__fixture__search".into()];
         let argv = tool_scope_args(&opts);
-        assert_eq!(
-            argv,
-            [
-                "--tools",
-                "Read,Grep,Bash",
-                "--setting-sources",
-                "",
-                "--disable-slash-commands"
-            ]
-        );
+        assert_eq!(argv, ["--tools", "Read,Grep,Bash", "--setting-sources", "", "--disable-slash-commands"]);
 
         // A call granted only MCP tools gets no built-ins at all.
         opts.allowed_tools = vec!["mcp__fixture__search".into()];
@@ -5995,17 +5589,8 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
 
         // Text-only calls keep their existing argv.
         opts.allowed_tools.clear();
-        assert_eq!(
-            tool_scope_args(&opts),
-            [
-                "--tools",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                r#"{"mcpServers":{}}"#,
-                "--disable-slash-commands"
-            ]
-        );
+        assert_eq!(tool_scope_args(&opts), ["--tools", "", "--strict-mcp-config", "--mcp-config",
+            r#"{"mcpServers":{}}"#, "--disable-slash-commands"]);
     }
 
     /// #2332 — a call with no `Read` can still open the images its prompt
@@ -6028,29 +5613,15 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         assert_eq!(grants, [format!("Read(/{})", image.display())]);
         assert_eq!(
             tool_scope_args_with_images(&opts, &grants),
-            [
-                "--tools",
-                "Read",
-                "--strict-mcp-config",
-                "--mcp-config",
-                r#"{"mcpServers":{}}"#,
-                "--setting-sources",
-                "",
-                "--disable-slash-commands"
-            ]
+            ["--tools", "Read", "--strict-mcp-config", "--mcp-config", r#"{"mcpServers":{}}"#,
+                "--setting-sources", "", "--disable-slash-commands"]
         );
         // No images: the text-only argv is unchanged.
         assert!(image_read_grants(&opts, "no pictures here").is_empty());
-        assert_eq!(
-            tool_scope_args_with_images(&opts, &[]),
-            tool_scope_args(&opts)
-        );
+        assert_eq!(tool_scope_args_with_images(&opts, &[]), tool_scope_args(&opts));
         // A preset with other tools just gains Read.
         opts.allowed_tools = vec!["Grep".into()];
-        assert_eq!(
-            flag_value(&tool_scope_args_with_images(&opts, &grants), "--tools"),
-            Some("Grep,Read")
-        );
+        assert_eq!(flag_value(&tool_scope_args_with_images(&opts, &grants), "--tools"), Some("Grep,Read"));
         // A preset that already reads files needs no grant.
         opts.allowed_tools = vec!["Read".into()];
         assert!(image_read_grants(&opts, &prompt).is_empty());
@@ -6062,36 +5633,20 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         let wiki = tempfile::tempdir().unwrap();
         for (name, opts) in [
             ("triage", triage_opts(Some(wiki.path().to_path_buf()))),
-            (
-                "draft",
-                draft_opts("stub".into(), Some(wiki.path().to_path_buf())),
-            ),
+            ("draft", draft_opts("stub".into(), Some(wiki.path().to_path_buf()))),
             ("digest", digest_opts(Some(wiki.path().to_path_buf()))),
-            (
-                "wiki_migrate",
-                wiki_migrate_opts("stub".into(), wiki.path().to_path_buf()),
-            ),
+            ("wiki_migrate", wiki_migrate_opts("stub".into(), wiki.path().to_path_buf())),
             ("lint", lint_opts("stub".into(), wiki.path().to_path_buf())),
-            (
-                "ingest",
-                ingest_opts("stub".into(), wiki.path().to_path_buf()),
-            ),
+            ("ingest", ingest_opts("stub".into(), wiki.path().to_path_buf())),
             ("resume", resume_opts(wiki.path().to_path_buf())),
         ] {
             assert!(!opts.allowed_tools.is_empty(), "{name}");
             let argv = tool_scope_args(&opts);
-            let tools: Vec<&str> = flag_value(&argv, "--tools")
-                .unwrap()
-                .split(',')
-                .filter(|t| !t.is_empty())
-                .collect();
+            let tools: Vec<&str> = flag_value(&argv, "--tools").unwrap().split(',').filter(|t| !t.is_empty()).collect();
             for allowed in &opts.allowed_tools {
                 let builtin = allowed.split('(').next().unwrap();
                 if !builtin.starts_with("mcp__") {
-                    assert!(
-                        tools.contains(&builtin),
-                        "{name}: {builtin} missing from {tools:?}"
-                    );
+                    assert!(tools.contains(&builtin), "{name}: {builtin} missing from {tools:?}");
                 }
             }
         }
@@ -6100,10 +5655,7 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
     #[tokio::test]
     async fn native_claude_records_first_nonempty_assistant_text() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli(
-            &dir,
-            "fake-claude-first-text",
-            r#"
+        let bin = stub_cli(&dir, "fake-claude-first-text", r#"
 session=''
 previous=''
 for argument in "$@"; do
@@ -6114,26 +5666,15 @@ cat >/dev/null
 echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"visible answer"}]}}'
 echo "{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"visible answer\"}"
-"#,
-        );
-        let session =
-            crate::native_session::NativeSession::new(crate::providers::ProviderKind::Claude)
-                .unwrap();
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
-        let answer = crate::native_session::CURRENT
-            .scope(
-                Arc::clone(&session),
-                reasoner.call(&dummy_opts(), "synthetic input"),
-            )
-            .await
-            .unwrap();
+"#);
+        let session = crate::native_session::NativeSession::new(
+            crate::providers::ProviderKind::Claude).unwrap();
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let answer = crate::native_session::CURRENT.scope(Arc::clone(&session),
+            reasoner.call(&dummy_opts(), "synthetic input")).await.unwrap();
         assert_eq!(answer, "visible answer");
-        assert!(
-            session.first_text_output_at_ms().unwrap() >= session.native_submitted_at_ms().unwrap()
-        );
+        assert!(session.first_text_output_at_ms().unwrap() >=
+            session.native_submitted_at_ms().unwrap());
         assert!(session.id().is_some());
     }
 
@@ -6200,41 +5741,22 @@ sleep 0.15
         let dir = tempfile::tempdir().unwrap();
         let argv = dir.path().join("argv");
         let auth = dir.path().join("auth");
-        let bin = stub_cli(
-            &dir,
-            "router-claude",
-            &format!(
-                r#"
+        let bin = stub_cli(&dir, "router-claude", &format!(r#"
 cat >/dev/null
 printf '%s\n' "$@" >{argv}
 printf '%s\n%s' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN" >{auth}
 echo '{{"type":"result","result":"ok","is_error":false}}'
-"#,
-                argv = argv.display(),
-                auth = auth.display()
-            ),
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
-        let mut options = dummy_opts();
-        options.restrict_env = true;
-        let config =
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
-        let answer = crate::model_router::SNAPSHOT
-            .scope(Some(config), reasoner.call(&options, "test"))
-            .await
-            .unwrap();
+"#,argv=argv.display(),auth=auth.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let mut options = dummy_opts(); options.restrict_env = true;
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let answer = crate::model_router::SNAPSHOT.scope(Some(config), reasoner.call(&options, "test")).await.unwrap();
         assert_eq!(answer, "ok");
         let args = std::fs::read_to_string(argv).unwrap();
         assert!(args.contains("cc/claude-opus-4-6"));
         assert!(args.contains("--allowedTools") && args.contains("--permission-mode"));
         assert!(!args.contains("router-secret"));
-        assert_eq!(
-            std::fs::read_to_string(auth).unwrap(),
-            "http://127.0.0.1:20128\nrouter-secret"
-        );
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), "http://127.0.0.1:20128\nrouter-secret");
     }
 
     // ---- #1400: a gateway API error is a provider failure, not an answer ----
@@ -6243,11 +5765,7 @@ echo '{{"type":"result","result":"ok","is_error":false}}'
     /// `API Error:` text as its result) whenever it is routed, and answers
     /// when it runs on the native login. `prelude` runs before either.
     fn gateway_down_cli(dir: &tempfile::TempDir, log: &std::path::Path, prelude: &str) -> String {
-        stub_cli(
-            dir,
-            "fake-claude-gateway-down",
-            &format!(
-                r#"
+        stub_cli(dir, "fake-claude-gateway-down", &format!(r#"
 cat >/dev/null
 printf 'base=%s retries=%s args=%s\n' "$ANTHROPIC_BASE_URL" "$CLAUDE_CODE_MAX_RETRIES" "$*" >>{log}
 session=''
@@ -6263,16 +5781,11 @@ if [ "$ANTHROPIC_BASE_URL" = 'http://127.0.0.1:20128' ]; then
   exit 1
 fi
 echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"}}"
-"#,
-                log = log.display()
-            ),
-        )
+"#, log = log.display()))
     }
 
     fn routed() -> Option<crate::model_router::RouterConfig> {
-        Some(
-            crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap(),
-        )
+        Some(crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap())
     }
 
     #[tokio::test]
@@ -6280,10 +5793,7 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls");
         let bin = gateway_down_cli(&dir, &log, "");
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let answer = crate::model_router::SNAPSHOT
             .scope(routed(), reasoner.call(&dummy_opts(), "test"))
             .await
@@ -6294,17 +5804,9 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"
         assert_eq!(calls.len(), 2, "{calls:?}");
         // The routed attempt gives up quickly instead of sitting in the
         // CLI's own retry loop; the direct one uses the preset's own model.
-        assert!(
-            calls[0].contains("base=http://127.0.0.1:20128 retries=2 "),
-            "{}",
-            calls[0]
-        );
+        assert!(calls[0].contains("base=http://127.0.0.1:20128 retries=2 "), "{}", calls[0]);
         assert!(calls[0].contains("cc/claude-opus-4-6"), "{}", calls[0]);
-        assert!(
-            !calls[1].contains("base=http://127.0.0.1:20128"),
-            "{}",
-            calls[1]
-        );
+        assert!(!calls[1].contains("base=http://127.0.0.1:20128"), "{}", calls[1]);
         assert!(!calls[1].contains("cc/"), "{}", calls[1]);
     }
 
@@ -6312,32 +5814,19 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"
     async fn direct_api_error_is_provider_unavailable_never_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls");
-        let bin = stub_cli(
-            &dir,
-            "fake-claude-api-error",
-            &format!(
-                r#"
+        let bin = stub_cli(&dir, "fake-claude-api-error", &format!(r#"
 cat >/dev/null
 echo call >>{log}
 echo '{{"type":"result","is_error":true,"result":"API Error: 529 Overloaded"}}'
 exit 1
-"#,
-                log = log.display()
-            ),
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+"#, log = log.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = crate::model_router::SNAPSHOT
             .scope(None, reasoner.call(&dummy_opts(), "test"))
             .await
             .unwrap_err();
         let typed = ReasonerError::find_in(&err).expect("typed for the fallback chain");
-        assert!(
-            matches!(typed, ReasonerError::Unavailable { .. }),
-            "{typed:?}"
-        );
+        assert!(matches!(typed, ReasonerError::Unavailable { .. }), "{typed:?}");
         assert!(typed.is_provider_side());
         assert!(err.to_string().contains("API Error: 529"), "{err}");
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
@@ -6347,31 +5836,15 @@ exit 1
     async fn routed_api_error_after_tools_ran_is_not_rerun_on_the_direct_cli() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls");
-        let bin = gateway_down_cli(
-            &dir,
-            &log,
-            r#"echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"send"}}]}}'"#,
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+        let bin = gateway_down_cli(&dir, &log, r#"echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"send"}}]}}'"#);
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = crate::model_router::SNAPSHOT
             .scope(routed(), reasoner.call(&dummy_opts(), "test"))
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                ReasonerError::find_in(&err),
-                Some(ReasonerError::Unavailable { .. })
-            ),
-            "{err:?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap().lines().count(),
-            1,
-            "a turn whose tools already acted must not be submitted twice"
-        );
+        assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1,
+            "a turn whose tools already acted must not be submitted twice");
     }
 
     #[tokio::test]
@@ -6379,44 +5852,26 @@ exit 1
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls");
         let bin = gateway_down_cli(&dir, &log, "");
-        let session =
-            crate::native_session::NativeSession::new(crate::providers::ProviderKind::Claude)
-                .unwrap();
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
-        let answer = crate::native_session::CURRENT
-            .scope(
-                Arc::clone(&session),
-                crate::model_router::SNAPSHOT.scope(routed(), reasoner.call(&dummy_opts(), "test")),
-            )
+        let session = crate::native_session::NativeSession::new(
+            crate::providers::ProviderKind::Claude).unwrap();
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let answer = crate::native_session::CURRENT.scope(Arc::clone(&session),
+            crate::model_router::SNAPSHOT.scope(routed(), reasoner.call(&dummy_opts(), "test")))
             .await
             .unwrap();
         assert_eq!(answer, "direct ok");
-        assert!(
-            !session.is_uncertain(),
-            "a rejected request must not wedge the conversation"
-        );
+        assert!(!session.is_uncertain(), "a rejected request must not wedge the conversation");
         let id = session.id().unwrap();
         let calls = std::fs::read_to_string(&log).unwrap();
         let calls: Vec<&str> = calls.lines().collect();
-        assert!(
-            calls[0].contains(&format!("--session-id {id}")),
-            "{}",
-            calls[0]
-        );
+        assert!(calls[0].contains(&format!("--session-id {id}")), "{}", calls[0]);
         assert!(calls[1].contains(&format!("--resume {id}")), "{}", calls[1]);
     }
 
     #[test]
     fn only_the_clis_own_api_error_result_counts_as_one() {
-        assert!(is_cli_api_error(
-            "API Error: 503 [claude/claude-opus-5] [400]: {\"type\":\"error\"}"
-        ));
-        assert!(is_cli_api_error(
-            "  API Error: Connection refused (ECONNREFUSED)\n"
-        ));
+        assert!(is_cli_api_error("API Error: 503 [claude/claude-opus-5] [400]: {\"type\":\"error\"}"));
+        assert!(is_cli_api_error("  API Error: Connection refused (ECONNREFUSED)\n"));
         assert!(!is_cli_api_error("The log shows `API Error: 503` twice."));
         assert!(!is_cli_api_error("ok"));
     }
@@ -6450,57 +5905,29 @@ exit 1
             ("fake-claude-sigterm-trapped", "cat >/dev/null\nexit 143\n"),
             // The deploy restart's real shape: the cgroup SIGTERM reaches the
             // provider supervisor, which reaps the CLI and exits 128+15.
-            (
-                "fake-claude-supervisor-stopped",
-                "cat >/dev/null\nkill -TERM $PPID\nsleep 5\n",
-            ),
+            ("fake-claude-supervisor-stopped", "cat >/dev/null\nkill -TERM $PPID\nsleep 5\n"),
         ] {
             let bin = stub_cli(&dir, name, script);
-            let reasoner = ClaudeCliReasoner {
-                bin,
-                gate: Arc::new(CliGate::new(1)),
-            };
+            let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
             let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
             assert!(
-                matches!(
-                    ReasonerError::find_in(&err),
-                    Some(ReasonerError::Interrupted { signal: 15, .. })
-                ),
+                matches!(ReasonerError::find_in(&err), Some(ReasonerError::Interrupted { signal: 15, .. })),
                 "{name}: {err:#}"
             );
         }
         // #1779 D2 — the CLI alone killed (OOM, `pkill claude`) while the
         // supervisor lives: forwarded as 128+9, so Interrupted, not Unavailable.
-        let bin = stub_cli(
-            &dir,
-            "fake-claude-child-sigkilled",
-            "cat >/dev/null\nkill -KILL $$\n",
-        );
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+        let bin = stub_cli(&dir, "fake-claude-child-sigkilled", "cat >/dev/null\nkill -KILL $$\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
         assert!(
-            matches!(
-                ReasonerError::find_in(&err),
-                Some(ReasonerError::Interrupted { signal: 9, .. })
-            ),
+            matches!(ReasonerError::find_in(&err), Some(ReasonerError::Interrupted { signal: 9, .. })),
             "child SIGKILL: {err:#}"
         );
         let bin = stub_cli(&dir, "fake-claude-exit-1", "cat >/dev/null\nexit 1\n");
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: Arc::new(CliGate::new(1)),
-        };
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
-        assert!(
-            matches!(
-                ReasonerError::find_in(&err),
-                Some(ReasonerError::Unavailable { .. })
-            ),
-            "{err:#}"
-        );
+        assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:#}");
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the
@@ -6586,10 +6013,7 @@ sleep 5
             gate: Arc::clone(&gate),
         };
         let err = TEST_REASONER_TIMEOUT
-            .scope(
-                std::time::Duration::from_secs(1),
-                reasoner.call(&dummy_opts(), "hi"),
-            )
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("the permit is held");
         let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
@@ -6648,18 +6072,11 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     /// #1499 — a fake `claude` that reports `result` and exits `code`.
     fn stub_cli_result(dir: &tempfile::TempDir, name: &str, result: &str, code: i32) -> String {
         let event = serde_json::json!({"type": "result", "result": result}).to_string();
-        stub_cli(
-            dir,
-            name,
-            &format!("cat >/dev/null\ncat <<'EOF'\n{event}\nEOF\nexit {code}\n"),
-        )
+        stub_cli(dir, name, &format!("cat >/dev/null\ncat <<'EOF'\n{event}\nEOF\nexit {code}\n"))
     }
 
     async fn expect_claude_unavailable(bin: String) {
-        let reasoner = ClaudeCliReasoner {
-            bin,
-            gate: CliGate::global(),
-        };
+        let reasoner = ClaudeCliReasoner { bin, gate: CliGate::global() };
         let err = reasoner
             .call(&dummy_opts(), "triage this")
             .await
@@ -6674,12 +6091,8 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     #[tokio::test]
     async fn auth_refusal_on_exit_zero_is_typed_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli_result(
-            &dir,
-            "fake-claude-auth-0",
-            "Failed to authenticate: OAuth session expired and could not be refreshed",
-            0,
-        );
+        let bin = stub_cli_result(&dir, "fake-claude-auth-0",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 0);
         expect_claude_unavailable(bin).await;
     }
 
@@ -6687,12 +6100,8 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     #[tokio::test]
     async fn auth_refusal_on_exit_one_is_typed_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli_result(
-            &dir,
-            "fake-claude-auth-1",
-            "Failed to authenticate: OAuth session expired and could not be refreshed",
-            1,
-        );
+        let bin = stub_cli_result(&dir, "fake-claude-auth-1",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 1);
         expect_claude_unavailable(bin).await;
     }
 
@@ -6715,37 +6124,19 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli_result(
-            &dir,
-            "fake-claude-auth-chain",
-            "Failed to authenticate: OAuth session expired and could not be refreshed",
-            0,
-        );
+        let bin = stub_cli_result(&dir, "fake-claude-auth-chain",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 0);
         let latch = crate::cooldown::CooldownLatch::at(dir.path().join("cooldowns.json"));
         let chain = crate::fallback::FallbackReasoner::for_tests(
             vec![
-                (
-                    crate::providers::ProviderKind::Claude,
-                    Arc::new(ClaudeCliReasoner {
-                        bin,
-                        gate: CliGate::global(),
-                    }) as Arc<dyn Reasoner>,
-                ),
-                (
-                    crate::providers::ProviderKind::Codex,
-                    Arc::new(Served) as Arc<dyn Reasoner>,
-                ),
+                (crate::providers::ProviderKind::Claude,
+                    Arc::new(ClaudeCliReasoner { bin, gate: CliGate::global() }) as Arc<dyn Reasoner>),
+                (crate::providers::ProviderKind::Codex, Arc::new(Served) as Arc<dyn Reasoner>),
             ],
             latch.clone(),
         );
-        assert_eq!(
-            chain.call(&dummy_opts(), "triage this").await.unwrap(),
-            "served"
-        );
-        assert!(
-            latch.latched_until("claude").is_some(),
-            "an expired login must latch claude"
-        );
+        assert_eq!(chain.call(&dummy_opts(), "triage this").await.unwrap(), "served");
+        assert!(latch.latched_until("claude").is_some(), "an expired login must latch claude");
     }
 
     /// #656 — a hung CLI becomes a typed Timeout instead of blocking the
@@ -6762,10 +6153,7 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         };
         let started = std::time::Instant::now();
         let err = TEST_REASONER_TIMEOUT
-            .scope(
-                std::time::Duration::from_secs(1),
-                reasoner.call(&dummy_opts(), "hi"),
-            )
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("must time out");
         assert!(
@@ -6773,13 +6161,10 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
             "watchdog must fire promptly, took {:?}",
             started.elapsed()
         );
-        assert!(
-            matches!(
-                ReasonerError::find_in(&err),
-                Some(ReasonerError::Timeout { .. })
-            ),
-            "expected timeout, got {err:#}"
-        );
+        assert!(matches!(
+            ReasonerError::find_in(&err),
+            Some(ReasonerError::Timeout { .. })
+        ), "expected timeout, got {err:#}");
     }
 
     /// A missing binary is a Local fault (never latched, never mistaken for
@@ -6921,11 +6306,7 @@ mod interrupted_by_signal_tests {
     fn host_signals_are_recognised_both_raw_and_as_128_plus_n() {
         let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8);
         let killed = std::process::ExitStatus::from_raw;
-        assert_eq!(
-            interrupted_by_signal(&exit(143)),
-            Some(15),
-            "claude traps SIGTERM, exits 143"
-        );
+        assert_eq!(interrupted_by_signal(&exit(143)), Some(15), "claude traps SIGTERM, exits 143");
         assert_eq!(interrupted_by_signal(&killed(15)), Some(15));
         assert_eq!(interrupted_by_signal(&exit(137)), Some(9));
         assert_eq!(interrupted_by_signal(&killed(9)), Some(9));
@@ -6933,17 +6314,9 @@ mod interrupted_by_signal_tests {
         assert_eq!(interrupted_by_signal(&exit(129)), Some(1));
         assert_eq!(interrupted_by_signal(&exit(1)), None);
         assert_eq!(interrupted_by_signal(&exit(0)), None);
-        assert_eq!(
-            interrupted_by_signal(&exit(139)),
-            None,
-            "a crash (SIGSEGV) is not a host stop"
-        );
+        assert_eq!(interrupted_by_signal(&exit(139)), None, "a crash (SIGSEGV) is not a host stop");
         assert_eq!(interrupted_by_signal(&killed(11)), None);
-        assert_eq!(
-            interrupted_by_signal(&exit(36608 >> 8)),
-            Some(15),
-            "the 2026-11-01 status"
-        );
+        assert_eq!(interrupted_by_signal(&exit(36608 >> 8)), Some(15), "the 2026-11-01 status");
     }
 
     #[test]
@@ -6953,9 +6326,6 @@ mod interrupted_by_signal_tests {
         assert!(!typed.is_provider_side());
         // classify_other keeps an already-typed error as it is.
         let kept = classify_other("claude", error);
-        assert!(matches!(
-            ReasonerError::find_in(&kept),
-            Some(ReasonerError::Interrupted { .. })
-        ));
+        assert!(matches!(ReasonerError::find_in(&kept), Some(ReasonerError::Interrupted { .. })));
     }
 }
