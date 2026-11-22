@@ -489,3 +489,112 @@ fn a_failing_legacy_keyring_is_consulted_once() {
     store.delete("slack-app", "T00000001").unwrap();
     assert_eq!(legacy.0.load(Ordering::SeqCst), 1);
 }
+
+// --- a legacy keyring that lacks the slot (#2433) ----------------------------
+//
+// Every Secret Service lookup opens a D-Bus connection and a DH session on
+// gnome-keyring-daemon, which keeps memory per session: on the production
+// host a key polled every few minutes and absent from the keyring grew the
+// daemon to 3.3 GB of swap. A "not there" answer is remembered (in the process
+// and, through a marker beside the credentials, by later processes), so the
+// keyring is asked once per slot, not on every poll.
+
+/// A legacy store that holds what `inner` holds and counts every `get`.
+#[derive(Clone, Default)]
+struct CountsGets {
+    inner: augmentagent_auth::MemoryCredentialStore,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountsGets {
+    fn gets(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl CredentialStore for CountsGets {
+    fn backend(&self) -> &'static str {
+        "counts-gets"
+    }
+    fn put(&self, p: &str, a: &str, payload: &[u8]) -> Result<(), AuthError> {
+        self.inner.put(p, a, payload)
+    }
+    fn get(&self, p: &str, a: &str) -> Result<Vec<u8>, AuthError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(p, a)
+    }
+    fn delete(&self, p: &str, a: &str) -> Result<(), AuthError> {
+        self.inner.delete(p, a)
+    }
+    fn exists(&self, p: &str, a: &str) -> bool {
+        self.inner.exists(p, a)
+    }
+}
+
+#[test]
+fn a_slot_missing_from_the_legacy_keyring_is_looked_up_there_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("credentials");
+    let legacy = CountsGets::default();
+    let store = PrivateFileCredentialStore::new(&dir).with_legacy(Arc::new(legacy.clone()));
+
+    // A daemon polling a key that only lives in .env.
+    for _ in 0..5 {
+        assert!(matches!(
+            store.get("api-key", "CEREBRAS_API_KEY"),
+            Err(AuthError::NotFound { .. })
+        ));
+    }
+    assert_eq!(
+        store.presence("api-key", "CEREBRAS_API_KEY"),
+        Presence::Missing
+    );
+    assert!(store.clone().get("api-key", "CEREBRAS_API_KEY").is_err());
+    assert_eq!(
+        legacy.gets(),
+        1,
+        "the keyring was asked again for a known miss"
+    );
+
+    // A later process (a fresh store over the same directory, as the
+    // 10-minute timers build) trusts the recorded miss too.
+    let next_process = PrivateFileCredentialStore::new(&dir).with_legacy(Arc::new(legacy.clone()));
+    assert!(next_process.get("api-key", "CEREBRAS_API_KEY").is_err());
+    assert_eq!(legacy.gets(), 1, "a new process asked the keyring again");
+
+    // Other slots are still looked up, and a hit is still read through.
+    legacy.put("api-key", "GROQ_API_KEY", CANARY).unwrap();
+    assert_eq!(store.get("api-key", "GROQ_API_KEY").unwrap(), CANARY);
+    assert_eq!(legacy.gets(), 2);
+
+    // The file store still wins as soon as the slot is written there.
+    store.put("api-key", "CEREBRAS_API_KEY", CANARY).unwrap();
+    assert_eq!(store.get("api-key", "CEREBRAS_API_KEY").unwrap(), CANARY);
+    assert_eq!(legacy.gets(), 2);
+}
+
+#[test]
+fn a_recorded_legacy_miss_expires_and_its_marker_is_owner_only() {
+    use std::time::Duration;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("credentials");
+    let legacy = CountsGets::default();
+    let store = PrivateFileCredentialStore::new(&dir)
+        .with_legacy(Arc::new(legacy.clone()))
+        .with_legacy_miss_ttl(Duration::ZERO);
+
+    assert!(store.get("api-key", "COMPOSIO_API_KEY").is_err());
+    // The marker is a credential-directory file: owner-only, never a secret.
+    let markers = dir.join(augmentagent_auth::LEGACY_MISS_DIR);
+    assert_eq!(mode(&markers), 0o700);
+    let marker = slot_file(&markers, "api-key");
+    assert_eq!(mode(&marker), 0o600);
+    assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
+
+    // Past the TTL the keyring is asked again, so a credential that shows up
+    // there later (a rollback to a pre-#1325 binary) is found.
+    legacy.put("api-key", "COMPOSIO_API_KEY", CANARY).unwrap();
+    assert_eq!(store.get("api-key", "COMPOSIO_API_KEY").unwrap(), CANARY);
+    assert_eq!(legacy.gets(), 2);
+    assert!(augmentagent_auth::LEGACY_MISS_TTL >= Duration::from_secs(60 * 60));
+}
