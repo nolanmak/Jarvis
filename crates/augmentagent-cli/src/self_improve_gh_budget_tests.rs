@@ -112,7 +112,6 @@ async fn measure(open: u64) -> std::collections::BTreeMap<String, usize> {
         .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &base)
         .env("XDG_STATE_HOME", base.join("state"))
         .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", base.join("workflow.db"))
-        .env("AUGMENTAGENT_AUTOPR_OPENED_FILE", base.join("opened.json"))
         .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner")
         .env("AUGMENTAGENT_GH_OWNER", "owner").env("GH_BIN", &gh)
         .env("CODEX_CLI", "/bin/false").env("CLAUDE_CLI", "/bin/false")
