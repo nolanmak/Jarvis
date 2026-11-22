@@ -106,7 +106,10 @@ def supervise(receipt, argv):
 
     def stopped():
         nonlocal stopping
-        stopping = stopping or cancel_path.exists()
+        # SIGTERM may set the latch while exists() is checking the filesystem.
+        # Never overwrite that stop with a stale false probe result.
+        if not stopping and cancel_path.exists():
+            stopping = True
         return stopping
 
     def stop(signum, frame):

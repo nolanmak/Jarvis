@@ -28,14 +28,21 @@ if '/actions/jobs/' in endpoint and endpoint.endswith('/logs'):
 if '/actions/jobs/' in endpoint:
     job = int(endpoint.rsplit('/', 1)[1]); run = job // 100; path = paths[run - 100]
     name = sorted(expected[path])[job % 100]
-    value = {'id': job, 'run_id': run, 'run_attempt': 1, 'head_sha': head, 'name': name, 'status': 'completed', 'conclusion': 'failure'}
+    value = {'id': job, 'run_id': run, 'run_attempt': 1, 'head_sha': head, 'name': name, 'status': 'completed', 'conclusion': state.get('job_conclusion', 'failure')}
 elif endpoint.endswith('/pulls/1669'):
     value = {'head': {'sha': head}, 'base': {'sha': state['base'], 'ref': 'main', 'repo': {'full_name': repository}}, 'state': 'open', 'changed_files': 1}
 elif '/pulls/1669/files' in endpoint:
+    # #2430: GitHub evidence for a conflicting PR can be unreadable; the
+    # hosted reader then answers "unknown" with no head at all.
+    if state.get('pr_unreadable'): sys.exit(1)
     value = [{'filename': 'crates/augmentagent-cli/src/fixture.rs'}]
 elif '/contents/' in endpoint:
     path = endpoint.split('/contents/', 1)[1].split('?', 1)[0]
-    value = {'type': 'file', 'encoding': 'base64', 'content': base64.b64encode((root / path).read_bytes()).decode()}
+    content = (root / path).read_bytes()
+    # A head cut before main's CI policy changed carries the old policy bytes.
+    if state.get('stale_policy') and endpoint.endswith('?ref=' + head):
+        content += b'\n# stale policy\n'
+    value = {'type': 'file', 'encoding': 'base64', 'content': base64.b64encode(content).decode()}
 elif '/actions/runs?' in endpoint:
     runs = [{'id': 100 + i, 'run_attempt': 1, 'head_sha': head, 'event': 'pull_request', 'path': path, 'repository': {'full_name': repository}, 'pull_requests': [{'number': 1669}]} for i, path in enumerate(paths)]
     if state.get('pending'): runs = []

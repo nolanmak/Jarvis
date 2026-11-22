@@ -115,6 +115,19 @@ pub trait GmailApi: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// #2332 — the image attachments of one message, as (lower-case
+    /// extension, bytes), at most `max`, for the drafter to look at. Best
+    /// effort: a failure yields fewer images, never an error. The default
+    /// returns none so test fakes need not model attachments.
+    async fn image_attachments(
+        &self,
+        _entity_id: &str,
+        _message_id: &str,
+        _max: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
+
     /// Create a reply draft. Returns the draft ID.
     async fn create_draft(
         &self,
@@ -856,7 +869,8 @@ impl ComposioClient {
         let mut args = serde_json::json!({
             "recipient_email": first,
             "subject": subject,
-            "body": body,
+            "body": crate::draft_body::plaintext(body),
+            "is_html": false,
         });
         if !rest.is_empty() {
             args["extra_recipients"] = serde_json::json!(rest);
@@ -2010,6 +2024,41 @@ mod tests {
     // ---- #439: multi-recipient / cc / bcc land as the array params Composio
     // actually accepts, not a comma-joined `recipient_email` string ----
 
+    // ---- #2332: image attachments for the drafter ----
+
+    #[test]
+    fn draft_image_ext_takes_only_formats_the_models_open() {
+        let meta = |name: Option<&str>, mime: Option<&str>| AttachmentMeta {
+            filename: name.map(str::to_string),
+            mime_type: mime.map(str::to_string),
+            attachment_id: Some("A1".into()),
+        };
+        assert_eq!(draft_image_ext(&meta(Some("Plan.PNG"), Some("image/png"))).as_deref(), Some("png"));
+        assert_eq!(draft_image_ext(&meta(Some("photo.jpeg"), None)).as_deref(), Some("jpeg"));
+        assert_eq!(draft_image_ext(&meta(Some("scan.jpg"), Some("application/octet-stream"))).as_deref(), Some("jpg"));
+        // No usable name: the type decides.
+        assert_eq!(draft_image_ext(&meta(None, Some("image/webp"))).as_deref(), Some("webp"));
+        assert_eq!(draft_image_ext(&meta(Some("noext"), Some("IMAGE/GIF; name=x"))).as_deref(), Some("gif"));
+        // Not an image, an unsupported image, or a name that lies about its type.
+        assert_eq!(draft_image_ext(&meta(Some("r.pdf"), Some("application/pdf"))), None);
+        assert_eq!(draft_image_ext(&meta(Some("IMG_1.HEIC"), Some("image/heic"))), None);
+        assert_eq!(draft_image_ext(&meta(Some("logo.svg"), Some("image/svg+xml"))), None);
+        assert_eq!(draft_image_ext(&meta(Some("report.png"), Some("application/pdf"))), None);
+        assert_eq!(draft_image_ext(&meta(None, None)), None);
+    }
+
+    #[tokio::test]
+    async fn image_attachments_downloads_nothing_for_a_message_without_images() {
+        let resp = r#"{"successful":true,"data":{"messageId":"m1","attachmentList":[{"attachmentId":"A1","filename":"r.pdf","mimeType":"application/pdf"}]}}"#;
+        // The capturing server answers one request: a second (a download)
+        // would fail the listing-only expectation by yielding an image.
+        let (addr, captured) = spawn_capturing_http(resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+        assert!(client.image_attachments("entity-x", "m1", 4).await.is_empty());
+        let raw = captured.await.expect("request captured");
+        assert!(raw.contains("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID"), "{raw}");
+    }
+
     // ---- #937: list_attachments / get_attachment_file / download_url ----
 
     #[tokio::test]
@@ -2102,6 +2151,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn draft_legacy_breaks_are_plaintext_newlines_on_the_wire() {
+        let (addr, captured) = spawn_capturing_http(r#"{"successful":true,"data":{"id":"synthetic-draft"}}"#).await;
+        let client = ComposioClient::new("synthetic".into()).with_base_url(format!("http://{addr}"));
+        client.create_draft_with_attachment("synthetic-account", "recipient@example.test", "Synthetic reply",
+            "Hello,<br/><br />First & second < quarter.", Some("synthetic-thread"), &[],
+            &["copy@example.test".into()], &[]).await.unwrap();
+        let request = captured.await.unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(value["arguments"]["body"], "Hello,\n\nFirst & second < quarter.");
+        assert_eq!(value["arguments"]["thread_id"], "synthetic-thread");
+        assert_eq!(value["arguments"]["cc"], serde_json::json!(["copy@example.test"]));
     }
 
     #[tokio::test]
@@ -3404,8 +3468,69 @@ impl FetchMessage {
     }
 }
 
+/// Smaller images are almost always icons, signature logos or tracking
+/// pixels, which tell the drafter nothing.
+const MIN_DRAFT_IMAGE_BYTES: usize = 5 * 1024;
+
+/// The extension to save an image attachment under, when it is a format the
+/// models can open: from the file name, else from an `image/<subtype>` type.
+pub(crate) fn draft_image_ext(meta: &AttachmentMeta) -> Option<String> {
+    use augmentagent_channel_core::images::PromptImages;
+    let mime = meta.mime_type.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let from_name = meta
+        .filename
+        .as_deref()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| PromptImages::supports(ext));
+    if let Some(ext) = from_name {
+        // A named image, unless the provider says it is something else.
+        return (mime.is_empty() || mime.starts_with("image/") || mime == "application/octet-stream")
+            .then_some(ext);
+    }
+    mime.strip_prefix("image/")
+        .map(|subtype| subtype.split(';').next().unwrap_or_default().trim().to_string())
+        .filter(|ext| PromptImages::supports(ext))
+}
+
 #[async_trait]
 impl GmailApi for ComposioClient {
+    async fn image_attachments(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+        max: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        let listed = match self.list_attachments(entity_id, message_id).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::debug!("image attachments not listed: {error}");
+                return Vec::new();
+            }
+        };
+        let mut images = Vec::new();
+        for meta in listed {
+            if images.len() >= max {
+                break;
+            }
+            let (Some(ext), Some(id)) = (draft_image_ext(&meta), meta.attachment_id.as_deref()) else {
+                continue;
+            };
+            let name = meta.filename.clone().unwrap_or_else(|| format!("image.{ext}"));
+            match self.fetch_attachment_bytes(entity_id, message_id, id, &name).await {
+                Ok((bytes, _))
+                    if bytes.len() >= MIN_DRAFT_IMAGE_BYTES
+                        && bytes.len() as u64 <= augmentagent_channel_core::images::PromptImages::MAX_BYTES =>
+                {
+                    images.push((ext, bytes));
+                }
+                Ok((bytes, _)) => tracing::debug!("image attachment skipped: {} bytes", bytes.len()),
+                Err(error) => tracing::debug!("image attachment not fetched: {error}"),
+            }
+        }
+        images
+    }
+
     async fn fetch_unread(
         &self,
         entity_id: &str,

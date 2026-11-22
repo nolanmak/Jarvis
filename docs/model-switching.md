@@ -2,14 +2,14 @@
 
 Tracking: #1136–#1143. The first implementation uses the Rust `FallbackReasoner` and its constrained Codex CLI bridge for Codex, Qwen and GLM. The selected model supplies turns; the bridge remains responsible for declared tools, workspace scope, approvals, handoff journals, audit and command isolation. Qwen and GLM have distinct `ProviderKind` identities even though they use the Codex CLI as transport.
 
-`/model` is currently a text command in a Discord DM or the configured query channel, intercepted after owner authorization and before history, attachment download or inference. It is not registered as a native Discord slash interaction. The equivalent `model` prefix is accepted. Commands are `/model list`, `/model status`, `/model set claude|codex|qwen|glm`, `/model reset`, and `scope:default` on set/reset. The default scope is the current channel or thread. A call snapshots its model selection; switching affects subsequent calls. The persisted state is `~/.config/augmentagent/model-selection.json` or `AUGMENTAGENT_MODEL_SELECTION_CONFIG`, and it contains profile names only, never credentials. The existing `model-router.json` retains the 9Router inference key. `AUGMENTAGENT_MODEL_QWEN_ENABLED=1` and `AUGMENTAGENT_MODEL_GLM_ENABLED=1` allow their respective profiles to be selected after each endpoint passes live verification; leave them unset while the endpoints are paused.
+`/model` is currently a text command in a Discord DM or the configured query channel, intercepted after owner authorization and before history, attachment download or inference. It is not registered as a native Discord slash interaction. The equivalent `model` prefix is accepted. Commands are `/model list`, `/model status`, `/model set claude|codex|qwen|glm`, `/model reset`, and `scope:default` on set/reset. The default scope is the current channel or thread. A call snapshots its model selection; switching affects subsequent calls. The persisted state is `~/.config/augmentagent/model-selection.json` or `AUGMENTAGENT_MODEL_SELECTION_CONFIG`, and it contains profile names only, never credentials. The existing `model-router.json` retains the configured gateway inference key. `AUGMENTAGENT_MODEL_QWEN_ENABLED=1` and `AUGMENTAGENT_MODEL_GLM_ENABLED=1` allow their respective profiles to be selected after each endpoint passes live verification; leave them unset while the endpoints are paused.
 
 Short forms such as `model qwen` and `/model codex` use the same readiness checks as `model set`. In an owner-authorized Discord conversation, the assistant also has `mcp__model__switch_model`: ask “switch this chat to Codex” or “use Claude for my next message.” The tool is bound to the current channel/thread, cannot alter another conversation or the daemon default, and reports paused profiles without enabling workers. A successful change applies to the next request; the response making the switch stays on its original model. Non-owner turns and scheduled loops do not receive this tool.
 
 
 Selecting `claude` uses Claude Code; selecting `codex` uses the Codex CLI.
 When dashboard routing is enabled for Claude/Codex (`auto`, `claude`, or
-`codex`), either selection uses that provider's connected 9Router account pool.
+`codex`), either selection uses that provider's connected gateway account pool.
 When routing is direct or Runpod-only, Claude uses its native login and Codex
 prefers its native login, using a gateway account only when native Codex auth
 is unavailable. Selection is refused if the running process has no corresponding
@@ -47,14 +47,14 @@ remains a separate parity gate.
 | --- | --- | --- | --- |
 | Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback`; Linux `discord_model_switch_sequence_uses_one_audited_harness` overlaps an active GLM turn with `/model set codex`; `unscoped_dispatch_keeps_route_and_model_on_one_selection_snapshot` switches the daemon default between route binding and dispatch and requires the original Qwen turn to complete | Live Discord set/call race on the daemon host |
 | Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests`; model-control history exclusion test in `event_handler::tests`; Linux `discord_model_switch_sequence_uses_one_audited_harness` drives the query handler through Qwen→GLM→Codex commands and replies with persisted channel selection, prior-answer context, an audited Qwen Write, three cross-model Reads, three Edits of the same artifact, three memory MCP calls, and three scoped shell calls | Real Discord gateway and live Qwen→GLM→Codex continuity on the daemon host |
-| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity` now includes a synthetic guard denial, allowed write, and Bash test for all three profiles; bridge duplicate-call and lost-reply tests; `selftest_tool_probe_requires_audited_read_for_each_profile`; pinned 9Router Chat and Responses parallel tool-result fixture | Live model-selected tool use for each provider |
-| Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; patched 9Router opt-in fixture refuses unsupported current/history images | Cross-profile deterministic and live attachment/computer-use fixtures; Qwen is currently declared text-only at the gateway and returns 422 for images |
+| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity` now includes a synthetic guard denial, allowed write, and Bash test for all three profiles; bridge duplicate-call and lost-reply tests; `selftest_tool_probe_requires_audited_read_for_each_profile`; retired patched-gateway fixture (historical only; replacement OmniRoute gate #1659) | Live model-selected tool use for each provider |
+| Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; retired gateway media fixture (historical only; replacement OmniRoute gate #1659) | Cross-profile deterministic and live attachment/computer-use fixtures; Qwen is currently declared text-only at the gateway and returns 422 for images |
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | The Linux Discord switch fixture starts a synthetic memory MCP server and requires `memory_recent` results and audit rows for Qwen, GLM and Codex; ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp` | Real memory store continuity and live model-selected memory use |
 | Approval, drafts and outbound delivery | Discord approval broker, tool audit and journals | Existing approval/broker suites; the three-profile bridge fixture checks a synthetic pre-tool guard denial with no write and an allowed write/test flow | Three-profile Discord broker approval and delivery receipts |
 | Code mode and build VM | `codex_tools.rs`, build runner | Ignored Codex-only VM fixture; no shared CI fixture | Three-profile approved edit/test through the VM |
 | Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | `user_loop_model_pin_survives_reopen_and_legacy_rows_inherit`, `legacy_user_loops_schema_adds_nullable_model_column`, `discord_loop_captures_selected_model_for_future_runs`, `occurrence_identity_survives_restart_and_advances_after_recorded_run`, `run_create_pins_model_and_rejects_other_profiles` | Live selected-model loop tool/approval run and daemon restart |
 | Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
-| Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; pinned 9Router image account/key/409/media CI gate | Real queue cancel and restart; repeat gateway test on daemon host |
+| Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; retired image gate; replacement OmniRoute package acceptance tracked in #1659 | Real queue cancel and restart; repeat gateway test on daemon host |
 | Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
 | Node dashboard query | `src/dashboard.ts` `/api/ask` invokes `augmentagent wiki ask` through `src/dashboardQuery.ts` | HTTP answer and cancellation tests | Verify the deployed dashboard has the new binary and revision |
 | Node email triage and revision | `src/index.ts` imports `src/agent.ts` for mail triage and revision | Existing Node tests | Determine whether this separate tool/approval path runs on the daemon host; migrate if active |
@@ -69,7 +69,7 @@ process. Dashboard questions are piped through `wiki ask --stdin` so their
 contents are absent from process arguments. Verify the actual host service
 environment before enabling this route for operators.
 
-Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
+Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen previously passed a gateway Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
 For recurring tasks, `augmentagent loop create --model claude|codex|qwen|glm` pins each
 future occurrence to that profile. Omitting `--model` inherits the daemon
@@ -105,11 +105,11 @@ cache probe was cancelled before inference; its reference was cleared, max
 workers restored to 0, and the worker list returned to zero. A single-file
 cache or persistent-volume plan needs a separate cost and cold-start check.
 
-Independent automated review uses native Claude or Codex transport with a separate login; a 9Router account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
+Independent automated review uses native Claude or Codex transport with a separate login; a gateway account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
 
 ## Operator notes
 
-The Runpod adapter source is in `scripts/runpod-adapter`. It normalizes 9Router Chat Completions content parts into Ollama requests and emits Chat Completions SSE. It is deployed separately from Jarvis; its checked-in Compose packaging and actual-host acceptance are tracked in #1143. The local gateway on this Mac depends on that Mac staying awake and connected to Docker and Tailscale. Move the gateway to the actual always-on Jarvis host for unattended work.
+The Runpod adapter source is in `scripts/runpod-adapter`. It normalizes OpenAI-compatible Chat Completions content parts into Ollama requests and emits Chat Completions SSE. It is deployed separately from Jarvis; its checked-in Compose packaging and actual-host acceptance are tracked in #1143. The local gateway on this Mac depends on that Mac staying awake and connected to Docker and Tailscale. Move the gateway to the actual always-on Jarvis host for unattended work.
 
 On a Linux gateway host with Docker Compose, provision an owner-private
 `adapter.env` containing `RUNPOD_API_KEY` and `ADAPTER_API_KEY`, and a routes
@@ -132,7 +132,7 @@ The opt-in deployment fixture runs this same Compose file with synthetic keys,
 paused Qwen/GLM routes, an authenticated catalog check and a private journal;
 `python3 scripts/runpod-adapter/test_compose_deployment.py` cleans up its own
 container and test image. Run the authenticated `verify_deployment.py` preflight
-with the host's private adapter and router client files after 9Router is ready.
+with the host's private adapter and router client files after an explicitly supported gateway is ready.
 Stopping this Compose service leaves its bind-mounted journal intact.
 
 ### Native Linux adapter without Docker
@@ -149,11 +149,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now augmentagent-runpod-adapter.service
 ```
 
+**Deferred gateway registration:** the following is historical setup guidance,
+not an instruction to enable a route. Do not register this upstream until
+OmniRoute acceptance (#1659) and Runpod enablement (#1661) are approved.
+Standalone adapter setup above does not satisfy either gate.
+
 The unit uses `/usr/bin/python3`, private persistent journal storage, and
 `127.0.0.1:20129`. It sets `RUNPOD_ADAPTER_ROUTES`, `RUNPOD_ADAPTER_JOURNAL`,
 `RUNPOD_ADAPTER_HOST`, and `RUNPOD_ADAPTER_PORT`; the Docker defaults remain
 unchanged. After changing credentials, restart this adapter service. Register
-one OpenAI-compatible Chat upstream in 9Router with prefix `runpod`, base URL
+one OpenAI-compatible Chat upstream in the gateway with prefix `runpod`, base URL
 `http://127.0.0.1:20129/v1`, and the private adapter key. Add `qwen38-27b` and
 `glm-5.3-flash` to its model catalog. Do not declare attachment capabilities
 until they have been verified for that route.
@@ -178,7 +183,7 @@ paid inference checks below remain explicit operator decisions.
 
 If Jarvis runs on another tailnet machine while the gateway remains on this Mac, set its router `base_url` to the HTTPS `/v1` URL shown by `tailscale serve status` and set `AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS` to that exact host and port in the daemon environment (`host.ts.net:443` for default HTTPS). Every remote URL, including a `.ts.net` name, requires HTTPS and an exact host-and-port allowlist entry. The router key remains in the private router config. `python3 scripts/tests/verify_codex_redirect.py` runs the real Codex Responses client against two synthetic local servers: the configured origin must receive the throwaway key, while a redirect to a different host and port must receive no credential. Codex CLI 0.154.0 passed this probe locally on 2026-09-18; the pinned version also runs in model-router CI. The daemon host still needs the complete routing and tool workflow acceptance run.
 
-The adapter stores prompt-free job state in `RUNPOD_ADAPTER_JOURNAL` (default `/app/state/jobs.sqlite3`). Mount `/app/state` on owner-private persistent storage so an adapter restart retains Runpod job IDs and unresolved submissions. A caller may send a stable `Idempotency-Key` for one logical turn; repeating it returns HTTP 409 without another Runpod submission. Stock 9Router 0.5.75 dropped that header and translated an upstream 409 into 503. `sidecars/9router/runpod-reconciliation.patch` fixes both on the pinned 9Router source and pins an explicit OpenAI-compatible model so 9Router cannot switch to its capacity adapter. It returns 422 before upstream inference when a current or historical attachment needs a capability the selected model does not declare; its Docker image and Linux installer are described in `docs/model-router.md`. The synthetic installed-router tests passed against the patched local image on 2026-09-18, including unchanged account quota failover and visible attachment refusal. The actual Jarvis host must run that patched build and pass the same checks. The adapter also journals an HMAC digest of each request body (keyed with its private adapter key). It refuses an identical unkeyed request while an earlier job is unresolved, and for one hour after a recorded completion. This survives adapter restarts and prevents immediate gateway/client retries from launching another paid job. An intentional identical request in that hour will also be refused; changed request bodies and adapter-key rotation do not share this guard. The adapter itself returns 409 for an uncertain submission or result rather than a retryable 502.
+The adapter stores prompt-free job state in `RUNPOD_ADAPTER_JOURNAL` (default `/app/state/jobs.sqlite3`). Mount `/app/state` on owner-private persistent storage so an adapter restart retains Runpod job IDs and unresolved submissions. A caller may send a stable `Idempotency-Key` for one logical turn; repeating it returns HTTP 409 without another Runpod submission. The previous patched gateway supplied request-key, conflict-status and media-capability checks, but that source/image and its opt-in tests have been retired. Do not treat their historical receipts as proof for OmniRoute: #1659 must establish equivalent end-to-end behavior, and Runpod use remains deferred under #1661. The adapter also journals an HMAC digest of each request body (keyed with its private adapter key). It refuses an identical unkeyed request while an earlier job is unresolved, and for one hour after a recorded completion. This survives adapter restarts and prevents immediate gateway/client retries from launching another paid job. An intentional identical request in that hour will also be refused; changed request bodies and adapter-key rotation do not share this guard. The adapter itself returns 409 for an uncertain submission or result rather than a retryable 502.
 
 The adapter returns `X-Adapter-Request-Id`, and authenticated `GET /v1/jobs/REQUEST_ID` reports the recorded state. Authenticated `POST /v1/jobs/REQUEST_ID/reconcile` checks Runpod using the endpoint saved with the job, and updates the state only when Runpod returns the matching job ID. A submission with no known job ID remains unresolved and returns 409. Authenticated `POST /v1/jobs/REQUEST_ID/cancel` requests queue cancellation and reports `CANCELLED` only after Runpod confirms the matching job ID; an ambiguous submission reports `CANCELLATION_UNKNOWN`, and a load-balancer job reports `CANCELLATION_UNSUPPORTED`. If cancellation arrives while a queue submission is in flight, the journal records the intent, captures the eventual job ID, and immediately sends one cancellation request for it. `SUBMISSION_UNKNOWN`, `POLL_UNKNOWN`, `RESULT_UNKNOWN`, and `CANCELLATION_UNKNOWN` require operator reconciliation. Closing a load-balancer stream is also recorded as `CANCELLATION_UNSUPPORTED`.
 The authenticated job response also contains `timing.observed_elapsed_ms`
@@ -203,8 +208,8 @@ Definite pre-submission Runpod HTTP rejections retain their 401/403
 authentication, 429 rate-limit or 400/404/422 request status with fixed redacted
 messages. A 5xx or lost response may have accepted work and remains an
 unresolved 409 in the adapter journal. This distinction applies to both queue
-and load-balancer routes; the patched local 9Router preserves 409, and the
-daemon-host gateway still needs the same acceptance test.
+and load-balancer routes; the replacement gateway must independently pass the 409-preservation
+acceptance test before Runpod routes are enabled (#1659/#1661).
 
 The adapter's authenticated Runpod client accepts only HTTPS URLs on `api.runpod.ai` or one endpoint subdomain of `api.runpod.ai`, with no URL credentials, nonstandard port, query or fragment. It rejects HTTP redirects. Local regression tests prove an unauthorized URL and a redirect target receive no request, so a changed upstream location cannot carry the Runpod key to a different host.
 Both Qwen queue requests and GLM load-balancer requests cap generated tokens to the route's `max_output_tokens` (default 2048) before reaching Runpod. This bounds output length, not GPU cost or wall time.
@@ -267,8 +272,8 @@ Claude is now selectable alongside Codex, Qwen, and GLM in the Discord text
 command, one-call CLI profile, and scheduled-loop pin. The Linux Discord
 handler fixture covers Qwen → GLM → Codex → Claude → reset, retaining its
 three bridge-provider tool/audit checks. Live CLI probes on this host passed
-text and audited Read calls for Claude and Codex through the connected 9Router
-account pools. The Read probe permits Markdown around the exact nonce while
+text and audited Read calls for Claude and Codex through the then-configured gateway
+account pools (historical evidence; OmniRoute acceptance is tracked in #1659). The Read probe permits Markdown around the exact nonce while
 still requiring the matching provider/session/file audit receipt.
 
 The Runpod setup inventory supplied endpoint IDs; a later private credential
@@ -278,15 +283,20 @@ transfer enabled authenticated preflight and live host testing. Qwen returned
 returned no model output; its load-balancer cancellation remains explicitly
 unsupported in the adapter journal. Both endpoints were restored to zero workers.
 
-The live Qwen Read probe exposed a missing Responses namespace translation:
+**Historical retired-revision evidence (not OmniRoute acceptance):** the
+following describes the removed `runpod-5` gateway and does not establish the
+current replacement gateway’s tool behavior. #1659 must supply new receipts.
+
+The historical Qwen Read probe exposed a missing Responses namespace translation:
 the gateway advertised `mcp__jarvis` as an empty function instead of exposing
-its Read leaf and parameters. Gateway revision `runpod-5` flattens namespace
-leaves to stable collision-checked aliases, retains prior-call identities, and
-restores the namespace/name pair in JSON and SSE responses. The regression was
+its Read leaf and parameters. The retired gateway revision `runpod-5` flattened namespace
+leaves to stable collision-checked aliases, retained prior-call identities, and
+restored the namespace/name pair in JSON and SSE responses. The regression was
 red against `runpod-4`; all five installed-router fixtures and three fragmented
-stream/schema unit tests pass with the fix. Claude/Codex live regression and
-Qwen's audited Read are checked again after installation. Full live parity and
-actual Discord gateway acceptance remain release gates.
+stream/schema unit tests passed for that retired revision. New Claude/Codex
+regressions and Qwen audited Read receipts must be collected against OmniRoute;
+those historical results do not satisfy the current live parity or Discord
+gateway acceptance gates.
 
 ## Verify stopped workers, not empty health counters
 
@@ -338,3 +348,13 @@ and generation rates and include startup/idle time. Claude/Codex cached
 input tokens cannot be assumed to retain their cache savings after moving
 to Runpod. Per-call usage records can aggregate several tool turns and are
 not measurements of the largest individual context window.
+
+## Yolo is not a selectable profile
+
+The yolo profile ([YOLO.md](YOLO.md)) runs on the same Codex bridge as Qwen
+and GLM, but it is not part of model switching. `/model set yolo`, the
+model-switch tool and `loop create --model yolo` all refuse it, and a
+`AUGMENTAGENT_REASONER_CHAIN` that names it reports it as an unknown entry.
+It is dispatched only for turns in a yolo thread, never as a fallback for
+another profile, and a yolo turn never falls back to another profile.
+

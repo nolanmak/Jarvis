@@ -358,9 +358,12 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             std::fs::write(root.join("fresh-claim-appeared"),b"owner opened manual PR after earlier absence observation").unwrap();
             if case.starts_with("fresh-uncertain") {
                 guard.transition(crate::autoship_workflow::Stage::Publish,"publishing_revision","push",0).await.unwrap();
-                let id=guard.id().to_owned();let binding=guard.binding().clone();guard.finish().unwrap();
+                let id=guard.id().to_owned();let binding=guard.binding().clone();
                 let now=chrono::Utc::now().timestamp_millis();
-                let lease=initial.claim(&id,"lost-response-controller",now,1000).unwrap().unwrap();
+                // Record the uncertain intent under the original controller's
+                // live authority, before finishing it. A new productive claim
+                // after a completed no-intent turn must respect retry backoff.
+                let lease=guard.merge_lease().unwrap();
                 let missing_peer=if matches!(case.as_str(),"fresh-uncertain-missing-peer"|"fresh-uncertain-access-denied") {
                     let peer="owner/repo#8";
                     initial.register(peer,"feat/missing-8",binding.clone(),now-20).unwrap();
@@ -382,7 +385,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 // Network I/O is served by the existing scripted GitHub API;
                 // effective push destination parsing is the actual Git command.
                 git(&["remote","set-url","--push","origin",if matches!(case.as_str(),"fresh-uncertain-unbound"|"fresh-uncertain-destination-changed") {"https://github.com/owner/other.git"}else{"https://github.com/owner/repo.git"}]);
-                initial.release(&lease,now+1).unwrap();
+                guard.finish().unwrap();
                 if case=="fresh-uncertain-branch-changed" {
                     // Isolate retained-effect identity from the mutable workflow
                     // branch in this fixture; production state is never edited.
@@ -573,7 +576,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         for case in ["cross-repository-source","push-failed-recovery","create-manual-auto","create-manual-explicit","merge-label-during-policy","ready-pause-during-routing","source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
-                let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
+                let dir=tempfile::tempdir_in("/tmp").unwrap();let base=dir.path().canonicalize().unwrap();let root=base.join("repo");
                 std::fs::create_dir(&root).unwrap();
                 for args in [vec!["init","-q"],vec!["remote","add","origin","https://github.com/owner/repo.git"]] {
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
@@ -685,9 +688,9 @@ else:raise AssertionError('Unexpected or mutating GitHub call: '+repr(a))
                 std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let output=tokio::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact","self_improve::manual_pr_routing_tests::automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer","--nocapture"])
-                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",dir.path())
-                    .env("XDG_STATE_HOME",dir.path().join("state"))
-                    .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",dir.path().join("workflow.db"))
+                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&base)
+                    .env("XDG_STATE_HOME",base.join("state"))
+                    .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",base.join("workflow.db"))
                     .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
                     .env("AUGMENTAGENT_GH_OWNER","owner").env("GH_BIN",gh)
                     .env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")

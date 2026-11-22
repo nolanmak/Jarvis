@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only preflight for the Runpod adapter and 9Router client path."""
+"""Read-only preflight for the Runpod adapter and gateway client path."""
 import argparse
 import json
 import os
@@ -119,8 +119,8 @@ def verify(adapter_env: Path, router_env: Path, adapter_url: str,
         raise DeploymentError('adapter health is not ready')
     adapter_models = model_ids(read_json(adapter_base + '/v1/models', adapter_key, 'adapter'),
                                'adapter', {'qwen38-27b', 'glm-5.3-flash'})
-    router_models = model_ids(read_json(router_base + '/models', router_key, '9Router'),
-                              '9Router', {'runpod/qwen38-27b', 'runpod/glm-5.3-flash'})
+    router_models = model_ids(read_json(router_base + '/models', router_key, 'gateway'),
+                              'gateway', {'runpod/qwen38-27b', 'runpod/glm-5.3-flash'})
     return {'adapter_models': adapter_models, 'router_models': router_models}
 
 

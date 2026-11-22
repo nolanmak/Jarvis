@@ -250,6 +250,7 @@ pub(super) async fn resume(
         automatic,
     )
     .await;
+    if let Some(report) = capacity_accounting.settle_family_wait().await? { return Ok(report); }
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     if result.as_ref().is_err_and(|error| error.is::<CiInfrastructureDeferred>()) {
         let report = capacity_accounting.settle_ci(result)?;
@@ -294,7 +295,7 @@ pub(super) async fn resume(
     }
 }
 
-pub(super) enum PreparationRequest {Request(String),Dependency(String)}
+pub(super) enum PreparationRequest {Request(String),Deferred(String)}
 
 pub(super) async fn preparation_request(root:&Path,pr:&adoption::AdoptedPr,request:&str,guard:&mut workflow::WorkflowGuard)->Result<PreparationRequest> {
     anyhow::ensure!(pr.source_issue.is_none() && guard.id()==pr.workflow_id()?,"source-less preparation identity mismatch");
@@ -304,7 +305,7 @@ pub(super) async fn preparation_request(root:&Path,pr:&adoption::AdoptedPr,reque
     }
     match acceptance::readiness::assess_pr(root,pr,guard).await? {
         acceptance::readiness::Decision::Ready(grounding)=>Ok(PreparationRequest::Request(format!("{request}\nIndependent readiness evidence (grounding, not approval):\n{grounding}"))),
-        acceptance::readiness::Decision::Dependency(reason)=>Ok(PreparationRequest::Dependency(reason)),
+        acceptance::readiness::Decision::Deferred(reason)=>Ok(PreparationRequest::Deferred(reason)),
     }
 }
 
@@ -322,7 +323,7 @@ async fn execute(
     let source = AcceptanceSource::PullRequest(pr.pr);
     let grounded_request=match preparation_request(worktree,pr,request,guard).await? {
         PreparationRequest::Request(request)=>request,
-        PreparationRequest::Dependency(reason)=>return Ok(RunReport::held(format!("PR #{}: grounded external decision; re-evaluate on PR/main change: {}",pr.pr,truncate(&reason,1200)))),
+        PreparationRequest::Deferred(reason)=>return Ok(RunReport::held(format!("PR #{}: readiness retry scheduled: {}",pr.pr,truncate(&reason,1200)))),
     };
     let control = acceptance::control_directories(&pr.repository, guard.id())?.workflow_acceptance;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;

@@ -42,6 +42,10 @@ personal wiki, and social/posting integrations.
 - **Heartbeat.** An opt-in periodic check-in reads your `HEARTBEAT.md`
   checklist plus recent activity and stays silent unless something needs you,
   with a liveness probe for external monitoring. See [Heartbeat](docs/HEARTBEAT.md).
+- **Scheduled scans.** A `/loop` can read its instructions from a wiki page,
+  report each match once by a stable key, stay quiet when it finds nothing,
+  and email new findings to an address you have allowlisted. See
+  [Scheduled scans](docs/SCHEDULED-SCANS.md).
 - **Self-improvement & scheduling.** A `self-improve` mode can pick up
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.
@@ -285,7 +289,10 @@ same account as the dashboard.
 `scripts/install-autostart.sh` and `scripts/install-dashboard.sh` write these
 units (or plists); `scripts/install-autostart.sh` accepts
 `AUGMENTAGENT_AUTOSTART_DRY_RUN=true` to register the daemon without it ever
-sending. Logs land under `~/.local/state/augmentagent*/` on both. The daemon unit runs **live** with the wiki on
+sending. When the build has the `auto-pr-worker` command, `install-autostart.sh`
+also registers the auto-ship worker: `augmentagent-autopr.service` on Linux, the
+`com.nolanmak.augmentagent.autopr` LaunchAgent on macOS. Auto-ship runs only in
+that worker, never inside the daemon. Logs land under `~/.local/state/augmentagent*/` on both. The daemon unit runs **live** with the wiki on
 (`--wiki-dir ./wiki serve --dry-run false`), which also needs `jq` on `PATH`,
 the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
@@ -474,4 +481,4 @@ still include unclassified transfers. Bank descriptions are treated as data,
 not instructions. The agent is allowed only `finance status`, `transactions`,
 and `summary`, not connection or sync operations.
 
-Multiple model accounts and local 9Router routing: [setup and verification](docs/model-router.md).
+Optional OmniRoute gateway (off by default; native CLI accounts remain direct): [setup and verification](docs/model-router.md).

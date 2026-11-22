@@ -133,6 +133,7 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),notified_at_ms INTEGER);
         INSERT OR IGNORE INTO owner_text_failure_notice_limit(singleton) VALUES(1);",
     )?;
+    crate::owner_alert_digest::migrate(c)?;
     Ok(())
 }
 
@@ -303,6 +304,9 @@ impl Store {
                     AND p.enabled=1 AND p.destination=o.target AND a.expires_at_ms>?1
                     AND (a.due_at_ms IS NULL OR a.due_at_ms>?1)
                     AND (a.snoozed_until_ms IS NULL OR a.snoozed_until_ms<=?1)
+                    AND NOT EXISTS(SELECT 1 FROM owner_alert_digest_items di
+                        JOIN owner_alert_digests d ON d.slot=di.slot JOIN imessage_outbox od ON od.id=d.outbox_id
+                        WHERE di.alert_id=a.id AND od.status IN ('claimed','unknown'))
                     ORDER BY a.text_after_ms,o.id LIMIT 1) AND status='queued'
                 RETURNING {}", crate::imessage::COLUMNS);
             let mut item = tx.query_row(&sql, [now], crate::imessage::row_to_item).optional()?;

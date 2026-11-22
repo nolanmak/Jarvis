@@ -5,11 +5,13 @@
 //! primitives (`Reasoner`, prompt builders, decision parsing, ingest) live in
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
+mod draft_body;
 pub mod gmail;
 pub mod google;
 pub mod inbound;
 pub mod outbound;
 pub mod owner_alerts;
+pub mod owner_alert_gate;
 pub mod prefilter;
 pub mod scheduled;
 // #1833 D12 — Gmail-direct sender authentication.

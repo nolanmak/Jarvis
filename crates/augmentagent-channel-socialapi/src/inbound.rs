@@ -444,6 +444,14 @@ impl SocialApiDmSource {
             // against. Cost is a few minutes of latency; the alternative is
             // drafting a reply to ourselves.
             if stated_outbound || is_own_handle(&own_handles, &payload.author) {
+                // #2284 — our own DM is the owner answering this conversation.
+                record_owner_dm(
+                    &self.store,
+                    &payload.conversation_id,
+                    &payload.message_id,
+                    &payload.created_at,
+                    "socialapi-webhook",
+                );
                 debug!(
                     event = %ev.id,
                     author = %payload.author,
@@ -552,6 +560,12 @@ impl InboundSource for SocialApiDmSource {
                 // observer; keyed on the conversation id, which is the draft's
                 // `thread_id`. Best-effort: a store error here must not block
                 // fetching new inbound work.
+                // #2284 — every owner DM in this page is reply evidence for
+                // the cross-channel sweep, including ones the other side has
+                // written after (which the supersede below can't see).
+                for m in msgs.iter().filter(|m| m.is_outgoing()) {
+                    record_owner_dm(&self.store, &conv.id, &m.id, &m.created_at, "socialapi-poll");
+                }
                 if msgs.first().is_some_and(|m| m.is_outgoing()) {
                     match self.store.mark_pending_drafts_superseded_by_thread(
                         &conv.id,
@@ -613,6 +627,21 @@ impl InboundSource for SocialApiDmSource {
         }
         debug!(n = out.len(), "socialapi dm source: new inbound messages");
         Ok(out)
+    }
+}
+
+/// #2284 — record one owner-sent DM in the shared owner ledger. A message
+/// with no id or no parseable time can't be ordered against an inbound, so it
+/// is skipped. Best effort: a store error must not block inbound work.
+fn record_owner_dm(store: &Store, conversation_id: &str, message_id: &str, created_at: &str, source: &str) {
+    if conversation_id.is_empty() || message_id.is_empty() {
+        return;
+    }
+    let Some(at_ms) = augmentagent_store::conversation_context::parse_source_timestamp_ms(created_at) else {
+        return;
+    };
+    if let Err(e) = store.record_owner_message(PLATFORM, conversation_id, message_id, at_ms, source) {
+        warn!(conversation = %conversation_id, "socialapi dm source: recording owner DM failed: {e}");
     }
 }
 
@@ -1260,6 +1289,77 @@ mod tests {
 
         let row = store.get_action_with_email(&action_id).unwrap().unwrap();
         assert_eq!(row.action.status, "superseded");
+    }
+
+    /// #2284 — every owner DM in polled history is recorded as reply
+    /// evidence, even when the other side wrote again after it (so the newest
+    /// message is not ours and the #244 supersede does not fire). Messages
+    /// with no stated direction or no usable time are not evidence.
+    #[tokio::test]
+    async fn poll_records_owner_dms_as_reply_evidence() {
+        let (store, _f) = tmp_store();
+        let server = MockServer::start().await;
+        mount_conversations(
+            &server,
+            serde_json::json!({"data": [{
+                "id": "conv_1", "account_id": "acc_1", "participant_name": "jane"
+            }]}),
+        )
+        .await;
+        let owner_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        mount_messages(
+            &server,
+            "conv_1",
+            serde_json::json!({"data": [
+                {"id":"m4","direction":"incoming","sender_name":"jane","text":"one more thing","created_at": rfc3339_ago(1)},
+                {"id":"m3","direction":"outgoing","sender_name":"me","text":"sure","created_at": owner_at.to_rfc3339()},
+                {"id":"m2","direction":"","sender_name":"?","text":"unstated","created_at": rfc3339_ago(1)},
+                {"id":"m5","direction":"outgoing","sender_name":"me","text":"no time","created_at": "not a time"},
+                {"id":"m1","direction":"incoming","sender_name":"jane","text":"hey","created_at": rfc3339_ago(3)}
+            ]}),
+        )
+        .await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+        let _ = source.fetch_new().await.unwrap();
+
+        let at = owner_at.timestamp_millis();
+        assert!(store.owner_replied_since(PLATFORM, "conv_1", at - 1).unwrap());
+        assert!(!store.owner_replied_since(PLATFORM, "conv_1", at).unwrap());
+        // Re-polling the same history records nothing new.
+        let _ = source.fetch_new().await.unwrap();
+        assert!(!store
+            .record_owner_message(PLATFORM, "conv_1", "m3", at, "test")
+            .unwrap());
+        assert!(store
+            .record_owner_message(PLATFORM, "conv_1", "m2", at, "test")
+            .unwrap(), "an unstated-direction message must not have been recorded");
+        assert!(store
+            .record_owner_message(PLATFORM, "conv_1", "m5", at, "test")
+            .unwrap(), "an untimed message must not have been recorded");
+    }
+
+    /// #2284 — an owner DM pushed through the webhook is reply evidence too.
+    #[tokio::test]
+    async fn drain_records_our_own_outbound_dm_as_reply_evidence() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_account(&store, "acc_1", "acme");
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_1:msg_1",
+            serde_json::json!({
+                "type": "dm", "id": "msg_1", "conversation_id": "conv_1",
+                "account_id": "acc_1", "with": "", "author": "@Acme",
+                "text": "thanks for reaching out", "created_at": "2026-05-28T00:00:00Z"
+            }),
+        );
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        assert!(src.fetch_new().await.unwrap().is_empty());
+        let at = chrono::DateTime::parse_from_rfc3339("2026-05-28T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert!(store.owner_replied_since(PLATFORM, "conv_1", at - 1).unwrap());
     }
 
     /// #249 fast-path: a webhook-delivered DM event drained from

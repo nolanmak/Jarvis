@@ -1,0 +1,27 @@
+{
+  "comment": "Integration commands the yolo preset may run (#2216). Every entry must be read-only under the bridge's read_only_operation. Both the Rust preset test and the bridge test read this file.",
+  "augmentagent": [
+    "gmail search *",
+    "gmail accounts",
+    "gmail list-attachments *",
+    "finance status",
+    "finance status *",
+    "finance transactions",
+    "finance transactions *",
+    "finance summary",
+    "finance summary *",
+    "calendar list-events",
+    "calendar list-events *",
+    "meetup events",
+    "meetup events *",
+    "linkedin recent-dms",
+    "linkedin recent-dms *",
+    "repo-docs sources",
+    "repo-docs list *",
+    "repo-docs get *"
+  ],
+  "aa-gh": [
+    "issue list *",
+    "issue view *"
+  ]
+}

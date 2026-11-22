@@ -153,33 +153,7 @@ impl Store {
         sender: &str,
         urgency: crate::owner_alerts::Urgency,
     ) -> StoreResult<()> {
-        if !sender.contains('@') || sender.contains(char::is_whitespace) {
-            return Err(crate::StoreError::InvalidInput(
-                "priority sender must be a bare email address".into(),
-            ));
-        }
-        self.with_conn(|c| {
-            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-            tx.execute(
-                "INSERT INTO owner_alert_priorities(sender,urgency) VALUES(lower(?1),?2)
-            ON CONFLICT(sender) DO UPDATE SET urgency=excluded.urgency",
-                params![sender, urgency.as_str()],
-            )?;
-            tx.execute(
-                "DELETE FROM owner_alert_assessments WHERE message_id IN
-                (SELECT messageId FROM emails WHERE lower(trim(fromEmail))=lower(?1)
-                OR instr(lower(fromEmail),'<'||lower(?1)||'>')>0)",
-                [sender],
-            )?;
-            tx.execute(
-                "DELETE FROM owner_alert_assessment_failures WHERE message_id IN
-                (SELECT messageId FROM emails WHERE lower(trim(fromEmail))=lower(?1)
-                OR instr(lower(fromEmail),'<'||lower(?1)||'>')>0)",
-                [sender],
-            )?;
-            tx.commit()
-        })?;
-        Ok(())
+        crate::owner_alert_gate::set_priority(self, sender, urgency, &[])
     }
 
     pub fn owner_alert_priority(

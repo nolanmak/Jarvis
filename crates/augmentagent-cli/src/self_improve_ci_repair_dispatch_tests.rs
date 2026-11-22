@@ -611,3 +611,176 @@ async fn paired_capacity_refusal_preserves_resource_recovery_and_original_cause(
     }
     child(TEST, "capacity", false);
 }
+
+fn update_scenario(control: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = control.join("scenario.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut value);
+    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+fn snapshot(control: &Path, id: &str) -> crate::autoship_workflow::Snapshot {
+    WorkflowStore::open(&control.join("workflow.db")).unwrap().snapshot(id).unwrap().unwrap()
+}
+fn reruns(control: &Path) -> usize {
+    std::fs::read_to_string(control.join("calls.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("\"rerun\"") && line.contains("\"--failed\""))
+        .count()
+}
+
+/// #2315 production shape (#2305, #2307): autoship's own PR is red, and its
+/// head predates main's CI policy, so the hosted reader answers "unknown".
+/// That used to become `verification_infrastructure_retry` forever. It is a
+/// code failure: the resume path must go on to merge main, rebuild, test and
+/// push, with the #2301 backoff between unchanged rounds, never parking.
+#[tokio::test]
+async fn red_pr_with_stale_policy_goes_to_repair_not_infrastructure_retry() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::red_pr_with_stale_policy_goes_to_repair_not_infrastructure_retry";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| value["stale_policy"] = true.into());
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+            ci_repair::Preflight::Continue => {}
+            ci_repair::Preflight::Deferred(report) => panic!("code failure parked: {}", report.message),
+            ci_repair::Preflight::Compare(_) => panic!("unknown hosted evidence cannot be compared"),
+        }
+        let after = snapshot(&control, &id);
+        assert_ne!(after.checkpoint.next.reason, "verification_infrastructure_retry");
+        assert_eq!(after.model_calls, 0, "classification spends no model calls");
+        // The same unchanged red head again: the ladder backs off, on the
+        // main-reconciliation cue rather than the infrastructure retry.
+        let report = match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+            ci_repair::Preflight::Deferred(report) => report,
+            _ => panic!("an unchanged red head must back off before its next repair round"),
+        };
+        assert!(report.message.contains("hosted_ci_policy_stale"), "{}", report.message);
+        let after = snapshot(&control, &id);
+        assert_eq!(after.checkpoint.stage, Stage::Reconcile);
+        assert_eq!((after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()),
+            ("review_main_changed", "reconcile_main"));
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(after.checkpoint.next.eligible_at_ms > now + 25 * 60_000
+            && after.checkpoint.next.eligible_at_ms <= now + 30 * 60_000);
+        assert!(after.lease_until_ms <= now, "backoff must release the lease");
+        return;
+    }
+    child(TEST, "stale", false);
+}
+
+/// The hosted merge ref fails to compile (E0063) because main moved, while
+/// the branch head alone still compiles. Waiting cannot fix that; merging
+/// main and rebuilding in the verifier can.
+#[tokio::test]
+async fn compile_error_from_moved_main_merges_main_instead_of_waiting() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::compile_error_from_moved_main_merges_main_instead_of_waiting";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        let replay = CompilerReplay { compiler: PathBuf::from(std::env::var_os("CI_REPLAY_RUSTC").unwrap()) };
+        std::fs::write(root.join("caller/src/main.rs"),
+            "fn main() { let _: Vec<String> = fixture_api::identity(); }\n").unwrap();
+        let head = commit(&root, "caller follows the candidate API");
+        update_scenario(&control, |value| {
+            value["head"] = head.clone().into();
+            value["log"] = "error[E0063]: missing field `latency` in initializer of `TurnMarks`\nerror: could not compile `fixture_caller`".into();
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        match ci_repair::prepare(&root, 1669, &mut workflow, &replay).await.unwrap() {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Deferred(report) => panic!("compile error parked: {}", report.message),
+            ci_repair::Preparation::Repair(_) => panic!("an unreproduced failure has no head-local repair input"),
+        }
+        assert_ne!(snapshot(&control, &id).checkpoint.next.reason, "verification_infrastructure_retry");
+        assert_eq!(reruns(&control), 0, "a compile error is never rerun as flakiness");
+        return;
+    }
+    child(TEST, "skew", false);
+}
+
+/// Infrastructure failures rerun the failed jobs a bounded number of times;
+/// once the reruns are spent the failure is treated as code and repaired.
+#[tokio::test]
+async fn infrastructure_failure_reruns_then_reclassifies_as_code() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::infrastructure_failure_reruns_then_reclassifies_as_code";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        let replay = CompilerReplay { compiler: PathBuf::from(std::env::var_os("CI_REPLAY_RUSTC").unwrap()) };
+        update_scenario(&control, |value| {
+            value["log"] = "E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu/pool/main/l/llvm.deb  Could not connect to azure.archive.ubuntu.com:80\nE: Unable to fetch some archives".into();
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        let head = workflow.binding().head.clone();
+        let report = match ci_repair::prepare(&root, 1669, &mut workflow, &replay).await.unwrap() {
+            ci_repair::Preparation::Deferred(report) => report,
+            _ => panic!("first infrastructure failure must rerun the failed jobs"),
+        };
+        assert!(report.message.contains("ci_infra_rerun_requested"), "{}", report.message);
+        assert_eq!(reruns(&control), 1);
+        let after = snapshot(&control, &id);
+        assert_eq!(after.checkpoint.next.reason, "verification_infrastructure_retry");
+        // Spend the rest of the bounded reruns, then observe the same red job.
+        let mut workflow = guard(&root, &control, Some(after.checkpoint.next.eligible_at_ms + 1)).await;
+        while workflow.admit_epoch_attempt(ci_repair::INFRA_RERUN_PURPOSE, &head, ci_repair::INFRA_RERUN_LIMIT).unwrap() {}
+        match ci_repair::prepare(&root, 1669, &mut workflow, &replay).await.unwrap() {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Deferred(report) => panic!("exhausted reruns parked: {}", report.message),
+            ci_repair::Preparation::Repair(_) => panic!("reclassified infrastructure has no head-local diagnosis"),
+        }
+        assert_eq!(reruns(&control), 1, "reruns are bounded");
+        assert_ne!(snapshot(&control, &id).checkpoint.next.reason, "verification_infrastructure_retry");
+        return;
+    }
+    child(TEST, "infra", false);
+}
+
+/// #2430 production shape (#2350 / PR #2358): the workflow holds an unpushed
+/// candidate (main already integrated) on top of the published PR head. GitHub
+/// ran nothing on the conflicting PR, so the hosted reader says "unknown" with
+/// no head, and preflight deferred it as infrastructure on every resume. The
+/// candidate descends from the fetched PR head, so it is retained unpublished
+/// work: continue to verification, review and publication.
+#[tokio::test]
+async fn unpushed_candidate_publishes_instead_of_infrastructure_retry() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::unpushed_candidate_publishes_instead_of_infrastructure_retry";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| value["pr_unreadable"] = true.into());
+        let mode = std::env::var("CI_DISPATCH_MODE").unwrap();
+        let published = git(&root, &["rev-parse", "HEAD~1"]);
+        if mode == "unpushed" {
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &published]);
+        } else {
+            // A remote PR head the candidate does not descend from.
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &git(&root, &["rev-parse", "origin/main"])]);
+            std::fs::write(root.join("unrelated.txt"), "remote moved\n").unwrap();
+            git(&root, &["checkout", "-q", "--detach", "origin/main"]);
+            let moved = commit(&root, "remote moved");
+            git(&root, &["checkout", "-q", "candidate"]);
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &moved]);
+        }
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        let outcome = ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap();
+        if mode == "unpushed" {
+            assert!(matches!(outcome, ci_repair::Preflight::Continue),
+                "an unpushed descendant candidate must publish, not wait on hosted CI");
+            assert_ne!(snapshot(&control, &id).checkpoint.next.reason, "verification_infrastructure_retry");
+        } else {
+            let ci_repair::Preflight::Deferred(report) = outcome else {
+                panic!("a moved remote head cannot be treated as retained local work");
+            };
+            assert!(report.message.contains("ci_observed_head_changed"), "{}", report.message);
+        }
+        return;
+    }
+    child(TEST, "unpushed", false);
+    child(TEST, "moved", false);
+}

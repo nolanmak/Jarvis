@@ -11,6 +11,15 @@ pub(crate) enum ReviewRecoveryReadiness {
     AdoptionWait,
 }
 
+/// #2383: held review reasons the reconciler re-admits on its own. Capacity
+/// and latch waits are already `waiting`; unknown provenance stands down.
+pub(crate) const AUTO_RESUMED_HOLDS: &[&str] = &["review-recovery-required", "review-evidence-budget"];
+const AUTO_RESUME_PURPOSE: &str = "review-recovery-auto-resume";
+/// Paid review re-runs per reviewed binding before the daily resume owns it.
+const AUTO_RESUME_LIMIT: u32 = 3;
+/// First retry after a repeated failure waits this long, doubling after.
+const AUTO_RESUME_BACKOFF_MS: i64 = 15 * 60 * 1000;
+
 impl WorkflowStore {
     /// Called only after matching a controller publication record to the remote
     /// PR/head. Unknown or superseded workflow custody requires adoption (#1537).
@@ -54,7 +63,14 @@ impl WorkflowStore {
             checkpoint.stage == Stage::Reconcile && checkpoint.next.reason == "draft_parked";
         let pending = checkpoint.stage == Stage::Review
             && checkpoint.next.reason == "review-recovery-required";
-        if !(waiting || parked || pending) {
+        // #2383: a review the executor could not finish (format/evidence
+        // recovery, evidence budget) parks on Held. Nothing else resumes it,
+        // so re-admit it here on a bounded backoff per reviewed binding. Past
+        // the bound it is left to the daily adopted-draft resume.
+        let recovering = checkpoint.stage == Stage::Held
+            && checkpoint.next.action == "resume_preserved_work"
+            && AUTO_RESUMED_HOLDS.contains(&checkpoint.next.reason.as_str());
+        if !(waiting || parked || pending || recovering) {
             return Ok(None);
         }
         let operations: bool = tx.query_row(
@@ -65,6 +81,37 @@ impl WorkflowStore {
         let uncertain_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state='dispatched')", [&id], |r|r.get(0))?;
         if operations || uncertain_merge {
             return Ok(None);
+        }
+        if recovering {
+            let key = serde_json::to_string(&checkpoint.binding)?;
+            let used: u32 = tx
+                .query_row(
+                    "SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",
+                    params![id, AUTO_RESUME_PURPOSE, key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if used >= AUTO_RESUME_LIMIT {
+                return Ok(None);
+            }
+            if used > 0 {
+                let held_at: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(at_ms),0) FROM workflow_event WHERE workflow=?1 AND kind='checkpoint'",
+                    [&id],
+                    |r| r.get(0),
+                )?;
+                if now < held_at.saturating_add(AUTO_RESUME_BACKOFF_MS.saturating_mul(1 << (used - 1).min(8))) {
+                    return Ok(None);
+                }
+            }
+            if matches!(readiness, ReviewRecoveryReadiness::Ready) {
+                tx.execute(
+                    "INSERT INTO bounded_attempt(workflow,purpose,binding,attempts) VALUES(?1,?2,?3,1)
+                     ON CONFLICT(workflow,purpose,binding) DO UPDATE SET attempts=attempts+1",
+                    params![id, AUTO_RESUME_PURPOSE, key],
+                )?;
+            }
         }
         // A provenance wait is not cleansed by a provider becoming available.
         let readiness = if checkpoint.next.reason == "dependency-adoption-provenance" {
