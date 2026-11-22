@@ -139,8 +139,105 @@ pub(crate) fn retire(session:&Path) {
         let _=write(&session.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}");
     }
 }
+/// One runtime whose closure could not be proved, with the exact blocker and
+/// the authenticated recovery route that could still settle it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetainedRuntime {
+    pub session: String,
+    pub blocker: &'static str,
+    pub recovery: &'static str,
+}
+
+/// Structured outcome of one bounded retirement pass. Only `pruned` runtimes
+/// were verified closed against their original producer evidence; every
+/// `retained` entry keeps its runtime, ownership bytes and alias untouched.
+#[derive(Debug, Default, Serialize)]
+pub struct RetirementOutcome {
+    pub authorized: usize,
+    pub pruned: usize,
+    pub retained: Vec<RetainedRuntime>,
+}
+impl RetirementOutcome {
+    /// True only when no runtime of this owner is still awaiting proof, so the
+    /// durable retirement intent may be marked complete.
+    pub fn verified(&self) -> bool { self.retained.is_empty() }
+    pub fn blocker(&self) -> Option<&RetainedRuntime> { self.retained.first() }
+}
+
+enum Closure { Verified, Retained(&'static str) }
+
+fn retained_runtime(session:&Path,blocker:&'static str)->RetainedRuntime {
+    RetainedRuntime {
+        session:session.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        blocker,
+        recovery:match blocker {
+            "active_session"|"resumed_session"=>"release the live native runtime, then request fenced workflow owner retirement",
+            "unsettled_durable_result"=>"record durable settlement of the authenticated upstream result/export",
+            "session_lock_held"=>"retry the locked pruning service once the conflicting native operation releases its session lock",
+            _=>"fenced workflow owner retirement bound to the original audit generation and lease",
+        },
+    }
+}
+
+/// Fail closed: evidence that cannot be read as an owner-private JSON record is
+/// treated as absent rather than as proof of closure.
+fn evidence(session:&Path,name:&str)->Option<serde_json::Value> {
+    let path=session.join(name);
+    if !path.symlink_metadata().is_ok_and(|info|info.is_file()) {return None;}
+    serde_json::from_slice(&private(&path).ok()?).ok()
+}
+
+/// Retirement markers, readonly labels, absent processes, expired leases and
+/// unsupported legacy records are observations. They describe a runtime; they
+/// never authorize deleting it, replaying it or backfilling its original
+/// execution binding from today's policy.
+fn observed_blocker(session:&Path)->&'static str {
+    for (name,blocker) in [("legacy-retirement.json","unsupported_legacy_evidence"),
+        ("readonly.json","readonly_label_only"),("lease.json","lease_observation_only"),
+        ("process.json","process_observation_only")] {
+        if session.join(name).exists() {return blocker;}
+    }
+    if !session.join("retired.json").exists() {return "no_retirement_intent";}
+    if !session.join("complete.json").exists() {return "retired_marker_only";}
+    "missing_producer_completion"
+}
+
+/// Decide whether this runtime's original producer closure is proven, against
+/// the retained owner/audit binding rather than any current selected policy.
+fn producer_closure(root:&Path,session:&Path)->Result<Closure> {
+    let Some(owned)=evidence(session,"owned.json") else {return Ok(Closure::Retained("missing_owner_receipt"))};
+    let (Some(audit),Some(owner))=(owned.get("audit_path").and_then(|value|value.as_str()),owned.get("owner"))
+        else {return Ok(Closure::Retained("missing_owner_receipt"))};
+    if session.join("active.json").exists() {return Ok(Closure::Retained("active_session"));}
+    if session.join("resumed.json").exists() {return Ok(Closure::Retained("resumed_session"));}
+    if let Some(marker)=evidence(session,"retired-owner.json") {
+        if marker.get("audit_path").and_then(|value|value.as_str())!=Some(audit) || marker.get("owner")!=Some(owner) {
+            return Ok(Closure::Retained("owner_audit_mismatch"));
+        }
+        let fenced:RuntimeOwner=serde_json::from_value(owner.clone())?;
+        return Ok(if owner_retired(root,Path::new(audit),&fenced)? {Closure::Verified}
+            else {Closure::Retained("unrecorded_owner_retirement")});
+    }
+    let Some(completion)=evidence(session,"producer-completion.json") else {return Ok(Closure::Retained(observed_blocker(session)))};
+    if completion.get("audit_path").and_then(|value|value.as_str())!=Some(audit) || completion.get("owner")!=Some(owner) {
+        return Ok(Closure::Retained("owner_audit_mismatch"));
+    }
+    if completion.get("writer_fence").and_then(|value|value.as_i64())!=owner.get("lease_generation").and_then(|value|value.as_i64()) {
+        return Ok(Closure::Retained("stale_writer_fence"));
+    }
+    if !session.join("retired.json").exists() {return Ok(Closure::Retained("no_retirement_intent"));}
+    let settled=evidence(session,"settled-result.json").is_some_and(|record|
+        record.get("durable")==Some(&serde_json::Value::Bool(true)) && record.get("owner")==Some(owner));
+    Ok(if settled {Closure::Verified} else {Closure::Retained("unsettled_durable_result")})
+}
+
 fn prune_and_count(root:&Path) -> Result<usize> {
-    let mut count=0;
+    Ok(prune_runtimes(root)?.0)
+}
+/// Bounded locked pruning pass over every provider runtime, returning retained
+/// and verified-pruned counts. The caller holds the state lock.
+fn prune_runtimes(root:&Path) -> Result<(usize,usize)> {
+    let (mut retained,mut pruned)=(0,0);
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
@@ -150,28 +247,29 @@ fn prune_and_count(root:&Path) -> Result<usize> {
             let session=entry?.path();
             if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
             ensure!(session.is_dir() && !session.is_symlink(),"native session state is not a directory");
-            let reconciled=session.join("retired-owner.json").exists();
-            let retired=session.join("owned.json").exists() && (reconciled
-                || (session.join("retired.json").exists() && session.join("complete.json").exists()));
+            if !matches!(producer_closure(root,&session)?,Closure::Verified) {retained+=1;continue;}
+            // Take the session lock before the first mutation and hold it, with
+            // the caller's state lock, until the runtime and its alias are gone.
             let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW).open(session.join("lock"))?;
-            let available=unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0;
-            if retired && available {
-                let receipts=if reconciled {vec!["retired-owner.json","owned.json"]} else {vec!["retired.json","owned.json","complete.json"]};
-                for name in receipts { let _:serde_json::Value=serde_json::from_slice(&private(&session.join(name))?)?; }
-                let aliases=provider.join("aliases");
-                if aliases.is_dir() {
-                    for entry in std::fs::read_dir(aliases)? {
-                        let alias=entry?.path();
-                        let target:String=serde_json::from_slice(&private(&alias)?)?;
-                        if session.file_name().is_some_and(|name|name==target.as_str()){std::fs::remove_file(alias)?;}
-                    }
-                }
-                std::fs::remove_dir_all(&session)?;
-            } else {count+=1;}
+            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {retained+=1;continue;}
+            remove_runtime(&provider,&session)?;
+            pruned+=1;
         }
     }
-    Ok(count)
+    Ok((retained,pruned))
+}
+fn remove_runtime(provider:&Path,session:&Path) -> Result<()> {
+    let aliases=provider.join("aliases");
+    if aliases.is_dir() {
+        for entry in std::fs::read_dir(aliases)? {
+            let alias=entry?.path();
+            let target:String=serde_json::from_slice(&private(&alias)?)?;
+            if session.file_name().is_some_and(|name|name==target.as_str()){std::fs::remove_file(alias)?;}
+        }
+    }
+    std::fs::remove_dir_all(session)?;
+    Ok(())
 }
 
 /// Finish already-authorized retirement through the same locked pruning path
@@ -190,9 +288,10 @@ pub fn reconcile_retired_runtimes()->Result<()> {
 /// Called by the workflow controller only after fenced recovery or completion.
 /// It authorizes retirement of owned runtime data, including interrupted exports;
 /// active session locks still prevent reclamation. Approval/audit history is not
-/// stored here and is never removed by this operation.
-pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<usize> {
-    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(0)};
+/// stored here and is never removed by this operation. The returned outcome is
+/// verified only when every runtime of this owner was proved closed and pruned.
+pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<RetirementOutcome> {
+    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(RetirementOutcome::default())};
     let policy:Policy=serde_json::from_slice(&private(Path::new(&policy_path))?)?;
     let root=policy.state_root.canonicalize()?;
     let _lock=StateLock::acquire(&root)?;
@@ -212,10 +311,11 @@ fn owner_retired(root:&Path,audit_path:&Path,owner:&RuntimeOwner)->Result<bool> 
     Ok(retirement_db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE audit_path=?1 AND workflow=?2 AND generation=?3)",
         rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,owner.workflow_id,owner.lease_generation],|row|row.get(0))?)
 }
-fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<usize> {
+fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<RetirementOutcome> {
     retirement_db(root)?.execute("INSERT OR IGNORE INTO retired_owner VALUES(?1,?2,?3)",rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,expected_owner.workflow_id,expected_owner.lease_generation])?;
     std::fs::File::open(root)?.sync_all()?;
-    let mut count=0;
+    let mut authorized=0;
+    let mut owned=Vec::new();
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
@@ -232,11 +332,24 @@ fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) ->
             let marker=session.join("retired-owner.json");
             if !marker.exists(){
                 write(&marker,&serde_json::to_vec(&serde_json::json!({"version":1,"reason":"fenced_workflow_owner_reconciled","audit_path":audit_path,"owner":expected_owner}))?)?;
-                count+=1;
+                authorized+=1;
             }
+            owned.push(session);
         }
     }
-    Ok(count)
+    let total=owned.len();
+    prune_runtimes(root)?;
+    // Whatever survived the locked pass still owes proof: an unreleased lock,
+    // or evidence that never closed. Report the blocker instead of completing.
+    let mut retained=Vec::new();
+    for session in owned {
+        if !session.exists(){continue;}
+        retained.push(match producer_closure(root,&session)? {
+            Closure::Verified=>retained_runtime(&session,"session_lock_held"),
+            Closure::Retained(blocker)=>retained_runtime(&session,blocker),
+        });
+    }
+    Ok(RetirementOutcome{authorized,pruned:total-retained.len(),retained})
 }
 
 fn validate_resume_owner(root:&Path,session:&Path,audit_path:&Path,current:&RuntimeOwner)->Result<()> {
@@ -846,8 +959,14 @@ mod tests {
         let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
         let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(held.join("lock")).unwrap();
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
-        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap(),0);
-        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
+        let unmatched=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap();
+        assert_eq!((unmatched.authorized,unmatched.pruned),(0,0));
+        assert!(unmatched.verified(),"no runtime of this owner exists to retain");
+        let fenced=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        assert_eq!((fenced.authorized,fenced.pruned),(2,1));
+        assert!(!fenced.verified(),"a locked runtime cannot complete durable retirement");
+        let blocker=fenced.blocker().unwrap();
+        assert_eq!((blocker.session.as_str(),blocker.blocker),("session-held","session_lock_held"));
         assert_eq!(prune_and_count(temp.path()).unwrap(),2);
         assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
         // Parallel tests can fork while this fixture lock is open. Explicitly
@@ -883,7 +1002,57 @@ mod tests {
         retire(&interrupted);
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(interrupted.exists());
-        retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        let fenced=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        assert!(fenced.verified() && fenced.pruned==1);
         assert_eq!(prune_and_count(temp.path()).unwrap(),0);
+    }
+    /// Filesystem observations are never closure. Only correlated producer
+    /// completion with durable settlement, or the controller's fenced owner
+    /// retirement, may authorize deleting a runtime.
+    #[test]
+    fn observed_runtime_evidence_never_authorizes_retirement() {
+        let temp=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner=serde_json::json!({"workflow_id":"workflow","lease_generation":1});
+        let completion=serde_json::json!({"version":1,"audit_path":"/audit/one","owner":owner,"writer_fence":1});
+        let settled=serde_json::json!({"version":1,"owner":owner,"durable":true});
+        let cases:&[(&str,&[(&str,serde_json::Value)],&str)]=&[
+            ("session-incomplete",&[],"missing_producer_completion"),
+            ("session-active",&[("producer-completion.json",completion.clone()),("settled-result.json",settled.clone()),("active.json",serde_json::json!({}))],"active_session"),
+            ("session-resumed",&[("producer-completion.json",completion.clone()),("settled-result.json",settled.clone()),("resumed.json",serde_json::json!({}))],"resumed_session"),
+            ("session-mismatch",&[("producer-completion.json",serde_json::json!({"audit_path":"/audit/other","owner":owner,"writer_fence":1})),("settled-result.json",settled.clone())],"owner_audit_mismatch"),
+            ("session-fence",&[("producer-completion.json",serde_json::json!({"audit_path":"/audit/one","owner":owner,"writer_fence":2})),("settled-result.json",settled.clone())],"stale_writer_fence"),
+            ("session-unsettled",&[("producer-completion.json",completion.clone()),("upstream-export.json",serde_json::json!({"authenticated":true}))],"unsettled_durable_result"),
+            ("session-foreign-settlement",&[("producer-completion.json",completion.clone()),("settled-result.json",serde_json::json!({"owner":{"workflow_id":"other","lease_generation":9},"durable":true}))],"unsettled_durable_result"),
+            ("session-legacy",&[("legacy-retirement.json",serde_json::json!({"retired":true}))],"unsupported_legacy_evidence"),
+            ("session-readonly",&[("readonly.json",serde_json::json!({"readonly":true}))],"readonly_label_only"),
+            ("session-stale-lease",&[("lease.json",serde_json::json!({"expired":true}))],"lease_observation_only"),
+            ("session-missing-process",&[("process.json",serde_json::json!({"present":false}))],"process_observation_only"),
+            ("session-unrecorded",&[("retired-owner.json",serde_json::json!({"version":1,"audit_path":"/audit/one","owner":owner}))],"unrecorded_owner_retirement"),
+            ("session-foreign-marker",&[("retired-owner.json",serde_json::json!({"version":1,"audit_path":"/audit/other","owner":owner}))],"owner_audit_mismatch"),
+        ];
+        for (name,extra,blocker) in cases {
+            let path=session(temp.path(),name,"/audit/one",true);
+            write(&path.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}").unwrap();
+            for (file,value) in *extra {write(&path.join(file),&serde_json::to_vec(value).unwrap()).unwrap();}
+            assert!(matches!(producer_closure(temp.path(),&path).unwrap(),Closure::Retained(observed) if observed==*blocker),
+                "{name} was not retained for {blocker}");
+        }
+        let retired_only=session(temp.path(),"session-retired-only","/audit/one",false);
+        write(&retired_only.join("retired.json"),b"{}").unwrap();
+        assert!(matches!(producer_closure(temp.path(),&retired_only).unwrap(),Closure::Retained("retired_marker_only")));
+        let unretired=session(temp.path(),"session-unretired","/audit/one",true);
+        write(&unretired.join("producer-completion.json"),&serde_json::to_vec(&completion).unwrap()).unwrap();
+        write(&unretired.join("settled-result.json"),&serde_json::to_vec(&settled).unwrap()).unwrap();
+        assert!(matches!(producer_closure(temp.path(),&unretired).unwrap(),Closure::Retained("no_retirement_intent")));
+        let before=cases.iter().map(|(name,..)|std::fs::read(temp.path().join("codex").join(name).join("owned.json")).unwrap()).collect::<Vec<_>>();
+        assert_eq!(prune_and_count(temp.path()).unwrap(),cases.len()+2,"observed evidence authorized a deletion");
+        for (index,(name,..)) in cases.iter().enumerate() {
+            let path=temp.path().join("codex").join(name);
+            assert!(path.exists() && std::fs::read(path.join("owned.json")).unwrap()==before[index],"{name} lost original ownership evidence");
+        }
+        write(&unretired.join("retired.json"),b"{}").unwrap();
+        assert_eq!(prune_and_count(temp.path()).unwrap(),cases.len()+1);
+        assert!(!unretired.exists(),"producer-verified settled closure was not reclaimed");
     }
 }
