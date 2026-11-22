@@ -1475,6 +1475,16 @@ impl WorkflowGuard {
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
     }
+    /// #2430: the PR branch this workflow publishes to.
+    pub(super) fn branch(&self) -> Result<String> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?
+            .context("workflow missing")?
+            .branch)
+    }
     /// #1714: when the durable outbox routes this workflow, legacy
     /// `notify_review` must stay silent so the owner is not told twice.
     pub(super) fn legacy_notice_suppressed(&self) -> bool {
