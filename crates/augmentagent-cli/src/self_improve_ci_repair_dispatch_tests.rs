@@ -739,3 +739,48 @@ async fn infrastructure_failure_reruns_then_reclassifies_as_code() {
     }
     child(TEST, "infra", false);
 }
+
+/// #2430 production shape (#2350 / PR #2358): the workflow holds an unpushed
+/// candidate (main already integrated) on top of the published PR head. GitHub
+/// ran nothing on the conflicting PR, so the hosted reader says "unknown" with
+/// no head, and preflight deferred it as infrastructure on every resume. The
+/// candidate descends from the fetched PR head, so it is retained unpublished
+/// work: continue to verification, review and publication.
+#[tokio::test]
+async fn unpushed_candidate_publishes_instead_of_infrastructure_retry() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::unpushed_candidate_publishes_instead_of_infrastructure_retry";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| value["pr_unreadable"] = true.into());
+        let mode = std::env::var("CI_DISPATCH_MODE").unwrap();
+        let published = git(&root, &["rev-parse", "HEAD~1"]);
+        if mode == "unpushed" {
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &published]);
+        } else {
+            // A remote PR head the candidate does not descend from.
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &git(&root, &["rev-parse", "origin/main"])]);
+            std::fs::write(root.join("unrelated.txt"), "remote moved\n").unwrap();
+            git(&root, &["checkout", "-q", "--detach", "origin/main"]);
+            let moved = commit(&root, "remote moved");
+            git(&root, &["checkout", "-q", "candidate"]);
+            git(&root, &["update-ref", "refs/remotes/origin/candidate", &moved]);
+        }
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        let outcome = ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap();
+        if mode == "unpushed" {
+            assert!(matches!(outcome, ci_repair::Preflight::Continue),
+                "an unpushed descendant candidate must publish, not wait on hosted CI");
+            assert_ne!(snapshot(&control, &id).checkpoint.next.reason, "verification_infrastructure_retry");
+        } else {
+            let ci_repair::Preflight::Deferred(report) = outcome else {
+                panic!("a moved remote head cannot be treated as retained local work");
+            };
+            assert!(report.message.contains("ci_observed_head_changed"), "{}", report.message);
+        }
+        return;
+    }
+    child(TEST, "unpushed", false);
+    child(TEST, "moved", false);
+}

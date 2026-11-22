@@ -527,15 +527,31 @@ pub(super) async fn preflight(
             .await?,
         ));
     }
+    // #2430: an unknown hosted result carries no head (GitHub ran nothing on
+    // a conflicting PR). Fall back to the PR head the resume lane fetched, so
+    // a preserved, unpushed candidate is published instead of being retried
+    // as infrastructure forever.
+    let observed_head = if observation.head.is_empty() {
+        let branch = workflow.branch()?;
+        let (fetched, published, _) = run(
+            "git",
+            &["rev-parse", "-q", "--verify", &format!("refs/remotes/origin/{branch}^{{commit}}")],
+            root,
+        )
+        .await?;
+        if fetched { published.trim().to_owned() } else { String::new() }
+    } else {
+        observation.head.clone()
+    };
     let different_head =
-        !observation.head.is_empty() && observation.head != workflow.binding().head;
+        !observed_head.is_empty() && observed_head != workflow.binding().head;
     if different_head {
         let (retained, _, _) = run(
             "git",
             &[
                 "merge-base",
                 "--is-ancestor",
-                &observation.head,
+                &observed_head,
                 &workflow.binding().head,
             ],
             root,
@@ -556,7 +572,7 @@ pub(super) async fn preflight(
     if different_head || !status.trim().is_empty() {
         workflow.audit_logger().record_controller(
             serde_json::json!({"kind":"hosted_ci_other_source",
-            "observed_head":observation.head,"candidate_head":workflow.binding().head,
+            "observed_head":observed_head,"candidate_head":workflow.binding().head,
             "action":"revalidate_candidate","shipping_authority":false}),
         )?;
         return Ok(Preflight::Continue);
