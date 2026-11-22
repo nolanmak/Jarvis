@@ -1120,7 +1120,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) && !due_retries.contains(&iss.number) {
+        // #2432 — that caps fresh starts only: a workflow already in flight
+        // (build..publish, open PR, preserved head) resumes on its own backoff.
+        let retry_due=qualification_retries.contains(&iss.number) || due_retries.contains(&iss.number);
+        if owner_controls.daily_ledger_holds(&ledger, today, &repository, iss.number, retry_due) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -4133,6 +4136,8 @@ async fn find_resumable_draft(
     retries.extend(integration_retries);
     retries.extend(adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
+    // #2432 — in-flight PRs resume on their own backoff, not the daily ledger.
+    retries.extend(adoption::in_flight_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     let select = |cursor| {
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
@@ -5742,13 +5747,15 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
             }
         }
     };
-    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
-        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
-    }
+    // #2432 — an open fix PR is work in flight: the daily ledger caps only a
+    // fresh start, so check for the PR first.
     match has_open_agent_pr(repo_root, number).await {
         Ok(true) => return RedMainPlan::Resume(number),
         Ok(false) => (),
         Err(_) => return RedMainPlan::Hold(linked_claims::Hold::Unknown.to_string()),
+    }
+    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
+        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
     }
     // Build the Issue the same way pick_issue does, trust gate included —
     // the daemon files with the owner's gh login, but nothing here assumes it.
