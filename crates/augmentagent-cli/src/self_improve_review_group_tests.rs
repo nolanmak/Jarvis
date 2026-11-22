@@ -469,16 +469,14 @@ async fn bounded_protocol_source_case(
 }
 #[tokio::test]
 async fn malformed_then_incomplete_cannot_read_another_dependency_or_call_again() {
+    // #2420: a second incomplete observation concludes the group with what
+    // it has; it never calls again and never ends the review "unavailable".
     let (result,calls)=bounded_protocol_case("fixture-reviewer","actual-native-session",vec![
         serde_json::json!("not a structured review"),
         serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"absent.rs","criterion_ids":["C1"],"question":"Need absent source","selector":{"kind":"whole_file"}}]}),
     ]).await;
     assert_eq!(calls, 2);
-    assert!(format!(
-        "{:#}",
-        result.err().expect("review must remain unavailable")
-    )
-    .contains("remains incomplete after the second observation"));
+    assert!(result.expect("bounded incomplete evidence concludes the group").findings.is_empty());
     let (result, calls) = bounded_protocol_case(
         "fixture-reviewer",
         "actual-native-session",
@@ -529,20 +527,18 @@ async fn all_matching_requested_items_must_fit_before_another_observation() {
     let padding = "x".repeat(300 * 1024);
     let source=format!("mod first {{\nfn cap() {{ /*{padding}*/ }}\n}}\nmod second {{\nfn cap() {{ /*{padding}*/ }}\n}}\n");
     let request = serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"source.rs","criterion_ids":["C1"],"question":"Do both cap implementations preserve behavior?","selector":{"kind":"rust_item","name":"cap"}}]});
+    // #2420: the items still resolve all-or-nothing (no fitting subset is
+    // ever supplied), but an over-budget request is now marked unavailable
+    // and the bounded recovery observation proceeds instead of failing.
     let (result, calls) = bounded_protocol_source_case(
         "fixture-reviewer",
         "actual-native-session",
-        vec![request],
+        vec![request, serde_json::json!({"decision":"approve","findings":[]})],
         &source,
     )
     .await;
-    assert!(is_evidence_budget(
-        &result.err().expect("all matches must fit together")
-    ));
-    assert_eq!(
-        calls, 1,
-        "a fitting subset must never reach a recovery observation"
-    );
+    assert_eq!(calls, 2, "the recovery observation proceeds without the oversized items");
+    assert!(result.expect("an over-budget request is unavailable, not a failed review").findings.is_empty());
 }
 
 struct CorrectionCandidateContext {
@@ -631,11 +627,50 @@ async fn malformed_first_observation_reuses_captured_candidate_in_the_same_bound
             provider:augmentagent_channel_core::ProviderKind::Codex,opts:&opts,group_index:0,workflow:None},&transport).await;
         assert_eq!(*transport.calls.lock().unwrap(),2);
         if matches!(case,"over-budget"|"escaped-over-budget") {
-            assert!(result.is_err(),"oversized optional source cannot authorize completion");
+            // #2420: the bounded correction is spent and the reviewer is still
+            // incomplete; the group concludes from what it observed (no
+            // findings) instead of failing the whole review. No third call.
+            let concluded=result.expect("spent bounded recovery concludes the group");
+            assert!(concluded.findings.is_empty());
+            assert_eq!(concluded.native_sessions.len(),2);
         } else {
             let completed=result.expect("available captured source must reach the bounded correction");
             assert_eq!(completed.native_sessions.len(),2);
             assert_eq!(completed.findings.len(),usize::from(case=="defect"));
         }
     }
+}
+
+/// #2420 production shape (PR #2378, head 32b43164, group 100): the recovery
+/// pass still asked for `store.rs` item `migrate`, and the second incomplete
+/// observation failed a 2-hour, 202-call review. The group concludes from
+/// what it gathered, and a blocking finding from the first pass still blocks.
+#[tokio::test]
+async fn second_incomplete_pass_concludes_with_retained_findings() {
+    let finding = serde_json::json!({"id":"digest-claim","criterion_id":"C1","evidence_hash":"e".repeat(64),
+        "claim":"claim happens after the post","requested_change":"claim before posting","conflicts_with":[],
+        "repair_rounds":0,"repair_target":{"kind":"candidate","paths":["source.rs"]}});
+    let (result, calls) = bounded_protocol_case("fixture-reviewer", "actual-native-session", vec![
+        serde_json::json!({"decision":"incomplete","findings":[finding],"missing_sources":[{"path":"source.rs",
+            "criterion_ids":["C1"],"question":"Provide the whole digest module","selector":{"kind":"whole_file"}}]}),
+        serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"source.rs",
+            "criterion_ids":["C1"],"question":"Provide the Store::migrate implementation","selector":{"kind":"rust_item","name":"migrate"}}]}),
+    ]).await;
+    assert_eq!(calls, 2, "no third observation");
+    let group = result.expect("an unresolved request after bounded recovery must not fail the review");
+    assert_eq!(group.findings.len(), 1, "the blocking finding is retained");
+    assert_eq!(group.findings[0].id, "digest-claim");
+}
+
+/// #2420: a requested source missing at this head is unavailable to the
+/// reviewer, not a failed review: the recovery observation proceeds.
+#[tokio::test]
+async fn missing_source_request_proceeds_as_unavailable() {
+    let (result, calls) = bounded_protocol_case("fixture-reviewer", "actual-native-session", vec![
+        serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"crates/gone/src/lib.rs",
+            "criterion_ids":["C1"],"question":"Provide the removed module","selector":{"kind":"whole_file"}}]}),
+        serde_json::json!({"decision":"approve","findings":[]}),
+    ]).await;
+    assert_eq!(calls, 2, "the recovery observation still ran");
+    assert!(result.expect("a missing source must not fail the review").findings.is_empty());
 }

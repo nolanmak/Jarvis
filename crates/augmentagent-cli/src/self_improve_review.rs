@@ -159,14 +159,20 @@ pub(super) async fn run_for_subject(
         Ok(review) => review,
         Err(error) => {
             let review = unavailable_from_error(provider, error);
-            if let (Some(guard), Some(head), Some(ReviewUnavailable::RecoveryRequired { .. })) =
-                (guard, head.as_deref(), review.why_unavailable.as_ref())
-            {
-                record_structured_failure(guard, head, provider);
+            if let (Some(guard), Some(head), Some(why)) = (guard, head.as_deref(), review.why_unavailable.as_ref()) {
+                if counts_toward_fallback(why) {
+                    record_structured_failure(guard, head, provider);
+                }
             }
             review
         }
     }
+}
+
+/// #2420: which unavailable reviews count toward the alternate-reviewer
+/// fallback: output a different reviewer may produce validly or within budget.
+fn counts_toward_fallback(why: &ReviewUnavailable) -> bool {
+    matches!(why, ReviewUnavailable::RecoveryRequired { .. } | ReviewUnavailable::EvidenceBudget { .. })
 }
 
 /// #2385: durable count of structured reviews by `provider` that needed
@@ -893,8 +899,18 @@ async fn run_impl(
         let mut stream=caller_plan.as_ref().map(|plan|plan.stream(&worktree));
         let mut batch_requests=requests.clone();
         let mut group_index=0usize;
-        loop {
+        'groups: loop {
         for original_request in &batch_requests {
+            // #2420: hard per-role cap; conclude from observed evidence.
+            if !evidence_plan::evidence_group_allowed(group_index) {
+                if let Some(workflow)=context.workflow {
+                    workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_bounded",
+                        "binding":binding,"role":role,"groups_observed":group_index,
+                        "cap":evidence_plan::MAX_EVIDENCE_GROUPS_PER_ROLE,"decision":"conclude_with_observed_evidence"}))?;
+                }
+                warn!(role=?role,groups=group_index,"independent review evidence group cap reached; concluding role from observed evidence");
+                break 'groups;
+            }
             let i=group_index; group_index+=1;
             let group=group_execution::execute_cached_evidence_group(group_execution::EvidenceGroupInput {
                 root:&worktree,inputs:&inputs,original_request,evidence_shards:&evidence_shards,
@@ -1915,6 +1931,18 @@ mod tests {
         let pieces = chunks(&text, 17);
         assert_eq!(pieces.concat(), text);
         assert!(pieces.iter().all(|p| p.len() <= 17));
+    }
+
+    /// #2420: evidence-budget failures on one head count toward the claude
+    /// fallback like structured-validation failures; capacity, latches and a
+    /// moved main do not (another reviewer cannot fix those).
+    #[test]
+    fn evidence_failures_count_toward_the_reviewer_fallback() {
+        assert!(counts_toward_fallback(&ReviewUnavailable::RecoveryRequired { detail: "x".into() }));
+        assert!(counts_toward_fallback(&ReviewUnavailable::EvidenceBudget { detail: "x".into() }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::NoCapacity { reviewers: vec![], detail: "x".into() }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::Latched { until: vec![] }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::ProvenanceUnknown));
     }
 
     #[test]
