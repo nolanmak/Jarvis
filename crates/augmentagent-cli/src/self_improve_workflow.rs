@@ -2596,6 +2596,8 @@ pub(super) async fn git_binding(
 
 /// Canonical trusted repository identity shared by both execution lanes.
 pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
+    // #2444: the repository identity cannot change while the process runs.
+    let name = gh_budget::repository_name(repo_root, || async {
     let (ok, out, _) = run(
         &gh_bin(),
         &[
@@ -2617,7 +2619,9 @@ pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
         "canonical GitHub repository identity unavailable"
     );
-    repository_identity::Policy::from_env()?.canonical(name)
+    Ok(name.to_owned())
+    }).await?;
+    repository_identity::Policy::from_env()?.canonical(&name)
 }
 
 async fn untracked_evidence(worktree: &Path) -> Result<Vec<(String, String)>> {

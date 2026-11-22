@@ -652,3 +652,88 @@ fn controller_integrated_head_keeps_review_recovery_provenance() {
     assert_ne!((cp.stage, cp.next.reason.as_str()), (Stage::Held, "review-recovery-required"),
         "the held review recovery must move to a due review or a named reviewer wait");
 }
+
+/// #2329 / #2350 production shape (PRs #2378 / #2358). After a verifier
+/// dispute, the adjudicated amendment failed and parked the workflow at
+/// scope/adjudicated_amendment_retry/retry_adjudicated_amendment. Its binding
+/// is the amendment candidate retained in the PR checkout: a local descendant
+/// of the head the controller itself last pushed. The opened-PR record still
+/// names the original publication. The issue lane must leave it to the PR
+/// lane (no fresh rescope over the PR), and the PR lane must keep and select
+/// it instead of dropping it as unproven provenance. Exactly one lane runs it.
+#[test]
+fn own_pr_adjudicated_amendment_retry_runs_on_exactly_one_lane() {
+    use std::collections::BTreeSet;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("workflow.db");
+    let (repository, issue, pr, branch) = ("owner/repo", 2329, 2378, "agent-fix/issue-2329");
+    let id = crate::autoship_workflow::workflow_id(repository, issue).unwrap();
+    let (opened, pushed, amended) = ("6f1a".repeat(10), "32b4".repeat(10), "f145".repeat(10));
+    let published = Binding { head: pushed.clone(), contract: "contract".into(), evidence_hash: "evidence".into() };
+    let mut store = WorkflowStore::open(&path).unwrap();
+    store.register(&id, branch, published.clone(), 1).unwrap();
+    let lease = store.claim(&id, "pr-lane", 2, 100).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, repository, pr, 3).unwrap();
+    let push = store.begin_operation(&lease, crate::autoship_workflow::OperationKind::Push, &published, 4).unwrap();
+    store.complete_operation(&lease, &push.id, &format!("git-head:{pushed}"), 5).unwrap();
+    let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+    cp.stage = Stage::Scope;
+    cp.binding.head = amended.clone();
+    cp.next = NextAction {
+        reason: "adjudicated_amendment_retry".into(),
+        action: "retry_adjudicated_amendment".into(),
+        eligible_at_ms: 10,
+    };
+    store.checkpoint(&lease, &cp, 6).unwrap();
+    store.release(&lease, 7).unwrap();
+    let own = store.snapshot(&id).unwrap().unwrap();
+    drop(store);
+    let now = 1_000;
+
+    // Issue lane: the open PR is its own, but this work is not a fresh issue
+    // run. The picker's dedup keeps it, and nothing routes it there.
+    assert_eq!(linked_claims::own_pr_continuation(Some(&own)), None);
+    assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr]), Some(&own)), BTreeSet::from([pr]),
+        "the issue lane must not select own-PR amendment work");
+
+    // PR lane: the controller's own confirmed push proves the PR head, so the
+    // candidate survives review-recovery admission and is due for the retry.
+    let record = OpenedPr { pr, head: opened, verdict: None };
+    assert_ne!(
+        review_recovery::observe(&path, repository, issue, pr, branch, &pushed, Some(&record), now).unwrap(),
+        Some(false),
+        "a head the workflow itself pushed is not unknown provenance"
+    );
+    let candidate = adoption::AdoptedPr {
+        repository: repository.into(), pr, source_issue: Some(issue), branch: branch.into(),
+        head: pushed.clone(), base: "main".into(), author: "owner".into(), title: "fix".into(),
+        body: String::new(), dependency: adoption::Dependency::Main,
+    };
+    let candidates = vec![candidate];
+    let retries = adoption::episode_retries(&path, &candidates, now).unwrap();
+    assert!(retries.contains(&pr), "the due amendment retry is PR-lane work");
+    let ledger = AttemptLedger { day: 0, issues: vec![issue] };
+    assert_eq!(
+        adoption::select_linked_with_retries(&candidates, &ledger, 0, &Default::default(), None, 0, &retries),
+        Some((pr, issue, branch.into()))
+    );
+    // The executor resumes the retained amendment candidate, not a rebuild.
+    let store = WorkflowStore::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(store.retained_candidate_head(repository, pr, branch, &pushed, &amended, now).unwrap(), Some(amended.clone()));
+    drop(store);
+
+    // A head nobody pushed for this workflow is still refused.
+    assert_eq!(
+        review_recovery::observe(&path, repository, issue, pr, branch, &"f".repeat(40), Some(&record), now).unwrap(),
+        Some(false)
+    );
+    // The dedup still blocks a different PR, or a different workflow, for
+    // the same issue.
+    assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr, 2400]), Some(&own)), BTreeSet::from([pr, 2400]));
+    let mut other = own.clone();
+    other.pr = Some(2400);
+    other.checkpoint.stage = Stage::Publish;
+    other.checkpoint.next = NextAction { reason: "publishing_revision".into(), action: "push".into(), eligible_at_ms: 0 };
+    assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr]), Some(&other)), BTreeSet::from([pr]));
+    assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr]), None), BTreeSet::from([pr]));
+}
