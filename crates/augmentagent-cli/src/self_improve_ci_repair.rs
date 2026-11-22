@@ -89,6 +89,7 @@ fn classify(log: &str) -> Classification {
         Classification::Compiler
     } else if log.contains("FAILED (")
         || log.contains("test result: FAILED")
+        || log.contains(" ... FAILED")
         || log.contains("AssertionError")
         || log.contains("panicked at")
     {
@@ -952,6 +953,59 @@ pub(super) async fn current_input(
 mod classification_tests {
     use super::*;
 
+    /// #2442, PR #2358 (#2350): `targeted` ran ~840 KB of cargo output. The
+    /// six panicking tests sat ~130 KB before the end because cargo kept
+    /// running other binaries, so the 64 KiB head/tail transport dropped every
+    /// failure line and the job classified `unknown`. That routed to a blind
+    /// main merge instead of a test repair, forever.
+    #[tokio::test]
+    async fn a_test_panic_in_the_dropped_middle_of_a_long_targeted_log_is_a_test_failure() {
+        const PREFIX: &str = "targeted\tRun python3 scripts/ci-contract.py step --hosted --id targeted/targeted/10\t2026-11-22T05:34:35.8567749Z ";
+        let tests = [
+            "socialapi_compose_identity::tests::a_conversation_id_with_like_wildcards_matches_only_itself",
+            "socialapi_compose_identity::tests::socialapi_compose_receipts_keep_exact_account_thread_and_platform_boundaries",
+        ];
+        let mut body = Vec::new();
+        for n in 0..1500 {
+            body.push(format!("test passing::prelude::case_{n} ... ok"));
+        }
+        body.push("running 7 tests".into());
+        for name in tests {
+            body.push(format!("test {name} ... FAILED"));
+        }
+        body.push(String::new());
+        body.push("failures:".into());
+        body.push(String::new());
+        for name in tests {
+            body.push(format!("---- {name} stdout ----"));
+            body.push(String::new());
+            body.push(format!("thread '{name}' (59092) panicked at crates/augmentagent-cli/src/bin/autoship_case.rs:15:5:"));
+            body.push("internal error: entered unreachable code: the observation only calls pending-compose selection and retirement".into());
+            body.push(String::new());
+        }
+        body.push("failures:".into());
+        for name in tests {
+            body.push(format!("    {name}"));
+        }
+        body.push(String::new());
+        body.push("test result: FAILED. 1 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s".into());
+        for n in 0..3000 {
+            body.push(format!("test passing::later_binary::case_{n} ... ok"));
+        }
+        body.push("##[error]Process completed with exit code 1.".into());
+        let raw: String = body.iter().map(|line| format!("{PREFIX}{line}\n")).collect();
+        assert!(raw.len() > 400 * 1024, "fixture must exceed the transport window");
+
+        let captured = hosted_ci::capture_log(raw.as_bytes()).await.unwrap();
+        assert!(captured.len() <= 192 * 1024, "transport stays bounded: {}", captured.len());
+        let logs = plain(&hosted_ci::job_diagnostics(&captured));
+        assert_eq!(classify_job(&logs, Some("failure")), Classification::TestFailure);
+        assert_eq!(failing_tests(&logs), tests.map(String::from).to_vec(),
+            "the repair family is anchored on the failing tests, not the log hash");
+        assert!(logs.contains("autoship_case.rs:15:5") && logs.contains("entered unreachable code"),
+            "the repair sees the panic location and message");
+    }
+
     /// #2315: infrastructure is the runner, network, apt/mirror, cancellation
     /// or a timeout with no test output. Everything the diff can cause is code.
     #[test]
@@ -959,6 +1013,8 @@ mod classification_tests {
         let code = [
             ("error[E0063]: missing field `latency` in initializer of `TurnMarks`\nerror: could not compile `augmentagent-cli`", Classification::Compiler),
             ("thread 'x' panicked at src/a.rs:1:1\ntest result: FAILED. 1 passed; 1 failed", Classification::TestFailure),
+            // #2442: the per-test verdict alone is test evidence too.
+            ("test socialapi_compose_identity::tests::x ... FAILED", Classification::TestFailure),
             ("POSSIBLE secret/PII in crates/x/src/lib.rs:\n  line 4", Classification::PolicyViolation),
             ("{\"valid\":false,\"changed\":[\".github/workflows/rust.yml\"]}", Classification::PolicyViolation),
             ("CONFLICT (content): Merge conflict in crates/x/src/lib.rs", Classification::PolicyViolation),
