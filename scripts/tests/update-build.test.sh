@@ -67,3 +67,5 @@ run_update_build "$TMP/target/release/augmentagent" "$TMP/target"
 [ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$TMP/target/release/augmentagent")" = 755 ]
 [ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$TMP/target/release/augmentagent-mcp-memory")" = 755 ]
 echo '9 update build outcome and permission cases passed'
+
+python3 "$ROOT/scripts/tests/remote_update_build_test.py"
