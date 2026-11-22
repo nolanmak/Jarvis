@@ -15,7 +15,7 @@ async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>
     }
     let inventory = serde_json::from_str(&raw)?;
     let mut candidates = adoption::authorized(&inventory, &repository, &allowed);
-    manual_routing::filter(repo, &mut candidates).await;
+    manual_routing::filter(repo, &mut candidates, &inventory).await;
     if !dry_run {
         adoption::persist(&workflow::path(), &candidates)?;
     }
@@ -696,10 +696,12 @@ pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec
         .into_iter()
         .filter(|p| p.source_issue.is_none() && p.ready_for_review())
     {
-        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
+        // #2444: the recorded approval is local; observe routing only for
+        // PRs that could actually merge.
         let Some(verdict) = approved(&store, &pr)? else {
             continue;
         };
+        if automatic && !manual_routing::allowed(repo,&pr.repository,pr.pr,pr.source_issue).await {continue;}
         let Some(evidence) = verdict.structured.as_ref() else {
             continue;
         };
