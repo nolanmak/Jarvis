@@ -61,12 +61,16 @@ pub fn load_provider_key(name: &str) -> Option<String> {
         }
         Err(AuthError::NotFound { .. }) => match std::env::var(name) {
             Ok(v) => {
-                warn!(
-                    key = name,
-                    "secret not in keyring; falling back to env var. \
-                     Run `augmentagent migrate-secrets-to-keyring` to \
-                     move {name} out of .env into Linux Secret Service"
-                );
+                if first_env_fallback(name) {
+                    warn!(
+                        key = name,
+                        "secret not in keyring; falling back to env var. \
+                         Run `augmentagent migrate-secrets-to-keyring` to \
+                         move {name} out of .env into Linux Secret Service"
+                    );
+                } else {
+                    debug!(key = name, source = "env", "secret loaded");
+                }
                 Some(v)
             }
             Err(_) => None,
@@ -82,6 +86,18 @@ pub fn load_provider_key(name: &str) -> Option<String> {
             std::env::var(name).ok()
         }
     }
+}
+
+/// #2433 — true the first time `name` falls back to the env in this
+/// process, so the warning is logged once per key instead of on every poll.
+fn first_env_fallback(name: &str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string())
 }
 
 #[cfg(test)]
@@ -111,5 +127,18 @@ mod tests {
         let got = load_provider_key(&key);
         std::env::remove_var(&key);
         assert_eq!(got.as_deref(), Some("from-env"));
+    }
+
+    /// #2433 — the env-fallback warning fires once per key per process, not
+    /// on every poll (the daemon logged it 26 times a second in bursts).
+    #[test]
+    fn env_fallback_warning_is_once_per_key() {
+        let key = format!("AUGMENTAGENT_TEST_WARN_ONCE_{}", std::process::id());
+        let other = format!("{key}_OTHER");
+        assert!(first_env_fallback(&key));
+        assert!(!first_env_fallback(&key));
+        assert!(!first_env_fallback(&key));
+        assert!(first_env_fallback(&other));
+        assert!(!first_env_fallback(&other));
     }
 }

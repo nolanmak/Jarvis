@@ -262,6 +262,19 @@ pub(crate) const INITIAL_INPUT_WAITS:&[(&str,&str)]=&[
     ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
 ];
 
+/// #2432 — is this workflow resuming work already in flight, rather than
+/// starting fresh? The #851 daily attempt ledger caps fresh starts only; work
+/// past the start is governed by its own lease, `eligible_at` backoff and the
+/// per-review cost cap (#2421). On 2026-11-21 the ledger held three PRs in
+/// verify/reconcile for 8+ hours.
+pub(crate) fn resumes_existing_work(snapshot:&Snapshot)->bool {
+    let stage=snapshot.checkpoint.stage;
+    if matches!(stage,Stage::Merged|Stage::Retired) {return false;}
+    matches!(stage,Stage::Build|Stage::Verify|Stage::Review|Stage::Reconcile|Stage::Publish)
+        || snapshot.pr.is_some()
+        || matches!(snapshot.checkpoint.next.action.as_str(),"resume_preserved_work"|"resume_preserved_pr")
+}
+
 /// Shape only; the unpaid consumer separately authenticates the exact private
 /// decline and original source before a transaction can queue reconsideration.
 pub(crate) fn legacy_amendment_input(checkpoint:&Checkpoint)->Option<&str> {
@@ -2529,6 +2542,30 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_work_is_distinguished_from_a_fresh_start() {
+        let snapshot=|stage:Stage,pr:Option<u64>,reason:&str,action:&str|Snapshot {workflow:"owner/repo#7".into(),branch:"agent-fix/issue-7".into(),pr,
+            checkpoint:Checkpoint {stage,binding:Binding {head:"h".into(),contract:"c".into(),evidence_hash:"e".into()},evidence:vec![],
+                next:NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0}},
+            attempts:1,wall_ms:0,model_calls:0,tokens:0,heartbeat_at_ms:0,progress_at_ms:0,lease_until_ms:0,generation:1};
+        for stage in [Stage::Build,Stage::Verify,Stage::Review,Stage::Reconcile,Stage::Publish] {
+            assert!(resumes_existing_work(&snapshot(stage,None,"r","a")),"{stage:?} without a PR is past the start");
+        }
+        // The 2026-11-21 shapes: #2360 and #2350 sat behind the ledger.
+        assert!(resumes_existing_work(&snapshot(Stage::Verify,Some(2372),"integration_checks_required","verify_integrated_head")));
+        assert!(resumes_existing_work(&snapshot(Stage::Reconcile,Some(2358),"verification_infrastructure_retry","retry_verification")));
+        assert!(resumes_existing_work(&snapshot(Stage::Scope,Some(2307),"original_evidence_unrecoverable","rescope_executable_acceptance")),"an open PR is in flight at any stage");
+        for action in ["resume_preserved_work","resume_preserved_pr"] {
+            assert!(resumes_existing_work(&snapshot(Stage::Held,None,"resume_deferred",action)),"preserved unpushed head {action}");
+        }
+        for stage in [Stage::Intake,Stage::Scope,Stage::Held] {
+            assert!(!resumes_existing_work(&snapshot(stage,None,"acceptance_failed","build")),"{stage:?} without a PR is a fresh start");
+        }
+        for stage in [Stage::Merged,Stage::Retired] {
+            assert!(!resumes_existing_work(&snapshot(stage,Some(9),"done","none")),"{stage:?} is finished, not in flight");
+        }
+    }
 
     #[test]
     fn unused_merge_cancellation_preserves_dispatched_legacy_and_stale_lease_intents() {

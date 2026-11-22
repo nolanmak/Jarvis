@@ -145,6 +145,14 @@ impl FreshIssueControls {
             Err(error)
         })().map_err(classify_issue_history_error)
     }
+    /// #851/#2432 — the daily ledger holds a fresh start only. An issue whose
+    /// workflow is already in flight resumes; an unreadable history keeps the
+    /// ledger's hold, since the spend guard is the safe side.
+    pub(super) fn daily_ledger_holds(&self,ledger:&AttemptLedger,today:u64,repository:&str,issue:u64,retry_due:bool)->bool {
+        ledger.attempted_today(today,issue) && !retry_due
+            && !self.selection_snapshot(repository,issue).ok().flatten()
+                .is_some_and(|snapshot|durable::resumes_existing_work(&snapshot))
+    }
     pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
         Ok(self.selection_snapshot(repository,issue)?.is_some_and(|snapshot|
             matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
@@ -2802,6 +2810,33 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_ledger_holds_fresh_starts_but_not_in_flight_issues() {
+        let data=tempfile::tempdir().unwrap();let path=data.path().join("workflow.db");
+        {
+            let mut store=WorkflowStore::open(&path).unwrap();
+            // #7: #2360's shape on 2026-11-21. #8: a scope-stage start with no PR.
+            for (issue,stage,pr) in [(7,Stage::Verify,Some(2372)),(8,Stage::Scope,None)] {
+                let id=durable::workflow_id("owner/repo",issue).unwrap();
+                let binding=Binding {head:"h".into(),contract:"c".into(),evidence_hash:"e".into()};
+                store.register(&id,"fixture",binding.clone(),0).unwrap();
+                let lease=store.claim(&id,"fixture",0,1).unwrap().unwrap();
+                if let Some(pr)=pr {store.attach_pr_in_repo(&lease,"owner/repo",pr,0).unwrap();}
+                store.checkpoint(&lease,&durable::Checkpoint {stage,binding,evidence:vec![],
+                    next:durable::NextAction {reason:"integration_checks_required".into(),action:"verify_integrated_head".into(),eligible_at_ms:0}},0).unwrap();
+                store.release(&lease,0).unwrap();
+            }
+        }
+        let controls=FreshIssueControls::open_at(&path).unwrap();
+        let ledger=AttemptLedger {day:100,issues:vec![7,8,9]};
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",7,false),"in-flight verify sat behind the ledger");
+        assert!(controls.daily_ledger_holds(&ledger,100,"owner/repo",8,false),"a second fresh start the same day is still capped");
+        assert!(controls.daily_ledger_holds(&ledger,100,"owner/repo",9,false),"no workflow is a fresh start");
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",9,true),"a due retry keeps its existing exemption");
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",10,false),"unlisted issues are untouched");
+        assert!(!controls.daily_ledger_holds(&ledger,101,"owner/repo",8,false),"the ledger resets each UTC day");
+    }
 
     #[test]
     fn source_failure_diagnostics_survive_owned_binding_rotation_and_deduplicate_each_binding() {
