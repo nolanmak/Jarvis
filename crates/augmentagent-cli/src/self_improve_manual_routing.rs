@@ -14,18 +14,16 @@ fn manual(value:&serde_json::Value)->Result<bool> {
     Ok(found)
 }
 
-async fn inspect(root:&Path,repository:&str,pr:u64,source:Option<u64>)->Result<bool> {
-    ensure!(pr>0 && source.is_none_or(|n|n>0),"automatic routing target missing");
-    let (ok,raw,_)=run(&gh_bin(),&["pr","view",&pr.to_string(),"--repo",repository,
-        "--json","number,labels,closingIssuesReferences"],root).await?;
-    ensure!(ok && raw.len()<=1024*1024,"automatic PR routing unavailable");
-    let row:serde_json::Value=serde_json::from_str(&raw)?;
+/// The sources a PR row routes through, or `None` when the PR itself is
+/// manual. A row that cannot prove its labels or sources is an error.
+fn routed_sources(row:&serde_json::Value,repository:&str,pr:u64,source:Option<u64>)
+    ->Result<Option<std::collections::BTreeSet<u64>>> {
     ensure!(row["number"].as_u64()==Some(pr),"automatic PR routing target changed");
     // gh hydrates only the first 100 entries of nested PR connections. A
     // saturated page cannot prove absence of a manual label/source.
     ensure!(row["labels"].as_array().is_some_and(|labels|labels.len()<100),
         "automatic PR labels incomplete");
-    if manual(&row)? {return Ok(false);}
+    if manual(row)? {return Ok(None);}
     let references=row["closingIssuesReferences"].as_array().context("automatic PR sources unavailable")?;
     ensure!(references.len()<100,"automatic PR sources incomplete");
     let mut sources=std::collections::BTreeSet::new();
@@ -38,15 +36,67 @@ async fn inspect(root:&Path,repository:&str,pr:u64,source:Option<u64>)->Result<b
             "cross-repository automatic source is unsupported");
         sources.insert(number);
     }
+    Ok(Some(sources))
+}
+
+async fn source_manual(root:&Path,repository:&str,number:u64)->Result<bool> {
+    let endpoint=format!("repos/{repository}/issues/{number}");
+    let (ok,raw,_)=run(&gh_bin(),&["api",&endpoint],root).await?;
+    ensure!(ok && raw.len()<=1024*1024,"automatic source routing unavailable");
+    let row:serde_json::Value=serde_json::from_str(&raw)?;
+    ensure!(row["number"].as_u64()==Some(number),"automatic source routing target changed");
+    manual(&row)
+}
+
+async fn inspect(root:&Path,repository:&str,pr:u64,source:Option<u64>)->Result<bool> {
+    ensure!(pr>0 && source.is_none_or(|n|n>0),"automatic routing target missing");
+    let (ok,raw,_)=run(&gh_bin(),&["pr","view",&pr.to_string(),"--repo",repository,
+        "--json","number,labels,closingIssuesReferences"],root).await?;
+    ensure!(ok && raw.len()<=1024*1024,"automatic PR routing unavailable");
+    let row:serde_json::Value=serde_json::from_str(&raw)?;
+    let Some(sources)=routed_sources(&row,repository,pr,source)? else {return Ok(false)};
     for number in sources {
-        let endpoint=format!("repos/{repository}/issues/{number}");
-        let (ok,raw,_)=run(&gh_bin(),&["api",&endpoint],root).await?;
-        ensure!(ok && raw.len()<=1024*1024,"automatic source routing unavailable");
-        let row:serde_json::Value=serde_json::from_str(&raw)?;
-        ensure!(row["number"].as_u64()==Some(number),"automatic source routing target changed");
-        if manual(&row)? {return Ok(false);}
+        if source_manual(root,repository,number).await? {return Ok(false);}
     }
     Ok(true)
+}
+
+/// #2444 — selection-time routing from this tick's PR inventory row and its
+/// open-issue inventory, instead of a `gh pr view` per open PR plus a REST
+/// read per source. A row the inventory cannot vouch for (absent, malformed
+/// or saturated) is observed directly, as is any source the open-issue
+/// inventory does not hold. Mutations still observe GitHub themselves.
+async fn inspect_listed(root:&Path,repository:&str,row:Option<&serde_json::Value>,pr:u64,source:Option<u64>,
+    issues:Option<&gh_budget::OpenIssues>)->Result<bool> {
+    ensure!(pr>0 && source.is_none_or(|n|n>0),"automatic routing target missing");
+    let sources=match row.map(|row|routed_sources(row,repository,pr,source)) {
+        Some(Ok(Some(sources)))=>sources,
+        Some(Ok(None))=>return Ok(false),
+        _=>return inspect(root,repository,pr,source).await,
+    };
+    for number in sources {
+        let listed=issues.and_then(|issues|issues.get(number))
+            .filter(|row|row["labels"].as_array().is_some_and(|labels|labels.len()<100))
+            .and_then(|row|manual(row).ok());
+        let manual_source=match listed {
+            Some(listed)=>listed,
+            None=>source_manual(root,repository,number).await?,
+        };
+        if manual_source {return Ok(false);}
+    }
+    Ok(true)
+}
+
+/// [`allowed`] for a PR this tick's inventory already listed (#2444).
+pub(super) async fn allowed_listed(root:&Path,repository:&str,row:Option<&serde_json::Value>,pr:u64,source:Option<u64>,
+    issues:Option<&gh_budget::OpenIssues>)->bool {
+    match inspect_listed(root,repository,row,pr,source,issues).await {
+        Ok(allowed)=>{
+            if !allowed {info!(pr,"manual engineering PR excluded from automatic routing");}
+            allowed
+        },
+        Err(_)=>{warn!(pr,"automatic PR routing unavailable; leaving candidate unchanged");false},
+    }
 }
 
 /// A current observation for each automatic entry/mutation; never cached as a
@@ -111,10 +161,20 @@ pub(super) async fn terminal_allowed(root:&Path,issue:u64,pr:Option<u64>,automat
     check.await.unwrap_or(false)
 }
 
-pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>) {
+/// Selection-time routing over the inventory the candidates came from. Costs
+/// one open-issue listing per tick, not reads per open PR (#2444).
+pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>,inventory:&serde_json::Value) {
+    let rows=inventory.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut issues:std::collections::HashMap<String,Option<gh_budget::OpenIssues>>=std::collections::HashMap::new();
     let mut eligible=Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
-        if allowed(root,&candidate.repository,candidate.pr,candidate.source_issue).await {
+        if !issues.contains_key(&candidate.repository) {
+            let listed=gh_budget::OpenIssues::read(root,&candidate.repository).await;
+            issues.insert(candidate.repository.clone(),listed);
+        }
+        let row=rows.iter().find(|row|row["number"].as_u64()==Some(candidate.pr));
+        if allowed_listed(root,&candidate.repository,row,candidate.pr,candidate.source_issue,
+            issues.get(&candidate.repository).and_then(Option::as_ref)).await {
             if let Err(error)=workflow::recover_pending_push(root,&candidate).await {
                 warn!(pr=candidate.pr,"bound Push recovery deferred: {error:#}");
             }

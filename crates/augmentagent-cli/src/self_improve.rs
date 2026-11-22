@@ -95,6 +95,11 @@ mod review_recovery;
 mod manual_pr_routing_tests;
 #[path = "self_improve_manual_routing.rs"]
 mod manual_routing;
+#[path = "self_improve_gh_budget.rs"]
+mod gh_budget;
+#[cfg(test)]
+#[path = "self_improve_gh_budget_tests.rs"]
+mod gh_budget_tests;
 #[path = "self_improve_integration_merge.rs"]
 mod integration_merge;
 #[path = "self_improve_integration.rs"]
@@ -659,12 +664,15 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             return Ok((false, String::new(), error));
         }
     }
+    // #2444: a GitHub write clears this tick's shared reads, before and after.
+    gh_budget::observed(cmd, args);
     let mut command = Command::new(cmd);
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     let child = command.spawn().with_context(|| format!("spawn {cmd}"))?;
     let _group = CommandGroup(child.id().context("command has no process id")?);
     let out = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), child.wait_with_output())
         .await.context("metadata/publication command timed out; reconcile durable intent before retry")??;
+    gh_budget::observed(cmd, args);
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1797,6 +1805,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     };
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
+    // #2444: one open-issue listing serves routing and source state for every
+    // examined PR. Unavailable, the sweep reads each source as before.
+    let open_issues = if selected.is_none() {gh_budget::OpenIssues::read(repo_root, &repository).await} else {None};
     let adopted = if let Some(target)=selected {
         adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()],false).await
     } else { adopted_execution::sweep(repo_root,dry_run).await };
@@ -1826,10 +1837,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         // Routing observations cost network reads even when the PR is excluded.
         examined += 1;
-        if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+        if selected.is_none() && !manual_routing::allowed_listed(repo_root,&repository,Some(row),pr,Some(issue),open_issues.as_ref()).await {
             continue;
         }
-        if source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
+        // A source this tick listed as open needs no further read; any other
+        // source is reconciled (and possibly retired) exactly as before.
+        if !open_issues.as_ref().is_some_and(|issues| issues.is_open(issue))
+            && source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
             != source_reconcile::SourceAction::Continue {
             continue;
         }
@@ -1856,6 +1870,21 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
             }
         }
+        // #2444: settle every gate that needs no remote evidence first. The
+        // hosted CI reader alone costs about 30 REST calls per PR, and most
+        // examined PRs are not yet approved.
+        let ours = head_is_ours(row, owner.as_deref());
+        let loop_authored = loop_authored(body, issue, pr, head_sha.as_deref(), record.as_ref())
+            || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue));
+        let mergeable = match row.get("mergeable").and_then(serde_json::Value::as_str) {
+            Some("MERGEABLE") => Some(true),
+            Some("CONFLICTING") => Some(false),
+            _ => None,
+        };
+        if let Some(why) = sweep_local_skip(pr, ours, loop_authored, mergeable, approval.reviewed) {
+            info!("merge sweep skipped {why}");
+            continue;
+        }
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -1863,19 +1892,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         let candidate = SweepCandidate {
             pr,
             issue,
-            ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(
-                body,
-                issue,
-                pr,
-                head_sha.as_deref(),
-                record.as_ref(),
-            ) || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue)),
-            mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
-                Some("MERGEABLE") => Some(true),
-                Some("CONFLICTING") => Some(false),
-                _ => None,
-            },
+            ours,
+            loop_authored,
+            mergeable,
             checks_green: checks_green(repo_root, pr).await,
             review_approved: approval.reviewed,
             policy: MergePolicy {
@@ -2588,12 +2607,16 @@ enum SweepVerdict {
 
 /// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
 /// so the whole decision is evidence already on the PR.
-fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
-    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
-    if c.ours != Some(true) {
+/// #2444 — the sweep's gates that need no remote evidence, in the order the
+/// verdict applies them. The sweep checks these before reading CI, the diff
+/// or the issue, so an unapproved PR costs no GitHub reads.
+fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable: Option<bool>,
+    review_approved: bool) -> Option<String> {
+    let skip = |why: &str| Some(format!("PR #{pr}: {why}"));
+    if ours != Some(true) {
         return skip("not ours — the loop only finishes work it opened (#1006)");
     }
-    if !c.loop_authored {
+    if !loop_authored {
         // Same repository is not the same as loop-authored. A human can open
         // `agent-fix/issue-N` here by hand; the sweep merges with nobody
         // watching, so it needs the loop's own signature on the body.
@@ -2601,16 +2624,24 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     }
     // GitHub UNKNOWN is a pending recompute, not proof of conflict.
     // Both states withhold merging; the integration scheduler owns recovery.
-    match c.mergeable {
+    match mergeable {
         None => return skip("mergeability unknown; retry remote metadata computation"),
         Some(false) => return skip("confirmed conflict with main; exact-head integration required"),
         Some(true) => {},
     }
+    if !review_approved {
+        return skip("no approving independent review recorded by the loop for this head");
+    }
+    None
+}
+
+fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
+    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved) {
+        return SweepVerdict::Skip(why);
+    }
     if c.checks_green != Some(true) {
         return skip("checks are not green, or their state is unknown");
-    }
-    if !c.review_approved {
-        return skip("no approving independent review recorded by the loop for this head");
     }
     // Unknown must DENY, and it must do so where nothing can release it.
     // Codex: routing an unreadable diff through the receipt gate as a gated
@@ -4104,7 +4135,7 @@ async fn find_resumable_draft(
     let mut allowed = trusted_authors(repo_root).await;
     if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
     let mut adopted = adoption::authorized(&prs, &repository, &allowed);
-    manual_routing::filter(repo_root, &mut adopted).await;
+    manual_routing::filter(repo_root, &mut adopted, &prs).await;
     if !dry_run {
         if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
             warn!("cannot persist adopted PR ownership: {error:#}");
@@ -10453,14 +10484,23 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
         limit=(limit*2).min(max);
     }
 }
+/// #2444 — every PR reader shares one listing per tick, so it asks for the
+/// union of the fields any reader needs (including routing labels and closing
+/// references, which used to cost a `gh pr view` per open PR).
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
-    complete_labelled_inventory(|limit| async move {
+    let fields=if kind=="pr" {
+        debug_assert!(fields.split(',').all(|f|PR_INVENTORY_FIELDS.split(',').any(|u|u==f)),"PR inventory field {fields} missing from the shared listing");
+        PR_INVENTORY_FIELDS
+    } else {fields};
+    let key=format!("inventory\0{}\0{kind}\0{}\0{fields}",repo_root.display(),repository.unwrap_or(""));
+    gh_budget::tick_read(key,||complete_labelled_inventory(|limit| async move {
         let args=repository_inventory_args(kind,repository,fields,limit);
         let (ok,raw,error)=run(&gh_bin(),&args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
         anyhow::ensure!(ok,"gh repository inventory failed: {}",truncate(&error,300));
         Ok(raw)
-    }).await
+    })).await
 }
 fn filter_inventory_label(raw:&str,label:&str)->Result<Vec<serde_json::Value>> {
     let rows:Vec<serde_json::Value>=serde_json::from_str(raw)?;
@@ -12467,6 +12507,7 @@ impl AutoPrLoop {
         let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
         tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
+        let canary_root = root.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
         // The protected daily claim prevents restart from multiplying probes.
@@ -12479,6 +12520,7 @@ impl AutoPrLoop {
                     _ = timer.tick() => {}
                 }
                 if dry_run { continue; }
+                if gh_budget::low(&canary_root, "review canary").await { continue; }
                 tokio::select! {
                     _ = canary_stop.cancelled() => return Ok(()),
                     result = review_canary_if_due() => {
@@ -12491,10 +12533,11 @@ impl AutoPrLoop {
         };
         let shipping = self.run_with(shutdown, move || {
             let root = root.clone();
-            async move { run_once(&root, dry_run).await }
+            // #2444: each tick shares its GitHub reads.
+            async move { gh_budget::tick_scope(run_once(&root, dry_run)).await }
         }, move || {
             let root = sweep_root.clone();
-            async move {
+            gh_budget::tick_scope(async move {
                 // Unknown remote mutations must reconcile even when controller
                 // preparation is temporarily unavailable. This path reads Git
                 // identity and remote evidence without editing the owner tree.
@@ -12508,6 +12551,9 @@ impl AutoPrLoop {
                 };
                 let root = controller.root.as_path();
                 let merged=merge_sweep(root,dry_run).await;
+                // #2444: housekeeping polls stand down while the shared REST
+                // budget is low; merges and their reconciliation continue.
+                if gh_budget::low(root, "legacy readmission and closed-target sweeps").await {return merged;}
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 // Waiting workflows never re-check their target, so one whose
                 // issue was fixed by hand stays queued forever (#2040, #2081).
@@ -12515,7 +12561,7 @@ impl AutoPrLoop {
                     if let Err(error)=closed_targets::sweep(root,&workflow::path()).await {warn!("closed-target sweep deferred: {error:#}");}
                 }
                 merged
-            }
+            })
         });
         tokio::pin!(shipping);
         tokio::pin!(canary);
