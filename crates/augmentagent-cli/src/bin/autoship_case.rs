@@ -61,9 +61,27 @@ fn label(id: &str) -> &'static str {
     }
 }
 
+fn action_id_for(store: &Store, message_id: &str) -> Result<String> {
+    Ok(store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id FROM actions WHERE messageId = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+    })?)
+}
+
 fn main() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let store = Store::open(directory.path().join("contract.db"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "augmentagent-autoship-case-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&directory)?;
+    let store = Store::open(directory.join("contract.db"))?;
 
     for (message, thread) in [
         (TRIAGE_MESSAGE, CONVERSATION),
@@ -102,29 +120,23 @@ fn main() -> Result<()> {
     let retired = socialapi_compose_identity::supersede_prior_compose_cards(&store, &prior);
     let retired: Vec<&str> = retired.iter().map(|id| label(id)).collect();
 
-    let statuses: Result<Vec<String>> = [LEGACY, FIRST, SECOND]
-        .iter()
-        .chain([TRIAGE_MESSAGE, OTHER_MESSAGE, SCHEDULED_MESSAGE].iter())
-        .map(|id| {
-            let action_id = match *id {
-                TRIAGE_MESSAGE | OTHER_MESSAGE | SCHEDULED_MESSAGE => store.with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT id FROM actions WHERE messageId = ?1",
-                        [*id],
-                        |row| row.get::<_, String>(0),
-                    )
-                })?,
-                _ => (*id).to_owned(),
-            };
-            Ok(store.get_action_with_email(&action_id)?.unwrap().action.status)
-        })
-        .collect();
+    let status = |id: &str| -> Result<String> {
+        Ok(store.get_action_with_email(id)?.unwrap().action.status)
+    };
+    let statuses = vec![
+        status(LEGACY)?,
+        status(FIRST)?,
+        status(SECOND)?,
+        status(&action_id_for(&store, TRIAGE_MESSAGE)?)?,
+        status(&action_id_for(&store, OTHER_MESSAGE)?)?,
+        status(&action_id_for(&store, SCHEDULED_MESSAGE)?)?,
+    ];
 
     let remaining: Vec<&str> = socialapi_compose_identity::pending_compose_cards(&store, CONVERSATION)?
         .iter()
         .map(|id| label(id))
         .collect();
 
-    println!("{}", serde_json::json!([order, retired, statuses?, remaining]));
+    println!("{}", serde_json::json!([order, retired, statuses, remaining]));
     Ok(())
 }
