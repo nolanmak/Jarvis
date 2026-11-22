@@ -678,6 +678,24 @@ async fn isolated_observation(
     isolated_observation_with_custody(root,target,invocation,audit,None).await
 }
 
+/// Build limits for every cargo in a verifier's process tree (#2445). The
+/// top-level `--config` flags reach only the cargo the controller starts. A
+/// verifier binary that runs `cargo run -p augmentagent-cli` itself starts a
+/// nested cargo that sees only the inherited env, and the sandbox passes
+/// `CARGO_HOME` but no `CARGO_BUILD_*` variables. With an empty home, that
+/// nested build used `jobs = nproc` and full debuginfo, and one rustc filled
+/// the swapless 4 GiB run cgroup on every capacity retry.
+const VERIFIER_CARGO_CONFIG: &str = "[build]\njobs = 1\n\n[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n";
+
+/// The verifier's private `CARGO_HOME`, created inside its runtime directory
+/// with the build limits that nested cargo invocations inherit.
+fn prepare_verifier_cargo_home(runtime: &Path) -> Result<PathBuf> {
+    let cargo_home = runtime.join("cargo");
+    std::fs::create_dir(&cargo_home)?;
+    std::fs::write(cargo_home.join("config.toml"), VERIFIER_CARGO_CONFIG)?;
+    Ok(cargo_home)
+}
+
 struct VerifierRuntime(Option<tempfile::TempDir>);
 impl VerifierRuntime {
     fn path(&self)->&Path {self.0.as_ref().expect("owned verifier runtime").path()}
@@ -706,8 +724,7 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
     std::fs::create_dir(&runtime)?;
     let home = runtime.join("home");
     std::fs::create_dir(&home)?;
-    let cargo_home = runtime.join("cargo");
-    std::fs::create_dir(&cargo_home)?;
+    let cargo_home = prepare_verifier_cargo_home(&runtime)?;
     let helper = private.path().join("sandbox.py");
     std::fs::write(&helper, SANDBOX)?;
     let policy = private.path().join("policy.json");
@@ -919,6 +936,41 @@ mod tests {
         assert_eq!(observed.exit_code,Some(0),"{}",observed.stderr);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&observed.stdout).unwrap(),serde_json::json!({"compiler":"operator","private":"denied","write":"denied","network":"denied"}));
         assert_eq!(std::fs::read_to_string(source.join("protected.txt")).unwrap(),"original source");
+    }
+    /// #2445 — a verifier binary that shells out to `cargo run -p
+    /// augmentagent-cli` starts a nested cargo that never sees the top-level
+    /// `--config` flags. With an empty private CARGO_HOME it built the largest
+    /// crate with `jobs = nproc` and full debuginfo, and one rustc filled the
+    /// swapless 4 GiB run cgroup. The limits must reach every cargo in the
+    /// verifier's tree through the CARGO_HOME it inherits.
+    #[test]
+    fn nested_verifier_cargo_inherits_build_limits_from_private_cargo_home() {
+        let root=tempfile::tempdir().unwrap();
+        let runtime=root.path().join("runtime");std::fs::create_dir(&runtime).unwrap();
+        let cargo_home=prepare_verifier_cargo_home(&runtime).unwrap();
+        let probe=root.path().join("probe");std::fs::create_dir_all(probe.join("src")).unwrap();
+        std::fs::write(probe.join("Cargo.toml"),"[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        std::fs::write(probe.join("src/lib.rs"),"").unwrap();
+        std::fs::write(probe.join("build.rs"),"fn main() {\n    let get = |key: &str| std::env::var(key).unwrap_or_default();\n    println!(\"cargo:warning=limits jobs={} debug={}\", get(\"NUM_JOBS\"), get(\"DEBUG\"));\n}\n").unwrap();
+        let home=root.path().join("home");std::fs::create_dir(&home).unwrap();
+        let cargo=PathBuf::from(env!("CARGO"));
+        let mut command=std::process::Command::new(&cargo);
+        // Exactly what a nested `Command::new("cargo")` inherits from the
+        // sandbox: no `--config` flags, the private CARGO_HOME, no host config.
+        command.args(["build","--offline"]).current_dir(&probe).env_clear()
+            .env("PATH",std::env::var_os("PATH").unwrap_or_default()).env("HOME",&home)
+            .env("CARGO_HOME",&cargo_home).env("CARGO_TARGET_DIR",root.path().join("target"))
+            .env("TMPDIR",&runtime);
+        let rustc=cargo.with_file_name("rustc");
+        if rustc.exists() {command.env("RUSTC",rustc);}
+        for key in ["RUSTUP_HOME","RUSTUP_TOOLCHAIN"] {
+            if let Some(value)=std::env::var_os(key) {command.env(key,value);}
+        }
+        let output=command.output().unwrap();
+        let stderr=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"{stderr}");
+        assert!(stderr.contains("limits jobs=1 debug=false"),
+            "a nested verifier cargo ignored the verifier build limits: {stderr}");
     }
     #[test]
     fn harness_install_reuses_an_identical_pinned_file_and_names_a_conflict() {
