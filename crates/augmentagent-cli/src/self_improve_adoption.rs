@@ -322,6 +322,38 @@ pub(super) async fn policy_reconciliation_retries(
     Ok(retries)
 }
 
+/// #2432 — open PRs whose workflow is already in flight and due. These pass
+/// the #851 daily ledger: it caps fresh starts, while resumed work is paced by
+/// its own lease and `eligible_at` backoff. A PR with no workflow record has
+/// no backoff of its own, so the ledger still paces it.
+pub(super) fn in_flight_retries(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    now: i64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(Default::default());
+    };
+    let mut result = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
+            continue;
+        };
+        let Some(snapshot) = store.snapshot(&id)? else {
+            continue;
+        };
+        if candidate_source_matches(&id, candidate)
+            && snapshot.pr == Some(candidate.pr)
+            && snapshot.lease_until_ms <= now
+            && snapshot.checkpoint.next.eligible_at_ms <= now
+            && crate::autoship_workflow::resumes_existing_work(&snapshot)
+        {
+            result.insert(candidate.pr);
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn select_linked_with_retries(
     candidates: &[AdoptedPr],
     ledger: &AttemptLedger,
@@ -502,6 +534,35 @@ pub(super) async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_prs_pass_the_daily_ledger_and_fresh_starts_do_not() {
+        use crate::autoship_workflow::{Binding,Checkpoint,NextAction,Stage,workflow_id};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let candidate=|issue:u64,pr:u64|AdoptedPr {repository:"owner/repo".into(),pr,source_issue:Some(issue),branch:format!("agent-fix/issue-{issue}"),
+            head:"a".repeat(40),base:"main".into(),author:"owner".into(),title:"t".into(),body:"b".into(),dependency:Dependency::Main};
+        // (issue, pr, stage, eligible_at): #2360's exact shape, a not-yet-due
+        // reconcile, and a scope-stage workflow that never attached its PR.
+        for (issue,pr,stage,attach,eligible) in [(7,42,Stage::Verify,true,0),(8,43,Stage::Reconcile,true,5_000),(9,44,Stage::Scope,false,0)] {
+            let id=workflow_id("owner/repo",issue).unwrap();
+            let binding=Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+            store.register(&id,&format!("agent-fix/issue-{issue}"),binding.clone(),0).unwrap();
+            let lease=store.claim(&id,"worker",0,1).unwrap().unwrap();
+            if attach {store.attach_pr_in_repo(&lease,"owner/repo",pr,0).unwrap();}
+            store.checkpoint(&lease,&Checkpoint {stage,binding,evidence:vec![],
+                next:NextAction {reason:"integration_checks_required".into(),action:"verify_integrated_head".into(),eligible_at_ms:eligible}},0).unwrap();
+            store.release(&lease,0).unwrap();
+        }
+        let candidates=vec![candidate(7,42),candidate(8,43),candidate(9,44),candidate(10,45)];
+        let ledger=AttemptLedger {day:100,issues:vec![7,8,9,10]};
+        let retries=in_flight_retries(&path,&candidates,1_000).unwrap();
+        assert_eq!(retries,[42].into_iter().collect(),"only the due in-flight PR is exempt");
+        assert_eq!(select_linked_with_retries(&candidates,&ledger,100,&Default::default(),None,0,&retries),
+            Some((42,7,"agent-fix/issue-7".into())),"a verify-stage PR sat behind the daily ledger (#2360, 2026-11-21)");
+        assert_eq!(in_flight_retries(&dir.path().join("missing.db"),&candidates,1_000).unwrap(),Default::default());
+    }
+
     #[test]
     fn due_owned_retries_survive_the_same_day_marker() {
         use crate::autoship_workflow::{Binding,NextAction,OperationKind,ResourceCharge,Stage};
