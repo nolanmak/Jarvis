@@ -32,6 +32,9 @@ if '/actions/jobs/' in endpoint:
 elif endpoint.endswith('/pulls/1669'):
     value = {'head': {'sha': head}, 'base': {'sha': state['base'], 'ref': 'main', 'repo': {'full_name': repository}}, 'state': 'open', 'changed_files': 1}
 elif '/pulls/1669/files' in endpoint:
+    # #2430: GitHub evidence for a conflicting PR can be unreadable; the
+    # hosted reader then answers "unknown" with no head at all.
+    if state.get('pr_unreadable'): sys.exit(1)
     value = [{'filename': 'crates/augmentagent-cli/src/fixture.rs'}]
 elif '/contents/' in endpoint:
     path = endpoint.split('/contents/', 1)[1].split('?', 1)[0]
