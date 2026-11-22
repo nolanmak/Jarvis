@@ -191,6 +191,15 @@ impl<'ast> Visit<'ast> for ItemRanges<'_> {
         self.context.truncate(previous);
     }
 }
+#[derive(Debug)]
+struct AbsentRustItem;
+impl std::fmt::Display for AbsentRustItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("requested Rust item is absent")
+    }
+}
+impl std::error::Error for AbsentRustItem {}
+
 fn requested_item_ranges(source: &str, name: &str) -> Result<Vec<Range<usize>>> {
     syn::parse_str::<syn::Ident>(name).context("source item is not a literal identifier")?;
     let file = syn::parse_file(source).context("requested Rust source cannot be parsed")?;
@@ -209,7 +218,9 @@ fn requested_item_ranges(source: &str, name: &str) -> Result<Vec<Range<usize>>> 
         ranges: vec![],
     };
     lookup.visit_file(&file);
-    anyhow::ensure!(!lookup.ranges.is_empty(), "requested Rust item is absent");
+    if lookup.ranges.is_empty() {
+        return Err(AbsentRustItem.into());
+    }
     lookup.ranges.sort_by_key(|r| (r.start, r.end));
     let mut ranges: Vec<Range<usize>> = vec![];
     for range in lookup.ranges {
@@ -254,8 +265,17 @@ pub(super) async fn resolve_review_source_request(
         }
         aligned::ReviewSourceSelector::RustItem { name } => {
             let body = collect_source_interval(root, &plan, 0..size, ITEM_BYTES).await?;
-            let ranges = requested_item_ranges(&body, name)?;
-            (body, ranges)
+            match requested_item_ranges(&body, name) {
+                Ok(ranges) => (body, ranges),
+                // #2385: the reviewer named an item this admitted file does not
+                // define. Answer the exact path with the whole file instead of
+                // failing the review; budget limits still apply.
+                Err(error) if error.is::<AbsentRustItem>() => {
+                    let body = collect_source_interval(root, &plan, 0..size, aligned::MAX_PROMPT_BYTES).await?;
+                    (body, vec![0..size])
+                }
+                Err(error) => return Err(error),
+            }
         }
         aligned::ReviewSourceSelector::Bytes {
             start_byte,
@@ -390,6 +410,30 @@ mod tests {
         assert!(text.contains("impl AnchoredAudit"));
         assert!(text.contains("fn append"));
         assert!(!text.contains("poison"));
+    }
+    /// #2385 (PR #2372 09:46Z, "requested Rust item is absent"): the reviewer
+    /// named an item the admitted file does not define. The path is still an
+    /// exact, admitted request, so supply the whole file instead of failing
+    /// the review; the reviewer then judges from real source.
+    #[tokio::test]
+    async fn absent_rust_item_is_answered_with_the_whole_admitted_file() {
+        let (root, head) = committed_fixture();
+        let request = aligned::ReviewSourceRequest {
+            path: "logic.rs".into(),
+            criterion_ids: vec!["C1".into()],
+            question: "Inspect the owner binding lifecycle".into(),
+            selector: aligned::ReviewSourceSelector::RustItem { name: "OwnerBindingLifecycle".into() },
+        };
+        let files = resolve_review_source_request(root.path(), &head, &request)
+            .await
+            .expect("absent item must degrade to the whole file");
+        let text = files.values().cloned().collect::<Vec<_>>().join("");
+        assert!(text.contains("fn cap() -> u32 { 3 }") && text.contains("impl AnchoredAudit"));
+        assert!(files.keys().all(|k| k.starts_with("__requested_source__:")));
+        // A path outside the candidate still fails; only the selector degrades.
+        let mut missing = request.clone();
+        missing.path = "absent.rs".into();
+        assert!(resolve_review_source_request(root.path(), &head, &missing).await.is_err());
     }
     #[test]
     fn requested_type_includes_its_inherent_and_trait_implementations() {
