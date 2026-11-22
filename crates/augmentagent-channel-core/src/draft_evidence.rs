@@ -247,7 +247,8 @@ pub async fn gather_within(
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
         let mut decision_ms = measured_ms(decided);
         // Queueing is not model latency: report it as its own step.
-        if let (Some(before), Some(after)) = (waited_before, crate::cli_gate::scope_gate_wait_ms()) {
+        if let (Some(before), Some(after)) = (waited_before, crate::cli_gate::scope_gate_wait_ms())
+        {
             let waited = after.saturating_sub(before);
             if waited > 0 {
                 out.record(StepKind::GateWait, "cli_permit", waited, "ok");

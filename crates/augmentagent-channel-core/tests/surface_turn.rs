@@ -473,23 +473,47 @@ async fn queued_phone_loads_history_only_if_no_native_session_exists_when_it_run
         let entered = tokio::sync::Notify::new();
         let loads = AtomicUsize::new(0);
         let (text_result, phone_result) = tokio::join!(
-            run_surface_turn(&store, SurfaceTurnRequest { turn: &text, history: "initial history", current: "text", cwd: "/fixture" },
-                || Ok(Some(kind)), None, |prompt| {
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &text,
+                    history: "initial history",
+                    current: "text",
+                    cwd: "/fixture"
+                },
+                || Ok(Some(kind)),
+                None,
+                |prompt| {
                     let (entered, provider, text) = (&entered, &provider, &text);
                     async move {
                         entered.notify_one();
                         tokio::time::sleep(Duration::from_millis(30)).await;
                         provider.call(&opts(text), &prompt).await
                     }
-                }),
+                }
+            ),
             async {
                 entered.notified().await;
-                run_surface_turn_with_history(&store, SurfaceTurnRequest { turn: &phone, history: "", current: "phone", cwd: "/fixture" },
-                    || Ok(Some(kind)), None, |prompt| {
+                run_surface_turn_with_history(
+                    &store,
+                    SurfaceTurnRequest {
+                        turn: &phone,
+                        history: "",
+                        current: "phone",
+                        cwd: "/fixture",
+                    },
+                    || Ok(Some(kind)),
+                    None,
+                    |prompt| {
                         let (provider, phone) = (&provider, &phone);
                         async move { provider.call(&opts(phone), &prompt).await }
                     },
-                    || async { loads.fetch_add(1, Ordering::SeqCst); anyhow::bail!("history is unavailable but native resume must work") }).await
+                    || async {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("history is unavailable but native resume must work")
+                    },
+                )
+                .await
             }
         );
         assert!(text_result.is_ok());
@@ -504,14 +528,31 @@ async fn queued_phone_loads_history_only_if_no_native_session_exists_when_it_run
 async fn cancellation_during_initial_history_load_never_dispatches_or_claims_a_turn() {
     use augmentagent_channel_core::surface_turn::run_surface_turn_with_history;
     let (_dir, store) = store();
-    let turn = SurfaceTurnRef::new(slack("D-history-cancel", None), "phone:cancel-history").unwrap();
+    let turn =
+        SurfaceTurnRef::new(slack("D-history-cancel", None), "phone:cancel-history").unwrap();
     let cancel = CancellationToken::new();
-    let result = tokio::time::timeout(Duration::from_secs(1), run_surface_turn_with_history(&store,
-        SurfaceTurnRequest { turn: &turn, history: "", current: "phone", cwd: "/fixture" },
-        || Ok(Some(ProviderKind::Claude)), Some(&cancel),
-        |_| async { panic!("cancelled history must not reach the model") },
-        || async { cancel.cancel(); std::future::pending::<anyhow::Result<String>>().await })).await
-        .expect("history cancellation must return promptly").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_surface_turn_with_history(
+            &store,
+            SurfaceTurnRequest {
+                turn: &turn,
+                history: "",
+                current: "phone",
+                cwd: "/fixture",
+            },
+            || Ok(Some(ProviderKind::Claude)),
+            Some(&cancel),
+            |_| async { panic!("cancelled history must not reach the model") },
+            || async {
+                cancel.cancel();
+                std::future::pending::<anyhow::Result<String>>().await
+            },
+        ),
+    )
+    .await
+    .expect("history cancellation must return promptly")
+    .unwrap();
     assert_eq!(result, SurfaceTurnOutcome::Cancelled);
     // A retry can claim the same ID: cancellation happened before submission.
     store.claim_surface_turn(&turn).unwrap();
@@ -523,8 +564,11 @@ async fn cancellation_during_initial_history_load_never_dispatches_or_claims_a_t
 // same native session.
 fn discord_channel() -> SurfaceConversationRef {
     SurfaceConversationRef::new(
-        SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "1000000000000000001")
-            .unwrap(),
+        SurfaceAccountRef::new(
+            SurfacePlatform::new("discord").unwrap(),
+            "1000000000000000001",
+        )
+        .unwrap(),
         "2000000000000000002",
         None,
     )
@@ -561,18 +605,31 @@ async fn a_pre_submission_refusal_does_not_latch(chat: SurfaceConversationRef) {
     let (_dir, store) = store();
     let provider = RecordingNativeProvider::new(ProviderKind::Claude);
     let first = SurfaceTurnRef::new(chat.clone(), "u1").unwrap();
-    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    answered(
+        run(&store, &provider, &first, "", "one", None, None)
+            .await
+            .unwrap(),
+    );
     let bound = store.surface_conversation(&chat).unwrap().unwrap();
 
     let refused = SurfaceTurnRef::new(chat.clone(), "u2").unwrap();
-    let error = refuse_before_submission(&store, &refused).await.unwrap_err();
+    let error = refuse_before_submission(&store, &refused)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("resource capacity"), "{error}");
     let binding = store.surface_conversation(&chat).unwrap().unwrap();
-    assert!(!binding.uncertain, "nothing reached the CLI; the conversation must not be latched");
+    assert!(
+        !binding.uncertain,
+        "nothing reached the CLI; the conversation must not be latched"
+    );
     assert_eq!(binding.native_session_id, bound.native_session_id);
 
     let third = SurfaceTurnRef::new(chat.clone(), "u3").unwrap();
-    let answer = answered(run(&store, &provider, &third, "", "three", None, None).await.unwrap());
+    let answer = answered(
+        run(&store, &provider, &third, "", "three", None, None)
+            .await
+            .unwrap(),
+    );
     assert!(answer.contains("turn=2"), "{answer}");
     let calls = provider.calls();
     assert_eq!(calls.len(), 2);
@@ -605,11 +662,20 @@ async fn a_refusal_after_submission_still_latches_the_conversation() {
     let provider = RecordingNativeProvider::new(ProviderKind::Claude);
     let chat = discord_channel();
     let first = SurfaceTurnRef::new(chat.clone(), "u1").unwrap();
-    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    answered(
+        run(&store, &provider, &first, "", "one", None, None)
+            .await
+            .unwrap(),
+    );
     let died = SurfaceTurnRef::new(chat.clone(), "u2").unwrap();
     let error = run_surface_turn(
         &store,
-        SurfaceTurnRequest { turn: &died, history: "", current: "two", cwd: "/w" },
+        SurfaceTurnRequest {
+            turn: &died,
+            history: "",
+            current: "two",
+            cwd: "/w",
+        },
         || Ok(None),
         None,
         |_prompt| async move {
@@ -622,10 +688,24 @@ async fn a_refusal_after_submission_still_latches_the_conversation() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("mid-turn"), "{error}");
-    assert!(store.surface_conversation(&chat).unwrap().unwrap().uncertain);
-    let blocked = run(&store, &provider, &SurfaceTurnRef::new(chat, "u3").unwrap(), "", "three", None, None)
-        .await
-        .unwrap_err();
+    assert!(
+        store
+            .surface_conversation(&chat)
+            .unwrap()
+            .unwrap()
+            .uncertain
+    );
+    let blocked = run(
+        &store,
+        &provider,
+        &SurfaceTurnRef::new(chat, "u3").unwrap(),
+        "",
+        "three",
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(blocked.to_string().contains("uncertain turn"), "{blocked}");
     assert_eq!(provider.calls().len(), 1);
 }
@@ -639,14 +719,21 @@ async fn interrupt_after_submission(store: &Store, turn: &SurfaceTurnRef) -> any
     use augmentagent_channel_core::native_session::CURRENT;
     run_surface_turn(
         store,
-        SurfaceTurnRequest { turn, history: "", current: "text my cousin", cwd: "/w" },
+        SurfaceTurnRequest {
+            turn,
+            history: "",
+            current: "text my cousin",
+            cwd: "/w",
+        },
         || Ok(None),
         None,
         |_prompt| async move {
             let session = CURRENT.with(Arc::clone);
             let lease = session.begin(ProviderKind::Claude)?;
             lease.mark_submitting();
-            Err(augmentagent_channel_core::reasoner::interrupted_error("claude", 15))
+            Err(augmentagent_channel_core::reasoner::interrupted_error(
+                "claude", 15,
+            ))
         },
     )
     .await
@@ -658,34 +745,58 @@ async fn a_host_signal_interrupts_without_wedging(chat: SurfaceConversationRef) 
     let (_dir, store) = store();
     let provider = RecordingNativeProvider::new(ProviderKind::Claude);
     let first = SurfaceTurnRef::new(chat.clone(), "c:1").unwrap();
-    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    answered(
+        run(&store, &provider, &first, "", "one", None, None)
+            .await
+            .unwrap(),
+    );
     let bound = store.surface_conversation(&chat).unwrap().unwrap();
 
     let stopped = SurfaceTurnRef::new(chat.clone(), "c:2").unwrap();
     let error = interrupt_after_submission(&store, &stopped).await;
     assert!(
-        matches!(ReasonerError::find_in(&error), Some(ReasonerError::Interrupted { signal: 15, .. })),
+        matches!(
+            ReasonerError::find_in(&error),
+            Some(ReasonerError::Interrupted { signal: 15, .. })
+        ),
         "the surface must still see the typed error: {error:#}"
     );
     let binding = store.surface_conversation(&chat).unwrap().unwrap();
-    assert!(!binding.uncertain, "a host signal must not latch the conversation");
+    assert!(
+        !binding.uncertain,
+        "a host signal must not latch the conversation"
+    );
     assert_eq!(binding.native_session_id, bound.native_session_id);
     let state = store.surface_turn_state(&stopped).unwrap().unwrap();
     assert_eq!(state.status, SurfaceTurnStatus::Uncertain);
     assert_eq!(state.resolution, Some(SurfaceTurnResolution::Interrupted));
     if chat.account().platform().as_str() == "discord" {
-        assert!(store.discord_turn_interrupted(chat.conversation_id(), "c:2").unwrap());
-        assert!(!store.discord_turn_interrupted(chat.conversation_id(), "c:1").unwrap());
+        assert!(store
+            .discord_turn_interrupted(chat.conversation_id(), "c:2")
+            .unwrap());
+        assert!(!store
+            .discord_turn_interrupted(chat.conversation_id(), "c:1")
+            .unwrap());
         assert!(store.interrupt_pending_discord_turns().unwrap().is_empty());
     }
 
     let next = SurfaceTurnRef::new(chat.clone(), "c:3").unwrap();
-    let answer = answered(run(&store, &provider, &next, "", "three", None, None).await.unwrap());
+    let answer = answered(
+        run(&store, &provider, &next, "", "three", None, None)
+            .await
+            .unwrap(),
+    );
     assert!(answer.contains("turn=2"), "{answer}");
     assert!(provider.calls()[1].resumed);
-    let replay = run(&store, &provider, &stopped, "", "again", None, None).await.unwrap_err();
+    let replay = run(&store, &provider, &stopped, "", "again", None, None)
+        .await
+        .unwrap_err();
     assert!(replay.to_string().contains("already submitted"), "{replay}");
-    assert_eq!(provider.calls().len(), 2, "the interrupted turn is never re-run");
+    assert_eq!(
+        provider.calls().len(),
+        2,
+        "the interrupted turn is never re-run"
+    );
 }
 
 #[tokio::test]

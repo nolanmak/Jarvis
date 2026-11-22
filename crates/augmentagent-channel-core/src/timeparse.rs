@@ -48,14 +48,16 @@ mod tests {
     #[test]
     fn guard_rejects_too_soon_and_too_far() {
         let now = 1_000_000_000;
-        assert!(validate_send_at(now, now).is_err(), "now itself is too soon");
+        assert!(
+            validate_send_at(now, now).is_err(),
+            "now itself is too soon"
+        );
         // The lead bound carries a skew allowance (#501 review): the exact
         // minimum must validate (parse-to-validate latency), anything under
         // the allowance must not.
         assert!(validate_send_at(now + MIN_LEAD_MS, now).is_ok());
         assert!(validate_send_at(now + MIN_LEAD_MS - SKEW_MS, now).is_ok());
-        let err =
-            validate_send_at(now + MIN_LEAD_MS - SKEW_MS - 1, now).unwrap_err();
+        let err = validate_send_at(now + MIN_LEAD_MS - SKEW_MS - 1, now).unwrap_err();
         assert!(err.contains("too soon"), "got: {err}");
         assert!(validate_send_at(now + MAX_HORIZON_MS, now).is_ok());
         let err = validate_send_at(now + MAX_HORIZON_MS + 1, now).unwrap_err();
@@ -150,8 +152,18 @@ mod tests {
         let now = ny(2026, 7, 20, 10, 0);
         // #2286 — `inNh`/`inNm` and `next-HHMM` are now generic token shapes,
         // so `in5h` resolves; anything outside those shapes is still refused.
-        assert_eq!(resolve_token_in("in5h", now).unwrap(), now.timestamp_millis() + 5 * 3_600_000);
-        for token in ["soon", "in5x", "in0h", "next-25:00", "next-930", "tomorrow-noon"] {
+        assert_eq!(
+            resolve_token_in("in5h", now).unwrap(),
+            now.timestamp_millis() + 5 * 3_600_000
+        );
+        for token in [
+            "soon",
+            "in5x",
+            "in0h",
+            "next-25:00",
+            "next-930",
+            "tomorrow-noon",
+        ] {
             assert!(resolve_token_in(token, now).is_err(), "{token}");
         }
     }
@@ -184,7 +196,10 @@ mod tests {
     fn parses_relative_offsets() {
         let now = ny(2026, 7, 20, 10, 0);
         let now_ms = now.timestamp_millis();
-        assert_eq!(parse_send_at_in("in 45m", now).unwrap(), now_ms + 45 * 60_000);
+        assert_eq!(
+            parse_send_at_in("in 45m", now).unwrap(),
+            now_ms + 45 * 60_000
+        );
         assert_eq!(
             parse_send_at_in("in 3h", now).unwrap(),
             now_ms + 3 * 3_600_000
@@ -193,7 +208,10 @@ mod tests {
             parse_send_at_in("in 2d", now).unwrap(),
             now_ms + 2 * 86_400_000
         );
-        assert!(parse_send_at_in("in 0h", now).is_err(), "zero offset is a typo");
+        assert!(
+            parse_send_at_in("in 0h", now).is_err(),
+            "zero offset is a typo"
+        );
         assert!(parse_send_at_in("in 3w", now).is_err(), "unknown unit");
     }
 
@@ -203,8 +221,8 @@ mod tests {
         // parse_offset and panic (#501 review) — it must parse-fail.
         let now = ny(2026, 7, 20, 10, 0);
         for bad in ["in 3ч", "in 3時", "in ч"] {
-            let err = parse_send_at_in(bad, now.clone())
-                .expect_err(&format!("{bad:?} must be rejected"));
+            let err =
+                parse_send_at_in(bad, now.clone()).expect_err(&format!("{bad:?} must be rejected"));
             assert!(err.contains("accepted formats"), "got: {err}");
         }
     }
@@ -299,8 +317,8 @@ mod tests {
     fn rejections_list_accepted_formats() {
         let now = ny(2026, 7, 20, 10, 0);
         for bad in ["", "whenever", "tomorrow 9", "13pm", "in h", "25:00"] {
-            let err = parse_send_at_in(bad, now.clone())
-                .expect_err(&format!("{bad:?} must be rejected"));
+            let err =
+                parse_send_at_in(bad, now.clone()).expect_err(&format!("{bad:?} must be rejected"));
             assert!(
                 err.contains("accepted formats"),
                 "{bad:?} error must be self-serve: {err}"

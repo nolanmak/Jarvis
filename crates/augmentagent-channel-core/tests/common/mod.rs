@@ -1,5 +1,5 @@
-use std::path::Path;
 use rusqlite::Connection;
+use std::path::Path;
 
 /// Seed the Node-tree-owned tables `Store::migrate` probes for. Mirrors
 /// the helper in the lib's `tests` module — duplicated here because Rust

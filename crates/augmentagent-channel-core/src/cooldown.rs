@@ -58,7 +58,9 @@ impl CooldownLatch {
     pub fn system() -> Self {
         if let Ok(p) = std::env::var("AUGMENTAGENT_COOLDOWN_FILE") {
             if !p.trim().is_empty() {
-                return Self { path: PathBuf::from(p) };
+                return Self {
+                    path: PathBuf::from(p),
+                };
             }
         }
         let path = crate::state_dir::state_dir()
@@ -164,7 +166,14 @@ impl CooldownLatch {
             .take(160)
             .collect();
         // A latch starts a new run: earlier strikes are spent.
-        map.insert(provider.to_string(), CooldownEntry { until, reason, strikes: None });
+        map.insert(
+            provider.to_string(),
+            CooldownEntry {
+                until,
+                reason,
+                strikes: None,
+            },
+        );
         self.write_all(&map);
     }
 
@@ -176,11 +185,13 @@ impl CooldownLatch {
     pub fn strike(&self, provider: &str, window: chrono::Duration) -> u32 {
         let now = Utc::now();
         let mut map = self.read_all();
-        let entry = map.entry(provider.to_string()).or_insert_with(|| CooldownEntry {
-            until: now,
-            reason: "unrecognised failures (not latched)".into(),
-            strikes: None,
-        });
+        let entry = map
+            .entry(provider.to_string())
+            .or_insert_with(|| CooldownEntry {
+                until: now,
+                reason: "unrecognised failures (not latched)".into(),
+                strikes: None,
+            });
         let count = match entry.strikes {
             Some(run) if now - run.last <= window => run.count.saturating_add(1),
             _ => 1,
@@ -256,19 +267,40 @@ mod tests {
         let window = chrono::Duration::hours(1);
         assert_eq!(latch.strike("codex", window), 1);
         assert_eq!(latch.strike("codex", window), 2);
-        assert!(latch.latched_until("codex").is_none(), "a strike is not a latch");
-        assert!(latch.active().is_empty(), "strike-only entries are not shown as latches");
+        assert!(
+            latch.latched_until("codex").is_none(),
+            "a strike is not a latch"
+        );
+        assert!(
+            latch.active().is_empty(),
+            "strike-only entries are not shown as latches"
+        );
         latch.clear("codex");
         assert_eq!(latch.strike("codex", window), 1, "a success ends the run");
-        latch.latch("codex", Utc::now() + chrono::Duration::minutes(1), "backoff");
+        latch.latch(
+            "codex",
+            Utc::now() + chrono::Duration::minutes(1),
+            "backoff",
+        );
         assert!(latch.latched_until("codex").is_some());
         assert_eq!(latch.strike("codex", window), 1, "a latch ends the run");
-        assert_eq!(latch.strike("codex", chrono::Duration::zero() - chrono::Duration::seconds(1)), 1,
-            "a run older than the window starts over");
+        assert_eq!(
+            latch.strike(
+                "codex",
+                chrono::Duration::zero() - chrono::Duration::seconds(1)
+            ),
+            1,
+            "a run older than the window starts over"
+        );
         // Other processes on older binaries still read the file.
         let raw = std::fs::read_to_string(dir.path().join("cd.json")).unwrap();
         #[derive(Deserialize)]
-        struct Legacy { #[allow(dead_code)] until: DateTime<Utc>, #[allow(dead_code)] reason: String }
+        struct Legacy {
+            #[allow(dead_code)]
+            until: DateTime<Utc>,
+            #[allow(dead_code)]
+            reason: String,
+        }
         let legacy: BTreeMap<String, Legacy> = serde_json::from_str(&raw).unwrap();
         assert!(legacy.contains_key("codex"));
     }

@@ -292,13 +292,15 @@ impl IngestPool {
 
     /// Synchronous admission so the cap holds even for a tight submit loop.
     fn admit(&self, message_id: &str) -> Admission {
-        let mut ids = self.active_ids.lock().expect("ingest pool ids mutex poisoned");
+        let mut ids = self
+            .active_ids
+            .lock()
+            .expect("ingest pool ids mutex poisoned");
         if ids.contains(message_id) {
             self.deduped.fetch_add(1, Ordering::SeqCst);
             return Admission::Duplicate;
         }
-        let unfinished =
-            self.queued.load(Ordering::SeqCst) + self.in_flight.load(Ordering::SeqCst);
+        let unfinished = self.queued.load(Ordering::SeqCst) + self.in_flight.load(Ordering::SeqCst);
         if unfinished >= self.config.queue_capacity + self.config.workers {
             self.dropped.fetch_add(1, Ordering::SeqCst);
             return Admission::Full;
@@ -572,7 +574,10 @@ mod tests {
             if s.queued == 0 && s.in_flight == 0 {
                 return;
             }
-            assert!(tokio::time::Instant::now() < deadline, "pool did not drain: {s:?}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pool did not drain: {s:?}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

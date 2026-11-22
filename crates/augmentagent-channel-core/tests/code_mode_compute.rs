@@ -487,7 +487,10 @@ async fn crash_recovery(kill_helper: bool) {
             )
             .await;
         if kill_helper {
-            assert!(_result.is_err(), "killed helper must not return compute success");
+            assert!(
+                _result.is_err(),
+                "killed helper must not return compute success"
+            );
             drop(service);
             drop(lease);
             return;
@@ -593,24 +596,51 @@ async fn crash_recovery(kill_helper: bool) {
     let started = std::time::Instant::now();
     if kill_helper {
         let audit: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(helper_files[0].parent().unwrap().join("audit.json")).unwrap()
-        ).unwrap();
+            &std::fs::read(helper_files[0].parent().unwrap().join("audit.json")).unwrap(),
+        )
+        .unwrap();
         let helper_pid = audit["ownerPid"].as_u64().unwrap() as u32;
-        let (_, descriptor) = process_descriptors.iter().find(|(pid, _)| *pid == helper_pid)
+        let (_, descriptor) = process_descriptors
+            .iter()
+            .find(|(pid, _)| *pid == helper_pid)
             .expect("helper must be pinned before crash injection");
-        assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
-            descriptor.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            },
+            0
+        );
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Some(status) = owner.0.try_wait().unwrap() { break status; }
+                if let Some(status) = owner.0.try_wait().unwrap() {
+                    break status;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("owner did not observe helper failure within cleanup allowance");
-        assert!(status.success(), "helper failure fixture failed: {}", std::fs::read_to_string(log.path()).unwrap());
+        })
+        .await
+        .expect("owner did not observe helper failure within cleanup allowance");
+        assert!(
+            status.success(),
+            "helper failure fixture failed: {}",
+            std::fs::read_to_string(log.path()).unwrap()
+        );
         let scratch = augmentagent_channel_core::build_scratch::sweep_compute_with(
-            root.path(), &ProcFs, std::time::SystemTime::now());
+            root.path(),
+            &ProcFs,
+            std::time::SystemTime::now(),
+        );
         assert_eq!(scratch.cleanup_unverified, 0);
-        assert!(scratch.removed > 0, "SIGKILL fixture must exercise orphan scratch recovery");
+        assert!(
+            scratch.removed > 0,
+            "SIGKILL fixture must exercise orphan scratch recovery"
+        );
     } else {
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
@@ -730,42 +760,84 @@ async fn dropped_future_stalled_helper_cannot_survive_cleanup() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn dropped_startup_stalled_helper_is_killed_before_any_workload() {
-    use augmentagent_channel_core::{build_scratch::{ProcFs, ProcessTable}, code_mode::compute::ComputeService};
+    use augmentagent_channel_core::{
+        build_scratch::{ProcFs, ProcessTable},
+        code_mode::compute::ComputeService,
+    };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     struct KillOnDrop(OwnedFd);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.0.as_raw_fd(),
-                libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0); }
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
         }
     }
     let root = tempfile::tempdir().unwrap();
     let mut config = service_config(root.path(), false);
     let source = root.path().join("selected-input");
-    std::fs::File::create(&source).unwrap().set_len(64 * 1024 * 1024).unwrap();
+    std::fs::File::create(&source)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
     config.input_files.insert("selected".into(), source);
     let artifacts = config.artifact_root.clone();
     let startup = tokio::spawn(ComputeService::start(config));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let (pid, identity) = loop {
         assert!(!startup.is_finished(), "missed pre-readiness startup stage");
-        if let Some(process) = ProcFs.vm_processes_using(&artifacts).into_iter().next() { break process; }
-        assert!(tokio::time::Instant::now() < deadline, "startup helper was not observed");
+        if let Some(process) = ProcFs.vm_processes_using(&artifacts).into_iter().next() {
+            break process;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "startup helper was not observed"
+        );
         tokio::time::sleep(Duration::from_millis(1)).await;
     };
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     assert!(descriptor >= 0);
     let pinned = KillOnDrop(unsafe { OwnedFd::from_raw_fd(descriptor as i32) });
     assert_eq!(ProcFs.start_time(pid).as_deref(), Some(identity.as_str()));
-    assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pinned.0.as_raw_fd(),
-        libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pinned.0.as_raw_fd(),
+                libc::SIGSTOP,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
+    );
     startup.abort();
-    assert!(startup.await.err().expect("startup was not aborted").is_cancelled());
-    let mut poll = libc::pollfd { fd: pinned.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    assert_eq!(unsafe { libc::poll(&mut poll, 1, 500) }, 1,
-        "abandoned startup left its stopped helper alive");
-    assert!(std::fs::read_dir(artifacts).unwrap().all(|entry|
-        !entry.unwrap().file_name().to_string_lossy().starts_with("compute-helper-")));
+    assert!(startup
+        .await
+        .err()
+        .expect("startup was not aborted")
+        .is_cancelled());
+    let mut poll = libc::pollfd {
+        fd: pinned.0.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut poll, 1, 500) },
+        1,
+        "abandoned startup left its stopped helper alive"
+    );
+    assert!(std::fs::read_dir(artifacts).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("compute-helper-")));
 }
 
 // pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
@@ -808,8 +880,12 @@ async fn stalled_helper_cleanup(drop_call: bool) {
     let mut dropped_at = None;
     let call = service.execute(json!({"runtime":"python","dependencies":[],"code":"pass"}));
     if drop_call {
-        assert!(tokio::time::timeout(Duration::from_millis(100), call).await.is_err(),
-            "stopped helper unexpectedly answered before future drop");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), call)
+                .await
+                .is_err(),
+            "stopped helper unexpectedly answered before future drop"
+        );
         dropped_at = Some(std::time::Instant::now());
         // A late finish or repeated cancellation must not restart cleanup.
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -839,7 +915,10 @@ async fn stalled_helper_cleanup(drop_call: bool) {
     );
     assert_ne!(poll.revents & libc::POLLIN, 0);
     if let Some(dropped_at) = dropped_at {
-        assert!(dropped_at.elapsed() < Duration::from_secs(5), "future-drop cleanup exceeded its original allowance");
+        assert!(
+            dropped_at.elapsed() < Duration::from_secs(5),
+            "future-drop cleanup exceeded its original allowance"
+        );
     }
 }
 
@@ -902,31 +981,61 @@ async fn compute_orchestration_files_are_owned_by_task_storage() {
     let service = ComputeService::start(config).await.unwrap();
     let options = service.run_options().unwrap();
     let running = tokio::spawn(async move {
-        run_program_with_options("async function main(){await new Promise(r=>setTimeout(r,1500));return 60;}main();",
-            &ToolManifest::default(), &StubDispatcher::always_null(&[]), &options).await
+        run_program_with_options(
+            "async function main(){await new Promise(r=>setTimeout(r,1500));return 60;}main();",
+            &ToolManifest::default(),
+            &StubDispatcher::always_null(&[]),
+            &options,
+        )
+        .await
     });
     let managed = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let Some(path) = std::fs::read_dir(&artifacts).unwrap().filter_map(|e| e.ok())
-                .map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("compute-orchestration-")) {
+            if let Some(path) = std::fs::read_dir(&artifacts)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("compute-orchestration-")
+                })
+            {
                 break path;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await;
+    })
+    .await;
     let managed = match managed {
         Ok(path) => path,
-        Err(_) => panic!("Deno runtime files must live in recoverable task storage: {:?}", running.await.unwrap()),
+        Err(_) => panic!(
+            "Deno runtime files must live in recoverable task storage: {:?}",
+            running.await.unwrap()
+        ),
     };
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&managed).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(&managed).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert!(managed.join("cache").is_dir());
     assert!(managed.join("home").is_dir());
-    let sidecars: Vec<_> = std::fs::read_dir(&managed).unwrap().filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ts")).collect();
+    let sidecars: Vec<_> = std::fs::read_dir(&managed)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
+        .collect();
     assert_eq!(sidecars.len(), 1);
-    assert_eq!(sidecars[0].metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        sidecars[0].metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert_eq!(running.await.unwrap().unwrap().final_value, json!(60));
-    assert!(!managed.exists(), "completed orchestration left runtime files behind");
+    assert!(
+        !managed.exists(),
+        "completed orchestration left runtime files behind"
+    );
     assert_eq!(service.finish().await.unwrap()["cleanupVerified"], true);
 }

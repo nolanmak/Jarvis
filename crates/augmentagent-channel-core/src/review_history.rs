@@ -229,12 +229,24 @@ mod tests {
     #[test]
     fn runpod_authors_keep_actual_model_identity_across_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = initialize(&dir.path().join("private-state"), "synthetic-repository", "runpod-model-swap", false).unwrap();
+        let path = initialize(
+            &dir.path().join("private-state"),
+            "synthetic-repository",
+            "runpod-model-swap",
+            false,
+        )
+        .unwrap();
         record(&path, ProviderKind::Qwen).unwrap();
         record(&path, ProviderKind::Qwen).unwrap();
         record(&path, ProviderKind::Glm).unwrap();
-        assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Qwen, ProviderKind::Glm]));
-        assert!(!authors(&path).unwrap().unwrap().contains(&ProviderKind::Codex));
+        assert_eq!(
+            authors(&path).unwrap(),
+            Some(vec![ProviderKind::Qwen, ProviderKind::Glm])
+        );
+        assert!(!authors(&path)
+            .unwrap()
+            .unwrap()
+            .contains(&ProviderKind::Codex));
     }
 
     #[test]
@@ -272,9 +284,16 @@ mod tests {
 
         let (branch, attempt) =
             begin_attempt(&root, "synthetic-repository", "synthetic-branch").unwrap();
-        assert_eq!(branch, earlier, "the branch record is the same file a resume reads");
+        assert_eq!(
+            branch, earlier,
+            "the branch record is the same file a resume reads"
+        );
         assert_ne!(attempt, branch, "the attempt keeps its own record");
-        assert_eq!(authors(&attempt).unwrap(), Some(vec![]), "a fresh attempt starts with no builders");
+        assert_eq!(
+            authors(&attempt).unwrap(),
+            Some(vec![]),
+            "a fresh attempt starts with no builders"
+        );
 
         // The dispatcher records every builder into both.
         record(&branch, ProviderKind::Codex).unwrap();
@@ -306,10 +325,15 @@ mod tests {
         let root = dir.path().join("state");
         let legacy = initialize(&root, "synthetic-repository", "legacy-draft", true).unwrap();
         assert_eq!(authors(&legacy).unwrap(), None);
-        let (branch, attempt) = begin_attempt(&root, "synthetic-repository", "legacy-draft").unwrap();
+        let (branch, attempt) =
+            begin_attempt(&root, "synthetic-repository", "legacy-draft").unwrap();
         record(&branch, ProviderKind::Claude).unwrap();
         record(&attempt, ProviderKind::Claude).unwrap();
-        assert_eq!(authors(&branch).unwrap(), None, "unpublished: still unknown");
+        assert_eq!(
+            authors(&branch).unwrap(),
+            None,
+            "unpublished: still unknown"
+        );
         supersede(&branch, &attempt).unwrap();
         assert_eq!(authors(&branch).unwrap(), Some(vec![ProviderKind::Claude]));
     }
@@ -370,15 +394,24 @@ mod tests {
         )
         .unwrap();
         let held = lock(&path).unwrap();
-        assert_eq!(unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) }, 0);
-        let mut child = std::process::Command::new("sleep").arg("3").spawn().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("3")
+            .spawn()
+            .unwrap();
         drop(held);
         let recorded = record(&path, ProviderKind::Codex);
         let child_still_running = child.try_wait().unwrap().is_none();
         child.kill().ok();
         child.wait().unwrap();
         recorded.unwrap();
-        assert!(child_still_running, "record must succeed while the child still holds its descriptor");
+        assert!(
+            child_still_running,
+            "record must succeed while the child still holds its descriptor"
+        );
         assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Codex]));
     }
 

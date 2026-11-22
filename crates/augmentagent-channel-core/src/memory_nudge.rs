@@ -97,11 +97,7 @@ impl CycleSummary {
     /// be non-empty after trimming (caller's responsibility — the writer
     /// rejects empty headlines so we don't accidentally produce a wall of
     /// `## ` rows).
-    pub fn new(
-        id: impl Into<String>,
-        surface: CycleSurface,
-        headline: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, surface: CycleSurface, headline: impl Into<String>) -> Self {
         Self {
             id: id.into().trim().to_string(),
             surface,
@@ -315,8 +311,7 @@ mod tests {
     fn writer_produces_both_files() {
         let tmp = TempDir::new().unwrap();
         let logger = CycleLogger::new(tmp.path());
-        let s = CycleSummary::new("2026-05-25T10:00", CycleSurface::Digest, "h")
-            .with_body("b");
+        let s = CycleSummary::new("2026-05-25T10:00", CycleSurface::Digest, "h").with_body("b");
         let cycle_path = logger.write(&s).unwrap();
         assert!(cycle_path.exists(), "per-cycle file must exist");
         assert!(logger.rolling_log_path().exists(), "rolling log must exist");
@@ -331,10 +326,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let logger = CycleLogger::new(tmp.path());
         logger
-            .write(&CycleSummary::new("2026-05-25T10:00", CycleSurface::Digest, "first"))
+            .write(&CycleSummary::new(
+                "2026-05-25T10:00",
+                CycleSurface::Digest,
+                "first",
+            ))
             .unwrap();
         logger
-            .write(&CycleSummary::new("2026-05-25T11:00", CycleSurface::EmailTriage, "second"))
+            .write(&CycleSummary::new(
+                "2026-05-25T11:00",
+                CycleSurface::EmailTriage,
+                "second",
+            ))
             .unwrap();
         let rolling = read(&logger.rolling_log_path());
         // Both anchors land in the rolling file in chronological order.
@@ -418,8 +421,15 @@ mod tests {
             resolve(Some("/tmp/state-test".into()), home()),
             Some(PathBuf::from("/tmp/state-test/augmentagent"))
         );
-        assert_ne!(resolve(None, home()), resolve(Some("/tmp/state-test".into()), home()));
-        assert_eq!(resolve(Some("".into()), home()), resolve(None, home()), "empty is unset");
+        assert_ne!(
+            resolve(None, home()),
+            resolve(Some("/tmp/state-test".into()), home())
+        );
+        assert_eq!(
+            resolve(Some("".into()), home()),
+            resolve(None, home()),
+            "empty is unset"
+        );
         assert_eq!(
             resolve(Some("relative".into()), home()),
             resolve(None, home()),

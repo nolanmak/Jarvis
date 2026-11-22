@@ -256,8 +256,16 @@ async fn run_program_inner(
     }
     let started = tokio::time::Instant::now();
     let resolution = resolve_deno_bin();
-    let runtime_storage = options.orchestration_root.as_deref().map(RunStorage::new).transpose()?;
-    let sidecar = resolve_sidecar(runtime_storage.as_ref().map(|storage| storage.path.as_path()))?;
+    let runtime_storage = options
+        .orchestration_root
+        .as_deref()
+        .map(RunStorage::new)
+        .transpose()?;
+    let sidecar = resolve_sidecar(
+        runtime_storage
+            .as_ref()
+            .map(|storage| storage.path.as_path()),
+    )?;
 
     tracing::debug!(
         deno = %resolution.path.display(),
@@ -268,7 +276,12 @@ async fn run_program_inner(
 
     let mut command = Command::new(&resolution.path);
     if let Some(storage) = &runtime_storage {
-        command.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+        command
+            .env_clear()
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
             .env("DENO_NO_UPDATE_CHECK", "1")
             .env("HOME", storage.path.join("home"))
             .env("DENO_DIR", storage.path.join("cache"))
@@ -734,7 +747,9 @@ struct RunStorage {
 impl RunStorage {
     #[cfg(not(unix))]
     fn new(_root: &std::path::Path) -> Result<Self, RunnerError> {
-        Err(RunnerError::Protocol("private compute storage requires Unix".into()))
+        Err(RunnerError::Protocol(
+            "private compute storage requires Unix".into(),
+        ))
     }
 
     #[cfg(unix)]
@@ -743,16 +758,23 @@ impl RunStorage {
             use std::os::unix::fs::MetadataExt;
             let parent = super::compute::artifacts::Directory::open(root, false)?;
             let metadata = std::fs::metadata(parent.path())?;
-            anyhow::ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o700,
-                "orchestration storage must be owner-private");
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o700,
+                "orchestration storage must be owner-private"
+            );
             let (temporary, _) = parent.private_tempdir("compute-orchestration-")?;
             let path = std::fs::canonicalize(temporary.path())?;
             for name in ["home", "cache", "tmp", "config", "data"] {
                 std::fs::create_dir(path.join(name))?;
             }
-            Ok(Self { _temporary: temporary, path, _parent: parent })
+            Ok(Self {
+                _temporary: temporary,
+                path,
+                _parent: parent,
+            })
         };
-        create().map_err(|_| RunnerError::Protocol("private orchestration storage unavailable".into()))
+        create()
+            .map_err(|_| RunnerError::Protocol("private orchestration storage unavailable".into()))
     }
 }
 
@@ -770,7 +792,10 @@ fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Side
     materialize_sidecar_in(override_path, None)
 }
 
-fn materialize_sidecar_in(override_path: Option<std::ffi::OsString>, root: Option<&std::path::Path>) -> Result<Sidecar, RunnerError> {
+fn materialize_sidecar_in(
+    override_path: Option<std::ffi::OsString>,
+    root: Option<&std::path::Path>,
+) -> Result<Sidecar, RunnerError> {
     if let Some(path) = override_path.filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
@@ -840,7 +865,8 @@ mod tests {
         // it up and tag the source as WellKnown.
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("deno");
-        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\necho 1\n").expect("write fake deno");
+        augmentagent_test_support::write_executable(&fake, "#!/bin/sh\necho 1\n")
+            .expect("write fake deno");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

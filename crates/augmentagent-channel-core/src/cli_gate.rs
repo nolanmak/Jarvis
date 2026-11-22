@@ -56,12 +56,16 @@ tokio::task_local! {
 /// Run `future` as owner-interactive work: its CLI calls may use the reserved
 /// permits, and [`scope_gate_wait_ms`] reports how long they queued.
 pub async fn run_interactive<F: std::future::Future>(future: F) -> F::Output {
-    INTERACTIVE.scope(Arc::new(CallScope::default()), future).await
+    INTERACTIVE
+        .scope(Arc::new(CallScope::default()), future)
+        .await
 }
 
 /// Total permit wait inside the current [`run_interactive`] scope, if any.
 pub fn scope_gate_wait_ms() -> Option<u64> {
-    INTERACTIVE.try_with(|scope| scope.gate_wait_ms.load(Ordering::Relaxed)).ok()
+    INTERACTIVE
+        .try_with(|scope| scope.gate_wait_ms.load(Ordering::Relaxed))
+        .ok()
 }
 
 fn in_interactive_scope() -> bool {
@@ -144,9 +148,14 @@ impl CliGate {
         static GLOBAL: OnceLock<Arc<CliGate>> = OnceLock::new();
         Arc::clone(GLOBAL.get_or_init(|| {
             let capacity = parse_capacity(std::env::var(ENV_MAX_INFLIGHT).ok().as_deref());
-            let reserve =
-                parse_reserve(std::env::var(ENV_INTERACTIVE_RESERVE).ok().as_deref(), capacity);
-            info!(capacity, reserve, "reasoner CLI gate armed ({ENV_MAX_INFLIGHT})");
+            let reserve = parse_reserve(
+                std::env::var(ENV_INTERACTIVE_RESERVE).ok().as_deref(),
+                capacity,
+            );
+            info!(
+                capacity,
+                reserve, "reasoner CLI gate armed ({ENV_MAX_INFLIGHT})"
+            );
             let mut gate = CliGate::with_reserve(capacity, reserve);
             gate.snapshot_to = Some(snapshot_path());
             Arc::new(gate)
@@ -231,7 +240,10 @@ impl CliGate {
                     self.warn_queued(provider, caller, started, true);
                     let (provider, waited_secs) =
                         (provider.to_string(), started.elapsed().as_secs());
-                    return Err(GateWaitTimeout { provider, waited_secs });
+                    return Err(GateWaitTimeout {
+                        provider,
+                        waited_secs,
+                    });
                 }
             }
         };
@@ -245,10 +257,23 @@ impl CliGate {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (provider, caller) = (provider.to_string(), caller.to_string());
         let (since, budget) = (Instant::now(), max_wait);
-        self.held().insert(id, Held { provider, caller, since, budget, overdue: false });
+        self.held().insert(
+            id,
+            Held {
+                provider,
+                caller,
+                since,
+                budget,
+                overdue: false,
+            },
+        );
         self.arm_watchdog();
         self.write_snapshot();
-        Ok(CliPermit { _permit: granted, gate: Arc::clone(self), id })
+        Ok(CliPermit {
+            _permit: granted,
+            gate: Arc::clone(self),
+            id,
+        })
     }
 
     /// One sweeper task per gate, armed by the first grant. Without it a leak is
@@ -270,7 +295,9 @@ impl CliGate {
     /// A quarter of the shortest budget policed, so a hold is named near its own deadline.
     fn sweep_period(&self) -> Duration {
         let soonest = self.held().values().map(|h| h.budget).min();
-        soonest.map_or(WATCHDOG_EVERY, |b| b / 4).clamp(Duration::from_millis(5), WATCHDOG_EVERY)
+        soonest
+            .map_or(WATCHDOG_EVERY, |b| b / 4)
+            .clamp(Duration::from_millis(5), WATCHDOG_EVERY)
     }
 
     /// One watchdog pass. #656 arms a call's budget *after* the permit is
@@ -334,11 +361,11 @@ impl CliGate {
         if !gave_up {
             // One line per interval per gate: a burst must not become 1,700.
             let (now, every) = (now_ms(), self.warn_every.as_millis() as u64);
-            let claimed = self.last_warn_ms.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |last| (now.saturating_sub(last) >= every).then_some(now),
-            );
+            let claimed =
+                self.last_warn_ms
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                        (now.saturating_sub(last) >= every).then_some(now)
+                    });
             if claimed.is_err() {
                 return;
             }
@@ -346,7 +373,12 @@ impl CliGate {
         }
         let (holder, held_secs) = self.held().values().min_by_key(|h| h.since).map_or_else(
             || ("none".to_string(), 0),
-            |h| (format!("{}/{}", h.provider, h.caller), h.since.elapsed().as_secs()),
+            |h| {
+                (
+                    format!("{}/{}", h.provider, h.caller),
+                    h.since.elapsed().as_secs(),
+                )
+            },
         );
         warn!(
             provider,
@@ -452,7 +484,9 @@ mod tests {
         let b = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
         assert_eq!(gate.in_flight(), 2);
 
-        let third = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        let third = gate
+            .acquire_timed("t", "triage", Duration::from_millis(50))
+            .await;
         assert!(third.is_err(), "third permit must wait for a free slot");
         assert_eq!(gate.in_flight(), 2);
 
@@ -489,27 +523,48 @@ mod tests {
         let gate = Arc::new(gate);
         let mut leaked = Vec::new();
         for _ in 0..DEFAULT_MAX_INFLIGHT {
-            leaked.push(gate.acquire_timed("claude", "triage", budget).await.unwrap());
+            leaked.push(
+                gate.acquire_timed("claude", "triage", budget)
+                    .await
+                    .unwrap(),
+            );
         }
         let Err(err) = gate.acquire_timed("claude", "triage", budget).await else {
             panic!("every slot is held; nothing can be granted");
         };
         assert_eq!(err.provider, "claude");
-        assert_eq!(gate.waiting(), 0, "a timed-out waiter must not stay counted");
+        assert_eq!(
+            gate.waiting(),
+            0,
+            "a timed-out waiter must not stay counted"
+        );
         // One call behind four stuck holds never makes the queue deeper than
         // the gate, so it has to name itself *while waiting*.
         let warned = gate.queued_warnings();
-        assert!(warned >= 2, "a queued caller must be named every interval ({warned})");
+        assert!(
+            warned >= 2,
+            "a queued caller must be named every interval ({warned})"
+        );
         // Not one more acquire from here: the watchdog task alone has to name
         // the leak, because "there is no next call" is exactly #954.
         let by = Instant::now() + budget * 20;
         while gate.overdue_holds() < DEFAULT_MAX_INFLIGHT as u64 && Instant::now() < by {
             tokio::time::sleep(budget / 8).await;
         }
-        assert_eq!(gate.overdue_holds(), DEFAULT_MAX_INFLIGHT as u64, "named once each");
-        assert_eq!(gate.sem.available_permits(), 0, "naming a hold must not widen the gate");
+        assert_eq!(
+            gate.overdue_holds(),
+            DEFAULT_MAX_INFLIGHT as u64,
+            "named once each"
+        );
+        assert_eq!(
+            gate.sem.available_permits(),
+            0,
+            "naming a hold must not widen the gate"
+        );
         drop(leaked);
-        gate.acquire_timed("claude", "triage", budget).await.expect("gate is usable again");
+        gate.acquire_timed("claude", "triage", budget)
+            .await
+            .expect("gate is usable again");
     }
 
     /// #1548 spy: every request for a permit is counted, granted or not, so a
@@ -519,7 +574,9 @@ mod tests {
         let gate = Arc::new(CliGate::new(1));
         assert_eq!(gate.acquire_calls(), 0);
         let held = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
-        let refused = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        let refused = gate
+            .acquire_timed("t", "triage", Duration::from_millis(50))
+            .await;
         assert!(refused.is_err());
         assert_eq!(gate.acquire_calls(), 2);
         drop(held);
@@ -541,32 +598,51 @@ mod tests {
         let gate = Arc::new(CliGate::with_reserve(2, 1));
         assert_eq!(gate.capacity(), 2);
         let bg = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
-        let refused = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
-        assert!(refused.is_err(), "background must not take the reserved permit");
+        let refused = gate
+            .acquire_timed("t", "triage", Duration::from_millis(50))
+            .await;
+        assert!(
+            refused.is_err(),
+            "background must not take the reserved permit"
+        );
         let owner = run_interactive(gate.acquire_timed("t", "draft", Duration::from_millis(50)))
             .await
             .expect("the reserved permit serves the owner at once");
-        assert_eq!(gate.in_flight(), 2, "total concurrency never exceeds capacity");
+        assert_eq!(
+            gate.in_flight(),
+            2,
+            "total concurrency never exceeds capacity"
+        );
         drop((bg, owner));
     }
 
     #[tokio::test(start_paused = true)]
     async fn interactive_callers_also_use_the_shared_pool() {
         let gate = Arc::new(CliGate::with_reserve(3, 1));
-        let a = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
-        let b = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
-        let c = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
-        assert_eq!(gate.in_flight(), 3);
-        assert!(run_interactive(gate.acquire_timed("t", "draft", Duration::from_millis(50)))
+        let a = run_interactive(gate.acquire_timed("t", "draft", BUDGET))
             .await
-            .is_err());
+            .unwrap();
+        let b = run_interactive(gate.acquire_timed("t", "draft", BUDGET))
+            .await
+            .unwrap();
+        let c = run_interactive(gate.acquire_timed("t", "draft", BUDGET))
+            .await
+            .unwrap();
+        assert_eq!(gate.in_flight(), 3);
+        assert!(
+            run_interactive(gate.acquire_timed("t", "draft", Duration::from_millis(50)))
+                .await
+                .is_err()
+        );
         drop((a, b, c));
     }
 
     #[tokio::test]
     async fn a_single_slot_gate_reserves_nothing() {
         let gate = Arc::new(CliGate::with_reserve(1, 1));
-        let bg = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        let bg = gate
+            .acquire_timed("t", "triage", Duration::from_millis(50))
+            .await;
         assert!(bg.is_ok(), "capacity 1 must not starve background work");
     }
 
@@ -594,7 +670,11 @@ mod tests {
     fn interactive_reserve_parsing_is_defensive() {
         assert_eq!(parse_reserve(None, 4), 1);
         assert_eq!(parse_reserve(Some("2"), 4), 2);
-        assert_eq!(parse_reserve(Some("9"), 4), 3, "always leaves one shared slot");
+        assert_eq!(
+            parse_reserve(Some("9"), 4),
+            3,
+            "always leaves one shared slot"
+        );
         assert_eq!(parse_reserve(Some("0"), 4), 0);
         assert_eq!(parse_reserve(Some("x"), 4), 1);
         assert_eq!(parse_reserve(None, 1), 0);

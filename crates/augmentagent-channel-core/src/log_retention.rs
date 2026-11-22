@@ -183,7 +183,13 @@ mod tests {
         let (text, out) = retain_since(&log, cutoff(14));
         assert_eq!(out.removed, 1, "only the genuinely old, readable record");
         assert_eq!(out.kept, 5);
-        for keep in ["truncated", "not json", "NoTimestamp", "BadTimestamp", "Recent"] {
+        for keep in [
+            "truncated",
+            "not json",
+            "NoTimestamp",
+            "BadTimestamp",
+            "Recent",
+        ] {
             assert!(text.contains(keep), "lost {keep}: {text}");
         }
     }
@@ -220,7 +226,9 @@ mod tests {
             "the temp file must not survive"
         );
         // Still valid NDJSON that can be appended to and re-read.
-        assert!(after.lines().all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
+        assert!(after
+            .lines()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
 
         // Running again is a cheap no-op, not a second rewrite.
         let again = prune_file(&path, cutoff(14));

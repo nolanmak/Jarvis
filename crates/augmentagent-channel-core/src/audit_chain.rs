@@ -43,7 +43,9 @@ impl<W: Write> Write for BoundedWriter<W> {
 #[derive(Debug)]
 pub(crate) struct GenerationSealed;
 impl std::fmt::Display for GenerationSealed {
-    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"audit generation is sealed")}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "audit generation is sealed")
+    }
 }
 impl std::error::Error for GenerationSealed {}
 #[derive(Clone, Debug)]
@@ -97,16 +99,24 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 impl AnchoredAudit {
     /// Writer registration and sealing share this cross-process ingress gate.
     /// The callback must persist its ticket before releasing the audit lock.
-    pub(crate) fn with_open_generation<T>(&self,register:impl FnOnce()->Result<T>)->Result<T> {
-        let lock=private_open(&self.lock_path()?,false)?;
+    pub(crate) fn with_open_generation<T>(
+        &self,
+        register: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let lock = private_open(&self.lock_path()?, false)?;
         #[cfg(unix)]
-        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
+        ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "audit lock failed"
+        );
         if self.anchor.exists() {
-            let file=private_open(&self.anchor,false)?;
-            ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
-            let anchor:Anchor=serde_json::from_reader(file)?;
-            ensure!(anchor.version==1,"unsupported anchor");
-            if anchor.sealed.is_some(){return Err(GenerationSealed.into());}
+            let file = private_open(&self.anchor, false)?;
+            ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
+            let anchor: Anchor = serde_json::from_reader(file)?;
+            ensure!(anchor.version == 1, "unsupported anchor");
+            if anchor.sealed.is_some() {
+                return Err(GenerationSealed.into());
+            }
         }
         register()
     }
@@ -168,11 +178,19 @@ impl AnchoredAudit {
     /// future appends. The caller validates kernel quiescence while holding the
     /// same lock as writers. A retry returns the identical immutable proof.
     pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
-    where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
+    where
+        F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value>,
+    {
         let lock = private_open(&self.lock_path()?, false)?;
         #[cfg(unix)]
-        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
-        ensure!(self.anchor.exists() && self.log.exists(), "recovery requires existing audit evidence");
+        ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "audit lock failed"
+        );
+        ensure!(
+            self.anchor.exists() && self.log.exists(),
+            "recovery requires existing audit evidence"
+        );
         let file = private_open(&self.anchor, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
         let mut anchor: Anchor = serde_json::from_reader(file)?;
@@ -183,14 +201,29 @@ impl AnchoredAudit {
         file.read_to_end(&mut bytes)?;
         ensure!(bytes.len() >= anchor.bytes, "committed audit truncated");
         let committed = &bytes[..anchor.bytes];
-        let actual = if committed.is_empty() { String::new() } else { digest(committed) };
+        let actual = if committed.is_empty() {
+            String::new()
+        } else {
+            digest(committed)
+        };
         ensure!(actual == anchor.hash, "committed audit modified");
         let tail = &bytes[anchor.bytes..];
-        ensure!(match &anchor.pending { Some(p) => p.as_bytes().starts_with(tail), None => tail.is_empty() }, "unrecognized audit tail");
-        let rows = committed.split(|b| *b == b'\n').filter(|r| !r.is_empty())
-            .map(serde_json::from_slice).collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
+        ensure!(
+            match &anchor.pending {
+                Some(p) => p.as_bytes().starts_with(tail),
+                None => tail.is_empty(),
+            },
+            "unrecognized audit tail"
+        );
+        let rows = committed
+            .split(|b| *b == b'\n')
+            .filter(|r| !r.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
         let validation = validate(&rows)?;
-        if let Some(proof) = anchor.sealed { return Ok(proof); }
+        if let Some(proof) = anchor.sealed {
+            return Ok(proof);
+        }
         let proof = serde_json::json!({"version":1,"committed_sha256":anchor.hash,
             "committed_bytes":anchor.bytes,"sequence":anchor.sequence,
             "interrupted_append":anchor.pending,"validation":validation});
@@ -305,21 +338,40 @@ mod tests {
         let mut anchor: Anchor = serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
         anchor.pending = Some("{\"uncertain_result\":true}\n".into());
         sink.save(&anchor).unwrap();
-        private_open(&sink.log, true).unwrap().write_all(b"{\"uncertain").unwrap();
+        private_open(&sink.log, true)
+            .unwrap()
+            .write_all(b"{\"uncertain")
+            .unwrap();
         let before = fs::read(&sink.log).unwrap();
-        assert!(sink.seal_for_recovery(|_| anyhow::bail!("worker live")).is_err());
-        let proof = sink.seal_for_recovery(|rows| {
-            assert_eq!(rows.len(), 1);
-            Ok(serde_json::json!({"quiescent":true}))
-        }).unwrap();
+        assert!(sink
+            .seal_for_recovery(|_| anyhow::bail!("worker live"))
+            .is_err());
+        let proof = sink
+            .seal_for_recovery(|rows| {
+                assert_eq!(rows.len(), 1);
+                Ok(serde_json::json!({"quiescent":true}))
+            })
+            .unwrap();
         assert_eq!(fs::read(&sink.log).unwrap(), before);
-        assert!(proof["interrupted_append"].as_str().unwrap().contains("uncertain_result"));
-        assert!(sink.clone().append(serde_json::json!({"late":true})).is_err());
-        assert_eq!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).unwrap(), proof);
+        assert!(proof["interrupted_append"]
+            .as_str()
+            .unwrap()
+            .contains("uncertain_result"));
+        assert!(sink
+            .clone()
+            .append(serde_json::json!({"late":true}))
+            .is_err());
+        assert_eq!(
+            sink.seal_for_recovery(|_| Ok(serde_json::json!({})))
+                .unwrap(),
+            proof
+        );
         let mut corrupted = before;
         corrupted[2] ^= 1;
         fs::write(&sink.log, corrupted).unwrap();
-        assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).is_err());
+        assert!(sink
+            .seal_for_recovery(|_| Ok(serde_json::json!({})))
+            .is_err());
     }
     #[test]
     fn append_coordinates_with_the_existing_anchor_lock() {
@@ -339,33 +391,57 @@ mod tests {
         let early = done_rx.recv_timeout(Duration::from_millis(200));
         let completed_early = early.is_ok();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-        let succeeded = early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        let succeeded =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         thread.join().unwrap();
-        assert!(!completed_early, "new writer bypassed the existing persistent anchor lock");
+        assert!(
+            !completed_early,
+            "new writer bypassed the existing persistent anchor lock"
+        );
         assert!(succeeded);
     }
 
     #[test]
     fn refuses_oversized_anchors_and_keeps_settled_evidence_usable() {
         let (_dir, sink) = setup();
-        sink.append(serde_json::json!({"payload":"settled"})).unwrap();
+        sink.append(serde_json::json!({"payload":"settled"}))
+            .unwrap();
         let log = fs::read(&sink.log).unwrap();
         let anchor = fs::read(&sink.anchor).unwrap();
         let anchor_dir = sink.anchor.parent().unwrap();
-        let entries = || fs::read_dir(anchor_dir).unwrap()
-            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        let entries = || {
+            fs::read_dir(anchor_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
         let original_entries = entries();
         // The log line fits the budget; escaping it into the anchor doubles it.
         let oversized = "\\".repeat(22 * 1024 * 1024);
-        assert!(sink.append(serde_json::json!({"payload":oversized})).is_err());
+        assert!(sink
+            .append(serde_json::json!({"payload":oversized}))
+            .is_err());
         assert_eq!(fs::read(&sink.log).unwrap(), log);
         assert_eq!(fs::read(&sink.anchor).unwrap(), anchor);
-        assert_eq!(entries(), original_entries, "leaked a file beside the anchor");
-        sink.append(serde_json::json!({"payload":"smaller"})).unwrap();
+        assert_eq!(
+            entries(),
+            original_entries,
+            "leaked a file beside the anchor"
+        );
+        sink.append(serde_json::json!({"payload":"smaller"}))
+            .unwrap();
         let oversized = "v".repeat(LIMIT as usize);
-        assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({"oversized":oversized}))).is_err());
-        assert_eq!(entries(), original_entries, "leaked a file beside the anchor");
-        let proof = sink.seal_for_recovery(|_| Ok(serde_json::json!({"quiescent":true}))).unwrap();
+        assert!(sink
+            .seal_for_recovery(|_| Ok(serde_json::json!({"oversized":oversized})))
+            .is_err());
+        assert_eq!(
+            entries(),
+            original_entries,
+            "leaked a file beside the anchor"
+        );
+        let proof = sink
+            .seal_for_recovery(|_| Ok(serde_json::json!({"quiescent":true})))
+            .unwrap();
         assert_eq!(proof["validation"], serde_json::json!({"quiescent":true}));
     }
     #[test]

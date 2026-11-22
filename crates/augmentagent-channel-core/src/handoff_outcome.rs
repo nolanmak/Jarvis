@@ -76,20 +76,29 @@ fn verdict_path(journal: &Path) -> PathBuf {
 /// Read a private regular file owned by this user, without following a
 /// symlink. `None` when it does not exist; an error when it is not trusted.
 fn read_private(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-    let file = match std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let metadata = file.metadata()?;
-    anyhow::ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
-        && metadata.uid() == unsafe { libc::geteuid() } && metadata.len() <= MAX_BYTES,
-        "handoff state is not a private bounded file");
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.len() <= MAX_BYTES,
+        "handoff state is not a private bounded file"
+    );
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "handoff state is not a private bounded file");
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "handoff state is not a private bounded file"
+    );
     Ok(Some(bytes))
 }
 
@@ -102,8 +111,11 @@ fn read_private(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
 /// the request forever. The next content-level ending writes it again.
 pub(crate) fn recorded(journal: &Path) -> anyhow::Result<Option<CompletedWithoutSummary>> {
     let path = verdict_path(journal);
-    let Some(bytes) = read_private(&path)? else { return Ok(None) };
-    let completed = serde_json::from_slice::<Value>(&bytes).ok()
+    let Some(bytes) = read_private(&path)? else {
+        return Ok(None);
+    };
+    let completed = serde_json::from_slice::<Value>(&bytes)
+        .ok()
         .filter(|value| value["version"] == 1)
         .and_then(|value| value["completed"].as_u64())
         .and_then(|count| usize::try_from(count).ok())
@@ -121,13 +133,20 @@ pub(crate) fn recorded(journal: &Path) -> anyhow::Result<Option<CompletedWithout
 /// Call this after a Content ending. If the journal holds completed
 /// operations and no uncertain ones, record the verdict and return it.
 pub(crate) fn settle(journal: &Path) -> anyhow::Result<Settlement> {
-    let Some(bytes) = read_private(journal)? else { return Ok(Settlement::Nothing) };
+    let Some(bytes) = read_private(journal)? else {
+        return Ok(Settlement::Nothing);
+    };
     let state: Value = serde_json::from_slice(&bytes)?;
     let operations = match (state["version"].as_u64(), state["operations"].as_array()) {
         (Some(1), Some(operations)) => operations,
         _ => anyhow::bail!("invalid handoff state"),
     };
-    let with_status = |status: &str| operations.iter().filter(|row| row["status"] == status).count();
+    let with_status = |status: &str| {
+        operations
+            .iter()
+            .filter(|row| row["status"] == status)
+            .count()
+    };
     let (completed, uncertain) = (with_status("completed"), with_status("started"));
     if uncertain > 0 {
         return Ok(Settlement::Uncertain { uncertain });
@@ -139,8 +158,10 @@ pub(crate) fn settle(journal: &Path) -> anyhow::Result<Settlement> {
     // The verdict still applies to this call if the file cannot be written.
     // Only the refusal of later retries depends on the file.
     if let Err(error) = persist(journal, &verdict) {
-        tracing::warn!("could not record the completed-without-summary verdict ({error:#}); \
-            a retry of this request would resume from its receipts instead");
+        tracing::warn!(
+            "could not record the completed-without-summary verdict ({error:#}); \
+            a retry of this request would resume from its receipts instead"
+        );
     }
     Ok(Settlement::Completed(verdict))
 }
@@ -154,10 +175,19 @@ fn persist(journal: &Path, verdict: &CompletedWithoutSummary) -> anyhow::Result<
         return Ok(());
     }
     let path = verdict_path(journal);
-    let directory = path.parent().ok_or_else(|| anyhow::anyhow!("verdict path has no directory"))?;
-    let mut file = tempfile::Builder::new().prefix(".handoff-").tempfile_in(directory)?;
-    file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(serde_json::json!({"version": 1, "completed": verdict.completed}).to_string().as_bytes())?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("verdict path has no directory"))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".handoff-")
+        .tempfile_in(directory)?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(
+        serde_json::json!({"version": 1, "completed": verdict.completed})
+            .to_string()
+            .as_bytes(),
+    )?;
     file.as_file().sync_all()?;
     file.persist(&path)?;
     std::fs::File::open(directory)?.sync_all()?;
@@ -175,31 +205,55 @@ mod tests {
     }
 
     fn write_journal(path: &Path, operations: Value) {
-        let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true)
-            .mode(0o600).open(path).unwrap();
-        file.write_all(serde_json::json!({"version": 1, "operations": operations}).to_string().as_bytes()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(
+            serde_json::json!({"version": 1, "operations": operations})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
     }
 
     #[test]
     fn completed_rows_settle_into_a_durable_verdict() {
         let dir = private_dir();
         let journal = dir.path().join("operations.json");
-        write_journal(&journal, serde_json::json!([
-            {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
-            {"tool": "Write", "arguments": {}, "status": "completed", "result": {"content": []}},
-            {"tool": "mcp__fixture__delete", "arguments": {}, "status": "not_applied",
-             "reconciliation": {"outcome": "not_applied", "evidence": "synthetic"}},
-        ]));
+        write_journal(
+            &journal,
+            serde_json::json!([
+                {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
+                {"tool": "Write", "arguments": {}, "status": "completed", "result": {"content": []}},
+                {"tool": "mcp__fixture__delete", "arguments": {}, "status": "not_applied",
+                 "reconciliation": {"outcome": "not_applied", "evidence": "synthetic"}},
+            ]),
+        );
         assert_eq!(recorded(&journal).unwrap(), None);
         let verdict = CompletedWithoutSummary { completed: 2 };
-        assert_eq!(settle(&journal).unwrap(), Settlement::Completed(verdict.clone()));
+        assert_eq!(
+            settle(&journal).unwrap(),
+            Settlement::Completed(verdict.clone())
+        );
         assert_eq!(recorded(&journal).unwrap(), Some(verdict));
-        let mode = std::fs::metadata(verdict_path(&journal)).unwrap().permissions().mode();
+        let mode = std::fs::metadata(verdict_path(&journal))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o077, 0, "the verdict is private task state");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with('.')).collect();
-        assert!(leftovers.is_empty(), "the atomic write leaves no temp file: {leftovers:?}");
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the atomic write leaves no temp file: {leftovers:?}"
+        );
     }
 
     /// #1069 review M1(d): a verdict is permanent, an uncertain row is not.
@@ -209,11 +263,17 @@ mod tests {
     fn uncertain_rows_never_settle_into_a_verdict() {
         let dir = private_dir();
         let journal = dir.path().join("operations.json");
-        write_journal(&journal, serde_json::json!([
-            {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
-            {"tool": "mcp__fixture__update", "arguments": {}, "status": "started"},
-        ]));
-        assert_eq!(settle(&journal).unwrap(), Settlement::Uncertain { uncertain: 1 });
+        write_journal(
+            &journal,
+            serde_json::json!([
+                {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
+                {"tool": "mcp__fixture__update", "arguments": {}, "status": "started"},
+            ]),
+        );
+        assert_eq!(
+            settle(&journal).unwrap(),
+            Settlement::Uncertain { uncertain: 1 }
+        );
         assert_eq!(recorded(&journal).unwrap(), None);
     }
 
@@ -234,16 +294,25 @@ mod tests {
     fn a_torn_verdict_reads_as_absent_and_is_repaired() {
         let dir = private_dir();
         let journal = dir.path().join("operations.json");
-        write_journal(&journal, serde_json::json!([
-            {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
-        ]));
+        write_journal(
+            &journal,
+            serde_json::json!([
+                {"tool": "mcp__fixture__create", "arguments": {}, "status": "completed", "result": {"content": []}},
+            ]),
+        );
         for damaged in [&b""[..], &b"{\"version\":1}"[..], &b"{not json"[..]] {
             let verdict = verdict_path(&journal);
             std::fs::write(&verdict, damaged).unwrap();
             std::fs::set_permissions(&verdict, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(recorded(&journal).unwrap(), None, "{damaged:?}");
-            assert!(matches!(settle(&journal).unwrap(), Settlement::Completed(_)));
-            assert!(recorded(&journal).unwrap().is_some(), "{damaged:?}: repaired");
+            assert!(matches!(
+                settle(&journal).unwrap(),
+                Settlement::Completed(_)
+            ));
+            assert!(
+                recorded(&journal).unwrap().is_some(),
+                "{damaged:?}: repaired"
+            );
             std::fs::remove_file(&verdict).unwrap();
         }
     }
@@ -254,16 +323,25 @@ mod tests {
         let journal = dir.path().join("operations.json");
         std::fs::write(dir.path().join("elsewhere.json"), b"{}").unwrap();
         std::os::unix::fs::symlink(dir.path().join("elsewhere.json"), &journal).unwrap();
-        assert!(settle(&journal).is_err(), "a symlinked journal is not evidence");
+        assert!(
+            settle(&journal).is_err(),
+            "a symlinked journal is not evidence"
+        );
         std::fs::remove_file(&journal).unwrap();
         write_journal(&journal, serde_json::json!({"not": "a list"}));
         assert!(settle(&journal).is_err());
         let verdict = verdict_path(&journal);
         std::os::unix::fs::symlink(dir.path().join("elsewhere.json"), &verdict).unwrap();
-        assert!(recorded(&journal).is_err(), "a linked verdict must stop dispatch, not vanish");
+        assert!(
+            recorded(&journal).is_err(),
+            "a linked verdict must stop dispatch, not vanish"
+        );
         std::fs::remove_file(&verdict).unwrap();
         std::fs::write(&verdict, b"{\"version\":1,\"completed\":1}").unwrap();
         std::fs::set_permissions(&verdict, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(recorded(&journal).is_err(), "a non-private verdict must stop dispatch, not vanish");
+        assert!(
+            recorded(&journal).is_err(),
+            "a non-private verdict must stop dispatch, not vanish"
+        );
     }
 }

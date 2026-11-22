@@ -167,5 +167,4 @@ mod tests {
         let out = summarize_value(&v);
         assert_eq!(out.as_object().unwrap().len(), 50);
     }
-
 }

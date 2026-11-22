@@ -321,7 +321,10 @@ impl<'a> DefaultDispatcher<'a> {
         self
     }
 
-    pub fn with_draft_context(mut self, context: Option<&'a crate::draft_workflow::PreparedDraftContext>) -> Self {
+    pub fn with_draft_context(
+        mut self,
+        context: Option<&'a crate::draft_workflow::PreparedDraftContext>,
+    ) -> Self {
         self.draft_context = context;
         self
     }
@@ -491,7 +494,10 @@ impl<'a> DefaultDispatcher<'a> {
             "draft" => {
                 let (channel, body, reason) =
                     parse_draft_args(args).map_err(DispatchError::BadArgs)?;
-                let body = self.draft_context.map(|ctx|ctx.guard_draft(&body)).unwrap_or(body);
+                let body = self
+                    .draft_context
+                    .map(|ctx| ctx.guard_draft(&body))
+                    .unwrap_or(body);
                 // The `.d.ts` never declares the `Channel` union and every
                 // prompt example says `"gmail"`, so the model's channel arg
                 // is unreliable (#989). Route on the wired channel — the
@@ -537,9 +543,14 @@ impl<'a> DefaultDispatcher<'a> {
                     )
                     .map_err(|e| DispatchError::Internal(e.to_string()))?;
                 if let Some(context) = self.draft_context {
-                    let attached = context.attach(&self.store, &action_id)
+                    let attached = context
+                        .attach(&self.store, &action_id)
                         .map_err(|e| DispatchError::Internal(e.to_string()))?;
-                    if !attached { return Err(DispatchError::Internal("Could not attach draft evidence receipt".into())); }
+                    if !attached {
+                        return Err(DispatchError::Internal(
+                            "Could not attach draft evidence receipt".into(),
+                        ));
+                    }
                 }
                 *self
                     .last_action_id

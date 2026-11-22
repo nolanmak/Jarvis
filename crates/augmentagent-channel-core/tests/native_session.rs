@@ -5,7 +5,12 @@ use augmentagent_channel_core::providers::ProviderKind;
 fn claude_create_then_resume_preserves_the_observed_session_id() {
     let session = NativeSession::new(ProviderKind::Claude).unwrap();
     let mut lease = session.begin(ProviderKind::Claude).unwrap();
-    let Launch::Create { requested_id: Some(id) } = lease.launch() else { panic!("expected a new Claude session") };
+    let Launch::Create {
+        requested_id: Some(id),
+    } = lease.launch()
+    else {
+        panic!("expected a new Claude session")
+    };
     assert!(uuid::Uuid::parse_str(&id).is_ok());
     lease.observe(&id).unwrap();
     lease.finish().unwrap();
@@ -25,7 +30,12 @@ fn codex_requires_an_observed_thread_id_before_resume() {
     assert_eq!(session.id().as_deref(), Some("codex-thread-1"));
     lease.finish().unwrap();
     let mut resumed = session.begin(ProviderKind::Codex).unwrap();
-    assert_eq!(resumed.launch(), Launch::Resume { id: "codex-thread-1".into() });
+    assert_eq!(
+        resumed.launch(),
+        Launch::Resume {
+            id: "codex-thread-1".into()
+        }
+    );
     assert!(resumed.observe("different-thread").is_err());
 }
 

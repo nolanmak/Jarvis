@@ -1,7 +1,11 @@
 //! Shared live output contracts using production presets and synthetic inputs.
 //! These tests do not send messages or read account data.
-use augmentagent_channel_core::{archetype, codex::CodexCliReasoner, decision,
-    reasoner::{self, ClaudeCliReasoner, Reasoner, ReasonerOpts}};
+use augmentagent_channel_core::{
+    archetype,
+    codex::CodexCliReasoner,
+    decision,
+    reasoner::{self, ClaudeCliReasoner, Reasoner, ReasonerOpts},
+};
 use serde_json::Value;
 
 // Every live contract first isolates its state (#1048): the providers' global
@@ -10,25 +14,45 @@ use serde_json::Value;
 // Consumers tolerate fenced JSON; tone profiles store the descriptor as text.
 // Validate the structured payload rather than requiring stricter formatting.
 fn structured_object(raw: &str) -> Value {
-    let start = raw.find('{').unwrap_or_else(|| panic!("missing structured payload: {raw}"));
+    let start = raw
+        .find('{')
+        .unwrap_or_else(|| panic!("missing structured payload: {raw}"));
     let end = raw.rfind('}').unwrap();
     serde_json::from_str(&raw[start..=end]).unwrap()
 }
 
 async fn structured_outputs(provider: &dyn Reasoner) {
     augmentagent_channel_core::state_dir::isolate_for_tests();
-    let interval = provider.call(&reasoner::loop_parse_opts(),
-        "Every 7 minutes for 35 minutes say fixture-ready").await.unwrap();
+    let interval = provider
+        .call(
+            &reasoner::loop_parse_opts(),
+            "Every 7 minutes for 35 minutes say fixture-ready",
+        )
+        .await
+        .unwrap();
     let interval = structured_object(&interval);
     assert_eq!(interval["interval_secs"], 420);
     assert_eq!(interval["duration_secs"], 2100);
-    assert!(interval["prompt"].as_str().unwrap().contains("fixture-ready"));
+    assert!(interval["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("fixture-ready"));
 
-    let ambiguous = provider.call(&reasoner::loop_parse_opts(),
-        "Every Monday at 9am say fixture-ready").await.unwrap();
+    let ambiguous = provider
+        .call(
+            &reasoner::loop_parse_opts(),
+            "Every Monday at 9am say fixture-ready",
+        )
+        .await
+        .unwrap();
     let ambiguous = structured_object(&ambiguous);
-    assert!(ambiguous["error"].as_str().is_some_and(|error| !error.is_empty()));
-    assert!(ambiguous.get("cron_expr").is_none(), "must not invent a timezone");
+    assert!(ambiguous["error"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+    assert!(
+        ambiguous.get("cron_expr").is_none(),
+        "must not invent a timezone"
+    );
 
     let choice = provider.call(&reasoner::archetype_pick_opts(),
         "Synthetic inbound message: Can we meet Tuesday at 14:00 UTC instead of Wednesday? Please confirm the new meeting time.")
@@ -40,7 +64,10 @@ async fn structured_outputs(provider: &dyn Reasoner) {
     let triage = provider.call(&reasoner::triage_opts(None),
         "Synthetic bulk newsletter, not a personal message. Subject: Weekly product roundup. Body: This is an automated weekly newsletter sent to all subscribers. No response or action is requested. Unsubscribe using your preferences.")
         .await.unwrap();
-    assert_eq!(decision::parse(&triage).unwrap().decision, decision::DecisionKind::Skip);
+    assert_eq!(
+        decision::parse(&triage).unwrap().decision,
+        decision::DecisionKind::Skip
+    );
 
     let tone = provider.call(&reasoner::tone_summarize_opts(),
         "Synthetic sent-message corpus containing exactly one message:\nHi team,\nThe fixture is ready for review.\nThanks,\nFixture Author")
@@ -56,38 +83,67 @@ mod common;
 
 /// The code-mode draft profile. All seven communication handlers construct
 /// this exact model/tool profile.
-fn code_mode_draft_options(manifest: &augmentagent_channel_core::code_mode::ToolManifest) -> ReasonerOpts {
-    ReasonerOpts::pinned(augmentagent_channel_core::ModelTier::Quality,
-        augmentagent_channel_core::prompt::code_mode_system(manifest))
+fn code_mode_draft_options(
+    manifest: &augmentagent_channel_core::code_mode::ToolManifest,
+) -> ReasonerOpts {
+    ReasonerOpts::pinned(
+        augmentagent_channel_core::ModelTier::Quality,
+        augmentagent_channel_core::prompt::code_mode_system(manifest),
+    )
 }
 
 /// #1046: the profile pins the quality-tier model instead of inheriting the
 /// owner's interactive `~/.claude/settings.json` model (#448).
 #[test]
 fn code_mode_draft_profile_pins_the_quality_model() {
-    use augmentagent_channel_core::providers::{classify, model_for, CapabilityClass, ModelTier, ProviderKind};
+    use augmentagent_channel_core::providers::{
+        classify, model_for, CapabilityClass, ModelTier, ProviderKind,
+    };
     let options = code_mode_draft_options(&augmentagent_channel_core::code_mode::manifest_v1());
-    assert_eq!(options.model, Some(model_for(ProviderKind::Claude, ModelTier::Quality)),
-        "code-mode drafts must pass --model, not inherit the owner's interactive model");
-    assert_eq!(classify(&options), CapabilityClass::TextOnly, "host tools stay disabled");
+    assert_eq!(
+        options.model,
+        Some(model_for(ProviderKind::Claude, ModelTier::Quality)),
+        "code-mode drafts must pass --model, not inherit the owner's interactive model"
+    );
+    assert_eq!(
+        classify(&options),
+        CapabilityClass::TextOnly,
+        "host tools stay disabled"
+    );
 }
 
 async fn executable_draft(provider: &dyn Reasoner) {
     augmentagent_channel_core::state_dir::isolate_for_tests();
     use augmentagent_channel_core::{code_mode, prompt};
-    use augmentagent_store::{Store, models::Email};
+    use augmentagent_store::{models::Email, Store};
     let manifest = code_mode::manifest_v1();
     let options = code_mode_draft_options(&manifest);
     let fixture = tempfile::tempdir().unwrap();
     let db = fixture.path().join("synthetic.db");
     common::seed_node_owned_tables(&db);
     let store = Store::open(&db).unwrap();
-    for platform in ["gmail", "linkedin", "slack", "discord", "whatsapp", "twitter", "instagram"] {
+    for platform in [
+        "gmail",
+        "linkedin",
+        "slack",
+        "discord",
+        "whatsapp",
+        "twitter",
+        "instagram",
+    ] {
         let email = Email {
-            message_id: format!("synthetic-{platform}"), thread_id: Some(format!("synthetic-thread-{platform}")),
-            from: "fixture@example.com".into(), to: "owner@example.com".into(), cc: String::new(), attachments: vec![],
-            subject: "Fixture readiness".into(), body: "Is the fixture ready?".into(), date: "2026-01-01T12:00:00Z".into(),
-            account_entity_id: Some("synthetic-account".into()), platform: platform.into(), kind: "dm".into(),
+            message_id: format!("synthetic-{platform}"),
+            thread_id: Some(format!("synthetic-thread-{platform}")),
+            from: "fixture@example.com".into(),
+            to: "owner@example.com".into(),
+            cc: String::new(),
+            attachments: vec![],
+            subject: "Fixture readiness".into(),
+            body: "Is the fixture ready?".into(),
+            date: "2026-01-01T12:00:00Z".into(),
+            account_entity_id: Some("synthetic-account".into()),
+            platform: platform.into(),
+            kind: "dm".into(),
         };
         store.upsert_email(&email).unwrap();
         let user = prompt::code_mode_user_message(&email,
@@ -96,18 +152,42 @@ async fn executable_draft(provider: &dyn Reasoner) {
         let source = code_mode::extract_ts_block(&response).unwrap();
         // Execute the actual generated program and persist the pending action.
         // This local dispatcher has no sender or account-service integration.
-        let dispatcher = code_mode::DefaultDispatcher::new(&store,
-            code_mode::MessageContext { channel: platform.into(), email, account_id: Some("synthetic-account".into()) }, &source);
-        let outcome = code_mode::run_program(&source, &manifest, &dispatcher).await.unwrap();
-        assert_eq!(outcome.trace.len(), 1, "{platform}: unexpected extra operations");
+        let dispatcher = code_mode::DefaultDispatcher::new(
+            &store,
+            code_mode::MessageContext {
+                channel: platform.into(),
+                email,
+                account_id: Some("synthetic-account".into()),
+            },
+            &source,
+        );
+        let outcome = code_mode::run_program(&source, &manifest, &dispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.trace.len(),
+            1,
+            "{platform}: unexpected extra operations"
+        );
         assert_eq!(outcome.trace[0].call, "draft");
         assert_eq!(outcome.trace[0].args_summary[1], "The fixture is ready.");
         assert!(outcome.trace[0].error.is_none());
-        let action = dispatcher.last_action_id().expect("draft must persist an action");
-        let (status, body, recorded_source): (String, String, String) = rusqlite::Connection::open(&db).unwrap()
-            .query_row("SELECT status, draftBody, generatedSource FROM actions WHERE id=?1", [&action],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
-        assert_eq!(status, "pending", "{platform}: model output must not approve or send the draft");
+        let action = dispatcher
+            .last_action_id()
+            .expect("draft must persist an action");
+        let (status, body, recorded_source): (String, String, String) =
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT status, draftBody, generatedSource FROM actions WHERE id=?1",
+                    [&action],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            status, "pending",
+            "{platform}: model output must not approve or send the draft"
+        );
         assert_eq!(body, "The fixture is ready.");
         assert_eq!(recorded_source, source);
     }
@@ -140,24 +220,39 @@ async fn claude_production_structured_output_contracts() {
 async fn digest_extraction_and_lint(provider: std::sync::Arc<dyn Reasoner>) {
     augmentagent_channel_core::state_dir::isolate_for_tests();
     use augmentagent_channel_core::{resolve, tool_audit::AuditLogger};
-    let digest = provider.call(&reasoner::digest_opts(None),
-        "Synthetic last 24 hours. Total emails: 3; flagged: 2; pending approvals: 1.\n\
+    let digest = provider
+        .call(
+            &reasoner::digest_opts(None),
+            "Synthetic last 24 hours. Total emails: 3; flagged: 2; pending approvals: 1.\n\
          ## Flagged items (all, last 24h) — EXHAUSTIVE\n\
          - alpha@example.com | FIXTURE_ALPHA | requires a decision\n\
          - beta@example.com | FIXTURE_BETA | requests a missing document\n\
          ## Pending approvals (all, oldest first) — EXHAUSTIVE\n\
          - gamma@example.com | FIXTURE_GAMMA | waiting 2d\n\
-         All context is supplied here. No additional senders or activity.")
-        .await.unwrap();
+         All context is supplied here. No additional senders or activity.",
+        )
+        .await
+        .unwrap();
     for marker in ["FIXTURE_ALPHA", "FIXTURE_BETA", "FIXTURE_GAMMA"] {
         assert!(digest.contains(marker), "digest omitted {marker}: {digest}");
     }
-    assert!(digest.len() <= 1500, "small digest exceeded the delivery limit");
+    assert!(
+        digest.len() <= 1500,
+        "small digest exceeded the delivery limit"
+    );
 
-    let asks = resolve::detect_asks_shadow(&provider, resolve::AskResolveMode::Shadow,
-        "Please send me your Calendly booking link so I can choose a time.").await;
-    assert!(asks.iter().any(|ask| ask.kind() == resolve::ResolverKind::Calendly
-        && ask.conf() >= resolve::INJECT_CONFIDENCE_FLOOR), "{asks:?}");
+    let asks = resolve::detect_asks_shadow(
+        &provider,
+        resolve::AskResolveMode::Shadow,
+        "Please send me your Calendly booking link so I can choose a time.",
+    )
+    .await;
+    assert!(
+        asks.iter()
+            .any(|ask| ask.kind() == resolve::ResolverKind::Calendly
+                && ask.conf() >= resolve::INJECT_CONFIDENCE_FLOOR),
+        "{asks:?}"
+    );
 
     let wiki = tempfile::tempdir().unwrap();
     let index = "# Synthetic wiki\n\n[Missing project](projects/missing-fixture.md)\n";
@@ -165,19 +260,35 @@ async fn digest_extraction_and_lint(provider: std::sync::Arc<dyn Reasoner>) {
     let logs = tempfile::tempdir().unwrap();
     let audit = logs.path().join("audit.jsonl");
     let mut options = reasoner::lint_opts(
-        include_str!("../../../schema/wiki-skill.md").into(), wiki.path().into());
+        include_str!("../../../schema/wiki-skill.md").into(),
+        wiki.path().into(),
+    );
     options.audit_logger = Some(std::sync::Arc::new(AuditLogger::new(audit.clone())));
     let report = provider.call(&options, &format!(
         "Run the lint workflow against the synthetic wiki at `{}`. Inspect index.md and verify its link target. Produce a markdown report using relative paths. Do not change any files.", wiki.path().display()))
         .await.unwrap();
-    assert!(report.contains("missing-fixture"), "lint missed the broken link at {}: {report}; audit: {}",
-        wiki.path().display(), std::fs::read_to_string(&audit).unwrap_or_default());
-    assert_eq!(std::fs::read_to_string(wiki.path().join("index.md")).unwrap(), index);
+    assert!(
+        report.contains("missing-fixture"),
+        "lint missed the broken link at {}: {report}; audit: {}",
+        wiki.path().display(),
+        std::fs::read_to_string(&audit).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(wiki.path().join("index.md")).unwrap(),
+        index
+    );
     assert!(!wiki.path().join("projects/missing-fixture.md").exists());
-    let records: Vec<Value> = std::fs::read_to_string(audit).unwrap().lines()
-        .map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert!(records.iter().any(|record| record["tool"] == "Read" || record["tool"] == "Grep"),
-        "lint must inspect the synthetic source");
+    let records: Vec<Value> = std::fs::read_to_string(audit)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["tool"] == "Read" || record["tool"] == "Grep"),
+        "lint must inspect the synthetic source"
+    );
 }
 
 #[tokio::test]
@@ -202,21 +313,41 @@ async fn wiki_mutation_contracts(provider: &dyn Reasoner) {
         "Synthetic resume fixture, not a real person. Name: Fixture Author. Current role: Test Engineer at Example Organization. Skills: Rust and TypeScript. No contact information and no other people named. Ingest this resume, preserving existing non-resume content.")
         .await.unwrap();
     let profile = std::fs::read_to_string(wiki.path().join("about/me.md")).unwrap();
-    for expected in ["SYNTHETIC_PRESERVE_42", "Rust", "TypeScript", "source: resume"] {
+    for expected in [
+        "SYNTHETIC_PRESERVE_42",
+        "Rust",
+        "TypeScript",
+        "source: resume",
+    ] {
         assert!(profile.contains(expected), "missing {expected}: {profile}");
     }
-    let marker = response.lines().filter(|line| !line.trim().is_empty()).last().unwrap();
-    assert!(marker.starts_with("wrote:") && marker.contains("about/me.md"), "{response}");
-    assert!(!profile.contains('@'), "must not invent contact information");
+    let marker = response
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .last()
+        .unwrap();
+    assert!(
+        marker.starts_with("wrote:") && marker.contains("about/me.md"),
+        "{response}"
+    );
+    assert!(
+        !profile.contains('@'),
+        "must not invent contact information"
+    );
 
     std::fs::create_dir_all(wiki.path().join("people")).unwrap();
     let person = wiki.path().join("people/fixture_at_example_com.md");
     std::fs::write(&person, "---\nkind: person\nkey: fixture_at_example_com\ncreated: 2026-01-01\nupdated: 2026-01-01\nsources: [synthetic-prior]\n---\n# Fixture\n\nPreviously confirmed: SYNTHETIC_PRESERVE_73.\n").unwrap();
     std::fs::write(wiki.path().join("index.md"), "SYNTHETIC_DERIVED_INDEX\n").unwrap();
-    let mut opts = reasoner::ingest_opts(include_str!("../../../schema/wiki-skill.md").into(), wiki.path().into());
+    let mut opts = reasoner::ingest_opts(
+        include_str!("../../../schema/wiki-skill.md").into(),
+        wiki.path().into(),
+    );
     let logs = tempfile::tempdir().unwrap();
     let audit = logs.path().join("audit.jsonl");
-    opts.audit_logger = Some(std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone())));
+    opts.audit_logger = Some(std::sync::Arc::new(
+        augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone()),
+    ));
     provider.call(&opts, &format!(
         "Run ingest against the wiki root `{}`. Synthetic email: messageId synthetic-inbound-901; threadId synthetic-thread-901; from fixture@example.com; subject Fixture preferences; body: My preferred programming language is Rust. Decision: skip. Outcome: skipped. This is the only message in the thread, with no ask. Update the existing person page and log; preserve previous facts and the derived index.", wiki.path().display()))
         .await.unwrap_or_else(|error| panic!("ingest failed: {error}; synthetic audit: {}",
@@ -225,8 +356,13 @@ async fn wiki_mutation_contracts(provider: &dyn Reasoner) {
     for expected in ["SYNTHETIC_PRESERVE_73", "synthetic-inbound-901", "Rust"] {
         assert!(page.contains(expected), "missing {expected}: {page}");
     }
-    assert_eq!(std::fs::read_to_string(wiki.path().join("index.md")).unwrap(), "SYNTHETIC_DERIVED_INDEX\n");
-    assert!(std::fs::read_to_string(wiki.path().join("log.md")).unwrap().contains("ingest"));
+    assert_eq!(
+        std::fs::read_to_string(wiki.path().join("index.md")).unwrap(),
+        "SYNTHETIC_DERIVED_INDEX\n"
+    );
+    assert!(std::fs::read_to_string(wiki.path().join("log.md"))
+        .unwrap()
+        .contains("ingest"));
 }
 
 #[tokio::test]
@@ -246,30 +382,62 @@ async fn classic_draft(provider: &dyn Reasoner) {
     use augmentagent_channel_core::prompt;
     use augmentagent_store::models::Email;
     let wiki = tempfile::tempdir().unwrap();
-    std::fs::write(wiki.path().join("fixture.md"), "The fixture status is SYNTHETIC_READY_B7.\n").unwrap();
+    std::fs::write(
+        wiki.path().join("fixture.md"),
+        "The fixture status is SYNTHETIC_READY_B7.\n",
+    )
+    .unwrap();
     let email = Email {
-        message_id: "synthetic-classic-draft".into(), thread_id: None,
-        from: "fixture@example.com".into(), to: "owner@example.com".into(), cc: String::new(), attachments: vec![],
-        subject: "Fixture status".into(), body: "Please confirm the fixture status.".into(),
-        date: "2026-01-01T12:00:00Z".into(), account_entity_id: None, platform: "gmail".into(), kind: "dm".into(),
+        message_id: "synthetic-classic-draft".into(),
+        thread_id: None,
+        from: "fixture@example.com".into(),
+        to: "owner@example.com".into(),
+        cc: String::new(),
+        attachments: vec![],
+        subject: "Fixture status".into(),
+        body: "Please confirm the fixture status.".into(),
+        date: "2026-01-01T12:00:00Z".into(),
+        account_entity_id: None,
+        platform: "gmail".into(),
+        kind: "dm".into(),
     };
     for with_wiki in [false, true] {
-        let options = reasoner::draft_opts(include_str!("../../../skills/email-triage/SKILL.md").into(),
-            with_wiki.then(|| wiki.path().into()));
+        let options = reasoner::draft_opts(
+            include_str!("../../../skills/email-triage/SKILL.md").into(),
+            with_wiki.then(|| wiki.path().into()),
+        );
         let hint = if with_wiki {
             format!("Read fixture.md under the wiki root `{}` for the status. Include its exact status marker in the draft.", wiki.path().display())
-        } else { "The fixture status is SYNTHETIC_READY_B7. Include this exact status marker in the draft.".into() };
-        let response = provider.call(&options, &prompt::draft_user_message(&email, &hint, "", "", "", "")).await.unwrap();
+        } else {
+            "The fixture status is SYNTHETIC_READY_B7. Include this exact status marker in the draft.".into()
+        };
+        let response = provider
+            .call(
+                &options,
+                &prompt::draft_user_message(&email, &hint, "", "", "", ""),
+            )
+            .await
+            .unwrap();
         assert!(response.contains("SYNTHETIC_READY_B7"), "{response}");
-        assert!(!response.contains("```"), "classic drafts must be prose, not generated programs");
+        assert!(
+            !response.contains("```"),
+            "classic drafts must be prose, not generated programs"
+        );
     }
-    assert_eq!(std::fs::read_to_string(wiki.path().join("fixture.md")).unwrap(), "The fixture status is SYNTHETIC_READY_B7.\n");
+    assert_eq!(
+        std::fs::read_to_string(wiki.path().join("fixture.md")).unwrap(),
+        "The fixture status is SYNTHETIC_READY_B7.\n"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires Codex login; classic drafting with and without synthetic wiki context"]
-async fn codex_classic_draft_contract() { classic_draft(&CodexCliReasoner::openai()).await; }
+async fn codex_classic_draft_contract() {
+    classic_draft(&CodexCliReasoner::openai()).await;
+}
 
 #[tokio::test]
 #[ignore = "requires Claude login; same classic draft fixtures as Codex"]
-async fn claude_classic_draft_contract() { classic_draft(&ClaudeCliReasoner::new()).await; }
+async fn claude_classic_draft_contract() {
+    classic_draft(&ClaudeCliReasoner::new()).await;
+}

@@ -436,7 +436,10 @@ pub async fn run_sweep_loop(shutdown: tokio_util::sync::CancellationToken) -> Re
     run_sweep_loop_at(crate::build_scratch::scratch_dir(), shutdown).await
 }
 
-async fn run_sweep_loop_at(root: PathBuf, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+async fn run_sweep_loop_at(
+    root: PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -473,7 +476,11 @@ mod tests {
         fn orphan(root: &Path, name: &str) -> PathBuf {
             let path = root.join(name);
             std::fs::create_dir(&path).unwrap();
-            std::fs::write(path.join("owner.json"), json!({"pid":u32::MAX,"start_time":"absent"}).to_string()).unwrap();
+            std::fs::write(
+                path.join("owner.json"),
+                json!({"pid":u32::MAX,"start_time":"absent"}).to_string(),
+            )
+            .unwrap();
             path
         }
         let root = tempfile::tempdir().unwrap();
@@ -482,12 +489,20 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let worker = tokio::spawn(run_sweep_loop_at(root.path().to_owned(), shutdown.clone()));
         tokio::time::timeout(Duration::from_secs(3), async {
-            while first.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
-        }).await.expect("startup recovery did not run");
+            while first.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup recovery did not run");
         let second = orphan(root.path(), "jarvis-vm-session-compute-next-tick");
         tokio::time::timeout(Duration::from_secs(35), async {
-            while second.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
-        }).await.expect("compute orphan missed its periodic sweep");
+            while second.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("compute orphan missed its periodic sweep");
         assert!(legacy.exists());
         shutdown.cancel();
         worker.await.unwrap().unwrap();

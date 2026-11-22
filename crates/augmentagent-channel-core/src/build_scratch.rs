@@ -42,7 +42,10 @@ const OWNERLESS_GRACE: Duration = Duration::from_secs(10 * 60);
 
 #[cfg(test)]
 fn configured_scratch_dir(value: Option<std::ffi::OsString>) -> PathBuf {
-    value.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_SCRATCH_DIR))
+    value
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SCRATCH_DIR))
 }
 
 /// The scratch root from the daemon's own environment.
@@ -51,8 +54,11 @@ pub fn scratch_dir() -> PathBuf {
 }
 
 fn configured_timeout(value: Option<String>) -> u64 {
-    value.and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_BUILD_TIMEOUT_SECS, |secs| secs.clamp(1, MAX_BUILD_TIMEOUT_SECS))
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_BUILD_TIMEOUT_SECS, |secs| {
+            secs.clamp(1, MAX_BUILD_TIMEOUT_SECS)
+        })
 }
 
 /// The default build-command timeout from the daemon's own environment.
@@ -117,7 +123,11 @@ impl BuildScratchLimits {
         )
     }
 
-    fn from_values(headroom: Option<String>, cache: Option<String>, budget: Option<String>) -> Self {
+    fn from_values(
+        headroom: Option<String>,
+        cache: Option<String>,
+        budget: Option<String>,
+    ) -> Self {
         Self {
             headroom_bytes: configured_gib(headroom, DEFAULT_HEADROOM_BYTES),
             cache_bytes: configured_gib(cache, DEFAULT_IMAGE_CAP_BYTES),
@@ -186,7 +196,11 @@ fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut rest = Vec::new();
     loop {
         if let Ok(resolved) = existing.canonicalize() {
-            return Some(rest.iter().rev().fold(resolved, |acc: PathBuf, part| acc.join(part)));
+            return Some(
+                rest.iter()
+                    .rev()
+                    .fold(resolved, |acc: PathBuf, part| acc.join(part)),
+            );
         }
         rest.push(existing.file_name()?.to_os_string());
         existing = existing.parent()?;
@@ -196,13 +210,16 @@ fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
 /// Refuse a scratch root the model could write through: it must be absolute
 /// and must not lie inside (or equal) any write root, after resolving both.
 pub fn check_outside_write_roots(scratch: &Path, write_roots: &[PathBuf]) -> anyhow::Result<()> {
-    let resolved = resolve_through_existing_ancestor(scratch)
-        .ok_or_else(|| anyhow::anyhow!("build scratch directory must be an absolute path without `..`"))?;
+    let resolved = resolve_through_existing_ancestor(scratch).ok_or_else(|| {
+        anyhow::anyhow!("build scratch directory must be an absolute path without `..`")
+    })?;
     for root in write_roots {
         let root = resolve_through_existing_ancestor(root)
             .ok_or_else(|| anyhow::anyhow!("write root cannot be resolved"))?;
-        anyhow::ensure!(!resolved.starts_with(&root),
-            "build scratch directory must be outside model-writable scopes");
+        anyhow::ensure!(
+            !resolved.starts_with(&root),
+            "build scratch directory must be outside model-writable scopes"
+        );
     }
     Ok(())
 }
@@ -257,16 +274,23 @@ pub trait ProcessTable {
 /// is a qemu option naming a file inside it (`path=` / `file=`). A process
 /// that only mentions the path, such as a shell running `du`, never matches.
 pub fn is_session_vm_process(exe_name: &str, args: &[String], dir: &Path) -> bool {
-    let formatter = exe_name == "mke2fs" && dir.file_name().and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
+    let formatter = exe_name == "mke2fs"
+        && dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
     if !(exe_name.starts_with("qemu-system-") || exe_name.starts_with("python3") || formatter) {
         return false;
     }
     let prefix = format!("{}/", dir.display());
     args.iter().any(|arg| {
         arg.starts_with(&prefix)
-            || arg.split(',').any(|option| option.strip_prefix("path=").or_else(|| option.strip_prefix("file="))
-                .is_some_and(|value| value.starts_with(&prefix)))
+            || arg.split(',').any(|option| {
+                option
+                    .strip_prefix("path=")
+                    .or_else(|| option.strip_prefix("file="))
+                    .is_some_and(|value| value.starts_with(&prefix))
+            })
     })
 }
 
@@ -278,20 +302,32 @@ pub struct ProcFs;
 impl ProcessTable for ProcFs {
     fn start_time(&self, pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        stat.rsplit_once(')')?.1.split_whitespace().nth(19).map(str::to_string)
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)
+            .map(str::to_string)
     }
 
     fn is_live(&self, pid: u32, start_time: &str) -> bool {
         use std::os::fd::{AsRawFd, FromRawFd};
-        if self.start_time(pid).as_deref() != Some(start_time) { return false; }
+        if self.start_time(pid).as_deref() != Some(start_time) {
+            return false;
+        }
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if fd < 0 {
             // An observation failure must not authorize deleting live storage.
             return self.start_time(pid).as_deref() == Some(start_time);
         }
         let descriptor = unsafe { std::fs::File::from_raw_fd(fd as i32) };
-        if self.start_time(pid).as_deref() != Some(start_time) { return false; }
-        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        if self.start_time(pid).as_deref() != Some(start_time) {
+            return false;
+        }
+        let mut poll = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let result = unsafe { libc::poll(&mut poll, 1, 0) };
         !(result > 0 && poll.revents & libc::POLLIN != 0)
     }
@@ -301,38 +337,73 @@ impl ProcessTable for ProcFs {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let me = std::process::id();
-        let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-        entries.flatten().filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            if pid == me || entry.metadata().ok()?.uid() != uid { return None; }
-            // Start time first, then exe and cmdline, then the start time
-            // again: all three reads describe one process, not a reused pid.
-            let start = self.start_time(pid)?;
-            let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
-            let exe_name = exe.file_name()?.to_string_lossy().into_owned();
-            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
-            let args: Vec<String> = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty())
-                .map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-            if !is_session_vm_process(&exe_name, &args, dir) { return None; }
-            (self.start_time(pid)? == start).then_some((pid, start))
-        }).collect()
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+                if pid == me || entry.metadata().ok()?.uid() != uid {
+                    return None;
+                }
+                // Start time first, then exe and cmdline, then the start time
+                // again: all three reads describe one process, not a reused pid.
+                let start = self.start_time(pid)?;
+                let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
+                let exe_name = exe.file_name()?.to_string_lossy().into_owned();
+                let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+                let args: Vec<String> = cmdline
+                    .split(|b| *b == 0)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect();
+                if !is_session_vm_process(&exe_name, &args, dir) {
+                    return None;
+                }
+                (self.start_time(pid)? == start).then_some((pid, start))
+            })
+            .collect()
     }
 
     fn kill_and_wait_if_same(&self, pid: u32, start_time: &str, timeout: Duration) -> bool {
         use std::os::fd::{AsRawFd, FromRawFd};
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if raw < 0 { return !self.is_live(pid, start_time); }
+        if raw < 0 {
+            return !self.is_live(pid, start_time);
+        }
         let descriptor = unsafe { std::fs::File::from_raw_fd(raw as i32) };
-        if self.start_time(pid).as_deref() != Some(start_time) { return true; }
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(), 0); }
-        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let result = unsafe { libc::poll(&mut poll, 1, timeout.as_millis().min(i32::MAX as u128) as i32) };
+        if self.start_time(pid).as_deref() != Some(start_time) {
+            return true;
+        }
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                descriptor.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+        let mut poll = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                timeout.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
         result > 0 && poll.revents & libc::POLLIN != 0
     }
 
     fn kill_if_same(&self, pid: u32, start_time: &str) -> bool {
-        let Ok(raw) = libc::pid_t::try_from(pid) else { return false };
+        let Ok(raw) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         // SAFETY: pidfd_open takes a pid and flags; a negative result is an error.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0) };
         if pidfd >= 0 {
@@ -348,41 +419,70 @@ impl ProcessTable for ProcFs {
         }
         // Kernels without pidfd: re-check immediately before signalling.
         // SAFETY: plain signal delivery to a pid owned by this user.
-        self.start_time(pid).as_deref() == Some(start_time) && unsafe { libc::kill(raw, libc::SIGKILL) } == 0
+        self.start_time(pid).as_deref() == Some(start_time)
+            && unsafe { libc::kill(raw, libc::SIGKILL) } == 0
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 impl ProcessTable for ProcFs {
-    fn start_time(&self, _pid: u32) -> Option<String> { None }
-    fn vm_processes_using(&self, _dir: &Path) -> Vec<(u32, String)> { Vec::new() }
-    fn kill_if_same(&self, _pid: u32, _start_time: &str) -> bool { false }
+    fn start_time(&self, _pid: u32) -> Option<String> {
+        None
+    }
+    fn vm_processes_using(&self, _dir: &Path) -> Vec<(u32, String)> {
+        Vec::new()
+    }
+    fn kill_if_same(&self, _pid: u32, _start_time: &str) -> bool {
+        false
+    }
 }
 
 fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool {
     use std::os::fd::AsRawFd;
-    let read_owner = || std::fs::read(dir.join("owner.json")).ok()
-        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+    let read_owner = || {
+        std::fs::read(dir.join("owner.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+    };
     let mut owner = read_owner();
     let _startup_guard;
     if owner.is_none() {
-        let grace = if dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX)) {
+        let grace = if dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX))
+        {
             COMPUTE_OWNERLESS_GRACE
-        } else { OWNERLESS_GRACE };
-        let young = std::fs::symlink_metadata(dir).and_then(|m| m.modified()).ok()
+        } else {
+            OWNERLESS_GRACE
+        };
+        let young = std::fs::symlink_metadata(dir)
+            .and_then(|m| m.modified())
+            .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_none_or(|age| age < grace);
-        if young { return true; }
+        if young {
+            return true;
+        }
         // The allocator holds this lock from before mkdir through owner.json.
         // Even an unusually slow live initializer must survive recovery.
-        let Some(parent) = dir.parent() else { return true };
-        let Ok(guard) = std::fs::File::open(parent) else { return true };
-        if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return true; }
+        let Some(parent) = dir.parent() else {
+            return true;
+        };
+        let Ok(guard) = std::fs::File::open(parent) else {
+            return true;
+        };
+        if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return true;
+        }
         _startup_guard = guard;
         owner = read_owner(); // The initializer may have finished before locking.
     }
     let Some(owner) = owner else { return false };
-    let pid = owner.get("pid").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok());
+    let pid = owner
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok());
     let start = owner.get("start_time").and_then(|v| v.as_str());
     match (pid, start) {
         (Some(pid), Some(start)) => procs.is_live(pid, start),
@@ -406,20 +506,33 @@ pub fn sweep_compute_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime
 
 /// The private marker binds one command to a receipt outside guest-writable
 /// workspace/control mounts. Its absence differs from unreadable evidence.
-fn cleanup_hold_verified(dir:&Path)->Option<bool> {
-    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+fn cleanup_hold_verified(dir: &Path) -> Option<bool> {
     use std::io::Read;
-    fn private_bytes(path:&Path,limit:u64)->Option<Vec<u8>> {
-        let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path).ok()?;
-        let meta=file.metadata().ok()?;
-        if !meta.is_file() || meta.uid()!=unsafe {libc::getuid()} || meta.nlink()!=1 || meta.mode()&0o077!=0 || meta.len()>limit {return None;}
-        let mut data=Vec::new();file.take(limit+1).read_to_end(&mut data).ok()?;
-        (data.len() as u64<=limit).then_some(data)
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    fn private_bytes(path: &Path, limit: u64) -> Option<Vec<u8>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::getuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
+            || meta.len() > limit
+        {
+            return None;
+        }
+        let mut data = Vec::new();
+        file.take(limit + 1).read_to_end(&mut data).ok()?;
+        (data.len() as u64 <= limit).then_some(data)
     }
-    let marker=dir.join("cleanup-pending");
+    let marker = dir.join("cleanup-pending");
     match std::fs::symlink_metadata(&marker) {
-        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return None,
-        Err(_)=>return Some(false),Ok(_)=>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(false),
+        Ok(_) => (),
     }
     let verified=(||->Option<bool>{
         let record:serde_json::Value=serde_json::from_slice(&private_bytes(&marker,4096)?).ok()?;
@@ -439,46 +552,88 @@ fn cleanup_hold_verified(dir:&Path)->Option<bool> {
     Some(verified)
 }
 
-fn sweep_matching(root: &Path, procs: &dyn ProcessTable, now: SystemTime, prefix: &str) -> SweepReport {
+fn sweep_matching(
+    root: &Path,
+    procs: &dyn ProcessTable,
+    now: SystemTime,
+    prefix: &str,
+) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
     let mut report = SweepReport::default();
     let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
     // Liveness comes from /proc; without it every owner would look dead.
-    if !cfg!(target_os = "linux") { return report; }
-    let Ok(entries) = std::fs::read_dir(root) else { return report };
+    if !cfg!(target_os = "linux") {
+        return report;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return report;
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_str().is_some_and(|n| n.starts_with(prefix)) { continue; }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
-        if !meta.is_dir() || meta.uid() != uid { continue; }
+        if !name.to_str().is_some_and(|n| n.starts_with(prefix)) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != uid {
+            continue;
+        }
         let dir = entry.path();
         if owner_is_live(&dir, procs, now) {
             report.kept_live += 1;
             continue;
         }
-        if let Some(verified)=cleanup_hold_verified(&dir) {
+        if let Some(verified) = cleanup_hold_verified(&dir) {
             // Never kill the subreaper to manufacture cleanup. Only the bound
             // supervisor receipt, with no conflicting live process, releases
             // a retained session after its bridge owner has exited.
-            if !verified || procs.vm_processes_using(&dir).iter().any(|(pid,start)|procs.is_live(*pid,start)) {
-                report.cleanup_unverified+=1;
+            if !verified
+                || procs
+                    .vm_processes_using(&dir)
+                    .iter()
+                    .any(|(pid, start)| procs.is_live(*pid, start))
+            {
+                report.cleanup_unverified += 1;
                 continue;
             }
         }
-        let compute = name.to_str().is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
+        let compute = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
         let mut verified = true;
         loop {
             for (pid, start) in procs.vm_processes_using(&dir) {
                 if compute {
-                    if procs.kill_and_wait_if_same(pid, &start, cleanup_deadline.saturating_duration_since(std::time::Instant::now())) {
+                    if procs.kill_and_wait_if_same(
+                        pid,
+                        &start,
+                        cleanup_deadline.saturating_duration_since(std::time::Instant::now()),
+                    ) {
                         report.killed += 1;
-                    } else { verified = false; break; }
-                } else if procs.kill_if_same(pid, &start) { report.killed += 1; }
+                    } else {
+                        verified = false;
+                        break;
+                    }
+                } else if procs.kill_if_same(pid, &start) {
+                    report.killed += 1;
+                }
             }
-            if !compute || !verified || !procs.vm_processes_using(&dir).iter().any(|(pid, start)| procs.is_live(*pid, start)) { break; }
-            if std::time::Instant::now() >= cleanup_deadline { verified = false; break; }
+            if !compute
+                || !verified
+                || !procs
+                    .vm_processes_using(&dir)
+                    .iter()
+                    .any(|(pid, start)| procs.is_live(*pid, start))
+            {
+                break;
+            }
+            if std::time::Instant::now() >= cleanup_deadline {
+                verified = false;
+                break;
+            }
         }
         if !verified {
             report.cleanup_unverified += 1;
@@ -487,7 +642,9 @@ fn sweep_matching(root: &Path, procs: &dyn ProcessTable, now: SystemTime, prefix
         }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => report.removed += 1,
-            Err(error) => tracing::warn!(dir = %dir.display(), %error, "build scratch sweep could not remove a stale session"),
+            Err(error) => {
+                tracing::warn!(dir = %dir.display(), %error, "build scratch sweep could not remove a stale session")
+            }
         }
     }
     report
@@ -523,10 +680,15 @@ mod tests {
     }
 
     impl ProcessTable for FakeProcs {
-        fn start_time(&self, pid: u32) -> Option<String> { self.running.get(&pid).cloned() }
+        fn start_time(&self, pid: u32) -> Option<String> {
+            self.running.get(&pid).cloned()
+        }
         fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)> {
-            self.vms.iter().filter(|(_, _, path)| path.starts_with(dir))
-                .map(|(pid, start, _)| (*pid, start.clone())).collect()
+            self.vms
+                .iter()
+                .filter(|(_, _, path)| path.starts_with(dir))
+                .map(|(pid, start, _)| (*pid, start.clone()))
+                .collect()
         }
         fn kill_if_same(&self, pid: u32, _start_time: &str) -> bool {
             self.killed.borrow_mut().push(pid);
@@ -537,7 +699,11 @@ mod tests {
     fn session(root: &Path, name: &str, owner: Option<serde_json::Value>) -> PathBuf {
         let dir = root.join(name);
         std::fs::create_dir_all(dir.join("tmp/jarvis-vm-build-synthetic/workspace")).unwrap();
-        std::fs::write(dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz"), b"synthetic").unwrap();
+        std::fs::write(
+            dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz"),
+            b"synthetic",
+        )
+        .unwrap();
         if let Some(owner) = owner {
             std::fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
         }
@@ -546,38 +712,91 @@ mod tests {
 
     #[test]
     fn cleanup_pending_session_survives_dead_owner_and_sweep() {
-        let root=tempfile::tempdir().unwrap();let mut procs=FakeProcs::default();
-        for prefix in [SESSION_PREFIX,COMPUTE_SESSION_PREFIX] {
-            let dir=session(root.path(),&format!("{prefix}unknown-cleanup"),Some(serde_json::json!({"pid":42,"start_time":"gone"})));
-            std::fs::write(dir.join("cleanup-pending"),"supervisor receipt required\n").unwrap();
-            procs.running.insert(100,"running".into());procs.vms.push((100,"running".into(),dir.clone()));
-            let report=sweep_with(root.path(),&procs,SystemTime::now());
-            assert!(dir.is_dir(),"sweeper deleted unverified VM control/workspace state");
-            assert_eq!(report.removed,0);assert!(report.cleanup_unverified>0);
-            assert!(procs.killed.borrow().is_empty(),"sweeper killed the subreaper instead of preserving unknown cleanup");
+        let root = tempfile::tempdir().unwrap();
+        let mut procs = FakeProcs::default();
+        for prefix in [SESSION_PREFIX, COMPUTE_SESSION_PREFIX] {
+            let dir = session(
+                root.path(),
+                &format!("{prefix}unknown-cleanup"),
+                Some(serde_json::json!({"pid":42,"start_time":"gone"})),
+            );
+            std::fs::write(dir.join("cleanup-pending"), "supervisor receipt required\n").unwrap();
+            procs.running.insert(100, "running".into());
+            procs.vms.push((100, "running".into(), dir.clone()));
+            let report = sweep_with(root.path(), &procs, SystemTime::now());
+            assert!(
+                dir.is_dir(),
+                "sweeper deleted unverified VM control/workspace state"
+            );
+            assert_eq!(report.removed, 0);
+            assert!(report.cleanup_unverified > 0);
+            assert!(
+                procs.killed.borrow().is_empty(),
+                "sweeper killed the subreaper instead of preserving unknown cleanup"
+            );
         }
     }
 
     #[test]
     fn cleanup_hold_requires_exact_private_bound_receipt_before_sweep() {
-        use std::os::unix::fs::{PermissionsExt,symlink};
-        for fault in ["missing","wrong-bytes","public","symlink","live-process","none"] {
-            let root=tempfile::tempdir().unwrap();let mut procs=FakeProcs::default();
-            let dir=session(root.path(),"jarvis-vm-session-held",Some(serde_json::json!({"pid":42,"start_time":"gone"})));
-            let private=dir.join("tmp/jarvis-vm-build-held");std::fs::create_dir_all(&private).unwrap();
-            for path in [dir.join("tmp"),private.clone()] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
-            let marker=dir.join("cleanup-pending");std::fs::write(&marker,serde_json::json!({"version":1,"receipt":"tmp/jarvis-vm-build-held/cleanup-complete"}).to_string()).unwrap();
-            std::fs::set_permissions(&marker,std::fs::Permissions::from_mode(0o600)).unwrap();
-            let receipt=private.join("cleanup-complete");
-            if fault!="missing" {
-                std::fs::write(&receipt,if fault=="wrong-bytes" {b"all-descendants-reaped\r\n".as_slice()} else {b"all-descendants-reaped\n".as_slice()}).unwrap();
-                std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(if fault=="public" {0o644} else {0o600})).unwrap();
-                if fault=="symlink" {let other=private.join("other");std::fs::rename(&receipt,&other).unwrap();symlink(&other,&receipt).unwrap();}
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for fault in [
+            "missing",
+            "wrong-bytes",
+            "public",
+            "symlink",
+            "live-process",
+            "none",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut procs = FakeProcs::default();
+            let dir = session(
+                root.path(),
+                "jarvis-vm-session-held",
+                Some(serde_json::json!({"pid":42,"start_time":"gone"})),
+            );
+            let private = dir.join("tmp/jarvis-vm-build-held");
+            std::fs::create_dir_all(&private).unwrap();
+            for path in [dir.join("tmp"), private.clone()] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            if fault=="live-process" {procs.running.insert(100,"running".into());procs.vms.push((100,"running".into(),dir.clone()));}
-            let report=sweep_with(root.path(),&procs,SystemTime::now());
-            assert_eq!(dir.exists(),fault!="none","{fault}: cleanup proof boundary");
-            assert_eq!(report.removed,usize::from(fault=="none"));assert!(procs.killed.borrow().is_empty());
+            let marker = dir.join("cleanup-pending");
+            std::fs::write(&marker,serde_json::json!({"version":1,"receipt":"tmp/jarvis-vm-build-held/cleanup-complete"}).to_string()).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let receipt = private.join("cleanup-complete");
+            if fault != "missing" {
+                std::fs::write(
+                    &receipt,
+                    if fault == "wrong-bytes" {
+                        b"all-descendants-reaped\r\n".as_slice()
+                    } else {
+                        b"all-descendants-reaped\n".as_slice()
+                    },
+                )
+                .unwrap();
+                std::fs::set_permissions(
+                    &receipt,
+                    std::fs::Permissions::from_mode(if fault == "public" { 0o644 } else { 0o600 }),
+                )
+                .unwrap();
+                if fault == "symlink" {
+                    let other = private.join("other");
+                    std::fs::rename(&receipt, &other).unwrap();
+                    symlink(&other, &receipt).unwrap();
+                }
+            }
+            if fault == "live-process" {
+                procs.running.insert(100, "running".into());
+                procs.vms.push((100, "running".into(), dir.clone()));
+            }
+            let report = sweep_with(root.path(), &procs, SystemTime::now());
+            assert_eq!(
+                dir.exists(),
+                fault != "none",
+                "{fault}: cleanup proof boundary"
+            );
+            assert_eq!(report.removed, usize::from(fault == "none"));
+            assert!(procs.killed.borrow().is_empty());
         }
     }
 
@@ -613,8 +832,11 @@ mod tests {
     ///     behaviour this pinning exists to test, not to change.
     fn pin_mtime(dir: &Path, at: SystemTime) {
         let dir_file = std::fs::File::open(dir).unwrap();
-        dir_file.set_times(std::fs::FileTimes::new().set_modified(at))
-            .unwrap_or_else(|error| panic!("could not pin the mtime of {}: {error}", dir.display()));
+        dir_file
+            .set_times(std::fs::FileTimes::new().set_modified(at))
+            .unwrap_or_else(|error| {
+                panic!("could not pin the mtime of {}: {error}", dir.display())
+            });
     }
 
     /// An mtime far enough in the past that every grace window has elapsed.
@@ -637,9 +859,13 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let report = sweep();
-            if report != live { return report; }
-            assert!(std::time::Instant::now() < deadline,
-                "recovery never stopped reporting the session live");
+            if report != live {
+                return report;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovery never stopped reporting the session live"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -648,21 +874,43 @@ mod tests {
     fn exited_unreaped_owner_does_not_keep_scratch_live() {
         use std::os::fd::{AsRawFd, FromRawFd};
         let root = tempfile::tempdir().unwrap();
-        let mut child = Child(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+        let mut child = Child(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
         let pid = child.0.id();
         let start = ProcFs.start_time(pid).unwrap();
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         assert!(raw >= 0);
         let descriptor = unsafe { std::fs::File::from_raw_fd(raw as i32) };
-        let stale = session(root.path(), "jarvis-vm-session-zombie", Some(serde_json::json!({"pid":pid,"start_time":start})));
-        let live = session(root.path(), "jarvis-vm-session-live", Some(serde_json::json!({"pid":std::process::id(),"start_time":ProcFs.start_time(std::process::id()).unwrap()})));
+        let stale = session(
+            root.path(),
+            "jarvis-vm-session-zombie",
+            Some(serde_json::json!({"pid":pid,"start_time":start})),
+        );
+        let live = session(
+            root.path(),
+            "jarvis-vm-session-live",
+            Some(
+                serde_json::json!({"pid":std::process::id(),"start_time":ProcFs.start_time(std::process::id()).unwrap()}),
+            ),
+        );
         child.0.kill().unwrap();
-        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut poll = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
         // Deliberately do not reap: an orphan can retain its /proc start time.
         assert_eq!(ProcFs.start_time(pid).as_deref(), Some(start.as_str()));
         let report = sweep_with(root.path(), &ProcFs, SystemTime::now());
-        assert_eq!(report.removed, 1, "exited owner was mistaken for a live task");
+        assert_eq!(
+            report.removed, 1,
+            "exited owner was mistaken for a live task"
+        );
         assert_eq!(report.kept_live, 1);
         assert!(!stale.exists());
         assert!(live.exists());
@@ -678,11 +926,20 @@ mod tests {
     fn await_vm_processes(dir: &Path, expected: &[u32]) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let mut pids: Vec<u32> = ProcFs.vm_processes_using(dir).into_iter().map(|(pid, _)| pid).collect();
+            let mut pids: Vec<u32> = ProcFs
+                .vm_processes_using(dir)
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect();
             pids.sort_unstable();
-            if pids == expected { return; }
-            assert!(std::time::Instant::now() < deadline,
-                "vm_processes_using({}) settled on {pids:?}, expected {expected:?}", dir.display());
+            if pids == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vm_processes_using({}) settled on {pids:?}, expected {expected:?}",
+                dir.display()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -698,28 +955,45 @@ mod tests {
         /// actually reached its own code. A file the child writes proves both.
         fn spawn(program: &str, args: &[&str], ready: &Path) -> Self {
             // Wrapped before the wait so a readiness timeout still kills and reaps.
-            let child = Self(std::process::Command::new(program).args(args)
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).spawn().unwrap());
+            let child = Self(
+                std::process::Command::new(program)
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !ready.exists() {
-                assert!(std::time::Instant::now() < deadline,
-                    "{program} never signalled readiness at {}", ready.display());
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{program} never signalled readiness at {}",
+                    ready.display()
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
             child
         }
-        fn pid(&self) -> u32 { self.0.id() }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
         fn killed_by_sigkill(&mut self) -> bool {
             use std::os::unix::process::ExitStatusExt;
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(status) = self.0.try_wait().unwrap() { return status.signal() == Some(libc::SIGKILL); }
-                if std::time::Instant::now() > deadline { return false; }
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    return status.signal() == Some(libc::SIGKILL);
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        fn alive(&mut self) -> bool { self.0.try_wait().unwrap().is_none() }
+        fn alive(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
     }
 
     impl Drop for Child {
@@ -731,9 +1005,18 @@ mod tests {
 
     #[test]
     fn scratch_root_defaults_to_the_build_volume_and_honours_the_override() {
-        assert_eq!(configured_scratch_dir(None), PathBuf::from("/mnt/build/codex-vm"));
-        assert_eq!(configured_scratch_dir(Some("".into())), PathBuf::from(DEFAULT_SCRATCH_DIR));
-        assert_eq!(configured_scratch_dir(Some("/srv/scratch".into())), PathBuf::from("/srv/scratch"));
+        assert_eq!(
+            configured_scratch_dir(None),
+            PathBuf::from("/mnt/build/codex-vm")
+        );
+        assert_eq!(
+            configured_scratch_dir(Some("".into())),
+            PathBuf::from(DEFAULT_SCRATCH_DIR)
+        );
+        assert_eq!(
+            configured_scratch_dir(Some("/srv/scratch".into())),
+            PathBuf::from("/srv/scratch")
+        );
         assert!(!PathBuf::from(DEFAULT_SCRATCH_DIR).starts_with("/tmp"));
     }
 
@@ -765,14 +1048,21 @@ mod tests {
         // Integer GiB is parsed to bytes, never clamped up or down.
         assert_eq!(
             BuildScratchLimits::from_values(Some("8".into()), Some("30".into()), Some("60".into())),
-            BuildScratchLimits { headroom_bytes: 8 * gib, cache_bytes: 30 * gib, budget_bytes: 60 * gib }
+            BuildScratchLimits {
+                headroom_bytes: 8 * gib,
+                cache_bytes: 30 * gib,
+                budget_bytes: 60 * gib
+            }
         );
         // Present but not a positive integer becomes 0 bytes and fails closed —
         // never silently defaulted.
         for bad in ["0", "-4", "abc", "9.5"] {
             let limits = BuildScratchLimits::from_values(Some(bad.into()), None, None);
             assert_eq!(limits.headroom_bytes, 0, "{bad}");
-            assert!(limits.validate().is_err(), "{bad} must fail closed, not default");
+            assert!(
+                limits.validate().is_err(),
+                "{bad} must fail closed, not default"
+            );
         }
         // A GiB value that overflows u64 when scaled to bytes must fail closed
         // too — not saturate to u64::MAX and slip past validate() as an
@@ -784,9 +1074,24 @@ mod tests {
             assert!(limits.validate().is_err(), "{overflow} must fail closed");
         }
         // Each bound is rejected on its own.
-        assert!(BuildScratchLimits { headroom_bytes: 3 * gib, ..defaults }.validate().is_err());
-        assert!(BuildScratchLimits { cache_bytes: 9 * gib, ..defaults }.validate().is_err());
-        assert!(BuildScratchLimits { budget_bytes: 11 * gib, ..defaults }.validate().is_err());
+        assert!(BuildScratchLimits {
+            headroom_bytes: 3 * gib,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(BuildScratchLimits {
+            cache_bytes: 9 * gib,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(BuildScratchLimits {
+            budget_bytes: 11 * gib,
+            ..defaults
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -800,7 +1105,10 @@ mod tests {
         assert!(check_outside_write_roots(&write_root.join("not-yet-created"), &roots).is_err());
         let link = temp.path().join("link-into-checkout");
         std::os::unix::fs::symlink(write_root.join("scratch"), &link).unwrap();
-        assert!(check_outside_write_roots(&link, &roots).is_err(), "a symlink into a write root is inside it");
+        assert!(
+            check_outside_write_roots(&link, &roots).is_err(),
+            "a symlink into a write root is inside it"
+        );
         assert!(check_outside_write_roots(Path::new("relative/scratch"), &roots).is_err());
         assert!(check_outside_write_roots(&temp.path().join("scratch"), &roots).is_ok());
         assert!(check_outside_write_roots(&temp.path().join("scratch"), &[]).is_ok());
@@ -816,14 +1124,21 @@ mod tests {
         let link = temp.path().join("volume-link");
         std::os::unix::fs::symlink(&write_root, &link).unwrap();
         let roots = vec![write_root.clone()];
-        assert!(check_outside_write_roots(&link.join("later/scratch"), &roots).is_err(),
-                "a missing root below a symlink into a write root is inside it");
-        assert!(check_outside_write_roots(&temp.path().join("elsewhere/../checkout/scratch"), &roots).is_err(),
-                "parent components are refused");
+        assert!(
+            check_outside_write_roots(&link.join("later/scratch"), &roots).is_err(),
+            "a missing root below a symlink into a write root is inside it"
+        );
+        assert!(
+            check_outside_write_roots(&temp.path().join("elsewhere/../checkout/scratch"), &roots)
+                .is_err(),
+            "parent components are refused"
+        );
         assert!(check_outside_write_roots(&temp.path().join("later/scratch"), &roots).is_ok());
         // A write root that does not exist resolves the same way.
         let missing_root = vec![link.join("nested")];
-        assert!(check_outside_write_roots(&write_root.join("nested/scratch"), &missing_root).is_err());
+        assert!(
+            check_outside_write_roots(&write_root.join("nested/scratch"), &missing_root).is_err()
+        );
     }
 
     /// L1: a refused root makes builds unavailable; it never fails the launch.
@@ -832,17 +1147,35 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let checkout = temp.path().join("checkout");
         std::fs::create_dir_all(&checkout).unwrap();
-        assert_eq!(policy_scratch_dir(checkout.join("scratch"), &[checkout.clone()]), None);
-        assert_eq!(policy_scratch_dir(temp.path().join("scratch"), &[checkout]), Some(temp.path().join("scratch")));
+        assert_eq!(
+            policy_scratch_dir(checkout.join("scratch"), &[checkout.clone()]),
+            None
+        );
+        assert_eq!(
+            policy_scratch_dir(temp.path().join("scratch"), &[checkout]),
+            Some(temp.path().join("scratch"))
+        );
     }
 
     #[test]
     fn sweep_reaps_stale_sessions_and_their_vms_but_keeps_live_ones() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let stale = session(root, "jarvis-vm-session-stale", Some(serde_json::json!({"pid": 4101, "start_time": "111"})));
-        let reused = session(root, "jarvis-vm-session-reused", Some(serde_json::json!({"pid": 4102, "start_time": "222"})));
-        let live = session(root, "jarvis-vm-session-live", Some(serde_json::json!({"pid": 4103, "start_time": "333"})));
+        let stale = session(
+            root,
+            "jarvis-vm-session-stale",
+            Some(serde_json::json!({"pid": 4101, "start_time": "111"})),
+        );
+        let reused = session(
+            root,
+            "jarvis-vm-session-reused",
+            Some(serde_json::json!({"pid": 4102, "start_time": "222"})),
+        );
+        let live = session(
+            root,
+            "jarvis-vm-session-live",
+            Some(serde_json::json!({"pid": 4103, "start_time": "333"})),
+        );
         let unrelated = root.join("jarvis-vm-build-unrelated");
         std::fs::create_dir(&unrelated).unwrap();
         let outside = temp.path().join("elsewhere");
@@ -852,16 +1185,43 @@ mod tests {
         let procs = FakeProcs {
             // 4102 is running but is a different process (pid reused).
             running: HashMap::from([(4102, "999".into()), (4103, "333".into())]),
-            vms: vec![(5001, "51".into(), stale.join("tmp/jarvis-vm-build-synthetic/initrd.gz")),
-                      (5002, "52".into(), live.join("tmp/jarvis-vm-build-synthetic/initrd.gz"))],
+            vms: vec![
+                (
+                    5001,
+                    "51".into(),
+                    stale.join("tmp/jarvis-vm-build-synthetic/initrd.gz"),
+                ),
+                (
+                    5002,
+                    "52".into(),
+                    live.join("tmp/jarvis-vm-build-synthetic/initrd.gz"),
+                ),
+            ],
             ..Default::default()
         };
         let report = sweep_with(root, &procs, SystemTime::now());
-        assert_eq!(report, SweepReport { removed: 2, kept_live: 1, killed: 1, ..Default::default() });
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 2,
+                kept_live: 1,
+                killed: 1,
+                ..Default::default()
+            }
+        );
         assert!(!stale.exists() && !reused.exists());
-        assert!(live.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
-        assert_eq!(*procs.killed.borrow(), vec![5001], "only the stale session's VM is killed");
-        assert!(unrelated.exists() && outside.exists() && linked.is_symlink(), "only session dirs are touched");
+        assert!(live
+            .join("tmp/jarvis-vm-build-synthetic/initrd.gz")
+            .exists());
+        assert_eq!(
+            *procs.killed.borrow(),
+            vec![5001],
+            "only the stale session's VM is killed"
+        );
+        assert!(
+            unrelated.exists() && outside.exists() && linked.is_symlink(),
+            "only session dirs are touched"
+        );
     }
 
     #[test]
@@ -874,15 +1234,20 @@ mod tests {
             fn vm_processes_using(&self, _dir: &Path) -> Vec<(u32, String)> {
                 vec![(5001, "51".into())]
             }
-            fn kill_if_same(&self, _pid: u32, _start: &str) -> bool { false }
+            fn kill_if_same(&self, _pid: u32, _start: &str) -> bool {
+                false
+            }
             fn kill_and_wait_if_same(&self, _pid: u32, _start: &str, timeout: Duration) -> bool {
                 assert!(timeout <= Duration::from_secs(5));
                 false
             }
         }
         let root = tempfile::tempdir().unwrap();
-        let orphan = session(root.path(), "jarvis-vm-session-compute-stuck",
-            Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+        let orphan = session(
+            root.path(),
+            "jarvis-vm-session-compute-stuck",
+            Some(serde_json::json!({"pid":42,"start_time":"gone"})),
+        );
         let report = sweep_compute_with(root.path(), &Unstoppable, SystemTime::now());
         assert_eq!(report.cleanup_unverified, 1);
         assert_eq!(report.removed, 0);
@@ -893,10 +1258,26 @@ mod tests {
     fn formatter_recovery_is_scoped_to_compute_image_arguments() {
         let compute = Path::new("/scratch/jarvis-vm-session-compute-x");
         let legacy = Path::new("/scratch/jarvis-vm-session-legacy-x");
-        assert!(is_session_vm_process("mke2fs", &[compute.join("build-cache.img").display().to_string()], compute));
-        assert!(!is_session_vm_process("mke2fs", &[legacy.join("build-cache.img").display().to_string()], legacy));
-        assert!(!is_session_vm_process("mke2fs", &["/scratch/other/build-cache.img".into()], compute));
-        assert!(!is_session_vm_process("mke2fs", &["/scratch/jarvis-vm-session-compute-xy/build-cache.img".into()], compute));
+        assert!(is_session_vm_process(
+            "mke2fs",
+            &[compute.join("build-cache.img").display().to_string()],
+            compute
+        ));
+        assert!(!is_session_vm_process(
+            "mke2fs",
+            &[legacy.join("build-cache.img").display().to_string()],
+            legacy
+        ));
+        assert!(!is_session_vm_process(
+            "mke2fs",
+            &["/scratch/other/build-cache.img".into()],
+            compute
+        ));
+        assert!(!is_session_vm_process(
+            "mke2fs",
+            &["/scratch/jarvis-vm-session-compute-xy/build-cache.img".into()],
+            compute
+        ));
     }
 
     /// #1467: this test was flaky. Reproduced on Linux with
@@ -912,25 +1293,58 @@ mod tests {
         use std::os::fd::AsRawFd;
         let root = tempfile::tempdir().unwrap();
         let partial = session(root.path(), "jarvis-vm-session-compute-partial", None);
-        let legacy = session(root.path(), "jarvis-vm-session-legacy", Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+        let legacy = session(
+            root.path(),
+            "jarvis-vm-session-legacy",
+            Some(serde_json::json!({"pid":42,"start_time":"gone"})),
+        );
         let base = pinned_base();
         pin_mtime(&partial, base);
         let guard = std::fs::File::open(root.path()).unwrap();
-        assert_eq!(unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert_eq!(
+            unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         // Still inside the startup grace: kept for its age alone, lock aside.
-        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(),
-            base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)),
-            SweepReport { kept_live: 1, ..Default::default() });
+        assert_eq!(
+            sweep_compute_with(
+                root.path(),
+                &FakeProcs::default(),
+                base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)
+            ),
+            SweepReport {
+                kept_live: 1,
+                ..Default::default()
+            }
+        );
         let later = base + COMPUTE_OWNERLESS_GRACE + Duration::from_secs(1);
-        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later),
-            SweepReport { kept_live: 1, ..Default::default() }, "the lock did not hold off recovery");
+        assert_eq!(
+            sweep_compute_with(root.path(), &FakeProcs::default(), later),
+            SweepReport {
+                kept_live: 1,
+                ..Default::default()
+            },
+            "the lock did not hold off recovery"
+        );
         assert!(partial.exists());
         drop(guard);
         assert_eq!(
-            sweep_until_removed(|| sweep_compute_with(root.path(), &FakeProcs::default(), later),
-                SweepReport { kept_live: 1, ..Default::default() }),
-            SweepReport { removed: 1, ..Default::default() });
-        assert!(legacy.exists(), "frequent compute recovery touched a legacy build");
+            sweep_until_removed(
+                || sweep_compute_with(root.path(), &FakeProcs::default(), later),
+                SweepReport {
+                    kept_live: 1,
+                    ..Default::default()
+                }
+            ),
+            SweepReport {
+                removed: 1,
+                ..Default::default()
+            }
+        );
+        assert!(
+            legacy.exists(),
+            "frequent compute recovery touched a legacy build"
+        );
     }
 
     #[test]
@@ -942,12 +1356,27 @@ mod tests {
         pin_mtime(&compute, base);
         pin_mtime(&legacy, base);
         let procs = FakeProcs::default();
-        assert_eq!(sweep_with(root.path(), &procs,
-            base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)).kept_live, 2);
+        assert_eq!(
+            sweep_with(
+                root.path(),
+                &procs,
+                base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)
+            )
+            .kept_live,
+            2
+        );
         let later = base + COMPUTE_OWNERLESS_GRACE + Duration::from_secs(1);
-        let report = sweep_until_removed(|| sweep_with(root.path(), &procs, later),
-            SweepReport { kept_live: 2, ..Default::default() });
-        assert_eq!(report.removed, 1, "partial compute initialization exceeds its recovery bound");
+        let report = sweep_until_removed(
+            || sweep_with(root.path(), &procs, later),
+            SweepReport {
+                kept_live: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            report.removed, 1,
+            "partial compute initialization exceeds its recovery bound"
+        );
         assert!(!compute.exists());
         assert!(legacy.exists(), "legacy initialization grace changed");
     }
@@ -959,14 +1388,33 @@ mod tests {
         let base = pinned_base();
         pin_mtime(&starting, base);
         let procs = FakeProcs::default();
-        assert_eq!(sweep_with(temp.path(), &procs,
-            base + OWNERLESS_GRACE - Duration::from_secs(1)).kept_live, 1);
+        assert_eq!(
+            sweep_with(
+                temp.path(),
+                &procs,
+                base + OWNERLESS_GRACE - Duration::from_secs(1)
+            )
+            .kept_live,
+            1
+        );
         assert!(starting.exists());
         let later = base + OWNERLESS_GRACE + Duration::from_secs(1);
-        assert_eq!(sweep_until_removed(|| sweep_with(temp.path(), &procs, later),
-            SweepReport { kept_live: 1, ..Default::default() }).removed, 1);
+        assert_eq!(
+            sweep_until_removed(
+                || sweep_with(temp.path(), &procs, later),
+                SweepReport {
+                    kept_live: 1,
+                    ..Default::default()
+                }
+            )
+            .removed,
+            1
+        );
         assert!(!starting.exists());
-        assert_eq!(sweep_with(&temp.path().join("absent"), &procs, later), SweepReport::default());
+        assert_eq!(
+            sweep_with(&temp.path().join("absent"), &procs, later),
+            SweepReport::default()
+        );
     }
 
     #[test]
@@ -974,20 +1422,45 @@ mod tests {
         let dir = Path::new("/scratch/jarvis-vm-session-x");
         let arg = |a: &str| a.to_string();
         let initrd = arg("/scratch/jarvis-vm-session-x/tmp/jarvis-build-vm-1/initrd.gz");
-        assert!(is_session_vm_process("qemu-system-x86_64", &[arg("-initrd"), initrd.clone()], dir));
-        assert!(is_session_vm_process("python3.12", &[arg("-I"), arg("/launch/supervisor.py"), initrd.clone()], dir));
-        assert!(is_session_vm_process("qemu-system-x86_64",
-            &[arg("local,id=workspace,path=/scratch/jarvis-vm-session-x/tmp/w,security_model=none")], dir));
+        assert!(is_session_vm_process(
+            "qemu-system-x86_64",
+            &[arg("-initrd"), initrd.clone()],
+            dir
+        ));
+        assert!(is_session_vm_process(
+            "python3.12",
+            &[arg("-I"), arg("/launch/supervisor.py"), initrd.clone()],
+            dir
+        ));
+        assert!(is_session_vm_process(
+            "qemu-system-x86_64",
+            &[arg(
+                "local,id=workspace,path=/scratch/jarvis-vm-session-x/tmp/w,security_model=none"
+            )],
+            dir
+        ));
         assert!(is_session_vm_process("qemu-system-x86_64",
             &[arg("if=none,id=buildcache,werror=report,file=/scratch/jarvis-vm-session-x/build-cache.img")], dir));
         // Other executables never match, even with the exact argument.
         assert!(!is_session_vm_process("bash", &[initrd.clone()], dir));
         assert!(!is_session_vm_process("du", &[initrd.clone()], dir));
         // An argument that merely mentions the path does not match.
-        assert!(!is_session_vm_process("python3", &[arg("-c"), arg("print('/scratch/jarvis-vm-session-x/')")], dir));
-        assert!(!is_session_vm_process("qemu-system-x86_64", &[arg("-name=/scratch/jarvis-vm-session-x/")], dir));
+        assert!(!is_session_vm_process(
+            "python3",
+            &[arg("-c"), arg("print('/scratch/jarvis-vm-session-x/')")],
+            dir
+        ));
+        assert!(!is_session_vm_process(
+            "qemu-system-x86_64",
+            &[arg("-name=/scratch/jarvis-vm-session-x/")],
+            dir
+        ));
         // A sibling session whose name extends this one is a different session.
-        assert!(!is_session_vm_process("qemu-system-x86_64", &[arg("/scratch/jarvis-vm-session-xy/build-cache.img")], dir));
+        assert!(!is_session_vm_process(
+            "qemu-system-x86_64",
+            &[arg("/scratch/jarvis-vm-session-xy/build-cache.img")],
+            dir
+        ));
     }
 
     /// M1 with real processes: a stale session's VM-like python3 is killed; a
@@ -995,7 +1468,11 @@ mod tests {
     #[test]
     fn real_sweep_kills_only_vm_processes_of_a_stale_session() {
         let temp = tempfile::tempdir().unwrap();
-        let stale = session(temp.path(), "jarvis-vm-session-stale", Some(serde_json::json!({"pid": u32::MAX, "start_time": "1"})));
+        let stale = session(
+            temp.path(),
+            "jarvis-vm-session-stale",
+            Some(serde_json::json!({"pid": u32::MAX, "start_time": "1"})),
+        );
         // The non-matching children signal readiness outside any session
         // directory: a sibling of the session dirs is ignored by the sweep, and
         // a path under `stale` would make them genuine matches.
@@ -1005,38 +1482,82 @@ mod tests {
         // its existence proves the argv the sweep matches on is installed.
         let vm_arg = stale.join("tmp/jarvis-build-vm-synthetic/cleanup-complete");
         std::fs::create_dir_all(vm_arg.parent().unwrap()).unwrap();
-        let mut vm_like = Child::spawn("python3",
-            &["-c", READY_THEN_SLEEP, &vm_arg.to_string_lossy()], &vm_arg);
+        let mut vm_like = Child::spawn(
+            "python3",
+            &["-c", READY_THEN_SLEEP, &vm_arg.to_string_lossy()],
+            &vm_arg,
+        );
         // `sleep 60` is not the last command, so bash does not exec away its argv.
-        let mut shell = Child::spawn("bash",
-            &["-c", &format!("touch {}; sleep 60; : {}/", ready.join("shell").display(), stale.display())],
-            &ready.join("shell"));
-        let mut mention = Child::spawn("python3",
-            &["-c", &format!("{READY_THEN_SLEEP} # {}/", stale.display()), &ready.join("mention").to_string_lossy()],
-            &ready.join("mention"));
+        let mut shell = Child::spawn(
+            "bash",
+            &[
+                "-c",
+                &format!(
+                    "touch {}; sleep 60; : {}/",
+                    ready.join("shell").display(),
+                    stale.display()
+                ),
+            ],
+            &ready.join("shell"),
+        );
+        let mut mention = Child::spawn(
+            "python3",
+            &[
+                "-c",
+                &format!("{READY_THEN_SLEEP} # {}/", stale.display()),
+                &ready.join("mention").to_string_lossy(),
+            ],
+            &ready.join("mention"),
+        );
         await_vm_processes(&stale, &[vm_like.pid()]);
         let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
         assert_eq!((report.removed, report.killed), (1, 1), "{report:?}");
-        assert!(vm_like.killed_by_sigkill(), "the stale session's VM process must be killed");
-        assert!(shell.alive(), "a shell mentioning the session path must survive");
-        assert!(mention.alive(), "a python3 that only mentions the path must survive");
+        assert!(
+            vm_like.killed_by_sigkill(),
+            "the stale session's VM process must be killed"
+        );
+        assert!(
+            shell.alive(),
+            "a shell mentioning the session path must survive"
+        );
+        assert!(
+            mention.alive(),
+            "a python3 that only mentions the path must survive"
+        );
         assert!(!stale.exists());
     }
 
     #[test]
     fn compute_recovery_verifies_real_process_exit_and_preserves_reused_pid() {
         let root = tempfile::tempdir().unwrap();
-        let stale = session(root.path(), "jarvis-vm-session-compute-real",
-            Some(serde_json::json!({"pid":u32::MAX,"start_time":"gone"})));
+        let stale = session(
+            root.path(),
+            "jarvis-vm-session-compute-real",
+            Some(serde_json::json!({"pid":u32::MAX,"start_time":"gone"})),
+        );
         let ready = stale.join("ready");
-        let mut child = Child::spawn("python3", &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()], &ready);
+        let mut child = Child::spawn(
+            "python3",
+            &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()],
+            &ready,
+        );
         await_vm_processes(&stale, &[child.pid()]);
         assert!(ProcFs.kill_and_wait_if_same(child.pid(), "mismatched-start", Duration::ZERO));
         assert!(child.alive(), "mismatched PID identity was signalled");
         let start = ProcFs.start_time(child.pid()).unwrap();
         let report = sweep_compute_with(root.path(), &ProcFs, SystemTime::now());
-        assert_eq!(report, SweepReport { removed: 1, killed: 1, ..Default::default() });
-        assert!(!ProcFs.is_live(child.pid(), &start), "storage removed before process termination");
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 1,
+                killed: 1,
+                ..Default::default()
+            }
+        );
+        assert!(
+            !ProcFs.is_live(child.pid(), &start),
+            "storage removed before process termination"
+        );
         assert!(child.killed_by_sigkill());
         assert!(!stale.exists());
     }
@@ -1048,17 +1569,39 @@ mod tests {
         let dir = temp.path().join("jarvis-vm-session-live");
         let ready = temp.path().join("ready");
         std::fs::create_dir(&ready).unwrap();
-        let mut owner = Child::spawn("python3",
-            &["-c", READY_THEN_SLEEP, &ready.join("owner").to_string_lossy()], &ready.join("owner"));
+        let mut owner = Child::spawn(
+            "python3",
+            &[
+                "-c",
+                READY_THEN_SLEEP,
+                &ready.join("owner").to_string_lossy(),
+            ],
+            &ready.join("owner"),
+        );
         let start = ProcFs.start_time(owner.pid()).unwrap();
-        session(temp.path(), "jarvis-vm-session-live", Some(serde_json::json!({"pid": owner.pid(), "start_time": start})));
+        session(
+            temp.path(),
+            "jarvis-vm-session-live",
+            Some(serde_json::json!({"pid": owner.pid(), "start_time": start})),
+        );
         let arg = dir.join("tmp/jarvis-build-vm-synthetic/cleanup-complete");
         std::fs::create_dir_all(arg.parent().unwrap()).unwrap();
-        let mut vm_like = Child::spawn("python3",
-            &["-c", READY_THEN_SLEEP, &arg.to_string_lossy()], &arg);
+        let mut vm_like = Child::spawn(
+            "python3",
+            &["-c", READY_THEN_SLEEP, &arg.to_string_lossy()],
+            &arg,
+        );
         await_vm_processes(&dir, &[vm_like.pid()]);
         let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
-        assert_eq!(report, SweepReport { removed: 0, kept_live: 1, killed: 0, ..Default::default() });
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 0,
+                kept_live: 1,
+                killed: 0,
+                ..Default::default()
+            }
+        );
         assert!(dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
         assert!(owner.alive() && vm_like.alive());
     }
@@ -1067,9 +1610,15 @@ mod tests {
     fn kill_if_same_refuses_a_mismatched_start_time() {
         let temp = tempfile::tempdir().unwrap();
         let ready = temp.path().join("ready");
-        let mut child = Child::spawn("python3",
-            &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()], &ready);
-        assert!(!ProcFs.kill_if_same(child.pid(), "0"), "a reused pid (other start time) is never signalled");
+        let mut child = Child::spawn(
+            "python3",
+            &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()],
+            &ready,
+        );
+        assert!(
+            !ProcFs.kill_if_same(child.pid(), "0"),
+            "a reused pid (other start time) is never signalled"
+        );
         assert!(child.alive());
         let start = ProcFs.start_time(child.pid()).unwrap();
         assert!(ProcFs.kill_if_same(child.pid(), &start));
@@ -1081,7 +1630,9 @@ mod tests {
     #[test]
     #[ignore = "live: reaps real stale sessions under JARVIS_TEST_BUILD_SCRATCH"]
     fn live_sweep_reaps_a_killed_bridge_session_and_its_vm() {
-        let Some(root) = std::env::var_os("JARVIS_TEST_BUILD_SCRATCH") else { return };
+        let Some(root) = std::env::var_os("JARVIS_TEST_BUILD_SCRATCH") else {
+            return;
+        };
         let report = sweep_with(Path::new(&root), &ProcFs, SystemTime::now());
         println!("SWEEP_REPORT {report:?}");
     }

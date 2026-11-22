@@ -170,9 +170,7 @@ impl SkillRegistry {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        format!(
-            "Skills available (load with the Skill tool when relevant): {body}."
-        )
+        format!("Skills available (load with the Skill tool when relevant): {body}.")
     }
 }
 

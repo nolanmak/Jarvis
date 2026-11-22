@@ -311,13 +311,19 @@ pub struct AuditLogger {
     owned_runs: Arc<cancellation::Registry>,
     path: PathBuf,
     native_progress_observer: Arc<std::sync::Mutex<Option<Arc<native_progress::Observer>>>>,
-    model_call_observer:
-        Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<Option<String>> + Send + Sync>>>>,
-    dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
+    model_call_observer: Arc<
+        std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<Option<String>> + Send + Sync>>>,
+    >,
+    dispatch_observer:
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
-    resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
+    resource_capacity_observer: Arc<
+        std::sync::Mutex<
+            Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>,
+        >,
+    >,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
     failure_path: Option<PathBuf>,
     pending_dir: Option<PathBuf>,
@@ -382,36 +388,69 @@ impl std::fmt::Debug for AuditLogger {
 impl AuditLogger {
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
-    pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
-        anyhow::ensure!(self.pending_writers.load(std::sync::atomic::Ordering::Acquire) == 0, "audit writers still active");
-        let sink = self.anchored.as_ref().ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
+    pub fn recovery_evidence(
+        &self,
+        new_lease_generation: i64,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "audit writers still active"
+        );
+        let sink = self
+            .anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
         let mut tickets = Vec::new();
         if let Some(dir) = &self.pending_dir {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
-                anyhow::ensure!(entry.file_type()?.is_file(), "invalid interrupted audit ticket");
+                anyhow::ensure!(
+                    entry.file_type()?.is_file(),
+                    "invalid interrupted audit ticket"
+                );
                 tickets.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         tickets.sort();
-        anyhow::ensure!(self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
-            || self.failure_path.as_ref().is_some_and(|path| path.exists())
-            || !tickets.is_empty(), "healthy audit generation cannot be replaced");
+        anyhow::ensure!(
+            self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+                || self.failure_path.as_ref().is_some_and(|path| path.exists())
+                || !tickets.is_empty(),
+            "healthy audit generation cannot be replaced"
+        );
         sink.seal_for_recovery(|rows| {
-            let generation = rows.iter().filter(|r| r["actor"] == "controller")
-                .filter_map(|r| r["generation"].as_i64()).max()
+            let generation = rows
+                .iter()
+                .filter(|r| r["actor"] == "controller")
+                .filter_map(|r| r["generation"].as_i64())
+                .max()
                 .ok_or_else(|| anyhow::anyhow!("previous workflow lease evidence missing"))?;
-            anyhow::ensure!(generation < new_lease_generation, "recovery requires a newer fenced lease");
-            let required = rows.iter().position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
+            anyhow::ensure!(
+                generation < new_lease_generation,
+                "recovery requires a newer fenced lease"
+            );
+            let required = rows
+                .iter()
+                .position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
                 .ok_or_else(|| anyhow::anyhow!("durable required resource policy missing"))?;
             let mut proofs = Vec::new();
             for (index, row) in rows.iter().enumerate() {
                 if row["kind"] == "run_resource_admitted" {
-                    anyhow::ensure!(index > required && row["actor"] == "controller", "unprotected resource admission");
-                    proofs.push(crate::run_resources::verify_quiescent(&row["observation"]["identity"])?);
+                    anyhow::ensure!(
+                        index > required && row["actor"] == "controller",
+                        "unprotected resource admission"
+                    );
+                    proofs.push(crate::run_resources::verify_quiescent(
+                        &row["observation"]["identity"],
+                    )?);
                 }
                 if row["kind"] == "model_call_admitted" {
-                    anyhow::ensure!(index > required && !proofs.is_empty(), "model dispatch without protected resource admission");
+                    anyhow::ensure!(
+                        index > required && !proofs.is_empty(),
+                        "model dispatch without protected resource admission"
+                    );
                 }
             }
             Ok(serde_json::json!({"previous_lease_generation":generation,
@@ -420,37 +459,77 @@ impl AuditLogger {
         })
     }
 
-    pub fn set_resource_capacity_observer(&self, observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>) -> anyhow::Result<()> {
-        *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
+    pub fn set_resource_capacity_observer(
+        &self,
+        observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .resource_capacity_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource observer lock poisoned"))? = Some(observer);
         Ok(())
     }
     /// Controller-owned workflow requirement, independent of model/child env.
     pub fn require_run_resources(&self) -> anyhow::Result<()> {
         self.protected_health()?;
-        anyhow::ensure!(self.is_protected(),"workflow resources require protected audit");
-        self.record_controller(serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}))?;
-        self.run_resources_required.store(true,std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            self.is_protected(),
+            "workflow resources require protected audit"
+        );
+        self.record_controller(
+            serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}),
+        )?;
+        self.run_resources_required
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    pub fn run_resources_required(&self) -> bool { self.run_resources_required.load(std::sync::atomic::Ordering::SeqCst) }
-    pub fn resource_capacity_seen(&self) -> bool { self.resource_capacity_seen.load(std::sync::atomic::Ordering::SeqCst) }
-    pub fn resource_capacity_exhausted(&self, observation: &serde_json::Value) -> anyhow::Result<()> {
-        self.resource_capacity_seen.store(true,std::sync::atomic::Ordering::SeqCst);
-        let observer=self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?.clone();
-        if let Some(observer)=observer {observer(observation)?;}
+    pub fn run_resources_required(&self) -> bool {
+        self.run_resources_required
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn resource_capacity_seen(&self) -> bool {
+        self.resource_capacity_seen
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn resource_capacity_exhausted(
+        &self,
+        observation: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.resource_capacity_seen
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let observer = self
+            .resource_capacity_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource observer lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer(observation)?;
+        }
         Ok(())
     }
 
     /// Workflow admission for both model and verification launches. This must
     /// run again at the supervisor's final release, after asynchronous setup.
-    pub fn set_dispatch_observer(&self,observer:Arc<dyn Fn()->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
-        *self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?=Some(observer);
+    pub fn set_dispatch_observer(
+        &self,
+        observer: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .dispatch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dispatch observer lock poisoned"))? = Some(observer);
         Ok(())
     }
-    pub fn dispatch_allowed(&self)->anyhow::Result<()> {
+    pub fn dispatch_allowed(&self) -> anyhow::Result<()> {
         self.owned_runs.require_dispatch()?;
-        let observer=self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?.clone();
-        if let Some(observer)=observer {observer()?;}
+        let observer = self
+            .dispatch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dispatch observer lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer()?;
+        }
         Ok(())
     }
 
@@ -458,9 +537,14 @@ impl AuditLogger {
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
     ) -> anyhow::Result<()> {
-        *self.model_call_observer.lock()
+        *self
+            .model_call_observer
+            .lock()
             .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? =
-            Some(Arc::new(move |provider| { observer(provider)?; Ok(None) }));
+            Some(Arc::new(move |provider| {
+                observer(provider)?;
+                Ok(None)
+            }));
         Ok(())
     }
 
@@ -470,23 +554,33 @@ impl AuditLogger {
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>,
     ) -> anyhow::Result<()> {
-        *self.model_call_observer.lock()
+        *self
+            .model_call_observer
+            .lock()
             .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? =
             Some(Arc::new(move |provider| observer(provider).map(Some)));
         Ok(())
     }
 
     pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
-        self.record_model_admission(provider,None)
+        self.record_model_admission(provider, None)
     }
 
     /// Bind a protected model turn to the exact controller resource receipt.
     /// Ordering alone cannot associate it with a later quiescence proof.
-    pub(crate) fn model_call_admitted_in_scope(&self,provider:&str,identity:&serde_json::Value)->anyhow::Result<()> {
-        self.record_model_admission(provider,Some(identity))
+    pub(crate) fn model_call_admitted_in_scope(
+        &self,
+        provider: &str,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.record_model_admission(provider, Some(identity))
     }
 
-    fn record_model_admission(&self,provider:&str,identity:Option<&serde_json::Value>)->anyhow::Result<()> {
+    fn record_model_admission(
+        &self,
+        provider: &str,
+        identity: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
         let observer = self
             .model_call_observer
             .lock()
@@ -497,15 +591,18 @@ impl AuditLogger {
             None => None,
         };
         if let Some(receipt) = &accounting_receipt {
-            anyhow::ensure!(!receipt.is_empty() && receipt.len() <= 512
-                && receipt.bytes().all(|byte| byte.is_ascii_graphic()),
-                "invalid model accounting receipt");
+            anyhow::ensure!(
+                !receipt.is_empty()
+                    && receipt.len() <= 512
+                    && receipt.bytes().all(|byte| byte.is_ascii_graphic()),
+                "invalid model accounting receipt"
+            );
         }
         if self.anchored.is_some() {
-            let mut record=serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
-            if let Some(identity)=identity {
-                record["admission_schema_version"]=2.into();
-                record["resource_identity"]=identity.clone();
+            let mut record = serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
+            if let Some(identity) = identity {
+                record["admission_schema_version"] = 2.into();
+                record["resource_identity"] = identity.clone();
             }
             if let Some(receipt) = accounting_receipt {
                 record["accounting_schema_version"] = 1.into();
@@ -519,15 +616,31 @@ impl AuditLogger {
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
     /// Set once for this logger instance after the workflow's fenced claim.
-    pub fn set_native_runtime_owner(&self, owner:crate::native_vm::RuntimeOwner)->anyhow::Result<()> {
-        anyhow::ensure!(self.is_protected() && owner.lease_generation>0 && !owner.workflow_id.is_empty(),"invalid native runtime owner");
-        let mut current=self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?;
-        anyhow::ensure!(current.as_ref().is_none_or(|existing|existing==&owner),"native runtime owner cannot change within a logger instance");
-        *current=Some(owner);
+    pub fn set_native_runtime_owner(
+        &self,
+        owner: crate::native_vm::RuntimeOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_protected() && owner.lease_generation > 0 && !owner.workflow_id.is_empty(),
+            "invalid native runtime owner"
+        );
+        let mut current = self
+            .native_runtime_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native owner lock poisoned"))?;
+        anyhow::ensure!(
+            current.as_ref().is_none_or(|existing| existing == &owner),
+            "native runtime owner cannot change within a logger instance"
+        );
+        *current = Some(owner);
         Ok(())
     }
-    pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
-        Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
+    pub fn native_runtime_owner(&self) -> anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
+        Ok(self
+            .native_runtime_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native owner lock poisoned"))?
+            .clone())
     }
 
     pub fn new(path: PathBuf) -> Self {
@@ -606,7 +719,11 @@ impl AuditLogger {
         result
     }
 
-    async fn record_value_checked(&self, value: serde_json::Value, step: Option<native_progress::CompletedToolStep>) -> anyhow::Result<()> {
+    async fn record_value_checked(
+        &self,
+        value: serde_json::Value,
+        step: Option<native_progress::CompletedToolStep>,
+    ) -> anyhow::Result<()> {
         let sink = self
             .anchored
             .clone()
@@ -614,7 +731,9 @@ impl AuditLogger {
         let ticket = self.begin_write()?;
         let logger = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let result = sink.append(value).and_then(|()| logger.publish_native_progress(step.as_ref()));
+            let result = sink
+                .append(value)
+                .and_then(|()| logger.publish_native_progress(step.as_ref()));
             if result.is_err() {
                 logger.mark_failed();
             }
@@ -661,16 +780,21 @@ impl AuditLogger {
     /// Register BEFORE spawning a writer. Durable tickets survive cancellation
     /// and process death; a restarted logger cannot silently forget lost rows.
     pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
-        if let Some(sink)=&self.anchored {
-            let result=sink.with_open_generation(||self.register_writer_ticket());
-            if result.as_ref().is_err_and(|error|!error.is::<crate::audit_chain::GenerationSealed>()) {
+        if let Some(sink) = &self.anchored {
+            let result = sink.with_open_generation(|| self.register_writer_ticket());
+            if result
+                .as_ref()
+                .is_err_and(|error| !error.is::<crate::audit_chain::GenerationSealed>())
+            {
                 self.mark_failed();
             }
             result
-        } else {self.register_writer_ticket()}
+        } else {
+            self.register_writer_ticket()
+        }
     }
 
-    fn register_writer_ticket(&self)->anyhow::Result<AuditWriteGuard> {
+    fn register_writer_ticket(&self) -> anyhow::Result<AuditWriteGuard> {
         let pending = if let Some(dir) = &self.pending_dir {
             let path = dir.join(uuid::Uuid::new_v4().to_string());
             let result = (|| -> anyhow::Result<()> {
@@ -884,19 +1008,29 @@ pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
 }
 
 fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
-    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern"));
-    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
-        .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
+    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern")
+    });
+    tool == "Bash"
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
 }
 
-const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
+const PRIVATE_COMPOSE_COMMAND: &str =
+    "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
 
 fn is_private_draft_context(tool: &str, args: &serde_json::Value) -> bool {
-    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#).expect("context audit pattern"));
-    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
-        .is_some_and(|command|CONTEXT.is_match(&command.replace("\\\n", "")))
+    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#)
+            .expect("context audit pattern")
+    });
+    tool == "Bash"
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|command| CONTEXT.is_match(&command.replace("\\\n", "")))
 }
 
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
@@ -921,13 +1055,20 @@ pub fn build_audit_record(
     // and result echoes, rather than attempting to parse private shell args.
     let private_compose = is_private_imessage_compose(&tool, &args);
     let private_context = is_private_draft_context(&tool, &args);
-    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) }
-        else if private_context {serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})} else { args };
+    let args = if private_compose {
+        serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
+    } else if private_context {
+        serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})
+    } else {
+        args
+    };
     let (captured, _truncated) = truncate_stream(if private_compose {
         "[iMessage compose output omitted; inspect approval card]"
     } else if private_context {
         "[Private draft evidence omitted; inspect the context receipt]"
-    } else { result_content });
+    } else {
+        result_content
+    });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
     // stream-json event shape, but recording the captured text on the
@@ -951,7 +1092,11 @@ pub fn build_audit_record(
     });
     AuditRecord {
         provider: Some(provider.name().to_string()),
-        native_step: if private_compose { None } else { native_progress::completed(provider, &tool, &args, result_content, is_error) },
+        native_step: if private_compose {
+            None
+        } else {
+            native_progress::completed(provider, &tool, &args, result_content, is_error)
+        },
         model: None,
         ts,
         session_id,
@@ -973,7 +1118,9 @@ pub fn format_notice(record: &AuditRecord) -> String {
     // pathological input.
     let safe_args = if is_private_imessage_compose(&record.tool, &record.args) {
         serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
-    } else { record.args.clone() };
+    } else {
+        record.args.clone()
+    };
     let arg_summary = safe_args
         .get("file_path")
         .or_else(|| safe_args.get("path"))
@@ -1427,9 +1574,12 @@ mod tests {
     }
 
     fn model_admission_rows(log: &Path) -> Vec<serde_json::Value> {
-        std::fs::read_to_string(log).unwrap_or_default().lines()
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|row| row["kind"] == "model_call_admitted").collect()
+            .filter(|row| row["kind"] == "model_call_admitted")
+            .collect()
     }
 
     #[test]
@@ -1437,14 +1587,21 @@ mod tests {
         let (_dir, logger, log, _anchor) = protected_fixture();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
-        logger.set_model_call_observer(Arc::new(|_| panic!("replaced observer ran"))).unwrap();
-        logger.set_correlated_model_call_observer(Arc::new(move |provider| {
-            assert_eq!(provider, "codex");
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("synthetic-charge-17".into())
-        })).unwrap();
-        let identity = serde_json::json!({"scope": "synthetic-scope", "limits": {"memory_max_bytes": 1024}});
-        logger.model_call_admitted_in_scope("codex", &identity).unwrap();
+        logger
+            .set_model_call_observer(Arc::new(|_| panic!("replaced observer ran")))
+            .unwrap();
+        logger
+            .set_correlated_model_call_observer(Arc::new(move |provider| {
+                assert_eq!(provider, "codex");
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("synthetic-charge-17".into())
+            }))
+            .unwrap();
+        let identity =
+            serde_json::json!({"scope": "synthetic-scope", "limits": {"memory_max_bytes": 1024}});
+        logger
+            .model_call_admitted_in_scope("codex", &identity)
+            .unwrap();
         let rows = model_admission_rows(&log);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["accounting_receipt"], "synthetic-charge-17");
@@ -1462,10 +1619,12 @@ mod tests {
         logger.model_call_admitted("codex").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
-        logger.set_model_call_observer(Arc::new(move |_| {
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        })).unwrap();
+        logger
+            .set_model_call_observer(Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
         logger.model_call_admitted("claude").unwrap();
         let rows = model_admission_rows(&log);
         assert_eq!(rows.len(), 2);
@@ -1487,27 +1646,43 @@ mod tests {
         let (started, captured) = std::sync::mpsc::channel();
         let (released, resume) = std::sync::mpsc::channel();
         let resume = std::sync::Mutex::new(resume);
-        logger.set_correlated_model_call_observer(Arc::new(move |_| {
-            started.send(()).unwrap();
-            resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5))?;
-            Ok("captured-charge".into())
-        })).unwrap();
+        logger
+            .set_correlated_model_call_observer(Arc::new(move |_| {
+                started.send(()).unwrap();
+                resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))?;
+                Ok("captured-charge".into())
+            }))
+            .unwrap();
         let active = std::thread::spawn(move || clone.model_call_admitted("codex"));
-        captured.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         // Replacement must not need the mutex held by an executing callback.
         let replacement = logger.clone();
         let (changed, observed) = std::sync::mpsc::channel();
         let setter = std::thread::spawn(move || {
-            replacement.set_correlated_model_call_observer(Arc::new(|_| Ok("next-charge".into()))).unwrap();
+            replacement
+                .set_correlated_model_call_observer(Arc::new(|_| Ok("next-charge".into())))
+                .unwrap();
             changed.send(()).unwrap();
         });
-        let replaced_before_release = observed.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        let replaced_before_release = observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
         released.send(()).unwrap();
         active.join().unwrap().unwrap();
         setter.join().unwrap();
-        assert!(replaced_before_release, "callback retained the observer mutex");
+        assert!(
+            replaced_before_release,
+            "callback retained the observer mutex"
+        );
         logger.model_call_admitted("codex").unwrap();
-        logger.set_model_call_observer(Arc::new(|_| Ok(()))).unwrap();
+        logger
+            .set_model_call_observer(Arc::new(|_| Ok(())))
+            .unwrap();
         logger.model_call_admitted("codex").unwrap();
         let rows = model_admission_rows(&log);
         assert_eq!(rows.len(), 3);
@@ -1519,15 +1694,24 @@ mod tests {
 
     #[test]
     fn model_admission_rejects_invalid_receipts_without_undoing_the_callback() {
-        for receipt in [String::new(), "r".repeat(513), "has space".into(),
-            "line\nbreak".into(), "tab\tbreak".into(), "nul\0byte".into(), "café".into()] {
+        for receipt in [
+            String::new(),
+            "r".repeat(513),
+            "has space".into(),
+            "line\nbreak".into(),
+            "tab\tbreak".into(),
+            "nul\0byte".into(),
+            "café".into(),
+        ] {
             let (_dir, logger, log, _anchor) = protected_fixture();
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let observed = calls.clone();
-            logger.set_correlated_model_call_observer(Arc::new(move |_| {
-                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(receipt.clone())
-            })).unwrap();
+            logger
+                .set_correlated_model_call_observer(Arc::new(move |_| {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(receipt.clone())
+                }))
+                .unwrap();
             assert!(logger.model_call_admitted("codex").is_err());
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert!(model_admission_rows(&log).is_empty());
@@ -1537,7 +1721,9 @@ mod tests {
             let (_dir, logger, log, _anchor) = protected_fixture();
             let receipt = "r".repeat(bytes);
             let returned = receipt.clone();
-            logger.set_correlated_model_call_observer(Arc::new(move |_| Ok(returned.clone()))).unwrap();
+            logger
+                .set_correlated_model_call_observer(Arc::new(move |_| Ok(returned.clone())))
+                .unwrap();
             logger.model_call_admitted("codex").unwrap();
             assert_eq!(model_admission_rows(&log)[0]["accounting_receipt"], receipt);
             logger.protected_health().unwrap();
@@ -1549,25 +1735,31 @@ mod tests {
         let (_dir, logger, log, _anchor) = protected_fixture();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
-        logger.set_correlated_model_call_observer(Arc::new(move |_| {
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            anyhow::bail!("synthetic accounting refusal")
-        })).unwrap();
+        logger
+            .set_correlated_model_call_observer(Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("synthetic accounting refusal")
+            }))
+            .unwrap();
         assert!(logger.model_call_admitted("codex").is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(model_admission_rows(&log).is_empty());
         logger.protected_health().unwrap();
 
         let (_dir, logger, log, _anchor) = protected_fixture();
-        logger.record_controller(serde_json::json!({"kind": "synthetic-start"})).unwrap();
+        logger
+            .record_controller(serde_json::json!({"kind": "synthetic-start"}))
+            .unwrap();
         std::fs::remove_file(&log).unwrap();
         std::fs::create_dir(&log).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
-        logger.set_correlated_model_call_observer(Arc::new(move |_| {
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("already-committed-charge".into())
-        })).unwrap();
+        logger
+            .set_correlated_model_call_observer(Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("already-committed-charge".into())
+            }))
+            .unwrap();
         assert!(logger.model_call_admitted("codex").is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(logger.protected_health().is_err());
@@ -1575,53 +1767,116 @@ mod tests {
 
     #[tokio::test]
     async fn sealed_generation_refuses_writer_registration_without_leaving_a_ticket() {
-        let (_dir,logger,_,_)=protected_fixture();
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
-        logger.anchored.as_ref().unwrap().seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();
-        assert!(logger.begin_write().is_err(),"sealed audit accepted a new writer ticket");
-        assert_eq!(logger.pending_writers.load(std::sync::atomic::Ordering::Acquire),0);
-        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
-        assert!(!logger.failure_path.as_ref().unwrap().exists(),"expected closed-generation refusal poisoned continuity");
+        let (_dir, logger, _, _) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"fixture"}))
+            .unwrap();
+        logger
+            .anchored
+            .as_ref()
+            .unwrap()
+            .seal_for_recovery(|_| Ok(serde_json::json!({"fixture":"sealed"})))
+            .unwrap();
+        assert!(
+            logger.begin_write().is_err(),
+            "sealed audit accepted a new writer ticket"
+        );
+        assert_eq!(
+            logger
+                .pending_writers
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(
+            !logger.failure_path.as_ref().unwrap().exists(),
+            "expected closed-generation refusal poisoned continuity"
+        );
     }
 
     #[test]
     fn audit_seal_serializes_cross_process_writer_registration() {
-        const CHILD:&str="AUDIT_INGRESS_CHILD_ROOT";
-        if let Some(root)=std::env::var_os(CHILD) {
-            let root=PathBuf::from(root);
-            let logger=AuditLogger::protected(root.join("logs/workflow.log"),root.join("anchors/workflow.json"),&[]).unwrap();
-            std::fs::write(root.join("writer-ready"),b"ready").unwrap();
-            assert!(logger.begin_write().is_err(),"writer crossed a sealed generation");
+        const CHILD: &str = "AUDIT_INGRESS_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let logger = AuditLogger::protected(
+                root.join("logs/workflow.log"),
+                root.join("anchors/workflow.json"),
+                &[],
+            )
+            .unwrap();
+            std::fs::write(root.join("writer-ready"), b"ready").unwrap();
+            assert!(
+                logger.begin_write().is_err(),
+                "writer crossed a sealed generation"
+            );
             return;
         }
-        let (dir,logger,_,_)=protected_fixture();
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
-        let sink=logger.anchored.as_ref().unwrap().clone();
-        let (entered,ready)=std::sync::mpsc::channel();
-        let (release,proceed)=std::sync::mpsc::channel();
-        let sealer=std::thread::spawn(move ||sink.seal_for_recovery(|_| {
-            entered.send(()).unwrap();
-            proceed.recv_timeout(std::time::Duration::from_secs(10))?;
-            Ok(serde_json::json!({"fixture":"sealed"}))
-        }));
-        ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","tool_audit::tests::audit_seal_serializes_cross_process_writer_registration","--nocapture"])
-            .env(CHILD,dir.path()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
-        while !dir.path().join("writer-ready").exists() && std::time::Instant::now()<deadline {
-            if child.try_wait().unwrap().is_some(){break;}
+        let (dir, logger, _, _) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"fixture"}))
+            .unwrap();
+        let sink = logger.anchored.as_ref().unwrap().clone();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let sealer = std::thread::spawn(move || {
+            sink.seal_for_recovery(|_| {
+                entered.send(()).unwrap();
+                proceed.recv_timeout(std::time::Duration::from_secs(10))?;
+                Ok(serde_json::json!({"fixture":"sealed"}))
+            })
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tool_audit::tests::audit_seal_serializes_cross_process_writer_registration",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dir.path().join("writer-ready").exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let saw_ready=dir.path().join("writer-ready").exists();
-        let pending_during_seal=std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_some();
+        let saw_ready = dir.path().join("writer-ready").exists();
+        let pending_during_seal = std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_some();
         release.send(()).unwrap();
         sealer.join().unwrap().unwrap();
-        let output=child.wait_with_output().unwrap();
-        assert!(saw_ready,"child failed before registration: {}",String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
-        assert!(!pending_during_seal,"writer registered while the sealer held the anchor gate");
-        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            saw_ready,
+            "child failed before registration: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !pending_during_seal,
+            "writer registered while the sealer held the anchor gate"
+        );
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
         assert!(!logger.failure_path.as_ref().unwrap().exists());
     }
 

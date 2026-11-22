@@ -36,7 +36,9 @@ impl Drop for OwnedCheckout {
         // Closing only this descriptor leaves flock held by an unrelated
         // fork until exec closes its inherited copy. Cleanup has completed,
         // so explicitly release the shared open-file-description lock now.
-        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN); }
+        unsafe {
+            libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -163,7 +165,10 @@ mod tests {
             )
             .unwrap();
             drop(checkout);
-            assert!(source.join("keep").exists(), "source was deleted without teardown proof");
+            assert!(
+                source.join("keep").exists(),
+                "source was deleted without teardown proof"
+            );
             assert!(
                 allocate(root, "head", "contract").is_err(),
                 "a restart must not reclaim the retained source"
@@ -196,8 +201,9 @@ mod tests {
         // unrelated child temporarily does between fork and exec.
         let inherited = checkout._lock.try_clone().unwrap();
         drop(checkout);
-        let replacement = allocate(parent.path(), "head", "contract")
-            .expect("completed checkout must release admission before every inherited descriptor closes");
+        let replacement = allocate(parent.path(), "head", "contract").expect(
+            "completed checkout must release admission before every inherited descriptor closes",
+        );
         drop(replacement);
         drop(inherited);
     }

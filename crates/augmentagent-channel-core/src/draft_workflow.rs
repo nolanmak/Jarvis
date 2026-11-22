@@ -465,7 +465,15 @@ pub async fn redraft_with(
     // The owner is waiting on this card: every CLI call it makes may use the
     // gate's interactive reserve instead of queueing behind background work.
     crate::cli_gate::run_interactive(revise_inner(
-        config, store, reasoner, email, action_id, previous, feedback, wiki_root, system_prompt,
+        config,
+        store,
+        reasoner,
+        email,
+        action_id,
+        previous,
+        feedback,
+        wiki_root,
+        system_prompt,
     ))
     .await
 }

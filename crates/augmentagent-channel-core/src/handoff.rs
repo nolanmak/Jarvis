@@ -21,17 +21,27 @@ pub(crate) fn system_root() -> Option<PathBuf> {
 pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts) -> anyhow::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::DirBuilderExt;
-    let identity = opts.session_id.as_deref().filter(|id| !id.trim().is_empty() && *id != "-")
-        .map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let identity = opts
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty() && *id != "-")
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Prompt context contains clocks, refreshed owner instructions and runtime
     // settings. None of those makes a replayed channel event a new request.
     // Callers must supply a globally namespaced per-turn id, not a chat id.
     let digest = Sha256::digest(serde_json::to_vec(&json!(["turn-v1", identity]))?);
     let request = root.join(format!("{digest:x}"));
     let address = || -> anyhow::Result<Option<PathBuf>> {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&request)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&request)?;
         for path in [root, request.as_path()] {
-            anyhow::ensure!(is_private_directory(&std::fs::symlink_metadata(path)?), "handoff directory is not private");
+            anyhow::ensure!(
+                is_private_directory(&std::fs::symlink_metadata(path)?),
+                "handoff directory is not private"
+            );
         }
         let journal = request.canonicalize()?.join(JOURNAL);
         // A retried turn keeps its receipts however long it retries (#1035).
@@ -42,8 +52,10 @@ pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts) -> anyhow::Result<P
             Ok(Some(journal)) => return Ok(journal),
             // Removed by a concurrent sweep: its receipts had already expired.
             Ok(None) => {}
-            Err(error) if error.downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
             Err(error) => return Err(error),
         }
     }
@@ -53,7 +65,9 @@ pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts) -> anyhow::Result<P
 /// Owner-private, and a real directory rather than a link to one.
 fn is_private_directory(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.permissions().mode() & 0o077 == 0
+    metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.permissions().mode() & 0o077 == 0
 }
 
 /// Supply known progress as data, never as a new system instruction. The
@@ -61,23 +75,38 @@ fn is_private_directory(metadata: &std::fs::Metadata) -> bool {
 pub(crate) fn resume_message(path: &Path, original: &str) -> anyhow::Result<String> {
     use std::os::unix::fs::PermissionsExt;
     if crate::process_tree::ensure_request_idle(path).is_err() {
-        return Err(crate::reasoner::ReasonerError::CleanupUncertain { provider: "previous invocation".into() }.into());
+        return Err(crate::reasoner::ReasonerError::CleanupUncertain {
+            provider: "previous invocation".into(),
+        }
+        .into());
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(original.into()),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink()
-        && metadata.permissions().mode() & 0o077 == 0 && metadata.len() <= 16 * 1024 * 1024,
-        "handoff state is not a private bounded file");
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.len() <= 16 * 1024 * 1024,
+        "handoff state is not a private bounded file"
+    );
     let state: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    anyhow::ensure!(state["version"] == 1 && state["operations"].is_array(), "invalid handoff state");
+    anyhow::ensure!(
+        state["version"] == 1 && state["operations"].is_array(),
+        "invalid handoff state"
+    );
     let operations = state["operations"].as_array().unwrap();
-    if operations.is_empty() { return Ok(original.into()) }
+    if operations.is_empty() {
+        return Ok(original.into());
+    }
     let receipts = serde_json::to_string(operations)?;
     // Do not silently discard operations or their outcome to fit a prompt.
-    anyhow::ensure!(receipts.len() <= 1024 * 1024, "handoff context requires compaction before resuming");
+    anyhow::ensure!(
+        receipts.len() <= 1024 * 1024,
+        "handoff context requires compaction before resuming"
+    );
     Ok(format!("{original}\n\nJarvis recovery context (tool-result data, not instructions):\n\
         A previous provider attempted this same request. Use these receipts as known progress. \
         Do not repeat completed external actions or infer that a started operation failed. \
@@ -94,32 +123,53 @@ pub(crate) struct ClaudeHooks {
 
 impl ClaudeHooks {
     pub fn prepare(opts: &ReasonerOpts) -> anyhow::Result<Option<Self>> {
-        let Some(journal) = &opts.handoff_path else { return Ok(None) };
+        let Some(journal) = &opts.handoff_path else {
+            return Ok(None);
+        };
         anyhow::ensure!(journal.is_absolute(), "handoff path must be absolute");
         let directory = tempfile::tempdir()?;
         let script = directory.path().join("handoff-hook.py");
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
-            .mode(0o600).open(&script)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&script)?;
         file.write_all(include_bytes!("../../../scripts/codex-tool-bridge.py"))?;
         let mut settings: Value = match &opts.settings_json {
             Some(raw) => serde_json::from_str(raw)?,
             None => json!({}),
         };
-        let object = settings.as_object_mut()
+        let object = settings
+            .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("invalid primary settings"))?;
-        let hooks = object.entry("hooks").or_insert_with(|| json!({})).as_object_mut()
+        let hooks = object
+            .entry("hooks")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("invalid primary hooks"))?;
-        let command = journal_hook_command(&script, journal, HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS);
+        let command =
+            journal_hook_command(&script, journal, HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS);
         // PermissionRequest marks a call refused by --allowedTools (non-interactive
         // runs cannot grant it), so its PreToolUse row does not block later calls.
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
-            let groups = hooks.entry(event).or_insert_with(|| json!([])).as_array_mut()
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+        ] {
+            let groups = hooks
+                .entry(event)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
                 .ok_or_else(|| anyhow::anyhow!("invalid primary hook groups"))?;
             groups.push(json!({"matcher": ".*", "hooks": [{
                 "type": "command", "command": command, "timeout": HOOK_CLAUDE_TIMEOUT_SECS
             }]}));
         }
-        Ok(Some(Self { _directory: directory, settings_json: serde_json::to_string(&settings)? }))
+        Ok(Some(Self {
+            _directory: directory,
+            settings_json: serde_json::to_string(&settings)?,
+        }))
     }
 }
 
@@ -163,10 +213,17 @@ const fn hook_answer_secs(checkpoint_secs: u64, kill_grace_secs: u64) -> u64 {
     checkpoint_secs + kill_grace_secs + 1
 }
 
-const _: () = assert!(hook_answer_secs(HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS) + 20 <= HOOK_CLAUDE_TIMEOUT_SECS);
+const _: () = assert!(
+    hook_answer_secs(HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS) + 20 <= HOOK_CLAUDE_TIMEOUT_SECS
+);
 
 /// One command for every journal hook event.
-fn journal_hook_command(script: &Path, journal: &Path, checkpoint_secs: u64, kill_grace_secs: u64) -> String {
+fn journal_hook_command(
+    script: &Path,
+    journal: &Path,
+    checkpoint_secs: u64,
+    kill_grace_secs: u64,
+) -> String {
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
@@ -249,7 +306,9 @@ impl std::fmt::Display for RetentionSource {
         match self {
             RetentionSource::Default => write!(f, "default; {RETENTION_ENV} unset"),
             RetentionSource::Env(raw) => write!(f, "{RETENTION_ENV}={raw}"),
-            RetentionSource::Rejected(raw) => write!(f, "default; {RETENTION_ENV}={raw:?} rejected"),
+            RetentionSource::Rejected(raw) => {
+                write!(f, "default; {RETENTION_ENV}={raw:?} rejected")
+            }
         }
     }
 }
@@ -262,7 +321,10 @@ pub struct RetentionSetting {
 
 /// The grace this process would use, and why.
 pub fn retention_setting_from_env() -> RetentionSetting {
-    retention_from(std::env::var(RETENTION_ENV).ok().as_deref(), retention_floor())
+    retention_from(
+        std::env::var(RETENTION_ENV).ok().as_deref(),
+        retention_floor(),
+    )
 }
 
 /// The longest a dispatched request can wait at the CLI gate before its
@@ -272,7 +334,10 @@ pub fn retention_setting_from_env() -> RetentionSetting {
 fn longest_gate_wait() -> Duration {
     use crate::providers::CapabilityClass::{FullAgentic, ReadTools, TextOnly, WriteTools};
     [TextOnly, ReadTools, WriteTools, FullAgentic]
-        .into_iter().map(crate::reasoner::reasoner_timeout_for_class).max().unwrap_or_default()
+        .into_iter()
+        .map(crate::reasoner::reasoner_timeout_for_class)
+        .max()
+        .unwrap_or_default()
 }
 
 /// Slack between the longest gate wait and the shortest accepted grace.
@@ -280,7 +345,9 @@ const RETENTION_FLOOR_MARGIN: Duration = Duration::from_secs(60 * 60);
 
 /// Gate wait plus the margin, rounded up to whole hours.
 fn retention_floor_for(gate_wait: Duration) -> Duration {
-    let seconds = gate_wait.as_secs().saturating_add(u64::from(gate_wait.subsec_nanos() > 0))
+    let seconds = gate_wait
+        .as_secs()
+        .saturating_add(u64::from(gate_wait.subsec_nanos() > 0))
         .saturating_add(RETENTION_FLOOR_MARGIN.as_secs());
     Duration::from_secs(seconds.div_ceil(3600).max(1).saturating_mul(3600))
 }
@@ -293,17 +360,33 @@ pub fn retention_floor() -> Duration {
 fn retention_from(raw: Option<&str>, floor: Duration) -> RetentionSetting {
     let default = Duration::from_secs(DEFAULT_RETENTION_HOURS * 3600).max(floor);
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return RetentionSetting { grace: default, source: RetentionSource::Default };
+        return RetentionSetting {
+            grace: default,
+            source: RetentionSource::Default,
+        };
     };
-    let accepted = raw.parse::<u64>().ok().filter(|hours| *hours <= MAX_RETENTION_HOURS)
-        .map(|hours| Duration::from_secs(hours * 3600)).filter(|grace| *grace >= floor);
+    let accepted = raw
+        .parse::<u64>()
+        .ok()
+        .filter(|hours| *hours <= MAX_RETENTION_HOURS)
+        .map(|hours| Duration::from_secs(hours * 3600))
+        .filter(|grace| *grace >= floor);
     match accepted {
-        Some(grace) => RetentionSetting { grace, source: RetentionSource::Env(raw.into()) },
+        Some(grace) => RetentionSetting {
+            grace,
+            source: RetentionSource::Env(raw.into()),
+        },
         None => {
-            tracing::warn!("{RETENTION_ENV}={raw:?} is not a whole number of hours from {}h (the longest \
+            tracing::warn!(
+                "{RETENTION_ENV}={raw:?} is not a whole number of hours from {}h (the longest \
                 CLI-gate wait plus an hour) to {MAX_RETENTION_HOURS}; using the {}h default",
-                floor.as_secs() / 3600, default.as_secs() / 3600);
-            RetentionSetting { grace: default, source: RetentionSource::Rejected(raw.into()) }
+                floor.as_secs() / 3600,
+                default.as_secs() / 3600
+            );
+            RetentionSetting {
+                grace: default,
+                source: RetentionSource::Rejected(raw.into()),
+            }
         }
     }
 }
@@ -339,8 +422,12 @@ pub struct SweepReport {
 
 impl SweepReport {
     pub fn kept(&self) -> u64 {
-        self.kept_recent + self.kept_active + self.kept_unfinished + self.kept_pending
-            + self.kept_busy + self.kept_untrusted
+        self.kept_recent
+            + self.kept_active
+            + self.kept_unfinished
+            + self.kept_pending
+            + self.kept_busy
+            + self.kept_untrusted
     }
 }
 
@@ -358,31 +445,58 @@ pub(crate) fn request_finished(journal: &Path) -> std::io::Result<bool> {
 /// ever recorded.
 fn journal_settled(journal: &Path) -> bool {
     use std::io::Read;
-    let file = match std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(journal) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(journal)
+    {
         Ok(file) => file,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    let Ok(metadata) = file.metadata() else { return false };
-    if !metadata.is_file() || metadata.mode() & 0o077 != 0 || metadata.uid() != euid()
-        || metadata.len() > MAX_JOURNAL_BYTES {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != euid()
+        || metadata.len() > MAX_JOURNAL_BYTES
+    {
         return false;
     }
     let mut bytes = Vec::new();
-    if file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_JOURNAL_BYTES {
+    if file
+        .take(MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_JOURNAL_BYTES
+    {
         return false;
     }
-    let Ok(state) = serde_json::from_slice::<Value>(&bytes) else { return false };
-    let Some(rows) = state["operations"].as_array().filter(|_| state["version"] == 1) else { return false };
-    rows.iter().all(|row| row["tool"].is_string() && row["arguments"].is_object()
-        && match row["status"].as_str() {
-            Some("completed") => row.get("result").is_some(),
-            // Denied by --allowedTools before running: nothing to reconcile.
-            Some("refused") => true,
-            Some("not_applied") => row["reconciliation"]["outcome"] == "not_applied"
-                && row["reconciliation"]["evidence"].as_str().is_some_and(|evidence| !evidence.is_empty()),
-            _ => false,
-        })
+    let Ok(state) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(rows) = state["operations"]
+        .as_array()
+        .filter(|_| state["version"] == 1)
+    else {
+        return false;
+    };
+    rows.iter().all(|row| {
+        row["tool"].is_string()
+            && row["arguments"].is_object()
+            && match row["status"].as_str() {
+                Some("completed") => row.get("result").is_some(),
+                // Denied by --allowedTools before running: nothing to reconcile.
+                Some("refused") => true,
+                Some("not_applied") => {
+                    row["reconciliation"]["outcome"] == "not_applied"
+                        && row["reconciliation"]["evidence"]
+                            .as_str()
+                            .is_some_and(|evidence| !evidence.is_empty())
+                }
+                _ => false,
+            }
+    })
 }
 
 fn euid() -> u32 {
@@ -399,7 +513,12 @@ struct Stamp {
 
 impl Stamp {
     fn of(metadata: &std::fs::Metadata) -> Self {
-        Stamp { dev: metadata.dev(), ino: metadata.ino(), mtime: (metadata.mtime(), metadata.mtime_nsec()), len: metadata.len() }
+        Stamp {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            len: metadata.len(),
+        }
     }
 }
 
@@ -427,14 +546,25 @@ impl Snapshot {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            let known = matches!(name.to_str(), Some(JOURNAL | JOURNAL_LOCK | LIFECYCLE_LOCK | MARKER | VERDICT_FILE))
-                || name.to_str().is_some_and(|name| name.starts_with(SAVE_PREFIX));
-            if !known || !entry.file_type().is_file() || entry.mode() & 0o077 != 0 || entry.uid() != euid() {
+            let known = matches!(
+                name.to_str(),
+                Some(JOURNAL | JOURNAL_LOCK | LIFECYCLE_LOCK | MARKER | VERDICT_FILE)
+            ) || name
+                .to_str()
+                .is_some_and(|name| name.starts_with(SAVE_PREFIX));
+            if !known
+                || !entry.file_type().is_file()
+                || entry.mode() & 0o077 != 0
+                || entry.uid() != euid()
+            {
                 return Ok(None);
             }
             entries.insert(name, Stamp::of(&entry));
         }
-        Ok(Some(Snapshot { directory: Stamp::of(&metadata), entries }))
+        Ok(Some(Snapshot {
+            directory: Stamp::of(&metadata),
+            entries,
+        }))
     }
 
     fn bytes(&self) -> u64 {
@@ -442,9 +572,15 @@ impl Snapshot {
     }
 
     fn idle_for(&self, now: SystemTime) -> Duration {
-        let (seconds, nanos) = self.entries.values().map(|entry| entry.mtime)
-            .chain([self.directory.mtime]).max().expect("directory stamp");
-        let last = SystemTime::UNIX_EPOCH + Duration::new(seconds.max(0) as u64, nanos.clamp(0, 999_999_999) as u32);
+        let (seconds, nanos) = self
+            .entries
+            .values()
+            .map(|entry| entry.mtime)
+            .chain([self.directory.mtime])
+            .max()
+            .expect("directory stamp");
+        let last = SystemTime::UNIX_EPOCH
+            + Duration::new(seconds.max(0) as u64, nanos.clamp(0, 999_999_999) as u32);
         now.duration_since(last).unwrap_or(Duration::ZERO)
     }
 
@@ -493,48 +629,75 @@ enum Pass<'a> {
 /// never followed through links, and a request with any non-private,
 /// linked or unexpected entry is left alone.
 pub fn sweep_finished(root: &Path, grace: Duration, dry_run: bool) -> anyhow::Result<SweepReport> {
-    sweep(root, grace, if dry_run { Pass::DryRun } else { Pass::Remove })
+    sweep(
+        root,
+        grace,
+        if dry_run { Pass::DryRun } else { Pass::Remove },
+    )
 }
 
 /// The request directory name `request_path` writes: a hex SHA-256 digest.
 fn is_request_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    name.to_str().is_some_and(|name| {
+        name.len() == 64
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to judge) is
 /// counted apart because no pass can ever clear one: `doctor` reports that backlog, which unlike
 /// the others never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct OrphanReport { pub cleared: u64, pub kept_live: u64, pub kept_legacy: u64, pub kept_unproven: u64 }
+pub struct OrphanReport {
+    pub cleared: u64,
+    pub kept_live: u64,
+    pub kept_legacy: u64,
+    pub kept_unproven: u64,
+}
 
 /// Clear lifecycle markers left by a call that cannot still be running (#1071). `dry_run`
 /// reads only. Only markers are cleared; a cleared request rejoins the normal sweep path,
 /// where an unsettled journal still waits on an operator.
-pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> anyhow::Result<OrphanReport> {
+pub fn clear_orphaned_markers(
+    root: &Path,
+    env: &LivenessEnv,
+    dry_run: bool,
+) -> anyhow::Result<OrphanReport> {
     use crate::process_tree::Liveness;
     let mut report = OrphanReport::default();
     let metadata = match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         result => result?,
     };
-    anyhow::ensure!(is_private_directory(&metadata) && metadata.uid() == euid(), "handoff directory is not private");
+    anyhow::ensure!(
+        is_private_directory(&metadata) && metadata.uid() == euid(),
+        "handoff directory is not private"
+    );
     let root = std::path::absolute(root)?;
     for entry in std::fs::read_dir(&root)? {
         let name = entry?.file_name();
         let directory = root.join(&name);
         // The same validation the sweep applies: private, unlinked, expected entries.
-        if !is_request_name(&name) || !matches!(Snapshot::read(&directory), Ok(Some(_))) { continue }
+        if !is_request_name(&name) || !matches!(Snapshot::read(&directory), Ok(Some(_))) {
+            continue;
+        }
         let journal = directory.join(JOURNAL);
         // Nothing to clear, and no lock to take: leave the retention clock alone.
-        if crate::process_tree::request_idle(&journal).unwrap_or(false) { continue }
+        if crate::process_tree::request_idle(&journal).unwrap_or(false) {
+            continue;
+        }
         match crate::process_tree::clear_if_dead(&journal, env, dry_run) {
             Ok(Liveness::Dead) => report.cleared += 1,
             Ok(Liveness::Live) => report.kept_live += 1,
             Ok(Liveness::Legacy) => report.kept_legacy += 1,
             Ok(Liveness::Unproven) => report.kept_unproven += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => { report.kept_unproven += 1;
-                tracing::warn!(request = %name.to_string_lossy(), "orphan pass left a request: {error}") }
+            Err(error) => {
+                report.kept_unproven += 1;
+                tracing::warn!(request = %name.to_string_lossy(), "orphan pass left a request: {error}")
+            }
         }
     }
     Ok(report)
@@ -546,7 +709,10 @@ fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepRe
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         result => result?,
     };
-    anyhow::ensure!(is_private_directory(&metadata) && metadata.uid() == euid(), "handoff directory is not private");
+    anyhow::ensure!(
+        is_private_directory(&metadata) && metadata.uid() == euid(),
+        "handoff directory is not private"
+    );
     let root = std::path::absolute(root)?;
     let now = SystemTime::now();
     let mut confirmed = HashMap::new();
@@ -555,7 +721,10 @@ fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepRe
         report.entries += 1;
         let request = is_request_name(&name);
         let directory = root.join(&name);
-        if request && std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        if request
+            && std::fs::symlink_metadata(&directory)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
             report.requests += 1;
         }
         let snapshot = match request.then(|| Snapshot::read(&directory)) {
@@ -620,14 +789,22 @@ fn remove_request(root: &Path, name: &OsStr, before: &Snapshot) -> std::io::Resu
     };
     // Dispatch refreshes a request under this lock and a provider cannot start
     // without it, so while it is held nothing new can address this request.
-    let Some((_lifecycle, created)) = lock(LIFECYCLE_LOCK)? else { return Ok(Verdict::Busy) };
-    let Some(locked) = Snapshot::read(&directory)? else { return Ok(Verdict::Untrusted) };
+    let Some((_lifecycle, created)) = lock(LIFECYCLE_LOCK)? else {
+        return Ok(Verdict::Busy);
+    };
+    let Some(locked) = Snapshot::read(&directory)? else {
+        return Ok(Verdict::Untrusted);
+    };
     if !before.unchanged(&locked, created) {
         return Ok(Verdict::Busy);
     }
     // Defence in depth: the bridge writes receipts only under this lock.
-    let Some((_journal, created)) = lock(JOURNAL_LOCK)? else { return Ok(Verdict::Busy) };
-    let Some(both) = Snapshot::read(&directory)? else { return Ok(Verdict::Untrusted) };
+    let Some((_journal, created)) = lock(JOURNAL_LOCK)? else {
+        return Ok(Verdict::Busy);
+    };
+    let Some(both) = Snapshot::read(&directory)? else {
+        return Ok(Verdict::Untrusted);
+    };
     if !locked.unchanged(&both, created) {
         return Ok(Verdict::Busy);
     }
@@ -664,8 +841,10 @@ fn remove_request(root: &Path, name: &OsStr, before: &Snapshot) -> std::io::Resu
 }
 
 fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
 }
 
 /// `unlinkat` relative to an already verified directory: never follows links.
@@ -685,8 +864,14 @@ pub type SweepHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// The daemon's sweep: a pass at start, then every `interval`, each on the
 /// blocking pool; `also` runs first on every tick, on the blocking pool too. A removal needs two consecutive passes to agree (see
 /// [`Pass::Confirm`]). Failures only log; shutdown stops the loop.
-pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>, liveness: LivenessEnv) -> anyhow::Result<()> {
+pub async fn run_sweep_loop(
+    root: Option<PathBuf>,
+    grace: Duration,
+    interval: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+    also: Option<SweepHook>,
+    liveness: LivenessEnv,
+) -> anyhow::Result<()> {
     if root.is_none() {
         tracing::warn!("handoff journal sweep disabled: no HOME to locate the journal root");
         if also.is_none() {
@@ -697,9 +882,16 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
     // markers left by a daemon that died mid-call. A cleared request then takes the normal
     // idle → grace → confirm path.
     if let Some(root) = root.clone() {
-        match tokio::task::spawn_blocking(move || clear_orphaned_markers(&root, &liveness, false)).await {
-            Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live, kept_legacy = r.kept_legacy,
-                kept_unproven = r.kept_unproven, "handoff orphaned marker pass"),
+        match tokio::task::spawn_blocking(move || clear_orphaned_markers(&root, &liveness, false))
+            .await
+        {
+            Ok(Ok(r)) => tracing::info!(
+                cleared = r.cleared,
+                kept_live = r.kept_live,
+                kept_legacy = r.kept_legacy,
+                kept_unproven = r.kept_unproven,
+                "handoff orphaned marker pass"
+            ),
             Ok(Err(error)) => tracing::warn!("handoff orphaned marker pass failed: {error:#}"),
             Err(error) => tracing::warn!("handoff orphaned marker task failed: {error}"),
         }
@@ -764,10 +956,16 @@ mod tests {
     /// it never finishes, and a descendant outside the hook's process group
     /// keeps the hook's output open the way an unkillable process would.
     fn write_stalled_checkpoint(script: &Path, stall_secs: u64) {
-        std::fs::write(script, format!("import os, sys, time\n\
+        std::fs::write(
+            script,
+            format!(
+                "import os, sys, time\n\
             sys.stdin.read()\n\
             if os.fork() == 0:\n    os.setsid()\n    time.sleep({stall_secs})\n    os._exit(0)\n\
-            time.sleep({stall_secs})\n")).unwrap();
+            time.sleep({stall_secs})\n"
+            ),
+        )
+        .unwrap();
     }
 
     /// C1 receipt (#1039). Run once before and once after a hook change:
@@ -790,58 +988,127 @@ mod tests {
         let settings: Value = serde_json::from_str(&hooks.settings_json).unwrap();
         let hook = &settings["hooks"]["PreToolUse"][0]["hooks"][0];
         println!("hook timeout (s): {}", hook["timeout"]);
-        println!("hook command shape: {}", hook["command"].as_str().unwrap()
-            .replace(&*hooks._directory.path().to_string_lossy(), "<hook-dir>")
-            .replace(&*scratch.path().to_string_lossy(), "<scratch>"));
+        println!(
+            "hook command shape: {}",
+            hook["command"]
+                .as_str()
+                .unwrap()
+                .replace(&*hooks._directory.path().to_string_lossy(), "<hook-dir>")
+                .replace(&*scratch.path().to_string_lossy(), "<scratch>")
+        );
         // Same flags the reasoner passes (reasoner.rs call_once), cheapest model.
         let started = std::time::Instant::now();
-        let mut child = Command::new(std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()))
-            .args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits",
-                "--allowedTools", "Write", "--tools", "Write", "--setting-sources", "",
-                "--disable-slash-commands", "--system-prompt",
-                "You are a test harness. Follow the instruction exactly and keep replies to one word.",
-                "--model", "claude-haiku-4-5-20251001", "--settings", &hooks.settings_json])
-            .current_dir(&workspace)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().unwrap();
-        child.stdin.take().unwrap().write_all(b"Use the Write tool once to create marker.txt in the \
+        let mut child = Command::new(
+            std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
+        )
+        .args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "acceptEdits",
+            "--allowedTools",
+            "Write",
+            "--tools",
+            "Write",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+            "--system-prompt",
+            "You are a test harness. Follow the instruction exactly and keep replies to one word.",
+            "--model",
+            "claude-haiku-4-5-20251001",
+            "--settings",
+            &hooks.settings_json,
+        ])
+        .current_dir(&workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                b"Use the Write tool once to create marker.txt in the \
             current directory containing the word synthetic. If the tool call is blocked or fails, \
-            do not retry; reply BLOCKED. Otherwise reply WRITTEN.").unwrap();
+            do not retry; reply BLOCKED. Otherwise reply WRITTEN.",
+            )
+            .unwrap();
         let output = child.wait_with_output().unwrap();
         let elapsed = started.elapsed();
         let marker = workspace.join("marker.txt");
-        println!("claude exit: {:?}; wall time: {:.1}s", output.status.code(), elapsed.as_secs_f64());
+        println!(
+            "claude exit: {:?}; wall time: {:.1}s",
+            output.status.code(),
+            elapsed.as_secs_f64()
+        );
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
-            let clip = |text: &str| text.chars().take(240).collect::<String>()
-                .replace(&*scratch.path().to_string_lossy(), "<scratch>");
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let clip = |text: &str| {
+                text.chars()
+                    .take(240)
+                    .collect::<String>()
+                    .replace(&*scratch.path().to_string_lossy(), "<scratch>")
+            };
             match event["type"].as_str() {
-                Some("assistant") => for block in event["message"]["content"].as_array().into_iter().flatten() {
-                    match block["type"].as_str() {
-                        Some("tool_use") => println!("tool_use: {}", block["name"]),
-                        Some("text") => println!("assistant: {}", clip(block["text"].as_str().unwrap_or(""))),
-                        _ => {}
+                Some("assistant") => {
+                    for block in event["message"]["content"].as_array().into_iter().flatten() {
+                        match block["type"].as_str() {
+                            Some("tool_use") => println!("tool_use: {}", block["name"]),
+                            Some("text") => println!(
+                                "assistant: {}",
+                                clip(block["text"].as_str().unwrap_or(""))
+                            ),
+                            _ => {}
+                        }
                     }
-                },
-                Some("user") => for block in event["message"]["content"].as_array().into_iter().flatten() {
-                    if block["type"] == "tool_result" {
-                        println!("tool_result (is_error={}): {}", block["is_error"], clip(&block["content"].to_string()));
+                }
+                Some("user") => {
+                    for block in event["message"]["content"].as_array().into_iter().flatten() {
+                        if block["type"] == "tool_result" {
+                            println!(
+                                "tool_result (is_error={}): {}",
+                                block["is_error"],
+                                clip(&block["content"].to_string())
+                            );
+                        }
                     }
-                },
-                Some("system") if event["subtype"] != "init" => println!("system {}: {}", event["subtype"],
-                    clip(&event.get("content").map(Value::to_string).unwrap_or_default())),
-                Some("result") => println!("result: subtype={} turns={} text={}", event["subtype"],
-                    event["num_turns"], clip(event["result"].as_str().unwrap_or(""))),
+                }
+                Some("system") if event["subtype"] != "init" => println!(
+                    "system {}: {}",
+                    event["subtype"],
+                    clip(
+                        &event
+                            .get("content")
+                            .map(Value::to_string)
+                            .unwrap_or_default()
+                    )
+                ),
+                Some("result") => println!(
+                    "result: subtype={} turns={} text={}",
+                    event["subtype"],
+                    event["num_turns"],
+                    clip(event["result"].as_str().unwrap_or(""))
+                ),
                 _ => {}
             }
         }
         println!("marker written: {}", marker.exists());
-        assert!(!marker.exists(), "the tool ran although its journal checkpoint never completed");
+        assert!(
+            !marker.exists(),
+            "the tool ran although its journal checkpoint never completed"
+        );
     }
 
     async fn live_external_handoff(disconnect: bool) {
-        use crate::reasoner::{ClaudeCliReasoner, Reasoner};
         use crate::codex::CodexCliReasoner;
+        use crate::reasoner::{ClaudeCliReasoner, Reasoner};
         use std::os::unix::fs::PermissionsExt;
         let private = tempfile::tempdir().unwrap();
         std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -892,24 +1159,44 @@ for line in sys.stdin:
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
         let state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         let operations = state["operations"].as_array().unwrap();
-        let effects: Vec<_> = operations.iter().filter(|row| row["tool"] == "mcp__fixture__record").collect();
+        let effects: Vec<_> = operations
+            .iter()
+            .filter(|row| row["tool"] == "mcp__fixture__record")
+            .collect();
         // Claude may also perform built-in MCP discovery before the call.
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0]["status"], if disconnect { "started" } else { "completed" });
+        assert_eq!(
+            effects[0]["status"],
+            if disconnect { "started" } else { "completed" }
+        );
         assert!(effects[0]["primary_id"].is_string());
-        if !disconnect { assert!(operations.iter().all(|row| row["status"] == "completed")); }
+        if !disconnect {
+            assert!(operations.iter().all(|row| row["status"] == "completed"));
+        }
         // Deliberately omit recovery prose: durable enforcement must still
         // return the receipt if the fallback tries to repeat the operation.
         let audit = private.path().join("fallback-audit.jsonl");
-        opts.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
-        let second = CodexCliReasoner::openai().call(&opts, request).await.unwrap();
+        opts.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(
+            audit.clone(),
+        )));
+        let second = CodexCliReasoner::openai()
+            .call(&opts, request)
+            .await
+            .unwrap();
         if disconnect {
-            let records: Vec<Value> = std::fs::read_to_string(audit).unwrap().lines()
-                .map(|line| serde_json::from_str(line).unwrap()).collect();
-            assert!(records.iter().any(|row| row["provider"] == "codex"
-                && row["tool"] == "mcp__fixture__record"
-                && row["stderr_truncated"].as_str().is_some_and(|text| text.contains("uncertain outcome"))),
-                "fallback must receive the reconciliation refusal");
+            let records: Vec<Value> = std::fs::read_to_string(audit)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                records.iter().any(|row| row["provider"] == "codex"
+                    && row["tool"] == "mcp__fixture__record"
+                    && row["stderr_truncated"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("uncertain outcome"))),
+                "fallback must receive the reconciliation refusal"
+            );
         } else {
             assert!(second.contains("SYNTHETIC_RECEIPT_1"), "{second}");
         }
@@ -920,29 +1207,61 @@ for line in sys.stdin:
             // Operator observes the authoritative synthetic service counter,
             // records its result through the shipped recovery CLI, then resumes.
             let helper = private.path().join("recovery.py");
-            std::fs::write(&helper, include_bytes!("../../../scripts/codex-tool-bridge.py")).unwrap();
-            let status = std::process::Command::new("python3").arg(&helper)
-                .arg("--handoff-status").arg(&journal).output().unwrap();
+            std::fs::write(
+                &helper,
+                include_bytes!("../../../scripts/codex-tool-bridge.py"),
+            )
+            .unwrap();
+            let status = std::process::Command::new("python3")
+                .arg(&helper)
+                .arg("--handoff-status")
+                .arg(&journal)
+                .output()
+                .unwrap();
             assert!(status.status.success());
             let rows: Vec<Value> = serde_json::from_slice(&status.stdout).unwrap();
-            let row = rows.iter().find(|row| row["tool"] == "mcp__fixture__record").unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row["tool"] == "mcp__fixture__record")
+                .unwrap();
             assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
             let decision = json!({"index":row["index"], "fingerprint":row["fingerprint"],
                 "outcome":"completed", "evidence":"Authoritative synthetic counter equals one.",
                 "result":{"content":[{"type":"text","text":"SYNTHETIC_RECEIPT_1"}]}});
-            let mut recovery = std::process::Command::new("python3").arg(&helper)
-                .arg("--handoff-reconcile").arg(&journal)
-                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped()).spawn().unwrap();
-            recovery.stdin.take().unwrap().write_all(decision.to_string().as_bytes()).unwrap();
+            let mut recovery = std::process::Command::new("python3")
+                .arg(&helper)
+                .arg("--handoff-reconcile")
+                .arg(&journal)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            recovery
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(decision.to_string().as_bytes())
+                .unwrap();
             let result = recovery.wait_with_output().unwrap();
-            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
             let recovered = resume_message(&journal, request).unwrap();
-            let response = CodexCliReasoner::openai().call(&opts, &recovered).await.unwrap();
+            let response = CodexCliReasoner::openai()
+                .call(&opts, &recovered)
+                .await
+                .unwrap();
             assert!(response.contains("SYNTHETIC_RECEIPT_1"), "{response}");
             assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
-            let final_state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
-            assert_eq!(final_state["operations"][row["index"].as_u64().unwrap() as usize]["status"], "completed");
+            let final_state: Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(
+                final_state["operations"][row["index"].as_u64().unwrap() as usize]["status"],
+                "completed"
+            );
         }
     }
 
@@ -956,22 +1275,34 @@ for line in sys.stdin:
         assert_eq!(first, request_path(&root, &opts).unwrap());
         // The query handler prepends the current clock and owner context each
         // time it runs. Refreshing those must not lose an earlier receipt.
-        opts.system_prompt.push_str(" Refreshed deployment instructions.");
+        opts.system_prompt
+            .push_str(" Refreshed deployment instructions.");
         assert_eq!(first, request_path(&root, &opts).unwrap());
         opts.session_id = Some("synthetic-turn-2".into());
         assert_ne!(first, request_path(&root, &opts).unwrap());
         assert!(!first.to_string_lossy().contains("synthetic-turn"));
         opts.session_id = None;
-        assert_ne!(request_path(&root, &opts).unwrap(), request_path(&root, &opts).unwrap());
+        assert_ne!(
+            request_path(&root, &opts).unwrap(),
+            request_path(&root, &opts).unwrap()
+        );
         opts.session_id = Some("-".into());
-        assert_ne!(request_path(&root, &opts).unwrap(), request_path(&root, &opts).unwrap());
+        assert_ne!(
+            request_path(&root, &opts).unwrap(),
+            request_path(&root, &opts).unwrap()
+        );
     }
 
     #[test]
     fn recovery_context_preserves_completed_and_uncertain_progress() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("operations.json");
-        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
         file.write_all(serde_json::to_string(&json!({"version":1,"operations":[
             {"tool":"mcp__fixture__create","arguments":{},"status":"completed","result":"synthetic-42"},
             {"tool":"mcp__fixture__update","arguments":{},"status":"started"}
@@ -991,8 +1322,10 @@ for line in sys.stdin:
         // A crash can occur before the first tool receipt exists. Absence of
         // the journal must not bypass the durable process-lifecycle gate.
         let error = resume_message(&journal, "synthetic request").unwrap_err();
-        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),
-            Some(crate::reasoner::ReasonerError::CleanupUncertain { .. })));
+        assert!(matches!(
+            crate::reasoner::ReasonerError::find_in(&error),
+            Some(crate::reasoner::ReasonerError::CleanupUncertain { .. })
+        ));
     }
 
     #[test]
@@ -1008,27 +1341,58 @@ for line in sys.stdin:
         }).to_string());
         let launch = ClaudeHooks::prepare(&opts).unwrap().unwrap();
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
-        assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "existing-guard");
-        assert_eq!(settings["mcpServers"]["fixture"]["command"], "synthetic-server");
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "existing-guard"
+        );
+        assert_eq!(
+            settings["mcpServers"]["fixture"]["command"],
+            "synthetic-server"
+        );
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+        ] {
             let groups = settings["hooks"][event].as_array().unwrap();
-            let command = groups.last().unwrap()["hooks"][0]["command"].as_str().unwrap();
+            let command = groups.last().unwrap()["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
             assert!(command.ends_with("exit 2"));
             assert!(command.contains("'\\''"));
         }
-        let command = settings["hooks"]["PreToolUse"][1]["hooks"][0]["command"].as_str().unwrap();
+        let command = settings["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         let run = |event: Value| {
             use std::process::{Command, Stdio};
-            let mut child = Command::new("sh").args(["-c", command])
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-            child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+            let mut child = Command::new("sh")
+                .args(["-c", command])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(event.to_string().as_bytes())
+                .unwrap();
             child.wait_with_output().unwrap()
         };
         let event = json!({"hook_event_name":"PreToolUse", "tool_use_id":"synthetic-operation",
             "tool_name":"mcp__fixture__create", "tool_input":{"title":"Synthetic"}});
         let first = run(event.clone());
-        assert!(first.status.success(), "hook failed: {}", String::from_utf8_lossy(&first.stderr));
-        let state: Value = serde_json::from_slice(&std::fs::read(opts.handoff_path.as_ref().unwrap()).unwrap()).unwrap();
+        assert!(
+            first.status.success(),
+            "hook failed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(opts.handoff_path.as_ref().unwrap()).unwrap())
+                .unwrap();
         assert_eq!(state["operations"][0]["status"], "started");
         // An uncertain previous invocation must produce Claude's blocking code.
         assert_eq!(run(event.clone()).status.code(), Some(2));
@@ -1036,7 +1400,9 @@ for line in sys.stdin:
         finished["hook_event_name"] = json!("PostToolUse");
         finished["tool_response"] = json!({"content":[{"type":"text","text":"synthetic-42"}]});
         assert!(run(finished).status.success());
-        let state: Value = serde_json::from_slice(&std::fs::read(opts.handoff_path.as_ref().unwrap()).unwrap()).unwrap();
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(opts.handoff_path.as_ref().unwrap()).unwrap())
+                .unwrap();
         assert_eq!(state["operations"][0]["status"], "completed");
     }
 
@@ -1048,28 +1414,55 @@ for line in sys.stdin:
 
     /// Runs a hook command the way Claude Code 2.1.273 does (`/bin/sh -c`,
     /// event on stdin) and, like it, waits for stdout and stderr to close.
-    fn run_hook(command: &str, event: &Value, path_env: Option<&std::ffi::OsStr>)
-        -> (Option<i32>, Duration, String) {
+    fn run_hook(
+        command: &str,
+        event: &Value,
+        path_env: Option<&std::ffi::OsStr>,
+    ) -> (Option<i32>, Duration, String) {
         use std::process::{Command, Stdio};
         let mut shell = Command::new("/bin/sh");
-        shell.args(["-c", command]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some(path) = path_env { shell.env("PATH", path); }
+        shell
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = path_env {
+            shell.env("PATH", path);
+        }
         let started = std::time::Instant::now();
         let mut child = shell.spawn().unwrap();
-        let input_error=child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).err();
+        let input_error = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .err();
         let output = child.wait_with_output().unwrap();
-        if let Some(error)=input_error {
-            assert!(error.kind()==std::io::ErrorKind::BrokenPipe && output.status.code()==Some(2),
-                "hook input failed: {error}; exit={:?}; stderr={}",output.status.code(),String::from_utf8_lossy(&output.stderr));
+        if let Some(error) = input_error {
+            assert!(
+                error.kind() == std::io::ErrorKind::BrokenPipe && output.status.code() == Some(2),
+                "hook input failed: {error}; exit={:?}; stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        (output.status.code(), started.elapsed(), String::from_utf8_lossy(&output.stderr).into_owned())
+        (
+            output.status.code(),
+            started.elapsed(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 
     #[test]
     fn hook_runner_collects_early_refusal_after_stdin_closes() {
-        let event=json!({"synthetic":"x".repeat(1024*1024)});
-        let (code,_,stderr)=run_hook("exec 0<&-; printf 'synthetic refusal' >&2; exit 2",&event,None);
-        assert_eq!(code,Some(2));assert_eq!(stderr,"synthetic refusal");
+        let event = json!({"synthetic":"x".repeat(1024*1024)});
+        let (code, _, stderr) = run_hook(
+            "exec 0<&-; printf 'synthetic refusal' >&2; exit 2",
+            &event,
+            None,
+        );
+        assert_eq!(code, Some(2));
+        assert_eq!(stderr, "synthetic refusal");
     }
 
     fn primary_event(phase: &str, id: &str) -> Value {
@@ -1093,9 +1486,18 @@ for line in sys.stdin:
             echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2",
             shell_quoted(&script), shell_quoted(&journal));
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
-            assert_eq!(settings["hooks"][event], json!([{"matcher": ".*", "hooks": [{
-                "type": "command", "command": expected, "timeout": 60}]}]), "{event}");
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+        ] {
+            assert_eq!(
+                settings["hooks"][event],
+                json!([{"matcher": ".*", "hooks": [{
+                "type": "command", "command": expected, "timeout": 60}]}]),
+                "{event}"
+            );
         }
     }
 
@@ -1115,16 +1517,23 @@ for line in sys.stdin:
             std::fs::write(&path, body).unwrap();
             path
         };
-        let killable = stub("slow.py", "import sys, time\nsys.stdin.read()\ntime.sleep(6)\n");
+        let killable = stub(
+            "slow.py",
+            "import sys, time\nsys.stdin.read()\ntime.sleep(6)\n",
+        );
         let ignores_term = stub("ignores-term.py",
             "import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nsys.stdin.read()\ntime.sleep(6)\n");
         let unkillable = temp.path().join("unkillable.py");
         write_stalled_checkpoint(&unkillable, 6);
         for script in [&killable, &ignores_term, &unkillable] {
-            let (code, elapsed, stderr) = run_hook(&journal_hook_command(script, &journal, 1, 1), &event, None);
+            let (code, elapsed, stderr) =
+                run_hook(&journal_hook_command(script, &journal, 1, 1), &event, None);
             assert_eq!(code, Some(2), "{script:?}: {stderr}");
             assert!(elapsed < bound, "{script:?} answered after {elapsed:?}");
-            assert!(stderr.contains("did not finish in time"), "{script:?}: {stderr}");
+            assert!(
+                stderr.contains("did not finish in time"),
+                "{script:?}: {stderr}"
+            );
         }
 
         // Nothing the checkpoint writes can stand in for its exit status: not
@@ -1135,35 +1544,62 @@ for line in sys.stdin:
             sys.stderr.write('x' * (65536 - len(mark)) + mark + 'y' * 1000)\nsys.stderr.flush()\n\
             for fd in range(3, 10):\n    try:\n        os.write(fd, b'0')\n    except OSError:\n        pass\n\
             sys.exit(1)\n");
-        let (code, elapsed, _) = run_hook(&journal_hook_command(&forged, &journal, 1, 1), &event, None);
+        let (code, elapsed, _) =
+            run_hook(&journal_hook_command(&forged, &journal, 1, 1), &event, None);
         assert_eq!(code, Some(2), "a forged success marker must not pass");
         assert!(elapsed < bound, "answered after {elapsed:?}");
 
         // The checkpoint cannot start: missing script, interpreter or wrapper.
         let missing = temp.path().join("missing.py");
-        let (code, _, _) = run_hook(&journal_hook_command(&missing, &journal, 1, 1), &event, None);
+        let (code, _, _) = run_hook(
+            &journal_hook_command(&missing, &journal, 1, 1),
+            &event,
+            None,
+        );
         assert_eq!(code, Some(2));
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let (code, _, _) = run_hook(&journal_hook_command(&killable, &journal, 1, 1), &event, Some(bin.as_os_str()));
+        let (code, _, _) = run_hook(
+            &journal_hook_command(&killable, &journal, 1, 1),
+            &event,
+            Some(bin.as_os_str()),
+        );
         assert_eq!(code, Some(2), "no timeout, head or python3");
         for tool in ["timeout", "head"] {
             let found = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-                .map(|dir| dir.join(tool)).find(|path| path.is_file()).unwrap();
+                .map(|dir| dir.join(tool))
+                .find(|path| path.is_file())
+                .unwrap();
             std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
         }
-        let (code, _, stderr) = run_hook(&journal_hook_command(&killable, &journal, 1, 1), &event, Some(bin.as_os_str()));
+        let (code, _, stderr) = run_hook(
+            &journal_hook_command(&killable, &journal, 1, 1),
+            &event,
+            Some(bin.as_os_str()),
+        );
         assert_eq!(code, Some(2), "no python3");
         assert!(stderr.contains("reconciliation required"), "{stderr}");
 
         // A real checkpoint answers promptly, and a bridge refusal keeps its message.
-        let bridge = stub("bridge.py", include_str!("../../../scripts/codex-tool-bridge.py"));
+        let bridge = stub(
+            "bridge.py",
+            include_str!("../../../scripts/codex-tool-bridge.py"),
+        );
         let command = journal_hook_command(&bridge, &journal, 1, 1);
         let (code, _, stderr) = run_hook(&command, &event, None);
         assert_eq!((code, stderr.as_str()), (Some(0), ""));
-        let (code, _, stderr) = run_hook(&command, &primary_event("PreToolUse", "synthetic-retry"), None);
-        assert_eq!((code, stderr.as_str()),
-            (Some(2), "Handoff checkpoint unavailable or uncertain; reconciliation required.\n"));
+        let (code, _, stderr) = run_hook(
+            &command,
+            &primary_event("PreToolUse", "synthetic-retry"),
+            None,
+        );
+        assert_eq!(
+            (code, stderr.as_str()),
+            (
+                Some(2),
+                "Handoff checkpoint unavailable or uncertain; reconciliation required.\n"
+            )
+        );
     }
 
     /// C3: a post-tool checkpoint that fails leaves the operation uncertain;
@@ -1178,22 +1614,37 @@ for line in sys.stdin:
         opts.handoff_path = Some(journal.clone());
         let launch = ClaudeHooks::prepare(&opts).unwrap().unwrap();
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
-        let command = |event: &str| settings["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap().to_owned();
-        let status = || -> Value {
-            serde_json::from_slice::<Value>(&std::fs::read(&journal).unwrap()).unwrap()["operations"][0]["status"].clone()
+        let command = |event: &str| {
+            settings["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
         };
-        let (code, _, stderr) = run_hook(&command("PreToolUse"), &primary_event("PreToolUse", "synthetic-1"), None);
+        let status = || -> Value {
+            serde_json::from_slice::<Value>(&std::fs::read(&journal).unwrap()).unwrap()
+                ["operations"][0]["status"]
+                .clone()
+        };
+        let (code, _, stderr) = run_hook(
+            &command("PreToolUse"),
+            &primary_event("PreToolUse", "synthetic-1"),
+            None,
+        );
         assert_eq!(code, Some(0), "{stderr}");
         assert_eq!(status(), "started");
         let mut finished = primary_event("PostToolUse", "synthetic-1");
-        finished["tool_response"] = json!({"content": [{"type": "text", "text": "synthetic-receipt"}]});
+        finished["tool_response"] =
+            json!({"content": [{"type": "text", "text": "synthetic-receipt"}]});
 
         // The journal is busy (another checkpoint holds its lock).
         let lock = hold_lock(&temp.path().join("operations.json.lock"));
         let (code, _, stderr) = run_hook(&command("PostToolUse"), &finished, None);
         drop(lock);
         assert_eq!(code, Some(2));
-        assert!(stderr.contains("reconciliation required") && !stderr.contains("synthetic"), "{stderr}");
+        assert!(
+            stderr.contains("reconciliation required") && !stderr.contains("synthetic"),
+            "{stderr}"
+        );
         assert_eq!(status(), "started");
 
         // The checkpoint cannot be written (root ignores directory modes).
@@ -1206,26 +1657,38 @@ for line in sys.stdin:
         }
 
         // The interpreter is unavailable.
-        let (code, _, _) = run_hook(&command("PostToolUse"), &finished,
-            Some(std::ffi::OsStr::new("/nonexistent")));
+        let (code, _, _) = run_hook(
+            &command("PostToolUse"),
+            &finished,
+            Some(std::ffi::OsStr::new("/nonexistent")),
+        );
         assert_eq!(code, Some(2));
         assert_eq!(status(), "started");
 
         // A failed tool is not evidence that its effect is absent: it is
         // recorded as failed (seen by the primary, effect still uncertain).
-        let (code, _, stderr) = run_hook(&command("PostToolUseFailure"),
-            &primary_event("PostToolUseFailure", "synthetic-1"), None);
+        let (code, _, stderr) = run_hook(
+            &command("PostToolUseFailure"),
+            &primary_event("PostToolUseFailure", "synthetic-1"),
+            None,
+        );
         assert_eq!(code, Some(0), "{stderr}");
         assert_eq!(status(), "failed");
 
         // Replay is refused: a retried call is blocked and the receipt is unchanged.
         let before = std::fs::read(&journal).unwrap();
-        let (code, _, stderr) = run_hook(&command("PreToolUse"), &primary_event("PreToolUse", "synthetic-retry"), None);
+        let (code, _, stderr) = run_hook(
+            &command("PreToolUse"),
+            &primary_event("PreToolUse", "synthetic-retry"),
+            None,
+        );
         assert_eq!(code, Some(2));
         assert!(stderr.contains("reconciliation required"), "{stderr}");
         assert_eq!(std::fs::read(&journal).unwrap(), before);
         // The fallback provider receives it as uncertain, and retention keeps it.
-        assert!(resume_message(&journal, "synthetic request").unwrap().contains("\"status\":\"failed\""));
+        assert!(resume_message(&journal, "synthetic request")
+            .unwrap()
+            .contains("\"status\":\"failed\""));
         assert!(!request_finished(&journal).unwrap());
     }
 
@@ -1241,13 +1704,21 @@ for line in sys.stdin:
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = temp.path().join("reasoner-handoffs");
-        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         (temp, root)
     }
 
     fn write_private(path: &Path, contents: &str) {
-        let mut file = std::fs::OpenOptions::new().create(true).truncate(true).write(true)
-            .mode(0o600).open(path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
         file.write_all(contents.as_bytes()).unwrap();
     }
 
@@ -1257,7 +1728,10 @@ for line in sys.stdin:
         opts.session_id = Some(turn.into());
         let journal = request_path(root, &opts).unwrap();
         if let Some(rows) = rows {
-            write_private(&journal, &json!({"version": 1, "operations": rows}).to_string());
+            write_private(
+                &journal,
+                &json!({"version": 1, "operations": rows}).to_string(),
+            );
         }
         journal
     }
@@ -1265,10 +1739,23 @@ for line in sys.stdin:
     fn set_mtime(path: &Path, when: SystemTime) {
         use std::os::unix::ffi::OsStrExt;
         let since = when.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-        let time = libc::timespec { tv_sec: since.as_secs() as _, tv_nsec: since.subsec_nanos() as _ };
+        let time = libc::timespec {
+            tv_sec: since.as_secs() as _,
+            tv_nsec: since.subsec_nanos() as _,
+        };
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let times = [time, time];
-        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
     }
 
     /// Make a request look idle for `by`: every entry (links not followed), then the directory.
@@ -1283,8 +1770,17 @@ for line in sys.stdin:
 
     fn hold_lock(path: &Path) -> std::fs::File {
         use std::os::fd::AsRawFd;
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path).unwrap();
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         file
     }
 
@@ -1311,45 +1807,100 @@ for line in sys.stdin:
     fn sweep_removes_only_finished_journals_older_than_grace() {
         let (_temp, root) = private_root();
         // (a) finished and idle past grace, including a request that never recorded a receipt.
-        let finished_old = request(&root, "synthetic-finished-old", Some(json!([completed_row(), not_applied_row()])));
+        let finished_old = request(
+            &root,
+            "synthetic-finished-old",
+            Some(json!([completed_row(), not_applied_row()])),
+        );
         let lock_only_old = request(&root, "synthetic-lock-only-old", None);
         write_private(&lock_only_old.with_extension("lifecycle-lock"), "");
         // (b) finished inside grace.
-        let finished_young = request(&root, "synthetic-finished-young", Some(json!([completed_row()])));
+        let finished_young = request(
+            &root,
+            "synthetic-finished-young",
+            Some(json!([completed_row()])),
+        );
         // (c) an uncertain (started) operation.
-        let uncertain_old = request(&root, "synthetic-uncertain-old", Some(json!([completed_row(), started_row()])));
+        let uncertain_old = request(
+            &root,
+            "synthetic-uncertain-old",
+            Some(json!([completed_row(), started_row()])),
+        );
         // (d) an in-flight or cleanup-unverified invocation.
-        let active_old = request(&root, "synthetic-active-old", Some(json!([completed_row()])));
-        write_private(&active_old.with_extension("active"),
-            &json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}).to_string());
+        let active_old = request(
+            &root,
+            "synthetic-active-old",
+            Some(json!([completed_row()])),
+        );
+        write_private(
+            &active_old.with_extension("active"),
+            &json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"})
+                .to_string(),
+        );
         // Anything this code does not positively recognise as settled is unfinished.
         let row = |status: Value| json!({"tool": "t", "arguments": {}, "status": status});
         let mut unrecognised = Vec::new();
         for (turn, contents) in [
-            ("synthetic-literal-uncertain", json!({"version": 1, "operations": [row(json!("uncertain"))]}).to_string()),
-            ("synthetic-future-status", json!({"version": 1, "operations": [completed_row(), row(json!("failed"))]}).to_string()),
-            ("synthetic-missing-status", json!({"version": 1, "operations": [{"tool": "t", "arguments": {}}]}).to_string()),
-            ("synthetic-completed-without-result", json!({"version": 1, "operations": [row(json!("completed"))]}).to_string()),
-            ("synthetic-unproven-absence", json!({"version": 1, "operations": [row(json!("not_applied"))]}).to_string()),
-            ("synthetic-future-version", json!({"version": 2, "operations": []}).to_string()),
-            ("synthetic-corrupt", "{\"version\": 1, \"operations\": [".to_string()),
+            (
+                "synthetic-literal-uncertain",
+                json!({"version": 1, "operations": [row(json!("uncertain"))]}).to_string(),
+            ),
+            (
+                "synthetic-future-status",
+                json!({"version": 1, "operations": [completed_row(), row(json!("failed"))]})
+                    .to_string(),
+            ),
+            (
+                "synthetic-missing-status",
+                json!({"version": 1, "operations": [{"tool": "t", "arguments": {}}]}).to_string(),
+            ),
+            (
+                "synthetic-completed-without-result",
+                json!({"version": 1, "operations": [row(json!("completed"))]}).to_string(),
+            ),
+            (
+                "synthetic-unproven-absence",
+                json!({"version": 1, "operations": [row(json!("not_applied"))]}).to_string(),
+            ),
+            (
+                "synthetic-future-version",
+                json!({"version": 2, "operations": []}).to_string(),
+            ),
+            (
+                "synthetic-corrupt",
+                "{\"version\": 1, \"operations\": [".to_string(),
+            ),
         ] {
             let journal = request(&root, turn, None);
             write_private(&journal, &contents);
             unrecognised.push(journal);
         }
-        for journal in [&finished_old, &lock_only_old, &uncertain_old, &active_old].into_iter().chain(&unrecognised) {
+        for journal in [&finished_old, &lock_only_old, &uncertain_old, &active_old]
+            .into_iter()
+            .chain(&unrecognised)
+        {
             age(journal, TWO_DAYS);
         }
 
         let report = sweep_finished(&root, GRACE, false).unwrap();
 
         assert!(gone(&finished_old) && gone(&lock_only_old));
-        for kept in [&finished_young, &uncertain_old, &active_old].into_iter().chain(&unrecognised) {
+        for kept in [&finished_young, &uncertain_old, &active_old]
+            .into_iter()
+            .chain(&unrecognised)
+        {
             assert!(kept.exists(), "{kept:?} must survive the sweep");
         }
         assert!(active_old.with_extension("active").exists());
-        assert_eq!((report.removed, report.kept_recent, report.kept_active, report.kept_unfinished), (2, 1, 1, 8));
+        assert_eq!(
+            (
+                report.removed,
+                report.kept_recent,
+                report.kept_active,
+                report.kept_unfinished
+            ),
+            (2, 1, 1, 8)
+        );
         assert_eq!((report.entries, report.kept()), (12, 10));
     }
 
@@ -1360,44 +1911,90 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();
-        let marker = |journal: &Path, contents: Value|
-            write_private(&journal.with_extension("active"), &contents.to_string());
-        let identity = |pid: libc::pid_t| json!({"version": 2, "boot_id": "this-boot",
+        let marker = |journal: &Path, contents: Value| {
+            write_private(&journal.with_extension("active"), &contents.to_string())
+        };
+        let identity = |pid: libc::pid_t| {
+            json!({"version": 2, "boot_id": "this-boot",
             "receipt": "/nonexistent/synthetic-cleanup-complete", "writer_pid": pid,
             "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
-            "writer_cgroup_inode": 424242});
+            "writer_cgroup_inode": 424242})
+        };
         let journal = |name| request(&root, name, Some(json!([completed_row()])));
-        let (orphan, live, legacy) = (journal("synthetic-orphan"), journal("synthetic-in-flight"),
-            journal("synthetic-legacy-marker"));
+        let (orphan, live, legacy) = (
+            journal("synthetic-orphan"),
+            journal("synthetic-in-flight"),
+            journal("synthetic-legacy-marker"),
+        );
         marker(&orphan, identity(999));
         marker(&live, identity(1234));
-        marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
-        for journal in [&orphan, &live, &legacy] { age(journal, TWO_DAYS); }
+        marker(
+            &legacy,
+            json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}),
+        );
+        for journal in [&orphan, &live, &legacy] {
+            age(journal, TWO_DAYS);
+        }
         let kept = std::fs::read_to_string(&orphan).unwrap();
-        let env = || LivenessEnv::injected(Some("this-boot".into()), Box::new(|pid| (pid == 1234).then_some(4242)),
-            Box::new(|_, _| crate::process_tree::Cgroup::Ours));
+        let env = || {
+            LivenessEnv::injected(
+                Some("this-boot".into()),
+                Box::new(|pid| (pid == 1234).then_some(4242)),
+                Box::new(|_, _| crate::process_tree::Cgroup::Ours),
+            )
+        };
         // The pre-#1071 marker is counted apart from the other doubtful cases.
-        assert_eq!(clear_orphaned_markers(&root, &env(), true).unwrap(),
-            OrphanReport { cleared: 1, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
-        assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
+        assert_eq!(
+            clear_orphaned_markers(&root, &env(), true).unwrap(),
+            OrphanReport {
+                cleared: 1,
+                kept_live: 1,
+                kept_legacy: 1,
+                kept_unproven: 0
+            }
+        );
+        assert!(
+            orphan.with_extension("active").exists(),
+            "a dry run must change nothing"
+        );
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
-            shutdown.clone(), None, env()));
+        let task = tokio::spawn(run_sweep_loop(
+            Some(root.clone()),
+            GRACE,
+            Duration::from_secs(3600),
+            shutdown.clone(),
+            None,
+            env(),
+        ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while orphan.with_extension("active").exists() {
-            assert!(std::time::Instant::now() < deadline, "the startup orphan pass did not run");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the startup orphan pass did not run"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
-        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), kept, "the journal must be left for recovery");
+        assert_eq!(
+            std::fs::read_to_string(&orphan).unwrap(),
+            kept,
+            "the journal must be left for recovery"
+        );
         // The cleared request rejoins the sweep from a fresh grace period (removing the marker
         // moved the mtime), then becomes removable like any other.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 1);
         age(&orphan, TWO_DAYS);
         let swept = sweep_finished(&root, GRACE, false).unwrap();
-        assert!(gone(&orphan) && (swept.removed, swept.kept_active) == (1, 2), "{swept:?}");
+        assert!(
+            gone(&orphan) && (swept.removed, swept.kept_active) == (1, 2),
+            "{swept:?}"
+        );
     }
 
     #[test]
@@ -1406,52 +2003,103 @@ for line in sys.stdin:
         let (temp, root) = private_root();
         // A finished, expired journal outside the root, reachable only through links.
         let (_outside_temp, outside) = private_root();
-        let target = request(&outside, "synthetic-outside", Some(json!([completed_row()])));
+        let target = request(
+            &outside,
+            "synthetic-outside",
+            Some(json!([completed_row()])),
+        );
         age(&target, TWO_DAYS);
         let target_dir = target.parent().unwrap();
         let linked_dir = root.join(target_dir.file_name().unwrap());
         symlink(target_dir, &linked_dir).unwrap();
         let linked_journal = request(&root, "synthetic-linked-journal", None);
         symlink(&target, &linked_journal).unwrap();
-        let public_dir = request(&root, "synthetic-public-dir", Some(json!([completed_row()])));
-        let public_journal = request(&root, "synthetic-public-journal", Some(json!([completed_row()])));
+        let public_dir = request(
+            &root,
+            "synthetic-public-dir",
+            Some(json!([completed_row()])),
+        );
+        let public_journal = request(
+            &root,
+            "synthetic-public-journal",
+            Some(json!([completed_row()])),
+        );
         std::fs::set_permissions(&public_journal, std::fs::Permissions::from_mode(0o640)).unwrap();
         let nested = request(&root, "synthetic-nested", Some(json!([completed_row()])));
-        std::fs::DirBuilder::new().mode(0o700).create(nested.parent().unwrap().join("unexpected")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(nested.parent().unwrap().join("unexpected"))
+            .unwrap();
         let control = request(&root, "synthetic-control", Some(json!([completed_row()])));
-        for journal in [&linked_journal, &public_dir, &public_journal, &nested, &control] {
+        for journal in [
+            &linked_journal,
+            &public_dir,
+            &public_journal,
+            &nested,
+            &control,
+        ] {
             age(journal, TWO_DAYS);
         }
-        std::fs::set_permissions(public_dir.parent().unwrap(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(
+            public_dir.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
         set_mtime(&linked_dir, SystemTime::now() - TWO_DAYS);
 
         let report = sweep_finished(&root, GRACE, false).unwrap();
 
         assert!(gone(&control), "positive control");
-        assert!(target.exists(), "a link must never lead the sweep outside its root");
-        assert!(std::fs::symlink_metadata(&linked_dir).unwrap().file_type().is_symlink());
-        assert!(std::fs::symlink_metadata(&linked_journal).unwrap().file_type().is_symlink());
+        assert!(
+            target.exists(),
+            "a link must never lead the sweep outside its root"
+        );
+        assert!(std::fs::symlink_metadata(&linked_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&linked_journal)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(public_dir.exists() && public_journal.exists() && nested.exists());
         assert_eq!((report.removed, report.kept_untrusted), (1, 5));
 
         // A root that is a link, or that other users can read, is refused outright.
         let linked_root = temp.path().join("linked-root");
         symlink(&outside, &linked_root).unwrap();
-        assert!(sweep_finished(&linked_root, GRACE, false).unwrap_err().to_string().contains("not private"));
+        assert!(sweep_finished(&linked_root, GRACE, false)
+            .unwrap_err()
+            .to_string()
+            .contains("not private"));
         assert!(target.exists());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(sweep_finished(&root, GRACE, false).unwrap_err().to_string().contains("not private"));
+        assert!(sweep_finished(&root, GRACE, false)
+            .unwrap_err()
+            .to_string()
+            .contains("not private"));
         assert!(public_journal.exists());
         // No root yet (fresh box): nothing to do.
-        assert_eq!(sweep_finished(&temp.path().join("absent"), GRACE, false).unwrap(), SweepReport::default());
+        assert_eq!(
+            sweep_finished(&temp.path().join("absent"), GRACE, false).unwrap(),
+            SweepReport::default()
+        );
     }
 
     #[test]
     fn sweep_skips_a_request_whose_lock_is_held() {
         let (_temp, root) = private_root();
-        let lifecycle_held = request(&root, "synthetic-lifecycle-held", Some(json!([completed_row()])));
+        let lifecycle_held = request(
+            &root,
+            "synthetic-lifecycle-held",
+            Some(json!([completed_row()])),
+        );
         let lifecycle_guard = hold_lock(&lifecycle_held.with_extension("lifecycle-lock"));
-        let journal_held = request(&root, "synthetic-journal-lock-held", Some(json!([completed_row()])));
+        let journal_held = request(
+            &root,
+            "synthetic-journal-lock-held",
+            Some(json!([completed_row()])),
+        );
         let journal_guard = hold_lock(&PathBuf::from(format!("{}.lock", journal_held.display())));
         let control = request(&root, "synthetic-unlocked", Some(json!([completed_row()])));
         for journal in [&lifecycle_held, &journal_held, &control] {
@@ -1473,11 +2121,19 @@ for line in sys.stdin:
     #[test]
     fn dry_run_reports_the_plan_without_creating_or_removing_anything() {
         let (_temp, root) = private_root();
-        let finished = request(&root, "synthetic-dry-finished", Some(json!([completed_row()])));
+        let finished = request(
+            &root,
+            "synthetic-dry-finished",
+            Some(json!([completed_row()])),
+        );
         // Never reached provider startup, so a real sweep would have to create its lock.
         let bare = request(&root, "synthetic-dry-bare", Some(json!([completed_row()])));
         let _ = std::fs::remove_file(bare.with_extension("lifecycle-lock"));
-        let uncertain = request(&root, "synthetic-dry-uncertain", Some(json!([started_row()])));
+        let uncertain = request(
+            &root,
+            "synthetic-dry-uncertain",
+            Some(json!([started_row()])),
+        );
         for journal in [&finished, &bare, &uncertain] {
             age(journal, TWO_DAYS);
         }
@@ -1494,14 +2150,25 @@ for line in sys.stdin:
             out.sort_by(|a, b| a.0.cmp(&b.0));
             out
         }
-        let fingerprint = |root: &Path| listing(root).into_iter()
-            .map(|(path, m)| (path, m.modified().unwrap(), m.len())).collect::<Vec<_>>();
+        let fingerprint = |root: &Path| {
+            listing(root)
+                .into_iter()
+                .map(|(path, m)| (path, m.modified().unwrap(), m.len()))
+                .collect::<Vec<_>>()
+        };
         let before = fingerprint(&root);
 
         let report = sweep_finished(&root, GRACE, true).unwrap();
 
-        assert_eq!(fingerprint(&root), before, "a dry run must not write, lock-create or delete");
-        assert_eq!((report.entries, report.removed, report.kept_unfinished), (3, 2, 1));
+        assert_eq!(
+            fingerprint(&root),
+            before,
+            "a dry run must not write, lock-create or delete"
+        );
+        assert_eq!(
+            (report.entries, report.removed, report.kept_unfinished),
+            (3, 2, 1)
+        );
         assert!(report.removed_bytes > 0 && report.bytes > report.removed_bytes);
     }
 
@@ -1510,8 +2177,16 @@ for line in sys.stdin:
         // A caller that keeps retrying one turn (every provider latched for
         // days, say) must find its receipts when a provider is next available.
         let (_temp, root) = private_root();
-        let retried = request(&root, "synthetic-retried-turn", Some(json!([completed_row()])));
-        let abandoned = request(&root, "synthetic-abandoned-turn", Some(json!([completed_row()])));
+        let retried = request(
+            &root,
+            "synthetic-retried-turn",
+            Some(json!([completed_row()])),
+        );
+        let abandoned = request(
+            &root,
+            "synthetic-abandoned-turn",
+            Some(json!([completed_row()])),
+        );
         age(&retried, TWO_DAYS);
         age(&abandoned, TWO_DAYS);
         assert_eq!(request(&root, "synthetic-retried-turn", None), retried);
@@ -1526,7 +2201,11 @@ for line in sys.stdin:
     #[test]
     fn daemon_pass_removes_only_after_a_second_unchanged_observation() {
         let (_temp, root) = private_root();
-        let replayed = request(&root, "synthetic-replayed-after-restart", Some(json!([completed_row()])));
+        let replayed = request(
+            &root,
+            "synthetic-replayed-after-restart",
+            Some(json!([completed_row()])),
+        );
         let idle = request(&root, "synthetic-idle", Some(json!([completed_row()])));
         age(&replayed, TWO_DAYS);
         age(&idle, TWO_DAYS);
@@ -1536,22 +2215,39 @@ for line in sys.stdin:
         assert_eq!((first.removed, first.kept_pending), (0, 2));
         assert!(replayed.exists() && idle.exists());
         // A channel replays one of those turns before the next pass.
-        assert_eq!(request(&root, "synthetic-replayed-after-restart", None), replayed);
+        assert_eq!(
+            request(&root, "synthetic-replayed-after-restart", None),
+            replayed
+        );
         let second = sweep(&root, GRACE, Pass::Confirm(&mut observed)).unwrap();
         assert_eq!((second.removed, second.kept_recent), (1, 1));
         assert!(replayed.exists() && gone(&idle));
         // Losing the observations (another restart) only delays removal.
         observed.clear();
         age(&replayed, TWO_DAYS);
-        assert_eq!(sweep(&root, GRACE, Pass::Confirm(&mut observed)).unwrap().kept_pending, 1);
-        assert_eq!(sweep(&root, GRACE, Pass::Confirm(&mut observed)).unwrap().removed, 1);
+        assert_eq!(
+            sweep(&root, GRACE, Pass::Confirm(&mut observed))
+                .unwrap()
+                .kept_pending,
+            1
+        );
+        assert_eq!(
+            sweep(&root, GRACE, Pass::Confirm(&mut observed))
+                .unwrap()
+                .removed,
+            1
+        );
         assert!(gone(&replayed));
     }
 
     #[test]
     fn request_path_waiting_on_a_sweep_gets_a_live_directory() {
         let (_temp, root) = private_root();
-        let journal = request(&root, "synthetic-contended-turn", Some(json!([completed_row()])));
+        let journal = request(
+            &root,
+            "synthetic-contended-turn",
+            Some(json!([completed_row()])),
+        );
         let lock = hold_lock(&journal.with_extension("lifecycle-lock"));
         let (opened, waiting) = std::sync::mpsc::channel();
         let (resume, paused) = std::sync::mpsc::channel::<()>();
@@ -1569,7 +2265,9 @@ for line in sys.stdin:
                 request_path(&root, &opts)
             }
         });
-        waiting.recv_timeout(Duration::from_secs(10)).expect("request_path never reached the lifecycle lock");
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("request_path never reached the lifecycle lock");
         // What a sweep does while it holds the lock: remove the request.
         let directory = journal.parent().unwrap();
         for entry in std::fs::read_dir(directory).unwrap() {
@@ -1580,7 +2278,10 @@ for line in sys.stdin:
         resume.send(()).unwrap();
         let addressed = waiter.join().unwrap().unwrap();
         assert_eq!(addressed, journal);
-        assert!(addressed.parent().unwrap().is_dir(), "caller was handed a removed request directory");
+        assert!(
+            addressed.parent().unwrap().is_dir(),
+            "caller was handed a removed request directory"
+        );
         assert!(!addressed.exists());
     }
 
@@ -1588,27 +2289,60 @@ for line in sys.stdin:
     fn recovery_cli_still_reconciles_an_uncertain_journal_older_than_grace() {
         use std::process::{Command, Stdio};
         let (temp, root) = private_root();
-        let journal = request(&root, "synthetic-uncertain-turn", Some(json!([completed_row(), started_row()])));
+        let journal = request(
+            &root,
+            "synthetic-uncertain-turn",
+            Some(json!([completed_row(), started_row()])),
+        );
         age(&journal, TWO_DAYS);
         let report = sweep_finished(&root, GRACE, false).unwrap();
         assert_eq!((report.removed, report.kept_unfinished), (0, 1));
 
         let helper = temp.path().join("recovery.py");
-        std::fs::write(&helper, include_bytes!("../../../scripts/codex-tool-bridge.py")).unwrap();
-        let status = Command::new("python3").arg("-I").arg(&helper)
-            .arg("--handoff-status").arg(&journal).output().unwrap();
-        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        std::fs::write(
+            &helper,
+            include_bytes!("../../../scripts/codex-tool-bridge.py"),
+        )
+        .unwrap();
+        let status = Command::new("python3")
+            .arg("-I")
+            .arg(&helper)
+            .arg("--handoff-status")
+            .arg(&journal)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
         let rows: Vec<Value> = serde_json::from_slice(&status.stdout).unwrap();
         assert_eq!(rows[1]["status"], "started");
         let decision = json!({"index": 1, "fingerprint": rows[1]["fingerprint"], "outcome": "completed",
             "evidence": "Synthetic service shows exactly one change.",
             "result": {"content": [{"type": "text", "text": "synthetic-43"}]}});
-        let mut recovery = Command::new("python3").arg("-I").arg(&helper)
-            .arg("--handoff-reconcile").arg(&journal)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        recovery.stdin.take().unwrap().write_all(decision.to_string().as_bytes()).unwrap();
+        let mut recovery = Command::new("python3")
+            .arg("-I")
+            .arg(&helper)
+            .arg("--handoff-reconcile")
+            .arg(&journal)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        recovery
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(decision.to_string().as_bytes())
+            .unwrap();
         let result = recovery.wait_with_output().unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         let state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         assert_eq!(state["operations"][1]["status"], "completed");
 
@@ -1623,14 +2357,41 @@ for line in sys.stdin:
         let hours = |h: u64| Duration::from_secs(h * 3600);
         let floor = hours(3);
         let grace = |raw| retention_from(raw, floor);
-        assert_eq!(grace(None), RetentionSetting { grace: hours(24), source: RetentionSource::Default });
+        assert_eq!(
+            grace(None),
+            RetentionSetting {
+                grace: hours(24),
+                source: RetentionSource::Default
+            }
+        );
         assert_eq!(grace(Some("  ")).source, RetentionSource::Default);
-        assert_eq!(grace(Some(" 72 ")), RetentionSetting { grace: hours(72), source: RetentionSource::Env("72".into()) });
+        assert_eq!(
+            grace(Some(" 72 ")),
+            RetentionSetting {
+                grace: hours(72),
+                source: RetentionSource::Env("72".into())
+            }
+        );
         assert_eq!(grace(Some("3")).grace, hours(3));
         assert_eq!(grace(Some("8760")).grace, hours(8760));
-        for invalid in ["0", "1", "2", "-5", "1.5", "a day", "8761", "18446744073709551615"] {
-            assert_eq!(grace(Some(invalid)), RetentionSetting { grace: hours(24),
-                source: RetentionSource::Rejected(invalid.into()) }, "{invalid}");
+        for invalid in [
+            "0",
+            "1",
+            "2",
+            "-5",
+            "1.5",
+            "a day",
+            "8761",
+            "18446744073709551615",
+        ] {
+            assert_eq!(
+                grace(Some(invalid)),
+                RetentionSetting {
+                    grace: hours(24),
+                    source: RetentionSource::Rejected(invalid.into())
+                },
+                "{invalid}"
+            );
         }
     }
 
@@ -1652,19 +2413,37 @@ for line in sys.stdin:
         };
         // Another test may briefly override the reasoner timeout; compare
         // two reads taken under the same setting.
-        let (gate, longest) = (0..1000).find_map(|_| {
-            let gate = longest_gate_wait();
-            let longest = classes.iter().map(crate::reasoner::reasoner_timeout_for).max().unwrap();
-            (gate == longest).then_some((gate, longest))
-        }).expect("longest_gate_wait must be the largest class gate budget");
+        let (gate, longest) = (0..1000)
+            .find_map(|_| {
+                let gate = longest_gate_wait();
+                let longest = classes
+                    .iter()
+                    .map(crate::reasoner::reasoner_timeout_for)
+                    .max()
+                    .unwrap();
+                (gate == longest).then_some((gate, longest))
+            })
+            .expect("longest_gate_wait must be the largest class gate budget");
         assert!(retention_floor_for(gate) >= longest + hours(1));
-        for wait in [Duration::ZERO, Duration::from_secs(1), hours(2), hours(2) + Duration::from_secs(1), hours(30)] {
+        for wait in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            hours(2),
+            hours(2) + Duration::from_secs(1),
+            hours(30),
+        ] {
             let floor = retention_floor_for(wait);
-            assert!(floor >= wait + hours(1) && floor.as_secs() % 3600 == 0, "{wait:?} -> {floor:?}");
+            assert!(
+                floor >= wait + hours(1) && floor.as_secs() % 3600 == 0,
+                "{wait:?} -> {floor:?}"
+            );
         }
         // Default timeouts: one hour base, doubled for write/agentic calls.
         assert_eq!(retention_floor_for(hours(2)), hours(3));
-        assert_eq!(retention_floor_for(hours(2) + Duration::from_secs(1)), hours(4));
+        assert_eq!(
+            retention_floor_for(hours(2) + Duration::from_secs(1)),
+            hours(4)
+        );
         // A floor above the default raises the default with it.
         assert_eq!(retention_from(None, hours(30)).grace, hours(30));
         assert_eq!(retention_from(Some("25"), hours(30)).grace, hours(30));
@@ -1679,27 +2458,64 @@ for line in sys.stdin:
     fn leftover_bridge_save_temp_files_follow_their_request() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let (_temp, root) = private_root();
-        let pending_state = json!({"version": 1, "operations": [completed_row(), started_row()]}).to_string();
-        let finished = request(&root, "synthetic-temp-finished", Some(json!([completed_row()])));
-        write_private(&finished.parent().unwrap().join(".handoff-a1b2c3d4"), &pending_state);
-        let uncertain = request(&root, "synthetic-temp-uncertain", Some(json!([started_row()])));
-        write_private(&uncertain.parent().unwrap().join(".handoff-e5f6a7b8"), &pending_state);
-        let public = request(&root, "synthetic-temp-public", Some(json!([completed_row()])));
+        let pending_state =
+            json!({"version": 1, "operations": [completed_row(), started_row()]}).to_string();
+        let finished = request(
+            &root,
+            "synthetic-temp-finished",
+            Some(json!([completed_row()])),
+        );
+        write_private(
+            &finished.parent().unwrap().join(".handoff-a1b2c3d4"),
+            &pending_state,
+        );
+        let uncertain = request(
+            &root,
+            "synthetic-temp-uncertain",
+            Some(json!([started_row()])),
+        );
+        write_private(
+            &uncertain.parent().unwrap().join(".handoff-e5f6a7b8"),
+            &pending_state,
+        );
+        let public = request(
+            &root,
+            "synthetic-temp-public",
+            Some(json!([completed_row()])),
+        );
         let public_temp = public.parent().unwrap().join(".handoff-c9d0e1f2");
         write_private(&public_temp, &pending_state);
         std::fs::set_permissions(&public_temp, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let linked = request(&root, "synthetic-temp-linked", Some(json!([completed_row()])));
-        symlink(&finished, linked.parent().unwrap().join(".handoff-a3b4c5d6")).unwrap();
+        let linked = request(
+            &root,
+            "synthetic-temp-linked",
+            Some(json!([completed_row()])),
+        );
+        symlink(
+            &finished,
+            linked.parent().unwrap().join(".handoff-a3b4c5d6"),
+        )
+        .unwrap();
         for journal in [&finished, &uncertain, &public, &linked] {
             age(journal, TWO_DAYS);
         }
 
         let report = sweep_finished(&root, GRACE, false).unwrap();
 
-        assert!(gone(&finished), "an interrupted save must not pin a finished request");
+        assert!(
+            gone(&finished),
+            "an interrupted save must not pin a finished request"
+        );
         assert!(uncertain.exists() && public.exists() && linked.exists());
         assert!(public_temp.exists());
-        assert_eq!((report.removed, report.kept_unfinished, report.kept_untrusted), (1, 1, 2));
+        assert_eq!(
+            (
+                report.removed,
+                report.kept_unfinished,
+                report.kept_untrusted
+            ),
+            (1, 1, 2)
+        );
     }
 
     /// #1069 review M1(c) — a request that finished without a summary keeps a
@@ -1709,22 +2525,45 @@ for line in sys.stdin:
     #[test]
     fn a_completed_without_summary_verdict_follows_its_request() {
         let (_temp, root) = private_root();
-        let finished = request(&root, "synthetic-verdict-finished", Some(json!([completed_row()])));
-        write_private(&finished.parent().unwrap().join(VERDICT_FILE),
-            &json!({"version": 1, "completed": 1}).to_string());
-        let young = request(&root, "synthetic-verdict-young", Some(json!([completed_row()])));
-        write_private(&young.parent().unwrap().join(VERDICT_FILE),
-            &json!({"version": 1, "completed": 1}).to_string());
+        let finished = request(
+            &root,
+            "synthetic-verdict-finished",
+            Some(json!([completed_row()])),
+        );
+        write_private(
+            &finished.parent().unwrap().join(VERDICT_FILE),
+            &json!({"version": 1, "completed": 1}).to_string(),
+        );
+        let young = request(
+            &root,
+            "synthetic-verdict-young",
+            Some(json!([completed_row()])),
+        );
+        write_private(
+            &young.parent().unwrap().join(VERDICT_FILE),
+            &json!({"version": 1, "completed": 1}).to_string(),
+        );
         age(&finished, TWO_DAYS);
 
         let dry = sweep_finished(&root, GRACE, true).unwrap();
-        assert_eq!((dry.removed, dry.kept_recent, dry.kept_untrusted), (1, 1, 0));
+        assert_eq!(
+            (dry.removed, dry.kept_recent, dry.kept_untrusted),
+            (1, 1, 0)
+        );
         let report = sweep_finished(&root, GRACE, false).unwrap();
 
-        assert!(gone(&finished), "an expired verdict must not pin its request");
-        assert!(young.parent().unwrap().join(VERDICT_FILE).exists(),
-            "inside grace the verdict still refuses a retry");
-        assert_eq!((report.removed, report.kept_recent, report.kept_untrusted), (1, 1, 0));
+        assert!(
+            gone(&finished),
+            "an expired verdict must not pin its request"
+        );
+        assert!(
+            young.parent().unwrap().join(VERDICT_FILE).exists(),
+            "inside grace the verdict still refuses a retry"
+        );
+        assert_eq!(
+            (report.removed, report.kept_recent, report.kept_untrusted),
+            (1, 1, 0)
+        );
     }
 
     /// #1035 review — doctor's dead-sweep signal comes from this classification.
@@ -1733,29 +2572,62 @@ for line in sys.stdin:
         use std::os::unix::fs::symlink;
         let (_temp, root) = private_root();
         let hours = |h: u64| Duration::from_secs(h * 3600);
-        let overdue: Vec<_> = (0..2).map(|i| {
-            let journal = request(&root, &format!("synthetic-overdue-{i}"), Some(json!([completed_row()])));
-            age(&journal, TWO_DAYS);
-            journal
-        }).collect();
+        let overdue: Vec<_> = (0..2)
+            .map(|i| {
+                let journal = request(
+                    &root,
+                    &format!("synthetic-overdue-{i}"),
+                    Some(json!([completed_row()])),
+                );
+                age(&journal, TWO_DAYS);
+                journal
+            })
+            .collect();
         // Past grace by less than two sweep intervals: a live sweep may not have reached it yet.
-        let expiring = request(&root, "synthetic-just-expired", Some(json!([completed_row()])));
+        let expiring = request(
+            &root,
+            "synthetic-just-expired",
+            Some(json!([completed_row()])),
+        );
         age(&expiring, GRACE + SWEEP_INTERVAL + hours(1) / 2);
         let recent = request(&root, "synthetic-recent", Some(json!([completed_row()])));
-        let active = request(&root, "synthetic-overdue-but-active", Some(json!([completed_row()])));
-        write_private(&active.with_extension("active"), &json!({"version": 1, "receipt": "/nonexistent"}).to_string());
-        let uncertain = request(&root, "synthetic-overdue-but-uncertain", Some(json!([started_row()])));
+        let active = request(
+            &root,
+            "synthetic-overdue-but-active",
+            Some(json!([completed_row()])),
+        );
+        write_private(
+            &active.with_extension("active"),
+            &json!({"version": 1, "receipt": "/nonexistent"}).to_string(),
+        );
+        let uncertain = request(
+            &root,
+            "synthetic-overdue-but-uncertain",
+            Some(json!([started_row()])),
+        );
         for journal in [&active, &uncertain] {
             age(journal, TWO_DAYS);
         }
         write_private(&root.join("notes.txt"), "not a request");
-        symlink(overdue[0].parent().unwrap(), root.join(format!("{:064x}", 7))).unwrap();
+        symlink(
+            overdue[0].parent().unwrap(),
+            root.join(format!("{:064x}", 7)),
+        )
+        .unwrap();
 
         let report = sweep_finished(&root, GRACE, true).unwrap();
 
         assert_eq!((report.entries, report.requests), (8, 6));
         assert_eq!((report.removed, report.finished_overdue), (3, 2));
-        assert_eq!((report.kept_recent, report.kept_active, report.kept_unfinished, report.kept_untrusted), (1, 1, 1, 2));
+        assert_eq!(
+            (
+                report.kept_recent,
+                report.kept_active,
+                report.kept_unfinished,
+                report.kept_untrusted
+            ),
+            (1, 1, 1, 2)
+        );
         assert!(recent.exists());
     }
 
@@ -1769,37 +2641,76 @@ for line in sys.stdin:
         let off_runtime = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let flag = std::sync::Arc::clone(&off_runtime);
         let also: SweepHook = std::sync::Arc::new(move || {
-            flag.fetch_and(std::thread::current().id() != runtime_thread, std::sync::atomic::Ordering::SeqCst);
+            flag.fetch_and(
+                std::thread::current().id() != runtime_thread,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(None, GRACE, Duration::from_millis(20), shutdown.clone(),
-            Some(also), LivenessEnv::probe()));
+        let task = tokio::spawn(run_sweep_loop(
+            None,
+            GRACE,
+            Duration::from_millis(20),
+            shutdown.clone(),
+            Some(also),
+            LivenessEnv::probe(),
+        ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
-            assert!(std::time::Instant::now() < deadline, "the scratch sweep did not run on consecutive ticks");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scratch sweep did not run on consecutive ticks"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(off_runtime.load(std::sync::atomic::Ordering::SeqCst), "the scratch sweep must run on the blocking pool");
+        assert!(
+            off_runtime.load(std::sync::atomic::Ordering::SeqCst),
+            "the scratch sweep must run on the blocking pool"
+        );
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sweep_loop_runs_at_start_and_stops_on_shutdown() {
-        assert!(SWEEP_INTERVAL <= Duration::from_secs(3600), "C2: at least hourly");
+        assert!(
+            SWEEP_INTERVAL <= Duration::from_secs(3600),
+            "C2: at least hourly"
+        );
         let (_temp, root) = private_root();
-        let journal = request(&root, "synthetic-startup-sweep", Some(json!([completed_row()])));
+        let journal = request(
+            &root,
+            "synthetic-startup-sweep",
+            Some(json!([completed_row()])),
+        );
         age(&journal, TWO_DAYS);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_millis(50),
-            shutdown.clone(), None, LivenessEnv::probe()));
+        let task = tokio::spawn(run_sweep_loop(
+            Some(root.clone()),
+            GRACE,
+            Duration::from_millis(50),
+            shutdown.clone(),
+            None,
+            LivenessEnv::probe(),
+        ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !gone(&journal) {
-            assert!(std::time::Instant::now() < deadline, "startup sweep did not run");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup sweep did not run"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

@@ -1,11 +1,14 @@
 //! Lifecycle boundary shared by CLI provider adapters.
-use tokio::process::{Child, Command};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::process::{Child, Command};
 
 /// Private supervisor owns all descendants, even after session detachment.
 /// The caller must check `clean` before treating an error as failover-eligible.
@@ -19,140 +22,248 @@ pub(crate) struct ProcessGroup {
     resource_observed: AtomicBool,
     release_attempted: AtomicBool,
     fresh_native_session: Option<crate::native_vm::FreshUnreleasedRuntime>,
-    resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
+    resource_audit: std::sync::Mutex<Option<(String, Arc<crate::tool_audit::AuditLogger>)>>,
     owned_run: std::sync::Mutex<Option<crate::tool_audit::cancellation::Registration>>,
     resource_admission: std::sync::Mutex<Option<serde_json::Value>>,
     _directory: Option<tempfile::TempDir>,
 }
 
 impl ProcessGroup {
-    pub(crate) fn with_fresh_native_session(mut self,fresh:Option<crate::native_vm::FreshUnreleasedRuntime>)->Self {
-        self.fresh_native_session=fresh;self
+    pub(crate) fn with_fresh_native_session(
+        mut self,
+        fresh: Option<crate::native_vm::FreshUnreleasedRuntime>,
+    ) -> Self {
+        self.fresh_native_session = fresh;
+        self
     }
-    pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        if let Some(logger)=logger {
-            let mut registration=self.owned_run.lock().map_err(|_|anyhow::anyhow!("owned-run registration poisoned"))?;
-            if registration.is_none() {*registration=logger.register_owned_run(&self.receipt)?;}
-            *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone()));
+    pub(crate) fn bind_resource_audit(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    ) -> anyhow::Result<()> {
+        if let Some(logger) = logger {
+            let mut registration = self
+                .owned_run
+                .lock()
+                .map_err(|_| anyhow::anyhow!("owned-run registration poisoned"))?;
+            if registration.is_none() {
+                *registration = logger.register_owned_run(&self.receipt)?;
+            }
+            *self
+                .resource_audit
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resource audit lock poisoned"))? =
+                Some((provider.into(), logger.clone()));
         }
         Ok(())
     }
-    pub(crate) async fn admit_model(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        self.admit(provider,logger,true).await
+    pub(crate) async fn admit_model(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    ) -> anyhow::Result<()> {
+        self.admit(provider, logger, true).await
     }
-    pub(crate) async fn admit_command(&self, label: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        self.admit(label,logger,false).await
+    pub(crate) async fn admit_command(
+        &self,
+        label: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    ) -> anyhow::Result<()> {
+        self.admit(label, logger, false).await
     }
-    pub(crate) async fn admit_command_observed(&self,provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,
-        observer:&mut (dyn FnMut(&serde_json::Value)->anyhow::Result<()> + Send)) -> anyhow::Result<()> {
-        self.admit_observed(provider,logger,false,Some(observer)).await
+    pub(crate) async fn admit_command_observed(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+        observer: &mut (dyn FnMut(&serde_json::Value) -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<()> {
+        self.admit_observed(provider, logger, false, Some(observer))
+            .await
     }
-    async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
-        self.admit_observed(provider,logger,model,None).await
+    async fn admit(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+        model: bool,
+    ) -> anyhow::Result<()> {
+        self.admit_observed(provider, logger, model, None).await
     }
-    async fn admit_observed(&self, provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,model:bool,
-        observer:Option<&mut (dyn FnMut(&serde_json::Value)->anyhow::Result<()> + Send)>) -> anyhow::Result<()> {
-        self.bind_resource_audit(provider,logger)?;
-        let ready=self.receipt.with_file_name("launch-ready");
+    async fn admit_observed(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+        model: bool,
+        observer: Option<&mut (dyn FnMut(&serde_json::Value) -> anyhow::Result<()> + Send)>,
+    ) -> anyhow::Result<()> {
+        self.bind_resource_audit(provider, logger)?;
+        let ready = self.receipt.with_file_name("launch-ready");
         // Admission may wait for capacity (reclaiming cache, then a sibling run
         // finishing) before it writes launch-ready; give it that long.
-        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(
-            ADMISSION_WAIT_SECS+if self.vm_preflight { 65 } else { 5 });
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(
+                ADMISSION_WAIT_SECS + if self.vm_preflight { 65 } else { 5 },
+            );
         while !ready.exists() {
-            if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
-                self.resource_outcome(provider,logger)?;
-                let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
-                    .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-                if let Some(category)=startup.as_ref().and_then(native_setup_category) {
-                    if let Some(logger)=logger {
+            if self.receipt.exists() || tokio::time::Instant::now() >= deadline {
+                self.resource_outcome(provider, logger)?;
+                let startup = private_read(&self.receipt.with_file_name("vm-startup-failure.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if let Some(category) = startup.as_ref().and_then(native_setup_category) {
+                    if let Some(logger) = logger {
                         logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
                     }
                     return Err(crate::reasoner::ReasonerError::Local {
                         message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
                     }.into());
                 }
-                let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
+                let phase = if startup
+                    .as_ref()
+                    .and_then(|value| value.get("phase"))
+                    .and_then(|value| value.as_str())
+                    == Some("native_credential_in_use")
+                {
                     "native_credential_in_use"
-                } else {"launch_readiness_unavailable"};
-                return crate::run_resources::admission_failed(provider,logger,phase);
+                } else {
+                    "launch_readiness_unavailable"
+                };
+                return crate::run_resources::admission_failed(provider, logger, phase);
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let mut resource_identity=None;
+        let mut resource_identity = None;
         if self.resource_required {
-            let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
-                .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            let Some(observation)=parsed.filter(|value|value.get("phase").and_then(|v|v.as_str())==Some("admitted")
-                && value.get("exhausted").and_then(|v|v.as_bool())==Some(false)
-                && value.pointer("/identity/limits").is_some_and(|v|v.is_object())) else {
-                self.resource_observed.store(true,Ordering::SeqCst);
-                return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable");
+            let parsed = private_read(&self.receipt.with_file_name("resource-accounting.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let Some(observation) = parsed.filter(|value| {
+                value.get("phase").and_then(|v| v.as_str()) == Some("admitted")
+                    && value.get("exhausted").and_then(|v| v.as_bool()) == Some(false)
+                    && value
+                        .pointer("/identity/limits")
+                        .is_some_and(|v| v.is_object())
+            }) else {
+                self.resource_observed.store(true, Ordering::SeqCst);
+                return crate::run_resources::admission_failed(
+                    provider,
+                    logger,
+                    "admission_receipt_unavailable",
+                );
             };
-            if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
+            if let Some(logger) = logger.filter(|logger| logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
-            resource_identity=Some(observation["identity"].clone());
+            resource_identity = Some(observation["identity"].clone());
         }
-        if let Some(identity)=&resource_identity {
-            let parent=self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource admission directory missing"))?;
-            let mut original=tempfile::NamedTempFile::new_in(parent)?;
-            original.write_all(&serde_json::to_vec(identity)?)?;original.as_file().sync_all()?;
-            original.persist_noclobber(parent.join("resource-admitted.json")).map_err(|error|error.error)?;
+        if let Some(identity) = &resource_identity {
+            let parent = self
+                .receipt
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("resource admission directory missing"))?;
+            let mut original = tempfile::NamedTempFile::new_in(parent)?;
+            original.write_all(&serde_json::to_vec(identity)?)?;
+            original.as_file().sync_all()?;
+            original
+                .persist_noclobber(parent.join("resource-admitted.json"))
+                .map_err(|error| error.error)?;
             std::fs::File::open(parent)?.sync_all()?;
         }
-        *self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?=resource_identity.clone();
-        if let Some(observer)=observer {
-            observer(resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("observed command requires a correlated resource scope"))?)?;
+        *self
+            .resource_admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource admission lock poisoned"))? =
+            resource_identity.clone();
+        if let Some(observer) = observer {
+            observer(resource_identity.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("observed command requires a correlated resource scope")
+            })?)?;
         }
-        if let Some(logger)=logger {logger.dispatch_allowed()?;}
-        if model { if let Some(logger)=logger {
-            match &resource_identity {
-                Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
-                None=>logger.model_call_admitted(provider)?,
+        if let Some(logger) = logger {
+            logger.dispatch_allowed()?;
+        }
+        if model {
+            if let Some(logger) = logger {
+                match &resource_identity {
+                    Some(identity) => logger.model_call_admitted_in_scope(provider, identity)?,
+                    None => logger.model_call_admitted(provider)?,
+                }
             }
-        } }
+        }
         // Publish only complete, synced admission bytes. Both the supervisor
         // and native VM can observe this path immediately after creation.
         // From the first publication attempt, cancellation or any error may
         // hide a released model. Never clear this flag or infer nonrelease
         // from a missing/partial acknowledgement afterwards.
-        self.release_attempted.store(true,Ordering::SeqCst);
-        let mut proceed=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||std::io::Error::other("admission directory missing"))?)?;
+        self.release_attempted.store(true, Ordering::SeqCst);
+        let mut proceed = tempfile::NamedTempFile::new_in(
+            self.receipt
+                .parent()
+                .ok_or_else(|| std::io::Error::other("admission directory missing"))?,
+        )?;
         proceed.write_all(b"admitted\n")?;
         proceed.as_file().sync_all()?;
-        proceed.persist_noclobber(self.receipt.with_file_name("launch-continue"))
-            .map_err(|error|error.error)?;
+        proceed
+            .persist_noclobber(self.receipt.with_file_name("launch-continue"))
+            .map_err(|error| error.error)?;
         std::fs::File::open(self.receipt.parent().unwrap())?.sync_all()?;
         Ok(())
     }
     pub(crate) fn verified_quiescence(&self) -> anyhow::Result<serde_json::Value> {
-        let admitted=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?
-            .clone().ok_or_else(||anyhow::anyhow!("command has no verified resource admission"))?;
-        let completed:serde_json::Value=serde_json::from_slice(&private_read(&self.receipt.with_file_name("resource-accounting.json"))?)?;
-        anyhow::ensure!(completed["phase"]=="completed" && completed.get("identity")==Some(&admitted),
-            "command completion lacks its exact admitted resource identity");
+        let admitted = self
+            .resource_admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource admission lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("command has no verified resource admission"))?;
+        let completed: serde_json::Value = serde_json::from_slice(&private_read(
+            &self.receipt.with_file_name("resource-accounting.json"),
+        )?)?;
+        anyhow::ensure!(
+            completed["phase"] == "completed" && completed.get("identity") == Some(&admitted),
+            "command completion lacks its exact admitted resource identity"
+        );
         crate::run_resources::verify_quiescent(&admitted)
     }
-    pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
-        crate::run_resources::record_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger)
+    pub(crate) fn resource_outcome(
+        &self,
+        provider: &str,
+        logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    ) -> anyhow::Result<()> {
+        if self.resource_observed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        crate::run_resources::record_outcome(
+            &self.receipt.with_file_name("resource-accounting.json"),
+            self.resource_required,
+            provider,
+            logger,
+        )
     }
 }
 
-fn native_setup_category(value:&serde_json::Value)->Option<&'static str> {
-    if value.get("phase").and_then(|v|v.as_str())!=Some("native_setup_failed") {return None;}
-    Some(match value.get("native_vm_failure").and_then(|v|v.as_str()) {
-        Some("JSONDecodeError")=>"JSONDecodeError",Some("ValueError")=>"ValueError",
-        Some("RuntimeError")=>"RuntimeError",Some("TimeoutError")=>"TimeoutError",
-        Some("OSError")=>"OSError",Some("BrokenPipeError")=>"BrokenPipeError",
-        Some("FileNotFoundError")=>"FileNotFoundError",Some("PermissionError")=>"PermissionError",
-        Some("ChildProcessError")=>"ChildProcessError",Some("CalledProcessError")=>"CalledProcessError",
-        _=>"BoundaryFailure",
-    })
+fn native_setup_category(value: &serde_json::Value) -> Option<&'static str> {
+    if value.get("phase").and_then(|v| v.as_str()) != Some("native_setup_failed") {
+        return None;
+    }
+    Some(
+        match value.get("native_vm_failure").and_then(|v| v.as_str()) {
+            Some("JSONDecodeError") => "JSONDecodeError",
+            Some("ValueError") => "ValueError",
+            Some("RuntimeError") => "RuntimeError",
+            Some("TimeoutError") => "TimeoutError",
+            Some("OSError") => "OSError",
+            Some("BrokenPipeError") => "BrokenPipeError",
+            Some("FileNotFoundError") => "FileNotFoundError",
+            Some("PermissionError") => "PermissionError",
+            Some("ChildProcessError") => "ChildProcessError",
+            Some("CalledProcessError") => "CalledProcessError",
+            _ => "BoundaryFailure",
+        },
+    )
 }
 
-fn cleanup_receipt_complete(bytes:&[u8])->bool {
-    bytes==b"all-descendants-reaped\n" || bytes==b"cgroup-descendants-cleared\n"
+fn cleanup_receipt_complete(bytes: &[u8]) -> bool {
+    bytes == b"all-descendants-reaped\n" || bytes == b"cgroup-descendants-cleared\n"
 }
 
 impl Drop for ProcessGroup {
@@ -160,52 +271,82 @@ impl Drop for ProcessGroup {
         // Creation precedes the supervisor's write/chmod/fsync. A visible
         // pathname is not yet a complete proof; give publication the same
         // bounded wait as a missing receipt, without accepting partial bytes.
-        let complete=|| private_read(&self.receipt).is_ok_and(|bytes|cleanup_receipt_complete(&bytes));
+        let complete =
+            || private_read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
         if !complete() {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
-            unsafe { libc::kill(self.id, libc::SIGTERM); }
+            unsafe {
+                libc::kill(self.id, libc::SIGTERM);
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while !complete() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        if let Ok(audit)=self.resource_audit.lock() {
-            if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
+        if let Ok(audit) = self.resource_audit.lock() {
+            if let Some((provider, logger)) = audit.as_ref() {
+                let _ = self.resource_outcome(provider, Some(logger));
+            }
         }
         let mut processes_settled = complete();
         if !processes_settled {
-            unsafe { libc::kill(self.id,libc::SIGKILL); }
+            unsafe {
+                libc::kill(self.id, libc::SIGKILL);
+            }
             if self.resource_required {
-                let killed=std::process::Command::new("/usr/bin/python3").arg("-I")
-                    .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup")
+                let killed = std::process::Command::new("/usr/bin/python3")
+                    .arg("-I")
+                    .arg(self.receipt.with_file_name("run-resource-scope.py"))
+                    .arg("--cleanup")
                     .arg(self.receipt.with_file_name("resource-accounting.json"))
-                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
-                    .is_ok_and(|status|status.success());
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
                 if killed {
                     // This is kernel-proven quiescence, not a claim that a dead
                     // supervisor personally reaped every process.
-                    processes_settled=(|| -> std::io::Result<()> {
-                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.receipt)?;
-                        file.write_all(b"cgroup-descendants-cleared\n")?;file.sync_all()
-                    })().is_ok();
+                    processes_settled = (|| -> std::io::Result<()> {
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&self.receipt)?;
+                        file.write_all(b"cgroup-descendants-cleared\n")?;
+                        file.sync_all()
+                    })()
+                    .is_ok();
                 }
             }
         }
-        let mut clean=processes_settled;
-        if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
-        self.clean.store(clean,Ordering::SeqCst);
-        if let Ok(mut registration)=self.owned_run.lock() {
-            if let Some(registration)=registration.take() {registration.complete(clean);}
+        let mut clean = processes_settled;
+        if clean {
+            if let Some(marker) = &self.active_request {
+                clean = retire_request(marker, &self.receipt).is_ok();
+            }
+        }
+        self.clean.store(clean, Ordering::SeqCst);
+        if let Ok(mut registration) = self.owned_run.lock() {
+            if let Some(registration) = registration.take() {
+                registration.complete(clean);
+            }
         }
         if clean && !self.release_attempted.load(Ordering::SeqCst) {
-            let absent=|name:&str|self.receipt.with_file_name(name).symlink_metadata()
-                .is_err_and(|error|error.kind()==std::io::ErrorKind::NotFound);
+            let absent = |name: &str| {
+                self.receipt
+                    .with_file_name(name)
+                    .symlink_metadata()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            };
             if absent("launch-continue") && absent("vm-dispatch-intent") {
-                if let Some(fresh)=self.fresh_native_session.take() {
-                    if fresh.reclaim().is_err() {tracing::warn!("unreleased native runtime retained for recovery");}
-                    else if let Ok(audit)=self.resource_audit.lock() {
-                        if let Some((provider,logger))=audit.as_ref() {
+                if let Some(fresh) = self.fresh_native_session.take() {
+                    if fresh.reclaim().is_err() {
+                        tracing::warn!("unreleased native runtime retained for recovery");
+                    } else if let Ok(audit) = self.resource_audit.lock() {
+                        if let Some((provider, logger)) = audit.as_ref() {
                             let _=logger.record_controller(serde_json::json!({"kind":"native_unreleased_session_reclaimed","provider":provider,
                                 "reason":"original_fresh_launch_unreleased_and_reaped","diagnostic_only":true}));
                         }
@@ -216,10 +357,11 @@ impl Drop for ProcessGroup {
         if !clean {
             // Retain private correlation evidence for restart recovery. A log
             // line or a finished supervisor PID cannot prove subtree teardown.
-            if let Some(directory)=self._directory.take() {let _=directory.keep();}
+            if let Some(directory) = self._directory.take() {
+                let _ = directory.keep();
+            }
             tracing::error!("provider descendant cleanup is unverified; failover blocked");
         }
-
     }
 }
 
@@ -231,31 +373,52 @@ pub(crate) fn spawn(command: &mut Command) -> std::io::Result<(Child, ProcessGro
 pub(crate) fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path)?;
-    if !path.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::other("lifecycle directory must be owner-private"));
+    if !path.is_absolute()
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(std::io::Error::other(
+            "lifecycle directory must be owner-private",
+        ));
     }
     Ok(())
 }
 
 fn private_read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
-    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    private_directory(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?,
+    )?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() } || metadata.len() > 4096 {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.len() > 4096
+    {
         return Err(std::io::Error::other("invalid lifecycle receipt"));
     }
     let mut bytes = Vec::new();
     file.take(4097).read_to_end(&mut bytes)?;
-    if bytes.len() > 4096 { return Err(std::io::Error::other("oversized lifecycle receipt")); }
+    if bytes.len() > 4096 {
+        return Err(std::io::Error::other("oversized lifecycle receipt"));
+    }
     Ok(bytes)
 }
 
 fn lock_options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     options
 }
 
@@ -267,19 +430,34 @@ thread_local! {
 }
 
 /// Open and flock an owner-private lock file without following links.
-fn flock_private(path: &std::path::Path, options: &std::fs::OpenOptions, wait: bool) -> std::io::Result<std::fs::File> {
+fn flock_private(
+    path: &std::path::Path,
+    options: &std::fs::OpenOptions,
+    wait: bool,
+) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
         return Err(std::io::Error::other("invalid lifecycle lock"));
     }
     #[cfg(test)]
     if wait {
-        if let Some(hook) = BEFORE_WAITING_LOCK.take() { hook() }
+        if let Some(hook) = BEFORE_WAITING_LOCK.take() {
+            hook()
+        }
     }
-    let operation = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 { return Err(std::io::Error::last_os_error()); }
+    let operation = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(file) // closing the descriptor releases the cross-process lock
 }
 
@@ -288,19 +466,30 @@ pub(crate) fn lifecycle_lock_path(journal: &std::path::Path) -> PathBuf {
 }
 
 fn lifecycle_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
+    private_directory(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?,
+    )?;
     // Held only across bounded local state reads/writes, never provider work.
-    flock_private(&lifecycle_lock_path(path), lock_options().create(true), true)
+    flock_private(
+        &lifecycle_lock_path(path),
+        lock_options().create(true),
+        true,
+    )
 }
 
 /// Housekeeping's lock (#1035): never waits, so contention is `WouldBlock`
 /// and the caller skips the request. Also reports whether this call created
 /// the file, since creating one moves the directory's modification time.
 pub(crate) fn try_private_lock(path: &std::path::Path) -> std::io::Result<(std::fs::File, bool)> {
-    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lock path"))?)?;
+    private_directory(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("invalid lock path"))?,
+    )?;
     match flock_private(path, lock_options().create_new(true), false) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
-            flock_private(path, &lock_options(), false).map(|file| (file, false)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            flock_private(path, &lock_options(), false).map(|file| (file, false))
+        }
         result => result.map(|file| (file, true)),
     }
 }
@@ -335,27 +524,38 @@ pub(crate) fn touch_request(journal: &std::path::Path) -> std::io::Result<bool> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     }
-    let request = journal.parent().ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
-    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(request)?.set_modified(std::time::SystemTime::now())?;
+    let request = journal
+        .parent()
+        .ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(request)?
+        .set_modified(std::time::SystemTime::now())?;
     Ok(true)
 }
 
 fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
     let value: serde_json::Value = serde_json::from_slice(&private_read(marker)?)?;
     // Pre-#1071 markers carry no writer identity, but name the same receipt.
-    let receipt = value["receipt"].as_str()
+    let receipt = value["receipt"]
+        .as_str()
         .filter(|_| value["version"] == 1 || value["version"] == MARKER_VERSION)
         .ok_or_else(|| std::io::Error::other("invalid lifecycle marker"))?;
     let receipt = PathBuf::from(receipt);
-    if !receipt.is_absolute() { return Err(std::io::Error::other("invalid receipt location")); }
+    if !receipt.is_absolute() {
+        return Err(std::io::Error::other("invalid receipt location"));
+    }
     Ok(receipt)
 }
 
 /// Proof that no descendant of the call can still be running: the supervisor's
 /// a supervisor-reaped or identity-bound cgroup-quiescent receipt, or — with no receipt left — that the writer is gone
 /// (#1071). Neither subsumes the other.
-enum Proof<'a> { Reaped(&'a std::path::Path), WriterGone(&'a LivenessEnv) }
+enum Proof<'a> {
+    Reaped(&'a std::path::Path),
+    WriterGone(&'a LivenessEnv),
+}
 
 /// The one site that unlinks a lifecycle marker, and the one that decides it may be. The
 /// caller holds the lifecycle lock; the proof is judged here against the marker on disk, so no
@@ -388,7 +588,12 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
 /// `Live` means its writer still runs, `Legacy` a pre-#1071 marker with no identity to judge,
 /// `Unproven` an incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
+pub(crate) enum Liveness {
+    Dead,
+    Live,
+    Legacy,
+    Unproven,
+}
 
 const MARKER_VERSION: u64 = 2;
 
@@ -401,17 +606,29 @@ fn read_trimmed(path: &str) -> Option<String> {
 /// holding spaces or parentheses cannot shift the offset. `None`: no such process.
 fn stat_field<T: std::str::FromStr>(pid: libc::pid_t, field: usize) -> Option<T> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().nth(field - 3)?.parse().ok()
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(field - 3)?
+        .parse()
+        .ok()
 }
 
 /// Field 22: when the process started, to tell a reused pid from the one recorded.
-fn process_start(pid: libc::pid_t) -> Option<u64> { stat_field(pid, 22) }
+fn process_start(pid: libc::pid_t) -> Option<u64> {
+    stat_field(pid, 22)
+}
 
 /// The cgroup a call ran in, as it stands now. `Gone` covers a vanished directory and
 /// one re-created at another inode: either way the recorded one was destroyed. `Ours`
 /// holds nobody but this process and its own descendants — empty, or the restart case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cgroup { Gone, Ours, Populated, Unknown }
+pub(crate) enum Cgroup {
+    Gone,
+    Ours,
+    Populated,
+    Unknown,
+}
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
@@ -419,7 +636,9 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 fn own_cgroup() -> Option<(String, u64)> {
     let line = read_trimmed("/proc/self/cgroup")?;
     let path = line.rsplit_once("::")?.1.to_owned();
-    let inode = std::fs::metadata(format!("{CGROUP_ROOT}{path}")).ok()?.ino();
+    let inode = std::fs::metadata(format!("{CGROUP_ROOT}{path}"))
+        .ok()?
+        .ino();
     Some((path, inode))
 }
 
@@ -442,26 +661,38 @@ fn cgroup_state(path: &str, inode: u64) -> Cgroup {
 }
 
 /// Field 4 of `/proc/<pid>/stat`: the parent, for the ancestry walk below.
-fn process_parent(pid: libc::pid_t) -> Option<libc::pid_t> { stat_field(pid, 4) }
+fn process_parent(pid: libc::pid_t) -> Option<libc::pid_t> {
+    stat_field(pid, 4)
+}
 
 /// Classify a `cgroup.procs` body by ancestry: only if every member's `/proc` parent chain
 /// reaches this process does nothing of the dead call survive there. Anything we cannot walk
 /// up to ourselves keeps the marker — a foreign process, a listed pid `/proc` will not show
 /// (no proven exit), or a leak of the call reparented away when its parent died. Start times
 /// cannot serve: a live writer's child spawned after us is younger yet not ours.
-fn cgroup_members(procs: &str, parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
-    own: libc::pid_t) -> Cgroup {
+fn cgroup_members(
+    procs: &str,
+    parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
+    own: libc::pid_t,
+) -> Cgroup {
     let ours = |member: libc::pid_t| {
         let mut pid = member;
         // Bounded, so a `/proc` reading that cycles cannot hang the pass.
         (0..64).any(|_| match parent_of(pid).filter(|_| pid != own) {
-            Some(next) if next > 1 && next != pid => { pid = next; false }
+            Some(next) if next > 1 && next != pid => {
+                pid = next;
+                false
+            }
             _ => true, // Reached us, or the chain ended below us. Stop looking.
         }) && pid == own
     };
     // An empty body vacuously satisfies this, which is the right reading.
     let mut members = procs.split_whitespace().filter_map(|pid| pid.parse().ok());
-    if members.all(ours) { Cgroup::Ours } else { Cgroup::Populated }
+    if members.all(ours) {
+        Cgroup::Ours
+    } else {
+        Cgroup::Populated
+    }
 }
 
 /// The systemd unit the daemon runs as, whose cgroup holds every call it makes.
@@ -471,32 +702,61 @@ pub const DAEMON_UNIT: &str = "augmentagent.service";
 /// respects, which [`call_provably_dead`] requires before reading membership at all.
 pub fn daemon_kill_mode(unit: &str) -> Option<String> {
     let shown = std::process::Command::new("systemctl")
-        .args(["--user", "show", "--property=KillMode", "--value", unit]).output().ok()?;
-    shown.status.success().then(|| String::from_utf8_lossy(&shown.stdout).trim().to_owned()).filter(|mode| !mode.is_empty())
+        .args(["--user", "show", "--property=KillMode", "--value", unit])
+        .output()
+        .ok()?;
+    shown
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&shown.stdout).trim().to_owned())
+        .filter(|mode| !mode.is_empty())
 }
 
 /// The liveness probes [`call_provably_dead`] reads, injected so the predicate is
 /// testable without a daemon, a reboot or a real cgroup hierarchy.
 pub type StartProbe = Box<dyn Fn(libc::pid_t) -> Option<u64> + Send + Sync>;
 pub type CgroupProbe = Box<dyn Fn(&str, u64) -> Cgroup + Send + Sync>;
-pub struct LivenessEnv { boot_id: Option<String>, start_of: StartProbe, cgroup_of: CgroupProbe, contained: bool }
+pub struct LivenessEnv {
+    boot_id: Option<String>,
+    start_of: StartProbe,
+    cgroup_of: CgroupProbe,
+    contained: bool,
+}
 
 impl LivenessEnv {
     /// Production: `/proc` and the cgroup v2 hierarchy, read-only.
     pub fn probe() -> Self {
-        LivenessEnv { boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
-            start_of: Box::new(process_start), cgroup_of: Box::new(cgroup_state),
-            contained: daemon_kill_mode(DAEMON_UNIT).as_deref() == Some("control-group") }
+        LivenessEnv {
+            boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
+            start_of: Box::new(process_start),
+            cgroup_of: Box::new(cgroup_state),
+            contained: daemon_kill_mode(DAEMON_UNIT).as_deref() == Some("control-group"),
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn injected(boot_id: Option<String>, start_of: StartProbe, cgroup_of: CgroupProbe) -> Self {
-        LivenessEnv { boot_id, start_of, cgroup_of, contained: true }
+    pub(crate) fn injected(
+        boot_id: Option<String>,
+        start_of: StartProbe,
+        cgroup_of: CgroupProbe,
+    ) -> Self {
+        LivenessEnv {
+            boot_id,
+            start_of,
+            cgroup_of,
+            contained: true,
+        }
     }
 }
 
 /// Who wrote a marker, as recorded by [`begin_request`].
-struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
+struct Writer {
+    boot_id: String,
+    pid: libc::pid_t,
+    start: u64,
+    cgroup: String,
+    cgroup_inode: u64,
+}
 
 /// Can any descendant of the call that wrote `marker` still be running? Two independent
 /// proofs of "no": a different `boot_id` (nothing the marker names survived the reboot),
@@ -513,11 +773,19 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
         Identity::Legacy => return Liveness::Legacy,
         Identity::Unknown => return Liveness::Unproven,
     };
-    let Some(current_boot) = env.boot_id.as_deref() else { return Liveness::Unproven };
-    if writer.boot_id != current_boot { return Liveness::Dead; }
+    let Some(current_boot) = env.boot_id.as_deref() else {
+        return Liveness::Unproven;
+    };
+    if writer.boot_id != current_boot {
+        return Liveness::Dead;
+    }
     // Never pid alone: a reused pid is a different process.
-    if (env.start_of)(writer.pid) == Some(writer.start) { return Liveness::Live; }
-    if !env.contained { return Liveness::Unproven; }
+    if (env.start_of)(writer.pid) == Some(writer.start) {
+        return Liveness::Live;
+    }
+    if !env.contained {
+        return Liveness::Unproven;
+    }
     match (env.cgroup_of)(&writer.cgroup, writer.cgroup_inode) {
         // Destroyed, emptied, or — after an in-place restart into the same unit cgroup —
         // holding none but this process and its own descendants.
@@ -528,30 +796,62 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
 
 /// What a marker says about its writer. `Legacy` is a well-formed pre-#1071 marker with
 /// no writer recorded; `Unknown` is missing, unreadable, or malformed. Both keep it.
-enum Identity { Writer(Writer), Legacy, Unknown }
+enum Identity {
+    Writer(Writer),
+    Legacy,
+    Unknown,
+}
 
 fn marker_identity(marker: &std::path::Path) -> Identity {
-    let Ok(bytes) = private_read(marker) else { return Identity::Unknown };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Identity::Unknown };
-    if value["version"] == 1 { return Identity::Legacy; }
-    if value["version"] != MARKER_VERSION { return Identity::Unknown; }
-    let writer = || Some(Writer {
-        boot_id: value["boot_id"].as_str().filter(|boot| !boot.is_empty())?.to_owned(),
-        pid: value["writer_pid"].as_i64().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 0)?,
-        start: value["writer_start"].as_u64()?,
-        cgroup: value["writer_cgroup"].as_str().filter(|cgroup| cgroup.starts_with('/'))?.to_owned(),
-        // Zero is no inode, so it would match no directory and read as `Gone` — a clearing
-        // verdict out of a malformed field. Keep the marker instead.
-        cgroup_inode: value["writer_cgroup_inode"].as_u64().filter(|inode| *inode > 0)? });
+    let Ok(bytes) = private_read(marker) else {
+        return Identity::Unknown;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Identity::Unknown;
+    };
+    if value["version"] == 1 {
+        return Identity::Legacy;
+    }
+    if value["version"] != MARKER_VERSION {
+        return Identity::Unknown;
+    }
+    let writer = || {
+        Some(Writer {
+            boot_id: value["boot_id"]
+                .as_str()
+                .filter(|boot| !boot.is_empty())?
+                .to_owned(),
+            pid: value["writer_pid"]
+                .as_i64()
+                .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                .filter(|pid| *pid > 0)?,
+            start: value["writer_start"].as_u64()?,
+            cgroup: value["writer_cgroup"]
+                .as_str()
+                .filter(|cgroup| cgroup.starts_with('/'))?
+                .to_owned(),
+            // Zero is no inode, so it would match no directory and read as `Gone` — a clearing
+            // verdict out of a malformed field. Keep the marker instead.
+            cgroup_inode: value["writer_cgroup_inode"]
+                .as_u64()
+                .filter(|inode| *inode > 0)?,
+        })
+    };
     writer().map_or(Identity::Unknown, Identity::Writer)
 }
 
 /// Clear one orphaned marker, or report why it was kept. `dry_run` reads only: it takes no lock
 /// and creates nothing. Only the marker is touched — the journal keeps its `started` rows, so
 /// recovery can still act on the request.
-pub(crate) fn clear_if_dead(journal: &std::path::Path, env: &LivenessEnv, dry_run: bool) -> std::io::Result<Liveness> {
+pub(crate) fn clear_if_dead(
+    journal: &std::path::Path,
+    env: &LivenessEnv,
+    dry_run: bool,
+) -> std::io::Result<Liveness> {
     let marker = journal.with_extension("active");
-    if dry_run { return Ok(call_provably_dead(&marker, env)); }
+    if dry_run {
+        return Ok(call_provably_dead(&marker, env));
+    }
     let _lock = lifecycle_lock(&marker)?;
     clear_marker(&marker, Proof::WriterGone(env))
 }
@@ -567,20 +867,41 @@ pub(crate) fn ensure_request_idle(journal: &std::path::Path) -> std::io::Result<
         result => result?,
     };
     if !cleanup_receipt_complete(&private_read(&receipt)?) {
-        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "cleanup receipt is incomplete"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "cleanup receipt is incomplete",
+        ));
     }
     clear_marker(&marker, Proof::Reaped(&receipt)).map(|_| ())
 }
 
-fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
-    let Some(journal) = journal else { return Ok(None) };
-    let parent = journal.parent().ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
+fn begin_request(
+    journal: Option<&std::path::Path>,
+    receipt: &std::path::Path,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(journal) = journal else {
+        return Ok(None);
+    };
+    let parent = journal
+        .parent()
+        .ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
     let _lock = lifecycle_lock(journal)?;
     let marker = journal.with_extension("active");
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker)
-        .map_err(|error| if error.kind() == std::io::ErrorKind::AlreadyExists {
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, "previous request cleanup is unverified")
-        } else { error })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "previous request cleanup is unverified",
+                )
+            } else {
+                error
+            }
+        })?;
     // #1071 — who wrote this, and on which boot, so an orphan left by a daemon that died
     // mid-call can be proved dead later.
     let writer = unsafe { libc::getpid() };
@@ -601,135 +922,383 @@ const ADMISSION_WAIT_SECS: u64 = 120;
 
 /// Provider adapters configure piped stdio and supply their environment-clear
 /// policy explicitly; Command does not expose whether env_clear was selected.
-pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
-    -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None,None)
+pub(crate) fn spawn_supervised(
+    command: &Command,
+    clear_env: bool,
+    clean: Arc<AtomicBool>,
+    journal: Option<&std::path::Path>,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        clear_env,
+        clean,
+        journal,
+        false,
+        false,
+        false,
+        None,
+        &[],
+        None,
+        None,
+    )
 }
-pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
-    -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None,None)
+pub(crate) fn spawn_admitted(
+    command: &Command,
+    clear_env: bool,
+    clean: Arc<AtomicBool>,
+    journal: Option<&std::path::Path>,
+    required_resources: bool,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        clear_env,
+        clean,
+        journal,
+        true,
+        required_resources,
+        false,
+        None,
+        &[],
+        None,
+        None,
+    )
 }
 /// Raw command with externally retained supervisor receipts. Its declared
 /// resource policy is unchanged, and no storage descriptors reach the child.
-pub(crate) fn spawn_admitted_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path)
-    ->std::io::Result<(Child,ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),None)
+pub(crate) fn spawn_admitted_at(
+    command: &Command,
+    clean: Arc<AtomicBool>,
+    required_resources: bool,
+    directory: &std::path::Path,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        true,
+        clean,
+        None,
+        true,
+        required_resources,
+        false,
+        None,
+        &[],
+        Some(directory),
+        None,
+    )
 }
-pub(crate) fn spawn_admitted_recorded_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path,capture:&std::path::Path)
-    ->std::io::Result<(Child,ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),Some(capture))
+pub(crate) fn spawn_admitted_recorded_at(
+    command: &Command,
+    clean: Arc<AtomicBool>,
+    required_resources: bool,
+    directory: &std::path::Path,
+    capture: &std::path::Path,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        true,
+        clean,
+        None,
+        true,
+        required_resources,
+        false,
+        None,
+        &[],
+        Some(directory),
+        Some(capture),
+    )
 }
 /// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
 /// supervisor's own declaration lookup (the builder tier).
-pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
-    -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None,None)
+pub(crate) fn spawn_admitted_with_policy(
+    command: &Command,
+    clear_env: bool,
+    clean: Arc<AtomicBool>,
+    journal: Option<&std::path::Path>,
+    required_resources: bool,
+    policy: Option<&serde_json::Value>,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        clear_env,
+        clean,
+        journal,
+        true,
+        required_resources,
+        false,
+        policy,
+        &[],
+        None,
+        None,
+    )
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
-pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
-    -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None,None)
+pub(crate) fn spawn_admitted_vm(
+    command: &Command,
+    clean: Arc<AtomicBool>,
+    journal: Option<&std::path::Path>,
+    policy: &serde_json::Value,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(
+        command,
+        true,
+        clean,
+        journal,
+        true,
+        true,
+        true,
+        Some(policy),
+        &[],
+        None,
+        None,
+    )
 }
-pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
-    storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
+pub(crate) fn spawn_admitted_storage(
+    command: &Command,
+    clean: Arc<AtomicBool>,
+    required_resources: bool,
+    storage_files: &[std::fs::File],
+    policy: &serde_json::Value,
+) -> std::io::Result<(Child, ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len() > 64 {
-        return Err(std::io::Error::other("invalid inherited storage descriptor set"));
+        return Err(std::io::Error::other(
+            "invalid inherited storage descriptor set",
+        ));
     }
-    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None,None)
+    spawn_supervised_inner(
+        command,
+        true,
+        clean,
+        None,
+        true,
+        required_resources,
+        false,
+        Some(policy),
+        storage_files,
+        None,
+        None,
+    )
 }
-pub(crate) fn spawn_admitted_storage_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,
-    storage_files:&[std::fs::File],policy:&serde_json::Value,directory:&std::path::Path)
-    -> std::io::Result<(Child,ProcessGroup)> {
-    if storage_files.is_empty() || storage_files.len()>64 {return Err(std::io::Error::other("invalid inherited storage descriptor set"));}
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory),None)
+pub(crate) fn spawn_admitted_storage_at(
+    command: &Command,
+    clean: Arc<AtomicBool>,
+    required_resources: bool,
+    storage_files: &[std::fs::File],
+    policy: &serde_json::Value,
+    directory: &std::path::Path,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    if storage_files.is_empty() || storage_files.len() > 64 {
+        return Err(std::io::Error::other(
+            "invalid inherited storage descriptor set",
+        ));
+    }
+    spawn_supervised_inner(
+        command,
+        true,
+        clean,
+        None,
+        true,
+        required_resources,
+        false,
+        Some(policy),
+        storage_files,
+        Some(directory),
+        None,
+    )
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>,raw_capture:Option<&std::path::Path>)
-    -> std::io::Result<(Child, ProcessGroup)> {
-    if let Some(capture)=raw_capture {
+fn spawn_supervised_inner(
+    command: &Command,
+    clear_env: bool,
+    clean: Arc<AtomicBool>,
+    journal: Option<&std::path::Path>,
+    admission: bool,
+    required_resources: bool,
+    vm_preflight: bool,
+    composed: Option<&serde_json::Value>,
+    storage_files: &[std::fs::File],
+    directory_override: Option<&std::path::Path>,
+    raw_capture: Option<&std::path::Path>,
+) -> std::io::Result<(Child, ProcessGroup)> {
+    if let Some(capture) = raw_capture {
         private_directory(capture)?;
-        let request:serde_json::Value=serde_json::from_slice(&private_read(&capture.join("request.json"))?).map_err(std::io::Error::other)?;
-        if request["version"]!=1 || request["command"].as_str().is_none_or(|key|key.len()!=64 || !key.bytes().all(|b|b.is_ascii_hexdigit()))
-            || request["output_limit"].as_u64().is_none_or(|limit|limit==0 || limit>8*1024*1024) {return Err(std::io::Error::other("invalid raw capture request"));}
+        let request: serde_json::Value =
+            serde_json::from_slice(&private_read(&capture.join("request.json"))?)
+                .map_err(std::io::Error::other)?;
+        if request["version"] != 1
+            || request["command"]
+                .as_str()
+                .is_none_or(|key| key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
+            || request["output_limit"]
+                .as_u64()
+                .is_none_or(|limit| limit == 0 || limit > 8 * 1024 * 1024)
+        {
+            return Err(std::io::Error::other("invalid raw capture request"));
+        }
     }
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
-    let search = original.get_envs().find(|(key, _)| *key == "PATH")
+    let search = original
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
         .and_then(|(_, value)| value.map(std::ffi::OsString::from))
         .or_else(|| (!clear_env).then(|| std::env::var_os("PATH")).flatten())
         .unwrap_or_else(|| "/bin:/usr/bin".into());
-    let cwd = original.get_current_dir().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+    let cwd = original
+        .get_current_dir()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
     let executable = if program.components().count() > 1 {
         cwd.join(program)
     } else {
-        std::env::split_paths(&search).map(|dir| cwd.join(dir).join(program))
-            .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "provider binary not found"))?
+        std::env::split_paths(&search)
+            .map(|dir| cwd.join(dir).join(program))
+            .find(|path| {
+                path.metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "provider binary not found")
+            })?
     };
     let metadata = executable.metadata()?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "provider binary is not executable"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "provider binary is not executable",
+        ));
     }
-    let owned_directory=if directory_override.is_none() {Some(tempfile::tempdir()?)} else {None};
-    let directory=directory_override.unwrap_or_else(||owned_directory.as_ref().unwrap().path());
-    if owned_directory.is_some() {std::fs::set_permissions(directory,std::fs::Permissions::from_mode(0o700))?;}
+    let owned_directory = if directory_override.is_none() {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let directory = directory_override.unwrap_or_else(|| owned_directory.as_ref().unwrap().path());
+    if owned_directory.is_some() {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
     private_directory(directory)?;
     let helper = directory.join("supervisor.py");
     let receipt = directory.join("cleanup-complete");
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&helper)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&helper)?;
     file.write_all(include_bytes!("../../../scripts/provider-supervisor.py"))?;
-    let resource_policy=match composed {Some(policy)=>Some(policy.clone()),None=>crate::run_resources::declared_policy().map_err(std::io::Error::other)?};
-    if required_resources && resource_policy.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"required run resource declaration unavailable")); }
-    if resource_policy.is_some() { crate::run_resources::install_helper(directory).map_err(std::io::Error::other)?; }
+    let resource_policy = match composed {
+        Some(policy) => Some(policy.clone()),
+        None => crate::run_resources::declared_policy().map_err(std::io::Error::other)?,
+    };
+    if required_resources && resource_policy.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "required run resource declaration unavailable",
+        ));
+    }
+    if resource_policy.is_some() {
+        crate::run_resources::install_helper(directory).map_err(std::io::Error::other)?;
+    }
     let mut supervised = Command::new("python3");
-    supervised.args([std::ffi::OsStr::new("-I"), helper.as_os_str(), receipt.as_os_str(), executable.as_os_str()])
-        .args(original.get_args()).current_dir(cwd)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .process_group(0).kill_on_drop(false);
-    if clear_env { supervised.env_clear(); }
+    supervised
+        .args([
+            std::ffi::OsStr::new("-I"),
+            helper.as_os_str(),
+            receipt.as_os_str(),
+            executable.as_os_str(),
+        ])
+        .args(original.get_args())
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false);
+    if clear_env {
+        supervised.env_clear();
+    }
     for (key, value) in original.get_envs() {
-        if let Some(value) = value { supervised.env(key, value); }
-        else { supervised.env_remove(key); }
+        if let Some(value) = value {
+            supervised.env(key, value);
+        } else {
+            supervised.env_remove(key);
+        }
     }
     supervised.env_remove("JARVIS_RAW_VERIFIER_CAPTURE");
-    if let Some(capture)=raw_capture {supervised.env("JARVIS_RAW_VERIFIER_CAPTURE",capture);}
+    if let Some(capture) = raw_capture {
+        supervised.env("JARVIS_RAW_VERIFIER_CAPTURE", capture);
+    }
     supervised.env_remove("JARVIS_SUPERVISOR_VM_PREFLIGHT");
     supervised.env_remove("JARVIS_NATIVE_VM_READY");
     supervised.env_remove("JARVIS_NATIVE_VM_CONTINUE");
-    if vm_preflight { supervised.env("JARVIS_SUPERVISOR_VM_PREFLIGHT","1"); }
+    if vm_preflight {
+        supervised.env("JARVIS_SUPERVISOR_VM_PREFLIGHT", "1");
+    }
     supervised.env_remove("JARVIS_SUPERVISOR_ADMISSION");
-    if admission { supervised.env("JARVIS_SUPERVISOR_ADMISSION","1"); }
+    if admission {
+        supervised.env("JARVIS_SUPERVISOR_ADMISSION", "1");
+    }
     supervised.env_remove("JARVIS_RUN_RESOURCE_POLICY");
-    if let Some(policy)=&resource_policy { supervised.env("JARVIS_RUN_RESOURCE_POLICY",policy.to_string()); }
+    if let Some(policy) = &resource_policy {
+        supervised.env("JARVIS_RUN_RESOURCE_POLICY", policy.to_string());
+    }
     supervised.env_remove("JARVIS_STORAGE_LEASE_FD");
     supervised.env_remove("JARVIS_STORAGE_LEASE_FDS");
     if !storage_files.is_empty() {
         let descriptors: Vec<_> = storage_files.iter().map(AsRawFd::as_raw_fd).collect();
         supervised.env("JARVIS_STORAGE_LEASE_FD", descriptors[0].to_string());
-        supervised.env("JARVIS_STORAGE_LEASE_FDS", descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+        supervised.env(
+            "JARVIS_STORAGE_LEASE_FDS",
+            descriptors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         // Change CLOEXEC only in the forked child, never globally in the daemon.
         // These are true inherited duplicates of the controller-held leases.
-        unsafe { supervised.pre_exec(move || {
-            for descriptor in &descriptors {
-                let flags = libc::fcntl(*descriptor, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
+        unsafe {
+            supervised.pre_exec(move || {
+                for descriptor in &descriptors {
+                    let flags = libc::fcntl(*descriptor, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
-            }
-            Ok(())
-        }); }
+                Ok(())
+            });
+        }
     }
     let active_request = begin_request(journal, &receipt)?;
     let child = match supervised.spawn() {
         Ok(child) => child,
         Err(error) => {
             // No process was created, so this request has no surviving tools.
-            if let Some(marker) = &active_request { retire_request(marker, &receipt)?; }
+            if let Some(marker) = &active_request {
+                retire_request(marker, &receipt)?;
+            }
             return Err(error);
         }
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
+    Ok((
+        child,
+        ProcessGroup {
+            id,
+            receipt,
+            clean,
+            active_request,
+            vm_preflight,
+            resource_required: resource_policy.is_some(),
+            resource_observed: AtomicBool::new(false),
+            release_attempted: AtomicBool::new(!admission),
+            fresh_native_session: None,
+            owned_run: std::sync::Mutex::new(None),
+            resource_audit: std::sync::Mutex::new(None),
+            resource_admission: std::sync::Mutex::new(None),
+            _directory: owned_directory,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -741,124 +1310,258 @@ mod tests {
 
     #[test]
     fn cleanup_waits_for_complete_receipt_after_path_is_created() {
-        for prefix in [b"".as_slice(),b"all-descendants-".as_slice()] {
-            let directory=tempfile::tempdir().unwrap();
-            std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
-            let receipt=directory.path().join("cleanup-complete");
-            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-            output.write_all(prefix).unwrap();output.sync_all().unwrap();
-            let mut child=std::process::Command::new("sleep").arg("5").spawn().unwrap();
-            let id=child.id() as libc::pid_t;
-            let prefix_length=prefix.len();
-            let writer=std::thread::spawn(move || {
+        for prefix in [b"".as_slice(), b"all-descendants-".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let receipt = directory.path().join("cleanup-complete");
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&receipt)
+                .unwrap();
+            output.write_all(prefix).unwrap();
+            output.sync_all().unwrap();
+            let mut child = std::process::Command::new("sleep")
+                .arg("5")
+                .spawn()
+                .unwrap();
+            let id = child.id() as libc::pid_t;
+            let prefix_length = prefix.len();
+            let writer = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                let _=child.kill();child.wait().unwrap();
+                let _ = child.kill();
+                child.wait().unwrap();
                 // Publish completion only after the fixture's actual child is reaped.
-                output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
+                output
+                    .write_all(&b"all-descendants-reaped\n"[prefix_length..])
+                    .unwrap();
+                output.sync_all().unwrap();
             });
-            let clean=Arc::new(AtomicBool::new(false));
-            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
-                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,
-                owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
-            drop(group);writer.join().unwrap();
-            assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
+            let clean = Arc::new(AtomicBool::new(false));
+            let group = ProcessGroup {
+                id,
+                receipt,
+                clean: clean.clone(),
+                active_request: None,
+                resource_required: false,
+                vm_preflight: false,
+                resource_observed: AtomicBool::new(false),
+                release_attempted: AtomicBool::new(false),
+                fresh_native_session: None,
+                owned_run: std::sync::Mutex::new(None),
+                resource_audit: std::sync::Mutex::new(None),
+                resource_admission: std::sync::Mutex::new(None),
+                _directory: Some(directory),
+            };
+            drop(group);
+            writer.join().unwrap();
+            assert!(
+                clean.load(Ordering::SeqCst),
+                "receipt existence was mistaken for completed publication"
+            );
         }
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn command_quiescence_requires_the_exact_admitted_scope_and_completed_receipt() {
-        use sha2::{Digest,Sha256};
-        let directory=tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
-        let receipt=directory.path().join("cleanup-complete");
-        std::fs::write(&receipt,b"all-descendants-reaped\n").unwrap();
-        std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
-        let resource=directory.path().join("resource-accounting.json");
-        let identity=serde_json::json!({
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt = directory.path().join("cleanup-complete");
+        std::fs::write(&receipt, b"all-descendants-reaped\n").unwrap();
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let resource = directory.path().join("resource-accounting.json");
+        let identity = serde_json::json!({
             "host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
             "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),
             "inode":1,"limits":{"memory.max":67108864}});
-        let write=|value:&serde_json::Value| {
-            std::fs::write(&resource,serde_json::to_vec(value).unwrap()).unwrap();
-            std::fs::set_permissions(&resource,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let write = |value: &serde_json::Value| {
+            std::fs::write(&resource, serde_json::to_vec(value).unwrap()).unwrap();
+            std::fs::set_permissions(&resource, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
         write(&serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}));
-        std::fs::write(directory.path().join("launch-ready"),b"ready").unwrap();
-        let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
-            active_request:None,resource_required:true,vm_preflight:false,
-            resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,owned_run:std::sync::Mutex::new(None),resource_audit:std::sync::Mutex::new(None),
-            resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
-        assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
-        group.admit_command("verification",None).await.unwrap();
-        assert!(group.verified_quiescence().is_err(),"admitted is not completed");
-        let completed=serde_json::json!({"phase":"completed","exhausted":false,"identity":identity});
+        std::fs::write(directory.path().join("launch-ready"), b"ready").unwrap();
+        let group = ProcessGroup {
+            id: i32::MAX,
+            receipt,
+            clean: Arc::new(AtomicBool::new(false)),
+            active_request: None,
+            resource_required: true,
+            vm_preflight: false,
+            resource_observed: AtomicBool::new(false),
+            release_attempted: AtomicBool::new(false),
+            fresh_native_session: None,
+            owned_run: std::sync::Mutex::new(None),
+            resource_audit: std::sync::Mutex::new(None),
+            resource_admission: std::sync::Mutex::new(None),
+            _directory: Some(directory),
+        };
+        assert!(
+            group.verified_quiescence().is_err(),
+            "a file without admission is not authority"
+        );
+        group.admit_command("verification", None).await.unwrap();
+        assert!(
+            group.verified_quiescence().is_err(),
+            "admitted is not completed"
+        );
+        let completed =
+            serde_json::json!({"phase":"completed","exhausted":false,"identity":identity});
         write(&completed);
-        let proof=group.verified_quiescence().expect("exact completed scope must be verified against the kernel");
-        assert_eq!(proof["identity"],identity);
-        assert_eq!(proof["verified_state"],"removed_empty_subtree");
-        let mut foreign=completed.clone();foreign["identity"]["path"]=format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()).into();
-        write(&foreign);assert!(group.verified_quiescence().is_err(),"a different empty scope cannot replace the admitted one");
-        let mut malformed=completed.clone();malformed["phase"]="admitted".into();
-        write(&malformed);assert!(group.verified_quiescence().is_err());
+        let proof = group
+            .verified_quiescence()
+            .expect("exact completed scope must be verified against the kernel");
+        assert_eq!(proof["identity"], identity);
+        assert_eq!(proof["verified_state"], "removed_empty_subtree");
+        let mut foreign = completed.clone();
+        foreign["identity"]["path"] =
+            format!("/sys/fs/cgroup/run-{}", uuid::Uuid::new_v4().simple()).into();
+        write(&foreign);
+        assert!(
+            group.verified_quiescence().is_err(),
+            "a different empty scope cannot replace the admitted one"
+        );
+        let mut malformed = completed.clone();
+        malformed["phase"] = "admitted".into();
+        write(&malformed);
+        assert!(group.verified_quiescence().is_err());
         write(&completed);
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires an isolated delegated systemd service; real kernel scope, no VM or model"]
     async fn observed_command_boundary_proves_live_then_quiescent_kernel_scope() {
         use tokio::io::AsyncWriteExt;
-        let root=tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
-        let directory=root.path().join("supervisor");std::fs::create_dir(&directory).unwrap();
-        std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
-        let lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
-            .open(root.path().join("storage-lease")).unwrap();
-        assert_eq!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
-        let mut command=Command::new("/usr/bin/python3");
-        command.args(["-I","-c","import sys; print('ready',flush=True); sys.stdin.readline()"])
-            .env_clear().env("PATH","/usr/bin:/bin");
-        let policy=serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
-        let (mut child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),
-            true,&[lease],&policy,&directory).unwrap();
-        let mut admitted=None;
-        group.admit_command_observed("verification",None,&mut |identity| {
-            assert!(!directory.join("launch-continue").exists(),"callback ran after release");
-            admitted=Some(identity.clone());Ok(())
-        }).await.unwrap();
-        let mut output=BufReader::new(child.stdout.take().unwrap());let mut line=String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(10),output.read_line(&mut line)).await.unwrap().unwrap();
-        assert_eq!(line.trim(),"ready");
-        let admitted=admitted.expect("actual admission callback missing");
-        assert!(crate::run_resources::verify_quiescent(&admitted).is_err(),"a live descendant was treated as quiescent");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.path().join("supervisor");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.path().join("storage-lease"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-I",
+                "-c",
+                "import sys; print('ready',flush=True); sys.stdin.readline()",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        let policy = serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
+        let (mut child, group) = spawn_admitted_storage_at(
+            &command,
+            Arc::new(AtomicBool::new(true)),
+            true,
+            &[lease],
+            &policy,
+            &directory,
+        )
+        .unwrap();
+        let mut admitted = None;
+        group
+            .admit_command_observed("verification", None, &mut |identity| {
+                assert!(
+                    !directory.join("launch-continue").exists(),
+                    "callback ran after release"
+                );
+                admitted = Some(identity.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            output.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let admitted = admitted.expect("actual admission callback missing");
+        assert!(
+            crate::run_resources::verify_quiescent(&admitted).is_err(),
+            "a live descendant was treated as quiescent"
+        );
         assert!(group.verified_quiescence().is_err());
-        child.stdin.take().unwrap().write_all(b"finish\n").await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(10),child.wait()).await.unwrap().unwrap().success());
-        group.resource_outcome("verification",None).unwrap();
-        let proof=group.verified_quiescence().unwrap();
-        assert_eq!(proof["identity"],admitted);
-        assert!(matches!(proof["verified_state"].as_str(),Some("removed_empty_subtree"|"kernel_empty_subtree_removed")));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"finish\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        group.resource_outcome("verification", None).unwrap();
+        let proof = group.verified_quiescence().unwrap();
+        assert_eq!(proof["identity"], admitted);
+        assert!(matches!(
+            proof["verified_state"].as_str(),
+            Some("removed_empty_subtree" | "kernel_empty_subtree_removed")
+        ));
         drop(group);
-        assert!(directory.join("resource-accounting.json").exists(),"caller-owned recovery receipts were deleted");
+        assert!(
+            directory.join("resource-accounting.json").exists(),
+            "caller-owned recovery receipts were deleted"
+        );
     }
 
     #[test]
     fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
-        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})),Some("FileNotFoundError"));
-        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})),Some("BoundaryFailure"));
-        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_credential_in_use"})),None);
+        assert_eq!(
+            native_setup_category(
+                &serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})
+            ),
+            Some("FileNotFoundError")
+        );
+        assert_eq!(
+            native_setup_category(
+                &serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})
+            ),
+            Some("BoundaryFailure")
+        );
+        assert_eq!(
+            native_setup_category(&serde_json::json!({"phase":"native_credential_in_use"})),
+            None
+        );
     }
     #[test]
     fn kernel_quiescence_receipt_settles_interrupted_request_without_fake_reaping() {
-        let directory=tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal=directory.path().join("operations.json");
-        let receipt=directory.path().join("cleanup-complete");
-        begin_request(Some(&journal),&receipt).unwrap();
-        let mut proof=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-        proof.write_all(b"cgroup-descendants-cleared\n").unwrap();proof.sync_all().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
+        let receipt = directory.path().join("cleanup-complete");
+        begin_request(Some(&journal), &receipt).unwrap();
+        let mut proof = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&receipt)
+            .unwrap();
+        proof.write_all(b"cgroup-descendants-cleared\n").unwrap();
+        proof.sync_all().unwrap();
         ensure_request_idle(&journal).unwrap();
         assert!(!journal.with_extension("active").exists());
     }
@@ -870,14 +1573,32 @@ mod tests {
         let journal = directory.path().join("operations.json");
         let receipt = directory.path().join("cleanup-complete");
         let marker = journal.with_extension("active");
-        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&marker).unwrap();
-        file.write_all(serde_json::json!({"version":1,"receipt":receipt}).to_string().as_bytes()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&marker)
+            .unwrap();
+        file.write_all(
+            serde_json::json!({"version":1,"receipt":receipt})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
         assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
-        let mut proof = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&receipt).unwrap();
+        let mut proof = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&receipt)
+            .unwrap();
         proof.write_all(b"partial").unwrap();
         assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
         std::fs::write(&receipt, b"all-descendants-reaped\n").unwrap();
-        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+        assert_eq!(
+            crate::handoff::resume_message(&journal, "synthetic request").unwrap(),
+            "synthetic request"
+        );
         assert!(!marker.exists());
     }
 
@@ -902,7 +1623,10 @@ mod tests {
         ensure_request_idle(&journal).unwrap();
         begin_request(Some(&journal), &other).unwrap();
         retire_request(&marker, &receipt).unwrap();
-        assert!(marker.exists(), "old invocation removed the newer owner's marker");
+        assert!(
+            marker.exists(),
+            "old invocation removed the newer owner's marker"
+        );
     }
 
     /// #1035 — retention may only remove a request the resume gate would
@@ -911,12 +1635,25 @@ mod tests {
     fn resume_gate_and_retention_share_one_idle_predicate() {
         use std::os::unix::fs::symlink;
         let write = |path: &std::path::Path, bytes: &[u8]| {
-            let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
             file.write_all(bytes).unwrap();
         };
-        for case in ["absent", "unverified", "partial-receipt", "dangling-link", "corrupt", "verified"] {
+        for case in [
+            "absent",
+            "unverified",
+            "partial-receipt",
+            "dangling-link",
+            "corrupt",
+            "verified",
+        ] {
             let directory = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
             let journal = directory.path().join("operations.json");
             write(&journal, br#"{"version":1,"operations":[]}"#);
             let marker = journal.with_extension("active");
@@ -925,19 +1662,36 @@ mod tests {
             match case {
                 "absent" => {}
                 "unverified" => write(&marker, marker_json.as_bytes()),
-                "partial-receipt" => { write(&marker, marker_json.as_bytes()); write(&receipt, b"partial"); }
+                "partial-receipt" => {
+                    write(&marker, marker_json.as_bytes());
+                    write(&receipt, b"partial");
+                }
                 "dangling-link" => symlink(directory.path().join("missing"), &marker).unwrap(),
                 "corrupt" => write(&marker, b"not json"),
-                "verified" => { write(&marker, marker_json.as_bytes()); write(&receipt, b"all-descendants-reaped\n"); }
+                "verified" => {
+                    write(&marker, marker_json.as_bytes());
+                    write(&receipt, b"all-descendants-reaped\n");
+                }
                 _ => unreachable!(),
             }
             let finished = crate::handoff::request_finished(&journal).unwrap();
-            assert_eq!(finished, case == "absent", "{case}: any marker means not finished");
+            assert_eq!(
+                finished,
+                case == "absent",
+                "{case}: any marker means not finished"
+            );
             let admitted = ensure_request_idle(&journal).is_ok();
-            assert!(!finished || admitted, "{case}: retention must never outrun the resume gate");
+            assert!(
+                !finished || admitted,
+                "{case}: retention must never outrun the resume gate"
+            );
             assert_eq!(admitted, matches!(case, "absent" | "verified"), "{case}");
             // Once the gate has verified and cleared cleanup, both agree again.
-            assert_eq!(crate::handoff::request_finished(&journal).unwrap(), admitted, "{case}");
+            assert_eq!(
+                crate::handoff::request_finished(&journal).unwrap(),
+                admitted,
+                "{case}"
+            );
         }
     }
 
@@ -950,7 +1704,14 @@ mod tests {
     }
     /// Write an owner-private file, as the daemon's own writes are.
     fn write_private(path: &std::path::Path, body: &[u8]) {
-        std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap().write_all(body).unwrap();
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .write_all(body)
+            .unwrap();
     }
 
     /// #1071 — a marker is cleared only on a proof that no descendant of the call can still be
@@ -958,39 +1719,116 @@ mod tests {
     #[test]
     fn a_marker_is_cleared_only_when_the_call_is_provably_dead() {
         let env = |boot: Option<&str>, live: bool, cgroup: Cgroup| LivenessEnv {
-            boot_id: boot.map(str::to_owned), start_of: Box::new(move |_| live.then_some(4242)),
-            cgroup_of: Box::new(move |_, _| cgroup), contained: true };
+            boot_id: boot.map(str::to_owned),
+            start_of: Box::new(move |_| live.then_some(4242)),
+            cgroup_of: Box::new(move |_, _| cgroup),
+            contained: true,
+        };
         // The daemon's own reading, from which each case departs in one way.
         let daemon = || env(Some("this-boot"), false, Cgroup::Gone);
         let same_boot = |cgroup| env(Some("this-boot"), false, cgroup);
         let elsewhere = json!({"boot_id": "other"});
         // A stop without KillMode=control-group can move a survivor out of the recorded
         // cgroup, so its membership proves nothing — only the reboot proof still holds.
-        let unconfined = || LivenessEnv { contained: false, ..daemon() };
+        let unconfined = || LivenessEnv {
+            contained: false,
+            ..daemon()
+        };
         let cases: Vec<(&str, Value, LivenessEnv, Liveness)> = vec![
-            ("a reboot killed all the marker names", elsewhere.clone(), env(Some("this-boot"), true, Cgroup::Populated), Liveness::Dead),
-            ("the writer still runs", json!({}), env(Some("this-boot"), true, Cgroup::Gone), Liveness::Live),
-            ("writer gone, cgroup destroyed", json!({}), daemon(), Liveness::Dead),
-            ("a restart reused the cgroup; only we are in it", json!({}), same_boot(Cgroup::Ours), Liveness::Dead),
-            ("the cgroup holds someone not ours", json!({}), same_boot(Cgroup::Populated), Liveness::Unproven),
-            ("the cgroup is unreadable", json!({}), same_boot(Cgroup::Unknown), Liveness::Unproven),
-            ("boot id is unreadable", elsewhere.clone(), env(None, false, Cgroup::Gone), Liveness::Unproven),
-            ("a pre-#1071 marker has no identity", json!({"version": 1}), daemon(), Liveness::Legacy),
-            ("a v2 marker missing a writer field", json!({"writer_start": Value::Null}), daemon(), Liveness::Unproven),
-            ("a v2 marker whose cgroup inode is zero", json!({"writer_cgroup_inode": 0}), daemon(), Liveness::Unproven),
-            ("the unit does not contain its calls", json!({}), unconfined(), Liveness::Unproven),
-            ("a reboot needs no containment", elsewhere, unconfined(), Liveness::Dead)];
+            (
+                "a reboot killed all the marker names",
+                elsewhere.clone(),
+                env(Some("this-boot"), true, Cgroup::Populated),
+                Liveness::Dead,
+            ),
+            (
+                "the writer still runs",
+                json!({}),
+                env(Some("this-boot"), true, Cgroup::Gone),
+                Liveness::Live,
+            ),
+            (
+                "writer gone, cgroup destroyed",
+                json!({}),
+                daemon(),
+                Liveness::Dead,
+            ),
+            (
+                "a restart reused the cgroup; only we are in it",
+                json!({}),
+                same_boot(Cgroup::Ours),
+                Liveness::Dead,
+            ),
+            (
+                "the cgroup holds someone not ours",
+                json!({}),
+                same_boot(Cgroup::Populated),
+                Liveness::Unproven,
+            ),
+            (
+                "the cgroup is unreadable",
+                json!({}),
+                same_boot(Cgroup::Unknown),
+                Liveness::Unproven,
+            ),
+            (
+                "boot id is unreadable",
+                elsewhere.clone(),
+                env(None, false, Cgroup::Gone),
+                Liveness::Unproven,
+            ),
+            (
+                "a pre-#1071 marker has no identity",
+                json!({"version": 1}),
+                daemon(),
+                Liveness::Legacy,
+            ),
+            (
+                "a v2 marker missing a writer field",
+                json!({"writer_start": Value::Null}),
+                daemon(),
+                Liveness::Unproven,
+            ),
+            (
+                "a v2 marker whose cgroup inode is zero",
+                json!({"writer_cgroup_inode": 0}),
+                daemon(),
+                Liveness::Unproven,
+            ),
+            (
+                "the unit does not contain its calls",
+                json!({}),
+                unconfined(),
+                Liveness::Unproven,
+            ),
+            (
+                "a reboot needs no containment",
+                elsewhere,
+                unconfined(),
+                Liveness::Dead,
+            ),
+        ];
         for (case, overrides, env, wanted) in cases {
             let (directory, journal) = request();
             let marker = journal.with_extension("active");
             let mut value = json!({"version": MARKER_VERSION, "writer_pid": 999, "writer_start": 4242,
                 "receipt": directory.path().join("cleanup-complete"), "boot_id": "this-boot",
                 "writer_cgroup": "/synthetic.slice/augmentagent.service", "writer_cgroup_inode": 424242});
-            for (key, replacement) in overrides.as_object().unwrap() { value[key] = replacement.clone(); }
+            for (key, replacement) in overrides.as_object().unwrap() {
+                value[key] = replacement.clone();
+            }
             write_private(&marker, value.to_string().as_bytes());
-            assert_eq!(clear_if_dead(&journal, &env, true).unwrap(), wanted, "{case} (dry run)");
+            assert_eq!(
+                clear_if_dead(&journal, &env, true).unwrap(),
+                wanted,
+                "{case} (dry run)"
+            );
             assert!(marker.exists(), "{case}: a dry run must change nothing");
-            assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), wanted, "{case}");
+            assert_eq!(
+                clear_if_dead(&journal, &env, false).unwrap(),
+                wanted,
+                "{case}"
+            );
             assert_eq!(marker.exists(), wanted != Liveness::Dead, "{case}");
         }
         // Both proofs stay independent at the one clearing site: with a real writer —
@@ -998,25 +1836,67 @@ mod tests {
         let (directory, journal) = request();
         let receipt = directory.path().join("cleanup-complete");
         let marker = begin_request(Some(&journal), &receipt).unwrap().unwrap();
-        assert_eq!(clear_marker(&marker, Proof::WriterGone(&LivenessEnv::probe())).unwrap(), Liveness::Live);
-        assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead);
+        assert_eq!(
+            clear_marker(&marker, Proof::WriterGone(&LivenessEnv::probe())).unwrap(),
+            Liveness::Live
+        );
+        assert_eq!(
+            clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(),
+            Liveness::Dead
+        );
         assert!(!marker.exists());
         // The reading that decides the restart case, by ancestry not age. 500 = us; 600/700
         // ours; 100 a leak reparented to pid 1; 800 foreign; 900/901 a cycle; 7777 not in /proc.
-        let seen = |procs: &str| cgroup_members(procs, |pid| match pid {
-            600 | 700 => Some(500), 100 => Some(1), 800 => Some(42),
-            900 => Some(901), 901 => Some(900), _ => None }, 500);
+        let seen = |procs: &str| {
+            cgroup_members(
+                procs,
+                |pid| match pid {
+                    600 | 700 => Some(500),
+                    100 => Some(1),
+                    800 => Some(42),
+                    900 => Some(901),
+                    901 => Some(900),
+                    _ => None,
+                },
+                500,
+            )
+        };
         for (case, procs, wanted) in [
             ("nobody is left: whitespace only", " \n", Cgroup::Ours),
-            ("the restart case: us and our own children", "500\n600\n700\n", Cgroup::Ours),
-            ("a reparented leak from the dead call", "500\n100\n", Cgroup::Populated),
-            ("a process belonging to nobody we know", "500\n800\n", Cgroup::Populated),
-            ("a listed pid /proc will not show is no proven exit", "500\n7777\n", Cgroup::Populated),
-            ("a cycle must terminate, and prove nothing", "900\n", Cgroup::Populated)]
-        { assert_eq!(seen(procs), wanted, "{case}"); }
+            (
+                "the restart case: us and our own children",
+                "500\n600\n700\n",
+                Cgroup::Ours,
+            ),
+            (
+                "a reparented leak from the dead call",
+                "500\n100\n",
+                Cgroup::Populated,
+            ),
+            (
+                "a process belonging to nobody we know",
+                "500\n800\n",
+                Cgroup::Populated,
+            ),
+            (
+                "a listed pid /proc will not show is no proven exit",
+                "500\n7777\n",
+                Cgroup::Populated,
+            ),
+            (
+                "a cycle must terminate, and prove nothing",
+                "900\n",
+                Cgroup::Populated,
+            ),
+        ] {
+            assert_eq!(seen(procs), wanted, "{case}");
+        }
         // And against the real hierarchy: a foreign inode means the recorded one is gone.
         if let Some((path, inode)) = own_cgroup() {
-            assert!(matches!(cgroup_state(&path, inode), Cgroup::Populated | Cgroup::Ours));
+            assert!(matches!(
+                cgroup_state(&path, inode),
+                Cgroup::Populated | Cgroup::Ours
+            ));
             assert_eq!(cgroup_state(&path, inode.wrapping_add(1)), Cgroup::Gone);
         }
     }
@@ -1031,165 +1911,330 @@ mod tests {
     fn a_restart_during_a_call_retires_the_marker_it_orphaned() {
         let (directory, journal) = request();
         let rows = json!({"version": 1, "operations": [{"tool": "mcp__fixture__create",
-            "arguments": {}, "status": "started"}]}).to_string();
+            "arguments": {}, "status": "started"}]})
+        .to_string();
         write_private(&journal, rows.as_bytes());
-        let marker = begin_request(Some(&journal), &directory.path().join("cleanup-complete")).unwrap().unwrap();
-        assert!(!request_idle(&journal).unwrap(), "the orphan blocks the request");
-        let Identity::Writer(recorded) = marker_identity(&marker) else { panic!("marker has no writer") };
-        assert_eq!(recorded.pid, unsafe { libc::getpid() }, "the marker names its real writer");
-        assert_eq!(process_start(recorded.pid), Some(recorded.start), "a real start time");
+        let marker = begin_request(Some(&journal), &directory.path().join("cleanup-complete"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !request_idle(&journal).unwrap(),
+            "the orphan blocks the request"
+        );
+        let Identity::Writer(recorded) = marker_identity(&marker) else {
+            panic!("marker has no writer")
+        };
+        assert_eq!(
+            recorded.pid,
+            unsafe { libc::getpid() },
+            "the marker names its real writer"
+        );
+        assert_eq!(
+            process_start(recorded.pid),
+            Some(recorded.start),
+            "a real start time"
+        );
         let recorded_cgroup = recorded.cgroup.clone();
-        let env = LivenessEnv { start_of: Box::new(|_| None), contained: true,
+        let env = LivenessEnv {
+            start_of: Box::new(|_| None),
+            contained: true,
             cgroup_of: Box::new(move |path, _| {
-                assert_eq!(path, recorded_cgroup, "the writer's cgroup must be the one probed");
-                Cgroup::Ours }), ..LivenessEnv::probe() };
-        assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), Liveness::Dead);
+                assert_eq!(
+                    path, recorded_cgroup,
+                    "the writer's cgroup must be the one probed"
+                );
+                Cgroup::Ours
+            }),
+            ..LivenessEnv::probe()
+        };
+        assert_eq!(
+            clear_if_dead(&journal, &env, false).unwrap(),
+            Liveness::Dead
+        );
         assert!(!marker.exists(), "the marker must not survive the restart");
-        assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            rows,
+            "clearing must not edit the journal"
+        );
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
-        assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+        assert!(
+            request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap()
+        );
     }
 
     #[tokio::test]
     async fn model_admission_binds_the_exact_supervisor_resource_identity() {
-        let directory=tempfile::tempdir_in("/tmp").unwrap();
-        for name in ["logs","anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
-        let log=directory.path().join("logs/audit.jsonl");
-        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
-        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
-        let mut command=Command::new("/usr/bin/python3");
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["logs", "anchors"] {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let log = directory.path().join("logs/audit.jsonl");
+        let logger = Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                log.clone(),
+                directory.path().join("anchors/audit.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let billed = count.clone();
+        let mut command = Command::new("/usr/bin/python3");
         command.args(["-I", "-c", "import json,pathlib,sys; rows=[json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]; assert any(row.get('kind') == 'model_call_admitted' and row.get('accounting_receipt') == 'synthetic-charge-17' for row in rows)"]).arg(&log);
-        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
-        let proceed=group.receipt.with_file_name("launch-continue");
-        logger.set_correlated_model_call_observer(Arc::new(move |_| {
-            assert!(!proceed.exists(), "provider released before accounting");
-            billed.fetch_add(1,Ordering::SeqCst);
-            Ok("synthetic-charge-17".into())
-        })).unwrap();
+        let (mut child, mut group) =
+            spawn_admitted(&command, true, Arc::new(AtomicBool::new(true)), None, false).unwrap();
+        let proceed = group.receipt.with_file_name("launch-continue");
+        logger
+            .set_correlated_model_call_observer(Arc::new(move |_| {
+                assert!(!proceed.exists(), "provider released before accounting");
+                billed.fetch_add(1, Ordering::SeqCst);
+                Ok("synthetic-charge-17".into())
+            }))
+            .unwrap();
         // Exercise the real supervisor admission boundary with a disposable
         // controller receipt. This tests correlation, not kernel quiescence.
-        let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
+        let identity = serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
             "path":"/sys/fs/cgroup/synthetic-run","inode":42,"limits":{"memory_max_bytes":1024}});
-        write_private(&group.receipt.with_file_name("resource-accounting.json"),
-            serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}).to_string().as_bytes());
-        group.resource_required=true;
-        group.admit_model("codex",Some(&logger)).await.unwrap();
-        assert!(child.wait().await.unwrap().success());drop(group);
-        let rows:Vec<serde_json::Value>=std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-        let resource=rows.iter().find(|r|r["kind"]=="run_resource_admitted").unwrap();
-        let model=rows.iter().find(|r|r["kind"]=="model_call_admitted").unwrap();
+        write_private(
+            &group.receipt.with_file_name("resource-accounting.json"),
+            serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity})
+                .to_string()
+                .as_bytes(),
+        );
+        group.resource_required = true;
+        group.admit_model("codex", Some(&logger)).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        drop(group);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let resource = rows
+            .iter()
+            .find(|r| r["kind"] == "run_resource_admitted")
+            .unwrap();
+        let model = rows
+            .iter()
+            .find(|r| r["kind"] == "model_call_admitted")
+            .unwrap();
         assert_eq!(model["resource_identity"],resource["observation"]["identity"],
             "model admission has no binding to the resource scope whose quiescence will be verified");
-        assert_eq!(model["admission_schema_version"],2);
-        assert_eq!(model["actual_provider"],resource["provider"]);
-        assert_eq!(model["accounting_receipt"],"synthetic-charge-17");
-        assert_eq!(model["accounting_schema_version"],1);
-        assert_eq!(count.load(Ordering::SeqCst),1);
+        assert_eq!(model["admission_schema_version"], 2);
+        assert_eq!(model["actual_provider"], resource["provider"]);
+        assert_eq!(model["accounting_receipt"], "synthetic-charge-17");
+        assert_eq!(model["accounting_schema_version"], 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn missing_resource_admission_receipt_blocks_before_model_charge() {
-        let directory=tempfile::tempdir_in("/tmp").unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         use std::os::unix::fs::PermissionsExt;
         for name in ["logs", "anchors"] {
             let path = directory.path().join(name);
             std::fs::create_dir(&path).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let effect=directory.path().join("effect");
-        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("logs/audit.jsonl"),directory.path().join("anchors/audit.json"),&[]).unwrap());
-        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
-        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
-        let blocked=Arc::new(std::sync::atomic::AtomicUsize::new(0));let callback=blocked.clone();
-        logger.set_resource_capacity_observer(Arc::new(move |_|{callback.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
-        let mut command=Command::new("/usr/bin/python3");
-        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
-        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let effect = directory.path().join("effect");
+        let logger = Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                directory.path().join("logs/audit.jsonl"),
+                directory.path().join("anchors/audit.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let billed = count.clone();
+        logger
+            .set_model_call_observer(Arc::new(move |_| {
+                billed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
+        let blocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback = blocked.clone();
+        logger
+            .set_resource_capacity_observer(Arc::new(move |_| {
+                callback.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-I",
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+            ])
+            .arg(&effect);
+        let (mut child, mut group) =
+            spawn_admitted(&command, true, Arc::new(AtomicBool::new(true)), None, false).unwrap();
         // Inject a missing required receipt after an ordinary test supervisor
         // is created, without requiring systemd in this transport unit test.
-        group.resource_required=true;
-        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
-        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity {..})));
-        drop(group);child.wait().await.unwrap();
-        assert_eq!(count.load(Ordering::SeqCst),0);
-        assert_eq!(blocked.load(Ordering::SeqCst),1);
+        group.resource_required = true;
+        let error = group.admit_model("codex", Some(&logger)).await.unwrap_err();
+        assert!(matches!(
+            crate::reasoner::ReasonerError::find_in(&error),
+            Some(crate::reasoner::ReasonerError::ResourceCapacity { .. })
+        ));
+        drop(group);
+        child.wait().await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(blocked.load(Ordering::SeqCst), 1);
         assert!(!effect.exists());
     }
 
     #[tokio::test]
     async fn late_owner_pause_blocks_model_and_verifier_supervisor_release() {
-        for model in [false,true] {
-            let directory=tempfile::tempdir().unwrap();let effect=directory.path().join("effect");
-            let mut command=Command::new("/usr/bin/python3");
-            command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
-            let paused=Arc::new(AtomicBool::new(false));let check=paused.clone();
-            let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
-            logger.set_dispatch_observer(Arc::new(move || {anyhow::ensure!(!check.load(Ordering::SeqCst),"owner-paused");Ok(())})).unwrap();
+        for model in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let effect = directory.path().join("effect");
+            let mut command = Command::new("/usr/bin/python3");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+                ])
+                .arg(&effect);
+            let paused = Arc::new(AtomicBool::new(false));
+            let check = paused.clone();
+            let logger = Arc::new(crate::tool_audit::AuditLogger::new(
+                directory.path().join("audit"),
+            ));
+            logger
+                .set_dispatch_observer(Arc::new(move || {
+                    anyhow::ensure!(!check.load(Ordering::SeqCst), "owner-paused");
+                    Ok(())
+                }))
+                .unwrap();
             logger.dispatch_allowed().unwrap();
-            let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
-            paused.store(true,Ordering::SeqCst);
-            let result=if model {group.admit_model("codex",Some(&logger)).await} else {group.admit_command("verification",Some(&logger)).await};
-            assert_eq!(result.unwrap_err().to_string(),"owner-paused");
-            drop(group);child.wait().await.unwrap();assert!(!effect.exists());
+            let (mut child, group) =
+                spawn_admitted(&command, true, Arc::new(AtomicBool::new(true)), None, false)
+                    .unwrap();
+            paused.store(true, Ordering::SeqCst);
+            let result = if model {
+                group.admit_model("codex", Some(&logger)).await
+            } else {
+                group.admit_command("verification", Some(&logger)).await
+            };
+            assert_eq!(result.unwrap_err().to_string(), "owner-paused");
+            drop(group);
+            child.wait().await.unwrap();
+            assert!(!effect.exists());
         }
     }
 
     #[tokio::test]
     async fn denied_model_admission_never_dispatches_waiting_provider() {
         for failure in ["callback", "receipt", "audit"] {
-        let directory=tempfile::tempdir().unwrap();
-        let effect=directory.path().join("provider-effect");
-        let mut command=Command::new("/usr/bin/python3");
-        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
-        for name in ["logs", "anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
-        let log=directory.path().join("logs/audit.jsonl");
-        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
-        if failure=="audit" {
-            logger.record_controller(serde_json::json!({"kind":"synthetic-start"})).unwrap();
-            std::fs::remove_file(&log).unwrap();std::fs::create_dir(&log).unwrap();
-        }
-        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let observed=count.clone();
-        logger.set_correlated_model_call_observer(Arc::new(move |_| {
-            observed.fetch_add(1,Ordering::SeqCst);
-            match failure {
-                "callback"=>anyhow::bail!("synthetic budget denied"),
-                "receipt"=>Ok(String::new()),
-                _=>Ok("already-committed-charge".into()),
+            let directory = tempfile::tempdir().unwrap();
+            let effect = directory.path().join("provider-effect");
+            let mut command = Command::new("/usr/bin/python3");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')",
+                ])
+                .arg(&effect);
+            for name in ["logs", "anchors"] {
+                std::fs::create_dir(directory.path().join(name)).unwrap();
             }
-        })).unwrap();
-        let clean=Arc::new(AtomicBool::new(true));
-        let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
-        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
-        if failure=="callback" {assert!(error.to_string().contains("synthetic budget denied"));}
-        if failure=="receipt" {assert!(error.to_string().contains("invalid model accounting receipt"));}
-        assert!(!group.receipt.with_file_name("launch-continue").exists());
-        drop(group);
-        child.wait().await.unwrap();
-        assert!(clean.load(Ordering::SeqCst));
-        assert!(!effect.exists());
-        assert_eq!(count.load(Ordering::SeqCst),1,"admission failure must not undo the callback");
-        if log.is_file() {
-            let rows=std::fs::read_to_string(log).unwrap();
-            assert!(!rows.lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|row|row["kind"]=="model_call_admitted"));
-        }
+            let log = directory.path().join("logs/audit.jsonl");
+            let logger = Arc::new(
+                crate::tool_audit::AuditLogger::protected(
+                    log.clone(),
+                    directory.path().join("anchors/audit.json"),
+                    &[],
+                )
+                .unwrap(),
+            );
+            if failure == "audit" {
+                logger
+                    .record_controller(serde_json::json!({"kind":"synthetic-start"}))
+                    .unwrap();
+                std::fs::remove_file(&log).unwrap();
+                std::fs::create_dir(&log).unwrap();
+            }
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = count.clone();
+            logger
+                .set_correlated_model_call_observer(Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    match failure {
+                        "callback" => anyhow::bail!("synthetic budget denied"),
+                        "receipt" => Ok(String::new()),
+                        _ => Ok("already-committed-charge".into()),
+                    }
+                }))
+                .unwrap();
+            let clean = Arc::new(AtomicBool::new(true));
+            let (mut child, group) =
+                spawn_admitted(&command, true, clean.clone(), None, false).unwrap();
+            let error = group.admit_model("codex", Some(&logger)).await.unwrap_err();
+            if failure == "callback" {
+                assert!(error.to_string().contains("synthetic budget denied"));
+            }
+            if failure == "receipt" {
+                assert!(error
+                    .to_string()
+                    .contains("invalid model accounting receipt"));
+            }
+            assert!(!group.receipt.with_file_name("launch-continue").exists());
+            drop(group);
+            child.wait().await.unwrap();
+            assert!(clean.load(Ordering::SeqCst));
+            assert!(!effect.exists());
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "admission failure must not undo the callback"
+            );
+            if log.is_file() {
+                let rows = std::fs::read_to_string(log).unwrap();
+                assert!(!rows
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .any(|row| row["kind"] == "model_call_admitted"));
+            }
         }
     }
 
     #[tokio::test]
     async fn admitted_model_dispatches_once_after_controller_observer() {
-        let directory=tempfile::tempdir().unwrap();
-        let effect=directory.path().join("provider-effect");
-        let mut command=Command::new("/usr/bin/python3");
-        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
-        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed=count.clone();let expected=effect.clone();
-        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
-        logger.set_model_call_observer(Arc::new(move |_|{ assert!(!expected.exists()); observed.fetch_add(1,Ordering::SeqCst);Ok(()) })).unwrap();
-        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
-        group.admit_model("codex",Some(&logger)).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let effect = directory.path().join("provider-effect");
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-I",
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')",
+            ])
+            .arg(&effect);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let expected = effect.clone();
+        let logger = Arc::new(crate::tool_audit::AuditLogger::new(
+            directory.path().join("audit"),
+        ));
+        logger
+            .set_model_call_observer(Arc::new(move |_| {
+                assert!(!expected.exists());
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
+        let (child, group) =
+            spawn_admitted(&command, true, Arc::new(AtomicBool::new(true)), None, false).unwrap();
+        group.admit_model("codex", Some(&logger)).await.unwrap();
         assert!(child.wait_with_output().await.unwrap().status.success());
         drop(group);
-        assert_eq!(count.load(Ordering::SeqCst),1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(effect.exists());
     }
 
@@ -1201,7 +2246,11 @@ mod tests {
         let receipt = directory.path().join("cleanup-complete");
         let unexpected = directory.path().join("unexpected-detached-effect");
         let helper = directory.path().join("supervisor.py");
-        std::fs::write(&helper, include_bytes!("../../../scripts/provider-supervisor.py")).unwrap();
+        std::fs::write(
+            &helper,
+            include_bytes!("../../../scripts/provider-supervisor.py"),
+        )
+        .unwrap();
         begin_request(Some(&journal), &receipt).unwrap();
         let mut controller = Command::new("/usr/bin/python3");
         // This fixture owns its supervisor; an outer managed build's admission
@@ -1213,7 +2262,10 @@ mod tests {
             .arg(&unexpected).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut controller = controller.spawn().unwrap();
         let mut output = BufReader::new(controller.stdout.take().unwrap()).lines();
-        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), output.next_line()).await.unwrap().unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), output.next_line())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ready.as_deref(), Some("ready"));
         controller.start_kill().unwrap();
         controller.wait().await.unwrap();
@@ -1221,14 +2273,24 @@ mod tests {
         // The supervisor creates the pathname before writing its proof. Wait
         // for the complete receipt, just as recovery requires, rather than
         // racing the writer with a pathname-existence check.
-        let complete = || private_read(&receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        let complete =
+            || private_read(&receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
         while !complete() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(complete(), "supervisor did not publish complete cleanup proof before the deadline");
-        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+        assert!(
+            complete(),
+            "supervisor did not publish complete cleanup proof before the deadline"
+        );
+        assert_eq!(
+            crate::handoff::resume_message(&journal, "synthetic request").unwrap(),
+            "synthetic request"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        assert!(!unexpected.exists(), "detached tool survived the daemon crash");
+        assert!(
+            !unexpected.exists(),
+            "detached tool survived the daemon crash"
+        );
     }
 
     /// #1779 D2 — the supervisor forwards how the provider ended. A child
@@ -1263,17 +2325,28 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf 'ready\\n'; sleep 0.2"]);
         let clean = Arc::new(AtomicBool::new(true));
-        let (mut child, group) = spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
+        let (mut child, group) =
+            spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
         assert!(journal.with_extension("active").exists());
-        let conflict = spawn_supervised(&command, false, Arc::new(AtomicBool::new(true)), Some(&journal)).err().unwrap();
+        let conflict = spawn_supervised(
+            &command,
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Some(&journal),
+        )
+        .err()
+        .unwrap();
         assert_eq!(conflict.kind(), std::io::ErrorKind::WouldBlock);
         assert!(child.wait().await.unwrap().success());
         drop(group);
         assert!(clean.load(Ordering::SeqCst));
         assert!(!journal.with_extension("active").exists());
-        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+        assert_eq!(
+            crate::handoff::resume_message(&journal, "synthetic request").unwrap(),
+            "synthetic request"
+        );
     }
 
     #[tokio::test]
@@ -1281,12 +2354,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("unexpected-after-success");
         let mut command = Command::new("sh");
-        command.args(["-c", "setsid sh -c 'sleep 0.3; printf escaped > \"$1\"' sh \"$1\" & printf 'result\\n'", "sh"])
+        command
+            .args([
+                "-c",
+                "setsid sh -c 'sleep 0.3; printf escaped > \"$1\"' sh \"$1\" & printf 'result\\n'",
+                "sh",
+            ])
             .arg(&marker);
         let clean = Arc::new(AtomicBool::new(true));
         let (child, group) = spawn_supervised(&command, false, clean.clone(), None).unwrap();
-        let output = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait_with_output()).await.unwrap().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(3), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.stdout, b"result\n");
         drop(group);
         assert!(clean.load(Ordering::SeqCst));
@@ -1302,15 +2388,20 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf '%s\\n' $$; sleep 30"]);
         let clean = Arc::new(AtomicBool::new(true));
-        let (mut child, group) = spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
+        let (mut child, group) =
+            spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
         let provider_pid: libc::pid_t = output.next_line().await.unwrap().unwrap().parse().unwrap();
-        unsafe { libc::kill(group.id, libc::SIGKILL); }
+        unsafe {
+            libc::kill(group.id, libc::SIGKILL);
+        }
         child.wait().await.unwrap();
         drop(group);
         // This intentionally simulates destruction of the supervisor itself;
         // clean the owned fixture explicitly, even if the assertion fails.
-        unsafe { libc::kill(-provider_pid, libc::SIGKILL); }
+        unsafe {
+            libc::kill(-provider_pid, libc::SIGKILL);
+        }
         assert!(!clean.load(Ordering::SeqCst));
         assert!(journal.with_extension("active").exists());
         assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
@@ -1329,7 +2420,10 @@ mod tests {
         drop(group);
         drop(child);
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        assert!(!marker.exists(), "detached tool outlived provider cancellation");
+        assert!(
+            !marker.exists(),
+            "detached tool outlived provider cancellation"
+        );
     }
 
     #[tokio::test]
@@ -1345,7 +2439,10 @@ mod tests {
         drop(group);
         drop(child);
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        assert!(!marker.exists(), "provider's background tool outlived cancellation");
+        assert!(
+            !marker.exists(),
+            "provider's background tool outlived cancellation"
+        );
     }
 }
 
@@ -1354,9 +2451,15 @@ mod admission_wait_tests {
     #[test]
     fn controller_deadline_covers_the_scope_scripts_capacity_wait() {
         let script = include_str!("../../../scripts/run-resource-scope.py");
-        let line = script.lines().find(|l| l.starts_with("ADMISSION_WAIT_SECONDS = "))
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("ADMISSION_WAIT_SECONDS = "))
             .expect("run-resource-scope.py declares ADMISSION_WAIT_SECONDS");
-        let secs: u64 = line.trim_start_matches("ADMISSION_WAIT_SECONDS = ").trim().parse().unwrap();
+        let secs: u64 = line
+            .trim_start_matches("ADMISSION_WAIT_SECONDS = ")
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(secs, super::ADMISSION_WAIT_SECS,
             "a script that waits longer than the controller would be reported as launch_readiness_unavailable");
     }

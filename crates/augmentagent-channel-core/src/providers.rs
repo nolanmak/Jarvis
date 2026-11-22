@@ -177,9 +177,15 @@ pub const OPUS_MODEL_ENV: &str = "AUGMENTAGENT_OPUS_MODEL";
 pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     // These profile names are user-facing identities. An environment override
     // must not silently route "qwen" or "glm" to another backend.
-    if kind == ProviderKind::Qwen { return "runpod/qwen38-27b".into(); }
-    if kind == ProviderKind::Glm { return "runpod/glm-5.3-flash".into(); }
-    if kind == ProviderKind::Yolo { return crate::yolo::model_id(); }
+    if kind == ProviderKind::Qwen {
+        return "runpod/qwen38-27b".into();
+    }
+    if kind == ProviderKind::Glm {
+        return "runpod/glm-5.3-flash".into();
+    }
+    if kind == ProviderKind::Yolo {
+        return crate::yolo::model_id();
+    }
     let tier_name = match tier {
         ModelTier::Quality => "QUALITY",
         ModelTier::Fast => "FAST",
@@ -335,19 +341,41 @@ mod tests {
             tier_of(&opts(vec![], Some("claude-haiku-4-5-20251001"))),
             ModelTier::Fast
         );
-        assert_eq!(tier_of(&opts(vec![], Some("claude-opus-4-8"))), ModelTier::Quality);
+        assert_eq!(
+            tier_of(&opts(vec![], Some("claude-opus-4-8"))),
+            ModelTier::Quality
+        );
         // Unpinned never lands on a cheap fallback model.
         assert_eq!(tier_of(&opts(vec![], None)), ModelTier::Quality);
 
-        assert!(allowed_for(ProviderKind::Claude, CapabilityClass::FullAgentic));
-        for class in [CapabilityClass::TextOnly, CapabilityClass::ReadTools,
-            CapabilityClass::WriteTools, CapabilityClass::FullAgentic] {
+        assert!(allowed_for(
+            ProviderKind::Claude,
+            CapabilityClass::FullAgentic
+        ));
+        for class in [
+            CapabilityClass::TextOnly,
+            CapabilityClass::ReadTools,
+            CapabilityClass::WriteTools,
+            CapabilityClass::FullAgentic,
+        ] {
             assert!(allowed_for(ProviderKind::Codex, class));
         }
-        assert!(allowed_for(ProviderKind::Gemini, CapabilityClass::ReadTools));
-        assert!(!allowed_for(ProviderKind::Gemini, CapabilityClass::FullAgentic));
-        assert!(allowed_for(ProviderKind::Cerebras, CapabilityClass::TextOnly));
-        assert!(!allowed_for(ProviderKind::Cerebras, CapabilityClass::ReadTools));
+        assert!(allowed_for(
+            ProviderKind::Gemini,
+            CapabilityClass::ReadTools
+        ));
+        assert!(!allowed_for(
+            ProviderKind::Gemini,
+            CapabilityClass::FullAgentic
+        ));
+        assert!(allowed_for(
+            ProviderKind::Cerebras,
+            CapabilityClass::TextOnly
+        ));
+        assert!(!allowed_for(
+            ProviderKind::Cerebras,
+            CapabilityClass::ReadTools
+        ));
     }
 
     /// #448's invariant extended to every provider (#658): the model each
@@ -389,12 +417,19 @@ mod tests {
     #[test]
     fn chain_env_parses_and_defaults() {
         // NB: env-var tests share process env; use a distinct var lifecycle.
-        std::env::set_var("AUGMENTAGENT_REASONER_CHAIN", "claude, codex,nope,gemini,claude");
+        std::env::set_var(
+            "AUGMENTAGENT_REASONER_CHAIN",
+            "claude, codex,nope,gemini,claude",
+        );
         let chain = chain_from_env();
         std::env::remove_var("AUGMENTAGENT_REASONER_CHAIN");
         assert_eq!(
             chain,
-            vec![ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Gemini]
+            vec![
+                ProviderKind::Claude,
+                ProviderKind::Codex,
+                ProviderKind::Gemini
+            ]
         );
 
         std::env::remove_var("AUGMENTAGENT_REASONER_CHAIN");
@@ -405,17 +440,26 @@ mod tests {
     fn yolo_round_trips_by_name_but_never_joins_a_chain() {
         assert_eq!(ProviderKind::parse("yolo"), Some(ProviderKind::Yolo));
         assert_eq!(ProviderKind::Yolo.name(), "yolo");
-        assert!(allowed_for(ProviderKind::Yolo, CapabilityClass::FullAgentic));
+        assert!(allowed_for(
+            ProviderKind::Yolo,
+            CapabilityClass::FullAgentic
+        ));
         // In a chain it is reported like an unknown token, so doctor flags it.
         let parsed = parse_chain("claude, yolo ,codex");
-        assert_eq!(parsed.providers, vec![ProviderKind::Claude, ProviderKind::Codex]);
+        assert_eq!(
+            parsed.providers,
+            vec![ProviderKind::Claude, ProviderKind::Codex]
+        );
         assert_eq!(parsed.unknown, vec!["yolo".to_string()]);
         assert_eq!(parse_chain("yolo").providers, vec![ProviderKind::Claude]);
     }
 
     #[test]
     fn runpod_profiles_are_distinct_full_agent_providers() {
-        for (name, model) in [("qwen", "runpod/qwen38-27b"), ("glm", "runpod/glm-5.3-flash")] {
+        for (name, model) in [
+            ("qwen", "runpod/qwen38-27b"),
+            ("glm", "runpod/glm-5.3-flash"),
+        ] {
             let provider = ProviderKind::parse(name).expect("configured Runpod profile");
             assert_eq!(provider.name(), name);
             assert_eq!(model_for(provider, ModelTier::Quality), model);

@@ -81,7 +81,10 @@ impl FailureClass {
     /// Whether the fallback chain may latch the provider and try the next
     /// one. Only transport, auth, binary and quota failures do.
     pub fn is_provider_side(self) -> bool {
-        matches!(self, Self::Quota | Self::Transport | Self::Auth | Self::Binary)
+        matches!(
+            self,
+            Self::Quota | Self::Transport | Self::Auth | Self::Binary
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -114,107 +117,116 @@ const READINESS: &[(&str, &str)] = &[
 /// installed CLI (`strings`) where it has one. Keep them specific: a needle
 /// that shows up inside unrelated text becomes a latch.
 const RULES: &[(FailureClass, &[&str])] = &[
-    (FailureClass::Content, &[
-        // Context overflow, in each wording codex and the API use.
-        "context window",
-        "context_length_exceeded",
-        "maximum context length",
-        "exceeds the model-context limit",
-        "input exceeds the maximum length",
-        "ran out of room",
-        // A policy refusal of this request. Not a bare "usage policy" or
-        // "flagged for possible": quota and account messages use those too.
-        "invalid prompt:",
-        "invalid_prompt",
-        "violating our usage policy",
-        "content_filter",
-        "misalignment policy",
-        "cyber policy",
-        "request has been flagged for possible",
-        "content was flagged for possible",
-        // The Jarvis bridge refusing further tool calls in this request.
-        "requires reconciliation",
-        "reconciliation required",
-        "already completed for this request",
-    ]),
-    (FailureClass::Quota, &[
-        "usage limit",
-        "rate limit",
-        "rate_limit",
-        "too many requests",
-        "insufficient_quota",
-        "resource_exhausted",
-        "payment required",
-        "quota exceeded",
-        "quota exhausted",
-        "exceeded your current quota",
-        "check your plan and billing",
-        "usage not included",
-        "usage_not_included",
-        // Plan and workspace walls.
-        "upgrade to plus",
-        "out of credits",
-        "spend cap",
-    ]),
-    (FailureClass::Auth, &[
-        "unauthorized",
-        "forbidden",
-        "not logged in",
-        "failed to authenticate",
-        "could not be refreshed",
-        // Covers "please run /login" too.
-        "run /login",
-        // The claude CLI's login is OAuth; codex has no oauth wording that
-        // isn't an auth failure.
-        "oauth",
-        "invalid api key",
-        "incorrect api key",
-        "invalid_api_key",
-        "access token",
-        "refresh token",
-        "authentication token",
-        "authentication session",
-        "token expired",
-        "token has expired",
-        "token is expired",
-        "token_expired",
-        "token data",
-        "auth is missing",
-        "auth is not configured",
-        "sign in again",
-        "signing in again",
-        "log in again",
-        "deactivated",
-    ]),
-    (FailureClass::Transport, &[
-        "stream disconnected",
-        "connection failed",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "error sending request",
-        "error while reading the server response",
-        "exceeded retry limit",
-        "timed out",
-        "dns error",
-        "failed to lookup address",
-        "network is unreachable",
-        "no route to host",
-        "upstream connect error",
-        "internal server error",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-        "temporarily unavailable",
-        "overloaded",
-        "at capacity",
-        "high demand",
-        "access blocked by cloudflare",
-    ]),
-    (FailureClass::Binary, &[
-        "panicked at",
-        "agent loop died",
-    ]),
+    (
+        FailureClass::Content,
+        &[
+            // Context overflow, in each wording codex and the API use.
+            "context window",
+            "context_length_exceeded",
+            "maximum context length",
+            "exceeds the model-context limit",
+            "input exceeds the maximum length",
+            "ran out of room",
+            // A policy refusal of this request. Not a bare "usage policy" or
+            // "flagged for possible": quota and account messages use those too.
+            "invalid prompt:",
+            "invalid_prompt",
+            "violating our usage policy",
+            "content_filter",
+            "misalignment policy",
+            "cyber policy",
+            "request has been flagged for possible",
+            "content was flagged for possible",
+            // The Jarvis bridge refusing further tool calls in this request.
+            "requires reconciliation",
+            "reconciliation required",
+            "already completed for this request",
+        ],
+    ),
+    (
+        FailureClass::Quota,
+        &[
+            "usage limit",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "insufficient_quota",
+            "resource_exhausted",
+            "payment required",
+            "quota exceeded",
+            "quota exhausted",
+            "exceeded your current quota",
+            "check your plan and billing",
+            "usage not included",
+            "usage_not_included",
+            // Plan and workspace walls.
+            "upgrade to plus",
+            "out of credits",
+            "spend cap",
+        ],
+    ),
+    (
+        FailureClass::Auth,
+        &[
+            "unauthorized",
+            "forbidden",
+            "not logged in",
+            "failed to authenticate",
+            "could not be refreshed",
+            // Covers "please run /login" too.
+            "run /login",
+            // The claude CLI's login is OAuth; codex has no oauth wording that
+            // isn't an auth failure.
+            "oauth",
+            "invalid api key",
+            "incorrect api key",
+            "invalid_api_key",
+            "access token",
+            "refresh token",
+            "authentication token",
+            "authentication session",
+            "token expired",
+            "token has expired",
+            "token is expired",
+            "token_expired",
+            "token data",
+            "auth is missing",
+            "auth is not configured",
+            "sign in again",
+            "signing in again",
+            "log in again",
+            "deactivated",
+        ],
+    ),
+    (
+        FailureClass::Transport,
+        &[
+            "stream disconnected",
+            "connection failed",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "error sending request",
+            "error while reading the server response",
+            "exceeded retry limit",
+            "timed out",
+            "dns error",
+            "failed to lookup address",
+            "network is unreachable",
+            "no route to host",
+            "upstream connect error",
+            "internal server error",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "temporarily unavailable",
+            "overloaded",
+            "at capacity",
+            "high demand",
+            "access blocked by cloudflare",
+        ],
+    ),
+    (FailureClass::Binary, &["panicked at", "agent loop died"]),
 ];
 
 /// HTTP statuses that name a quota wall on their own. Matched as standalone
@@ -238,7 +250,8 @@ fn explicit_status(lower: &str) -> Option<FailureClass> {
             r"^(?:reconnecting\.\.\. \d+/\d+ \()?",
             r"(?:unexpected status |exceeded retry limit, last status: |http/\d(?:\.\d)? )",
             r"(\d{3})\b",
-        )).expect("status pattern")
+        ))
+        .expect("status pattern")
     });
     let captures = STATUS.captures(lower.trim_start())?;
     match captures[1].parse::<u16>().ok()? {
@@ -260,7 +273,11 @@ pub fn classify(detail: &str, turn_began: bool) -> FailureClass {
     if let Some(class) = explicit_status(&lower) {
         return class;
     }
-    let status_token = |code: &&str| lower.split(|c: char| !c.is_ascii_digit()).any(|t| t == *code);
+    let status_token = |code: &&str| {
+        lower
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|t| t == *code)
+    };
     for (class, needles) in RULES {
         if needles.iter().any(|needle| lower.contains(needle))
             || (*class == FailureClass::Quota && QUOTA_STATUS_CODES.iter().any(status_token))
@@ -268,7 +285,11 @@ pub fn classify(detail: &str, turn_began: bool) -> FailureClass {
             return *class;
         }
     }
-    if turn_began { FailureClass::Unrecognised } else { FailureClass::Binary }
+    if turn_began {
+        FailureClass::Unrecognised
+    } else {
+        FailureClass::Binary
+    }
 }
 
 /// A turn that ended content-level, or for a reason nothing recognised. Not a
@@ -296,37 +317,58 @@ impl TurnFailure {
 
 /// The error the fallback chain acts on for `class` on a call of
 /// `capability`, following the module table.
-pub(crate) fn turn_error(provider: &str, class: FailureClass, capability: CapabilityClass, detail: String) -> anyhow::Error {
+pub(crate) fn turn_error(
+    provider: &str,
+    class: FailureClass,
+    capability: CapabilityClass,
+    detail: String,
+) -> anyhow::Error {
     let short = || detail.chars().take(300).collect::<String>();
     match class {
         FailureClass::Readiness => {
-            let message = READINESS.iter()
+            let message = READINESS
+                .iter()
                 .find(|(category, _)| detail.contains(&format!("{READINESS_MARKER}{category} ")))
                 .map(|(_, message)| *message)
                 .unwrap_or("required MCP server is not ready; check its configuration");
-            ReasonerError::Local { message: format!("{provider}: {message}") }.into()
+            ReasonerError::Local {
+                message: format!("{provider}: {message}"),
+            }
+            .into()
         }
         FailureClass::Quota => ReasonerError::RateLimited {
             provider: provider.into(),
             reset_at: parse_reset_hint(&detail),
             message: detail,
-        }.into(),
+        }
+        .into(),
         FailureClass::Transport | FailureClass::Auth | FailureClass::Binary => {
-            ReasonerError::Unavailable { provider: provider.into(), message: short() }.into()
+            ReasonerError::Unavailable {
+                provider: provider.into(),
+                message: short(),
+            }
+            .into()
         }
         // A text or read call cannot repeat a write, so an unexplained failure
         // there is an outage: the chain latches the provider and moves on.
-        FailureClass::Unrecognised if matches!(capability, CapabilityClass::TextOnly | CapabilityClass::ReadTools) => {
+        FailureClass::Unrecognised
+            if matches!(
+                capability,
+                CapabilityClass::TextOnly | CapabilityClass::ReadTools
+            ) =>
+        {
             ReasonerError::Unavailable {
                 provider: provider.into(),
                 message: format!("{}: {}", class.label(), short()),
-            }.into()
+            }
+            .into()
         }
         FailureClass::Content | FailureClass::Unrecognised => TurnFailure {
             provider: provider.into(),
             class,
             message: format!("{provider} turn failed ({}): {}", class.label(), short()),
-        }.into(),
+        }
+        .into(),
     }
 }
 
@@ -452,14 +494,29 @@ mod tests {
     fn content_is_matched_before_any_provider_row() {
         // A 400 carrying a context overflow must not read as anything else,
         // even when the body also mentions a limit or a retry.
-        assert_eq!(classify("exceeded retry limit: context_length_exceeded (rate limit headers attached)", true), Content);
+        assert_eq!(
+            classify(
+                "exceeded retry limit: context_length_exceeded (rate limit headers attached)",
+                true
+            ),
+            Content
+        );
     }
 
     #[test]
     fn unexplained_text_fails_safe_once_the_turn_began() {
-        for detail in ["turn.failed with no message", "synthetic unrecognised failure 7F3A", "", "codex exited 1"] {
+        for detail in [
+            "turn.failed with no message",
+            "synthetic unrecognised failure 7F3A",
+            "",
+            "codex exited 1",
+        ] {
             assert_eq!(classify(detail, true), Unrecognised, "{detail}");
-            assert_eq!(classify(detail, false), Binary, "{detail}: nothing ran before the turn");
+            assert_eq!(
+                classify(detail, false),
+                Binary,
+                "{detail}: nothing ran before the turn"
+            );
         }
     }
 
@@ -471,8 +528,18 @@ mod tests {
 
     #[test]
     fn only_outage_classes_are_provider_side() {
-        let provider_side: Vec<_> = [Readiness, Quota, Transport, Auth, Binary, Content, Unrecognised]
-            .into_iter().filter(|class| class.is_provider_side()).collect();
+        let provider_side: Vec<_> = [
+            Readiness,
+            Quota,
+            Transport,
+            Auth,
+            Binary,
+            Content,
+            Unrecognised,
+        ]
+        .into_iter()
+        .filter(|class| class.is_provider_side())
+        .collect();
         assert_eq!(provider_side, vec![Quota, Transport, Auth, Binary]);
     }
 
@@ -481,18 +548,41 @@ mod tests {
         use CapabilityClass::*;
         for capability in [TextOnly, ReadTools, WriteTools, FullAgentic] {
             let may_write = matches!(capability, WriteTools | FullAgentic);
-            for class in [Readiness, Quota, Transport, Auth, Binary, Content, Unrecognised] {
-                let error = turn_error("codex", class, capability, "synthetic detail JARVIS_READINESS:mcp_tools PRIVATE".into());
+            for class in [
+                Readiness,
+                Quota,
+                Transport,
+                Auth,
+                Binary,
+                Content,
+                Unrecognised,
+            ] {
+                let error = turn_error(
+                    "codex",
+                    class,
+                    capability,
+                    "synthetic detail JARVIS_READINESS:mcp_tools PRIVATE".into(),
+                );
                 let typed = ReasonerError::find_in(&error);
                 match class {
                     Readiness => assert!(matches!(typed, Some(ReasonerError::Local { .. }))),
                     Quota => assert!(matches!(typed, Some(ReasonerError::RateLimited { .. }))),
-                    Transport | Auth | Binary => assert!(matches!(typed, Some(ReasonerError::Unavailable { .. }))),
-                    Unrecognised if !may_write => assert!(matches!(typed, Some(ReasonerError::Unavailable { .. })),
-                        "{capability:?}: an unrecognised text/read failure is an outage"),
+                    Transport | Auth | Binary => {
+                        assert!(matches!(typed, Some(ReasonerError::Unavailable { .. })))
+                    }
+                    Unrecognised if !may_write => assert!(
+                        matches!(typed, Some(ReasonerError::Unavailable { .. })),
+                        "{capability:?}: an unrecognised text/read failure is an outage"
+                    ),
                     Content | Unrecognised => {
-                        assert!(typed.is_none(), "{class:?} on {capability:?} must stay untyped");
-                        assert_eq!(error.downcast_ref::<TurnFailure>().map(|f| f.class), Some(class));
+                        assert!(
+                            typed.is_none(),
+                            "{class:?} on {capability:?} must stay untyped"
+                        );
+                        assert_eq!(
+                            error.downcast_ref::<TurnFailure>().map(|f| f.class),
+                            Some(class)
+                        );
                     }
                 }
                 if class == Readiness {
@@ -508,26 +598,54 @@ mod tests {
     #[test]
     fn routes_unrecognised_by_capability() {
         use CapabilityClass::*;
-        for detail in ["synthetic unrecognised failure 7F3A", "unexpected status 404 Not Found: model_not_found"] {
+        for detail in [
+            "synthetic unrecognised failure 7F3A",
+            "unexpected status 404 Not Found: model_not_found",
+        ] {
             let class = classify(detail, true);
             assert_eq!(class, Unrecognised, "{detail}");
             for capability in [TextOnly, ReadTools] {
-                assert!(ReasonerError::find_in(&turn_error("codex", class, capability, detail.into()))
-                    .is_some_and(ReasonerError::is_provider_side), "{capability:?}");
+                assert!(
+                    ReasonerError::find_in(&turn_error("codex", class, capability, detail.into()))
+                        .is_some_and(ReasonerError::is_provider_side),
+                    "{capability:?}"
+                );
             }
             for capability in [WriteTools, FullAgentic] {
-                assert!(ReasonerError::find_in(&turn_error("codex", class, capability, detail.into())).is_none(), "{capability:?}");
+                assert!(
+                    ReasonerError::find_in(&turn_error("codex", class, capability, detail.into()))
+                        .is_none(),
+                    "{capability:?}"
+                );
             }
         }
     }
 
     #[test]
     fn an_explicit_status_outranks_body_text_but_400_403_404_do_not_decide() {
-        assert_eq!(classify("unexpected status 503 Service Unavailable: context window", true), Transport);
-        assert_eq!(classify("HTTP/1.1 502 upstream said: usage policy", true), Transport);
-        assert_eq!(classify("unexpected status 400 Bad Request: context_length_exceeded", true), Content);
+        assert_eq!(
+            classify(
+                "unexpected status 503 Service Unavailable: context window",
+                true
+            ),
+            Transport
+        );
+        assert_eq!(
+            classify("HTTP/1.1 502 upstream said: usage policy", true),
+            Transport
+        );
+        assert_eq!(
+            classify(
+                "unexpected status 400 Bad Request: context_length_exceeded",
+                true
+            ),
+            Content
+        );
         assert_eq!(classify("unexpected status 403 Forbidden: This request has been flagged for possible cybersecurity risk.", true), Content);
-        assert_eq!(classify("request id 5031 failed with a synthetic reason", true), Unrecognised);
+        assert_eq!(
+            classify("request id 5031 failed with a synthetic reason", true),
+            Unrecognised
+        );
     }
 
     /// #1069 re-review — the status rule only reads codex's own status

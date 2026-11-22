@@ -54,7 +54,12 @@ impl State {
 
 fn profile(name: &str) -> Option<ProviderKind> {
     match ProviderKind::parse(name) {
-        Some(kind @ (ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)) => Some(kind),
+        Some(
+            kind @ (ProviderKind::Claude
+            | ProviderKind::Qwen
+            | ProviderKind::Glm
+            | ProviderKind::Codex),
+        ) => Some(kind),
         _ => None,
     }
 }
@@ -302,10 +307,19 @@ mod tests {
     fn short_profile_command_uses_the_same_pause_gate() {
         let temp = tempfile::tempdir().unwrap();
         let store = SelectionStore::new(temp.path().join("selection.json"));
-        assert!(run_command(&store, "42", "model qwen", |_| Err("paused".into())).unwrap().contains("paused"));
+        assert!(
+            run_command(&store, "42", "model qwen", |_| Err("paused".into()))
+                .unwrap()
+                .contains("paused")
+        );
         assert_eq!(store.selected(Some("42")).unwrap(), None);
-        assert!(run_command(&store, "42", "/model codex", |_| Ok(())).unwrap().contains("Model set to codex"));
-        assert_eq!(store.selected(Some("42")).unwrap(), Some(ProviderKind::Codex));
+        assert!(run_command(&store, "42", "/model codex", |_| Ok(()))
+            .unwrap()
+            .contains("Model set to codex"));
+        assert_eq!(
+            store.selected(Some("42")).unwrap(),
+            Some(ProviderKind::Codex)
+        );
     }
 
     #[test]
@@ -313,9 +327,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SelectionStore::new(temp.path().join("selection.json"));
         for kind in [ProviderKind::Claude, ProviderKind::Codex] {
-            let reply = run_command(&store, "123", &format!("/model set {}", kind.name()), |_| Ok(())).unwrap();
-            assert!(reply.contains(&format!("set to {}", kind.name())), "{reply}");
-            assert_eq!(SelectionStore::new(temp.path().join("selection.json")).selected(Some("123")).unwrap(), Some(kind));
+            let reply = run_command(
+                &store,
+                "123",
+                &format!("/model set {}", kind.name()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(
+                reply.contains(&format!("set to {}", kind.name())),
+                "{reply}"
+            );
+            assert_eq!(
+                SelectionStore::new(temp.path().join("selection.json"))
+                    .selected(Some("123"))
+                    .unwrap(),
+                Some(kind)
+            );
         }
         run_command(&store, "123", "/model reset", |_| Ok(()));
         assert_eq!(store.selected(Some("123")).unwrap(), None);
@@ -449,15 +477,35 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let check = |kind| {
             calls.set(calls.get() + 1);
-            if kind == ProviderKind::Qwen { Err("Qwen is paused".into()) } else { Ok(()) }
+            if kind == ProviderKind::Qwen {
+                Err("Qwen is paused".into())
+            } else {
+                Ok(())
+            }
         };
         let paused = run_command(&store, "123", "/model status", check).unwrap();
-        assert!(paused.contains("qwen") && paused.contains("conversation"), "{paused}");
-        assert!(paused.contains("Qwen is paused") && paused.contains("Fallback: disabled"), "{paused}");
+        assert!(
+            paused.contains("qwen") && paused.contains("conversation"),
+            "{paused}"
+        );
+        assert!(
+            paused.contains("Qwen is paused") && paused.contains("Fallback: disabled"),
+            "{paused}"
+        );
         let inherited = run_command(&store, "456", "/model status", check).unwrap();
-        assert!(inherited.contains("codex") && inherited.contains("daemon default"), "{inherited}");
-        assert!(inherited.contains("Readiness: ready") && inherited.contains("Fallback: disabled"), "{inherited}");
-        assert_eq!(calls.get(), 2, "status performs only readiness checks, no inference");
+        assert!(
+            inherited.contains("codex") && inherited.contains("daemon default"),
+            "{inherited}"
+        );
+        assert!(
+            inherited.contains("Readiness: ready") && inherited.contains("Fallback: disabled"),
+            "{inherited}"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "status performs only readiness checks, no inference"
+        );
     }
 
     #[test]
@@ -465,17 +513,35 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SelectionStore::new(temp.path().join("selection.json"));
         let available = |_| Ok(());
-        assert!(run_command(&store, "123", "/model set qwen scope:default", available)
-            .unwrap().contains("daemon default"));
-        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Qwen));
-        assert_eq!(store.selected(Some("456")).unwrap(), Some(ProviderKind::Qwen));
+        assert!(
+            run_command(&store, "123", "/model set qwen scope:default", available)
+                .unwrap()
+                .contains("daemon default")
+        );
+        assert_eq!(
+            store.selected(Some("123")).unwrap(),
+            Some(ProviderKind::Qwen)
+        );
+        assert_eq!(
+            store.selected(Some("456")).unwrap(),
+            Some(ProviderKind::Qwen)
+        );
         run_command(&store, "123", "/model set codex", available);
         run_command(&store, "456", "/model set glm scope:default", available);
-        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Codex));
-        assert_eq!(store.selected(Some("456")).unwrap(), Some(ProviderKind::Glm));
+        assert_eq!(
+            store.selected(Some("123")).unwrap(),
+            Some(ProviderKind::Codex)
+        );
+        assert_eq!(
+            store.selected(Some("456")).unwrap(),
+            Some(ProviderKind::Glm)
+        );
         assert_eq!(store.selected(None).unwrap(), Some(ProviderKind::Glm));
         run_command(&store, "123", "/model reset", available);
-        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Glm));
+        assert_eq!(
+            store.selected(Some("123")).unwrap(),
+            Some(ProviderKind::Glm)
+        );
     }
 
     #[test]
@@ -506,7 +572,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("selection.json");
         let store = SelectionStore::new(&path);
-        for command in ["/model yolo", "model set yolo", "/model set YOLO scope:default"] {
+        for command in [
+            "/model yolo",
+            "model set yolo",
+            "/model set YOLO scope:default",
+        ] {
             let reply = run_command(&store, "123", command, |_| Ok(())).unwrap();
             assert_eq!(reply, "Use /yolo to start a yolo thread.", "{command}");
         }
@@ -540,6 +610,9 @@ mod tests {
                 assert_eq!(current().unwrap(), Some(ProviderKind::Qwen));
             })
             .await;
-        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Codex));
+        assert_eq!(
+            store.selected(Some("123")).unwrap(),
+            Some(ProviderKind::Codex)
+        );
     }
 }

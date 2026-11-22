@@ -555,12 +555,7 @@ impl SqliteGovernor {
             return Ok(());
         };
         let multiplier = self.warmup_multiplier(req.platform, &req.account_id, now_ms)?;
-        let counter = WindowedCounter::new(
-            &self.store,
-            req.platform,
-            req.action,
-            &req.account_id,
-        );
+        let counter = WindowedCounter::new(&self.store, req.platform, req.action, &req.account_id);
 
         // 4. min_gap (NOT scaled by warmup — anti-pattern guard).
         if !limit.min_gap.is_zero() {
@@ -1006,8 +1001,7 @@ pub(crate) mod tests {
             let p = gov.permit(r.clone()).await.unwrap();
             gov.record(p, Outcome::RolledBack).await.unwrap();
         }
-        let counter =
-            WindowedCounter::new(&store, Platform::Instagram, ActionKind::Like, "g");
+        let counter = WindowedCounter::new(&store, Platform::Instagram, ActionKind::Like, "g");
         let n = counter
             .count_in_window(clock.now_ms(), Duration::from_secs(86_400))
             .unwrap();

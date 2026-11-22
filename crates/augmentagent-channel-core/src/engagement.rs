@@ -31,9 +31,7 @@ use augmentagent_store::{Email, ScheduledPost, ScheduledPostStatus, Store};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::governor::{
-    ActionKind, ActionRequest, Denial, Outcome, Platform, RateGovernor, Risk,
-};
+use crate::governor::{ActionKind, ActionRequest, Denial, Outcome, Platform, RateGovernor, Risk};
 
 /// Default preview horizon — the #58 spec's T-30min preview window.
 pub const PREVIEW_HORIZON: Duration = Duration::from_secs(30 * 60);
@@ -283,12 +281,14 @@ impl ScheduledPostEngine {
                     );
                     return Ok(());
                 }
-                Err(d @ (Denial::DailyCap { .. }
-                | Denial::HourlyCap { .. }
-                | Denial::BurstCap { .. }
-                | Denial::QuietHours { .. }
-                | Denial::WarmupGate(_)
-                | Denial::Halted { .. })) => {
+                Err(
+                    d @ (Denial::DailyCap { .. }
+                    | Denial::HourlyCap { .. }
+                    | Denial::BurstCap { .. }
+                    | Denial::QuietHours { .. }
+                    | Denial::WarmupGate(_)
+                    | Denial::Halted { .. }),
+                ) => {
                     // Soft denial — defer, don't drop. The post stays in its
                     // current state and the loop re-evaluates next tick.
                     info!(post = %post.id, "scheduled post deferred: {d}");
@@ -351,20 +351,14 @@ impl ScheduledPostEngine {
                         message_id: format!("sched-fail:{}", post.id),
                         thread_id: None,
                         from: format!("scheduled:{}", post.platform),
-                        subject: format!(
-                            "Scheduled {} post FAILED",
-                            post.platform
-                        ),
+                        subject: format!("Scheduled {} post FAILED", post.platform),
                         body: message.clone(),
                         date: String::new(),
                         account_entity_id: None,
                         platform: post.platform.clone(),
                         kind: crate::trigger::kind::SCHEDULED_POST_FIRE.into(),
                     };
-                    let _ = self
-                        .broker
-                        .post_flag_notice(&pseudo, &message)
-                        .await;
+                    let _ = self.broker.post_flag_notice(&pseudo, &message).await;
                 }
                 warn!(post = %post.id, "scheduled post failed: {message}");
             }
@@ -430,8 +424,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("data.db");
         {
-            let conn =
-                augmentagent_store::rusqlite::Connection::open(&path).unwrap();
+            let conn = augmentagent_store::rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 r#"
                 CREATE TABLE actions (
@@ -485,21 +478,14 @@ mod tests {
     struct AlwaysPermit;
     #[async_trait]
     impl RateGovernor for AlwaysPermit {
-        async fn permit(
-            &self,
-            req: ActionRequest,
-        ) -> Result<crate::governor::Permit, Denial> {
+        async fn permit(&self, req: ActionRequest) -> Result<crate::governor::Permit, Denial> {
             Ok(crate::governor::Permit {
                 id: uuid::Uuid::new_v4(),
                 req,
                 reserved_at_ms: 0,
             })
         }
-        async fn record(
-            &self,
-            _: crate::governor::Permit,
-            _: Outcome,
-        ) -> anyhow::Result<()> {
+        async fn record(&self, _: crate::governor::Permit, _: Outcome) -> anyhow::Result<()> {
             Ok(())
         }
         async fn record_halt(
@@ -510,10 +496,7 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn halt_status(
-            &self,
-            _: Platform,
-        ) -> Option<crate::governor::HaltState> {
+        async fn halt_status(&self, _: Platform) -> Option<crate::governor::HaltState> {
             None
         }
         async fn is_halted(&self, _: Platform) -> Option<i64> {
@@ -524,19 +507,10 @@ mod tests {
     struct CountingBroker(Arc<AtomicUsize>);
     #[async_trait]
     impl ApprovalBroker for CountingBroker {
-        async fn post_approval(
-            &self,
-            _: &str,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_approval(&self, _: &str, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -546,8 +520,7 @@ mod tests {
     async fn preview_then_fire_lifecycle() {
         let (_d, store) = test_store();
         let cards = Arc::new(AtomicUsize::new(0));
-        let broker: Arc<dyn ApprovalBroker> =
-            Arc::new(CountingBroker(Arc::clone(&cards)));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker(Arc::clone(&cards)));
         let pubr = Arc::new(RecordingPublisher {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -563,13 +536,7 @@ mod tests {
         let now = 1_700_000_000_000_i64;
         // Fires in 10 min — inside the 30-min preview horizon.
         let id = store
-            .enqueue_scheduled_post(
-                "linkedin",
-                "shipped a thing",
-                None,
-                now + 10 * 60_000,
-                None,
-            )
+            .enqueue_scheduled_post("linkedin", "shipped a thing", None, now + 10 * 60_000, None)
             .unwrap();
 
         // Pass 1 at `now`: preview card, no fire yet.
@@ -583,9 +550,14 @@ mod tests {
         // Pass 2 at fire time: publishes, terminal `posted`.
         let (p2, f2) = engine.tick_once(now + 11 * 60_000).await.unwrap();
         assert_eq!((p2, f2), (0, 1));
-        assert_eq!(pubr.published.lock().unwrap().as_slice(), &["shipped a thing"]);
+        assert_eq!(
+            pubr.published.lock().unwrap().as_slice(),
+            &["shipped a thing"]
+        );
         assert!(store.list_pending_scheduled_posts().unwrap().is_empty());
-        let q = store.scheduled_posts_due_to_fire(now + 999_999_999).unwrap();
+        let q = store
+            .scheduled_posts_due_to_fire(now + 999_999_999)
+            .unwrap();
         assert!(q.is_empty(), "posted row must not re-fire");
         let _ = id;
     }
@@ -595,8 +567,7 @@ mod tests {
         std::env::set_var("AUGMENTAGENT_TWITTER_AUTO_POST_MODE", "post_silently");
         let (_d, store) = test_store();
         let cards = Arc::new(AtomicUsize::new(0));
-        let broker: Arc<dyn ApprovalBroker> =
-            Arc::new(CountingBroker(Arc::clone(&cards)));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker(Arc::clone(&cards)));
         let pubr = Arc::new(RecordingPublisher {
             published: Mutex::new(Vec::new()),
             fail: false,

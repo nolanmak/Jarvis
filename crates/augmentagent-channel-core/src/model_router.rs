@@ -41,7 +41,9 @@ impl GatewayKind {
     }
 }
 
-fn direct_mode() -> String { "direct".into() }
+fn direct_mode() -> String {
+    "direct".into()
+}
 
 // Deliberately no Debug: the gateway key is a secret. Dashboard administration
 // credentials are ignored during deserialization and never reach subprocesses.
@@ -63,9 +65,17 @@ tokio::task_local! { static NATIVE_REVIEW: ProviderKind; }
 /// Pin an independent reviewer to its native CLI identity for one call.
 /// Gateway account aliases cannot establish that a reviewer differs from an
 /// author model, and an inherited Discord selection must not redirect it.
-pub async fn native_reviewer_scope<F: std::future::Future>(provider: ProviderKind, call: F) -> F::Output {
+pub async fn native_reviewer_scope<F: std::future::Future>(
+    provider: ProviderKind,
+    call: F,
+) -> F::Output {
     let selected = (provider == ProviderKind::Codex).then_some(provider);
-    NATIVE_REVIEW.scope(provider, crate::model_selection::SELECTED_PROFILE.scope(selected, call)).await
+    NATIVE_REVIEW
+        .scope(
+            provider,
+            crate::model_selection::SELECTED_PROFILE.scope(selected, call),
+        )
+        .await
 }
 
 pub fn config_path() -> PathBuf {
@@ -113,30 +123,56 @@ pub async fn without_router<F: std::future::Future>(fut: F) -> F::Output {
 
 /// A Discord/default profile applies only to this call's cloned router
 /// configuration. The persisted account settings and other calls are intact.
-pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
-    select_profile_for_workflow(config,selected,false)
+pub fn select_profile(
+    config: Option<RouterConfig>,
+    selected: Option<ProviderKind>,
+) -> anyhow::Result<Option<RouterConfig>> {
+    select_profile_for_workflow(config, selected, false)
 }
 /// Required workflows use only the explicit isolated native credential grant.
 /// Interactive selection retains the original host-authentication behavior.
-pub(crate) fn select_profile_for_workflow(config:Option<RouterConfig>,selected:Option<ProviderKind>,required:bool)->anyhow::Result<Option<RouterConfig>> {
-    let native_codex_available=selected==Some(ProviderKind::Codex) && if required {
-        crate::native_vm::declared_native_auth("codex")?
-    } else {crate::codex::codex_auth_available()};
-    select_profile_with_auth(config,selected,native_codex_available)
+pub(crate) fn select_profile_for_workflow(
+    config: Option<RouterConfig>,
+    selected: Option<ProviderKind>,
+    required: bool,
+) -> anyhow::Result<Option<RouterConfig>> {
+    let native_codex_available = selected == Some(ProviderKind::Codex)
+        && if required {
+            crate::native_vm::declared_native_auth("codex")?
+        } else {
+            crate::codex::codex_auth_available()
+        };
+    select_profile_with_auth(config, selected, native_codex_available)
 }
 
-fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<ProviderKind>, native_codex_available: bool) -> anyhow::Result<Option<RouterConfig>> {
+fn select_profile_with_auth(
+    mut config: Option<RouterConfig>,
+    selected: Option<ProviderKind>,
+    native_codex_available: bool,
+) -> anyhow::Result<Option<RouterConfig>> {
     if let Ok(reviewer) = NATIVE_REVIEW.try_with(|provider| *provider) {
-        anyhow::ensure!(matches!(reviewer, ProviderKind::Codex | ProviderKind::Claude)
-            && selected == (reviewer == ProviderKind::Codex).then_some(reviewer),
-            "independent review must stay pinned to its native provider");
-        anyhow::ensure!(reviewer != ProviderKind::Codex || native_codex_available,
-            "native Codex authentication is required for independent review");
-        if let Some(router) = config.as_mut() { router.mode = "direct".into(); }
+        anyhow::ensure!(
+            matches!(reviewer, ProviderKind::Codex | ProviderKind::Claude)
+                && selected == (reviewer == ProviderKind::Codex).then_some(reviewer),
+            "independent review must stay pinned to its native provider"
+        );
+        anyhow::ensure!(
+            reviewer != ProviderKind::Codex || native_codex_available,
+            "native Codex authentication is required for independent review"
+        );
+        if let Some(router) = config.as_mut() {
+            router.mode = "direct".into();
+        }
         return Ok(config);
     }
     if let Some(profile) = selected {
-        anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
+        anyhow::ensure!(
+            matches!(
+                profile,
+                ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm
+            ),
+            "unsupported model profile"
+        );
         if let Some(router) = config.as_mut() {
             // An enabled subscription route keeps using the connected account
             // pool. A direct or Runpod-only configuration retains native CLI
@@ -150,8 +186,10 @@ fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<P
                 profile.name().into()
             };
         } else {
-            anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
-                "Selected Runpod model requires a configured model gateway endpoint");
+            anyhow::ensure!(
+                matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
+                "Selected Runpod model requires a configured model gateway endpoint"
+            );
         }
     }
     Ok(config)
@@ -175,7 +213,9 @@ pub fn validate_remote_v1(raw: &str, allowed: &str) -> anyhow::Result<reqwest::U
     let host = url.host_str().unwrap_or_default();
     let listed = url.port_or_known_default().is_some_and(|port| {
         let authority = format!("{host}:{port}");
-        allowed.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority))
+        allowed
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(&authority))
     });
     anyhow::ensure!(
         url.scheme() == "https"
@@ -201,13 +241,18 @@ pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
     let url = reqwest::Url::parse(&config.base_url)
         .map_err(|_| anyhow::anyhow!("Invalid router endpoint"))?;
     let host = url.host_str().unwrap_or_default();
-    let local = url.scheme() == "http"
-        && matches!(host, "127.0.0.1" | "localhost" | "[::1]");
-    let remote = url.scheme() == "https" && url.port_or_known_default().is_some_and(|port| {
-        let authority = format!("{host}:{port}");
-        std::env::var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS")
-            .ok().is_some_and(|hosts| hosts.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority)))
-    });
+    let local = url.scheme() == "http" && matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+    let remote = url.scheme() == "https"
+        && url.port_or_known_default().is_some_and(|port| {
+            let authority = format!("{host}:{port}");
+            std::env::var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS")
+                .ok()
+                .is_some_and(|hosts| {
+                    hosts
+                        .split(',')
+                        .any(|entry| entry.trim().eq_ignore_ascii_case(&authority))
+                })
+        });
     anyhow::ensure!(
         (local || remote)
             && url.username().is_empty()
@@ -275,12 +320,21 @@ impl RouterConfig {
     pub fn codex_overrides(&self) -> Vec<String> {
         vec![
             "model_provider=\"augmentagent_router\"".into(),
-            format!("model_providers.augmentagent_router.name=\"{}\"", self.gateway.display_name()),
-            format!("model_providers.augmentagent_router.base_url={}", serde_json::to_string(&self.base_url).expect("string")),
+            format!(
+                "model_providers.augmentagent_router.name=\"{}\"",
+                self.gateway.display_name()
+            ),
+            format!(
+                "model_providers.augmentagent_router.base_url={}",
+                serde_json::to_string(&self.base_url).expect("string")
+            ),
             "model_providers.augmentagent_router.wire_api=\"responses\"".into(),
             "model_providers.augmentagent_router.env_key=\"AUGMENTAGENT_ROUTER_API_KEY\"".into(),
             "model_providers.augmentagent_router.requires_openai_auth=false".into(),
-            format!("model_providers.augmentagent_router.http_headers={{ \"{}\" = \"off\" }}", self.gateway.compression_header()),
+            format!(
+                "model_providers.augmentagent_router.http_headers={{ \"{}\" = \"off\" }}",
+                self.gateway.compression_header()
+            ),
         ]
     }
     pub fn configure_codex(&self, cmd: &mut tokio::process::Command) {
@@ -290,7 +344,10 @@ impl RouterConfig {
     pub fn configure_claude(&self, cmd: &mut tokio::process::Command) {
         cmd.env("ANTHROPIC_BASE_URL", self.base_url.trim_end_matches("/v1"))
             .env("ANTHROPIC_AUTH_TOKEN", &self.api_key)
-            .env("ANTHROPIC_CUSTOM_HEADERS", format!("{}: off", self.gateway.compression_header()))
+            .env(
+                "ANTHROPIC_CUSTOM_HEADERS",
+                format!("{}: off", self.gateway.compression_header()),
+            )
             // #1404 — a dead route should fail in seconds, not sit in the
             // CLI's own retry loop; the caller has the direct CLI to fall to.
             .env("CLAUDE_CODE_MAX_RETRIES", "2")
@@ -310,71 +367,123 @@ pub(crate) mod tests {
     }
     #[test]
     fn gateway_kinds_select_their_claude_and_codex_wire_contracts() {
-        for (gateway,name,header) in [
-            ("omniroute","OmniRoute","x-omniroute-compression"),
-            ("9router","9Router","X-9Router-Token-Saver"),
+        for (gateway, name, header) in [
+            ("omniroute", "OmniRoute", "x-omniroute-compression"),
+            ("9router", "9Router", "X-9Router-Token-Saver"),
         ] {
-            let mut value=fixture();value["gateway"]=gateway.into();
-            let config=parse(&value.to_string()).unwrap();
-            assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],gateway);
-            let overrides=config.codex_overrides();
-            assert!(overrides.contains(&format!("model_providers.augmentagent_router.name=\"{name}\"")));
-            assert!(overrides.contains(&format!("model_providers.augmentagent_router.http_headers={{ \"{header}\" = \"off\" }}")));
-            assert!(overrides.contains(&"model_providers.augmentagent_router.base_url=\"http://127.0.0.1:20128/v1\"".into()));
-            assert!(overrides.contains(&"model_providers.augmentagent_router.requires_openai_auth=false".into()));
+            let mut value = fixture();
+            value["gateway"] = gateway.into();
+            let config = parse(&value.to_string()).unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap()["gateway"], gateway);
+            let overrides = config.codex_overrides();
+            assert!(overrides.contains(&format!(
+                "model_providers.augmentagent_router.name=\"{name}\""
+            )));
+            assert!(overrides.contains(&format!(
+                "model_providers.augmentagent_router.http_headers={{ \"{header}\" = \"off\" }}"
+            )));
+            assert!(overrides.contains(
+                &"model_providers.augmentagent_router.base_url=\"http://127.0.0.1:20128/v1\""
+                    .into()
+            ));
+            assert!(overrides.contains(
+                &"model_providers.augmentagent_router.requires_openai_auth=false".into()
+            ));
             assert!(!overrides.join(" ").contains("router-secret"));
-            let mut cmd=tokio::process::Command::new("claude");
+            let mut cmd = tokio::process::Command::new("claude");
             config.configure_claude(&mut cmd);
-            let env=cmd.as_std().get_envs().map(|(k,v)|(k.to_string_lossy().into_owned(),v.map(|v|v.to_string_lossy().into_owned()))).collect::<std::collections::BTreeMap<_,_>>();
-            assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"],Some(format!("{header}: off")));
-            assert_eq!(env["ANTHROPIC_BASE_URL"].as_deref(),Some("http://127.0.0.1:20128"));
-            assert_eq!(env["ANTHROPIC_AUTH_TOKEN"].as_deref(),Some("router-secret"));
-            assert_eq!(env["CLAUDE_CODE_MAX_RETRIES"].as_deref(),Some("2"));
-            assert_eq!(env["ANTHROPIC_API_KEY"],None);
-            assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"],None);
+            let env = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                env["ANTHROPIC_CUSTOM_HEADERS"],
+                Some(format!("{header}: off"))
+            );
+            assert_eq!(
+                env["ANTHROPIC_BASE_URL"].as_deref(),
+                Some("http://127.0.0.1:20128")
+            );
+            assert_eq!(
+                env["ANTHROPIC_AUTH_TOKEN"].as_deref(),
+                Some("router-secret")
+            );
+            assert_eq!(env["CLAUDE_CODE_MAX_RETRIES"].as_deref(), Some("2"));
+            assert_eq!(env["ANTHROPIC_API_KEY"], None);
+            assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], None);
         }
     }
 
     #[test]
     fn missing_gateway_defaults_to_omniroute_and_missing_mode_stays_direct() {
-        let mut value=fixture();
+        let mut value = fixture();
         value.as_object_mut().unwrap().remove("gateway");
-        let config=parse(&value.to_string()).unwrap();
-        assert_eq!(serde_json::to_value(&config).unwrap()["gateway"],"omniroute");
-        assert!(config.codex_overrides().iter().any(|arg|arg.contains("OmniRoute")));
+        let config = parse(&value.to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["gateway"],
+            "omniroute"
+        );
+        assert!(config
+            .codex_overrides()
+            .iter()
+            .any(|arg| arg.contains("OmniRoute")));
         value.as_object_mut().unwrap().remove("mode");
-        let direct=parse(&value.to_string()).unwrap();
-        assert_eq!(direct.mode,"direct");
+        let direct = parse(&value.to_string()).unwrap();
+        assert_eq!(direct.mode, "direct");
         assert!(!direct.enabled());
-        for provider in [ProviderKind::Claude,ProviderKind::Codex,ProviderKind::Gemini] {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+        ] {
             assert!(direct.allows(provider));
-            assert!(direct.model(provider,ModelTier::Quality).is_none());
+            assert!(direct.model(provider, ModelTier::Quality).is_none());
         }
     }
 
     #[test]
     fn unknown_gateway_is_rejected_without_echoing_secrets() {
-        for gateway in [serde_json::json!("other"),serde_json::json!(null),serde_json::json!(7)] {
-            let mut value=fixture();value["gateway"]=gateway;
-            let error=parse(&value.to_string()).err().expect("unsupported gateway must fail closed");
+        for gateway in [
+            serde_json::json!("other"),
+            serde_json::json!(null),
+            serde_json::json!(7),
+        ] {
+            let mut value = fixture();
+            value["gateway"] = gateway;
+            let error = parse(&value.to_string())
+                .err()
+                .expect("unsupported gateway must fail closed");
             assert!(!error.to_string().contains("router-secret"));
         }
     }
 
     #[tokio::test]
     async fn direct_mode_and_native_review_do_not_depend_on_gateway_kind() {
-        for gateway in ["omniroute","9router"] {
-            let mut value=fixture();value["gateway"]=gateway.into();value["mode"]="direct".into();
-            let direct=parse(&value.to_string()).unwrap();
+        for gateway in ["omniroute", "9router"] {
+            let mut value = fixture();
+            value["gateway"] = gateway.into();
+            value["mode"] = "direct".into();
+            let direct = parse(&value.to_string()).unwrap();
             assert!(!direct.enabled());
-            assert!(direct.model(ProviderKind::Claude,ModelTier::Quality).is_none());
-            assert!(direct.model(ProviderKind::Codex,ModelTier::Fast).is_none());
-            value["mode"]="auto".into();
-            let config=Some(parse(&value.to_string()).unwrap());
-            let native=native_reviewer_scope(ProviderKind::Codex,async {
-                select_profile_with_auth(config,Some(ProviderKind::Codex),true)
-            }).await.unwrap().unwrap();
-            assert_eq!(native.mode,"direct");
+            assert!(direct
+                .model(ProviderKind::Claude, ModelTier::Quality)
+                .is_none());
+            assert!(direct.model(ProviderKind::Codex, ModelTier::Fast).is_none());
+            value["mode"] = "auto".into();
+            let config = Some(parse(&value.to_string()).unwrap());
+            let native = native_reviewer_scope(ProviderKind::Codex, async {
+                select_profile_with_auth(config, Some(ProviderKind::Codex), true)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(native.mode, "direct");
         }
     }
 
@@ -382,12 +491,22 @@ pub(crate) mod tests {
     fn account_profiles_respect_enabled_router_and_direct_mode() {
         let original = parse(&fixture().to_string()).unwrap();
         for kind in [ProviderKind::Claude, ProviderKind::Codex] {
-            let routed = select_profile_with_auth(Some(original.clone()), Some(kind), true).unwrap().unwrap();
+            let routed = select_profile_with_auth(Some(original.clone()), Some(kind), true)
+                .unwrap()
+                .unwrap();
             assert_eq!(routed.mode, kind.name());
             let mut direct = original.clone();
             direct.mode = "direct".into();
-            assert_eq!(select_profile_with_auth(Some(direct), Some(kind), true).unwrap().unwrap().mode, "direct");
-            assert!(select_profile_with_auth(None, Some(kind), true).unwrap().is_none());
+            assert_eq!(
+                select_profile_with_auth(Some(direct), Some(kind), true)
+                    .unwrap()
+                    .unwrap()
+                    .mode,
+                "direct"
+            );
+            assert!(select_profile_with_auth(None, Some(kind), true)
+                .unwrap()
+                .is_none());
         }
         assert_eq!(original.mode, "auto");
     }
@@ -443,9 +562,15 @@ pub(crate) mod tests {
         const NAME: &str =
             "model_router::tests::without_router_bypasses_a_live_router_config_from_the_environment";
         if std::env::var_os("JARVIS_ROUTER_CONFIG_CHILD").is_some() {
-            assert!(current().unwrap().is_some(), "precondition: load() sees the env router");
+            assert!(
+                current().unwrap().is_some(),
+                "precondition: load() sees the env router"
+            );
             without_router(async {
-                assert!(current().unwrap().is_none(), "without_router must bypass load()");
+                assert!(
+                    current().unwrap().is_none(),
+                    "without_router must bypass load()"
+                );
             })
             .await;
             return;
@@ -459,8 +584,12 @@ pub(crate) mod tests {
             .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &path)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
     fn rejects_external_endpoints_and_cross_provider_models() {
@@ -514,7 +643,9 @@ pub(crate) mod tests {
     #[test]
     fn selected_profile_is_pinned_without_changing_router_accounts() {
         let original = parse(&fixture().to_string()).unwrap();
-        let selected = select_profile(Some(original.clone()), Some(ProviderKind::Qwen)).unwrap().unwrap();
+        let selected = select_profile(Some(original.clone()), Some(ProviderKind::Qwen))
+            .unwrap()
+            .unwrap();
         assert!(selected.allows(ProviderKind::Qwen));
         assert!(!selected.allows(ProviderKind::Codex));
         assert!(!selected.allows(ProviderKind::Glm));
@@ -526,11 +657,15 @@ pub(crate) mod tests {
     fn explicit_codex_uses_existing_account_when_available() {
         let mut original = parse(&fixture().to_string()).unwrap();
         original.mode = "qwen".into();
-        let native = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), true)
-            .unwrap().unwrap();
+        let native =
+            select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), true)
+                .unwrap()
+                .unwrap();
         assert_eq!(native.mode, "direct");
-        let gateway = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), false)
-            .unwrap().unwrap();
+        let gateway =
+            select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), false)
+                .unwrap()
+                .unwrap();
         assert_eq!(gateway.mode, "codex");
         assert_eq!(original.mode, "qwen");
     }
@@ -540,25 +675,39 @@ pub(crate) mod tests {
         let config = Some(parse(&fixture().to_string()).unwrap());
         let lost_login = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), false)
-        }).await;
-        assert!(lost_login.is_err(), "a lost native login must not fall through to a model gateway");
+        })
+        .await;
+        assert!(
+            lost_login.is_err(),
+            "a lost native login must not fall through to a model gateway"
+        );
         let native_codex = native_reviewer_scope(ProviderKind::Codex, async {
             select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), true)
-        }).await.unwrap().unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(native_codex.mode, "direct");
         let native_claude = native_reviewer_scope(ProviderKind::Claude, async {
             select_profile_with_auth(config, None, false)
-        }).await.unwrap().unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(native_claude.mode, "direct");
     }
 
     #[test]
     fn explicitly_allowed_remote_router_requires_https_and_exact_host() {
-        const NAME: &str = "model_router::tests::explicitly_allowed_remote_router_requires_https_and_exact_host";
+        const NAME: &str =
+            "model_router::tests::explicitly_allowed_remote_router_requires_https_and_exact_host";
         if std::env::var_os("JARVIS_TAILNET_ROUTER_CHILD").is_some() {
             let mut value = fixture();
             value["base_url"] = "https://router.fixture.ts.net:20128/v1".into();
-            assert!(parse(&value.to_string()).is_ok(), "the exact allowed HTTPS router should parse");
+            assert!(
+                parse(&value.to_string()).is_ok(),
+                "the exact allowed HTTPS router should parse"
+            );
             for url in [
                 "http://router.fixture.ts.net:20128/v1",
                 "https://other.fixture.ts.net:20128/v1",
@@ -568,27 +717,55 @@ pub(crate) mod tests {
                 "http://evil.example:20128/v1",
             ] {
                 value["base_url"] = url.into();
-                assert!(parse(&value.to_string()).is_err(), "unauthorized router URL {url}");
+                assert!(
+                    parse(&value.to_string()).is_err(),
+                    "unauthorized router URL {url}"
+                );
             }
-            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
-                "router.fixture.ts.net:20128,evil.example:20128");
+            std::env::set_var(
+                "AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
+                "router.fixture.ts.net:20128,evil.example:20128",
+            );
             value["base_url"] = "http://evil.example:20128/v1".into();
-            assert!(parse(&value.to_string()).is_err(), "remote cleartext is refused even for an allowed host");
+            assert!(
+                parse(&value.to_string()).is_err(),
+                "remote cleartext is refused even for an allowed host"
+            );
             value["base_url"] = "https://evil.example:20128/v1".into();
-            assert!(parse(&value.to_string()).is_ok(), "an explicitly allowed HTTPS router is valid");
-            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:443");
+            assert!(
+                parse(&value.to_string()).is_ok(),
+                "an explicitly allowed HTTPS router is valid"
+            );
+            std::env::set_var(
+                "AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
+                "router.fixture.ts.net:443",
+            );
             value["base_url"] = "https://router.fixture.ts.net/v1".into();
-            assert!(parse(&value.to_string()).is_ok(), "Tailscale Serve HTTPS should use the exact default port");
+            assert!(
+                parse(&value.to_string()).is_ok(),
+                "Tailscale Serve HTTPS should use the exact default port"
+            );
             value["base_url"] = "http://router.fixture.ts.net:443/v1".into();
-            assert!(parse(&value.to_string()).is_err(), "port 443 does not make cleartext safe");
+            assert!(
+                parse(&value.to_string()).is_err(),
+                "port 443 does not make cleartext safe"
+            );
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
             .env("JARVIS_TAILNET_ROUTER_CHILD", "1")
-            .env("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:20128")
-            .output().unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr));
+            .env(
+                "AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
+                "router.fixture.ts.net:20128",
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
