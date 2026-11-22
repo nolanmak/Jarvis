@@ -22,12 +22,14 @@ const CONVERSATION: &str = "contract-conversation";
 const LEGACY_MESSAGE: &str = "compose:socialapi:dm:contract-conversation";
 const FIRST_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:first";
 const SECOND_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:second";
+const RACED_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:raced";
 const TRIAGE_MESSAGE: &str = "contract-inbound";
 const OTHER_MESSAGE: &str = "compose:socialapi:dm:other-conversation:card";
 const SCHEDULED_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:scheduled";
-const LEGACY: &str = "c0000000-0000-0000-0000-000000000001";
-const FIRST: &str = "b0000000-0000-0000-0000-000000000002";
-const SECOND: &str = "a0000000-0000-0000-0000-000000000003";
+const LEGACY: &str = "d0000000-0000-0000-0000-000000000001";
+const FIRST: &str = "c0000000-0000-0000-0000-000000000002";
+const SECOND: &str = "b0000000-0000-0000-0000-000000000003";
+const RACED: &str = "a0000000-0000-0000-0000-000000000004";
 
 fn seed_email(store: &Store, message_id: &str, thread_id: &str) -> Result<()> {
     store.with_conn(|conn| {
@@ -57,6 +59,7 @@ fn label(id: &str) -> &'static str {
         LEGACY => "legacy",
         FIRST => "first",
         SECOND => "second",
+        RACED => "raced",
         _ => "unknown",
     }
 }
@@ -88,6 +91,7 @@ fn main() -> Result<()> {
         (LEGACY_MESSAGE, CONVERSATION),
         (FIRST_MESSAGE, CONVERSATION),
         (SECOND_MESSAGE, CONVERSATION),
+        (RACED_MESSAGE, CONVERSATION),
         (OTHER_MESSAGE, "other-conversation"),
         (SCHEDULED_MESSAGE, CONVERSATION),
     ] {
@@ -100,6 +104,7 @@ fn main() -> Result<()> {
             (LEGACY, LEGACY_MESSAGE),
             (FIRST, FIRST_MESSAGE),
             (SECOND, SECOND_MESSAGE),
+            (RACED, RACED_MESSAGE),
         ] {
             conn.execute(
                 "UPDATE actions SET id = ?1, createdAt = 1000 WHERE messageId = ?2",
@@ -117,6 +122,13 @@ fn main() -> Result<()> {
     let order: Vec<&str> = prior.iter().map(|id| label(id)).collect();
 
     store.update_action_status(FIRST, ActionStatus::Sent, None, None)?;
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE actions SET scheduledAtMs = 2 WHERE id = ?1",
+            [RACED],
+        )?;
+        Ok(())
+    })?;
     let retired = socialapi_compose_identity::supersede_prior_compose_cards(&store, &prior);
     let retired: Vec<&str> = retired.iter().map(|id| label(id)).collect();
 
@@ -130,6 +142,7 @@ fn main() -> Result<()> {
         status(&action_id_for(&store, TRIAGE_MESSAGE)?)?,
         status(&action_id_for(&store, OTHER_MESSAGE)?)?,
         status(&action_id_for(&store, SCHEDULED_MESSAGE)?)?,
+        status(RACED)?,
     ];
 
     let remaining: Vec<&str> = socialapi_compose_identity::pending_compose_cards(&store, CONVERSATION)?
@@ -138,5 +151,6 @@ fn main() -> Result<()> {
         .collect();
 
     println!("{}", serde_json::json!([order, retired, statuses, remaining]));
+    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
