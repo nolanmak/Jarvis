@@ -150,6 +150,36 @@ impl WorkflowStore {
         Ok(eligible)
     }
 
+    /// #2495: the bound head's checks finished green before the poll expired.
+    /// Make the waiting poll due now. Only the eligibility time changes; an
+    /// active lease, an owner pause, another head or another wait is a no-op.
+    pub fn expedite_hosted_ci_pending(&mut self, workflow: &str, head: &str, now: i64) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, i64)> = tx.query_row(
+            "SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1", [workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let Some((raw, lease_until, generation)) = row else { return Ok(false) };
+        let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
+        if lease_until > now
+            || checkpoint.binding.head != head
+            || checkpoint.next.reason != HOSTED_CI_PENDING_REASON
+            || checkpoint.next.action != "retry_verification"
+            || checkpoint.next.eligible_at_ms <= now
+            || !retryable_stage(checkpoint.stage)
+            || owner_control::read(&tx, workflow)?.is_some_and(|control| control.paused)
+        {
+            return Ok(false);
+        }
+        checkpoint.next.eligible_at_ms = now;
+        let checkpoint = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1", params![workflow, checkpoint])?;
+        event(&tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+        event(&tx, workflow, generation, "hosted_ci_green_observed",
+            &serde_json::json!({"version":1,"head":head,"eligible_at_ms":now}).to_string(), now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn defer_verification_infrastructure(
         &mut self,
         lease: &Lease,
