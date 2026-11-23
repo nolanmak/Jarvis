@@ -13,8 +13,10 @@ _REQUIRED = {"guid", "text", "attributedBody", "is_from_me", "date",
              "associated_message_type", "associated_message_guid",
              "reply_to_guid", "thread_originator_guid", "date_edited", "date_retracted"}
 
-# One fixed diagnostic for every native schema or database failure: column
-# names, statements, paths and private bodies never leave the Mac.
+# One fixed diagnostic for every native schema, database or body decode
+# failure: column names, statements, paths and private bodies never leave the
+# Mac. Owner protocol failures keep their own wording; they describe our own
+# state, and the operator has to act on them.
 UNAVAILABLE = "native owner capture unavailable"
 
 
@@ -22,6 +24,14 @@ def target_guid(value):
     """Only native plain/part-prefixed UUID forms we can bind exactly."""
     match = _TARGET.fullmatch(value or "")
     return match.group(1).upper() if match else None
+
+
+def _decoded_body(blob, decode_body):
+    """Decoding reads private native bytes, so its failures stay redacted."""
+    try:
+        return decode_body(blob)
+    except Exception:
+        raise RuntimeError(UNAVAILABLE) from None
 
 
 def capture(db_path, binding, decode_body=None, limit=100):
@@ -69,7 +79,7 @@ def capture(db_path, binding, decode_body=None, limit=100):
             # Edited/retracted text must never become an executable replacement.
             if edited or retracted:
                 kind = "other"
-            body = text or (decode_body(blob) if blob and decode_body else "")
+            body = text or (_decoded_body(blob, decode_body) if blob and decode_body else "")
             if len(body) > 8000:
                 # Keep a receipt for the event, but never dispatch a truncated command.
                 kind, body = "other", "[Owner input exceeds 8000 characters]"
@@ -82,7 +92,9 @@ def capture(db_path, binding, decode_body=None, limit=100):
                            "kind": kind, "target_guid": target, "body": body})
         watermark = rows[-1][0] if len(rows) == limit else high
         return {"revision": binding["revision"], "watermark": watermark, "events": events}
-    except Exception:
+    except sqlite3.Error:
+        # Only native failures are redacted: an invalid cursor has to stay
+        # readable as the explicit reenrollment signal it is.
         raise RuntimeError(UNAVAILABLE) from None
     finally:
         con.close()

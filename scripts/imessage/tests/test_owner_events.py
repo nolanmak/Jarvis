@@ -94,6 +94,14 @@ class CaptureTest(unittest.TestCase):
             self.capture()
         self.assertEqual(str(raised.exception), owner_events.UNAVAILABLE)
 
+    def test_cursor_rollback_is_never_redacted_into_the_native_diagnostic(self):
+        self.add()
+        self.binding["cursor"] = 500
+        with self.assertRaises(RuntimeError) as raised:
+            self.capture()
+        self.assertNotEqual(str(raised.exception), owner_events.UNAVAILABLE)
+        self.assertIn("reenrollment", str(raised.exception))
+
     def assert_redacted(self, error):
         text = str(error)
         self.assertEqual(text, owner_events.UNAVAILABLE)
