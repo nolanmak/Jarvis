@@ -7187,9 +7187,16 @@ async fn resume_draft_pr(
     workflow.bind_builder(reasoner.as_ref())?;
     // #2488: read the checkpoint before this run moves it. A workflow that
     // stopped for the owner after its bounded rescopes does no more work.
+    // The stop is a bounded wait autoship revisits itself (#2371): daily, or
+    // as soon as main or the issue's request changes.
     let rescope_entry = workflow.current_checkpoint()?;
-    if acceptance::own_pr_rescope::exhausted(&rescope_entry) {
-        return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; waiting for the owner")));
+    let (_, rescope_main, _) = run("git", &["rev-parse", "origin/main"], &worktree).await?;
+    let rescope_inputs = acceptance::own_pr_rescope::Inputs {
+        request: crate::autoship_review::digest(format!("{}\n{}", issue.title, issue.body).as_bytes()),
+        main: rescope_main.trim().to_owned(),
+    };
+    if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
+        return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; re-evaluated daily or when main or the issue changes")));
     }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
     let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
@@ -7232,7 +7239,7 @@ async fn resume_draft_pr(
             .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
         let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
             pr, issue: issue.number, automatic: expected_head.is_none() };
-        match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &mut workflow).await? {
+        match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
             acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
                 info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
                 rescope_notes = notes;
@@ -16375,7 +16382,7 @@ CODEX-REVIEW: lgtm").0);
         let body = &src[start..end];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
         let entry = at("let rescope_entry = workflow.current_checkpoint()?");
-        let parked = at("own_pr_rescope::exhausted(&rescope_entry)");
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
         let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
         let bound = at("workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;");
         let rescoped = at("own_pr_rescope::run(");

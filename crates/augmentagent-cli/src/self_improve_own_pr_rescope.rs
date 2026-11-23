@@ -36,9 +36,12 @@ const MAX_TRIES: u32 = 3;
 const COMMENT_PURPOSE: &str = "own-pr-rescope-comment";
 /// Top-level marker of a controller-built rescope request.
 pub(crate) const ORIGIN: &str = "own_pr_rescope";
-/// The single owner-attention checkpoint.
+/// The single stop checkpoint. #2371: never an owner-only park. It is a
+/// bounded wait autoship revisits: daily, or when main or the issue changes.
 pub(crate) const EXHAUSTED_REASON: &str = "own_pr_rescope_exhausted";
-pub(crate) const EXHAUSTED_ACTION: &str = "await_owner_rescope_decision";
+pub(crate) const EXHAUSTED_ACTION: &str = "await_request_or_main_change";
+const REQUEST_EVIDENCE: &str = "request:";
+const MAIN_EVIDENCE: &str = "main:";
 const PATH_EVIDENCE: &str = "ci-scope-path:";
 const NOTES_BYTES: usize = 8000;
 const BLOCKER_BYTES: usize = 600;
@@ -73,6 +76,25 @@ pub(crate) fn pending(checkpoint: &Checkpoint) -> Option<Findings> {
     })
 }
 
+/// How long an unchanged stop waits before autoship re-evaluates it.
+pub(crate) const REVISIT_MS: i64 = 24 * 3_600_000;
+
+/// The inputs a stop waits on: the issue's request and canonical main.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Inputs {
+    pub request: String,
+    pub main: String,
+}
+
+/// Whether a stop is still waiting: unchanged main and request, and not yet
+/// due for its daily re-evaluation. Anything else re-runs the resume.
+pub(crate) fn parked(checkpoint: &Checkpoint, now: i64, inputs: &Inputs) -> bool {
+    exhausted(checkpoint)
+        && now < checkpoint.next.eligible_at_ms
+        && checkpoint.evidence.contains(&format!("{REQUEST_EVIDENCE}{}", inputs.request))
+        && checkpoint.evidence.contains(&format!("{MAIN_EVIDENCE}{}", inputs.main))
+}
+
 /// Whether the workflow already stopped for the owner.
 pub(crate) fn exhausted(checkpoint: &Checkpoint) -> bool {
     checkpoint.stage == Stage::Scope
@@ -104,9 +126,12 @@ fn bounded(text: &str, limit: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-fn key(prepared: &PreparedAcceptance) -> Result<String> {
+/// The rescope budget: per source issue and original base, and per owner
+/// request, so an issue edit earns a fresh budget. Main changes do not.
+fn key(prepared: &PreparedAcceptance, inputs: &Inputs) -> Result<String> {
     let source = prepared.proposal.contract.source()?;
-    Ok(adjudication_round_key(&source.key(), prepared.baseline.registration.baseline_head()))
+    let round = adjudication_round_key(&source.key(), prepared.baseline.registration.baseline_head());
+    Ok(amendment::digest(&serde_json::to_vec(&("own-pr-rescope-budget-v1", round, &inputs.request))?))
 }
 
 /// The paid and remote steps, behind a seam so the controller logic is
@@ -165,18 +190,19 @@ pub(crate) async fn run<R: Rescope>(
     control: &Path,
     findings: &Findings,
     notes: Option<String>,
+    inputs: &Inputs,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<Outcome> {
     let logger = workflow.audit_logger();
     let request = ci_scope::request(prepared, &findings.paths);
-    let key = key(prepared)?;
+    let key = key(prepared, inputs)?;
     if request.add.len() > ci_scope::MAX_SCOPE_FILES {
-        return needs_owner(rescope, workflow, findings, &key, format!(
+        return needs_owner(rescope, workflow, findings, &key, inputs, format!(
             "the fix needs {} files outside the contract ({}), more than a rescope may add ({})",
             request.add.len(), request.add.join(", "), ci_scope::MAX_SCOPE_FILES)).await;
     }
     if request.add.is_empty() && !request.protected.is_empty() {
-        return needs_owner(rescope, workflow, findings, &key, format!(
+        return needs_owner(rescope, workflow, findings, &key, inputs, format!(
             "the fix needs protected, controller or verifier files that autoship never adds to a contract: {}",
             request.protected.join(", "))).await;
     }
@@ -187,11 +213,11 @@ pub(crate) async fn run<R: Rescope>(
     if workflow.epoch_attempts(TRY_PURPOSE, &attempt)? == 0
         && !workflow.admit_epoch_attempt(PURPOSE, &key, MAX_RESCOPES)?
     {
-        return needs_owner(rescope, workflow, findings, &key, format!(
+        return needs_owner(rescope, workflow, findings, &key, inputs, format!(
             "all {MAX_RESCOPES} rescopes for this issue and original base are spent")).await;
     }
     if !workflow.admit_epoch_attempt(TRY_PURPOSE, &attempt, MAX_TRIES)? {
-        return needs_owner(rescope, workflow, findings, &key, format!(
+        return needs_owner(rescope, workflow, findings, &key, inputs, format!(
             "registering the rescoped contract failed {MAX_TRIES} times")).await;
     }
     let number = workflow.epoch_attempts(PURPOSE, &key)?;
@@ -217,7 +243,7 @@ pub(crate) async fn run<R: Rescope>(
                 if let Some(hold) = persist_enrolled_acceptance_error(workflow, prepared, &error).await? {
                     return Err(hold.into());
                 }
-                return needs_owner(rescope, workflow, findings, &key,
+                return needs_owner(rescope, workflow, findings, &key, inputs,
                     format!("the rescoped contract could not be registered: {error:#}")).await;
             }
         };
@@ -225,7 +251,7 @@ pub(crate) async fn run<R: Rescope>(
             || next.proposal.contract.revision <= prepared.proposal.contract.revision
             || !ci_scope::covers(&next, &request.add)
         {
-            return needs_owner(rescope, workflow, findings, &key,
+            return needs_owner(rescope, workflow, findings, &key, inputs,
                 "the registered revision does not add the requested files".into()).await;
         }
         *prepared = next;
@@ -247,6 +273,7 @@ async fn needs_owner<R: Rescope>(
     workflow: &mut workflow::WorkflowGuard,
     findings: &Findings,
     key: &str,
+    inputs: &Inputs,
     blocker: String,
 ) -> Result<Outcome> {
     let blocker = bounded(&blocker, BLOCKER_BYTES);
@@ -254,7 +281,10 @@ async fn needs_owner<R: Rescope>(
     let mut evidence = vec![format!("own-pr-rescope:{used}/{MAX_RESCOPES}"), format!("blocked-after:{}", findings.reason)];
     evidence.extend(findings.paths.iter().map(|path| format!("{PATH_EVIDENCE}{path}")));
     evidence.push(format!("blocker:{blocker}"));
-    workflow.checkpoint(Stage::Scope, EXHAUSTED_REASON, EXHAUSTED_ACTION, 0, &evidence).await?;
+    evidence.push(format!("{REQUEST_EVIDENCE}{}", inputs.request));
+    evidence.push(format!("{MAIN_EVIDENCE}{}", inputs.main));
+    workflow.checkpoint(Stage::Scope, EXHAUSTED_REASON, EXHAUSTED_ACTION,
+        chrono::Utc::now().timestamp_millis() + REVISIT_MS, &evidence).await?;
     let comment = amendment::digest(&serde_json::to_vec(&("own-pr-rescope-comment-v1", key, &findings.head))?);
     let mut commented = workflow.epoch_attempts(COMMENT_PURPOSE, &comment)? > 0;
     if !commented {
@@ -265,7 +295,7 @@ async fn needs_owner<R: Rescope>(
             "Autoship stopped working on this issue's open PR and needs a decision from you.\n\n\
              The PR still cannot ship. Blocking: {blocker}. \
              Rescopes used for this issue and original base: {used} of {MAX_RESCOPES}.\n\nLast checkpoint before the stop: `{}`.{files}\n\n\
-             The branch and its commits are kept. To continue, push a fix to the branch, widen the issue's scope, or close the PR.",
+             The branch and its commits are kept. Autoship looks again daily, or as soon as main or this issue changes; editing the issue starts a fresh rescope budget. You can also push a fix to the branch or close the PR.",
             findings.reason);
         if rescope.notify(workflow, &body).await? {
             workflow.admit_epoch_attempt(COMMENT_PURPOSE, &comment, 1)?;
@@ -339,6 +369,7 @@ mod tests {
         prepared: PreparedAcceptance,
         workflow: workflow::WorkflowGuard,
         rescope: Scripted,
+        inputs: Inputs,
     }
 
     /// PR #2378's shape: issue #2329's own PR, bound to a qualified revision 1
@@ -383,7 +414,7 @@ mod tests {
         }).await.unwrap().unwrap();
         workflow.bind_acceptance(&prepared, control.path()).unwrap();
         let rescope = Scripted { root: root.path().to_owned(), control: control.path().to_owned(), base, registered: Mutex::new(vec![]), comments: Mutex::new(vec![]), fail };
-        Lane { root, control, prepared, workflow, rescope }
+        Lane { root, control, prepared, workflow, rescope, inputs: Inputs { request: "request-a".into(), main: "main-a".into() } }
     }
 
     impl Lane {
@@ -396,15 +427,15 @@ mod tests {
         }
         async fn run(&mut self, findings: &Findings, notes: Option<&str>) -> Outcome {
             let control = self.control.path().to_owned();
-            run(&self.rescope, &mut self.prepared, &control, findings, notes.map(str::to_owned), &mut self.workflow).await.unwrap()
+            let inputs = self.inputs.clone();
+            run(&self.rescope, &mut self.prepared, &control, findings, notes.map(str::to_owned), &inputs, &mut self.workflow).await.unwrap()
         }
         fn snapshot(&self) -> crate::autoship_workflow::Snapshot {
             crate::autoship_workflow::WorkflowStore::open(&self.control.path().join("workflow.db")).unwrap()
                 .snapshot(self.workflow.id()).unwrap().unwrap()
         }
         fn rescopes(&self) -> u32 {
-            let key = adjudication_round_key(&AcceptanceSource::Issue(2329).key(), self.prepared.baseline.registration.baseline_head());
-            self.workflow.epoch_attempts(PURPOSE, &key).unwrap()
+            self.workflow.epoch_attempts(PURPOSE, &key(&self.prepared, &self.inputs).unwrap()).unwrap()
         }
     }
 
@@ -505,7 +536,12 @@ mod tests {
         assert_eq!((after.checkpoint.stage, after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()),
             (Stage::Scope, EXHAUSTED_REASON, EXHAUSTED_ACTION));
         assert!(after.checkpoint.evidence.contains(&format!("own-pr-rescope:{MAX_RESCOPES}/{MAX_RESCOPES}")), "{:?}", after.checkpoint.evidence);
+        assert_eq!(EXHAUSTED_ACTION, "await_request_or_main_change", "#2371: the stop must be an automatic wait, never owner-only");
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(after.checkpoint.next.eligible_at_ms > now && after.checkpoint.next.eligible_at_ms <= now + REVISIT_MS,
+            "the stop is not revisited within a day: {}", after.checkpoint.next.eligible_at_ms);
         assert!(exhausted(&after.checkpoint));
+        assert!(parked(&after.checkpoint, now, &lane.inputs), "an unchanged stop was revisited at once");
         assert!(pending(&after.checkpoint).is_none(), "the terminal checkpoint is picked up as another rescope");
         assert_eq!(lane.prepared.proposal.contract.revision, 3, "the refused third rescope changed the contract");
         assert_eq!(lane.rescope.registered.lock().unwrap().len(), 2, "the third rescope registered a revision");
@@ -575,6 +611,40 @@ mod tests {
         assert_eq!(lane.prepared.proposal.contract.revision, 1);
         assert!(exhausted(&lane.snapshot().checkpoint));
         assert_eq!(lane.rescope.comments.lock().unwrap().len(), 1);
+    }
+
+    /// #2371: the stop is a bounded wait autoship revisits itself: once a
+    /// day, or as soon as main or the issue's request changes. An issue edit
+    /// also earns a fresh rescope budget; the owner comment stays single.
+    #[tokio::test]
+    async fn the_stop_is_revisited_daily_or_when_main_or_the_issue_changes() {
+        if parent("the_stop_is_revisited_daily_or_when_main_or_the_issue_changes") { return; }
+        let mut lane = lane(None).await;
+        for file in [NOTIFY, DIGEST] {
+            let findings = lane.refused(&[file]).await;
+            assert!(matches!(lane.run(&findings, None).await, Outcome::Rescoped { .. }));
+        }
+        let findings = lane.refused(&[LEDGER]).await;
+        assert!(matches!(lane.run(&findings, None).await, Outcome::NeedsOwner(_)));
+        let stop = lane.snapshot().checkpoint;
+        let now = chrono::Utc::now().timestamp_millis();
+        let main_moved = Inputs { request: lane.inputs.request.clone(), main: "main-b".into() };
+        let issue_edited = Inputs { request: "request-b".into(), main: lane.inputs.main.clone() };
+        assert!(parked(&stop, now, &lane.inputs));
+        assert!(!parked(&stop, stop.next.eligible_at_ms, &lane.inputs), "the daily re-evaluation never comes");
+        assert!(!parked(&stop, now, &main_moved), "a main change does not re-evaluate the stop");
+        assert!(!parked(&stop, now, &issue_edited), "an issue edit does not re-evaluate the stop");
+
+        // Main moved: re-evaluated, but the spent budget still holds.
+        lane.inputs = main_moved;
+        let findings = lane.refused(&[LEDGER]).await;
+        assert!(matches!(lane.run(&findings, None).await, Outcome::NeedsOwner(_)));
+        assert_eq!(lane.rescope.registered.lock().unwrap().len(), 2);
+        // The issue was edited: a fresh budget, and the rescope runs.
+        lane.inputs = issue_edited;
+        let findings = lane.refused(&[LEDGER]).await;
+        assert_eq!(lane.run(&findings, None).await, Outcome::Rescoped { revision: 4, added: vec![LEDGER.into()], notes: None });
+        assert_eq!(lane.rescope.comments.lock().unwrap().len(), 1, "the owner was commented on again");
     }
 
     #[test]
