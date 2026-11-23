@@ -78,7 +78,7 @@ fn immutable(control: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     std::fs::File::open(control)?.sync_all()?;
     Ok(path)
 }
-fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
+pub(super) fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
     let Some(raw)=adjudication else {return Ok(());};
     let value:serde_json::Value=serde_json::from_str(raw)?;
     let mut bound=None::<std::collections::BTreeSet<String>>;
@@ -472,7 +472,10 @@ fn authority_base_request(old:&PreparedAcceptance,facts:AuthorityFacts<'_>)->Res
     );
     let prompt = format!("{prompt}\n{}", environments.prompt()?);
     let prompt = append_verifier_schema(&prompt,next_revision)?;
-    let prompt = if let Some(directive) = adjudication {
+    let prompt = if let Some(request) = adjudication.filter(|bound| super::ci_scope::is_request(bound)) {
+        // #2454: a controller-built CI scope request, not a review ruling.
+        format!("{prompt}\n{}{request}", super::ci_scope::AUTHORITY_TASK)
+    } else if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. For a contract_scope directive, additional files must be a subset of its explicit bound paths and necessary for that unchanged owner requirement. Never authorize Git/provider configuration, credentials, CI or daemon control state; if a requested path is protected, derive a compliant implementation alternative or report the immutable authorization conflict. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
         prompt
