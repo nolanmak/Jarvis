@@ -382,8 +382,28 @@ fn require_empty_native_history(control:&Path,archived_before_ms:Option<i64>)->R
     }
     Ok(())
 }
+#[derive(Clone,Copy,PartialEq,Eq,Debug)]
+pub(super) enum Corrective {Refuse,Regenerate}
+#[derive(Debug)]
+pub(super) struct ControllerWitnessChanged;
+impl std::fmt::Display for ControllerWitnessChanged {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("corrective controller witness question is unavailable or changed")}
+}
+impl std::error::Error for ControllerWitnessChanged {}
+pub(super) fn controller_witness_changed(error:&anyhow::Error)->bool {
+    error.chain().any(|cause|cause.downcast_ref::<ControllerWitnessChanged>().is_some())
+}
 pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<RetainedWitnessRunData>> {
+    retained_controller_slots_for(root,control,prepared,evidence,Corrective::Refuse)
+}
+/// `Corrective::Regenerate` is admitted only for an own open PR's published
+/// head (#2471, bounded per head). A run whose corrective question the current
+/// controller cannot reproduce is then set aside as stale history, so the
+/// witness is regenerated for the current contract. Every other refusal,
+/// and every reproducible run, applies unchanged.
+pub(super) fn retained_controller_slots_for(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,mode:Corrective)->Result<Vec<RetainedWitnessRunData>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"controller witness contract changed");
     prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
@@ -432,12 +452,16 @@ pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&Prepa
         let proof=retained_witness_proof(&original.provenance)?;
         let original_question=amendment::digest(qualification_prompt(&origin,prepared)?.as_bytes());
         if proof["scope_request_hash"].as_str()!=Some(original_question.as_str()) {continue;}
+        let mut stale=false;
         for reply in replies.iter().skip(1) {
             let proof=retained_witness_proof(&reply.provenance)?;
             let request=proof["scope_request_hash"].as_str().context("corrective controller question missing")?;
-            ensure!(request!=original_question && retained_question_matches(root,prepared,control,&origin,request,&custody)?,
-                "corrective controller witness question is unavailable or changed");
+            if request==original_question || !retained_question_matches(root,prepared,control,&origin,request,&custody)? {
+                if mode==Corrective::Regenerate {stale=true;break;}
+                return Err(ControllerWitnessChanged.into());
+            }
         }
+        if stale {continue;}
         let identity=retained_run_identity(evidence.workflow(),&origin,&contract,&replies)?;
         runs.push(RetainedWitnessRunData {identity,context:origin,replies});
     }
@@ -520,6 +544,9 @@ pub(super) fn require_retained_publication(root:&Path,control:&Path,repository:&
 /// custody; a later candidate HEAD need not be checked out a second time.
 pub(super) fn qualify_known_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
+    // #2471: the known reference names the run the current controller can no
+    // longer reproduce; an admitted regeneration replaces it.
+    if workflow.regenerating_witness() {return Ok(false);}
     if workflow.retained_qualification_reference(prepared).map_err(requalification_error)?.is_none() {return Ok(false);}
     prepared.baseline.registration.verify_integrity(root).map_err(requalification_error)?;
     (||->Result<()> {
@@ -545,8 +572,9 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
     let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     workflow.with_qualification_evidence(|database,evidence| {
         (||->Result<bool> {
-            if retained_controller_slots(root,&native_control,prepared,evidence)?.is_empty() {
-                ensure!(retained.is_none(),"known retained original witness data is unavailable; fresh witness generation is forbidden");
+            let mode=if workflow.regenerating_witness() {Corrective::Regenerate}else{Corrective::Refuse};
+            if retained_controller_slots_for(root,&native_control,prepared,evidence,mode)?.is_empty() {
+                ensure!(retained.is_none() || mode==Corrective::Regenerate,"known retained original witness data is unavailable; fresh witness generation is forbidden");
                 return Ok(false);
             }
             let references=verifier_execution::matching_original_results(prepared,evidence)?;
@@ -731,7 +759,9 @@ mod tests {
     use super::*;
     pub(super) fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {fixture_for_source(AcceptanceSource::PullRequest(840))}
     fn fixture_for_source(source:AcceptanceSource)->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {
-        let root=tempfile::tempdir_in("/tmp").unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        // Canonical, so the fixture also runs where /tmp is a symlink (macOS).
+        let tmp=std::fs::canonicalize("/tmp").unwrap();
+        let root=tempfile::tempdir_in(&tmp).unwrap();let control=tempfile::tempdir_in(&tmp).unwrap();
         std::fs::write(root.path().join("behavior.py"),"READY = False\n").unwrap();
         for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","baseline"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
             let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();assert!(out.status.success());
@@ -1286,6 +1316,21 @@ mod tests {
                 let last=validate(root.path(),&prepared.proposal,&prepared.baseline,&origin,&runs[0].replies[1].response).unwrap();
                 assert!(disposition(&last).is_err(),"corrective Unknown became positive qualification");
             }else {assert!(runs.is_err(),"{fault} was accepted as complete controller witness data");}
+            // #2471: only a corrective question the current controller cannot
+            // reproduce is a controller-side change; it names itself, and an
+            // own-PR regeneration sets that stale run aside. Every other
+            // fault still refuses, and a matching run is still applied.
+            let regenerated=retained_controller_slots_for(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id),Corrective::Regenerate);
+            match fault {
+                "none"=>assert_eq!(regenerated.unwrap().len(),1,"a reproducible run was set aside"),
+                "changed-corrective-question"=>{
+                    let Err(refused)=retained_controller_slots(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id)) else {panic!("changed corrective question was accepted")};
+                    assert!(controller_witness_changed(&refused),"controller-side change is not named: {refused:#}");
+                    assert!(format!("{refused:#}").contains("corrective controller witness question is unavailable or changed"));
+                    assert!(regenerated.unwrap().is_empty(),"own-PR regeneration still replays the stale corrective run");
+                }
+                _=>{let Err(error)=regenerated else {panic!("{fault} was accepted by regeneration")};assert!(!controller_witness_changed(&error),"{fault} became a regenerable controller change");}
+            }
             assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
             assert_eq!(before.unwrap().model_calls,2,"fixture's recorded admissions changed during inspection");
         }

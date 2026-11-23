@@ -268,6 +268,8 @@ pub(super) struct WorkflowGuard {
     audit: Arc<augmentagent_channel_core::AuditLogger>,
     acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
     acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
+    /// #2471: set only while an admitted own-PR witness regeneration runs.
+    witness_regeneration:Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -762,6 +764,7 @@ impl SweepGuard {
             family_budget_wait: Arc::new(AtomicBool::new(false)),
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
             family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
         };
@@ -1220,6 +1223,7 @@ impl WorkflowGuard {
             released: false,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
         };
         if let Some(context)=guard.execution_context(&guard.binding)? {
             let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
@@ -1418,6 +1422,7 @@ impl WorkflowGuard {
         let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),family_wait_released:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
@@ -2164,6 +2169,19 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .epoch_attempts(&self.lease,purpose,epoch,millis())
     }
+
+    /// #2471: admit one bounded regeneration of the acceptance witness for
+    /// the own open PR head this workflow published. Refused for issue-only
+    /// work, an unpublished head, or past the per-head bound.
+    pub(super) fn begin_witness_regeneration(&self)->Result<bool> {
+        self.check_resource_policy()?;
+        let admitted=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_own_pr_witness_regeneration(&self.lease,&self.repository,&self.binding.head,millis())?;
+        if admitted {self.witness_regeneration.store(true,Ordering::SeqCst);}
+        Ok(admitted)
+    }
+    pub(super) fn end_witness_regeneration(&self) {self.witness_regeneration.store(false,Ordering::SeqCst);}
+    pub(super) fn regenerating_witness(&self)->bool {self.witness_regeneration.load(Ordering::SeqCst)}
 
     pub(super) fn admit_epoch_attempt(
         &self,
