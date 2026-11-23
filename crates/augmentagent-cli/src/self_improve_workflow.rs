@@ -1805,6 +1805,24 @@ impl WorkflowGuard {
             .require_independent_native_session(provider,session)
     }
 
+    /// #2451: decide whether this binding may be reviewed again; consumes an
+    /// attempt only when admitted. Refusals are audited with their route.
+    pub(super) fn admit_review_binding(&self, key: &str, per_attempt_bound: u64, has_findings: bool,
+        repair_round_left: bool) -> Result<crate::autoship_workflow::review_binding_cap::Route> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_review_binding(&self.lease,key,per_attempt_bound,has_findings,repair_round_left,millis())
+    }
+    pub(super) fn charge_review_binding_calls(&self, key: &str, calls: u64) -> Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .charge_review_binding_calls(&self.lease,key,calls,millis())
+    }
+    /// Durable model admissions charged to this workflow so far.
+    pub(super) fn model_calls(&self) -> Result<u64> {
+        Ok(self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?.context("workflow missing")?.model_calls)
+    }
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?

@@ -7273,7 +7273,7 @@ async fn resume_draft_pr(
         Some(note) => format!("Resumed sitting draft PR #{pr}.\n{note}"),
         None => format!("Resumed sitting draft PR #{pr}."),
     };
-    loop {
+    'resume: loop {
         // The PR's actual contribution, freshly computed each round.
         let (_ok, diff, _) =
             run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
@@ -7529,6 +7529,47 @@ async fn resume_draft_pr(
         resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        // #2451: at most N review attempts per (head, contract). A rejection
+        // already recorded for this exact code is acted on, not re-reviewed:
+        // PR #2378 reviewed one head three times to reach the same verdict.
+        let review_key = crate::autoship_workflow::review_binding_cap::binding_key(
+            &workflow.binding().head, &workflow.binding().contract);
+        let recorded = previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
+            review, &workflow.binding().head, &workflow.binding().contract));
+        let review_route = workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
+            recorded.is_some(), rounds_done < revise_rounds())?;
+        let mut capped_findings = None;
+        {
+            use crate::autoship_workflow::review_binding_cap::{Route, EXHAUSTED_BACKOFF_MS};
+            match (review_route, recorded) {
+                (Route::Review, _) => {}
+                // Repair goes through the one shared revise round below; it
+                // adds no commit or prompt site of its own.
+                (Route::Repair, Some(findings)) => capped_findings = Some(findings),
+                (Route::Rescope, _) | (Route::Repair, None) => {
+                    workflow.transition(Stage::Scope, Route::Rescope.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + 300_000).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted; findings routed to rescoping")));
+                }
+                (Route::Backoff, _) => {
+                    workflow.transition(Stage::Scope, review_route.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + EXHAUSTED_BACKOFF_MS).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted without actionable findings; backing off")));
+                }
+            }
+        }
+        let (findings, kind, episode_session) = 'review: {
+        if let Some(findings) = capped_findings {
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, reason = review_route.reason(),
+                "resume: review attempts for this head exhausted; revising against recorded findings");
+            break 'review (findings, "recorded review findings", None);
+        }
+        let review_calls_before = workflow.model_calls()?;
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
@@ -7566,13 +7607,15 @@ async fn resume_draft_pr(
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
             0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+        // #2451: charge what this attempt actually spent to its binding.
+        workflow.charge_review_binding_calls(&review_key, workflow.model_calls()?.saturating_sub(review_calls_before))?;
         if let Some(structured) = &independent.structured {
             if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
                 &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                 verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await??;
-                continue;
+                continue 'resume;
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
@@ -7850,6 +7893,8 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
+        (findings, kind, episode_session)
+        };
         if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
         let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
