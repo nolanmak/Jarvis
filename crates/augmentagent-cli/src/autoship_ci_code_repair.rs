@@ -41,6 +41,20 @@ pub(crate) fn decide(admitted: u32, last: Option<Last>, now: i64, immediate: boo
             admitted: false, ..
         }) => Ladder::Repair(admitted + 1),
         _ if immediate && admitted == 0 => Ladder::Repair(1),
+        // #2430: after an admitted round, back off from that round, not from
+        // this (possibly much later) check. A late resume past the backoff
+        // runs the next round now instead of waiting the full backoff again.
+        Some(Last {
+            admitted: true,
+            eligible_at_ms: admitted_at,
+        }) => {
+            let due = admitted_at.saturating_add(backoff_ms(admitted.saturating_sub(1)));
+            if now >= due {
+                Ladder::Repair(admitted + 1)
+            } else {
+                Ladder::Wait(due)
+            }
+        }
         _ => Ladder::Wait(now.saturating_add(backoff_ms(admitted.saturating_sub(1)))),
     }
 }
@@ -148,7 +162,8 @@ mod tests {
     #[test]
     fn first_code_failure_repairs_now_then_rounds_back_off_and_never_park() {
         assert_eq!(decide(0, None, 0, true), Ladder::Repair(1));
-        // The same head is still red after a round: wait 30m, then repair.
+        // The same head is still red after a round: wait 30m from that
+        // round (#2430), then repair.
         let wait = decide(
             1,
             Some(Last {
@@ -158,7 +173,7 @@ mod tests {
             10,
             true,
         );
-        assert_eq!(wait, Ladder::Wait(10 + 30 * MIN));
+        assert_eq!(wait, Ladder::Wait(30 * MIN));
         assert_eq!(
             decide(
                 1,
@@ -212,6 +227,20 @@ mod tests {
         assert_eq!(decide(0, None, 5, false), Ladder::Wait(5 + 30 * MIN));
     }
 
+    /// #2430 production shape (#2169 / PR #2305): round 3 was admitted at
+    /// 2026-11-21 03:16Z, the next resume came 21 hours later, and the ladder
+    /// answered "wait 2 more hours" because the backoff ran from the check,
+    /// not from the round. Past the backoff, the next round runs now.
+    #[test]
+    fn backoff_runs_from_the_admitted_round_not_from_the_late_check() {
+        let round3 = 1_795_231_014_339;
+        let late = round3 + 21 * 60 * MIN;
+        let last = Some(Last { admitted: true, eligible_at_ms: round3 });
+        assert_eq!(decide(3, last, late, false), Ladder::Repair(4), "a late resume past the backoff repairs now");
+        // Inside the backoff the wait still ends at round3 + backoff, not later.
+        assert_eq!(decide(3, last, round3 + MIN, false), Ladder::Wait(round3 + 120 * MIN));
+    }
+
     #[test]
     fn code_repair_wait_is_a_main_reconciliation_not_an_infrastructure_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -245,7 +274,8 @@ mod tests {
         let wait = store
             .code_repair_round(&lease, &binding, "hosted_ci_policy_stale", true, 3)
             .unwrap();
-        assert_eq!(wait, Ladder::Wait(3 + 30 * MIN));
+        // #2430: the backoff runs from the admitted round (t=2), not the check.
+        assert_eq!(wait, Ladder::Wait(2 + 30 * MIN));
         let after = store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint;
         assert_eq!(
             (
@@ -258,7 +288,7 @@ mod tests {
                 Stage::Reconcile,
                 "review_main_changed",
                 "reconcile_main",
-                3 + 30 * MIN
+                2 + 30 * MIN
             )
         );
         // Replaying before the wait elapses keeps the same schedule.
@@ -275,7 +305,7 @@ mod tests {
                     &binding,
                     "hosted_ci_policy_stale",
                     true,
-                    3 + 30 * MIN
+                    2 + 30 * MIN
                 )
                 .unwrap(),
             Ladder::Repair(2)

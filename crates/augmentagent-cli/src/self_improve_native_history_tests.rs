@@ -79,3 +79,41 @@ fn unattributed_baseline_and_ambiguous_native_history_still_refuse() {
             &store.inspect_verifier_evidence("owner/repo#840")).is_err(), "{fault} authorized fresh witness dispatch");
     }
 }
+
+/// #2165 / #2169 / #2360 production loop (PRs #2307, #2305, #2372): an
+/// unrecoverable original (#2356) cuts its DB custody over, but its native
+/// witness files stay in the controller's acceptance directory. The fresh
+/// re-verification then had empty custody beside "unattributed" history and
+/// held `acceptance_verifier_evidence_unknown` within a second, every cycle.
+/// History written before the cutover is the archived original; anything
+/// written after it still refuses.
+#[test]
+fn archived_native_history_does_not_block_reverification_after_an_unrecoverable_cutover() {
+    let (root, control, prepared) = super::tests::fixture();
+    // Canonical: on macOS the fixture's /tmp is a symlink SQLite refuses.
+    let database = control.path().canonicalize().unwrap().join("workflow.sqlite3");
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+    let id = "owner/repo#2165";
+    store.register(id, "fixture", crate::autoship_workflow::Binding {head:prepared.baseline.registration.baseline_head().into(),
+        contract:prepared.baseline.registration.contract_hash().into(),evidence_hash:"e".repeat(64)}, 0).unwrap();
+    let at = |ms: i64| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64);
+    let cutover: i64 = 1_795_398_165_913;
+    let original = control.path().join("baseline-witness-original.json");
+    write_private(&original, &serde_json::to_vec(&proof(&prepared, Some("baseline_witness"))).unwrap());
+    std::fs::File::options().write(true).open(&original).unwrap().set_modified(at(cutover - 60_000)).unwrap();
+    assert!(retained_controller_slots(root.path(), control.path(), &prepared, &store.inspect_verifier_evidence(id)).is_err(),
+        "without a cutover, unattributed native history still refuses");
+    rusqlite::Connection::open(&database).unwrap().execute(
+        "INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,24,'original_evidence_unrecoverable',?2,?3)",
+        rusqlite::params![id, r#"{"cause":"retained_source_unavailable","lost":{"scope_keys":[],"bounded_attempts":[]}}"#, cutover],
+    ).unwrap();
+    let runs = retained_controller_slots(root.path(), control.path(), &prepared, &store.inspect_verifier_evidence(id))
+        .unwrap_or_else(|error| panic!("archived original history blocked fresh re-verification: {error:#}"));
+    assert!(runs.is_empty());
+    assert!(original.exists(), "archived history is retained, never deleted");
+    let late = control.path().join("baseline-witness-late.json");
+    write_private(&late, &serde_json::to_vec(&proof(&prepared, Some("baseline_witness"))).unwrap());
+    std::fs::File::options().write(true).open(&late).unwrap().set_modified(at(cutover + 60_000)).unwrap();
+    assert!(retained_controller_slots(root.path(), control.path(), &prepared, &store.inspect_verifier_evidence(id)).is_err(),
+        "native history written after the cutover without paid custody must still refuse");
+}

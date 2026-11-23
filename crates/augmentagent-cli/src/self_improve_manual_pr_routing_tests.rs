@@ -55,13 +55,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 let mut issues:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("issues.json")).unwrap()).unwrap();
                 issues["7"]["state"]="closed".into();issues["7"]["state_reason"]="completed".into();
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
-                let mut closed=candidates.clone();manual_routing::filter(&root,&mut closed).await;
+                let mut closed=candidates.clone();manual_routing::filter(&root,&mut closed,&rows).await;
                 assert_eq!(initial.pending_operations(&id).unwrap().len(),1,"already completed source still replayed its pending Push");
                 assert_eq!(initial.snapshot(&id).unwrap().unwrap().attempts,before.attempts,"closed source admitted another attempt");
                 issues["7"]["state"]="open".into();issues["7"]["state_reason"]=serde_json::Value::Null;
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
             }
-            manual_routing::filter(&root,&mut candidates).await;
+            manual_routing::filter(&root,&mut candidates,&rows).await;
             assert!(initial.pending_operations(&id).unwrap().is_empty(),"automatic inventory never recovered the failed bound Push");
             let out=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"])
                 .current_dir(&root).output().unwrap();assert!(out.status.success());
@@ -628,8 +628,26 @@ elif a[:2]==['pr','list']:
  if case.startswith('create-manual-'):print('[]');sys.exit(0)
  if case=='late-fresh-recheck':
   p=root/'fresh-observations';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));print(json.dumps([] if n<=2 else prs))
- else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
-elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
+ else:
+  # #2444: selection routes from this listing, so the PR-row faults that
+  # used to reach selection only through `pr view` are applied here too.
+  for row in prs:
+   if row['number']!=9: continue
+   if case=='race': row['labels']=[dict(name='autoship-manual')]
+   if case in ('malformed-pr','unknown-pr'): row.pop('labels')
+   if case=='saturated-pr-labels': row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
+   if case=='saturated-references': row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
+  print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
+elif a[:2]==['issue','list']:
+ # An unknown source is absent from the routing listing (the one asking for
+ # state); a malformed one is listed malformed there. Both fall back to the
+ # direct issue read. Other issue inventories keep their own observations.
+ routing='--json' in a and 'state' in a[a.index('--json')+1].split(',')
+ rows=[dict(i) for k,i in issues.items() if not (routing and case=='unknown-source' and k=='7')]
+ if routing and case=='malformed-source':
+  for row in rows:
+   if row['number']==7: row.pop('labels',None)
+ print(json.dumps(rows))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
  row=next(p for p in prs if p['number']==int(a[2]))

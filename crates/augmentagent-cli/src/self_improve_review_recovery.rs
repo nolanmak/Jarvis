@@ -36,7 +36,10 @@ pub(super) fn observe(
     // publication record (PR #2372: recorded 424b…, pushed dd17…). That exact
     // head is still the protected workflow binding, which is the custody the
     // reconciler below requires anyway. Any other head stays unproven.
-    if record.head != head && !controller_bound_head(path, repository, pr, head)? {
+    // #2448: a workflow that carries a retained local candidate (a scope-stage
+    // amendment retry kept in the PR checkout) is bound past the PR head. The
+    // head its own latest confirmed Push published is equally its custody.
+    if record.head != head && !controller_bound_head(path, repository, pr, branch, head, now)? {
         info!(
             pr,
             outcome = "dependency_wait",
@@ -65,14 +68,25 @@ pub(super) fn observe(
     store.reconcile_review_recovery(repository, pr, branch, head, readiness(), now)
 }
 
-fn controller_bound_head(path: &Path, repository: &str, pr: u64, head: &str) -> Result<bool> {
+fn controller_bound_head(path: &Path, repository: &str, pr: u64, branch: &str, head: &str, now: i64) -> Result<bool> {
     let store = WorkflowStore::open(path)?;
     let Some(id) = store.resolve_pr(repository, pr)? else {
         return Ok(false);
     };
+    let Some(snapshot) = store.snapshot(&id)? else {
+        return Ok(false);
+    };
+    if head.is_empty() {
+        return Ok(false);
+    }
+    if snapshot.checkpoint.binding.head == head {
+        return Ok(true);
+    }
+    // The same proof the resume executor uses to keep the retained candidate
+    // instead of rebuilding from the PR head.
     Ok(store
-        .snapshot(&id)?
-        .is_some_and(|snapshot| !head.is_empty() && snapshot.checkpoint.binding.head == head))
+        .retained_candidate_head(repository, pr, branch, head, &snapshot.checkpoint.binding.head, now)?
+        .is_some())
 }
 
 pub(super) fn filter(

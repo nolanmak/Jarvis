@@ -95,6 +95,11 @@ mod review_recovery;
 mod manual_pr_routing_tests;
 #[path = "self_improve_manual_routing.rs"]
 mod manual_routing;
+#[path = "self_improve_gh_budget.rs"]
+mod gh_budget;
+#[cfg(test)]
+#[path = "self_improve_gh_budget_tests.rs"]
+mod gh_budget_tests;
 #[path = "self_improve_integration_merge.rs"]
 mod integration_merge;
 #[path = "self_improve_integration.rs"]
@@ -659,12 +664,15 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             return Ok((false, String::new(), error));
         }
     }
+    // #2444: a GitHub write clears this tick's shared reads, before and after.
+    gh_budget::observed(cmd, args);
     let mut command = Command::new(cmd);
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     let child = command.spawn().with_context(|| format!("spawn {cmd}"))?;
     let _group = CommandGroup(child.id().context("command has no process id")?);
     let out = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), child.wait_with_output())
         .await.context("metadata/publication command timed out; reconcile durable intent before retry")??;
+    gh_budget::observed(cmd, args);
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1120,7 +1128,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) && !due_retries.contains(&iss.number) {
+        // #2432 — that caps fresh starts only: a workflow already in flight
+        // (build..publish, open PR, preserved head) resumes on its own backoff.
+        let retry_due=qualification_retries.contains(&iss.number) || due_retries.contains(&iss.number);
+        if owner_controls.daily_ledger_holds(&ledger, today, &repository, iss.number, retry_due) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -1226,6 +1237,15 @@ async fn has_foreign_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
         None=>None,
     };
     Ok(!linked_claims::foreign_claims(claims,own.as_ref()).is_empty())
+}
+
+/// #2408: the PR lane target for an issue whose own workflow is continuing on
+/// a PR it owns. None keeps the fresh issue pipeline.
+async fn own_pr_route(repo_root: &Path, issue: u64) -> Result<Option<(u64, String)>> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else {return Ok(None)};
+    let repository=workflow::canonical_repository(repo_root).await?;
+    let own=store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?;
+    Ok(linked_claims::own_pr_continuation(own.as_ref()))
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -1760,7 +1780,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     // locally only after the complete pool is known, then apply fair windows.
     let out = if let Some(target) = selected {
         let read = run(&gh, &["pr","view",&target.pr.to_string(),"--repo",&target.repository,"--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body"],repo_root).await;
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body"],repo_root).await;
         let row = match read {
             Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
             _ => None,
@@ -1771,7 +1791,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         serde_json::json!([row]).to_string()
     } else { match complete_repository_inventory(repo_root, "pr", None,
-        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
+        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body").await {
         Ok(out) => out,
         Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
     }};
@@ -1785,6 +1805,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     };
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
+    // #2444: one open-issue listing serves routing and source state for every
+    // examined PR. Unavailable, the sweep reads each source as before.
+    let open_issues = if selected.is_none() {gh_budget::OpenIssues::read(repo_root, &repository).await} else {None};
     let adopted = if let Some(target)=selected {
         adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()],false).await
     } else { adopted_execution::sweep(repo_root,dry_run).await };
@@ -1814,10 +1837,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         // Routing observations cost network reads even when the PR is excluded.
         examined += 1;
-        if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+        if selected.is_none() && !manual_routing::allowed_listed(repo_root,&repository,Some(row),pr,Some(issue),open_issues.as_ref()).await {
             continue;
         }
-        if source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
+        // A source this tick listed as open needs no further read; any other
+        // source is reconciled (and possibly retired) exactly as before.
+        if !open_issues.as_ref().is_some_and(|issues| issues.is_open(issue))
+            && source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
             != source_reconcile::SourceAction::Continue {
             continue;
         }
@@ -1835,7 +1861,16 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // box's own record is the half of provenance GitHub cannot produce, and
         // the half that binds to a specific pull request rather than a shape.
         let record = opened_prs::get(issue);
-        let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
+        // #2458: after GitHub merged main into the approved head, the
+        // approval recorded at that head reaches the merge commit through
+        // the durable update. Resolved before any gate reads approval.
+        let carry = match (record.as_ref(), head_sha.as_deref()) {
+            (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
+                finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
+            _ => None,
+        };
+        let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
+        let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
         if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
                 if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
@@ -1844,6 +1879,21 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
             }
         }
+        // #2444: settle every gate that needs no remote evidence first. The
+        // hosted CI reader alone costs about 30 REST calls per PR, and most
+        // examined PRs are not yet approved.
+        let ours = head_is_ours(row, owner.as_deref());
+        let loop_authored = loop_authored(body, issue, pr, approval_head.as_deref(), record.as_ref())
+            || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue));
+        let mergeable = match row.get("mergeable").and_then(serde_json::Value::as_str) {
+            Some("MERGEABLE") => Some(true),
+            Some("CONFLICTING") => Some(false),
+            _ => None,
+        };
+        if let Some(why) = sweep_local_skip(pr, ours, loop_authored, mergeable, approval.reviewed) {
+            info!("merge sweep skipped {why}");
+            continue;
+        }
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -1851,19 +1901,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         let candidate = SweepCandidate {
             pr,
             issue,
-            ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(
-                body,
-                issue,
-                pr,
-                head_sha.as_deref(),
-                record.as_ref(),
-            ) || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue)),
-            mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
-                Some("MERGEABLE") => Some(true),
-                Some("CONFLICTING") => Some(false),
-                _ => None,
-            },
+            ours,
+            loop_authored,
+            mergeable,
             checks_green: checks_green(repo_root, pr).await,
             review_approved: approval.reviewed,
             policy: MergePolicy {
@@ -1920,11 +1960,39 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
                 let head = candidate_head.clone().unwrap_or_default();
                 let recorded = match serde_json::to_string(&record) { Ok(value) => value, Err(_) => continue };
-                let sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, &head, &recorded).await {
+                // #2458: an uncarried update is authorized by the head it merged into.
+                let pending_carry = carry.as_ref().filter(|c| c.pending);
+                let authorized = pending_carry.map_or(head.as_str(), |c| c.reviewed_head.as_str());
+                let mut sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, authorized, &recorded).await {
                     Ok(Some(lease)) => lease,
                     Ok(None) => { info!(pr, "merge sweep: workflow busy or approval evidence changed"); continue; }
                     Err(error) => { warn!(pr, "merge sweep lease unavailable: {error:#}"); continue; }
                 };
+                if pending_carry.is_some() {
+                    if let Err(error) = sweep_lease.carry_main_update(repo_root, &head).await {
+                        warn!(pr, "merge sweep cannot carry the approval to the main update: {error:#}"); continue;
+                    }
+                }
+                // #2458: green but BEHIND main under strict protection. Merge
+                // main in with a merge commit; checks rerun on it and a later
+                // tick merges it once green. No worker slot, no model call.
+                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                    let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
+                        Ok(main) => main,
+                        Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
+                    };
+                    if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                        continue;
+                    }
+                    if let Err(error) = sweep_lease.request_main_update(&main) {
+                        warn!(pr, "merge sweep main update unavailable: {error:#}"); continue;
+                    }
+                    match finalize::update_branch(repo_root, &repository, pr, &head).await {
+                        Ok(()) => info!(pr, issue, "merge sweep: merged main into the approved head; merging once checks pass on it"),
+                        Err(error) => warn!(pr, "merge sweep: update-branch refused: {error:#}"),
+                    }
+                    continue;
+                }
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
                 }
@@ -2050,6 +2118,8 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>, before_
 /// determined, which the sweep treats as "do not merge".
 #[path = "self_improve_optional_checks.rs"]
 mod optional_checks;
+#[path = "self_improve_finalize.rs"]
+mod finalize;
 
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
@@ -2576,12 +2646,16 @@ enum SweepVerdict {
 
 /// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
 /// so the whole decision is evidence already on the PR.
-fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
-    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
-    if c.ours != Some(true) {
+/// #2444 — the sweep's gates that need no remote evidence, in the order the
+/// verdict applies them. The sweep checks these before reading CI, the diff
+/// or the issue, so an unapproved PR costs no GitHub reads.
+fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable: Option<bool>,
+    review_approved: bool) -> Option<String> {
+    let skip = |why: &str| Some(format!("PR #{pr}: {why}"));
+    if ours != Some(true) {
         return skip("not ours — the loop only finishes work it opened (#1006)");
     }
-    if !c.loop_authored {
+    if !loop_authored {
         // Same repository is not the same as loop-authored. A human can open
         // `agent-fix/issue-N` here by hand; the sweep merges with nobody
         // watching, so it needs the loop's own signature on the body.
@@ -2589,16 +2663,24 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     }
     // GitHub UNKNOWN is a pending recompute, not proof of conflict.
     // Both states withhold merging; the integration scheduler owns recovery.
-    match c.mergeable {
+    match mergeable {
         None => return skip("mergeability unknown; retry remote metadata computation"),
         Some(false) => return skip("confirmed conflict with main; exact-head integration required"),
         Some(true) => {},
     }
+    if !review_approved {
+        return skip("no approving independent review recorded by the loop for this head");
+    }
+    None
+}
+
+fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
+    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved) {
+        return SweepVerdict::Skip(why);
+    }
     if c.checks_green != Some(true) {
         return skip("checks are not green, or their state is unknown");
-    }
-    if !c.review_approved {
-        return skip("no approving independent review recorded by the loop for this head");
     }
     // Unknown must DENY, and it must do so where nothing can release it.
     // Codex: routing an unreadable diff through the receipt gate as a gated
@@ -4092,7 +4174,7 @@ async fn find_resumable_draft(
     let mut allowed = trusted_authors(repo_root).await;
     if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
     let mut adopted = adoption::authorized(&prs, &repository, &allowed);
-    manual_routing::filter(repo_root, &mut adopted).await;
+    manual_routing::filter(repo_root, &mut adopted, &prs).await;
     if !dry_run {
         if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
             warn!("cannot persist adopted PR ownership: {error:#}");
@@ -4124,6 +4206,8 @@ async fn find_resumable_draft(
     retries.extend(integration_retries);
     retries.extend(adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
+    // #2432 — in-flight PRs resume on their own backoff, not the daily ledger.
+    retries.extend(adoption::in_flight_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     let select = |cursor| {
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
@@ -5079,6 +5163,16 @@ impl CiGateResult {
                 return Err(CiInfrastructureDeferred{workflow:workflow.id().to_owned(),eligible_at_ms}.into());
             }
         }
+        // #2408: a candidate outside its PR's lineage is provenance, never
+        // infrastructure. Reroute to the PR lane, which checks out the PR
+        // head, instead of retrying a check that can never pass.
+        if let Some(diverged)=error.downcast_ref::<adoption::CandidateProvenanceDiverged>().cloned() {
+            workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+                "kind":"candidate_provenance_diverged","adopted_head":diverged.adopted_head,
+                "candidate_head":diverged.candidate_head,"action":"resume_preserved_pr","shipping_authority":false}))?;
+            workflow.transition(crate::autoship_workflow::Stage::Reconcile,"candidate_provenance_diverged","resume_preserved_pr",0).await?;
+            return Err(error.context("candidate provenance diverged; resuming on the PR lane"));
+        }
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
             return Err(error);
@@ -5723,13 +5817,15 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
             }
         }
     };
-    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
-        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
-    }
+    // #2432 — an open fix PR is work in flight: the daily ledger caps only a
+    // fresh start, so check for the PR first.
     match has_open_agent_pr(repo_root, number).await {
         Ok(true) => return RedMainPlan::Resume(number),
         Ok(false) => (),
         Err(_) => return RedMainPlan::Hold(linked_claims::Hold::Unknown.to_string()),
+    }
+    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
+        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
     }
     // Build the Issue the same way pick_issue does, trust gate included —
     // the daemon files with the owner's gh login, but nothing here assumes it.
@@ -7090,7 +7186,8 @@ async fn resume_draft_pr(
     let outcome = async {
     workflow.bind_builder(reasoner.as_ref())?;
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
-    let mut ci_findings = match ci_repair::prepare(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await? {
+    let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
+    let mut ci_findings = match ci_preparation {
         ci_repair::Preparation::Continue => None,
         ci_repair::Preparation::Repair(input) => Some(input),
         ci_repair::Preparation::Deferred(report) => return Ok(report),
@@ -7118,6 +7215,23 @@ async fn resume_draft_pr(
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
+    // #2454: a required check whose failure implicates files outside the
+    // contract asks the amendment authority for exactly those files before any
+    // repair round. A refusal rescopes; repair never retries the old scope.
+    if let Some(scope) = ci_scope {
+        let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+            title: &issue.title, worktree: &worktree, control: &acceptance_control };
+        match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, &scope.tests, &mut workflow).await? {
+            acceptance::ci_scope::Widen::InScope => {}
+            acceptance::ci_scope::Widen::Amended(paths) => {
+                info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
+            }
+            acceptance::ci_scope::Widen::Rescoped(message) => {
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+            }
+        }
+    }
 
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
@@ -7216,7 +7330,7 @@ async fn resume_draft_pr(
         Some(note) => format!("Resumed sitting draft PR #{pr}.\n{note}"),
         None => format!("Resumed sitting draft PR #{pr}."),
     };
-    loop {
+    'resume: loop {
         // The PR's actual contribution, freshly computed each round.
         let (_ok, diff, _) =
             run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
@@ -7472,6 +7586,47 @@ async fn resume_draft_pr(
         resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        // #2451: at most N review attempts per (head, contract). A rejection
+        // already recorded for this exact code is acted on, not re-reviewed:
+        // PR #2378 reviewed one head three times to reach the same verdict.
+        let review_key = crate::autoship_workflow::review_binding_cap::binding_key(
+            &workflow.binding().head, &workflow.binding().contract);
+        let recorded = previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
+            review, &workflow.binding().head, &workflow.binding().contract));
+        let review_route = workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
+            recorded.is_some(), rounds_done < revise_rounds())?;
+        let mut capped_findings = None;
+        {
+            use crate::autoship_workflow::review_binding_cap::{Route, EXHAUSTED_BACKOFF_MS};
+            match (review_route, recorded) {
+                (Route::Review, _) => {}
+                // Repair goes through the one shared revise round below; it
+                // adds no commit or prompt site of its own.
+                (Route::Repair, Some(findings)) => capped_findings = Some(findings),
+                (Route::Rescope, _) | (Route::Repair, None) => {
+                    workflow.transition(Stage::Scope, Route::Rescope.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + 300_000).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted; findings routed to rescoping")));
+                }
+                (Route::Backoff, _) => {
+                    workflow.transition(Stage::Scope, review_route.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + EXHAUSTED_BACKOFF_MS).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted without actionable findings; backing off")));
+                }
+            }
+        }
+        let (findings, kind, episode_session) = 'review: {
+        if let Some(findings) = capped_findings {
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, reason = review_route.reason(),
+                "resume: review attempts for this head exhausted; revising against recorded findings");
+            break 'review (findings, "recorded review findings", None);
+        }
+        let review_calls_before = workflow.model_calls()?;
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
@@ -7509,13 +7664,15 @@ async fn resume_draft_pr(
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
             0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+        // #2451: charge what this attempt actually spent to its binding.
+        workflow.charge_review_binding_calls(&review_key, workflow.model_calls()?.saturating_sub(review_calls_before))?;
         if let Some(structured) = &independent.structured {
             if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
                 &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                 verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await??;
-                continue;
+                continue 'resume;
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
@@ -7793,6 +7950,8 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
+        (findings, kind, episode_session)
+        };
         if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
         let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
@@ -8441,6 +8600,16 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         )));
     }
 
+    // #2408: an issue whose own workflow owns an open PR and is continuing
+    // runs on the PR lane. The issue checkout can be stale, and rebuilding
+    // there abandoned verified work and produced a candidate the PR could
+    // never accept.
+    if let Some((pr,pr_branch))=own_pr_route(repo_root,issue.number).await? {
+        info!(issue=issue.number,pr,"selected issue owns a continuing PR; resuming on the PR lane");
+        let reasoner=workflow_builder(repo_root,crate::autoship_workflow::submission::Target::Pr(pr)).await?;
+        return resume_draft_pr(repo_root,&reasoner,pr,issue.number,&pr_branch,dry_run,None).await
+            .map(|mut report|{report.resumed=true;report});
+    }
     match publication::claimed_after_reconcile(repo_root,issue.number,dry_run).await {
         Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
@@ -8582,8 +8751,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     workflow_guard.require_fresh_issue(repo_root).await?;
     if saved_scope.is_none() {if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
-                return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
+            if let Some(base)=acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
+                workflow_guard.validate_before_side_effect()?;
+                return Ok(match close_satisfied_issue(repo_root,issue.number,&base,automatic_routing).await {
+                    Ok(())=>RunReport::triage(format!("issue #{}: current main `{}` satisfies the request (registered observations and independent completeness review); closed as completed",issue.number,truncate(&base,12))),
+                    Err(error)=>{
+                        warn!(issue=issue.number,"satisfied issue left open: {error:#}");
+                        RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; closing held; automatically re-evaluate on request/main change",issue.number))
+                    }
+                });
             }
             // A model's relevance claim or an inadequate green test is never
             // enough to retire useful work. Generate a fresh falsifier below.
@@ -10417,14 +10593,23 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
         limit=(limit*2).min(max);
     }
 }
+/// #2444 — every PR reader shares one listing per tick, so it asks for the
+/// union of the fields any reader needs (including routing labels and closing
+/// references, which used to cost a `gh pr view` per open PR).
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
-    complete_labelled_inventory(|limit| async move {
+    let fields=if kind=="pr" {
+        debug_assert!(fields.split(',').all(|f|PR_INVENTORY_FIELDS.split(',').any(|u|u==f)),"PR inventory field {fields} missing from the shared listing");
+        PR_INVENTORY_FIELDS
+    } else {fields};
+    let key=format!("inventory\0{}\0{kind}\0{}\0{fields}",repo_root.display(),repository.unwrap_or(""));
+    gh_budget::tick_read(key,||complete_labelled_inventory(|limit| async move {
         let args=repository_inventory_args(kind,repository,fields,limit);
         let (ok,raw,error)=run(&gh_bin(),&args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
         anyhow::ensure!(ok,"gh repository inventory failed: {}",truncate(&error,300));
         Ok(raw)
-    }).await
+    })).await
 }
 fn filter_inventory_label(raw:&str,label:&str)->Result<Vec<serde_json::Value>> {
     let rows:Vec<serde_json::Value>=serde_json::from_str(raw)?;
@@ -10587,6 +10772,22 @@ async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()>
     if !ok {
         bail!("gh issue comment failed: {e}");
     }
+    Ok(())
+}
+
+/// #2462 (#1644): current main was independently proven to satisfy the issue
+/// (registered verifiers already green on `base`, plus a separate completeness
+/// review). Close it as completed instead of re-proving it on every main
+/// change. Terminal routing and owner controls are re-observed right before
+/// the write; the workflow retires through the closed-target path.
+async fn close_satisfied_issue(repo_root:&Path,issue:u64,base:&str,automatic:bool)->Result<()> {
+    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,None,automatic).await,
+        "terminal controls or routing held before closing a satisfied issue");
+    let comment=format!("Autoship: current main already satisfies this issue. Independently registered \
+        verifiers pass on main `{base}`, and a separate completeness review covered every criterion. \
+        Closing as completed; reopen it to request more work.");
+    let (ok,_,error)=run(&gh_bin(),&["issue","close",&issue.to_string(),"--reason","completed","--comment",&comment],repo_root).await?;
+    anyhow::ensure!(ok,"closing satisfied issue #{issue} failed: {}",truncate(&error,300));
     Ok(())
 }
 
@@ -12431,6 +12632,7 @@ impl AutoPrLoop {
         let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
         tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
+        let canary_root = root.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
         // The protected daily claim prevents restart from multiplying probes.
@@ -12443,6 +12645,7 @@ impl AutoPrLoop {
                     _ = timer.tick() => {}
                 }
                 if dry_run { continue; }
+                if gh_budget::low(&canary_root, "review canary").await { continue; }
                 tokio::select! {
                     _ = canary_stop.cancelled() => return Ok(()),
                     result = review_canary_if_due() => {
@@ -12455,10 +12658,11 @@ impl AutoPrLoop {
         };
         let shipping = self.run_with(shutdown, move || {
             let root = root.clone();
-            async move { run_once(&root, dry_run).await }
+            // #2444: each tick shares its GitHub reads.
+            async move { gh_budget::tick_scope(run_once(&root, dry_run)).await }
         }, move || {
             let root = sweep_root.clone();
-            async move {
+            gh_budget::tick_scope(async move {
                 // Unknown remote mutations must reconcile even when controller
                 // preparation is temporarily unavailable. This path reads Git
                 // identity and remote evidence without editing the owner tree.
@@ -12472,6 +12676,9 @@ impl AutoPrLoop {
                 };
                 let root = controller.root.as_path();
                 let merged=merge_sweep(root,dry_run).await;
+                // #2444: housekeeping polls stand down while the shared REST
+                // budget is low; merges and their reconciliation continue.
+                if gh_budget::low(root, "legacy readmission and closed-target sweeps").await {return merged;}
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 // Waiting workflows never re-check their target, so one whose
                 // issue was fixed by hand stays queued forever (#2040, #2081).
@@ -12479,7 +12686,7 @@ impl AutoPrLoop {
                     if let Err(error)=closed_targets::sweep(root,&workflow::path()).await {warn!("closed-target sweep deferred: {error:#}");}
                 }
                 merged
-            }
+            })
         });
         tokio::pin!(shipping);
         tokio::pin!(canary);
@@ -19124,6 +19331,71 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert!(log.contains("--add-label"), "{log}");
             let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
             assert!(comments.contains(&format!("reason=stuck:gate-red:{fp}")), "{comments}");
+        });
+    }
+
+    /// #1644: independent proof that current main already satisfies an issue
+    /// parked it on `await_request_or_main_change`. Main changes many times a
+    /// day, so the same paid scope, verifier and completeness review re-ran
+    /// and re-proved "already done" forever (the owner paused it by hand).
+    /// The proof now closes the issue as completed, once, through the same
+    /// terminal routing and owner controls as every other terminal write.
+    #[test]
+    fn issue_proven_satisfied_on_main_closes_as_completed() {
+        const CHILD: &str = "JARVIS_1644_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("fake-gh.py");
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['JARVIS_1644_ROOT'])
+args = sys.argv[1:]
+with (root/'gh-calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\n')
+labels = json.loads((root/'labels.json').read_text())
+if args[:2]==['repo','view']:
+    print('fixture-owner/repo')
+elif args[:2]==['api','repos/fixture-owner/repo/issues/1644']:
+    print(json.dumps({'number':1644,'state':'open','labels':[{'name':n} for n in labels]}))
+elif args[:2]==['issue','close']:
+    print('closed')
+else:
+    sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n'); sys.exit(1)
+"#).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::issue_proven_satisfied_on_main_closes_as_completed", "--nocapture"])
+                .env(CHILD, "1")
+                .env("JARVIS_1644_ROOT", root.path())
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.path().join("workflow.db"))
+                .env("HOME", root.path().join("home"))
+                .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.path().join("state"))
+                .env("GH_BIN", gh)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("JARVIS_1644_ROOT").unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let calls = || std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap_or_default()
+                .lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+            let base = "4fbb04bf69c9a69f577136ab5009b78aef94a55c";
+            // A manual issue is never closed by automatic routing.
+            std::fs::write(root.join("labels.json"), format!("[\"{MANUAL_ENGINEERING_LABEL}\"]")).unwrap();
+            assert!(close_satisfied_issue(&root, 1644, base, true).await.is_err());
+            assert!(!calls().iter().any(|call| call.starts_with(&["issue".into(), "close".into()])));
+            std::fs::write(root.join("labels.json"), "[]").unwrap();
+            close_satisfied_issue(&root, 1644, base, true).await.unwrap();
+            let closes = calls().into_iter().filter(|call| call.starts_with(&["issue".into(), "close".into()])).collect::<Vec<_>>();
+            assert_eq!(closes.len(), 1, "{closes:?}");
+            let close = &closes[0];
+            assert_eq!(close[2], "1644");
+            assert_eq!(close[close.iter().position(|a| a == "--reason").unwrap() + 1], "completed");
+            let comment = &close[close.iter().position(|a| a == "--comment").unwrap() + 1];
+            assert!(comment.contains(base) && comment.contains("already satisfies"), "{comment}");
         });
     }
 

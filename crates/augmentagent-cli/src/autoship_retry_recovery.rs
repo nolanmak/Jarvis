@@ -14,9 +14,14 @@ pub(crate) fn class(cp: &Checkpoint) -> Option<&'static str> {
         ("scope_deferred", "retry_scope") => Some("scope"),
         ("resource_capacity", "await_capacity") => Some("capacity"),
         ("verification_infrastructure_retry", "retry_verification") => Some("verification"),
+        // #2458: a short poll of still-running checks. Due work, not a turn
+        // of the bounded retry cycle.
+        (HOSTED_CI_PENDING_REASON, "retry_verification") => Some("ci_pending"),
         ("publishing_revision", "push") => Some("publish"),
         ("acceptance_registration_retry", "rescope_executable_acceptance") => Some("registration"),
         ("retry_cycle_exhausted", "rescope_executable_acceptance") => Some("recovery"),
+        // #2408: a candidate outside its PR's lineage resumes on the PR lane.
+        ("candidate_provenance_diverged", "resume_preserved_pr") => Some("provenance"),
         _ => None,
     }
 }
@@ -43,7 +48,7 @@ pub(super) fn finish(tx: &Transaction<'_>, lease: &Lease, now: i64) -> Result<()
         |r| r.get(0),
     )?;
     let mut cp: Checkpoint = serde_json::from_str(&raw)?;
-    let Some(class) = class(&cp).filter(|class| *class != "recovery") else {
+    let Some(class) = class(&cp).filter(|class| !matches!(*class, "recovery" | "ci_pending")) else {
         return Ok(());
     };
     if owner_control::read(tx, &lease.workflow)?.is_some_and(|c| c.paused)

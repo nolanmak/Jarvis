@@ -470,6 +470,10 @@ pub fn parse_review_pass_with_sources(
         ensure!(matches!(response.decision, Decision::Incomplete), "missing paths require incomplete decision");
         ensure!(paths.len() <= 16 && paths.iter().all(|p| !p.is_empty() && p.len() <= 4096), "invalid missing evidence paths");
     }
+    let mut response = response;
+    if let Some(sources)=response.missing_sources.as_mut() {
+        for source in sources.iter_mut() {source_requests::repair_item_selector(&mut source.selector);}
+    }
     if let Some(sources)=&response.missing_sources {
         ensure!(matches!(response.decision,Decision::Incomplete) && sources.len()<=16,"invalid source requests");
         for source in sources {source.validate_review_source_request(criteria)?;}

@@ -89,6 +89,7 @@ fn classify(log: &str) -> Classification {
         Classification::Compiler
     } else if log.contains("FAILED (")
         || log.contains("test result: FAILED")
+        || log.contains(" ... FAILED")
         || log.contains("AssertionError")
         || log.contains("panicked at")
     {
@@ -135,6 +136,16 @@ fn classify(log: &str) -> Classification {
 /// times per head; a failure that survives them is repaired as code.
 pub(super) const INFRA_RERUN_PURPOSE: &str = "hosted-ci-infra-rerun";
 pub(super) const INFRA_RERUN_LIMIT: u32 = 2;
+/// #2453: hosted CI infrastructure holds per head. With the 5 min to 1 h
+/// backoff this is about three hours of waiting; then the hold escalates to
+/// code repair, whose new head reruns every job.
+pub(super) const INFRA_HOLD_PURPOSE: &str = "hosted-ci-infra-hold";
+pub(super) const INFRA_HOLD_LIMIT: u32 = 6;
+/// #2458: polls of still-running checks per head. Five minutes apart this is
+/// two hours, longer than any required job's timeout; past it the head takes
+/// the bounded infrastructure hold above.
+pub(super) const PENDING_POLL_PURPOSE: &str = "hosted-ci-pending-poll";
+pub(super) const PENDING_POLL_LIMIT: u32 = 24;
 
 /// Where a hosted CI hold goes. Only infrastructure waits on the bounded
 /// `verification_infrastructure_retry`; a code failure goes to repair (merge
@@ -159,7 +170,12 @@ pub(super) fn route(reason: &str) -> Route {
         | "hosted_ci_blocked_by_conflict"
         // #2394: no local replay recipe exists for this job, so a paired
         // comparison can never succeed. Repair the hosted failure instead.
-        | "ci_job_recipe_unsupported" => Route::Code,
+        | "ci_job_recipe_unsupported"
+        // #2453: the same for `targeted`, whose suite depends on the diff
+        // (`ci-targeted.py`). Its replay is refused on every attempt.
+        | "ci_selection_contract_required"
+        // #2453: an infrastructure hold that outlived its bound.
+        | "ci_infra_retries_exhausted" => Route::Code,
         _ => Route::Infrastructure,
     }
 }
@@ -357,6 +373,107 @@ fn comparison_dependency(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// #2454: what a failing hosted check says about where its fix lives. The
+/// controller derives it from panic and compiler locations only; it grants
+/// nothing by itself and is filtered against the registered contract later.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ScopeEvidence {
+    pub checks: Vec<String>,
+    pub tests: Vec<String>,
+    pub files: Vec<String>,
+}
+impl ScopeEvidence {
+    fn of(root: &Path, observation: &Observation) -> Option<Self> {
+        fn add(list: &mut Vec<String>, value: String) {
+            if !list.contains(&value) {
+                list.push(value);
+            }
+        }
+        let mut evidence = Self::default();
+        for failure in &observation.failures {
+            if !matches!(failure.classification, Classification::TestFailure | Classification::Compiler) {
+                continue;
+            }
+            add(&mut evidence.checks, failure.name.clone());
+            for test in failing_tests(&failure.diagnostics).into_iter().chain(failed_verdicts(&failure.diagnostics)) {
+                add(&mut evidence.tests, test);
+            }
+            for file in implicated_files(root, &failure.diagnostics) {
+                add(&mut evidence.files, file);
+            }
+        }
+        (!evidence.files.is_empty()).then_some(evidence)
+    }
+}
+/// `test a::b ... FAILED` verdict lines.
+fn failed_verdicts(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            let name = line[line.find("test ")? + 5..].strip_suffix(" ... FAILED")?;
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+/// `path:line:col`, with an optional trailing colon.
+fn location_path(token: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (rest, column) = token.trim_end_matches(':').rsplit_once(':')?;
+    let (path, line) = rest.rsplit_once(':')?;
+    (digits(column) && digits(line)).then_some(path)
+}
+/// A plain relative path to an existing regular file inside `root`, with no
+/// symlink anywhere on it.
+fn repository_file(root: &Path, path: &str) -> bool {
+    let plain = !path.is_empty()
+        && !path.starts_with('/')
+        && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'));
+    if !plain {
+        return false;
+    }
+    let (Ok(base), Ok(file)) = (root.canonicalize(), root.join(path).canonicalize()) else {
+        return false;
+    };
+    file == base.join(path) && file.is_file()
+}
+fn is_test_source(path: &str) -> bool {
+    path.ends_with("_tests.rs")
+        || path.ends_with("/tests.rs")
+        || path.split('/').any(|part| matches!(part, "tests" | "benches"))
+}
+/// The module a test file exercises (`notify_tests.rs`, `store/tests.rs`).
+fn subjects(path: &str) -> Vec<String> {
+    if let Some(stem) = path.strip_suffix("_tests.rs") {
+        vec![format!("{stem}.rs")]
+    } else if let Some(directory) = path.strip_suffix("/tests.rs") {
+        vec![format!("{directory}.rs"), format!("{directory}/mod.rs")]
+    } else {
+        Vec::new()
+    }
+}
+/// Repository files that a failing check's panic or compiler location
+/// implicates. A test file implicates its subject (`notify_tests.rs` names
+/// `notify.rs`), never itself: a repair must not edit the failing test.
+pub(super) fn implicated_files(root: &Path, diagnostics: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for marker in ["panicked at ", "--> "] {
+        for (at, _) in diagnostics.match_indices(marker) {
+            let token = diagnostics[at + marker.len()..].split_whitespace().next().unwrap_or("");
+            let Some(path) = location_path(token) else { continue };
+            let candidates = if is_test_source(path) { subjects(path) } else { vec![path.to_owned()] };
+            for file in candidates {
+                if !files.contains(&file) && repository_file(root, &file) {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    files
+}
+
 pub(super) enum Preflight {
     Continue,
     Compare(Observation),
@@ -397,6 +514,17 @@ async fn defer(
     };
     Ok(RunReport::held(message))
 }
+/// #2458: checks still running on the bound head. Not an infrastructure
+/// failure: a fixed short wait that releases the worker slot.
+async fn pending(workflow: &mut workflow::WorkflowGuard, pr: u64) -> Result<RunReport> {
+    workflow.validate_before_side_effect()?;
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_pending",
+        "head":workflow.binding().head,"action":"poll_checks","outcome":WorkflowOutcome::DependencyWait,
+        "transition":"observation","shipping_authority":false}))?;
+    let eligible = workflow.defer_hosted_ci_pending().await?;
+    workflow.finish_ci_deferral()?;
+    Ok(RunReport::held(format!("PR #{pr}: checks pending on the bound head; poll again after {eligible}")))
+}
 pub(super) enum Hold {
     /// Go on to repair: merge main, rebuild and test in the verifier, push.
     Repair,
@@ -413,8 +541,15 @@ async fn hold(
     immediate: bool,
 ) -> Result<Hold> {
     use crate::autoship_workflow::ci_code_repair::Ladder;
+    let mut reason = reason;
     if route(reason) == Route::Infrastructure {
-        return Ok(Hold::Deferred(defer(workflow, pr, reason, jobs).await?));
+        let head = workflow.binding().head.clone();
+        if workflow.admit_epoch_attempt(INFRA_HOLD_PURPOSE, &head, INFRA_HOLD_LIMIT)? {
+            return Ok(Hold::Deferred(defer(workflow, pr, reason, jobs).await?));
+        }
+        workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_infra_hold_exhausted",
+            "head":head,"reason":reason,"limit":INFRA_HOLD_LIMIT,"action":"repair","shipping_authority":false}))?;
+        reason = "ci_infra_retries_exhausted";
     }
     workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_code_failure",
         "head":workflow.binding().head,"reason":reason,"action":"repair",
@@ -527,15 +662,31 @@ pub(super) async fn preflight(
             .await?,
         ));
     }
+    // #2430: an unknown hosted result carries no head (GitHub ran nothing on
+    // a conflicting PR). Fall back to the PR head the resume lane fetched, so
+    // a preserved, unpushed candidate is published instead of being retried
+    // as infrastructure forever.
+    let observed_head = if observation.head.is_empty() {
+        let branch = workflow.branch()?;
+        let (fetched, published, _) = run(
+            "git",
+            &["rev-parse", "-q", "--verify", &format!("refs/remotes/origin/{branch}^{{commit}}")],
+            root,
+        )
+        .await?;
+        if fetched { published.trim().to_owned() } else { String::new() }
+    } else {
+        observation.head.clone()
+    };
     let different_head =
-        !observation.head.is_empty() && observation.head != workflow.binding().head;
+        !observed_head.is_empty() && observed_head != workflow.binding().head;
     if different_head {
         let (retained, _, _) = run(
             "git",
             &[
                 "merge-base",
                 "--is-ancestor",
-                &observation.head,
+                &observed_head,
                 &workflow.binding().head,
             ],
             root,
@@ -556,7 +707,7 @@ pub(super) async fn preflight(
     if different_head || !status.trim().is_empty() {
         workflow.audit_logger().record_controller(
             serde_json::json!({"kind":"hosted_ci_other_source",
-            "observed_head":observation.head,"candidate_head":workflow.binding().head,
+            "observed_head":observed_head,"candidate_head":workflow.binding().head,
             "action":"revalidate_candidate","shipping_authority":false}),
         )?;
         return Ok(Preflight::Continue);
@@ -570,6 +721,14 @@ pub(super) async fn preflight(
         "diagnosis":observation,"transition":"observation","shipping_authority":false}))?;
     if let Some(reason) = observation.dependency {
         let reason = blocked_by_conflict(root, reason).await;
+        if reason == "hosted_ci_incomplete" && observation.state == "pending" {
+            let head = workflow.binding().head.clone();
+            if workflow.admit_epoch_attempt(PENDING_POLL_PURPOSE, &head, PENDING_POLL_LIMIT)? {
+                return Ok(Preflight::Deferred(pending(workflow, pr).await?));
+            }
+            workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_pending_exhausted",
+                "head":head,"limit":PENDING_POLL_LIMIT,"action":"infrastructure_hold","shipping_authority":false}))?;
+        }
         return Ok(match hold(workflow, pr, reason, &jobs(&observation), true).await? {
             Hold::Repair => Preflight::Continue,
             Hold::Deferred(report) => Preflight::Deferred(report),
@@ -605,21 +764,37 @@ impl Replay for SharedReplay {
     }
 }
 
-/// Production decision entry with the execution boundary supplied explicitly.
-/// Tests can script that boundary while still using real Git, compiler results,
-/// the hosted reader, durable workflow, dependency and repair admission paths.
+/// [`prepare_scoped`] without its scope evidence, for routing tests.
+#[cfg(test)]
 pub(super) async fn prepare<R: Replay>(
     root: &Path,
     pr: u64,
     workflow: &mut workflow::WorkflowGuard,
     replay: &R,
 ) -> Result<Preparation> {
+    Ok(prepare_scoped(root, pr, workflow, replay).await?.0)
+}
+
+/// Production decision entry with the execution boundary supplied explicitly.
+/// Tests can script that boundary while still using real Git, compiler results,
+/// the hosted reader, durable workflow, dependency and repair admission paths.
+/// It also returns the #2454 scope evidence of the code failures it routes to
+/// repair. A deferral carries none: nothing is repaired this round.
+pub(super) async fn prepare_scoped<R: Replay>(
+    root: &Path,
+    pr: u64,
+    workflow: &mut workflow::WorkflowGuard,
+    replay: &R,
+) -> Result<(Preparation, Option<ScopeEvidence>)> {
     match preflight(root, pr, workflow).await? {
-        Preflight::Continue => Ok(Preparation::Continue),
+        Preflight::Continue => Ok((Preparation::Continue, None)),
         Preflight::Compare(observation) => {
-            compare_observed(root, pr, workflow, observation, replay).await
+            let scope = ScopeEvidence::of(root, &observation);
+            let preparation = compare_observed(root, pr, workflow, observation, replay).await?;
+            let scope = scope.filter(|_| !matches!(preparation, Preparation::Deferred(_)));
+            Ok((preparation, scope))
         }
-        Preflight::Deferred(report) => Ok(Preparation::Deferred(report)),
+        Preflight::Deferred(report) => Ok((Preparation::Deferred(report), None)),
     }
 }
 
@@ -936,6 +1111,88 @@ pub(super) async fn current_input(
 mod classification_tests {
     use super::*;
 
+    /// #2442, PR #2358 (#2350): `targeted` ran ~840 KB of cargo output. The
+    /// six panicking tests sat ~130 KB before the end because cargo kept
+    /// running other binaries, so the 64 KiB head/tail transport dropped every
+    /// failure line and the job classified `unknown`. That routed to a blind
+    /// main merge instead of a test repair, forever.
+    #[tokio::test]
+    async fn a_test_panic_in_the_dropped_middle_of_a_long_targeted_log_is_a_test_failure() {
+        const PREFIX: &str = "targeted\tRun python3 scripts/ci-contract.py step --hosted --id targeted/targeted/10\t2026-11-22T05:34:35.8567749Z ";
+        let tests = [
+            "socialapi_compose_identity::tests::a_conversation_id_with_like_wildcards_matches_only_itself",
+            "socialapi_compose_identity::tests::socialapi_compose_receipts_keep_exact_account_thread_and_platform_boundaries",
+        ];
+        let mut body = Vec::new();
+        for n in 0..1500 {
+            body.push(format!("test passing::prelude::case_{n} ... ok"));
+        }
+        body.push("running 7 tests".into());
+        for name in tests {
+            body.push(format!("test {name} ... FAILED"));
+        }
+        body.push(String::new());
+        body.push("failures:".into());
+        body.push(String::new());
+        for name in tests {
+            body.push(format!("---- {name} stdout ----"));
+            body.push(String::new());
+            body.push(format!("thread '{name}' (59092) panicked at crates/augmentagent-cli/src/bin/autoship_case.rs:15:5:"));
+            body.push("internal error: entered unreachable code: the observation only calls pending-compose selection and retirement".into());
+            body.push(String::new());
+        }
+        body.push("failures:".into());
+        for name in tests {
+            body.push(format!("    {name}"));
+        }
+        body.push(String::new());
+        body.push("test result: FAILED. 1 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s".into());
+        for n in 0..3000 {
+            body.push(format!("test passing::later_binary::case_{n} ... ok"));
+        }
+        body.push("##[error]Process completed with exit code 1.".into());
+        let raw: String = body.iter().map(|line| format!("{PREFIX}{line}\n")).collect();
+        assert!(raw.len() > 400 * 1024, "fixture must exceed the transport window");
+
+        let captured = hosted_ci::capture_log(raw.as_bytes()).await.unwrap();
+        assert!(captured.len() <= 192 * 1024, "transport stays bounded: {}", captured.len());
+        let logs = plain(&hosted_ci::job_diagnostics(&captured));
+        assert_eq!(classify_job(&logs, Some("failure")), Classification::TestFailure);
+        assert_eq!(failing_tests(&logs), tests.map(String::from).to_vec(),
+            "the repair family is anchored on the failing tests, not the log hash");
+        assert!(logs.contains("autoship_case.rs:15:5") && logs.contains("entered unreachable code"),
+            "the repair sees the panic location and message");
+    }
+
+    /// #2454 (PR #2378): the required `targeted` check panics in
+    /// `notify_tests.rs`; the fix is the `notify::PRODUCERS` registry in
+    /// `notify.rs`. A test file implicates its subject, never itself, and
+    /// only real relative repository files are named.
+    #[test]
+    fn a_failing_test_implicates_its_subject_file_not_the_test() {
+        let root = tempfile::tempdir().unwrap();
+        for file in ["crates/augmentagent-cli/src/notify.rs", "crates/augmentagent-cli/src/notify_tests.rs",
+            "crates/core/src/store.rs", "crates/core/src/store/tests.rs", "crates/api/src/lib.rs"] {
+            std::fs::create_dir_all(root.path().join(file).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(file), "// fixture\n").unwrap();
+        }
+        let log = "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+            thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+            producers posting to the owner without a registry entry (or stale entries); add them to notify::PRODUCERS:\n\
+            thread 'notify_tests::a_producer_missing_from_the_registry_fails_the_check' panicked at crates/augmentagent-cli/src/notify_tests.rs:211:5:\n\
+            test result: FAILED. 2618 passed; 2 failed; 0 ignored";
+        assert_eq!(implicated_files(root.path(), log), vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
+
+        let mixed = "thread 'store::tests::x' panicked at crates/core/src/store/tests.rs:9:5:\n\
+            thread 'y' panicked at /rustc/abc/library/core/src/option.rs:1:1:\n\
+            thread 'z' panicked at ../outside/src/lib.rs:1:1:\n\
+            thread 'w' panicked at crates/missing/src/lib.rs:1:1:\n\
+            error[E0308]: mismatched types\n  --> crates/api/src/lib.rs:3:9\n";
+        assert_eq!(implicated_files(root.path(), mixed),
+            vec!["crates/core/src/store.rs".to_string(), "crates/api/src/lib.rs".to_string()],
+            "std, escaping and missing paths are never implicated");
+    }
+
     /// #2315: infrastructure is the runner, network, apt/mirror, cancellation
     /// or a timeout with no test output. Everything the diff can cause is code.
     #[test]
@@ -943,6 +1200,8 @@ mod classification_tests {
         let code = [
             ("error[E0063]: missing field `latency` in initializer of `TurnMarks`\nerror: could not compile `augmentagent-cli`", Classification::Compiler),
             ("thread 'x' panicked at src/a.rs:1:1\ntest result: FAILED. 1 passed; 1 failed", Classification::TestFailure),
+            // #2442: the per-test verdict alone is test evidence too.
+            ("test socialapi_compose_identity::tests::x ... FAILED", Classification::TestFailure),
             ("POSSIBLE secret/PII in crates/x/src/lib.rs:\n  line 4", Classification::PolicyViolation),
             ("{\"valid\":false,\"changed\":[\".github/workflows/rust.yml\"]}", Classification::PolicyViolation),
             ("CONFLICT (content): Merge conflict in crates/x/src/lib.rs", Classification::PolicyViolation),
@@ -978,6 +1237,10 @@ mod classification_tests {
         // replay recipe. Paired comparison can never succeed, so waiting on it
         // as infrastructure retried hourly forever. Repair the hosted failure.
         assert_eq!(route("ci_job_recipe_unsupported"), Route::Code);
+        // #2453 (PR #2378): `targeted` test panics whose paired replay is
+        // refused for diff-dependent selection waited hourly forever.
+        assert_eq!(route("ci_selection_contract_required"), Route::Code);
+        assert_eq!(route("ci_infra_retries_exhausted"), Route::Code);
         for reason in ["hosted_ci_transport_unknown", "hosted_ci_logs_unavailable", "hosted_ci_incomplete",
             "ci_infra_rerun_requested", "ci_main_failure_dependency", "ci_comparison_deadline"] {
             assert_eq!(route(reason), Route::Infrastructure, "{reason}");

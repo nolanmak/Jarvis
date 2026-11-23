@@ -61,6 +61,40 @@ async fn contribution_diff(
     let diff = trusted_git(root, &["--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv", &basis, head, "--"]).await?;
     Ok((basis, diff))
 }
+/// Register an amended verifier (#2460). A registered environment transition
+/// is part of the original's identity: an amendment whose authority did not
+/// need to approve a new one inherits it. Dropping it turned an unchanged
+/// environment into an "unapproved" candidate change on every resume.
+fn register_amended(root:&Path,old:&RegisteredContract,contract:AcceptanceContract,base:String,
+    baseline_environment:String,candidate_environment:String,approve_transition:bool)->Result<RegisteredContract> {
+    if approve_transition {
+        return RegisteredContract::register_transition(root,contract,base,baseline_environment,candidate_environment);
+    }
+    if old.has_environment_transition() {
+        ensure!(candidate_environment==old.candidate_environment_id(),"environment change was not independently approved");
+        return RegisteredContract::register_transition(root,contract,base,baseline_environment,candidate_environment);
+    }
+    RegisteredContract::register(root,contract,base,baseline_environment)
+}
+/// The #2350 pending shape written before [`register_amended`]: the old
+/// registration's transition is gone from the next one while the baseline
+/// environment is unchanged. Nothing new was ever asked of the authority.
+fn inherited_transition_dropped(old:&RegisteredContract,next:&RegisteredContract)->Result<bool> {
+    let base=old.baseline_head();
+    Ok(old.has_environment_transition() && !next.has_environment_transition()
+        && next.baseline_head()==base
+        && old.binding(base)?.environment_id==next.binding(base)?.environment_id)
+}
+/// Move a never-applied pending amendment aside (kept, never deleted), so
+/// acceptance continues from the active manifest instead of failing on it.
+fn archive_unapplied_pending(control:&Path,source:AcceptanceSource)->Result<PathBuf> {
+    let path=pending_path(control,source);
+    let archived=control.join(format!("{}-pending-amendment-discarded-{}.json",source.key(),uuid::Uuid::new_v4()));
+    ensure!(!archived.exists(),"pending amendment archive collision");
+    std::fs::rename(&path,&archived)?;
+    std::fs::File::open(control)?.sync_all()?;
+    Ok(archived)
+}
 fn pending_path(control: &Path, source: AcceptanceSource) -> PathBuf {
     control.join(format!("{}-pending-amendment.json", source.key()))
 }
@@ -78,7 +112,7 @@ fn immutable(control: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     std::fs::File::open(control)?.sync_all()?;
     Ok(path)
 }
-fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
+pub(super) fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
     let Some(raw)=adjudication else {return Ok(());};
     let value:serde_json::Value=serde_json::from_str(raw)?;
     let mut bound=None::<std::collections::BTreeSet<String>>;
@@ -472,7 +506,10 @@ fn authority_base_request(old:&PreparedAcceptance,facts:AuthorityFacts<'_>)->Res
     );
     let prompt = format!("{prompt}\n{}", environments.prompt()?);
     let prompt = append_verifier_schema(&prompt,next_revision)?;
-    let prompt = if let Some(directive) = adjudication {
+    let prompt = if let Some(request) = adjudication.filter(|bound| super::ci_scope::is_request(bound)) {
+        // #2454: a controller-built CI scope request, not a review ruling.
+        format!("{prompt}\n{}{request}", super::ci_scope::AUTHORITY_TASK)
+    } else if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. For a contract_scope directive, additional files must be a subset of its explicit bound paths and necessary for that unchanged owner requirement. Never authorize Git/provider configuration, credentials, CI or daemon control state; if a requested path is protected, derive a compliant implementation alternative or report the immutable authorization conflict. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
         prompt
@@ -665,22 +702,15 @@ pub(super) async fn try_amend(
         install_harness(&baseline_root, &proposal)?;
         let baseline_environment = environment_id(&baseline_root)?;
         ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
-        let registration = if decision.approve_environment_transition {
-            RegisteredContract::register_transition(
-                &baseline_root,
-                proposal.contract.clone(),
-                base.into(),
-                baseline_environment,
-                candidate_environment,
-            )?
-        } else {
-            RegisteredContract::register(
-                &baseline_root,
-                proposal.contract.clone(),
-                base.into(),
-                baseline_environment,
-            )?
-        };
+        let registration = register_amended(
+            &baseline_root,
+            &old.baseline.registration,
+            proposal.contract.clone(),
+            base.into(),
+            baseline_environment,
+            candidate_environment,
+            decision.approve_environment_transition,
+        )?;
         let receipts = execute_registered(&baseline_root, &registration, &workflow.audit_logger()).await?;
         ensure!(
             registration.baseline_result(&receipts)? == BaselineResult::Reproduced,
@@ -895,8 +925,20 @@ pub(super) async fn resume_pending(
         != pending.next.baseline.registration.binding(old_base)?.environment_id;
     let candidate_changed = pending.old.baseline.registration.candidate_environment_id()
         != pending.next.baseline.registration.candidate_environment_id();
-    ensure!(!(baseline_changed || candidate_changed) || pending.authority.approve_environment_transition,
-        "pending environment transition lacks independent approval");
+    if (baseline_changed || candidate_changed) && !pending.authority.approve_environment_transition {
+        // #2460: written by the pre-fix amendment, never applied. Retrying it
+        // can only fail the same way; set it aside and continue from the
+        // active manifest, which the normal amendment path may correct again.
+        let active = original_manifest(control, source)?
+            .is_some_and(|current| current.contract_hash == pending.next.baseline.registration.contract_hash());
+        if !active && inherited_transition_dropped(&pending.old.baseline.registration, &pending.next.baseline.registration)? {
+            let archived = archive_unapplied_pending(control, source)?;
+            warn!(source = %source.key(), archived = %archived.display(),
+                "pending amendment dropped its registered environment transition; archived instead of retried");
+            return Ok(None);
+        }
+        anyhow::bail!("pending environment transition lacks independent approval");
+    }
     ensure!(
         pending.next.baseline.registration.baseline_head()
             == pending.old.baseline.registration.baseline_head(),
@@ -1574,6 +1616,59 @@ mod tests {
         )
         .is_err());
     }
+    /// #2350 / PR #2358: the original registration carried an approved
+    /// environment transition (candidate environment differs from the
+    /// baseline). A later amendment whose authority did not need to approve a
+    /// new one re-registered without it, so the pending transaction read back
+    /// as an unapproved candidate environment change, deterministically, on
+    /// every resume: 228 model calls and no progress. The amendment inherits
+    /// the registered transition; a genuinely new one still needs approval.
+    #[test]
+    fn amendment_inherits_the_registered_environment_transition() {
+        let (root, prepared) = fixture();
+        let contract = prepared.proposal.contract.clone();
+        let base = "a".repeat(40);
+        let old = RegisteredContract::register_transition(root.path(), contract.clone(), base.clone(),
+            "environment-a".into(), "environment-b".into()).unwrap();
+        let next = register_amended(root.path(), &old, contract.clone(), base.clone(),
+            "environment-a".into(), "environment-b".into(), false).unwrap();
+        assert!(next.has_environment_transition(), "the inherited transition was dropped");
+        assert_eq!(next.candidate_environment_id(), old.candidate_environment_id());
+        assert!(!inherited_transition_dropped(&old, &next).unwrap());
+        assert!(register_amended(root.path(), &old, contract.clone(), base.clone(),
+            "environment-a".into(), "environment-c".into(), false).is_err(),
+            "a new candidate environment still requires independent approval");
+        let approved = register_amended(root.path(), &old, contract.clone(), base.clone(),
+            "environment-a".into(), "environment-c".into(), true).unwrap();
+        assert_eq!(approved.candidate_environment_id(), "environment-c");
+        let plain = RegisteredContract::register(root.path(), contract.clone(), base.clone(), "environment-a".into()).unwrap();
+        let unchanged = register_amended(root.path(), &plain, contract.clone(), base.clone(),
+            "environment-a".into(), "environment-a".into(), false).unwrap();
+        assert!(!unchanged.has_environment_transition(), "no transition is invented");
+        // The production pending file shape: old with a transition, next
+        // without one, the same baseline environment.
+        assert!(inherited_transition_dropped(&old, &plain).unwrap());
+        assert!(!inherited_transition_dropped(&plain, &plain).unwrap());
+        let moved = RegisteredContract::register(root.path(), contract, base, "environment-z".into()).unwrap();
+        assert!(!inherited_transition_dropped(&old, &moved).unwrap(), "a changed baseline is a real transition");
+    }
+
+    /// The poisoned #2350 pending transaction was never applied: it is moved
+    /// aside (kept, never deleted) so acceptance preparation can continue
+    /// from the active manifest instead of failing on it forever.
+    #[test]
+    fn a_pending_amendment_that_dropped_its_transition_is_archived_not_retried() {
+        let control = tempfile::tempdir().unwrap();
+        let source = AcceptanceSource::Issue(2350);
+        let path = pending_path(control.path(), source);
+        immutable(control.path(), path.file_name().unwrap().to_str().unwrap(), b"{\"pending\":true}").unwrap();
+        let archived = archive_unapplied_pending(control.path(), source).unwrap();
+        assert!(!path.exists(), "the poisoned pending transaction is still active");
+        assert_eq!(std::fs::read(&archived).unwrap(), b"{\"pending\":true}");
+        assert!(archived.starts_with(control.path()));
+        assert!(archived.file_name().unwrap().to_str().unwrap().starts_with("issue-2350-pending-amendment-discarded-"));
+    }
+
     #[test]
     fn immutable_amendment_artifacts_cannot_be_overwritten() {
         let control = tempfile::tempdir().unwrap();
