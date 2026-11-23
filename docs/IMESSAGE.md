@@ -291,6 +291,23 @@ one SSH connection for two minutes. Logs go to
 `~/Library/Logs/augmentagent/imessage-send.log`. Uninstall with
 `python3 scripts/imessage/schedule.py --job send --uninstall`.
 
+### Keeping the Mac checkout current
+
+The Mac jobs run straight from this checkout, and the Linux auto-updater never
+touches it. Install the updater so fixes merged to `main` reach the Mac:
+
+```sh
+python3 scripts/imessage/schedule.py --job update --interval 5
+```
+
+Every 5 minutes it fast-forwards the checkout to `origin/main`. It never
+rebases, resets or discards work. A checkout that is off `main`, has edits to
+tracked files, or has diverged is left alone, and the reason is logged. When
+`scripts/imessage` changes it restarts the long-running owner-capture job; the
+send job picks up new code on its next 15-second run. Each run's result and
+commit are written to `~/.local/state/augmentagent/mac-update/mac-update.json`,
+and the log is `~/Library/Logs/augmentagent/mac-update.log`.
+
 End-to-end latency is the exporter interval plus the agent poll interval for
 the card, then the send interval once you approve.
 
