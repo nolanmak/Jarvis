@@ -664,4 +664,64 @@ mod tests {
         assert!(exhausted(&at(Stage::Scope, EXHAUSTED_REASON, EXHAUSTED_ACTION)));
         assert!(!exhausted(&at(Stage::Scope, "ci_scope_amendment_refused", ACTION)));
     }
+
+    /// The CI scope amendment answers no, every time, and counts its calls.
+    struct Refuses(Mutex<u32>);
+    #[async_trait::async_trait]
+    impl ci_scope::Authority for Refuses {
+        async fn amend(&self, _: &PreparedAcceptance, _: &mut workflow::WorkflowGuard, _: &str) -> Result<Option<PreparedAcceptance>> {
+            *self.0.lock().unwrap() += 1;
+            Ok(None)
+        }
+    }
+
+    /// #2329 sequence (PR #2378, 2026-11-23): the required `targeted` check
+    /// fails on `notify::PRODUCERS` and the fix needs `notify.rs`, outside the
+    /// contract. The CI scope amendment refuses it; the own-PR rescope then
+    /// runs from that refusal and adds the file; the CI scope step lets the
+    /// repair run without asking the authority again; and the repair's edit
+    /// to `notify.rs` is inside the new contract.
+    #[tokio::test]
+    async fn the_2329_sequence_refused_then_rescoped_then_repair_edits_the_file() {
+        if parent("the_2329_sequence_refused_then_rescoped_then_repair_edits_the_file") { return; }
+        let mut lane = lane(None).await;
+        let control = lane.control.path().to_owned();
+        let authority = Refuses(Mutex::new(0));
+        let tests = vec!["notify_tests::registry_covers_every_producer_in_the_code".to_string()];
+        let failure = ci_scope::Failure { tests: &tests, diagnostics: "add them to notify::PRODUCERS", panic_locations: &[],
+            regression: ci_scope::Regression::of(false, Some("ci_selection_contract_required")), main: None };
+
+        // 1. Refused: the CI scope step leaves a pending own-PR rescope.
+        let widened = ci_scope::widen(&authority, &mut lane.prepared, &control, &[NOTIFY.to_string()], failure, &mut lane.workflow).await.unwrap();
+        assert!(matches!(widened, ci_scope::Widen::Rescoped(_)), "{widened:?}");
+        assert_eq!(*authority.0.lock().unwrap(), 1);
+        let checkpoint = lane.workflow.current_checkpoint().unwrap();
+        assert_eq!((checkpoint.stage, checkpoint.next.reason.as_str()), (Stage::Scope, "ci_scope_amendment_refused"));
+        let findings = pending(&checkpoint).expect("a refused CI scope amendment must leave a pending own-PR rescope");
+        assert_eq!(findings.paths, vec![NOTIFY.to_string()]);
+
+        // 2. The rescope runs and adds the file.
+        let outcome = lane.run(&findings, None).await;
+        assert_eq!(outcome, Outcome::Rescoped { revision: 2, added: vec![NOTIFY.into()], notes: None });
+        assert!(lane.prepared.proposal.contract.allowed_paths.iter().any(|scope| scope.contains(NOTIFY)));
+
+        // 3. The CI scope step is now in scope: no second authority call.
+        let widened = ci_scope::widen(&authority, &mut lane.prepared, &control, &[NOTIFY.to_string()], failure, &mut lane.workflow).await.unwrap();
+        assert_eq!(widened, ci_scope::Widen::InScope);
+        assert_eq!(*authority.0.lock().unwrap(), 1, "the authority was asked again for a file the rescope added");
+        assert!(pending(&lane.workflow.current_checkpoint().unwrap()).is_none(), "the rescope is still pending after it ran");
+
+        // 4. The repair edits notify.rs and every changed file is in scope.
+        let root = lane.root.path();
+        std::fs::create_dir_all(root.join("crates/augmentagent-cli/src")).unwrap();
+        std::fs::write(root.join(NOTIFY), "pub const PRODUCERS: &[&str] = &[\"post_digest\"];\n").unwrap();
+        git(root, &["add", NOTIFY]);
+        git(root, &["commit", "-qm", "register post_digest in notify::PRODUCERS"]);
+        let changed = git(root, &["diff", "--name-only", "HEAD~1", "HEAD"]);
+        assert_eq!(changed, NOTIFY);
+        for path in changed.lines() {
+            assert!(lane.prepared.proposal.contract.allowed_paths.iter().any(|scope| scope.contains(path)),
+                "the repair's edit to {path} is outside the rescoped contract");
+        }
+    }
 }
