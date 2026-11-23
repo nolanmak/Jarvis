@@ -4625,8 +4625,10 @@ mod tests {
         write(&aliases.join("completed-fixture"),br#""session-completed""#);
         write(&aliases.join("interrupted-fixture"),br#""session-interrupted""#);
         let policy=root.path().join("policy.json");
-        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":1073741824u64,"max_sessions":3,"providers":{}})).unwrap());
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        // The interrupted scope-retired runtime is unresumable history and holds
+        // no reservation (#2506); only the completed one fills this 1 GiB budget.
         let full=augmentagent_channel_core::native_vm::state_capacity::inspect();
         assert!(full.available_fingerprint().is_none());assert!(known.exists(),"read-only inspection deleted runtime state");
         let fingerprint=serde_json::to_value(full).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();

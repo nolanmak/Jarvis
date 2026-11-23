@@ -1,5 +1,5 @@
 //! Observational native storage diagnostics. This neither admits a call nor
-//! prunes retained results. Measurements never establish live workflow readiness.
+//! prunes retained results; unresumable retired history is reported as evictable. Measurements never establish live workflow readiness.
 use super::*;
 
 #[derive(Debug, Serialize)]
@@ -13,6 +13,8 @@ pub struct Report {
 #[derive(Debug, Serialize)]
 struct Measurements {
     retained_sessions: usize,
+    retired_history_sessions: usize,
+    retired_history_bytes: u64,
     additional_sessions: usize,
     max_sessions: usize,
     session_reserved_bytes: u64,
@@ -38,22 +40,27 @@ impl Report {
     }
 }
 
-pub(super) fn observed(count: usize, additional: usize, max_sessions: usize,
+/// `count` is the live or resumable sessions that each hold a reservation.
+/// Unresumable retired history (`history`, `history_bytes`) is evictable by
+/// admission, so it never blocks a new session: it is excluded from session
+/// reservations, stored bytes and the free-space floor.
+pub(super) fn observed(count: usize, history: usize, history_bytes: u64, additional: usize, max_sessions: usize,
     max_state_bytes: u64, stored_bytes: u64, free_bytes: u64) -> Report {
     let required_sessions=count.saturating_add(additional);
     let reserved=(required_sessions as u64).saturating_mul(SESSION_BYTES);
     let mut blockers=Vec::new();
     if required_sessions>max_sessions {blockers.push("session-count");}
     if reserved>max_state_bytes {blockers.push("reserved-bytes");}
-    if stored_bytes>max_state_bytes {blockers.push("stored-bytes");}
-    if free_bytes<SESSION_BYTES {blockers.push("filesystem-free-bytes");}
+    if stored_bytes.saturating_sub(history_bytes)>max_state_bytes {blockers.push("stored-bytes");}
+    if free_bytes.saturating_add(history_bytes)<SESSION_BYTES {blockers.push("filesystem-free-bytes");}
     // Free space and small file writes fluctuate. Fingerprint the admission
     // boundaries rather than making every audit append look like recovery.
-    let capacity_fingerprint=digest(&serde_json::json!({"version":1,"retained_sessions":count,
-        "additional_sessions":additional,"max_sessions":max_sessions,"max_state_bytes":max_state_bytes,
+    let capacity_fingerprint=digest(&serde_json::json!({"version":2,"retained_sessions":count,
+        "retired_history_sessions":history,"additional_sessions":additional,"max_sessions":max_sessions,"max_state_bytes":max_state_bytes,
         "session_reserved_bytes":SESSION_BYTES,"blockers":blockers}).to_string());
     Report { status:if blockers.is_empty(){"capacity-observed"}else{"capacity-exhausted"},live_verified:false,
-        measurements:Some(Measurements {retained_sessions:count,additional_sessions:additional,max_sessions,
+        measurements:Some(Measurements {retained_sessions:count,retired_history_sessions:history,retired_history_bytes:history_bytes,
+            additional_sessions:additional,max_sessions,
             session_reserved_bytes:SESSION_BYTES,required_reserved_bytes:reserved,max_state_bytes,
             stored_bytes,filesystem_available_bytes:free_bytes,blockers,capacity_fingerprint}) }
 }
@@ -89,39 +96,47 @@ fn inspect_locked(policy:&Policy)->Result<Report> {
     ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native lock");
     ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)}==0,"native state busy");
     let _guard=StateLock(file);
-    let mut count=0usize;
-    for provider in std::fs::read_dir(&root)? {
-        let provider=provider?.path();
-        if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
-        ensure!(provider.is_dir() && !provider.is_symlink(),"unsafe provider state");
-        for entry in std::fs::read_dir(provider)? {
-            let session=entry?.path();
-            if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
-            ensure!(session.is_dir() && !session.is_symlink(),"unsafe session state");
-            count=count.checked_add(1).context("native session count overflow")?;
-        }
-    }
-    // Count all retained sessions, including potentially reclaimable state.
-    // Only the admission/retirement service may perform actual reclamation.
-    Ok(observed(count,1,policy.max_sessions,policy.max_state_bytes,tree_bytes(&root)?,available_bytes(&root)?))
+    // Marker-only observation: no pruning, eviction or session-lock contact.
+    // Admission alone reclaims, re-proving liveness under the exclusive lock.
+    let inventory=scan(&root,false)?;
+    Ok(observed(inventory.reserving,inventory.history.len(),inventory.history_bytes(),1,policy.max_sessions,
+        policy.max_state_bytes,tree_bytes(&root)?,available_bytes(&root)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Exact #2329 observation: 8 retained x 1 GiB + 1 new = 9 GiB against an
+    /// 8 GiB budget with 2.6 GB stored and 30 GB free. When those eight are
+    /// unresumable retired history they cost their bytes, not reservations.
+    #[test]
+    fn retired_history_never_blocks_the_production_observation() {
+        let value=|report:Report|serde_json::to_value(report).unwrap();
+        let (stored,free)=(2_619_576_074u64,30_961_291_264u64);
+        let live=value(observed(8,0,0,1,16,8*SESSION_BYTES,stored,free));
+        assert_eq!(live["required_reserved_bytes"],9_663_676_416u64);
+        assert_eq!(live["blockers"],serde_json::json!(["reserved-bytes"]));
+        let history=value(observed(0,8,stored,1,16,8*SESSION_BYTES,stored,free));
+        assert_eq!(history["status"],"capacity-observed","{history}");
+        assert_eq!(history["required_reserved_bytes"],SESSION_BYTES);
+        // Evictable history never trips the stored-bytes or free-space floors.
+        let crowded=value(observed(1,40,40*SESSION_BYTES,1,16,8*SESSION_BYTES,41*SESSION_BYTES,0));
+        assert_eq!(crowded["blockers"],serde_json::json!([]));
+        assert_ne!(live["capacity_fingerprint"],history["capacity_fingerprint"]);
+    }
     #[test]
     fn boundaries_and_fingerprints_distinguish_each_storage_limit() {
         let value=|report:Report|serde_json::to_value(report).unwrap();
-        let full=value(observed(8,1,16,8*SESSION_BYTES,4096,100*SESSION_BYTES));
+        let full=value(observed(8,0,0,1,16,8*SESSION_BYTES,4096,100*SESSION_BYTES));
         assert_eq!(full["blockers"],serde_json::json!(["reserved-bytes"]));
-        let same=value(observed(8,1,16,8*SESSION_BYTES,8192,99*SESSION_BYTES));
+        let same=value(observed(8,0,0,1,16,8*SESSION_BYTES,8192,99*SESSION_BYTES));
         assert_eq!(full["capacity_fingerprint"],same["capacity_fingerprint"]);
-        let changed=value(observed(7,1,16,8*SESSION_BYTES,8192,99*SESSION_BYTES));
+        let changed=value(observed(7,0,0,1,16,8*SESSION_BYTES,8192,99*SESSION_BYTES));
         assert_ne!(full["capacity_fingerprint"],changed["capacity_fingerprint"]);
         assert_eq!(changed["status"],"capacity-observed");
-        assert_eq!(value(observed(8,0,16,8*SESSION_BYTES,8*SESSION_BYTES,SESSION_BYTES))["blockers"],serde_json::json!([]));
-        assert_eq!(value(observed(1,1,1,8*SESSION_BYTES,8*SESSION_BYTES+1,SESSION_BYTES-1))["blockers"],
+        assert_eq!(value(observed(8,0,0,0,16,8*SESSION_BYTES,8*SESSION_BYTES,SESSION_BYTES))["blockers"],serde_json::json!([]));
+        assert_eq!(value(observed(1,0,0,1,1,8*SESSION_BYTES,8*SESSION_BYTES+1,SESSION_BYTES-1))["blockers"],
             serde_json::json!(["session-count","stored-bytes","filesystem-free-bytes"]));
-        assert!(observed(usize::MAX,1,16,8*SESSION_BYTES,0,SESSION_BYTES).exhausted());
+        assert!(observed(usize::MAX,0,0,1,16,8*SESSION_BYTES,0,SESSION_BYTES).exhausted());
     }
 }
