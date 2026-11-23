@@ -136,6 +136,11 @@ fn classify(log: &str) -> Classification {
 /// times per head; a failure that survives them is repaired as code.
 pub(super) const INFRA_RERUN_PURPOSE: &str = "hosted-ci-infra-rerun";
 pub(super) const INFRA_RERUN_LIMIT: u32 = 2;
+/// #2453: hosted CI infrastructure holds per head. With the 5 min to 1 h
+/// backoff this is about three hours of waiting; then the hold escalates to
+/// code repair, whose new head reruns every job.
+pub(super) const INFRA_HOLD_PURPOSE: &str = "hosted-ci-infra-hold";
+pub(super) const INFRA_HOLD_LIMIT: u32 = 6;
 
 /// Where a hosted CI hold goes. Only infrastructure waits on the bounded
 /// `verification_infrastructure_retry`; a code failure goes to repair (merge
@@ -160,7 +165,12 @@ pub(super) fn route(reason: &str) -> Route {
         | "hosted_ci_blocked_by_conflict"
         // #2394: no local replay recipe exists for this job, so a paired
         // comparison can never succeed. Repair the hosted failure instead.
-        | "ci_job_recipe_unsupported" => Route::Code,
+        | "ci_job_recipe_unsupported"
+        // #2453: the same for `targeted`, whose suite depends on the diff
+        // (`ci-targeted.py`). Its replay is refused on every attempt.
+        | "ci_selection_contract_required"
+        // #2453: an infrastructure hold that outlived its bound.
+        | "ci_infra_retries_exhausted" => Route::Code,
         _ => Route::Infrastructure,
     }
 }
@@ -414,8 +424,15 @@ async fn hold(
     immediate: bool,
 ) -> Result<Hold> {
     use crate::autoship_workflow::ci_code_repair::Ladder;
+    let mut reason = reason;
     if route(reason) == Route::Infrastructure {
-        return Ok(Hold::Deferred(defer(workflow, pr, reason, jobs).await?));
+        let head = workflow.binding().head.clone();
+        if workflow.admit_epoch_attempt(INFRA_HOLD_PURPOSE, &head, INFRA_HOLD_LIMIT)? {
+            return Ok(Hold::Deferred(defer(workflow, pr, reason, jobs).await?));
+        }
+        workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_infra_hold_exhausted",
+            "head":head,"reason":reason,"limit":INFRA_HOLD_LIMIT,"action":"repair","shipping_authority":false}))?;
+        reason = "ci_infra_retries_exhausted";
     }
     workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_code_failure",
         "head":workflow.binding().head,"reason":reason,"action":"repair",
@@ -1050,6 +1067,10 @@ mod classification_tests {
         // replay recipe. Paired comparison can never succeed, so waiting on it
         // as infrastructure retried hourly forever. Repair the hosted failure.
         assert_eq!(route("ci_job_recipe_unsupported"), Route::Code);
+        // #2453 (PR #2378): `targeted` test panics whose paired replay is
+        // refused for diff-dependent selection waited hourly forever.
+        assert_eq!(route("ci_selection_contract_required"), Route::Code);
+        assert_eq!(route("ci_infra_retries_exhausted"), Route::Code);
         for reason in ["hosted_ci_transport_unknown", "hosted_ci_logs_unavailable", "hosted_ci_incomplete",
             "ci_infra_rerun_requested", "ci_main_failure_dependency", "ci_comparison_deadline"] {
             assert_eq!(route(reason), Route::Infrastructure, "{reason}");
