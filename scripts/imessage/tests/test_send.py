@@ -465,6 +465,15 @@ class SendCliTests(unittest.TestCase):
         self.assertEqual(plist["StartInterval"], 15)
         self.assertTrue(plist["StandardOutPath"].endswith("imessage-send.log"))
 
+    def test_schedule_builds_mac_update_job(self):
+        import schedule
+        with tempfile.TemporaryDirectory() as home:
+            plist = schedule.make_plist([], 5, home, job="update")
+        self.assertEqual(plist["Label"], "org.augmentagent.mac-update")
+        self.assertTrue(plist["ProgramArguments"][1].endswith("update.py"))
+        self.assertEqual(plist["StartInterval"], 300)
+        self.assertTrue(plist["StandardOutPath"].endswith("mac-update.log"))
+
     def test_schedule_keeps_the_export_job_unchanged(self):
         import schedule
         with tempfile.TemporaryDirectory() as home:

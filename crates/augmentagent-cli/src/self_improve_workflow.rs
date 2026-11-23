@@ -268,6 +268,8 @@ pub(super) struct WorkflowGuard {
     audit: Arc<augmentagent_channel_core::AuditLogger>,
     acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
     acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
+    /// #2471: set only while an admitted own-PR witness regeneration runs.
+    witness_regeneration:Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -592,6 +594,9 @@ fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
 pub(super) struct SweepGuard {
     inner: Option<WorkflowGuard>,
     reviewed_base: Option<String>,
+    /// #2458: after a carried main update, the head the protected acceptance
+    /// receipt binds (the reviewed origin), not the merge commit.
+    acceptance_head: Option<String>,
     source: crate::autoship_contract::AcceptanceSource,
     branch: String,
     worktree_lock: Mutex<Option<RunLock>>,
@@ -765,8 +770,18 @@ impl SweepGuard {
             family_budget_wait: Arc::new(AtomicBool::new(false)),
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
             family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
+        };
+        // A head produced by a carried main update was reviewed at its origin.
+        let carried = if existing.is_some() {
+            inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
+                .filter(|update| update.updated_head.as_deref() == Some(head))
+        } else { None };
+        let (reviewed_base, acceptance_head) = match carried {
+            Some(update) => (Some(update.main), Some(update.origin_head)),
+            None => (reviewed_base, None),
         };
         inner.install_model_accounting()?;
         inner.audit_event("sweep_claimed", serde_json::json!({}))?;
@@ -774,6 +789,7 @@ impl SweepGuard {
         Ok(Some(Self {
             inner: Some(inner),
             reviewed_base,
+            acceptance_head,
             source: issue
                 .map(crate::autoship_contract::AcceptanceSource::Issue)
                 .unwrap_or(crate::autoship_contract::AcceptanceSource::PullRequest(pr)),
@@ -783,6 +799,17 @@ impl SweepGuard {
     }
 
     pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
+        self.validate_remote_at(repo, pr, expected, true).await.map(|_| ())
+    }
+
+    /// #2458: every check `validate_remote` makes except that main is
+    /// unchanged since review: the PR is BEHIND and main is about to be
+    /// merged in. Returns the current main.
+    pub(super) async fn validate_for_main_update(&self, repo: &Path, pr: u64, expected: &str) -> Result<String> {
+        self.validate_remote_at(repo, pr, expected, false).await
+    }
+
+    async fn validate_remote_at(&self, repo: &Path, pr: u64, expected: &str, reviewed_main: bool) -> Result<String> {
         let inner = self.inner.as_ref().context("released sweep lease")?;
         inner.validate_before_side_effect()?;
         anyhow::ensure!(
@@ -793,8 +820,9 @@ impl SweepGuard {
             .reviewed_base
             .as_deref()
             .context("recorded approval lacks a structured integration base; refresh review")?;
+        let main = remote_main_head(repo, &inner.repository).await?;
         anyhow::ensure!(
-            remote_main_head(repo, &inner.repository).await? == reviewed_base,
+            !reviewed_main || main == reviewed_base,
             "main changed since review; integrate and verify the candidate again"
         );
         let (ok, head, _) = run(
@@ -856,7 +884,7 @@ impl SweepGuard {
                     .workflow_acceptance,
                 self.source,
                 &reference,
-                expected,
+                self.acceptance_head.as_deref().unwrap_or(expected),
             )
             .await
         }
@@ -885,7 +913,48 @@ impl SweepGuard {
             return Err(error).context("sweep approval invalidated; verification repair queued");
         }
         // Network and artifact reads can span lease expiry; fence immediately before mutation.
-        inner.validate_before_side_effect()
+        inner.validate_before_side_effect()?;
+        Ok(main)
+    }
+
+    /// #2458: durably record the main GitHub is about to merge into the
+    /// approved head, before asking it to.
+    pub(super) fn request_main_update(&self, main: &str) -> Result<()> {
+        let inner = self.inner.as_ref().context("released sweep lease")?;
+        inner.validate_before_side_effect()?;
+        let base = self.reviewed_base.as_deref().context("recorded approval lacks a structured integration base")?;
+        inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .record_main_update_request(&inner.lease, &inner.binding, main, base, millis())?;
+        inner.audit_event("main_update_requested", serde_json::json!({"main":main,"reviewed_base":base}))
+    }
+
+    /// #2458: GitHub merged main into the approved head. Verify the new PR
+    /// head is exactly that clean merge, move the resume checkout onto it and
+    /// carry the approval. Afterwards this lease validates and merges `updated`.
+    pub(super) async fn carry_main_update(&mut self, repo: &Path, updated: &str) -> Result<()> {
+        let inner = self.inner.as_mut().context("released sweep lease")?;
+        inner.validate_before_side_effect()?;
+        let update = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
+            .filter(|update| update.updated_head.is_none() && update.reviewed_head == inner.binding.head)
+            .context("no pending main update for the approved head")?;
+        let (ok, _, _) = workspace::preparation_git(repo, &["fetch", "--no-write-fetch-head", "origin", &self.branch,
+            "+refs/heads/main:refs/remotes/origin/main"]).await?;
+        anyhow::ensure!(ok, "cannot fetch the updated PR head");
+        let fetched = git_evidence(repo, &["rev-parse", "--verify", &format!("origin/{}^{{commit}}", self.branch)]).await?;
+        anyhow::ensure!(fetched.eq_ignore_ascii_case(updated), "PR head moved past the main update");
+        super::finalize::verify_main_merge(repo, &update.reviewed_head, updated, &update.main).await?;
+        let pr = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(inner.id())?.context("sweep workflow missing")?.pr.context("main update needs its PR")?;
+        advance_resume_checkout(repo, pr, &update.reviewed_head, updated).await?;
+        inner.validate_before_side_effect()?;
+        let carried = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .carry_main_update(&inner.lease, &inner.binding, updated, &update.main, millis())?;
+        inner.audit_event("main_update_carried", serde_json::json!({"reviewed_head":update.reviewed_head,
+            "updated_head":updated,"main":update.main}))?;
+        inner.binding = carried;
+        self.reviewed_base = Some(update.main);
+        self.acceptance_head = Some(update.origin_head);
+        Ok(())
     }
 
     pub(super) fn validate_note_dispatch(&self)->Result<()> {
@@ -1160,6 +1229,7 @@ impl WorkflowGuard {
             released: false,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
         };
         if let Some(context)=guard.execution_context(&guard.binding)? {
             let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
@@ -1358,6 +1428,7 @@ impl WorkflowGuard {
         let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),family_wait_released:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
@@ -2105,6 +2176,19 @@ impl WorkflowGuard {
             .epoch_attempts(&self.lease,purpose,epoch,millis())
     }
 
+    /// #2471: admit one bounded regeneration of the acceptance witness for
+    /// the own open PR head this workflow published. Refused for issue-only
+    /// work, an unpublished head, or past the per-head bound.
+    pub(super) fn begin_witness_regeneration(&self)->Result<bool> {
+        self.check_resource_policy()?;
+        let admitted=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_own_pr_witness_regeneration(&self.lease,&self.repository,&self.binding.head,millis())?;
+        if admitted {self.witness_regeneration.store(true,Ordering::SeqCst);}
+        Ok(admitted)
+    }
+    pub(super) fn end_witness_regeneration(&self) {self.witness_regeneration.store(false,Ordering::SeqCst);}
+    pub(super) fn regenerating_witness(&self)->bool {self.witness_regeneration.load(Ordering::SeqCst)}
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,
@@ -2315,6 +2399,16 @@ impl WorkflowGuard {
         Ok(eligible)
     }
 
+    /// #2458: checks still running on the bound head wait a short poll.
+    pub(super) async fn defer_hosted_ci_pending(&mut self)->Result<i64> {
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        let eligible=self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .defer_hosted_ci_pending(&self.lease,&self.binding,millis())?;
+        self.audit_event("hosted_ci_pending_wait",serde_json::json!({"eligible_at_ms":eligible}))?;
+        Ok(eligible)
+    }
+
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
         let message=format!("{error:#}");
         let Some(code)=infra_failure_reason(&message) else {return Ok(None);};
@@ -2490,7 +2584,8 @@ impl WorkflowGuard {
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
         anyhow::ensure!(matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")),
+            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")
+            | (durable::HOSTED_CI_PENDING_REASON,"retry_verification")),
             "no durable CI deferral to release");
         self.release_after_teardown()
     }
@@ -2722,6 +2817,27 @@ pub(super) async fn resume_worktree_path(repo_root:&Path,pr:u64)->Result<PathBuf
     let path=primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
     recovery::checkout_path(&primary,&path)?;
     Ok(path)
+}
+
+/// #2458: a resume checkout left on the approved head follows GitHub's merge
+/// of main, so later validation and any resumed work see the PR head. Only a
+/// clean checkout at exactly `from` moves, and only forward to `to`.
+async fn advance_resume_checkout(repo_root: &Path, pr: u64, from: &str, to: &str) -> Result<()> {
+    let path = resume_worktree_path(repo_root, pr).await?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    recovery::existing_checkout(repo_root, &path).await?;
+    let head = git_evidence(&path, &["rev-parse", "HEAD"]).await?;
+    if head.eq_ignore_ascii_case(to) {
+        return Ok(());
+    }
+    anyhow::ensure!(head.eq_ignore_ascii_case(from), "resume checkout holds another candidate");
+    let (ok, status, _) = run("git", &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], &path).await?;
+    anyhow::ensure!(ok && status.trim().is_empty(), "resume checkout has unpublished changes");
+    let (ok, _, error) = run("git", &["merge", "--ff-only", "-q", to], &path).await?;
+    anyhow::ensure!(ok, "resume checkout cannot follow the main update: {}", error.trim());
+    Ok(())
 }
 
 pub(super) async fn prepare_resume_worktree_at_head(

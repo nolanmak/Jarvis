@@ -14,6 +14,13 @@ pub(crate) const READINESS_LADDER_MIGRATION: &str = "readiness-invalid-ladder-v1
 /// declared unrecoverable, even when its checkout still exists.
 pub(crate) const EVIDENCE_HOLD_TTL_MS: i64 = 6 * 3_600_000;
 const BATCH: usize = 8;
+/// #2439: cause recorded when an own PR's contract-invalid hold re-verifies.
+pub(crate) const OWN_PR_CONTRACT_INVALID: &str = "own_pr_contract_invalid";
+/// Free recovery gets this long before an own PR's contract-invalid hold
+/// re-verifies its branch.
+pub(crate) const CONTRACT_INVALID_HOLD_TTL_MS: i64 = 3_600_000;
+/// Re-verifications from a contract-invalid hold per PR head.
+pub(crate) const CONTRACT_INVALID_REVERIFY_LIMIT: usize = 2;
 
 /// The latest unrecoverable cutover: its sequence plus the scope responses and
 /// bounded attempts that belonged to the lost original. Consumers treat them
@@ -101,6 +108,24 @@ fn reverify(
     Ok(())
 }
 
+/// Contract-invalid re-verifications already recorded for `head`.
+fn contract_invalid_reverifications(tx: &Transaction<'_>, id: &str, head: &str) -> Result<usize> {
+    let rows = tx
+        .prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind=?2")?
+        .query_map(params![id, UNRECOVERABLE], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|audit| audit["cause"] == OWN_PR_CONTRACT_INVALID)
+        .filter(|audit| {
+            audit["prior_checkpoint"].as_str()
+                .and_then(|cp| serde_json::from_str::<Checkpoint>(cp).ok())
+                .is_some_and(|cp| cp.binding.head == head)
+        })
+        .count())
+}
+
 fn prefixes(repository: &str) -> (String, String) {
     let repository = repository.to_ascii_lowercase();
     (format!("{repository}#"), format!("{repository}/pr/"))
@@ -173,7 +198,9 @@ impl WorkflowStore {
                  AND ((json_extract(checkpoint,'$.next.reason')='acceptance_verifier_evidence_unknown'
                    AND json_extract(checkpoint,'$.next.action')='await_original_evidence_recovery')
                   OR (json_extract(checkpoint,'$.next.reason')='acceptance_verifier_infrastructure_unavailable'
-                   AND json_extract(checkpoint,'$.next.action')='await_verifier_infrastructure_recovery'))
+                   AND json_extract(checkpoint,'$.next.action')='await_verifier_infrastructure_recovery')
+                  OR (pr IS NOT NULL AND json_extract(checkpoint,'$.next.reason')='acceptance_contract_invalid'
+                   AND json_extract(checkpoint,'$.next.action')='await_acceptance_input_change'))
                  ORDER BY heartbeat_at,id LIMIT 64",
             )?
             .query_map(params![now, issue, pr], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -182,6 +209,30 @@ impl WorkflowStore {
         for (id, raw, generation, pr) in rows {
             let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) else { continue };
             if !movable(&tx, &id)? {
+                continue;
+            }
+            // #2439 (PR #2449): an own PR whose witness completed invalid
+            // waits on an input nothing supplies, while its claim requires a
+            // recovery that the same invalid replies can never provide. After
+            // the free recovery window it re-verifies its branch (same head,
+            // fresh verifier under current policy), bounded per head.
+            if cp.next.reason == "acceptance_contract_invalid" {
+                let held: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(at_ms),0) FROM workflow_event WHERE workflow=?1 AND kind='checkpoint'",
+                    [&id],
+                    |r| r.get(0),
+                )?;
+                if now.saturating_sub(held) < CONTRACT_INVALID_HOLD_TTL_MS
+                    || contract_invalid_reverifications(&tx, &id, &cp.binding.head)? >= CONTRACT_INVALID_REVERIFY_LIMIT
+                {
+                    continue;
+                }
+                let worktree = qualification_schedule::context(&tx, &id, &cp.binding).ok().flatten().map(|c| c.worktree);
+                reverify(&tx, &id, generation, &cp, pr, OWN_PR_CONTRACT_INVALID, worktree.as_deref(), now)?;
+                moved += 1;
+                if moved == BATCH {
+                    break;
+                }
                 continue;
             }
             let (cause, worktree) = match qualification_schedule::context(&tx, &id, &cp.binding) {
@@ -551,5 +602,70 @@ mod tests {
             .claim_productive_for_binding(id, "ladder", 1_300, 100, &binding)
             .unwrap()
             .is_some(), "migrated readiness row is not retried");
+    }
+
+    /// Park a row on the contract-invalid hold an invalid witness leaves.
+    fn park_contract_invalid(store: &mut WorkflowStore, id: &str, worktree: &std::path::Path, pr: Option<u64>, at: i64) -> Binding {
+        let binding = park_evidence(store, id, worktree, pr, at);
+        let lease = store.claim(id, "witness", at + 4, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.next = NextAction {
+            reason: "acceptance_contract_invalid".into(),
+            action: "await_acceptance_input_change".into(),
+            eligible_at_ms: 0,
+        };
+        cp.stage = Stage::Scope;
+        store.checkpoint(&lease, &cp, at + 5).unwrap();
+        store.release(&lease, at + 6).unwrap();
+        binding
+    }
+
+    /// #2439 (PR #2449, head 62d22fa2, all required checks green): the
+    /// witness completed invalid on every bounded retry, so the workflow held
+    /// `acceptance_contract_invalid` / `await_acceptance_input_change`. Its
+    /// claim requires a free recovery from the same invalid replies, which
+    /// never comes, so the green PR waited for good. After the recovery
+    /// window an own PR re-verifies its branch on the same head, at most
+    /// twice per head; issue-only rows keep their existing ladder.
+    #[test]
+    fn an_own_pr_contract_invalid_hold_reverifies_its_branch_bounded_per_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id = "owner/repo#2439";
+        let binding = park_contract_invalid(&mut store, id, dir.path(), Some(2449), 1);
+        let issue_only = "owner/repo#2440";
+        park_contract_invalid(&mut store, issue_only, dir.path(), None, 1);
+        let untouched = (store.snapshot(issue_only).unwrap().unwrap(), store.events(issue_only).unwrap());
+        assert!(store.claim_productive_for_binding(id, "parked", 9, 100, &binding).unwrap().is_none(),
+            "fixture is not the parked own PR");
+        assert_eq!(store.reverify_unrecoverable_original_evidence("owner/repo", CONTRACT_INVALID_HOLD_TTL_MS, |p| p.exists()).unwrap(), 0,
+            "a fresh hold must keep its free recovery window");
+        let mut now = 6 + CONTRACT_INVALID_HOLD_TTL_MS;
+        for round in 0..CONTRACT_INVALID_REVERIFY_LIMIT {
+            assert_eq!(store.reverify_unrecoverable_original_evidence("owner/repo", now, |p| p.exists()).unwrap(), 1,
+                "round {round}: the green own PR stayed parked on an input nothing supplies");
+            let after = store.snapshot(id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.next.reason, REVERIFY_REASON);
+            assert_eq!(after.checkpoint.next.action, "rescope_executable_acceptance");
+            assert_eq!(after.checkpoint.binding, binding, "the PR head changed");
+            assert_eq!(after.pr, Some(2449));
+            let events = audit(&store, id, UNRECOVERABLE);
+            assert_eq!(events.len(), round + 1);
+            assert_eq!(events[round]["cause"], OWN_PR_CONTRACT_INVALID);
+            assert_eq!(events[round]["mode"], "reverify_branch", "the branch was not kept");
+            assert!(store.claim_productive_for_binding(id, "fresh", now + 1, 100, &binding).unwrap().is_some(),
+                "round {round}: re-verification is not claimable");
+            // The fresh witness completes invalid again on the same head.
+            let lease = store.claim(id, "witness", now + 200, 100).unwrap().unwrap();
+            let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+            cp.next = NextAction { reason: "acceptance_contract_invalid".into(), action: "await_acceptance_input_change".into(), eligible_at_ms: 0 };
+            store.checkpoint(&lease, &cp, now + 201).unwrap();
+            store.release(&lease, now + 202).unwrap();
+            now += 202 + CONTRACT_INVALID_HOLD_TTL_MS;
+        }
+        assert_eq!(store.reverify_unrecoverable_original_evidence("owner/repo", now, |p| p.exists()).unwrap(), 0,
+            "re-verification from a contract-invalid hold is unbounded on one head");
+        assert_eq!((store.snapshot(issue_only).unwrap().unwrap(), store.events(issue_only).unwrap()), untouched,
+            "an issue-only contract-invalid row changed");
     }
 }
