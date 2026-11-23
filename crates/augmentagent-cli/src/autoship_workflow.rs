@@ -19,6 +19,8 @@ pub(crate) mod owner_checkout_recovery;
 pub(crate) mod checkout_continuity;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
+#[path="autoship_review_binding_cap.rs"]
+pub(crate) mod review_binding_cap;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};

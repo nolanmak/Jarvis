@@ -179,6 +179,25 @@ pub(crate) async fn apply(
             .map_err(|error| error.error)?;
         std::fs::File::open(control)?.sync_all()?;
     }
+    // #2451: dispute → amend → review → dispute is bounded. Every round,
+    // failed amendments included, costs a full review; past the limit the
+    // remaining findings are rescoped instead of amended again.
+    {
+        use crate::autoship_workflow::review_binding_cap::{adjudication_round_key, ADJUDICATION_ROUND_PURPOSE, MAX_ADJUDICATION_ROUNDS};
+        let round_key = adjudication_round_key(&source.key(), prepared.baseline.registration.baseline_head());
+        if !workflow.admit_epoch_attempt(ADJUDICATION_ROUND_PURPOSE, &round_key, MAX_ADJUDICATION_ROUNDS)? {
+            workflow
+                .checkpoint(
+                    crate::autoship_workflow::Stage::Scope,
+                    "adjudication_rounds_exhausted",
+                    "rescope_remaining_findings",
+                    chrono::Utc::now().timestamp_millis() + 300_000,
+                    &[format!("adjudication-rounds:{round_key}:{MAX_ADJUDICATION_ROUNDS}")],
+                )
+                .await?;
+            bail!("final contract ruling action: rescope_remaining_findings (adjudicated amendment rounds exhausted: {MAX_ADJUDICATION_ROUNDS})");
+        }
+    }
     let result = amendment::try_amend(
         reasoner,
         source,
