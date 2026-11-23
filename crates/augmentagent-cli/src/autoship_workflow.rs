@@ -112,6 +112,8 @@ pub(crate) mod owner_control;
 pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_main_update.rs"]
+pub(crate) mod main_update;
 #[path = "autoship_ci_code_repair.rs"]
 pub(crate) mod ci_code_repair;
 #[path = "autoship_tool_capacity.rs"]
@@ -129,7 +131,7 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::VerificationDomain;
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -873,6 +875,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS integration_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS main_update_carry (
+                workflow TEXT NOT NULL REFERENCES workflow(id), reviewed_head TEXT NOT NULL,
+                main TEXT NOT NULL, reviewed_base TEXT NOT NULL, origin_head TEXT NOT NULL,
+                updated_head TEXT, requested_at INTEGER NOT NULL, carried_at INTEGER,
+                PRIMARY KEY(workflow, reviewed_head));
             CREATE TABLE IF NOT EXISTS integration_recovery (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);

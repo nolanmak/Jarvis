@@ -1780,7 +1780,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     // locally only after the complete pool is known, then apply fair windows.
     let out = if let Some(target) = selected {
         let read = run(&gh, &["pr","view",&target.pr.to_string(),"--repo",&target.repository,"--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body"],repo_root).await;
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body"],repo_root).await;
         let row = match read {
             Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
             _ => None,
@@ -1791,7 +1791,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         serde_json::json!([row]).to_string()
     } else { match complete_repository_inventory(repo_root, "pr", None,
-        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
+        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body").await {
         Ok(out) => out,
         Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
     }};
@@ -1861,7 +1861,16 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // box's own record is the half of provenance GitHub cannot produce, and
         // the half that binds to a specific pull request rather than a shape.
         let record = opened_prs::get(issue);
-        let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
+        // #2458: after GitHub merged main into the approved head, the
+        // approval recorded at that head reaches the merge commit through
+        // the durable update. Resolved before any gate reads approval.
+        let carry = match (record.as_ref(), head_sha.as_deref()) {
+            (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
+                finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
+            _ => None,
+        };
+        let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
+        let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
         if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
                 if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
@@ -1874,7 +1883,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // hosted CI reader alone costs about 30 REST calls per PR, and most
         // examined PRs are not yet approved.
         let ours = head_is_ours(row, owner.as_deref());
-        let loop_authored = loop_authored(body, issue, pr, head_sha.as_deref(), record.as_ref())
+        let loop_authored = loop_authored(body, issue, pr, approval_head.as_deref(), record.as_ref())
             || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue));
         let mergeable = match row.get("mergeable").and_then(serde_json::Value::as_str) {
             Some("MERGEABLE") => Some(true),
@@ -1951,11 +1960,39 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
                 let head = candidate_head.clone().unwrap_or_default();
                 let recorded = match serde_json::to_string(&record) { Ok(value) => value, Err(_) => continue };
-                let sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, &head, &recorded).await {
+                // #2458: an uncarried update is authorized by the head it merged into.
+                let pending_carry = carry.as_ref().filter(|c| c.pending);
+                let authorized = pending_carry.map_or(head.as_str(), |c| c.reviewed_head.as_str());
+                let mut sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, authorized, &recorded).await {
                     Ok(Some(lease)) => lease,
                     Ok(None) => { info!(pr, "merge sweep: workflow busy or approval evidence changed"); continue; }
                     Err(error) => { warn!(pr, "merge sweep lease unavailable: {error:#}"); continue; }
                 };
+                if pending_carry.is_some() {
+                    if let Err(error) = sweep_lease.carry_main_update(repo_root, &head).await {
+                        warn!(pr, "merge sweep cannot carry the approval to the main update: {error:#}"); continue;
+                    }
+                }
+                // #2458: green but BEHIND main under strict protection. Merge
+                // main in with a merge commit; checks rerun on it and a later
+                // tick merges it once green. No worker slot, no model call.
+                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                    let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
+                        Ok(main) => main,
+                        Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
+                    };
+                    if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                        continue;
+                    }
+                    if let Err(error) = sweep_lease.request_main_update(&main) {
+                        warn!(pr, "merge sweep main update unavailable: {error:#}"); continue;
+                    }
+                    match finalize::update_branch(repo_root, &repository, pr, &head).await {
+                        Ok(()) => info!(pr, issue, "merge sweep: merged main into the approved head; merging once checks pass on it"),
+                        Err(error) => warn!(pr, "merge sweep: update-branch refused: {error:#}"),
+                    }
+                    continue;
+                }
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
                 }
@@ -2081,6 +2118,8 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>, before_
 /// determined, which the sweep treats as "do not merge".
 #[path = "self_improve_optional_checks.rs"]
 mod optional_checks;
+#[path = "self_improve_finalize.rs"]
+mod finalize;
 
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
@@ -10532,7 +10571,7 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
 /// #2444 — every PR reader shares one listing per tick, so it asks for the
 /// union of the fields any reader needs (including routing labels and closing
 /// references, which used to cost a `gh pr view` per open PR).
-const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
     let fields=if kind=="pr" {
