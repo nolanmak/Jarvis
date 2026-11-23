@@ -8751,8 +8751,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     workflow_guard.require_fresh_issue(repo_root).await?;
     if saved_scope.is_none() {if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
-                return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
+            if let Some(base)=acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
+                workflow_guard.validate_before_side_effect()?;
+                return Ok(match close_satisfied_issue(repo_root,issue.number,&base,automatic_routing).await {
+                    Ok(())=>RunReport::triage(format!("issue #{}: current main `{}` satisfies the request (registered observations and independent completeness review); closed as completed",issue.number,truncate(&base,12))),
+                    Err(error)=>{
+                        warn!(issue=issue.number,"satisfied issue left open: {error:#}");
+                        RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; closing held; automatically re-evaluate on request/main change",issue.number))
+                    }
+                });
             }
             // A model's relevance claim or an inadequate green test is never
             // enough to retire useful work. Generate a fresh falsifier below.
@@ -10765,6 +10772,22 @@ async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()>
     if !ok {
         bail!("gh issue comment failed: {e}");
     }
+    Ok(())
+}
+
+/// #2462 (#1644): current main was independently proven to satisfy the issue
+/// (registered verifiers already green on `base`, plus a separate completeness
+/// review). Close it as completed instead of re-proving it on every main
+/// change. Terminal routing and owner controls are re-observed right before
+/// the write; the workflow retires through the closed-target path.
+async fn close_satisfied_issue(repo_root:&Path,issue:u64,base:&str,automatic:bool)->Result<()> {
+    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,None,automatic).await,
+        "terminal controls or routing held before closing a satisfied issue");
+    let comment=format!("Autoship: current main already satisfies this issue. Independently registered \
+        verifiers pass on main `{base}`, and a separate completeness review covered every criterion. \
+        Closing as completed; reopen it to request more work.");
+    let (ok,_,error)=run(&gh_bin(),&["issue","close",&issue.to_string(),"--reason","completed","--comment",&comment],repo_root).await?;
+    anyhow::ensure!(ok,"closing satisfied issue #{issue} failed: {}",truncate(&error,300));
     Ok(())
 }
 
@@ -19308,6 +19331,71 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert!(log.contains("--add-label"), "{log}");
             let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
             assert!(comments.contains(&format!("reason=stuck:gate-red:{fp}")), "{comments}");
+        });
+    }
+
+    /// #1644: independent proof that current main already satisfies an issue
+    /// parked it on `await_request_or_main_change`. Main changes many times a
+    /// day, so the same paid scope, verifier and completeness review re-ran
+    /// and re-proved "already done" forever (the owner paused it by hand).
+    /// The proof now closes the issue as completed, once, through the same
+    /// terminal routing and owner controls as every other terminal write.
+    #[test]
+    fn issue_proven_satisfied_on_main_closes_as_completed() {
+        const CHILD: &str = "JARVIS_1644_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("fake-gh.py");
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['JARVIS_1644_ROOT'])
+args = sys.argv[1:]
+with (root/'gh-calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\n')
+labels = json.loads((root/'labels.json').read_text())
+if args[:2]==['repo','view']:
+    print('fixture-owner/repo')
+elif args[:2]==['api','repos/fixture-owner/repo/issues/1644']:
+    print(json.dumps({'number':1644,'state':'open','labels':[{'name':n} for n in labels]}))
+elif args[:2]==['issue','close']:
+    print('closed')
+else:
+    sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n'); sys.exit(1)
+"#).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::issue_proven_satisfied_on_main_closes_as_completed", "--nocapture"])
+                .env(CHILD, "1")
+                .env("JARVIS_1644_ROOT", root.path())
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.path().join("workflow.db"))
+                .env("HOME", root.path().join("home"))
+                .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.path().join("state"))
+                .env("GH_BIN", gh)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("JARVIS_1644_ROOT").unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let calls = || std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap_or_default()
+                .lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+            let base = "4fbb04bf69c9a69f577136ab5009b78aef94a55c";
+            // A manual issue is never closed by automatic routing.
+            std::fs::write(root.join("labels.json"), format!("[\"{MANUAL_ENGINEERING_LABEL}\"]")).unwrap();
+            assert!(close_satisfied_issue(&root, 1644, base, true).await.is_err());
+            assert!(!calls().iter().any(|call| call.starts_with(&["issue".into(), "close".into()])));
+            std::fs::write(root.join("labels.json"), "[]").unwrap();
+            close_satisfied_issue(&root, 1644, base, true).await.unwrap();
+            let closes = calls().into_iter().filter(|call| call.starts_with(&["issue".into(), "close".into()])).collect::<Vec<_>>();
+            assert_eq!(closes.len(), 1, "{closes:?}");
+            let close = &closes[0];
+            assert_eq!(close[2], "1644");
+            assert_eq!(close[close.iter().position(|a| a == "--reason").unwrap() + 1], "completed");
+            let comment = &close[close.iter().position(|a| a == "--comment").unwrap() + 1];
+            assert!(comment.contains(base) && comment.contains("already satisfies"), "{comment}");
         });
     }
 

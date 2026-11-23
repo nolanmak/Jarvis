@@ -889,6 +889,21 @@ fn only_unmapped_hunks_named(detail: &str) -> bool {
 mod tests {
     use super::*;
     use anyhow::ensure;
+    /// #2471: an EvidenceUnknown hold logged nothing about which check
+    /// fired. The stderr line carries the controller's own check message as a
+    /// code, or only a hash when the chain could carry private text.
+    #[test]
+    fn evidence_unknown_hold_names_its_failed_check_without_private_text() {
+        let error=anyhow::anyhow!("corrective controller witness question is unavailable or changed")
+            .context(initial_repair::Hold::EvidenceUnknown);
+        let (code,sha)=hold_cause(&error);
+        assert!(code.contains("corrective controller witness question is unavailable or changed"),"{code}");
+        assert_eq!(sha.len(),64);
+        let private=anyhow::anyhow!("read /home/someone/secret/plan.json failed").context(initial_repair::Hold::EvidenceUnknown);
+        let (code,sha)=hold_cause(&private);
+        assert!(code.starts_with("withheld:") && !code.contains("someone"),"{code}");
+        assert_ne!(sha,hold_cause(&error).1);
+    }
     #[test]
     fn a_narrowing_repair_is_offered_only_when_unmapped_changes_are_the_whole_failure() {
         let marker = crate::self_improve::alignment::UNMAPPED_LOCATIONS;
@@ -1607,6 +1622,18 @@ mod initial_diagnostic_tests {
     }
 }
 
+/// #2471: which check produced an acceptance hold, for the worker log. The
+/// controller's own check messages are fixed text; a chain that could carry a
+/// path or other private text is reduced to a hash. The full diagnostic stays
+/// in the private scope-stage record.
+fn hold_cause(error:&anyhow::Error)->(String,String) {
+    let chain=format!("{error:#}");
+    let sha=amendment::digest(chain.as_bytes());
+    let safe=chain.len()<=600 && !chain.contains('/') && !chain.contains('\\')
+        && augmentagent_channel_core::public_report::validate("",&chain).is_ok();
+    (if safe {chain} else {format!("withheld:{}",&sha[..16])},sha)
+}
+
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
     if workflow.semantic_source_waiting()? {return Ok(Some(RunReport::held("Autoship waiting for original verification evidence; candidate and prior charges preserved".into())));}
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
@@ -1614,6 +1641,8 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     // make the workflow runnable or publish the underlying source/output.
     let original=error.downcast_ref::<verifier_execution::OriginalExecutionFailed>().map(|failure|failure.plan.as_str());
     workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),native_custody_failure(error),original).await?;
+    let (cause,cause_sha256)=hold_cause(error);
+    warn!(workflow=%workflow.id(),reason=hold.reason(),%cause,%cause_sha256,"initial acceptance hold recorded");
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&(
         "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
@@ -1643,6 +1672,8 @@ async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard
     if let Some(setup)=retained_setup_failure(error) {
         workflow.hold_enrolled_setup_failure(prepared,setup).await?;
     }else {workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;}
+    let (cause,cause_sha256)=hold_cause(error);
+    warn!(workflow=%workflow.id(),reason=hold.reason(),%cause,%cause_sha256,"enrolled acceptance hold recorded");
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});

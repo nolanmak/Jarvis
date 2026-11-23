@@ -355,13 +355,23 @@ fn require_admitted_native_references(evidence:&crate::autoship_workflow::Verifi
     Ok(())
 }
 
-fn require_empty_native_history(control:&Path)->Result<()> {
+/// `archived_before_ms` is the latest scope cutover (#2356 unrecoverable
+/// original or owner checkout recovery). Native history written before it
+/// belongs to the archived episode, like its DB rows: kept, never replayed,
+/// and no reason to refuse the fresh episode (#2459).
+fn require_empty_native_history(control:&Path,archived_before_ms:Option<i64>)->Result<()> {
     let entries=match std::fs::read_dir(control) {
         Ok(entries)=>entries,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),Err(error)=>return Err(error.into()),
     };
     for entry in entries {
         let entry=entry?;
         let name=entry.file_name();let Some(name)=name.to_str() else {continue};
+        if let Some(cutover)=archived_before_ms {
+            let metadata=std::fs::symlink_metadata(entry.path())?;
+            let written=metadata.modified()?.duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed|i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)).unwrap_or(0);
+            if metadata.is_file() && written<cutover {continue;}
+        }
         if name.ends_with(".json") && name.starts_with("primary-scope-")
             && !scope_authority::requires_baseline_custody(&entry.path())
                 .map_err(|error|error.context(crate::autoship_workflow::NativeScopeOutcomeUnresolved))? {continue;}
@@ -402,7 +412,7 @@ pub(super) fn retained_controller_slots_for(root:&Path,control:&Path,prepared:&P
     let bindings=admissions.iter().map(|data|(data.custody.input.clone(),data.binding.clone())).collect::<BTreeMap<_,_>>();
     let custody=admissions.into_iter().map(|data|data.custody).collect::<Vec<_>>();
     require_admitted_native_references(evidence,&custody)?;
-    if custody.is_empty() {require_empty_native_history(control)?;return Ok(Vec::new());}
+    if custody.is_empty() {require_empty_native_history(control,evidence.cutover_at_ms()?)?;return Ok(Vec::new());}
     retained_namespace(control,&custody)?;
     scope_authority::require_retained_native_custody(root,&custody)?;
     let base=prepared.baseline.registration.baseline_head();
