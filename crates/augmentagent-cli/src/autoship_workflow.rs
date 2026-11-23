@@ -65,6 +65,8 @@ mod adopted_publication;
 
 #[path = "autoship_push_observation.rs"]
 mod push_observation;
+#[path = "autoship_publish_checkpoint.rs"]
+mod publish_checkpoint;
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
