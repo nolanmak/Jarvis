@@ -425,6 +425,34 @@ impl std::error::Error for ControllerWitnessChanged {}
 pub(super) fn controller_witness_changed(error:&anyhow::Error)->bool {
     error.chain().any(|cause|cause.downcast_ref::<ControllerWitnessChanged>().is_some())
 }
+/// #2491: no retained original measurement matches the prepared contract,
+/// for example because an `original_evidence_unrecoverable` cutover archived
+/// every original result. This is not ambiguity, and it refuses unless an
+/// own-PR regeneration was admitted.
+#[derive(Debug)]
+pub(super) struct OriginalMeasurementMissing;
+impl std::fmt::Display for OriginalMeasurementMissing {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("retained witness original measurement is missing")}
+}
+impl std::error::Error for OriginalMeasurementMissing {}
+pub(super) fn original_measurement_missing(error:&anyhow::Error)->bool {
+    error.chain().any(|cause|cause.downcast_ref::<OriginalMeasurementMissing>().is_some())
+}
+/// Holds that #2477's bounded regeneration on the same own-PR head resolves.
+pub(super) fn regenerates_own_pr_witness(error:&anyhow::Error)->bool {
+    controller_witness_changed(error) || original_measurement_missing(error)
+}
+/// #2491: the one retained original result to requalify from. `None` admits a
+/// regenerated witness for the current contract on the same head, and only
+/// under `Corrective::Regenerate`. Ambiguity always refuses.
+pub(super) fn original_reference<T>(mut references:Vec<T>,mode:Corrective)->Result<Option<T>> {
+    match references.len() {
+        1=>Ok(references.pop()),
+        0 if mode==Corrective::Regenerate=>Ok(None),
+        0=>Err(OriginalMeasurementMissing.into()),
+        _=>bail!("retained witness original measurement is ambiguous"),
+    }
+}
 pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<RetainedWitnessRunData>> {
     retained_controller_slots_for(root,control,prepared,evidence,Corrective::Refuse)
@@ -532,9 +560,8 @@ fn requalification_error(error:anyhow::Error)->anyhow::Error {
 pub(super) fn retained_qualification_reference(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Option<crate::autoship_workflow::RetainedWitnessReference>> {
     if retained_controller_slots(root,control,prepared,evidence)?.is_empty() {return Ok(None);}
-    let references=verifier_execution::matching_original_results(prepared,evidence)?;
-    ensure!(references.len()==1,"retained witness original measurement is missing or ambiguous");
-    let (plan,result)=&references[0];
+    let (plan,result)=&original_reference(verifier_execution::matching_original_results(prepared,evidence)?,Corrective::Refuse)?
+        .context("retained witness original measurement is missing")?;
     let data=retained_original_witness_data(root,control,plan,result,evidence)?.context("retained original witness data missing")?;
     let serialized=serde_json::to_vec(prepared)?;
     ensure!(serde_json::to_vec(&data.original.prepared)?==serialized,"retained original measurement changed");
@@ -609,9 +636,12 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
                 ensure!(retained.is_none() || mode==Corrective::Regenerate,"known retained original witness data is unavailable; fresh witness generation is forbidden");
                 return Ok(false);
             }
-            let references=verifier_execution::matching_original_results(prepared,evidence)?;
-            ensure!(references.len()==1,"retained witness original measurement is missing or ambiguous");
-            let (plan,result)=&references[0];
+            // #2491: an admitted own-PR regeneration replaces an archived
+            // original measurement with a witness for the current contract.
+            let Some((plan,result))=original_reference(verifier_execution::matching_original_results(prepared,evidence)?,mode)? else {
+                return Ok(false);
+            };
+            let (plan,result)=(&plan,&result);
             let data=retained_original_witness_data(root,&native_control,plan,result,evidence)?.context("retained original witness data missing")?;
             ensure!(serde_json::to_vec(&data.original.prepared)?==serde_json::to_vec(prepared)?,"retained original measurement changed");
             if let Some(reference)=&retained {
@@ -1358,6 +1388,32 @@ mod tests {
             "if READY:\r\n    return True\r\n\r\nreturn False","if READY:\n    return True\nreturn False","  if READY:\n    return True\n\nreturn False"] {
             assert!(validate(root.path(),&prepared.proposal,&prepared.baseline,&expected,&cite(fault)).is_err(),"accepted a changed quote {fault:?}");
         }
+    }
+
+    /// #2491 (PR #2449, 14:34Z): the 13:05Z `original_evidence_unrecoverable`
+    /// cutover archived every original result, so requalification found none,
+    /// and the own PR parked as evidence-unknown. A missing measurement now
+    /// names itself, survives the evidence-unknown wrapping, and triggers
+    /// #2477's bounded regeneration. Under that regeneration it admits a fresh
+    /// witness. Ambiguity and the non-regenerating path still refuse.
+    #[test]
+    fn a_missing_original_measurement_regenerates_the_own_pr_witness() {
+        let missing=original_reference(Vec::<(String,String)>::new(),Corrective::Refuse).unwrap_err();
+        let held=requalification_error(missing);
+        assert_eq!(held.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"the hold type changed");
+        assert!(original_measurement_missing(&held) && regenerates_own_pr_witness(&held),"a missing measurement parked instead of regenerating: {held:#}");
+        assert_eq!(original_reference(Vec::<(String,String)>::new(),Corrective::Regenerate).unwrap(),None,
+            "an admitted regeneration still required the archived measurement");
+        let one=vec![("plan".to_string(),"result".to_string())];
+        for mode in [Corrective::Refuse,Corrective::Regenerate] {
+            assert_eq!(original_reference(one.clone(),mode).unwrap(),Some(one[0].clone()),"a retained measurement was set aside");
+            let two=vec![one[0].clone(),("other".to_string(),"result".to_string())];
+            let ambiguous=original_reference(two,mode).unwrap_err();
+            assert!(!regenerates_own_pr_witness(&ambiguous),"ambiguity regenerated the witness");
+        }
+        let changed=anyhow::Error::from(ControllerWitnessChanged).context(initial_repair::Hold::EvidenceUnknown);
+        assert!(regenerates_own_pr_witness(&changed),"#2477's controller change no longer regenerates");
+        assert!(!regenerates_own_pr_witness(&anyhow::anyhow!("baseline_witness_invalid: other")));
     }
 
     #[test]

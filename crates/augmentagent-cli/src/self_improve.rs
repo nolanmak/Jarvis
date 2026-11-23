@@ -7198,6 +7198,23 @@ async fn resume_draft_pr(
     if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
         return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; re-evaluated daily or when main or the issue changes")));
     }
+    // #2491: a push this workflow checkpointed for the exact head it built
+    // goes first. The push is idempotent and pinned to that head, so a later
+    // acceptance hold can no longer strand finished work unpublished. It also
+    // makes the head the workflow's own published head, which #2477's bounded
+    // witness regeneration requires. A changed contract or source is a
+    // different binding and takes the normal path below.
+    if workflow.unpushed_publish_checkpoint()? {
+        if let Err(error) = workflow.push_fresh(repo_root, branch, expected_head.is_none()).await {
+            if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
+            if let Some(report) = linked_claims::report(&error) { return Ok(report); }
+            workflow.transition(Stage::Publish, "publishing_revision", "push", chrono::Utc::now().timestamp_millis() + 60_000).await?;
+            return Err(error.context("resume: checkpointed publication push deferred; candidate preserved"));
+        }
+        info!(pr, issue = issue.number, head = %workflow.binding().head, "resume: published the workflow's checkpointed head before acceptance");
+    }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
     let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
     let mut ci_findings = match ci_preparation {
@@ -16395,6 +16412,29 @@ CODEX-REVIEW: lgtm").0);
         assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
         assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
         assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2491 (PR #2449, 14:33Z): the resume ran acceptance preparation before
+    /// the push its own `publish` checkpoint was waiting for, and parked the
+    /// verified head unpublished. The checkpointed push comes first: after the
+    /// rescope gate reads the entry, and before the resume moves the
+    /// checkpoint or prepares acceptance.
+    #[test]
+    fn resume_pushes_its_checkpointed_head_before_acceptance() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
+        let pending = at("if workflow.unpushed_publish_checkpoint()? {");
+        let pushed = at("workflow.push_fresh(repo_root, branch, expected_head.is_none())");
+        let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
+        let prepared = at("acceptance::prepare_acceptance(");
+        let qualified = at("acceptance::qualify_or_amend(");
+        assert!(parked < pending && pending < pushed, "the checkpointed push must follow the owner-stop gate");
+        assert!(pushed < started && started < prepared && prepared < qualified,
+            "the checkpointed push must come before the resume re-establishes acceptance");
     }
 
     // --- #931 baseline check: a red `main` is not the builder's failure ----
