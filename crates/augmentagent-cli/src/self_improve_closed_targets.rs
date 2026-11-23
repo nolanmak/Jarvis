@@ -27,10 +27,41 @@ pub(crate) const RECHECK_MS: i64 = 6 * 60 * 60 * 1000;
 /// Bound on GitHub lookups per sweep pass.
 const PER_PASS: usize = 8;
 
-/// When each waiting workflow was last looked up. Process memory is enough:
-/// after a restart every waiting workflow is checked once more, which is the
-/// same bounded lookup.
+/// When each waiting workflow was last looked up. Loaded from, and saved to,
+/// [`checks_path`] so the rotation survives restarts.
+///
+/// #2461 follow-up (#1830 / PR #2091): this lived in process memory only, so
+/// each restart started over at the [`PER_PASS`] longest-idle rows. Thirteen
+/// still-open rows were idle longer than #1830, and the worker restarted
+/// under an hour apart (09:37, 09:57, 10:37Z on 2026-11-23), so the pass that
+/// reaches #1830 never ran and #2473's closed-source path never fired.
 static LAST_CHECKED: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// Durable rotation state next to the workflow database.
+pub(crate) fn checks_path(path: &Path) -> std::path::PathBuf {
+    path.with_file_name("autopr-closed-target-checks.json")
+}
+
+/// Missing or unreadable state is an empty rotation: every row is due.
+fn load_checks(file: &Path) -> HashMap<String, i64> {
+    std::fs::read(file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Best effort: a failed save only costs a repeated bounded lookup.
+fn save_checks(file: &Path, map: &HashMap<String, i64>) {
+    let Some(dir) = file.parent() else { return };
+    let Ok(bytes) = serde_json::to_vec(map) else { return };
+    let Ok(mut staged) = tempfile::NamedTempFile::new_in(dir) else { return };
+    use std::io::Write;
+    if staged.write_all(&bytes).is_ok() && staged.as_file().sync_all().is_ok() {
+        if let Err(error) = staged.persist(file) {
+            debug!("closed-target rotation not saved: {error}");
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -90,19 +121,22 @@ where
     Fut: Future<Output = Outcome>,
 {
     let waiting = waiting(path, repository, now)?;
+    let file = checks_path(path);
     let todo = {
         let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
-        let map = guard.get_or_insert_with(HashMap::new);
+        let map = guard.get_or_insert_with(|| load_checks(&file));
         map.retain(|id, _| waiting.contains(id));
         due(waiting, map, now)
     };
     let mut settled = 0;
     for id in todo {
         let outcome = check(id.clone()).await;
-        last.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(HashMap::new)
-            .insert(id.clone(), now);
+        {
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            let map = guard.get_or_insert_with(|| load_checks(&file));
+            map.insert(id.clone(), now);
+            save_checks(&file, map);
+        }
         match outcome {
             Outcome::Settled => {
                 settled += 1;
@@ -389,6 +423,41 @@ mod tests {
         }
         let missed: Vec<&String> = ids.iter().filter(|id| !reached.contains(*id)).collect();
         assert!(missed.is_empty(), "never looked up: {missed:?}");
+    }
+
+    /// #1830 / PR #2091 (2026-11-23): #2473's closed-source path never ran
+    /// because #1830 was the 14th longest-idle row and every restart, under
+    /// an hour apart, re-checked the same first eight. The rotation now
+    /// survives a restart, so the next pass reaches the next rows.
+    #[tokio::test]
+    async fn a_restart_continues_the_rotation_instead_of_rechecking_the_queue_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let ids: Vec<String> = (1..=14).map(|n| format!("owner/repo#{n}")).collect();
+        for (n, id) in ids.iter().enumerate() {
+            park(&mut store, id, Stage::Reconcile, n as i64);
+        }
+        let seen = Mutex::new(Vec::new());
+        let still_open = |id: String| {
+            seen.lock().unwrap().push(id);
+            async { Outcome::StillOpen }
+        };
+        let before_restart = Mutex::new(None);
+        sweep_with(&path, "owner/repo", 7 * HOUR, &before_restart, still_open).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ids[..PER_PASS].to_vec());
+        // The worker restarts 20 minutes later: process memory is gone.
+        seen.lock().unwrap().clear();
+        let after_restart = Mutex::new(None);
+        sweep_with(&path, "owner/repo", 7 * HOUR + 20 * 60 * 1000, &after_restart, |id: String| {
+            seen.lock().unwrap().push(id);
+            async { Outcome::StillOpen }
+        })
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, ids[PER_PASS..].to_vec(), "a restart re-checked the queue head instead of reaching the rest");
+        assert!(seen.contains(&"owner/repo#14".to_string()), "the 14th idle row (#1830's position) was never reached");
     }
 
     /// A long queue is worked through a bounded number of lookups at a time.
