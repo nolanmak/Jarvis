@@ -15845,9 +15845,22 @@ CODEX-REVIEW: lgtm").0);
         let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
+        // #2495: the resume-first block is gated by `resume_ceiling`. An owed
+        // build slot admits only finishing work (green head, publish, CI
+        // pending); ordinary drafts still yield the slot to a build.
         let resume_first = body
-            .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
+            .find("let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);")
             .expect("the resume-first block yields a reserved slot");
+        assert!(body[resume_first..].starts_with("let ceiling") && body.contains("find_resumable_draft(repo_root, None, dry_run, ceiling)"));
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "an owed build slot must not go to ordinary draft work");
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other));
+        assert_eq!(resume_ceiling(Lane::Build, true, false), None);
+        assert_eq!(resume_ceiling(Lane::Combined, false, false), None);
+        let fallback = &src[src.find("async fn waiting_issue_fallback(").expect("fallback")..];
+        let fallback = &fallback[..fallback.find("\n}\n").expect("fallback end")];
+        assert!(fallback.contains("find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other)"),
+            "with no build to run, the reserved slot falls back to any waiting draft");
         let pick=body.find("match select_issue_with_fallback(repo_root, dry_run, prefer_build, || waiting_issue_fallback(repo_root,dry_run)).await").expect("production picker and guarded waiting-work fallback");
         assert!(resume_first<pick,"resume-first still precedes reserved-slot issue selection");
 
