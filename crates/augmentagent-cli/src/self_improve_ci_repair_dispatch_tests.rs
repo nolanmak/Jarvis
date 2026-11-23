@@ -849,6 +849,17 @@ async fn targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair(
         assert_eq!(scope.files, vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
         assert_eq!(scope.checks, vec!["targeted".to_string()]);
         assert!(scope.tests.contains(&"notify_tests::registry_covers_every_producer_in_the_code".to_string()), "{:?}", scope.tests);
+        // #2456: the refused replay is recorded as the reason the regression
+        // is unknown, beside the evidence that does exist.
+        assert_eq!(scope.unreplayed, Some("ci_selection_contract_required"), "a refused replay reads as a definite answer");
+        assert_eq!(scope.panic_locations, vec!["crates/augmentagent-cli/src/notify_tests.rs:171:5".to_string()]);
+        let main = scope.main.expect("main's hosted checks were not read");
+        assert_eq!(main.head, git(&root, &["rev-parse", "origin/main"]));
+        assert_eq!((main.basis, main.green), ("all_main_checks", Some(true)),
+            "`targeted` is pull-request only, so main's push checks are the comparison");
+        let lookups = std::fs::read_to_string(control.join("calls.jsonl")).unwrap().lines()
+            .filter(|line| line.contains("/check-runs")).count();
+        assert_eq!(lookups, 1, "main's checks take one aggregate read");
         return;
     }
     child(TEST, "scope-evidence", false);
