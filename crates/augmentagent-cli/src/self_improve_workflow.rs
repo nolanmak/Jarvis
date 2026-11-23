@@ -1554,6 +1554,16 @@ impl WorkflowGuard {
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
     }
+    /// The durable checkpoint as it stands, before this run moves it.
+    pub(super) fn current_checkpoint(&self) -> Result<Checkpoint> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?
+            .context("workflow missing")?
+            .checkpoint)
+    }
     /// #2430: the PR branch this workflow publishes to.
     pub(super) fn branch(&self) -> Result<String> {
         Ok(self

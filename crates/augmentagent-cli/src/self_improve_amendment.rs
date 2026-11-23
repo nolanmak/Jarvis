@@ -727,6 +727,93 @@ pub(super) async fn try_amend(
         return Ok(None);
     }
     environments.authorize(decision.approve_environment_transition)?;
+    activate(root, control, workflow, old, &environments.current_original_baseline, Approved {
+        proposal, decision, head, input_hash, candidate_environment,
+        native_provider, native_session, prompt_hash: digest(prompt.as_bytes()),
+    }).await
+}
+
+/// #2488: the controller's own-PR rescope revision. The bounded CI scope
+/// amendment refused (or its rounds ran out), so nothing else would ever
+/// change the contract and the PR looped on it. The next revision keeps every
+/// criterion, verifier, harness file and the environment, and adds only the
+/// literal files in `add` (the caller already excluded protected, controller
+/// and verifier files). It is registered exactly like an approved amendment:
+/// intended red measured again at the unchanged original base, the
+/// measurement qualified, the revision journaled and activated. An
+/// environment change still needs the independent authority.
+pub(super) async fn rescope_revision(
+    root: &Path,
+    old: &PreparedAcceptance,
+    control: &Path,
+    workflow: &mut workflow::WorkflowGuard,
+    bound: &str,
+    add: &[String],
+) -> Result<PreparedAcceptance> {
+    let source = old.proposal.contract.source()?;
+    if let Some(prepared) = resume_pending(root, control, source).await? {
+        return Ok(prepared);
+    }
+    ensure!(!add.is_empty(), "rescope revision adds no file");
+    old.baseline.registration.verify_integrity(root)?;
+    let head = actual_head(root).await?;
+    let environments = environment_evidence(root, control, old).await?;
+    let candidate_environment = environments.current_candidate.clone();
+    environments.authorize(false)?;
+    validate_bound_scope_files(Some(bound), add)?;
+    let proposal = super::own_pr_rescope::next_proposal(&old.proposal, add)?;
+    validate_correction_with_files(old, &proposal, &candidate_environment, add)?;
+    let input_hash = digest(&serde_json::to_vec(&("own-pr-rescope-revision-v1",
+        old.baseline.registration.contract_hash(), &head, digest(bound.as_bytes())))?);
+    let decision = Decision {
+        approved: true,
+        previous_contract_hash: old.baseline.registration.contract_hash().into(),
+        approve_environment_transition: false,
+        approve_additional_files: add.to_vec(),
+        reason: format!("Controller own-PR rescope (#2488): add {} to allowed_paths; criteria, verifiers and harness unchanged", add.join(", ")),
+        proposal: Some(proposal.clone()),
+    };
+    immutable(control, &format!("{}-rescope-decision-{input_hash}.json", source.key()), &serde_json::to_vec(&decision)?)?;
+    workflow.audit_logger().record_controller(serde_json::json!({
+        "kind": "own_pr_rescope_revision", "workflow": workflow.id(), "candidate_head": head,
+        "previous_contract_hash": old.baseline.registration.contract_hash(), "revision": proposal.contract.revision,
+        "added": add, "bound_sha256": digest(bound.as_bytes()), "shipping_authority": false,
+    }))?;
+    workflow.bind_acceptance_for_recovery(old)?;
+    activate(root, control, workflow, old, &environments.current_original_baseline, Approved {
+        proposal, decision, head, input_hash: input_hash.clone(), candidate_environment,
+        native_provider: "controller-own-pr-rescope".into(),
+        native_session: format!("own-pr-rescope:{input_hash}"),
+        prompt_hash: digest(bound.as_bytes()),
+    }).await?.context("rescope revision did not activate")
+}
+
+/// An approved next revision, before its original-base measurement.
+struct Approved {
+    proposal: ContractProposal,
+    decision: Decision,
+    head: String,
+    input_hash: String,
+    candidate_environment: String,
+    native_provider: String,
+    native_session: String,
+    prompt_hash: String,
+}
+
+/// Measure an approved revision at the unchanged original base (intended
+/// red), qualify that measurement, journal it and activate it. Every revision
+/// is registered here: the independent amendment authority and the
+/// controller's own-PR rescope (#2488) alike.
+async fn activate(
+    root: &Path,
+    control: &Path,
+    workflow: &mut workflow::WorkflowGuard,
+    old: &PreparedAcceptance,
+    current_original_baseline: &str,
+    approved: Approved,
+) -> Result<Option<PreparedAcceptance>> {
+    let Approved { proposal, decision, head, input_hash, candidate_environment, native_provider, native_session, prompt_hash } = approved;
+    let source = old.proposal.contract.source()?;
     let directory = tempfile::Builder::new()
         .prefix("amend-baseline-")
         .tempdir_in(control)?;
@@ -737,7 +824,7 @@ pub(super) async fn try_amend(
     let reproduce = async {
         install_harness(&baseline_root, &proposal)?;
         let baseline_environment = environment_id(&baseline_root)?;
-        ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
+        ensure!(baseline_environment == current_original_baseline, "runner environment changed during independent amendment");
         let registration = register_amended(
             &baseline_root,
             &old.baseline.registration,
@@ -800,7 +887,7 @@ pub(super) async fn try_amend(
         authority: decision,
         native_provider,
         native_session,
-        prompt_hash: digest(prompt.as_bytes()),
+        prompt_hash,
     };
     let bytes = serde_json::to_vec(&pending)?;
     ensure!(
