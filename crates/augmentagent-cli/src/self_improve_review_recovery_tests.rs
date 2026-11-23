@@ -737,3 +737,68 @@ fn own_pr_adjudicated_amendment_retry_runs_on_exactly_one_lane() {
     assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr]), Some(&other)), BTreeSet::from([pr]));
     assert_eq!(linked_claims::foreign_claims(BTreeSet::from([pr]), None), BTreeSet::from([pr]));
 }
+
+/// #2475, production shapes of PRs #2358 / #2372 / #2378. The PR head is the
+/// one the workflow's own latest confirmed Push published, while the workflow
+/// waits: a retry delay, a rescope after unrecoverable evidence, or a live
+/// lease on its own lane. Those are scheduling facts, not provenance. Review
+/// recovery must not drop the PR as unknown provenance while it waits.
+#[test]
+fn own_pushed_head_keeps_review_recovery_provenance_while_the_workflow_waits() {
+    let (repository, issue, pr, branch) = ("owner/repo", 2350, 2358, "agent-fix/issue-2350");
+    for wait in ["retry-delay", "unrecoverable-rescope", "live-lease"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workflow.db");
+        let id = crate::autoship_workflow::workflow_id(repository, issue).unwrap();
+        let (opened, earlier, pushed, retained) = ("a32e".repeat(10), "f013".repeat(10), "3efd".repeat(10), "ceff".repeat(10));
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let first = Binding { head: earlier.clone(), contract: "contract".into(), evidence_hash: "evidence".into() };
+        store.register(&id, branch, first.clone(), 1).unwrap();
+        let lease = store.claim(&id, "pr-lane", 2, 100).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, repository, pr, 3).unwrap();
+        let push = store.begin_operation(&lease, crate::autoship_workflow::OperationKind::Push, &first, 4).unwrap();
+        store.complete_operation(&lease, &push.id, &format!("git-head:{earlier}"), 5).unwrap();
+        let published = Binding { head: pushed.clone(), ..first.clone() };
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.binding = published.clone();
+        store.checkpoint(&lease, &cp, 6).unwrap();
+        let push = store.begin_operation(&lease, crate::autoship_workflow::OperationKind::Push, &published, 6).unwrap();
+        store.complete_operation(&lease, &push.id, &format!("git-head:{pushed}"), 7).unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Scope;
+        cp.binding.head = retained.clone();
+        cp.next = match wait {
+            "unrecoverable-rescope" => NextAction { reason: "original_evidence_unrecoverable".into(), action: "rescope_executable_acceptance".into(), eligible_at_ms: 5_000 },
+            _ => NextAction { reason: "retry_cycle_exhausted".into(), action: "rescope_executable_acceptance".into(), eligible_at_ms: if wait == "retry-delay" { 5_000 } else { 0 } },
+        };
+        store.checkpoint(&lease, &cp, 8).unwrap();
+        store.release(&lease, 9).unwrap();
+        let now = 1_000;
+        let held = if wait == "live-lease" { Some(store.claim(&id, "own-lane", now - 1, 60_000).unwrap().unwrap()) } else { None };
+        let before = store.snapshot(&id).unwrap().unwrap();
+        drop(store);
+        let record = OpenedPr { pr, head: opened.clone(), verdict: None };
+        assert_ne!(
+            review_recovery::observe(&path, repository, issue, pr, branch, &pushed, Some(&record), now).unwrap(),
+            Some(false),
+            "{wait}: the head the workflow's own confirmed Push published is not unknown provenance"
+        );
+        // An older head the same workflow once pushed was superseded.
+        assert_eq!(
+            review_recovery::observe(&path, repository, issue, pr, branch, &earlier, Some(&record), now).unwrap(),
+            Some(false),
+            "{wait}: a superseded push cannot vouch for the PR head"
+        );
+        assert_eq!(
+            review_recovery::observe(&path, repository, issue, pr, branch, &"f".repeat(40), Some(&record), now).unwrap(),
+            Some(false),
+            "{wait}: a head nobody pushed for this workflow stays unproven"
+        );
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(), before, "{wait}: provenance inspection changed the workflow");
+        // The resume executor keeps its own gates: a waiting workflow is not
+        // yet due to resume its retained candidate.
+        assert_eq!(store.retained_candidate_head(repository, pr, branch, &pushed, &retained, now).unwrap(), None, "{wait}");
+        drop(held);
+    }
+}

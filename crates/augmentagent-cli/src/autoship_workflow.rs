@@ -13,6 +13,8 @@ pub(crate) mod owner_requalification;
 pub(crate) mod scope_policy;
 #[path="autoship_terminal_parks.rs"]
 pub(crate) mod terminal_parks;
+#[path="autoship_witness_regeneration.rs"]
+pub(crate) mod witness_regeneration;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
 #[path = "autoship_checkout_continuity.rs"]
@@ -2436,6 +2438,22 @@ impl WorkflowStore {
             || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
             return Ok(None);
         }
+        Ok(self.published_by_workflow(repository, pr, branch, published)?.then_some(snapshot.checkpoint.binding.head))
+    }
+
+    /// #2475: provenance only. True when this PR's workflow itself published
+    /// `published`: its latest Push carries the `git-head:<published>`
+    /// receipt, or, with no Push at all, the fenced adoption record names it.
+    /// Leases, retry delays and stages say when work may run, never who
+    /// published a head, so none of them are consulted here.
+    pub fn published_by_workflow(&self, repository: &str, pr: u64, branch: &str, published: &str) -> Result<bool> {
+        if published.is_empty() { return Ok(false); }
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        if snapshot.pr != Some(pr) || snapshot.branch != branch
+            || matches!(snapshot.checkpoint.stage, Stage::Merged | Stage::Retired) {
+            return Ok(false);
+        }
         let latest: Option<(String, Option<String>)> = self.conn.query_row(
             "SELECT binding,receipt FROM operation WHERE workflow=?1 AND kind=?2 ORDER BY rowid DESC LIMIT 1",
             params![id, serde_json::to_string(&OperationKind::Push)?],
@@ -2445,15 +2463,11 @@ impl WorkflowStore {
             // An imported PR may have been published by its owner, before this
             // workflow existed. Its fenced admission is a different fact from
             // a Push; any actual Push above still takes precedence.
-            return Ok((adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published))
-                .then_some(snapshot.checkpoint.binding.head));
+            return Ok(adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published));
         };
         let binding: Binding = serde_json::from_str(&binding)?;
         binding.validate()?;
-        if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {
-            return Ok(None);
-        }
-        Ok(Some(snapshot.checkpoint.binding.head))
+        Ok(binding.head == published && receipt.as_deref() == Some(&format!("git-head:{published}")))
     }
 
     /// #2279 — the PR workflow is idle and authorized to resume: no lease,

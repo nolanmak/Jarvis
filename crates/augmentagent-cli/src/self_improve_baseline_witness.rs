@@ -123,17 +123,41 @@ fn validate_endpoint_policy(root:&Path,proposal:&ContractProposal,baseline:&Base
                 let count=cite.quote.split('\n').count();
                 ensure!(count<=600,"original production quote exceeds source-line bound");
                 let end=(cite.start_line-1).checked_add(count).context("original production citation end overflow")?;
-                ensure!(end<=lines.len() && cite.end_line.abs_diff(end)<=1,"original production citation ending line is inconsistent");
+                ensure!(end<=lines.len(),"original production citation ending line is inconsistent");
                 end
             }else {cite.end_line};
             let quoted=lines[cite.start_line-1..end].join("\n");
-            ensure!(cite.quote==quoted,"production citation differs from immutable original source");
+            // #2439: a quote with the source's common indentation removed
+            // cites the same original lines; the canonical data keeps the
+            // exact source bytes. Any other difference still refuses.
+            let matches=cite.quote==quoted || (canonicalize && dedented_quote(&cite.quote,&lines[cite.start_line-1..end]));
+            // #2360 (PR #2372, 11:35Z): the witness quoted 476-505 exactly
+            // (dedented) but declared 521. The quote is checked byte for byte
+            // from its start line; a wrong declared end is metadata only. A
+            // quote that does not match still reports an inconsistent end.
+            ensure!(matches || cite.end_line.abs_diff(end)<=1,"original production citation ending line is inconsistent");
+            ensure!(matches,"production citation differs from immutable original source");
+            cite.quote=quoted.clone();
             cite.end_line=end;
             total=total.checked_add(quoted.len()).context("citation size overflow")?;
             ensure!(total<=512*1024,"production citations exceed existing source evidence envelope");
         }
     }
     Ok(judgment)
+}
+/// #2439 (PR #2449): the witness quoted `native_vm.rs` 153-170 with its 12
+/// leading spaces of common indentation stripped, every retry, until the
+/// bounded completed-response retries ran out. Accept exactly that: one
+/// uniform whitespace prefix removed from every non-blank source line, blank
+/// lines blank, nothing else changed.
+fn dedented_quote(quote:&str,source:&[&str])->bool {
+    let quoted=quote.split('\n').collect::<Vec<_>>();
+    if quoted.len()!=source.len() || quote.contains('\r') {return false;}
+    let Some(first)=source.iter().position(|line|!line.trim().is_empty()) else {return false};
+    let Some(prefix)=source[first].strip_suffix(quoted[first]) else {return false};
+    if prefix.is_empty() || !prefix.chars().all(|c|c==' ' || c=='\t') {return false;}
+    source.iter().zip(&quoted).all(|(line,quote)| if line.trim().is_empty() {quote.trim().is_empty()}
+        else {line.strip_prefix(prefix)==Some(*quote)})
 }
 fn disposition(judgment:&Judgment)->Result<()> {
     // This is a completed, authenticated semantic judgment. Unknown does not
@@ -231,7 +255,15 @@ fn retained_judgments_matching(root:&Path,prepared:&PreparedAcceptance,
         let provenance:serde_json::Value=serde_json::from_slice(&proof)?;
         let observed_request=provenance["scope_request_hash"].as_str().context("retained witness request missing")?;
         if !retained_question_matches(root,prepared,control,&judgment.context,observed_request,custody)? {continue;}
-        let judgment=validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
+        // #2360 (PR #2372): a reply the checker rejected is why a corrective
+        // question followed it; it is history, never a retained judgment. Its
+        // failure must not abort the scan for the reply that was accepted.
+        // Missing original objects (a Hold) still refuse.
+        let judgment=match validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response) {
+            Ok(judgment)=>judgment,
+            Err(error) if error.chain().any(|cause|cause.downcast_ref::<initial_repair::Hold>().is_some())=>return Err(error),
+            Err(_)=>continue,
+        };
         let identity=amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
             &observation.input,observed_request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?);
         selected.push((identity,judgment));
@@ -382,8 +414,28 @@ fn require_empty_native_history(control:&Path,archived_before_ms:Option<i64>)->R
     }
     Ok(())
 }
+#[derive(Clone,Copy,PartialEq,Eq,Debug)]
+pub(super) enum Corrective {Refuse,Regenerate}
+#[derive(Debug)]
+pub(super) struct ControllerWitnessChanged;
+impl std::fmt::Display for ControllerWitnessChanged {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("corrective controller witness question is unavailable or changed")}
+}
+impl std::error::Error for ControllerWitnessChanged {}
+pub(super) fn controller_witness_changed(error:&anyhow::Error)->bool {
+    error.chain().any(|cause|cause.downcast_ref::<ControllerWitnessChanged>().is_some())
+}
 pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&PreparedAcceptance,
     evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)->Result<Vec<RetainedWitnessRunData>> {
+    retained_controller_slots_for(root,control,prepared,evidence,Corrective::Refuse)
+}
+/// `Corrective::Regenerate` is admitted only for an own open PR's published
+/// head (#2471, bounded per head). A run whose corrective question the current
+/// controller cannot reproduce is then set aside as stale history, so the
+/// witness is regenerated for the current contract. Every other refusal,
+/// and every reproducible run, applies unchanged.
+pub(super) fn retained_controller_slots_for(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,mode:Corrective)->Result<Vec<RetainedWitnessRunData>> {
     ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"controller witness contract changed");
     prepared.baseline.registration.verify_source_files(root,&prepared.proposal.files)?;
     ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
@@ -432,12 +484,16 @@ pub(super) fn retained_controller_slots(root:&Path,control:&Path,prepared:&Prepa
         let proof=retained_witness_proof(&original.provenance)?;
         let original_question=amendment::digest(qualification_prompt(&origin,prepared)?.as_bytes());
         if proof["scope_request_hash"].as_str()!=Some(original_question.as_str()) {continue;}
+        let mut stale=false;
         for reply in replies.iter().skip(1) {
             let proof=retained_witness_proof(&reply.provenance)?;
             let request=proof["scope_request_hash"].as_str().context("corrective controller question missing")?;
-            ensure!(request!=original_question && retained_question_matches(root,prepared,control,&origin,request,&custody)?,
-                "corrective controller witness question is unavailable or changed");
+            if request==original_question || !retained_question_matches(root,prepared,control,&origin,request,&custody)? {
+                if mode==Corrective::Regenerate {stale=true;break;}
+                return Err(ControllerWitnessChanged.into());
+            }
         }
+        if stale {continue;}
         let identity=retained_run_identity(evidence.workflow(),&origin,&contract,&replies)?;
         runs.push(RetainedWitnessRunData {identity,context:origin,replies});
     }
@@ -520,6 +576,9 @@ pub(super) fn require_retained_publication(root:&Path,control:&Path,repository:&
 /// custody; a later candidate HEAD need not be checked out a second time.
 pub(super) fn qualify_known_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<bool> {
     workflow.validate_acceptance_source(prepared)?;
+    // #2471: the known reference names the run the current controller can no
+    // longer reproduce; an admitted regeneration replaces it.
+    if workflow.regenerating_witness() {return Ok(false);}
     if workflow.retained_qualification_reference(prepared).map_err(requalification_error)?.is_none() {return Ok(false);}
     prepared.baseline.registration.verify_integrity(root).map_err(requalification_error)?;
     (||->Result<()> {
@@ -545,8 +604,9 @@ fn requalify_retained(root:&Path,control:&Path,prepared:&PreparedAcceptance,work
     let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     workflow.with_qualification_evidence(|database,evidence| {
         (||->Result<bool> {
-            if retained_controller_slots(root,&native_control,prepared,evidence)?.is_empty() {
-                ensure!(retained.is_none(),"known retained original witness data is unavailable; fresh witness generation is forbidden");
+            let mode=if workflow.regenerating_witness() {Corrective::Regenerate}else{Corrective::Refuse};
+            if retained_controller_slots_for(root,&native_control,prepared,evidence,mode)?.is_empty() {
+                ensure!(retained.is_none() || mode==Corrective::Regenerate,"known retained original witness data is unavailable; fresh witness generation is forbidden");
                 return Ok(false);
             }
             let references=verifier_execution::matching_original_results(prepared,evidence)?;
@@ -731,7 +791,9 @@ mod tests {
     use super::*;
     pub(super) fn fixture()->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {fixture_for_source(AcceptanceSource::PullRequest(840))}
     fn fixture_for_source(source:AcceptanceSource)->(tempfile::TempDir,tempfile::TempDir,PreparedAcceptance) {
-        let root=tempfile::tempdir_in("/tmp").unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        // Canonical, so the fixture also runs where /tmp is a symlink (macOS).
+        let tmp=std::fs::canonicalize("/tmp").unwrap();
+        let root=tempfile::tempdir_in(&tmp).unwrap();let control=tempfile::tempdir_in(&tmp).unwrap();
         std::fs::write(root.path().join("behavior.py"),"READY = False\n").unwrap();
         for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","baseline"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
             let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();assert!(out.status.success());
@@ -1217,6 +1279,87 @@ mod tests {
         assert!(retained_semantic_diagnosis_in(root.path(),control.path(),&prepared,&ambiguous).is_err());
     }
 
+    /// #2360 (PR #2372, 2026-11-23 10:22Z): the adjudicated amendment needed
+    /// the retained source context. One retained reply had been rejected by
+    /// the checker (its correction followed), and re-validating it aborted the
+    /// whole scan ("original production citation ending line is
+    /// inconsistent"), so the amendment held as evidence-unknown and the
+    /// workflow was cut over to `original_evidence_unrecoverable`. A rejected
+    /// reply is history: the accepted correction still identifies the source.
+    #[test]
+    fn a_rejected_retained_reply_does_not_hide_its_accepted_correction() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
+        let (root,control,prepared)=fixture();
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        let origin=context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY).unwrap();
+        let mut first=saved_judgment(control.path(),&prepared);first["context"]=origin.clone().into();
+        first["verifiers"][0]["production_citations"][0]["quote"]="READY = True".into();
+        let first=first.to_string();let question=qualification_prompt(&origin,&prepared).unwrap();
+        let error="production citation differs from immutable original source";
+        let correction=original_v1_correction_question(&question,error,&first).unwrap();
+        let mut second:serde_json::Value=serde_json::from_str(&first).unwrap();
+        second["verifiers"][0]["measurement"]="unknown".into();
+        second["verifiers"][0]["production_citations"]=serde_json::json!([]);
+        second["verifiers"][0]["reason"]="The corrective review cannot establish production attribution".into();
+        let second=second.to_string();
+        let observe=|input:&str,text:&str,request:&str| {
+            let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":format!("scripted-correction-{input}"),
+                "supplied_request_hash":amendment::digest(b"scripted selected original sources"),"response_hash":amendment::digest(text.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":origin,"native_input_hash":input,
+                "scope_request_hash":amendment::digest(request.as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let path=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&path,&bytes).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            NativeScopeCustody {input:input.into(),response:text.into(),provider:Provider::Codex,
+                provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact:path,artifact_sha256:amendment::digest(&bytes)}).unwrap()}
+        };
+        let custody=vec![observe(&"a".repeat(64),&first,&question),observe(&"b".repeat(64),&second,&correction)];
+        let context=retained_source_context_in(root.path(),control.path(),&prepared,&custody)
+            .expect("a rejected historical reply aborted the retained source scan");
+        assert_eq!(context.as_deref(),Some(origin.as_str()),"the accepted correction no longer identifies the source");
+        let all=retained_judgments_matching(root.path(),&prepared,&custody,|_|true).unwrap();
+        assert_eq!(all.len(),1,"the rejected reply became a retained judgment");
+        assert_eq!(all[0].1.verifiers[0].measurement,Measurement::Unknown);
+    }
+
+    /// #2439 (PR #2449, 2026-11-23 10:32Z): the witness cited original
+    /// `native_vm.rs` lines with their common indentation stripped. Every
+    /// bounded retry did the same, so acceptance held `acceptance_contract_invalid`
+    /// on a green own PR. A uniform dedent is the same original lines.
+    #[test]
+    fn a_quote_with_the_common_indentation_stripped_cites_the_same_original_lines() {
+        let (root,control,mut prepared)=fixture();
+        let mut source=(1..=40).map(|line|format!("# original fixture line {line}\n")).collect::<String>();
+        source.push_str("READY = False\n");
+        source.push_str("def ready():\n            if READY:\n                return True\n\n            return False\n");
+        source.push_str(&(47..=60).map(|line|format!("# observed source line {line}\n")).collect::<String>());
+        std::fs::write(root.path().join("behavior.py"),&source).unwrap();
+        original_git(root.path(),&["add","--","behavior.py"]).unwrap();
+        original_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","pin dedent fixture"]).unwrap();
+        let base=original_git(root.path(),&["rev-parse","HEAD"]).unwrap().trim().to_owned();
+        let registration=RegisteredContract::register(root.path(),prepared.proposal.contract.clone(),base.clone(),environment_id(root.path()).unwrap()).unwrap();
+        let observation=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+        let receipt=registration.observe(root.path(),"observe",registration.binding(&base).unwrap(),&observation).unwrap();
+        prepared.baseline=BaselineEvidence {registration,receipts:vec![receipt]};
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        let original=saved_judgment(control.path(),&prepared);let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
+        let lines=source.lines().collect::<Vec<_>>();
+        let exact=lines[42..46].join("\n");
+        let cite=|quote:&str|{let mut raw=original.clone();
+            raw["verifiers"][0]["production_citations"][0]=serde_json::json!({"path":"behavior.py","start_line":43,"end_line":46,"quote":quote});raw.to_string()};
+        let dedented="if READY:\n    return True\n\nreturn False";
+        let result=validate(root.path(),&prepared.proposal,&prepared.baseline,&expected,&cite(dedented))
+            .expect("a uniformly dedented quote of the exact original lines exhausted the witness");
+        assert_eq!(result.verifiers[0].production_citations[0].quote,exact,"canonical data does not carry the exact source bytes");
+        assert!(validate_endpoint_policy(root.path(),&prepared.proposal,&prepared.baseline,&expected,&cite(dedented),false).is_err(),
+            "the frozen legacy checker changed");
+        for fault in ["if READY:\n        return True\n\nreturn False","if READY:\n    return False\n\nreturn False",
+            "if READY:\r\n    return True\r\n\r\nreturn False","if READY:\n    return True\nreturn False","  if READY:\n    return True\n\nreturn False"] {
+            assert!(validate(root.path(),&prepared.proposal,&prepared.baseline,&expected,&cite(fault)).is_err(),"accepted a changed quote {fault:?}");
+        }
+    }
+
     #[test]
     fn controller_slots_use_paid_historical_bindings_and_preserve_corrective_unknown() {
         use std::os::unix::fs::PermissionsExt;
@@ -1286,6 +1429,21 @@ mod tests {
                 let last=validate(root.path(),&prepared.proposal,&prepared.baseline,&origin,&runs[0].replies[1].response).unwrap();
                 assert!(disposition(&last).is_err(),"corrective Unknown became positive qualification");
             }else {assert!(runs.is_err(),"{fault} was accepted as complete controller witness data");}
+            // #2471: only a corrective question the current controller cannot
+            // reproduce is a controller-side change; it names itself, and an
+            // own-PR regeneration sets that stale run aside. Every other
+            // fault still refuses, and a matching run is still applied.
+            let regenerated=retained_controller_slots_for(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id),Corrective::Regenerate);
+            match fault {
+                "none"=>assert_eq!(regenerated.unwrap().len(),1,"a reproducible run was set aside"),
+                "changed-corrective-question"=>{
+                    let Err(refused)=retained_controller_slots(root.path(),control.path(),&prepared,&store.inspect_verifier_evidence(id)) else {panic!("changed corrective question was accepted")};
+                    assert!(controller_witness_changed(&refused),"controller-side change is not named: {refused:#}");
+                    assert!(format!("{refused:#}").contains("corrective controller witness question is unavailable or changed"));
+                    assert!(regenerated.unwrap().is_empty(),"own-PR regeneration still replays the stale corrective run");
+                }
+                _=>{let Err(error)=regenerated else {panic!("{fault} was accepted by regeneration")};assert!(!controller_witness_changed(&error),"{fault} became a regenerable controller change");}
+            }
             assert_eq!(store.snapshot(id).unwrap(),before);assert_eq!(store.events(id).unwrap(),events);
             assert_eq!(before.unwrap().model_calls,2,"fixture's recorded admissions changed during inspection");
         }
@@ -2041,7 +2199,8 @@ mod tests {
         persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
         let original=saved_judgment(control.path(),&prepared);let expected=context(&prepared.proposal,&prepared.baseline).unwrap();
         let lines=source.lines().collect::<Vec<_>>();
-        for (declared_end,actual_end) in [(68,69),(60,61),(62,61)] {
+        // #2360: a far-off declared end is metadata once the quote matches.
+        for (declared_end,actual_end) in [(68,69),(60,61),(62,61),(59,61),(66,61)] {
             let mut raw=original.clone();
             raw["verifiers"][0]["production_citations"][0]=serde_json::json!({
                 "path":"behavior.py","start_line":41,"end_line":declared_end,"quote":lines[40..actual_end].join("\n"),
@@ -2055,7 +2214,7 @@ mod tests {
             // This result is decoded data, not a newly persisted qualification.
             assert_current(root.path(),control.path(),&prepared).unwrap();
         }
-        for fault in ["wrong_start","wrong_quote","trailing_lf","crlf_quote","far_end","outside_source","before_start","candidate_only"] {
+        for fault in ["wrong_start","wrong_quote","trailing_lf","crlf_quote","outside_source","before_start","candidate_only"] {
             let mut raw=original.clone();
             raw["verifiers"][0]["production_citations"][0]=serde_json::json!({
                 "path":"behavior.py","start_line":41,"end_line":60,"quote":lines[40..61].join("\n"),
@@ -2066,7 +2225,6 @@ mod tests {
                 "wrong_quote"=>citation["quote"]=lines[40..61].join("\n").replace("READY = False","READY = True").into(),
                 "trailing_lf"=>citation["quote"]=format!("{}\n",lines[40..61].join("\n")).into(),
                 "crlf_quote"=>citation["quote"]=lines[40..61].join("\r\n").into(),
-                "far_end"=>citation["end_line"]=59.into(),
                 "outside_source"=>citation["end_line"]=70.into(),
                 "before_start"=>citation["end_line"]=40.into(),
                 "candidate_only"=> {
