@@ -47,6 +47,8 @@ pub(super) mod readiness;
 mod adjudicated;
 #[path = "self_improve_ci_scope.rs"]
 pub(super) mod ci_scope;
+#[path = "self_improve_own_pr_rescope.rs"]
+pub(super) mod own_pr_rescope;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
