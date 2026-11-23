@@ -368,6 +368,107 @@ fn comparison_dependency(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// #2454: what a failing hosted check says about where its fix lives. The
+/// controller derives it from panic and compiler locations only; it grants
+/// nothing by itself and is filtered against the registered contract later.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ScopeEvidence {
+    pub checks: Vec<String>,
+    pub tests: Vec<String>,
+    pub files: Vec<String>,
+}
+impl ScopeEvidence {
+    fn of(root: &Path, observation: &Observation) -> Option<Self> {
+        fn add(list: &mut Vec<String>, value: String) {
+            if !list.contains(&value) {
+                list.push(value);
+            }
+        }
+        let mut evidence = Self::default();
+        for failure in &observation.failures {
+            if !matches!(failure.classification, Classification::TestFailure | Classification::Compiler) {
+                continue;
+            }
+            add(&mut evidence.checks, failure.name.clone());
+            for test in failing_tests(&failure.diagnostics).into_iter().chain(failed_verdicts(&failure.diagnostics)) {
+                add(&mut evidence.tests, test);
+            }
+            for file in implicated_files(root, &failure.diagnostics) {
+                add(&mut evidence.files, file);
+            }
+        }
+        (!evidence.files.is_empty()).then_some(evidence)
+    }
+}
+/// `test a::b ... FAILED` verdict lines.
+fn failed_verdicts(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            let name = line[line.find("test ")? + 5..].strip_suffix(" ... FAILED")?;
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+/// `path:line:col`, with an optional trailing colon.
+fn location_path(token: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (rest, column) = token.trim_end_matches(':').rsplit_once(':')?;
+    let (path, line) = rest.rsplit_once(':')?;
+    (digits(column) && digits(line)).then_some(path)
+}
+/// A plain relative path to an existing regular file inside `root`, with no
+/// symlink anywhere on it.
+fn repository_file(root: &Path, path: &str) -> bool {
+    let plain = !path.is_empty()
+        && !path.starts_with('/')
+        && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'));
+    if !plain {
+        return false;
+    }
+    let (Ok(base), Ok(file)) = (root.canonicalize(), root.join(path).canonicalize()) else {
+        return false;
+    };
+    file == base.join(path) && file.is_file()
+}
+fn is_test_source(path: &str) -> bool {
+    path.ends_with("_tests.rs")
+        || path.ends_with("/tests.rs")
+        || path.split('/').any(|part| matches!(part, "tests" | "benches"))
+}
+/// The module a test file exercises (`notify_tests.rs`, `store/tests.rs`).
+fn subjects(path: &str) -> Vec<String> {
+    if let Some(stem) = path.strip_suffix("_tests.rs") {
+        vec![format!("{stem}.rs")]
+    } else if let Some(directory) = path.strip_suffix("/tests.rs") {
+        vec![format!("{directory}.rs"), format!("{directory}/mod.rs")]
+    } else {
+        Vec::new()
+    }
+}
+/// Repository files that a failing check's panic or compiler location
+/// implicates. A test file implicates its subject (`notify_tests.rs` names
+/// `notify.rs`), never itself: a repair must not edit the failing test.
+pub(super) fn implicated_files(root: &Path, diagnostics: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for marker in ["panicked at ", "--> "] {
+        for (at, _) in diagnostics.match_indices(marker) {
+            let token = diagnostics[at + marker.len()..].split_whitespace().next().unwrap_or("");
+            let Some(path) = location_path(token) else { continue };
+            let candidates = if is_test_source(path) { subjects(path) } else { vec![path.to_owned()] };
+            for file in candidates {
+                if !files.contains(&file) && repository_file(root, &file) {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    files
+}
+
 pub(super) enum Preflight {
     Continue,
     Compare(Observation),
@@ -639,21 +740,37 @@ impl Replay for SharedReplay {
     }
 }
 
-/// Production decision entry with the execution boundary supplied explicitly.
-/// Tests can script that boundary while still using real Git, compiler results,
-/// the hosted reader, durable workflow, dependency and repair admission paths.
+/// [`prepare_scoped`] without its scope evidence, for routing tests.
+#[cfg(test)]
 pub(super) async fn prepare<R: Replay>(
     root: &Path,
     pr: u64,
     workflow: &mut workflow::WorkflowGuard,
     replay: &R,
 ) -> Result<Preparation> {
+    Ok(prepare_scoped(root, pr, workflow, replay).await?.0)
+}
+
+/// Production decision entry with the execution boundary supplied explicitly.
+/// Tests can script that boundary while still using real Git, compiler results,
+/// the hosted reader, durable workflow, dependency and repair admission paths.
+/// It also returns the #2454 scope evidence of the code failures it routes to
+/// repair. A deferral carries none: nothing is repaired this round.
+pub(super) async fn prepare_scoped<R: Replay>(
+    root: &Path,
+    pr: u64,
+    workflow: &mut workflow::WorkflowGuard,
+    replay: &R,
+) -> Result<(Preparation, Option<ScopeEvidence>)> {
     match preflight(root, pr, workflow).await? {
-        Preflight::Continue => Ok(Preparation::Continue),
+        Preflight::Continue => Ok((Preparation::Continue, None)),
         Preflight::Compare(observation) => {
-            compare_observed(root, pr, workflow, observation, replay).await
+            let scope = ScopeEvidence::of(root, &observation);
+            let preparation = compare_observed(root, pr, workflow, observation, replay).await?;
+            let scope = scope.filter(|_| !matches!(preparation, Preparation::Deferred(_)));
+            Ok((preparation, scope))
         }
-        Preflight::Deferred(report) => Ok(Preparation::Deferred(report)),
+        Preflight::Deferred(report) => Ok((Preparation::Deferred(report), None)),
     }
 }
 
@@ -1021,6 +1138,35 @@ mod classification_tests {
             "the repair family is anchored on the failing tests, not the log hash");
         assert!(logs.contains("autoship_case.rs:15:5") && logs.contains("entered unreachable code"),
             "the repair sees the panic location and message");
+    }
+
+    /// #2454 (PR #2378): the required `targeted` check panics in
+    /// `notify_tests.rs`; the fix is the `notify::PRODUCERS` registry in
+    /// `notify.rs`. A test file implicates its subject, never itself, and
+    /// only real relative repository files are named.
+    #[test]
+    fn a_failing_test_implicates_its_subject_file_not_the_test() {
+        let root = tempfile::tempdir().unwrap();
+        for file in ["crates/augmentagent-cli/src/notify.rs", "crates/augmentagent-cli/src/notify_tests.rs",
+            "crates/core/src/store.rs", "crates/core/src/store/tests.rs", "crates/api/src/lib.rs"] {
+            std::fs::create_dir_all(root.path().join(file).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(file), "// fixture\n").unwrap();
+        }
+        let log = "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+            thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+            producers posting to the owner without a registry entry (or stale entries); add them to notify::PRODUCERS:\n\
+            thread 'notify_tests::a_producer_missing_from_the_registry_fails_the_check' panicked at crates/augmentagent-cli/src/notify_tests.rs:211:5:\n\
+            test result: FAILED. 2618 passed; 2 failed; 0 ignored";
+        assert_eq!(implicated_files(root.path(), log), vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
+
+        let mixed = "thread 'store::tests::x' panicked at crates/core/src/store/tests.rs:9:5:\n\
+            thread 'y' panicked at /rustc/abc/library/core/src/option.rs:1:1:\n\
+            thread 'z' panicked at ../outside/src/lib.rs:1:1:\n\
+            thread 'w' panicked at crates/missing/src/lib.rs:1:1:\n\
+            error[E0308]: mismatched types\n  --> crates/api/src/lib.rs:3:9\n";
+        assert_eq!(implicated_files(root.path(), mixed),
+            vec!["crates/core/src/store.rs".to_string(), "crates/api/src/lib.rs".to_string()],
+            "std, escaping and missing paths are never implicated");
     }
 
     /// #2315: infrastructure is the runner, network, apt/mirror, cancellation

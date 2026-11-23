@@ -816,6 +816,42 @@ async fn targeted_test_panic_beside_an_environment_failure_goes_to_repair() {
     child(TEST, "panic-and-apt", false);
 }
 
+/// #2454 (PR #2378, workflow #2329): the `targeted` panics route to repair,
+/// and the repair round now also learns which file outside the contract the
+/// failing check implicates (`notify.rs`, not the failing test itself).
+#[tokio::test]
+async fn targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        std::fs::create_dir_all(root.join("crates/augmentagent-cli/src")).unwrap();
+        for file in ["notify.rs", "notify_tests.rs"] {
+            std::fs::write(root.join("crates/augmentagent-cli/src").join(file), "// fixture\n").unwrap();
+        }
+        let head = commit(&root, "notify fixture");
+        update_scenario(&control, |value| {
+            value["head"] = head.clone().into();
+            value["job_names"] = serde_json::json!(["targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    add them to notify::PRODUCERS\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+            });
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let (preparation, scope) = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap();
+        assert!(matches!(preparation, ci_repair::Preparation::Continue), "the panic still routes to repair");
+        let scope = scope.expect("a repaired code failure carries its scope evidence");
+        assert_eq!(scope.files, vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
+        assert_eq!(scope.checks, vec!["targeted".to_string()]);
+        assert!(scope.tests.contains(&"notify_tests::registry_covers_every_producer_in_the_code".to_string()), "{:?}", scope.tests);
+        return;
+    }
+    child(TEST, "scope-evidence", false);
+}
+
 /// #2453: hosted CI infrastructure holds were unbounded (production reached
 /// six hourly retries on one head). Each hold still backs off, but after a
 /// bounded number on the same head the hold escalates to code repair, which
