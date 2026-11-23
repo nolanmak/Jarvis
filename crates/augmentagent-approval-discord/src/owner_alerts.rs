@@ -193,11 +193,13 @@ pub fn control(store: &Store, custom_id: &str, now: i64) -> anyhow::Result<Strin
     match verb {
         "ack" => {
             store.set_owner_alert_state(id, AlertState::Acknowledged, now)?;
+            store.record_owner_alert_discord_action(id, now)?;
             store.reconcile_owner_alert_texts(now)?;
             Ok("Marked as seen — still open. Ordinary follow-ups and queued text escalation are stopped; preparation reminders remain. To stop all reminders, click Mark done / stop reminders. No reply was sent.".into())
         }
         "resolve" => {
             store.set_owner_alert_state(id, AlertState::Resolved, now)?;
+            store.record_owner_alert_discord_action(id, now)?;
             store.reconcile_owner_alert_texts(now)?;
             Ok("Marked done. Future reminders and queued text escalation are cancelled.".into())
         }
@@ -247,9 +249,7 @@ async fn post_day_digest(
         return Ok(false);
     };
     let title = format!("Owner alerts · {} ({})", digest.local_date, digest.zone);
-    // Trait-path call: a `broker.post_digest(` site here needs a matching
-    // `notify::PRODUCERS` entry in augmentagent-cli, outside this change.
-    if let Err(error) = ApprovalBroker::post_digest(broker, &title, &digest_text(&digest)).await {
+    if let Err(error) = broker.post_digest(&title, &digest_text(&digest)).await {
         tracing::warn!(local_date=%digest.local_date,"owner alert digest delivery failed: {error}");
         return Ok(false);
     }
@@ -647,7 +647,14 @@ mod tests {
             .timestamp_millis()
     }
 
-    fn seed_alert(store: &Store, id: &str, urgency: Urgency, created: i64, text_after: i64) {
+    fn seed_alert(
+        store: &Store,
+        id: &str,
+        urgency: Urgency,
+        created: i64,
+        text_after: i64,
+        meeting: Option<&str>,
+    ) {
         store
             .insert_owner_alert(
                 &augmentagent_store::owner_alerts::NewOwnerAlert {
@@ -659,7 +666,7 @@ mod tests {
                     urgency,
                     due_at_ms: None,
                     timezone: "America/New_York",
-                    meeting_id: None,
+                    meeting_id: meeting,
                     expires_at_ms: ms("2026-12-01T00:00:00Z"),
                     text_after_ms: text_after,
                 },
@@ -704,29 +711,26 @@ mod tests {
         let yesterday = ms("2026-11-18T15:00:00Z"); // 10:00 America/New_York
         let morning = ms("2026-11-19T14:00:00Z"); // 09:00 America/New_York
         let store = Store::open(&path).unwrap();
-        seed_alert(&store, "handled", Urgency::High, yesterday, morning);
+        seed_alert(&store, "handled", Urgency::High, yesterday, morning, None);
         post_on_discord(&store, "handled", yesterday + 10);
-        store
-            .set_owner_alert_state("handled", AlertState::Acknowledged, yesterday + 11)
-            .unwrap();
-        seed_alert(&store, "texted", Urgency::High, yesterday + 20, yesterday + 21);
+        control(&store, "oa:ack:handled", yesterday + 11).unwrap();
+        seed_alert(&store, "texted", Urgency::High, yesterday + 20, yesterday + 21, None);
         post_on_discord(&store, "texted", yesterday + 30);
         store
             .configure_owner_alert_texts(Some("+15555550123"), true)
             .unwrap();
         store.enqueue_owner_alert_texts(yesterday + 40).unwrap();
         store.claim_owner_alert_text(yesterday + 50).unwrap().unwrap();
-        store
-            .set_owner_alert_state("texted", AlertState::Acknowledged, yesterday + 60)
-            .unwrap();
+        control(&store, "oa:ack:texted", yesterday + 60).unwrap();
         seed_alert(
             &store,
             "older",
             Urgency::Routine,
             ms("2026-11-17T15:00:00Z"),
             morning,
+            None,
         );
-        seed_alert(&store, "today", Urgency::Routine, morning, morning);
+        seed_alert(&store, "today", Urgency::Routine, morning, morning, None);
 
         let broker = DigestBroker::new(false);
         tick(&store, &broker, morning).await.unwrap();
@@ -771,11 +775,9 @@ mod tests {
         let store = Store::open(dir.path().join("test.db")).unwrap();
         let yesterday = ms("2026-11-18T15:00:00Z");
         let morning = ms("2026-11-19T14:00:00Z");
-        seed_alert(&store, "handled", Urgency::High, yesterday, morning);
+        seed_alert(&store, "handled", Urgency::High, yesterday, morning, None);
         post_on_discord(&store, "handled", yesterday + 10);
-        store
-            .set_owner_alert_state("handled", AlertState::Acknowledged, yesterday + 11)
-            .unwrap();
+        control(&store, "oa:ack:handled", yesterday + 11).unwrap();
 
         let opt_in = DigestOptIn::disabled();
         let broker = DigestBroker::new(false);
@@ -793,6 +795,33 @@ mod tests {
         );
     }
 
+    /// Reconciliation resolves an alert on its own, after the Discord post and
+    /// without the owner touching it there: that is not "handled here".
+    #[tokio::test]
+    async fn digest_lists_only_alerts_the_owner_handled_on_discord() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let opt_in = DigestOptIn::disabled();
+        opt_in.enable();
+        let yesterday = ms("2026-11-18T15:00:00Z");
+        let morning = ms("2026-11-19T14:00:00Z");
+        seed_alert(&store, "reconciled", Urgency::High, yesterday, morning, Some("m1"));
+        seed_alert(&store, "pressed", Urgency::High, yesterday + 1, morning, None);
+        post_on_discord(&store, "reconciled", yesterday + 10);
+        post_on_discord(&store, "pressed", yesterday + 20);
+        store.cancel_owner_alert_meeting("m1", yesterday + 30).unwrap();
+        control(&store, "oa:ack:pressed", yesterday + 40).unwrap();
+
+        let broker = DigestBroker::new(false);
+        tick(&store, &broker, morning).await.unwrap();
+        let body = broker.posts().remove(0).1;
+        assert!(body.contains("• pressed subject"), "{body}");
+        assert!(
+            !body.contains("reconciled subject"),
+            "an alert resolved away from Discord was not handled here: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn digest_derives_the_prior_date_from_local_time_not_a_fixed_day() {
         let dir = tempfile::tempdir().unwrap();
@@ -806,6 +835,7 @@ mod tests {
             Urgency::Routine,
             ms("2026-11-01T05:30:00Z"),
             ms("2026-12-01T00:00:00Z"),
+            None,
         );
         seed_alert(
             &store,
@@ -813,6 +843,7 @@ mod tests {
             Urgency::Routine,
             ms("2026-11-02T04:30:00Z"),
             ms("2026-12-01T00:00:00Z"),
+            None,
         );
 
         let broker = DigestBroker::new(false);

@@ -16,7 +16,9 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
         slot TEXT NOT NULL, alert_id TEXT NOT NULL, PRIMARY KEY(slot,alert_id));
         CREATE TABLE IF NOT EXISTS owner_alert_day_digests (
         zone TEXT NOT NULL, local_date TEXT NOT NULL, claimed_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(zone,local_date));",
+        PRIMARY KEY(zone,local_date));
+        CREATE TABLE IF NOT EXISTS owner_alert_discord_actions (
+        alert_id TEXT PRIMARY KEY, acted_at_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -228,7 +230,7 @@ impl Store {
                     JOIN owner_alert_details d ON d.alert_id=a.id
                     WHERE a.created_at_ms>=?1 AND a.created_at_ms<?2 AND a.urgency='high'
                     AND a.state IN ('acknowledged','resolved')
-                    AND EXISTS(SELECT 1 FROM owner_alert_notices n WHERE n.alert_id=a.id AND n.status='posted')
+                    AND EXISTS(SELECT 1 FROM owner_alert_discord_actions x WHERE x.alert_id=a.id)
                     AND NOT {TEXTED} ORDER BY a.created_at_ms,a.id LIMIT ?3"
                 ))?;
                 let rows = q.query_map(params![start, end, MAX_SUBJECTS], |r| r.get(0))?;
@@ -244,5 +246,20 @@ impl Store {
                 subjects: subjects.into_iter().flatten().collect(),
             }))
         })
+    }
+
+    /// Record that the owner acted on `id` from its Discord post. Only an
+    /// action taken there, after the alert was posted there, makes the alert
+    /// eligible for the digest: reply and meeting reconciliation resolve
+    /// alerts on their own, and that is not handling them here.
+    pub fn record_owner_alert_discord_action(&self, id: &str, now: i64) -> StoreResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO owner_alert_discord_actions(alert_id,acted_at_ms)
+                SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM owner_alert_notices
+                WHERE alert_id=?1 AND status='posted' AND posted_at_ms<=?2)",
+                params![id, now],
+            )
+        })? == 1)
     }
 }
