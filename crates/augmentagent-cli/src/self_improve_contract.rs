@@ -45,6 +45,8 @@ pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::a
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
+#[path = "self_improve_ci_scope.rs"]
+pub(super) mod ci_scope;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");

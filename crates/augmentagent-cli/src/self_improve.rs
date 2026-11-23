@@ -7147,7 +7147,8 @@ async fn resume_draft_pr(
     let outcome = async {
     workflow.bind_builder(reasoner.as_ref())?;
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
-    let mut ci_findings = match ci_repair::prepare(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await? {
+    let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
+    let mut ci_findings = match ci_preparation {
         ci_repair::Preparation::Continue => None,
         ci_repair::Preparation::Repair(input) => Some(input),
         ci_repair::Preparation::Deferred(report) => return Ok(report),
@@ -7175,6 +7176,23 @@ async fn resume_draft_pr(
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
+    // #2454: a required check whose failure implicates files outside the
+    // contract asks the amendment authority for exactly those files before any
+    // repair round. A refusal rescopes; repair never retries the old scope.
+    if let Some(scope) = ci_scope {
+        let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+            title: &issue.title, worktree: &worktree, control: &acceptance_control };
+        match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, &scope.tests, &mut workflow).await? {
+            acceptance::ci_scope::Widen::InScope => {}
+            acceptance::ci_scope::Widen::Amended(paths) => {
+                info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
+            }
+            acceptance::ci_scope::Widen::Rescoped(message) => {
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+            }
+        }
+    }
 
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
