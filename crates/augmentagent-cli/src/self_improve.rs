@@ -12023,6 +12023,14 @@ impl FairSched {
         self.resume_reservations_since_build = self.resume_reservations_since_build.saturating_add(1);
     }
 
+    /// #2504 — an issue-lane turn (selected, scoped or parked, billed or not)
+    /// settles the debt. Unbilled scoping used to leave it standing, so the
+    /// issue lane kept the slot while due own PRs starved.
+    fn record_issue_turn(&mut self) {
+        self.resumes_since_build = 0;
+        self.resume_reservations_since_build = 0;
+    }
+
     fn record_billed(&mut self, resumed: bool) {
         if !resumed { self.resume_reservations_since_build = 0; }
         self.resumes_since_build = if resumed {
@@ -13058,6 +13066,10 @@ impl AutoPrLoop {
                 if let Ok(report) = &outcome {
                     if report.billed {
                         FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
+                    } else if !report.resumed && report.message != IDLE_MSG {
+                        // #2504: an unbilled issue-lane turn still took the
+                        // slot the debt reserved for it; own-PR work is next.
+                        FairSched::update_persist(&self.fair_path, FairSched::record_issue_turn);
                     }
                 }
                 match outcome {
@@ -13529,7 +13541,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         assert_eq!(allowance.confirmed, 0);
         assert_eq!(allowance.available, 5, "a paid retry is not a merged PR");
         let fair = FairSched::load(&fair_path);
-        let expected = if billed { if resumed { (3, 3) } else { (0, 0) } } else { (2, 3) };
+        // #2504: any issue-lane turn (selected, scoped or parked) settles the
+        // debt, billed or not; an unpaid PR turn leaves it unchanged.
+        let expected = if !resumed { (0, 0) } else if billed { (3, 3) } else { (2, 3) };
         assert_eq!((fair.resumes_since_build, fair.resume_reservations_since_build), expected,
             "held control flow must not erase a paid turn's fairness settlement");
     }
@@ -13558,6 +13572,82 @@ else:raise Exception('unexpected fixture call '+repr(args))
     #[tokio::test(start_paused = true)]
     async fn paid_completed_build_clears_resume_debt() {
         assert_turn_fairness(false, true, false).await;
+    }
+
+    /// #2504 — Legion 2026-11-23 20:20Z-20:40Z: autopr-fair.json read
+    /// {"resume_cursor":2449,"resumes_since_build":1,"resume_reservations_since_build":3}.
+    /// About ten fresh issues were scoped and parked unbilled, so the debt never
+    /// cleared and due own PRs (#2378, #2358, #2449) starved. An unbilled
+    /// issue-lane turn must settle the debt so own-PR work gets the next slot,
+    /// and own-PR work must come back at least every `per_build + 1` turns.
+    #[tokio::test(start_paused = true)]
+    async fn unbilled_issue_turns_cannot_starve_due_own_pr_work() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1);
+        let now = chrono::Utc::now();
+        worker.clock = Arc::new(move || now);
+        FairSched::update_persist(&worker.fair_path, |fair| {
+            fair.resume_cursor = 2449;
+            fair.resumes_since_build = 1;
+            fair.resume_reservations_since_build = 3;
+        });
+        let fair_path = worker.fair_path.clone();
+        assert!(prefer_build_now(Lane::Combined, true, &FairSched::load(&fair_path), 2), "fixture: the owed build turn");
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "fixture: tier (c) own-PR work is shut out while the debt stands");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let timer_stop = stop.clone();
+        let run = worker.run_with(stop, move || {
+            let turn = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if turn > 0 { return Ok(RunReport::idle()); }
+                // A fresh issue scoped and parked: unbilled, held, not a resume.
+                Ok(RunReport { message: "issue #2401: scoping parked awaiting input".into(),
+                    billed: false, held: true, resumed: false })
+            }
+        }, || async { 0 });
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            timer_stop.cancel();
+        };
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        let fair = FairSched::load(&fair_path);
+        assert_eq!((fair.resume_cursor, fair.resumes_since_build, fair.resume_reservations_since_build), (2449, 0, 0),
+            "an unbilled issue-lane turn must settle the resume debt");
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other),
+            "the next slot admits due tier (c) own-PR work");
+
+        // Bounded interleave: issue turns settle, PR reservations accrue; own-PR
+        // work is never more than one issue turn away.
+        let mut fair = FairSched::default();
+        let mut since_pr = 0;
+        for _ in 0..30 {
+            if prefer_build_now(Lane::Combined, true, &fair, 2) {
+                fair.record_issue_turn();
+                since_pr += 1;
+            } else {
+                fair.reserve_resume();
+                since_pr = 0;
+            }
+            assert!(since_pr <= 1, "own-PR work starved for {since_pr} consecutive issue turns");
+        }
+
+        // A stale owner whose lease expired does not keep the workflow.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let binding = crate::autoship_workflow::Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        store.register("owner/repo#2439", "agent-fix/issue-2439", binding, 0).unwrap();
+        assert!(store.claim("owner/repo#2439", "stale-worker", 0, 1_000).unwrap().is_some());
+        assert!(store.claim("owner/repo#2439", "worker", 500, 1_000).unwrap().is_none(), "a live lease is exclusive");
+        assert!(store.claim("owner/repo#2439", "worker", 1_001, 1_000).unwrap().is_some(),
+            "an expired lease with a stale owner is claimable");
     }
 
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
