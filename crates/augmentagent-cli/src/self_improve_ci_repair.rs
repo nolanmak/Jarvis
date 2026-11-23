@@ -381,6 +381,9 @@ pub(super) struct ScopeEvidence {
     pub checks: Vec<String>,
     pub tests: Vec<String>,
     pub files: Vec<String>,
+    /// #2329: the failing checks' bounded diagnostics, quoted to the scope
+    /// authority as untrusted data.
+    pub diagnostics: String,
 }
 impl ScopeEvidence {
     fn of(root: &Path, observation: &Observation) -> Option<Self> {
@@ -401,6 +404,8 @@ impl ScopeEvidence {
             for file in implicated_files(root, &failure.diagnostics) {
                 add(&mut evidence.files, file);
             }
+            evidence.diagnostics.push_str(&format!("{}:\n{}\n", failure.name,
+                hosted_ci::diagnostic_excerpt(&failure.diagnostics, 3000)));
         }
         (!evidence.files.is_empty()).then_some(evidence)
     }

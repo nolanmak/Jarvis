@@ -7256,7 +7256,10 @@ async fn resume_draft_pr(
     if let Some(scope) = ci_scope {
         let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
             title: &issue.title, worktree: &worktree, control: &acceptance_control };
-        match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, &scope.tests, &mut workflow).await? {
+        // #2329: `Repair` means the failure reproduced on this head with the
+        // same pinned recipe while green main passes it.
+        let failure = acceptance::ci_scope::Failure { tests: &scope.tests, diagnostics: &scope.diagnostics, regression: ci_findings.is_some() };
+        match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, failure, &mut workflow).await? {
             acceptance::ci_scope::Widen::InScope => {}
             acceptance::ci_scope::Widen::Amended(paths) => {
                 info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
