@@ -7216,7 +7216,13 @@ async fn resume_draft_pr(
         info!(pr, issue = issue.number, head = %workflow.binding().head, "resume: published the workflow's checkpointed head before acceptance");
     }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
-    let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
+    // #2329: with a rescope pending (or a failure implicating files outside
+    // the contract), the CI code-repair round is only `due` here. It is
+    // admitted after the scope decision below, so a repair confined to the
+    // old scope spends nothing and its backoff never replaces the rescope.
+    let mut rescope_findings = acceptance::own_pr_rescope::pending(&rescope_entry);
+    let ci_repair::Scoped { preparation: ci_preparation, scope: mut ci_scope, due: mut ci_due } =
+        ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay, rescope_findings.is_some()).await?;
     let mut ci_findings = match ci_preparation {
         ci_repair::Preparation::Continue => None,
         ci_repair::Preparation::Repair(input) => Some(input),
@@ -7250,41 +7256,64 @@ async fn resume_draft_pr(
     // recorded findings: a new revision on this branch and head, then repair,
     // verify and review in it; past the bound, stop for the owner.
     let mut rescope_notes = None;
-    if let Some(findings) = acceptance::own_pr_rescope::pending(&rescope_entry) {
-        let upheld = workflow.latest_review_receipt("resume-structured-")?
-            .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
-            .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
-        let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
-            pr, issue: issue.number, automatic: expected_head.is_none() };
-        match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
-            acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
-                info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
-                rescope_notes = notes;
-            }
-            acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
-                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-                return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+    // #2329: a refused CI scope amendment goes straight to the rescope in
+    // this same run (the second pass), instead of waiting for a later tick
+    // whose CI preparation could move the checkpoint first.
+    for _pass in 0..2 {
+        let rescoping = rescope_findings.is_some();
+        if let Some(findings) = rescope_findings.take() {
+            let upheld = workflow.latest_review_receipt("resume-structured-")?
+                .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+                .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+            let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
+                pr, issue: issue.number, automatic: expected_head.is_none() };
+            match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
+                acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
+                    info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
+                    rescope_notes = notes;
+                }
+                acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+                }
             }
         }
-    }
-    // #2454: a required check whose failure implicates files outside the
-    // contract asks the amendment authority for exactly those files before any
-    // repair round. A refusal rescopes; repair never retries the old scope.
-    if let Some(scope) = ci_scope {
+        // #2454: a required check whose failure implicates files outside the
+        // contract asks the amendment authority for exactly those files before
+        // any repair round. A refusal rescopes; repair never retries the old scope.
+        let Some(scope) = ci_scope.take() else { break };
         let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
             title: &issue.title, worktree: &worktree, control: &acceptance_control };
         // #2329: `Repair` means the failure reproduced on this head with the
         // same pinned recipe while green main passes it.
         let failure = acceptance::ci_scope::Failure { tests: &scope.tests, diagnostics: &scope.diagnostics, regression: ci_findings.is_some() };
         match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, failure, &mut workflow).await? {
-            acceptance::ci_scope::Widen::InScope => {}
+            acceptance::ci_scope::Widen::InScope => break,
             acceptance::ci_scope::Widen::Amended(paths) => {
                 info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
+                break;
             }
             acceptance::ci_scope::Widen::Rescoped(message) => {
-                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-                return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+                let pending = acceptance::own_pr_rescope::pending(&workflow.current_checkpoint()?);
+                if rescoping || pending.is_none() {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+                }
+                info!(pr, issue = issue.number, "resume: CI scope refused; rescoping the own PR now");
+                rescope_findings = pending;
+                ci_scope = Some(scope);
             }
+        }
+    }
+    // #2329: the scope now covers the failing check's files (or never needed
+    // them): only now does a due CI code-repair round spend a rung.
+    if let Some(due) = ci_due.take() {
+        match ci_repair::admit_due(&mut workflow, pr, due).await? {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Repair(input) => {
+                if ci_findings.is_none() { ci_findings = Some(input); }
+            }
+            ci_repair::Preparation::Deferred(report) => return Ok(report),
         }
     }
 
@@ -16412,6 +16441,34 @@ CODEX-REVIEW: lgtm").0);
         assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
         assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
         assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2329 (PR #2378, head 856aca6f): the CI code-repair ladder ran before
+    /// the pending own-PR rescope and the CI scope step, so it spent four
+    /// rounds on a repair that could not edit `notify.rs` and its backoff
+    /// returned before the rescope (and overwrote it). The CI preparation is
+    /// told a rescope is pending; the rescope runs; the CI scope step runs; a
+    /// refusal there goes straight to the rescope in the same run; and only
+    /// then is a due CI repair round admitted, before the revise round uses it.
+    #[test]
+    fn resume_admits_a_due_ci_repair_round_only_after_the_scope_decision() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let pending = at("own_pr_rescope::pending(&rescope_entry)");
+        let prepared = at("ci_repair::prepare_scoped(");
+        let told = at("&ci_repair::SharedReplay, rescope_findings.is_some())");
+        let rescoped = at("own_pr_rescope::run(");
+        let widened = at("acceptance::ci_scope::widen(");
+        let straight = at("own_pr_rescope::pending(&workflow.current_checkpoint()?)");
+        let admitted = at("ci_repair::admit_due(");
+        let repaired = at("ci_findings.take()");
+        assert!(pending < prepared && prepared < told, "the CI preparation must know a rescope is pending");
+        assert!(told < rescoped && rescoped < widened, "the rescope runs before the CI scope step");
+        assert!(widened < straight && straight < admitted, "a refused CI scope must rescope before any repair round is admitted");
+        assert!(admitted < repaired, "the admitted round feeds the CI repair revise round");
     }
 
     /// #2491 (PR #2449, 14:33Z): the resume ran acceptance preparation before
