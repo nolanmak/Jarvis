@@ -439,13 +439,15 @@ struct Fixture {
     compiler: PathBuf,
 }
 fn setup(shared: bool) -> Fixture {
+    // The workflow store refuses symlinked paths; /tmp is one on macOS.
+    let tmp = Path::new("/tmp").canonicalize().unwrap();
     let root = tempfile::Builder::new()
         .prefix("ci-two-crate-")
-        .tempdir_in("/tmp")
+        .tempdir_in(&tmp)
         .unwrap();
     let control = tempfile::Builder::new()
         .prefix("ci-dispatch-control-")
-        .tempdir_in("/tmp")
+        .tempdir_in(&tmp)
         .unwrap();
     let sysroot = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -883,4 +885,70 @@ async fn hosted_infrastructure_holds_are_bounded_then_escalate_to_repair() {
         return;
     }
     child(TEST, "missing", false);
+}
+
+/// #2458 production shape (PR #2449, 2026-11-23 06:18Z): the workflow resumed
+/// ten minutes after pushing `62d22fa2`, while hosted CI on that head was still
+/// running. The reader answered `pending` and preflight filed it as a shared
+/// CI infrastructure failure: `failures` went to 5, so the retry slept a full
+/// hour, and six such polls would escalate CI that is merely running to code
+/// repair. Pending checks on the bound head are a short poll. They never
+/// count as an infrastructure failure or spend an infrastructure-hold slot,
+/// and green checks continue the workflow on the next poll.
+#[tokio::test]
+async fn pending_checks_after_a_push_wait_briefly_without_counting_infrastructure() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::pending_checks_after_a_push_wait_briefly_without_counting_infrastructure";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| value["pending"] = true.into());
+        let mut at = None;
+        // More polls than INFRA_HOLD_LIMIT: running CI must never escalate.
+        for poll in 0..(ci_repair::INFRA_HOLD_LIMIT + 3) {
+            let mut workflow = guard(&root, &control, at).await;
+            let id = workflow.id().to_owned();
+            let head = workflow.binding().head.clone();
+            let before = snapshot(&control, &id);
+            let started = chrono::Utc::now().timestamp_millis();
+            let report = match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+                ci_repair::Preflight::Deferred(report) => report,
+                ci_repair::Preflight::Continue => panic!("poll {poll}: pending checks continued as if green"),
+                ci_repair::Preflight::Compare(_) => panic!("poll {poll}: pending checks cannot be compared"),
+            };
+            assert!(report.message.contains("checks pending"), "poll {poll}: {}", report.message);
+            let after = snapshot(&control, &id);
+            assert_eq!((after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()),
+                ("hosted_ci_pending", "retry_verification"), "poll {poll}");
+            assert_eq!(after.checkpoint.stage, Stage::Reconcile, "poll {poll}");
+            let eligible = after.checkpoint.next.eligible_at_ms;
+            assert!(eligible >= started + 5 * 60_000 && eligible <= chrono::Utc::now().timestamp_millis() + 5 * 60_000,
+                "poll {poll}: pending checks wait five minutes, not a growing backoff ({eligible})");
+            assert!(after.lease_until_ms <= chrono::Utc::now().timestamp_millis(), "poll {poll}: the wait releases the slot");
+            assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+            assert_eq!(after.model_calls, before.model_calls);
+            let store = WorkflowStore::open(&control.join("workflow.db")).unwrap();
+            let events = store.events(&id).unwrap();
+            assert!(!events.iter().any(|event| event.1 == "verification_infrastructure_retry"),
+                "poll {poll}: pending checks were counted as an infrastructure failure");
+            assert!(!events.iter().any(|event| event.1 == "hosted_ci_code_failure"),
+                "poll {poll}: pending checks escalated to code repair");
+            let mut workflow = guard(&root, &control, Some(eligible + 1)).await;
+            assert_eq!(workflow.epoch_attempts(ci_repair::INFRA_HOLD_PURPOSE, &head).unwrap(), 0,
+                "poll {poll}: pending checks spent an infrastructure-hold slot");
+            workflow.finish().unwrap();
+            at = Some(eligible + 2);
+        }
+        // Checks finish green on the same head: the next poll continues.
+        update_scenario(&control, |value| {
+            value["pending"] = false.into();
+            value["job_names"] = serde_json::json!([]);
+            value["required_state"] = "SUCCESS".into();
+        });
+        let mut workflow = guard(&root, &control, at).await;
+        assert!(matches!(ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap(), ci_repair::Preflight::Continue),
+            "green checks on the bound head continue the workflow");
+        workflow.finish().unwrap();
+        return;
+    }
+    child(TEST, "pending", false);
 }
