@@ -521,6 +521,19 @@ fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &s
     store.release(&lease,now)?;
     result.map(|_|true)
 }
+/// Marker of the one-time reopen of a pre-split budget hold.
+const BUDGET_REOPEN: &str = "adjudicated-amend-total-v1";
+/// #2350 (PR #2358, 11:32Z 2026-11-23): a paid final adjudication was refused
+/// because pre-review verifier disputes had spent `verifier-amend-total`, then
+/// parked on `dependency_new_adjudication_evidence`, which only an owner edit
+/// reopens. Adjudicated amendments now have their own total budget, so a hold
+/// parked under the old shared budget reopens once, without an owner edit.
+fn shared_budget_hold(checkpoint: &crate::autoship_workflow::Checkpoint, history: &[String]) -> bool {
+    checkpoint.next.reason == "adjudicated_amendment_budget"
+        && checkpoint.next.action == "dependency_new_adjudication_evidence"
+        && checkpoint.evidence.iter().any(|item| item.contains("adjudicated amendment epoch budget exhausted"))
+        && !history.iter().any(|payload| payload.contains(BUDGET_REOPEN))
+}
 pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool) -> Option<&'static str> {
     adjudicated_dependency_at(repo,candidate,dry_run,&workflow::path()).await
 }
@@ -548,11 +561,17 @@ pub(super) async fn adjudicated_dependency_at(repo: &Path, candidate: &adoption:
             _ => return Some("dependency-evidence-unavailable"),
         }
     } else { None };
-    let current = serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":candidate.head,
+    let mut current = serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":candidate.head,
         "pr_body_hash":crate::autoship_review::digest(candidate.body.as_bytes()),"pr_title_hash":crate::autoship_review::digest(candidate.title.as_bytes()),"request_hash":request_hash});
     let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
         .find(|value|value["kind"] == "adjudicated_dependency");
-    if dependency_inputs_match(marker.as_ref(),&current,candidate.source_issue.is_some()) { return Some(reason); }
+    let history = match store.events(&id) {
+        Ok(events) => events.into_iter().map(|(_, _, payload, _)| payload).collect::<Vec<_>>(),
+        Err(_) => return Some("dependency-evidence-unavailable"),
+    };
+    let budget_reopen = shared_budget_hold(&snapshot.checkpoint, &history);
+    if budget_reopen { current["budget_policy"] = BUDGET_REOPEN.into(); }
+    if !budget_reopen && dependency_inputs_match(marker.as_ref(),&current,candidate.source_issue.is_some()) { return Some(reason); }
     if dry_run { return None; }
     match reopen_dependency(&mut store,&id,&snapshot.checkpoint,current,chrono::Utc::now().timestamp_millis()) {
         Ok(true)=>None,
@@ -593,6 +612,32 @@ mod dependency_recovery_tests {
         assert!(dependency_inputs_match(Some(&prior),&prior,false));
         assert!(!dependency_inputs_match(Some(&prior),&current,false));
     }
+    /// #2350 (PR #2358): parked on the old shared budget with unchanged
+    /// inputs. It reopens once without an owner edit; never twice.
+    #[test]
+    fn a_hold_parked_on_the_old_shared_budget_reopens_once() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        let dir=tempfile::tempdir().unwrap();
+        let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id="owner/repo#2350";
+        store.register(id,"branch",Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},1).unwrap();
+        let lease=store.claim(id,"initial",2,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.next.reason="adjudicated_amendment_budget".into();
+        checkpoint.next.action="dependency_new_adjudication_evidence".into();
+        checkpoint.evidence=vec!["adjudicated amendment epoch budget exhausted; changed trusted inputs required".into()];
+        store.checkpoint(&lease,&checkpoint,3).unwrap(); store.release(&lease,4).unwrap();
+        let history=|store:&WorkflowStore|store.events(id).unwrap().into_iter().map(|(_,_,p,_)|p).collect::<Vec<_>>();
+        assert!(shared_budget_hold(&checkpoint,&history(&store)),"a shared-budget hold waits for an owner edit");
+        let mut other=checkpoint.clone();other.next.reason="owner_requirement_conflict".into();
+        assert!(!shared_budget_hold(&other,&history(&store)),"a real owner dependency reopened");
+        let current=serde_json::json!({"kind":"adjudicated_dependency_reconciliation","budget_policy":BUDGET_REOPEN});
+        assert!(reopen_dependency(&mut store,id,&checkpoint,current,5).unwrap());
+        let reopened=store.snapshot(id).unwrap().unwrap().checkpoint;
+        assert_eq!(reopened.next.action,"retry_adjudicated_amendment");
+        assert!(!shared_budget_hold(&checkpoint,&history(&store)),"the one-time reopen can repeat");
+    }
+
     #[test]
     fn issue_edit_after_failed_snapshot_reopens_durably_without_model_admission() {
         use crate::autoship_workflow::{Binding,WorkflowStore};
