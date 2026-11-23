@@ -249,6 +249,7 @@ struct MiddleEvidence {
     line:Vec<u8>,
     in_failures:bool,
     after_panic:u8,
+    after_error:u8,
     kept:String,
     omitted:bool,
 }
@@ -271,6 +272,9 @@ impl MiddleEvidence {
         };
         let content=log_content(text).trim_end();
         let panic=content.contains("panicked at");
+        // PR #2449: a compiler error's location is the `-->` line after its
+        // header; keep it so the excerpt still attributes the error.
+        let error=content.contains("error[E");
         let keep=if content.ends_with("failures:") {
             self.in_failures=true;
             true
@@ -279,10 +283,12 @@ impl MiddleEvidence {
             true
         }else {
             panic || self.after_panic>0
+                || self.after_error>0 && content.contains("--> ")
                 || EVIDENCE_SIGNS.iter().any(|sign|content.contains(sign))
                 || self.in_failures && (content.starts_with("    ")||content.starts_with("---- "))
         };
         self.after_panic=if panic {3} else {self.after_panic.saturating_sub(1)};
+        self.after_error=if error {2} else {self.after_error.saturating_sub(1)};
         if !keep {return;}
         if self.kept.len()+text.len()+1>EVIDENCE_BUDGET {
             self.omitted=true;
