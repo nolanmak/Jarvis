@@ -460,6 +460,23 @@ pub fn start_runtime(
     }
 }
 
+/// An enrolled context is pinned to the configuration it was established
+/// under. Drift fails before dispatch instead of rebinding the owner surface
+/// to a different Discord identity under the same binding revision.
+fn pinned_context(
+    existing: Option<augmentagent_store::imessage_owner::OwnerContext>,
+    digest: &str,
+) -> Result<Option<augmentagent_store::imessage_owner::OwnerContext>> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        existing.config_digest == digest,
+        "Discord owner configuration changed; disable and re-enroll the owner text surface"
+    );
+    Ok(Some(existing))
+}
+
 async fn ensure_context(
     store: &Store,
     http: &serenity::http::Http,
@@ -478,11 +495,7 @@ async fn ensure_context(
     let digest = augmentagent_approval_discord::imessage_owner::origin_digest(
         &token, owner, channel, approval,
     );
-    if let Some(existing) = store.imessage_owner_context()? {
-        anyhow::ensure!(
-            existing.config_digest == digest,
-            "Discord owner configuration changed; disable and re-enroll the owner text surface"
-        );
+    if let Some(existing) = pinned_context(store.imessage_owner_context()?, &digest)? {
         return Ok(Some(existing));
     }
     let user = http.get_current_user().await?;
@@ -527,6 +540,69 @@ mod tests {
         );
         record_dispatch_result(&store, &Ok(true));
         assert!(store.imessage_owner_status(0).unwrap()["dispatch_error"].is_null());
+    }
+
+    /// Help is generated offline: every control it names is recognized by the
+    /// deterministic parser, and none of it depends on a configured endpoint.
+    #[test]
+    fn help_names_the_supported_deterministic_controls_without_endpoint_values() {
+        use augmentagent_approval_discord::imessage_owner_control::{
+            immediate_command, parse, Control,
+        };
+        let help = augmentagent_approval_discord::imessage_owner::HELP;
+        for control in ["status", "cancel", "cancel all", "reset", "help"] {
+            assert!(help.contains(control), "help omits {control}");
+            assert!(
+                immediate_command(control) || parse(control, None) == Control::Help,
+                "{control} is not a deterministic control"
+            );
+        }
+        for environment in ["DISCORD_", "://", "example"] {
+            assert!(!help.contains(environment), "help leaks {environment}");
+        }
+    }
+
+    #[test]
+    fn a_changed_configuration_digest_refuses_dispatch_until_re_enrollment() {
+        use augmentagent_store::imessage_owner::OwnerContext;
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let binding = store
+            .bind_imessage_owner("owner-chat", "owner@example.invalid", false, 0)
+            .unwrap();
+        let pinned = OwnerContext {
+            revision: binding.revision,
+            config_digest: "fixture-digest-a".into(),
+            guild_id: 11,
+            channel_id: 12,
+            approval_channel_id: 13,
+            owner_id: 14,
+            bot_id: 15,
+        };
+        store.configure_imessage_owner_context(&pinned).unwrap();
+        assert!(pinned_context(Some(pinned.clone()), "fixture-digest-b").is_err());
+        assert_eq!(
+            pinned_context(Some(pinned.clone()), "fixture-digest-a").unwrap(),
+            Some(pinned.clone())
+        );
+        assert_eq!(pinned_context(None, "fixture-digest-b").unwrap(), None);
+        assert_eq!(store.imessage_owner_context().unwrap(), Some(pinned.clone()));
+        let surface = augmentagent_approval_discord::imessage_owner::OwnerSurface::for_origin(
+            store.clone(),
+            "fixture-digest-b".into(),
+        );
+        assert!(!surface.active(), "drifted configuration must not dispatch");
+        store.disable_imessage_owner().unwrap();
+        let reenrolled = store
+            .bind_imessage_owner("owner-chat", "owner@example.invalid", false, 0)
+            .unwrap();
+        store
+            .configure_imessage_owner_context(&OwnerContext {
+                revision: reenrolled.revision,
+                config_digest: "fixture-digest-b".into(),
+                ..pinned
+            })
+            .unwrap();
+        assert!(surface.active());
     }
 
     #[tokio::test]
