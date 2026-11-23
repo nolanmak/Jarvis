@@ -1224,7 +1224,18 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
     workflow.checkpoint_qualification_source(prepared).await?;
     let legacy=prepared.proposal.contract.verifiers.iter().any(|v|!v.command.controller_asserted());
     let checked=if legacy {Err(anyhow::anyhow!("legacy in-process verifier requires independent behavioral-oracle migration"))}else {
-        qualify_original_baseline(root,control,prepared,workflow).await
+        match qualify_original_baseline(root,control,prepared,workflow).await {
+            // #2471: an own open PR is not parked or rescoped because the
+            // controller's witness contract changed. Re-establish acceptance
+            // on the same head with a witness for the current contract.
+            Err(error) if baseline_witness::controller_witness_changed(&error) && workflow.begin_witness_regeneration()? => {
+                warn!(workflow=%workflow.id(),head=%workflow.binding().head,"own PR: regenerating the acceptance witness for the current controller contract");
+                let regenerated=qualify_original_baseline(root,control,prepared,workflow).await;
+                workflow.end_witness_regeneration();
+                regenerated
+            }
+            other=>other,
+        }
     };
     match checked {
         Ok(())=>Ok(()),
