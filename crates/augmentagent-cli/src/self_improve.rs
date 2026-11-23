@@ -7529,6 +7529,66 @@ async fn resume_draft_pr(
         resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        // #2451: at most N review attempts per (head, contract). A rejection
+        // already recorded for this exact code is acted on, not re-reviewed:
+        // PR #2378 reviewed one head three times to reach the same verdict.
+        let review_key = crate::autoship_workflow::review_binding_cap::binding_key(
+            &workflow.binding().head, &workflow.binding().contract);
+        let recorded = previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
+            review, &workflow.binding().head, &workflow.binding().contract));
+        let review_route = workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
+            recorded.is_some(), rounds_done < revise_rounds())?;
+        {
+            use crate::autoship_workflow::review_binding_cap::{Route, EXHAUSTED_BACKOFF_MS};
+            match (review_route, recorded) {
+                (Route::Review, _) => {}
+                (Route::Repair, Some(findings)) => {
+                    rounds_done += 1;
+                    info!(pr, issue = issue.number, round = rounds_done, reason = review_route.reason(),
+                        "resume: review attempts for this head exhausted; repairing recorded findings");
+                    match adoption::revise(reasoner, &workflow, &fix_opts(worktree.clone()),
+                        &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref())).await
+                    {
+                        Ok(rs) => {
+                            let _ = drop_root_scratch(&worktree).await;
+                            let _ = run("git", &["add", "-A"], &worktree).await?;
+                            let msg = format!("review round {rounds_done}: address recorded review findings");
+                            let _ = run("git", &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                                &worktree).await?;
+                            if !workflow.publish_round(branch, repo_root, pr, rounds_done, "recorded review findings", &findings,
+                                dry_run, expected_head.is_none(), Some(issue_no)).await? {
+                                return Ok(RunReport::held(format!("PR #{pr}: automatic round publication routing held")));
+                            }
+                            summary = format!("{summary}\nRound {rounds_done} (recorded findings): {}", truncate(&rs, 300));
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(pr, "capped-review repair failed; draft preserved: {e:#}");
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                            record_reasoner_error(issue.number,
+                                failure_record(reasoner, FailureKind::ReasonerError, "resume:capped-review-repair", &format!("{e:#}")));
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                            return Ok(RunReport::built(format!("PR #{pr}: capped-review repair errored; draft unchanged")));
+                        }
+                    }
+                }
+                (Route::Rescope, _) | (Route::Repair, None) => {
+                    workflow.transition(Stage::Scope, Route::Rescope.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + 300_000).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted; findings routed to rescoping")));
+                }
+                (Route::Backoff, _) => {
+                    workflow.transition(Stage::Scope, review_route.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + EXHAUSTED_BACKOFF_MS).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted without actionable findings; backing off")));
+                }
+            }
+        }
+        let review_calls_before = workflow.model_calls()?;
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
@@ -7566,6 +7626,8 @@ async fn resume_draft_pr(
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
             0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+        // #2451: charge what this attempt actually spent to its binding.
+        workflow.charge_review_binding_calls(&review_key, workflow.model_calls()?.saturating_sub(review_calls_before))?;
         if let Some(structured) = &independent.structured {
             if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
                 &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
