@@ -66,7 +66,7 @@ fn rows(open: u64) -> (serde_json::Value, serde_json::Value) {
 /// One worker tick's read side: both selectors, then the reconciliation sweep.
 async fn tick(root: &Path) {
     gh_budget::tick_scope(async {
-        let _ = find_resumable_draft(root, None, true).await;
+        let _ = find_resumable_draft(root, None, true, adoption::FinishTier::Other).await;
         let _ = adopted_execution::next(root, true).await;
     })
     .await;
