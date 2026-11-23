@@ -37,6 +37,13 @@ struct Artifact {
     provenance:scope_authority::NativeReplyReference,
 }
 
+/// #2493: the version-1 acceptance of a byte-hash era qualification.
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigratedArtifact {
+    version:u32,context:String,policy_version:u32,legacy_policy:String,legacy_context:String,legacy_sha256:String,
+}
+
 const REQUALIFICATION_RULE:&str=crate::autoship_workflow::RETAINED_REQUALIFICATION_RULE;
 #[derive(Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(deny_unknown_fields)]
@@ -51,14 +58,42 @@ struct RequalifiedArtifact {
     checked:Vec<CheckedNativeResponse>,
 }
 
-pub(super) fn policy_hash()->String {
-    amendment::digest(&serde_json::to_vec(&("original-production-witness-v1",amendment::digest(include_bytes!("self_improve_baseline_witness.rs")),
-        amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
-        amendment::digest(include_bytes!("self_improve_native_history.rs")),
-        amendment::digest(include_bytes!("self_improve_verifier_checkout.rs")),scope_authority::witness_policy_hash(),REQUALIFICATION_RULE)).unwrap())
+/// Witness qualification semantics, versioned on purpose (#2493). A context
+/// binds this version, not the source bytes of the modules that implement it,
+/// so a deploy that only edits code or comments keeps every stored
+/// qualification. Bump it when what a qualification MEANS changes: the
+/// judgment schema, validator, disposition, prompt, context or acceptance
+/// checks. A bump invalidates every stored qualification (#2477's same-head
+/// regeneration then re-establishes own PRs).
+/// `tests::witness_semantics_require_a_policy_version_decision` fails when
+/// those items change without a recorded decision.
+pub(super) const WITNESS_POLICY_VERSION:u32=1;
+pub(super) fn policy_hash()->String {policy_hash_for(WITNESS_POLICY_VERSION)}
+fn policy_hash_for(version:u32)->String {
+    amendment::digest(&serde_json::to_vec(&("original-production-witness-policy",version,scope_authority::witness_policy_hash(),REQUALIFICATION_RULE)).unwrap())
 }
+/// Retired byte-hash policies (`original-production-witness-v1` over source
+/// digests) that main deployed while the scoper identity was the frozen
+/// version-1 value, oldest first: cfa5393b, f0da445a, 5d4f09a4, 54c678e1,
+/// 8b1c9e64, 088b78c3, abbee4f1. They are recognized only to migrate a stored
+/// qualification into `BYTE_HASH_MIGRATION_VERSION`, never under a later one.
+const BYTE_HASH_POLICIES:&[&str]=&[
+    "b7d6b3a7551a32f615552aefc994b1f53b60ffd32909e8179ac06dc4561ac87f",
+    "b928f794a962cd06f145928d8598d972c0a318d375c09c9188d5ba42d5458d40",
+    "f08e6c99634d5345adce64e54d1680ac53f7c07c31acb7d7e7f9a35b6dae3dde",
+    "317789132e61db19809df45ff8317b208d316a89b3f08b74074d9f18ef7410ca",
+    "897367c38e57e6a7567be3ee396553350c8955558c665f60db2962fd83348f9b",
+    "b1573d6a90ccca333bdf414dc6dede12b7cab2b4a46f20081071b98f3a703e58",
+    "a198632d7e74e6cf8f6ad00916a48e88e1ec3ce51cdf7db4231632f4b2b3b96a",
+];
+const BYTE_HASH_MIGRATION_VERSION:u32=1;
+#[cfg(test)]
+const FROZEN_V1_POLICY:&str="ee746a7daa5f29ed71258b0e78655326a9932263d70e5f6bb47cbf1ddc0568ff";
 fn context(proposal:&ContractProposal,baseline:&BaselineEvidence)->Result<String> {
-    context_with_policy(proposal,baseline,&policy_hash())
+    context_for(proposal,baseline,WITNESS_POLICY_VERSION)
+}
+fn context_for(proposal:&ContractProposal,baseline:&BaselineEvidence,version:u32)->Result<String> {
+    context_with_policy(proposal,baseline,&policy_hash_for(version))
 }
 fn context_with_policy(proposal:&ContractProposal,baseline:&BaselineEvidence,policy:&str)->Result<String> {
     ensure!(proposal.contract==*baseline.registration.contract(),"witness proposal differs from registration");
@@ -202,7 +237,7 @@ fn retained_question_matches(root:&Path,prepared:&PreparedAcceptance,control:&Pa
     // Unknown historical checker versions remain data-only. Never guess the
     // error text that determined a later recorded native question.
     let legacy=origin==context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY)?;
-    if !legacy && origin!=context(&prepared.proposal,&prepared.baseline)? {return Ok(false);}
+    if !legacy && origin!=context(&prepared.proposal,&prepared.baseline)? && !byte_hash_context(prepared,origin)? {return Ok(false);}
     let mut matches=0;
     for observation in custody {
         let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:serde_json::from_str(&observation.provenance)?};
@@ -670,28 +705,87 @@ fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authorit
 }
 
 pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptance)->Result<()> {
-    let expected=context(&prepared.proposal,&prepared.baseline)?;
+    assert_current_under(root,control,prepared,WITNESS_POLICY_VERSION)
+}
+fn assert_current_under(root:&Path,control:&Path,prepared:&PreparedAcceptance,version:u32)->Result<()> {
+    let expected=context_for(&prepared.proposal,&prepared.baseline,version)?;
     prepared.baseline.registration.verify_integrity(root)?;
     let control=control.canonicalize()?;
     for writable in worker_roots(root) {if writable.exists() {ensure!(!control.starts_with(writable.canonicalize()?),"baseline qualification is writable by worker");}}
     let path=artifact_path(&control,&expected);
-    if !path.try_exists()? {bail!("baseline_witness_unqualified: protected original-production qualification is missing");}
-    let bytes=private_bytes(&path,64*1024).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    if !path.try_exists()? && !migrate_byte_hash_qualification(root,&control,prepared,version,&expected)? {
+        bail!("baseline_witness_unqualified: protected original-production qualification is missing");
+    }
+    let bytes=read_artifact(&path)?;
     let header:serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|anyhow::Error::from(e).context(initial_repair::Hold::EvidenceUnknown))?;
+    if header["version"]!=3 {return assert_artifact(root,&control,prepared,&expected,&bytes);}
+    let (legacy_context,legacy)=(||->Result<(String,Vec<u8>)> {
+        let record:MigratedArtifact=serde_json::from_slice(&bytes)?;
+        ensure!(record.version==3 && record.context==expected && record.policy_version==version && version==BYTE_HASH_MIGRATION_VERSION
+            && BYTE_HASH_POLICIES.contains(&record.legacy_policy.as_str())
+            && record.legacy_context==context_with_policy(&prepared.proposal,&prepared.baseline,&record.legacy_policy)?,
+            "migrated byte-hash qualification receipt changed");
+        let legacy=private_bytes(&artifact_path(&control,&record.legacy_context),64*1024)?;
+        ensure!(amendment::digest(&legacy)==record.legacy_sha256,"migrated byte-hash qualification changed");
+        Ok((record.legacy_context,legacy))
+    })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    assert_artifact(root,&control,prepared,&legacy_context,&legacy)
+}
+/// #2493: a context the current version-1 checker shares with a deployed
+/// byte-hash policy (same question, same validator), for retained runs.
+fn byte_hash_context(prepared:&PreparedAcceptance,origin:&str)->Result<bool> {
+    if WITNESS_POLICY_VERSION!=BYTE_HASH_MIGRATION_VERSION {return Ok(false);}
+    for policy in BYTE_HASH_POLICIES {
+        if origin==context_with_policy(&prepared.proposal,&prepared.baseline,policy)? {return Ok(true);}
+    }
+    Ok(false)
+}
+fn read_artifact(path:&Path)->Result<Vec<u8>> {
+    private_bytes(path,64*1024).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))
+}
+/// #2493: accept a qualification stored under the retired byte-hash scheme
+/// once, into version 1. Only a deployed byte-hash policy qualifies, only for
+/// this exact proposal and measured baseline (head, contract and environment
+/// are all in the context), and only the newest stored one, which must still
+/// pass today's checks. A receipt at the version-1 context records the
+/// acceptance; a later version bump invalidates receipt and artifact alike.
+fn migrate_byte_hash_qualification(root:&Path,control:&Path,prepared:&PreparedAcceptance,version:u32,expected:&str)->Result<bool> {
+    if version!=BYTE_HASH_MIGRATION_VERSION {return Ok(false);}
+    for legacy_policy in BYTE_HASH_POLICIES.iter().rev() {
+        let legacy_context=context_with_policy(&prepared.proposal,&prepared.baseline,legacy_policy)?;
+        let path=artifact_path(control,&legacy_context);
+        if !path.try_exists()? {continue;}
+        // The newest stored observation governs. An older positive never
+        // replaces a newer negative, changed or unreadable one.
+        let legacy=match read_artifact(&path).and_then(|bytes|assert_artifact(root,control,prepared,&legacy_context,&bytes).map(|()|bytes)) {
+            Ok(bytes)=>bytes,
+            Err(error)=>{warn!(context=%legacy_context,"byte-hash qualification not migrated: {error:#}");return Ok(false);},
+        };
+        let record=MigratedArtifact {version:3,context:expected.into(),policy_version:version,legacy_policy:(*legacy_policy).into(),
+            legacy_context:legacy_context.clone(),legacy_sha256:amendment::digest(&legacy)};
+        immutable(control,&artifact_path(control,expected),&serde_json::to_vec(&record)?)?;
+        info!(context=%expected,legacy=%legacy_context,"byte-hash qualification migrated into witness policy version {version}");
+        return Ok(true);
+    }
+    Ok(false)
+}
+/// Check one stored native (v1) or retained (v2) qualification for `expected`.
+fn assert_artifact(root:&Path,control:&Path,prepared:&PreparedAcceptance,expected:&str,bytes:&[u8])->Result<()> {
+    let header:serde_json::Value=serde_json::from_slice(bytes).map_err(|e|anyhow::Error::from(e).context(initial_repair::Hold::EvidenceUnknown))?;
     if header["version"]==2 {
-        return (||->Result<()> {assert_requalified(root,prepared,&expected,serde_json::from_slice(&bytes)?)})().map_err(requalification_error);
+        return (||->Result<()> {assert_requalified(root,prepared,expected,serde_json::from_slice(bytes)?)})().map_err(requalification_error);
     }
     let checked=(||->Result<Judgment> {
-        let artifact:Artifact=serde_json::from_slice(&bytes)?;
+        let artifact:Artifact=serde_json::from_slice(bytes)?;
         ensure!(artifact.version==1 && artifact.context==expected,"baseline witness artifact context changed");
         ensure!(artifact.native_control.is_absolute() && artifact.native_control.canonicalize()?==artifact.native_control,"native witness authority directory changed");
         ensure!(artifact.response_sha256.len()==64 && artifact.response_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid witness response identity");
         for writable in worker_roots(root) {if writable.exists() {ensure!(!artifact.native_control.starts_with(writable.canonicalize()?),"native qualification authority overlaps worker");}}
-        let bytes=private_bytes(&raw_path(&control,&expected,&artifact.response_sha256),2*1024*1024)?;
+        let bytes=private_bytes(&raw_path(control,expected,&artifact.response_sha256),2*1024*1024)?;
         ensure!(amendment::digest(&bytes)==artifact.response_sha256,"original witness response changed");
         let reply=scope_authority::NativeReply {text:String::from_utf8(bytes)?,provenance:artifact.provenance};
-        scope_authority::verify_witness_reply(&artifact.native_control,prepared.baseline.registration.baseline_head(),&expected,&reply)?;
-        validate(root,&prepared.proposal,&prepared.baseline,&expected,&reply.text)
+        scope_authority::verify_witness_reply(&artifact.native_control,prepared.baseline.registration.baseline_head(),expected,&reply)?;
+        validate(root,&prepared.proposal,&prepared.baseline,expected,&reply.text)
     })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     disposition(&checked)
 }
@@ -1364,11 +1458,16 @@ mod tests {
     fn controller_slots_use_paid_historical_bindings_and_preserve_corrective_unknown() {
         use std::os::unix::fs::PermissionsExt;
         use crate::autoship_workflow::{WorkflowStore,Binding,submission::Provider};
-        for fault in ["none","missing-controller","foreign-controller-proof","missing-native-proof","changed-corrective-question","lost-admission-and-counter"] {
+        // #2493: a corrective chain asked under a deployed byte-hash context
+        // is still the current version-1 question, not a controller change.
+        let cases=["none","missing-controller","foreign-controller-proof","missing-native-proof","changed-corrective-question","lost-admission-and-counter"]
+            .map(|fault|(PRE_CITATION_POLICY,fault)).into_iter()
+            .chain(["none","changed-corrective-question"].map(|fault|(*BYTE_HASH_POLICIES.last().unwrap(),fault)));
+        for (policy,fault) in cases {
             let (root,control,prepared)=fixture();
             std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
             persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
-            let origin=context_with_policy(&prepared.proposal,&prepared.baseline,PRE_CITATION_POLICY).unwrap();
+            let origin=context_with_policy(&prepared.proposal,&prepared.baseline,policy).unwrap();
             let mut first=saved_judgment(control.path(),&prepared);first["context"]=origin.clone().into();
             first["verifiers"][0]["production_citations"][0]["quote"]="READY = True".into();
             let first=first.to_string();let question=qualification_prompt(&origin,&prepared).unwrap();
@@ -2380,6 +2479,211 @@ mod tests {
         let error=disposition(&judged).unwrap_err();
         assert!(!format!("{error:#}").contains("private-native-diagnostic-never-publish"),"private native diagnosis escaped through the general error channel");
         assert!(error.downcast_ref::<BaselineNotRed>().is_some());
+    }
+    fn saved_judgment_at(control:&Path,expected:&str)->serde_json::Value {
+        let artifact:Artifact=serde_json::from_slice(&private_bytes(&artifact_path(control,expected),64*1024).unwrap()).unwrap();
+        serde_json::from_slice(&private_bytes(&raw_path(control,expected,&artifact.response_sha256),2*1024*1024).unwrap()).unwrap()
+    }
+
+    // #2493: qualification is bound to a deliberate policy version, not to
+    // the source bytes of the modules that implement it.
+    fn persist_scripted_under_policy(root:&Path,control:&Path,prepared:&PreparedAcceptance,policy:&str)->String {
+        persist_scripted(root,control,prepared,true).unwrap();
+        let current=context(&prepared.proposal,&prepared.baseline).unwrap();
+        let legacy=context_with_policy(&prepared.proposal,&prepared.baseline,policy).unwrap();
+        let mut judgment=saved_judgment(control,prepared);
+        judgment["context"]=legacy.clone().into();
+        let raw=judgment.to_string();
+        let mut reply=scope_authority::scripted_witness_reply(control,prepared.baseline.registration.baseline_head(),&legacy,&raw).unwrap();
+        let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+        proof["scope_request_hash"]=amendment::digest(qualification_prompt(&legacy,prepared).unwrap().as_bytes()).into();
+        let bytes=serde_json::to_vec(&proof).unwrap();
+        std::fs::write(&reply.provenance.artifact,&bytes).unwrap();reply.provenance.artifact_sha256=amendment::digest(&bytes);
+        let control=&control.canonicalize().unwrap();persist(control,&legacy,control,&reply).unwrap();
+        // Only the byte-hash artifact remains, as after a deploy.
+        let artifact:Artifact=serde_json::from_slice(&private_bytes(&artifact_path(control,&current),64*1024).unwrap()).unwrap();
+        std::fs::remove_file(raw_path(control,&current,&artifact.response_sha256)).unwrap();
+        std::fs::remove_file(artifact_path(control,&current)).unwrap();
+        legacy
+    }
+
+    #[test]
+    fn an_unrelated_witness_source_edit_keeps_an_existing_qualification() {
+        let (root,control,prepared)=fixture();
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        // These literals are the version-1 identities. Under the byte-hash
+        // scheme any edit to the witness, contract, history, checkout or scoper
+        // source (including this test) moved them and orphaned every stored
+        // qualification; now only a version bump does.
+        assert_eq!(scope_authority::witness_policy_hash(),"d404a078a3bb1f5377d365a750126faf76610f0437b9ece9fed0825a834f5512");
+        assert_eq!(policy_hash(),FROZEN_V1_POLICY,"witness policy identity depends on something other than its version");
+        assert_eq!(policy_hash_for(WITNESS_POLICY_VERSION),policy_hash());
+        assert_current(root.path(),control.path(),&prepared).unwrap();
+    }
+
+    #[test]
+    fn a_witness_policy_version_bump_invalidates_an_existing_qualification() {
+        let (root,control,prepared)=fixture();
+        persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
+        assert_current_under(root.path(),control.path(),&prepared,WITNESS_POLICY_VERSION).unwrap();
+        let error=assert_current_under(root.path(),control.path(),&prepared,WITNESS_POLICY_VERSION+1).unwrap_err();
+        assert!(format!("{error:#}").contains("baseline_witness_unqualified"),"a bumped policy accepted an older qualification: {error:#}");
+        assert_ne!(policy_hash_for(WITNESS_POLICY_VERSION+1),policy_hash());
+    }
+
+    #[test]
+    fn a_byte_hash_qualification_migrates_once_into_version_one() {
+        let (root,control,prepared)=fixture();
+        let deployed=BYTE_HASH_POLICIES.last().unwrap();
+        let legacy=persist_scripted_under_policy(root.path(),control.path(),&prepared,deployed);
+        let current=artifact_path(&control.path().canonicalize().unwrap(),&context(&prepared.proposal,&prepared.baseline).unwrap());
+        assert!(!current.exists());
+        assert_current(root.path(),control.path(),&prepared).unwrap();
+        let receipt:serde_json::Value=serde_json::from_slice(&private_bytes(&current,64*1024).unwrap()).unwrap();
+        assert_eq!((receipt["version"].as_u64(),receipt["legacy_context"].as_str(),receipt["legacy_policy"].as_str()),(Some(3),Some(legacy.as_str()),Some(*deployed)));
+        // The receipt now carries the migration; it is not repeated or redone.
+        let written=std::fs::read(&current).unwrap();
+        assert_current(root.path(),control.path(),&prepared).unwrap();
+        assert_eq!(std::fs::read(&current).unwrap(),written);
+        // A bump invalidates the migrated qualification like any other.
+        let error=assert_current_under(root.path(),control.path(),&prepared,WITNESS_POLICY_VERSION+1).unwrap_err();
+        assert!(format!("{error:#}").contains("baseline_witness_unqualified"),"{error:#}");
+        // The receipt stays bound to the byte-hash artifact it accepted.
+        let legacy_path=artifact_path(&control.path().canonicalize().unwrap(),&legacy);
+        std::fs::remove_file(&legacy_path).unwrap();
+        assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"a receipt outlived the qualification it migrated");
+    }
+
+    #[test]
+    fn only_a_deployed_byte_hash_policy_for_the_same_measurement_migrates() {
+        let (root,control,prepared)=fixture();
+        persist_scripted_under_policy(root.path(),control.path(),&prepared,&"a".repeat(64));
+        let error=assert_current(root.path(),control.path(),&prepared).unwrap_err();
+        assert!(format!("{error:#}").contains("baseline_witness_unqualified"),"an unknown policy migrated: {error:#}");
+        // Same deployed policy, different environment: another context.
+        let (root,control,mut prepared)=fixture();
+        persist_scripted_under_policy(root.path(),control.path(),&prepared,BYTE_HASH_POLICIES.last().unwrap());
+        let base=prepared.baseline.registration.baseline_head().to_owned();
+        let registration=RegisteredContract::register(root.path(),prepared.proposal.contract.clone(),base.clone(),"another environment".into()).unwrap();
+        let observed=Observation {exit_code:Some(0),stdout:"false\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+        prepared.baseline=BaselineEvidence {receipts:vec![registration.observe(root.path(),"observe",registration.binding(&base).unwrap(),&observed).unwrap()],registration};
+        assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"a byte-hash qualification migrated into another environment");
+        // A newer stored negative is never replaced by an older positive.
+        let (root,control,prepared)=fixture();
+        let policies=BYTE_HASH_POLICIES;
+        persist_scripted_under_policy(root.path(),control.path(),&prepared,policies[policies.len()-2]);
+        let newer=context_with_policy(&prepared.proposal,&prepared.baseline,policies[policies.len()-1]).unwrap();
+        let mut judgment=saved_judgment_at(&control.path().canonicalize().unwrap(),&context_with_policy(&prepared.proposal,&prepared.baseline,policies[policies.len()-2]).unwrap());
+        judgment["context"]=newer.clone().into();judgment["verifiers"][0]["measurement"]="unknown".into();
+        let raw=judgment.to_string();
+        let mut reply=scope_authority::scripted_witness_reply(control.path(),prepared.baseline.registration.baseline_head(),&newer,&raw).unwrap();
+        let mut proof:serde_json::Value=serde_json::from_slice(&std::fs::read(&reply.provenance.artifact).unwrap()).unwrap();
+        proof["scope_request_hash"]=amendment::digest(qualification_prompt(&newer,&prepared).unwrap().as_bytes()).into();
+        let bytes=serde_json::to_vec(&proof).unwrap();
+        std::fs::write(&reply.provenance.artifact,&bytes).unwrap();reply.provenance.artifact_sha256=amendment::digest(&bytes);
+        persist(control.path(),&newer,control.path(),&reply).unwrap();
+        assert!(assert_current(root.path(),control.path(),&prepared).is_err(),"an older positive replaced a newer negative byte-hash judgment");
+    }
+
+    /// The items whose behaviour defines what a stored qualification means.
+    /// Edits elsewhere in these files never touch the policy identity.
+    const WITNESS_SEMANTIC_ITEMS:&[(&str,&str)]=&[
+        ("self_improve_baseline_witness.rs","enum Measurement"),("self_improve_baseline_witness.rs","struct Citation"),
+        ("self_improve_baseline_witness.rs","struct Witness "),("self_improve_baseline_witness.rs","struct Judgment"),
+        ("self_improve_baseline_witness.rs","struct Artifact "),("self_improve_baseline_witness.rs","struct MigratedArtifact"),
+        ("self_improve_baseline_witness.rs","struct RequalifiedArtifact"),("self_improve_baseline_witness.rs","struct CheckedNativeResponse"),
+        ("self_improve_baseline_witness.rs","fn policy_hash_for("),("self_improve_baseline_witness.rs","const BYTE_HASH_POLICIES"),
+        ("self_improve_baseline_witness.rs","fn context_with_policy("),("self_improve_baseline_witness.rs","fn validate_endpoint_policy("),
+        ("self_improve_baseline_witness.rs","fn dedented_quote("),("self_improve_baseline_witness.rs","fn disposition("),
+        ("self_improve_baseline_witness.rs","fn checked_retained_responses("),("self_improve_baseline_witness.rs","fn assert_requalified("),
+        ("self_improve_baseline_witness.rs","fn assert_current_under("),("self_improve_baseline_witness.rs","fn migrate_byte_hash_qualification("),
+        ("self_improve_baseline_witness.rs","fn assert_artifact("),("self_improve_baseline_witness.rs","fn byte_hash_context("),
+        ("self_improve_baseline_witness.rs","fn retained_question_matches("),("self_improve_baseline_witness.rs","fn qualification_prompt("),
+        ("self_improve_scope.rs","struct NativeReplyProvenance"),("self_improve_scope.rs","fn read_native_reply("),
+        ("self_improve_scope.rs","fn verify_native_reply("),("self_improve_scope.rs","fn source_allowed("),
+        ("self_improve_scope.rs","fn scope_witness_policy("),("self_improve_scope.rs","const SCOPE_WITNESS_POLICY_V1"),
+        ("autoship_contract.rs","fn baseline_result("),
+    ];
+    /// (WITNESS_POLICY_VERSION, SCOPE_WITNESS_POLICY_VERSION, fingerprint).
+    /// Append only. A behaviour-preserving edit adds its fingerprint under the
+    /// current versions; a change to what a qualification means bumps one.
+    const WITNESS_SEMANTICS:&[(u32,u32,&str)]=&[
+        (1,1,"e23a9428e1364f50f91faed4cb276d626fc2eea6e43a5dbecf85969254ec15e1"),
+    ];
+    fn witness_source(file:&str)->&'static str {
+        match file {
+            "self_improve_baseline_witness.rs"=>include_str!("self_improve_baseline_witness.rs"),
+            "self_improve_scope.rs"=>include_str!("self_improve_scope.rs"),
+            "autoship_contract.rs"=>include_str!("autoship_contract.rs"),
+            _=>panic!("unknown witness semantic source {file}"),
+        }
+    }
+    /// Rust text without comments or layout; string and char literals kept.
+    /// Returns the normalized text of one item when `item` is given.
+    fn normalized_item(source:&str,needle:&str)->String {
+        let production=source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let found=production.match_indices(needle).filter(|(at,_)|*at==0 || !production.as_bytes()[at-1].is_ascii_alphanumeric() && production.as_bytes()[at-1]!=b'_').collect::<Vec<_>>();
+        assert_eq!(found.len(),1,"witness semantic item `{needle}` must occur exactly once");
+        // Include the item's attributes (serde shape) and visibility.
+        let mut start=production[..found[0].0].rfind('\n').map_or(0,|i|i+1);
+        while let Some(previous)=production[..start.saturating_sub(1)].rfind('\n').map(|i|i+1).or((start>0).then_some(0)) {
+            if production[previous..start].trim_start().starts_with("#[") {start=previous;} else {break;}
+        }
+        normalized(&production[start..],true)
+    }
+    fn normalized(source:&str,one_item:bool)->String {
+        let chars=source.chars().collect::<Vec<_>>();
+        let (mut out,mut i,mut depth,mut opened)=(String::new(),0usize,0i64,false);
+        while i<chars.len() {
+            let c=chars[i];
+            if c=='/' && chars.get(i+1)==Some(&'/') {while i<chars.len() && chars[i]!='\n' {i+=1;} continue;}
+            if c=='/' && chars.get(i+1)==Some(&'*') {i+=2;while i+1<chars.len() && !(chars[i]=='*' && chars[i+1]=='/') {i+=1;} i+=2;continue;}
+            if c=='"' {
+                out.push(c);i+=1;
+                while i<chars.len() {out.push(chars[i]);if chars[i]=='\\' {i+=1;out.push(chars[i]);} else if chars[i]=='"' {break;} i+=1;}
+                i+=1;continue;
+            }
+            if c=='\'' && chars.get(i+2)==Some(&'\'') {out.extend(&chars[i..i+3]);i+=3;continue;}
+            if c=='\'' && chars.get(i+1)==Some(&'\\') {let end=chars[i+2..].iter().position(|&c|c=='\'').unwrap()+i+2;out.extend(&chars[i..=end]);i=end+1;continue;}
+            if c.is_whitespace() {
+                // Keep one separator only where two word characters would join.
+                let next=chars[i..].iter().find(|c|!c.is_whitespace());
+                if out.chars().last().is_some_and(|l|l.is_alphanumeric() || l=='_') && next.is_some_and(|n|n.is_alphanumeric() || *n=='_') {out.push(' ');}
+                i+=1;continue;
+            }
+            out.push(c);i+=1;
+            if one_item {
+                match c {'{'=>{depth+=1;opened=true;},'}'=>{depth-=1;if opened && depth==0 {break;}},';' if depth==0=>break,_=>{}}
+            }
+        }
+        out
+    }
+    fn witness_semantic_fingerprint()->String {
+        let items=WITNESS_SEMANTIC_ITEMS.iter().map(|(file,needle)|normalized_item(witness_source(file),needle)).collect::<Vec<_>>();
+        amendment::digest(&serde_json::to_vec(&items).unwrap())
+    }
+
+    #[test]
+    fn witness_semantics_require_a_policy_version_decision() {
+        let current=witness_semantic_fingerprint();
+        let versions=(WITNESS_POLICY_VERSION,scope_authority::SCOPE_WITNESS_POLICY_VERSION);
+        assert!(WITNESS_SEMANTICS.windows(2).all(|w|(w[0].0,w[0].1)<=(w[1].0,w[1].1)),"witness semantic history is append-only");
+        let recorded=WITNESS_SEMANTICS.iter().find(|(_,_,fingerprint)|*fingerprint==current).map(|(w,s,_)|(*w,*s));
+        assert_eq!(recorded,Some(versions),"\nWitness qualification semantics changed (fingerprint {current}).\n\
+            If what a stored qualification means changed (schema, validator, disposition, prompt, context, acceptance or native-reply checks),\n\
+            bump WITNESS_POLICY_VERSION (or scope_authority::SCOPE_WITNESS_POLICY_VERSION) and append ({}, {}, \"{current}\") with the bumped value.\n\
+            If the edit is behaviour-preserving, append ({}, {}, \"{current}\") to WITNESS_SEMANTICS under the current versions.\n\
+            Never edit an existing row.",versions.0,versions.1,versions.0,versions.1);
+    }
+
+    #[test]
+    fn the_semantic_fingerprint_ignores_layout_and_comments_but_not_code() {
+        let base="fn f(x:u32)->u32 {\n    // why\n    x+1 /* note */\n}\nfn g() {}";
+        let relaid="fn f( x : u32 ) -> u32 { x + 1 }   // trailing\nfn g() {panic!()}";
+        assert_eq!(normalized_item(base,"fn f("),normalized_item(relaid,"fn f("));
+        assert_ne!(normalized_item(base,"fn f("),normalized_item("fn f(x:u32)->u32 {x+2}","fn f("));
+        assert_ne!(normalized_item("fn f()->&'static str {\"a // b\"}","fn f("),normalized_item("fn f()->&'static str {\"a\"}","fn f("),"string literals are code");
+        assert_eq!(normalized_item("#[serde(deny_unknown_fields)]\nstruct S {a:u8}","struct S"),"#[serde(deny_unknown_fields)]struct S{a:u8}");
     }
 }
 
