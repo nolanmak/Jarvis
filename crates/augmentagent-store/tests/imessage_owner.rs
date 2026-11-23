@@ -310,6 +310,116 @@ fn mirrored_output_is_durable_and_disabled_bindings_cancel_queued_parts() {
     assert!(s.claim_imessage_outbox().unwrap().is_none());
 }
 
+/// Disable is the lifecycle stop: input prepared before it stays refused and
+/// nothing still queued can be picked up. Already claimed sends are explicitly
+/// outside cancellation — the sender owns their outcome.
+#[test]
+fn a_disabled_binding_refuses_prepared_input_and_leaves_no_queued_output_claimable() {
+    let s = Store::open(":memory:").unwrap();
+    let rev = bind(&s, 0);
+    let prepared = event(rev, 1);
+    output(&s, "in-flight-notice", "in-flight synthetic report", None, 1).unwrap();
+    output(&s, "queued-notice", "queued synthetic report", None, 2).unwrap();
+    let in_flight = s.claim_imessage_outbox().unwrap().unwrap();
+    s.disable_imessage_owner().unwrap();
+    assert!(s
+        .accept_imessage_owner_events(rev, 1, &[prepared], 3)
+        .is_err());
+    assert!(s.ready_imessage_owner_events().unwrap().is_empty());
+    assert!(claim(&s, 4).unwrap().is_none());
+    assert!(s.claim_imessage_outbox().unwrap().is_none());
+    assert_eq!(
+        s.get_imessage_outbox(in_flight.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        augmentagent_store::ImessageOutboxStatus::Claimed
+    );
+    assert_eq!(
+        output(&s, "after-disable", "never queued", None, 5).unwrap(),
+        0
+    );
+    assert!(s.imessage_owner_context().unwrap().is_none());
+    assert!(!s.imessage_owner_status(6).unwrap()["enabled"]
+        .as_bool()
+        .unwrap());
+}
+
+#[test]
+fn status_bounds_capture_mirror_and_dispatch_diagnostics_for_the_active_revision() {
+    let s = Store::open(":memory:").unwrap();
+    let rev = bind(&s, 0);
+    let flood = "native detail ".repeat(60);
+    s.report_imessage_owner_capture_error(&flood).unwrap();
+    s.report_imessage_owner_runtime(true, Some(&flood), 1).unwrap();
+    s.report_imessage_owner_runtime(false, Some(&flood), 1).unwrap();
+    let status = s.imessage_owner_status(1).unwrap();
+    assert_eq!(status["revision"], rev);
+    for key in ["capture_error", "mirror_error", "dispatch_error"] {
+        assert_eq!(status[key].as_str().unwrap().chars().count(), 300, "{key}");
+    }
+    // Only the existing successful-report semantics clear a diagnostic.
+    s.accept_imessage_owner_events(rev, 1, &[event(rev, 1)], 2)
+        .unwrap();
+    s.report_imessage_owner_runtime(true, None, 3).unwrap();
+    s.report_imessage_owner_runtime(false, None, 3).unwrap();
+    let cleared = s.imessage_owner_status(3).unwrap();
+    for key in ["capture_error", "mirror_error", "dispatch_error"] {
+        assert!(cleared[key].is_null(), "{key}");
+    }
+    // A diagnostic never carries across a re-enrollment.
+    s.report_imessage_owner_capture_error(&flood).unwrap();
+    s.disable_imessage_owner().unwrap();
+    let next = bind(&s, 0);
+    assert!(next > rev);
+    let rebound = s.imessage_owner_status(4).unwrap();
+    assert_eq!(rebound["revision"], next);
+    assert!(rebound["capture_error"].is_null());
+    // A disabled revision accepts no further diagnostics of its own.
+    s.disable_imessage_owner().unwrap();
+    s.report_imessage_owner_capture_error(&flood).unwrap();
+    s.report_imessage_owner_runtime(false, Some(&flood), 5)
+        .unwrap();
+    let disabled = s.imessage_owner_status(5).unwrap();
+    assert!(disabled["capture_error"].is_null());
+    assert!(disabled["dispatch_error"].is_null());
+}
+
+/// A pinned configuration digest is the only thing that authorizes the stored
+/// owner context; drift must fail rather than silently overwrite it.
+#[test]
+fn a_changed_configuration_digest_cannot_overwrite_or_reuse_the_owner_context() {
+    use augmentagent_store::imessage_owner::OwnerContext;
+    let s = Store::open(":memory:").unwrap();
+    let rev = bind(&s, 0);
+    let pinned = OwnerContext {
+        revision: rev,
+        config_digest: "fixture-digest-a".into(),
+        guild_id: 11,
+        channel_id: 12,
+        approval_channel_id: 13,
+        owner_id: 14,
+        bot_id: 15,
+    };
+    s.configure_imessage_owner_context(&pinned).unwrap();
+    let drifted = OwnerContext {
+        config_digest: "fixture-digest-b".into(),
+        ..pinned.clone()
+    };
+    assert!(s.configure_imessage_owner_context(&drifted).is_err());
+    assert_eq!(s.imessage_owner_context().unwrap().unwrap(), pinned);
+    s.disable_imessage_owner().unwrap();
+    let next = bind(&s, 0);
+    // The stale revision cannot be re-pinned under the new enrollment either.
+    assert!(s.configure_imessage_owner_context(&drifted).is_err());
+    let reenrolled = OwnerContext {
+        revision: next,
+        ..drifted
+    };
+    s.configure_imessage_owner_context(&reenrolled).unwrap();
+    assert_eq!(s.imessage_owner_context().unwrap().unwrap(), reenrolled);
+}
+
 #[test]
 fn incomplete_or_changed_presentations_cannot_authorize_an_action() {
     let s = Store::open(":memory:").unwrap();
