@@ -15,6 +15,8 @@ pub(super) fn classify(cp: &Checkpoint, paused: bool, waiting: bool) -> Workflow
         _ if matches!(cp.next.reason.as_str(),"acceptance_strategy_budget_wait"|"readiness_budget_wait") => WorkflowOutcome::QuotaWait,
         _ if cp.next.reason=="acceptance_strategies_exhausted" => WorkflowOutcome::ConfigurationFault,
         "await_quota" => WorkflowOutcome::QuotaWait,
+        // #2488: bounded own-PR rescopes spent; the owner decides.
+        "await_owner_rescope_decision" => WorkflowOutcome::DependencyWait,
         "rescope_executable_acceptance" if cp.next.reason=="retry_cycle_exhausted" => WorkflowOutcome::RetryableInfrastructure,
         "retry_verification" | "await_verifier_infrastructure_recovery" | "await_inactivity_retry" =>
             WorkflowOutcome::RetryableInfrastructure,
