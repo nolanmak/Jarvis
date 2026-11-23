@@ -4156,9 +4156,10 @@ async fn find_resumable_draft(
     repo_root: &Path,
     only: Option<u64>,
     dry_run: bool,
+    ceiling: adoption::FinishTier,
 ) -> Option<(u64, u64, String)> {
     let stdout = complete_repository_inventory(repo_root, "pr", None,
-        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences")
+        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,statusCheckRollup")
         .await.ok()?;
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
     // Never treat a capped/malformed issue listing as absence of a hold.
@@ -4208,7 +4209,33 @@ async fn find_resumable_draft(
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
     // #2432 — in-flight PRs resume on their own backoff, not the daily ledger.
     retries.extend(adoption::in_flight_retries(&workflow::path(), &adopted, now).unwrap_or_default());
+    // #2495 — finish before starting: a due PR whose bound head is green, or
+    // one at publish/CI-pending, outranks the rotation, oldest first. Ranked
+    // from the same inventory, so no per-PR GitHub reads.
+    let plan = adoption::finish_plan(&workflow::path(), &adopted, &prs, now).unwrap_or_else(|error| {
+        warn!("finish-first ranking unavailable; using the rotation: {error:#}");
+        Default::default()
+    });
+    if !dry_run && !plan.expedite.is_empty() {
+        match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) {
+            Ok(mut store) => for (id, head) in &plan.expedite {
+                match store.expedite_hosted_ci_pending(id, head, now) {
+                    Ok(true) => info!(workflow=%id, %head, "hosted checks finished green on the bound head; CI poll is due now"),
+                    Ok(false) => {},
+                    Err(error) => warn!(workflow=%id, "cannot end the hosted CI poll early: {error:#}"),
+                }
+            },
+            Err(error) => warn!("cannot end hosted CI polls early: {error:#}"),
+        }
+    }
+    retries.extend(plan.tiers.keys().copied());
     let select = |cursor| {
+        if let Some(finishing) = adoption::select_finishing(&adopted, &ledger, utc_day_now(), only, &retries, &plan.tiers) {
+            return Some(finishing);
+        }
+        if ceiling < adoption::FinishTier::Other {
+            return None;
+        }
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
@@ -8428,7 +8455,7 @@ where F:FnOnce()->Fut,Fut:std::future::Future<Output=Result<Option<RunReport>>> 
 
 async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<RunReport>> {
     if let Some((pr, issue_no, resume_branch)) =
-        find_resumable_draft(repo_root, None, dry_run).await
+        find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other).await
     {
         let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
         return resume_draft_pr(
@@ -8525,7 +8552,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 RedMainPlan::Resume(n) => {
                     if lane != Lane::Build {
                         if let Some((pr, issue_no, resume_branch)) =
-                            find_resumable_draft(repo_root, Some(n), dry_run).await
+                            find_resumable_draft(repo_root, Some(n), dry_run, adoption::FinishTier::Other).await
                         {
                             info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
                             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
@@ -8580,8 +8607,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         &fair,
         resume_per_build(),
     );
-    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
-        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
+    // #2495 — an owed build turn still yields to finishing: near-done PRs
+    // (green bound head, publish, CI pending) are what that debt protects.
+    let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);
+    if let (None, Some(ceiling)) = (&red_main_issue, ceiling) {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run, ceiling).await {
             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run, None)
                 .await
@@ -10655,7 +10685,7 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
 /// #2444 — every PR reader shares one listing per tick, so it asks for the
 /// union of the fields any reader needs (including routing labels and closing
 /// references, which used to cost a `gh pr view` per open PR).
-const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels,statusCheckRollup";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
     let fields=if kind=="pr" {
@@ -12054,6 +12084,16 @@ fn resume_per_build() -> u32 {
 /// #1532 — is this billed slot reserved for a new-issue build? Only the
 /// combined lane interleaves: the explicit lanes keep their single purpose,
 /// and with resume-first off there is nothing to interleave against.
+/// #2495 — the furthest-from-done PR work the PR lane may take this turn.
+/// `None` skips it (build lane, or resume-first off); an owed fresh-issue turn
+/// (#1532) still admits work that only needs finishing.
+fn resume_ceiling(lane: Lane, resume_first: bool, prefer_build: bool) -> Option<adoption::FinishTier> {
+    if lane == Lane::Build || !resume_first {
+        return None;
+    }
+    Some(if prefer_build { adoption::FinishTier::PublishOrCiPending } else { adoption::FinishTier::Other })
+}
+
 fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
     lane == Lane::Combined && resume_first && fair.resumes_since_build.max(fair.resume_reservations_since_build) >= per_build
 }
