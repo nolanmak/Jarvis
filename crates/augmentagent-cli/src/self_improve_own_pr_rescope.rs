@@ -688,7 +688,8 @@ mod tests {
         let control = lane.control.path().to_owned();
         let authority = Refuses(Mutex::new(0));
         let tests = vec!["notify_tests::registry_covers_every_producer_in_the_code".to_string()];
-        let failure = ci_scope::Failure { tests: &tests, diagnostics: "add them to notify::PRODUCERS", regression: false };
+        let failure = ci_scope::Failure { tests: &tests, diagnostics: "add them to notify::PRODUCERS", panic_locations: &[],
+            regression: ci_scope::Regression::of(false, Some("ci_selection_contract_required")), main: None };
 
         // 1. Refused: the CI scope step leaves a pending own-PR rescope.
         let widened = ci_scope::widen(&authority, &mut lane.prepared, &control, &[NOTIFY.to_string()], failure, &mut lane.workflow).await.unwrap();

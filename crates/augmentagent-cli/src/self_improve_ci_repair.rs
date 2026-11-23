@@ -384,6 +384,14 @@ pub(super) struct ScopeEvidence {
     /// #2329: the failing checks' bounded diagnostics, quoted to the scope
     /// authority as untrusted data.
     pub diagnostics: String,
+    /// #2456: `path:line:col` panic locations in the failing checks.
+    pub panic_locations: Vec<String>,
+    /// #2456: why no paired local replay ran (a controller reason code), when
+    /// none did. A refused replay is unknown, not "main also fails".
+    pub unreplayed: Option<&'static str>,
+    /// #2456: the same required checks on canonical main's current head, read
+    /// only when no paired replay ran.
+    pub main: Option<super::acceptance::ci_scope::MainCheck>,
 }
 impl ScopeEvidence {
     fn of(root: &Path, observation: &Observation) -> Option<Self> {
@@ -404,11 +412,61 @@ impl ScopeEvidence {
             for file in implicated_files(root, &failure.diagnostics) {
                 add(&mut evidence.files, file);
             }
+            for location in panic_locations(&failure.diagnostics) {
+                add(&mut evidence.panic_locations, location);
+            }
             evidence.diagnostics.push_str(&format!("{}:\n{}\n", failure.name,
                 hosted_ci::diagnostic_excerpt(&failure.diagnostics, 3000)));
         }
         (!evidence.files.is_empty()).then_some(evidence)
     }
+}
+/// #2456: `path:line:col` tokens after `panicked at`, plain relative paths only.
+fn panic_locations(log: &str) -> Vec<String> {
+    let marker = "panicked at ";
+    let mut locations = Vec::new();
+    for (at, _) in log.match_indices(marker) {
+        let token = log[at + marker.len()..].split_whitespace().next().unwrap_or("").trim_end_matches(':');
+        let plain = location_path(token).is_some_and(|path| !path.starts_with('/')
+            && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/')));
+        if plain && !locations.iter().any(|known: &String| known == token) {
+            locations.push(token.to_owned());
+        }
+    }
+    locations
+}
+/// GitHub Actions' app id: other apps cannot stand in for a hosted check.
+const ACTIONS_APP: u64 = 15368;
+/// #2456: whether the failing required checks are green on canonical main's
+/// `main`, from one aggregate check-runs read. `targeted` runs on pull
+/// requests only, so when main has no run of every failing check, main's
+/// hosted checks as a whole are the comparison. Unreadable is unknown.
+async fn main_check(root: &Path, main: &str, checks: &[String]) -> super::acceptance::ci_scope::MainCheck {
+    let mut result = super::acceptance::ci_scope::MainCheck { head: main.to_owned(), basis: "unavailable", green: None };
+    let Ok(repository) = workflow::canonical_repository(root).await else { return result };
+    let endpoint = format!("repos/{repository}/commits/{main}/check-runs?filter=latest&per_page=100");
+    let Ok((true, out, _)) = run(&gh_bin(), &["api", &endpoint], root).await else { return result };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) else { return result };
+    let Some(runs) = value["check_runs"].as_array() else { return result };
+    if value["total_count"].as_u64().is_none_or(|total| total as usize > runs.len()) {
+        return result;
+    }
+    let hosted: Vec<_> = runs.iter().filter(|run| run["app"]["id"] == ACTIONS_APP && run["head_sha"] == main).collect();
+    let same: Vec<_> = hosted.iter().copied().filter(|run| checks.iter().any(|check| run["name"] == check.as_str())).collect();
+    let every_check = checks.iter().all(|check| same.iter().any(|run| run["name"] == check.as_str()));
+    let (basis, compared) = if !checks.is_empty() && every_check { ("same_check", same) } else { ("all_main_checks", hosted) };
+    result.basis = basis;
+    let passed = |run: &&serde_json::Value| matches!(run["conclusion"].as_str(), Some("success" | "skipped" | "neutral"));
+    result.green = if compared.is_empty() {
+        None
+    } else if compared.iter().any(|run| run["status"] == "completed" && !passed(run)) {
+        Some(false)
+    } else if compared.iter().all(|run| run["status"] == "completed") {
+        Some(true)
+    } else {
+        None
+    };
+    result
 }
 /// `test a::b ... FAILED` verdict lines.
 fn failed_verdicts(log: &str) -> Vec<String> {
@@ -916,11 +974,20 @@ pub(super) async fn prepare_scoped<R: Replay>(
             let scope = ScopeEvidence::of(root, &observation);
             admission.defer |= scope.is_some();
             let unpaired = scope.as_ref().map(|_| unpaired_input(&observation));
-            let preparation = compare_observed(root, pr, workflow, observation, replay, &mut admission).await?;
+            let mut unreplayed = None;
+            let preparation = compare_observed(root, pr, workflow, observation, replay, &mut admission, &mut unreplayed).await?;
             if let (Some(due), Some(input)) = (admission.due.as_mut(), unpaired) {
                 due.input = Some(input);
             }
-            let scope = scope.filter(|_| !matches!(preparation, Preparation::Deferred(_)));
+            let mut scope = scope.filter(|_| !matches!(preparation, Preparation::Deferred(_)));
+            // #2456: without a paired replay the regression is unknown; say
+            // why, and read main's hosted result for the same checks once.
+            if let Some(scope) = scope.as_mut().filter(|_| matches!(preparation, Preparation::Continue)) {
+                scope.unreplayed = Some(unreplayed.unwrap_or("ci_replay_unavailable"));
+                if let Ok((true, main, _)) = run("git", &["rev-parse", "--verify", "origin/main^{commit}"], root).await {
+                    scope.main = Some(main_check(root, main.trim(), &scope.checks).await);
+                }
+            }
             (preparation, scope)
         }
         Preflight::Deferred(report) => (Preparation::Deferred(report), None),
@@ -963,9 +1030,11 @@ async fn compare_observed<R: Replay>(
     observation: Observation,
     replay: &R,
     admission: &mut Admission,
+    unreplayed: &mut Option<&'static str>,
 ) -> Result<Preparation> {
     workflow.validate_before_side_effect()?;
     if observation.head != workflow.binding().head {
+        *unreplayed = Some("ci_observed_head_changed");
         return Ok(Preparation::Continue);
     }
     if !observation.failures.is_empty()
@@ -1008,6 +1077,7 @@ async fn compare_observed<R: Replay>(
             continue;
         }
         if failure.classification == Classification::Unknown {
+            *unreplayed = Some("ci_failure_requires_diagnosis");
             return repair_or_wait(workflow, pr, "ci_failure_requires_diagnosis", &observation, admission).await;
         }
         workflow.validate_before_side_effect()?;
@@ -1028,6 +1098,7 @@ async fn compare_observed<R: Replay>(
                     return Err(error);
                 }
                 let reason = comparison_dependency(&error);
+                *unreplayed = Some(reason);
                 workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_comparison_unavailable",
                     "reason":reason,"cause_sha256":digest(format!("{error:#}").as_bytes()),"shipping_authority":false}))?;
                 // #2394: one routing table (#2316) for every hold; an
@@ -1067,6 +1138,7 @@ async fn compare_observed<R: Replay>(
         {
             // The head alone does not fail the same way: the failure belongs
             // to its merge with a main that moved. Merge main and rebuild.
+            *unreplayed = Some("ci_failure_not_reproduced");
             return repair_or_wait(workflow, pr, "ci_failure_not_reproduced", &observation, admission).await;
         }
         if comparison.main_result.failed {
