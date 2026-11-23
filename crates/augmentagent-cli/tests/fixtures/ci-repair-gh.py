@@ -17,14 +17,23 @@ if args[:2] == ['repo', 'view']:
     print(repository); sys.exit(0)
 if args[:2] == ['pr', 'checks']:
     print(json.dumps([{'name': 'privacy', 'state': 'SUCCESS'}, {'name': 'node-release', 'state': state.get('required_state', 'FAILURE')}])); sys.exit(0)
+def job_name(job):
+    run = job // 100
+    return sorted(expected[paths[run - 100]])[job % 100]
+def job_log(job):
+    return state.get('logs', {}).get(job_name(job), state['log'])
+# Several jobs can fail at once, each with its own log (#2453).
+failing = state.get('job_names', [state['job_name']])
 if args and args[0] == 'run':
     if state.get('missing_logs'): sys.exit(1)
+    if '--job' in args:
+        print(job_log(int(args[args.index('--job') + 1]))); sys.exit(0)
     print(state['log']); sys.exit(0)
 if not args or args[0] != 'api': sys.exit(1)
 endpoint = args[1]
 if '/actions/jobs/' in endpoint and endpoint.endswith('/logs'):
     if state.get('missing_logs'): sys.exit(1)
-    print(state['log']); sys.exit(0)
+    print(job_log(int(endpoint.rsplit('/', 2)[1]))); sys.exit(0)
 if '/actions/jobs/' in endpoint:
     job = int(endpoint.rsplit('/', 1)[1]); run = job // 100; path = paths[run - 100]
     name = sorted(expected[path])[job % 100]
@@ -50,7 +59,7 @@ elif '/actions/runs?' in endpoint:
 elif '/actions/runs/' in endpoint and '/jobs?' in endpoint:
     run = int(endpoint.split('/actions/runs/')[1].split('/')[0]); path = paths[run - 100]
     names = sorted(expected[path])
-    value = {'jobs': [{'id': run * 100 + i, 'run_id': run, 'run_attempt': 1, 'head_sha': head, 'name': name, 'status': 'completed', 'conclusion': 'failure' if name == state['job_name'] else 'success', 'html_url': f'https://github.com/{repository}/actions/runs/{run}/job/{run * 100 + i}'} for i, name in enumerate(names)]}
+    value = {'jobs': [{'id': run * 100 + i, 'run_id': run, 'run_attempt': 1, 'head_sha': head, 'name': name, 'status': 'completed', 'conclusion': 'failure' if name in failing else 'success', 'html_url': f'https://github.com/{repository}/actions/runs/{run}/job/{run * 100 + i}'} for i, name in enumerate(names)]}
 else:
     sys.exit(1)
 print(json.dumps(value))

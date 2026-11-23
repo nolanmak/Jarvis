@@ -354,8 +354,9 @@ where R:Fn(u32)->Result<Option<String>>,W:Fn(u32,&str)->Result<()>,G:FnMut(Strin
 struct Relevance { complete:bool, criterion_evidence:BTreeMap<String,String>, explanation:String }
 /// All-green alone is not acceptance. A separate independent assessment must
 /// establish that the registered observations cover the unchanged owner ask.
-/// This never yields a shipping receipt or closes the issue.
-pub(in crate::self_improve) async fn prove_current_main(repo:&Path,issue:&Issue,scope:&ScopeOutcome,workflow:&mut workflow::WorkflowGuard)->Result<bool> {
+/// This never yields a shipping receipt. It returns the proven main commit;
+/// the caller closes the issue through terminal routing (#2462).
+pub(in crate::self_improve) async fn prove_current_main(repo:&Path,issue:&Issue,scope:&ScopeOutcome,workflow:&mut workflow::WorkflowGuard)->Result<Option<String>> {
     workflow.check_resource_policy()?;
     let base=workflow::remote_main_head(repo,workflow.repository()).await?;
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
@@ -363,24 +364,24 @@ pub(in crate::self_improve) async fn prove_current_main(repo:&Path,issue:&Issue,
     let temporary=tempfile::Builder::new().prefix("relevance-").tempdir_in(&control)?;
     let root=temporary.path().join("checkout");let checkout=root.to_str().context("relevance checkout path invalid")?;
     trusted_git(repo,&["worktree","add","--detach",checkout,&base]).await?;
-    let result:Result<bool>=async {
+    let result:Result<Option<String>>=async {
         let proposal=proposal_with_retry(workflow,&root,AcceptanceSource::Issue(issue.number),&scope.body,&scope.criteria).await?;
         let baseline=register_and_observe(&root,proposal.clone(),&workflow.audit_logger()).await?;
         let result=baseline.registration.baseline_result(&baseline.receipts)?;
-        let BaselineResult::AlreadyPasses(passed)=result else{return Ok(false);};
-        if passed.len()!=proposal.contract.verifiers.len() {return Ok(false);}
+        let BaselineResult::AlreadyPasses(passed)=result else{return Ok(None);};
+        if passed.len()!=proposal.contract.verifiers.len() {return Ok(None);}
         let prompt=format!("Independently verify relevance and completeness against the ENTIRE owner request; do not treat an already-green test as sufficient. Return ONLY JSON {{\"complete\":true|false,\"criterion_evidence\":{{\"criterion-id\":\"concrete implementation and observable coverage\"}},\"explanation\":\"...\"}}. complete=true only if every owner requirement is covered by the registered executable observations and current immutable implementation; partial/inadequate tests require false. No issue closure or approval is authorized. Owner title:{}\nOwner body:{}\nRegistered contract:{}\nIndependently pinned adapter sources:{}\nObserved baseline receipts:{}",issue.title,issue.body,serde_json::to_string(&proposal.contract)?,serde_json::to_string(&proposal.files)?,serde_json::to_string(&baseline.receipts)?);
         let raw=scope_authority::assess(&root,workflow.repository(),workflow,&prompt).await?;
         let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
         let relevance:Relevance=serde_json::from_str(raw)?;
-        if !relevance.complete {return Ok(false);}
+        if !relevance.complete {return Ok(None);}
         ensure!(!relevance.explanation.trim().is_empty() && relevance.explanation.len()<=8000,"relevance lacks explanation");
         ensure!(relevance.criterion_evidence.keys().collect::<BTreeSet<_>>()==proposal.contract.criteria.iter().map(|c|&c.id).collect() && relevance.criterion_evidence.values().all(|e|!e.trim().is_empty() && e.len()<=8000),"relevance must cover every registered criterion");
         ensure!(workflow::remote_main_head(repo,workflow.repository()).await?==base,"main changed during relevance investigation");
         let evidence=serde_json::json!({"kind":"already_satisfied_relevance","base":base,"request_hash":request_hash(issue),"baseline":baseline,"criterion_evidence":relevance.criterion_evidence,"explanation":relevance.explanation}).to_string();
         workflow.set_readiness_dependency(issue.number,Some((&request_hash(issue),&base,"objectively_satisfied",&evidence)))?;
         workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"current_main_satisfies_registered_requirements","await_request_or_main_change",0,&[amendment::digest(evidence.as_bytes())]).await?;
-        Ok(true)
+        Ok(Some(base.clone()))
     }.await;
     let cleanup=trusted_git(repo,&["worktree","remove","--force",checkout]).await;
     let outcome=result?;cleanup?;Ok(outcome)

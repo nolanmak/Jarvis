@@ -236,14 +236,81 @@ pub(super) fn job_diagnostics(log: &str) -> String {
     output
 }
 
+/// #2442: failure evidence kept from the middle of a log the transport cuts.
+/// Cargo keeps running later test binaries after one fails, so a panic and
+/// its `failures:` block can sit far from both ends of a long failed step.
+/// Keep those lines, bounded, so classification and repair still see them.
+const EVIDENCE_BUDGET:usize=32*1024;
+const EVIDENCE_LINE:usize=2048;
+const EVIDENCE_SIGNS:&[&str]=&["panicked at"," ... FAILED","test result: FAILED","FAILED (","AssertionError",
+    "error[E","could not compile","error: test failed"];
+#[derive(Default)]
+struct MiddleEvidence {
+    line:Vec<u8>,
+    in_failures:bool,
+    after_panic:u8,
+    kept:String,
+    omitted:bool,
+}
+impl MiddleEvidence {
+    fn feed(&mut self,bytes:&[u8]) {
+        for &byte in bytes {
+            if byte==b'\n' {
+                self.end_line();
+            }else if self.line.len()<EVIDENCE_LINE {
+                self.line.push(byte);
+            }
+        }
+    }
+    fn end_line(&mut self) {
+        let raw=std::mem::take(&mut self.line);
+        // An overlong line was cut at a byte budget: drop a split scalar.
+        let text=match std::str::from_utf8(&raw) {
+            Ok(text)=>text,
+            Err(error)=>std::str::from_utf8(&raw[..error.valid_up_to()]).unwrap_or_default(),
+        };
+        let content=log_content(text).trim_end();
+        let panic=content.contains("panicked at");
+        let keep=if content.ends_with("failures:") {
+            self.in_failures=true;
+            true
+        }else if self.in_failures && content.starts_with("test result:") {
+            self.in_failures=false;
+            true
+        }else {
+            panic || self.after_panic>0
+                || EVIDENCE_SIGNS.iter().any(|sign|content.contains(sign))
+                || self.in_failures && (content.starts_with("    ")||content.starts_with("---- "))
+        };
+        self.after_panic=if panic {3} else {self.after_panic.saturating_sub(1)};
+        if !keep {return;}
+        if self.kept.len()+text.len()+1>EVIDENCE_BUDGET {
+            self.omitted=true;
+            return;
+        }
+        self.kept.push_str(text);
+        self.kept.push('\n');
+    }
+}
+/// The message part of a `gh run view --log-failed` line: after the job and
+/// step columns and the RFC 3339 timestamp, when present.
+fn log_content(line:&str)->&str {
+    let line=line.splitn(3,'\t').nth(2).unwrap_or(line).trim_start_matches('\u{feff}');
+    match line.split_once(' ') {
+        Some((timestamp,content)) if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()=>content,
+        _=>line,
+    }
+}
+
 // GitHub CLI resolves step boundaries from the verified job's own metadata.
 // Keep transport bounded as well as the eventual public excerpt.
-async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String> {
+pub(super) async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String> {
     use tokio::io::AsyncReadExt;
     const HALF:usize=64*1024;
     let mut head=Vec::new();
     let mut tail=Vec::new();
     let mut dropped=false;
+    let mut evidence=MiddleEvidence::default();
     let mut chunk=[0u8;8192];
     loop {
         let n=reader.read(&mut chunk).await?;
@@ -252,6 +319,7 @@ async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String>
         head.extend_from_slice(&chunk[..first]);
         tail.extend_from_slice(&chunk[first..n]);
         if tail.len()>HALF {
+            evidence.feed(&tail[..tail.len()-HALF]);
             tail.drain(..tail.len()-HALF);
             dropped=true;
         }
@@ -266,7 +334,11 @@ async fn capture_log(mut reader:impl tokio::io::AsyncRead+Unpin)->Result<String>
         if error.error_len().is_none() {head.truncate(error.valid_up_to());}
     }
     let start=tail.iter().take_while(|byte|(**byte&0xc0)==0x80).count().min(3);
-    Ok(format!("{}\n[failed-step log truncated in transport; see job URL]\n{}",
+    let kept=if evidence.kept.is_empty() {String::new()} else {
+        format!("[failure evidence kept from the truncated middle]\n{}{}",evidence.kept,
+            if evidence.omitted {"[further failure evidence omitted; see job URL]\n"} else {""})
+    };
+    Ok(format!("{}\n[failed-step log truncated in transport; see job URL]\n{kept}{}",
         String::from_utf8_lossy(&head),String::from_utf8_lossy(&tail[start..])))
 }
 
@@ -468,6 +540,15 @@ mod tests {
         assert!(captured.starts_with("begin") && captured.ends_with("finish"));
         assert!(captured.contains("truncated in transport") && !captured.contains('\u{fffd}'));
         assert!(captured.len()<=128*1024+80);
+        // #2442: evidence lines from the dropped middle stay bounded, even
+        // when every line is a failure or a single line never ends.
+        let flood="test noisy::case ... FAILED\n".repeat(100_000);
+        let captured=capture_log(flood.as_bytes()).await.unwrap();
+        assert!(captured.contains("failure evidence kept") && captured.contains("further failure evidence omitted"));
+        assert!(captured.len()<=128*1024+EVIDENCE_BUDGET+200,"{}",captured.len());
+        let endless=format!("{}panicked at {}","x".repeat(200_000),"é".repeat(100_000));
+        let captured=capture_log(endless.as_bytes()).await.unwrap();
+        assert!(captured.len()<=128*1024+80 && !captured.contains('\u{fffd}'));
         for budget in 0..=2500 {
             let excerpt=diagnostic_excerpt(&large,budget);
             assert!(excerpt.len()<=budget,"budget {budget} exceeded");

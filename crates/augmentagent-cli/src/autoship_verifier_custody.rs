@@ -41,6 +41,10 @@ impl<'a> VerifierEvidenceInspection<'a> {
     pub(crate) fn native_admissions(&self)->Result<Vec<NativeScopeAdmissionData>> {
         baseline_native_admissions(self.conn,self.workflow)
     }
+    /// #2356 cutover time: on-disk native history older than this is archived.
+    pub(crate) fn cutover_at_ms(&self)->Result<Option<i64>> {
+        owner_checkout_recovery::cutover_at_ms(self.conn,self.workflow)
+    }
     pub(crate) fn scope_response(&self,key:&str)->Result<Option<String>> {
         read_scope_response(self.conn,self.workflow,key)
     }

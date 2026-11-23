@@ -45,6 +45,8 @@ pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::a
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
+#[path = "self_improve_ci_scope.rs"]
+pub(super) mod ci_scope;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
@@ -678,6 +680,24 @@ async fn isolated_observation(
     isolated_observation_with_custody(root,target,invocation,audit,None).await
 }
 
+/// Build limits for every cargo in a verifier's process tree (#2445). The
+/// top-level `--config` flags reach only the cargo the controller starts. A
+/// verifier binary that runs `cargo run -p augmentagent-cli` itself starts a
+/// nested cargo that sees only the inherited env, and the sandbox passes
+/// `CARGO_HOME` but no `CARGO_BUILD_*` variables. With an empty home, that
+/// nested build used `jobs = nproc` and full debuginfo, and one rustc filled
+/// the swapless 4 GiB run cgroup on every capacity retry.
+const VERIFIER_CARGO_CONFIG: &str = "[build]\njobs = 1\n\n[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n";
+
+/// The verifier's private `CARGO_HOME`, created inside its runtime directory
+/// with the build limits that nested cargo invocations inherit.
+fn prepare_verifier_cargo_home(runtime: &Path) -> Result<PathBuf> {
+    let cargo_home = runtime.join("cargo");
+    std::fs::create_dir(&cargo_home)?;
+    std::fs::write(cargo_home.join("config.toml"), VERIFIER_CARGO_CONFIG)?;
+    Ok(cargo_home)
+}
+
 struct VerifierRuntime(Option<tempfile::TempDir>);
 impl VerifierRuntime {
     fn path(&self)->&Path {self.0.as_ref().expect("owned verifier runtime").path()}
@@ -706,8 +726,7 @@ async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:cr
     std::fs::create_dir(&runtime)?;
     let home = runtime.join("home");
     std::fs::create_dir(&home)?;
-    let cargo_home = runtime.join("cargo");
-    std::fs::create_dir(&cargo_home)?;
+    let cargo_home = prepare_verifier_cargo_home(&runtime)?;
     let helper = private.path().join("sandbox.py");
     std::fs::write(&helper, SANDBOX)?;
     let policy = private.path().join("policy.json");
@@ -870,6 +889,21 @@ fn only_unmapped_hunks_named(detail: &str) -> bool {
 mod tests {
     use super::*;
     use anyhow::ensure;
+    /// #2471: an EvidenceUnknown hold logged nothing about which check
+    /// fired. The stderr line carries the controller's own check message as a
+    /// code, or only a hash when the chain could carry private text.
+    #[test]
+    fn evidence_unknown_hold_names_its_failed_check_without_private_text() {
+        let error=anyhow::anyhow!("corrective controller witness question is unavailable or changed")
+            .context(initial_repair::Hold::EvidenceUnknown);
+        let (code,sha)=hold_cause(&error);
+        assert!(code.contains("corrective controller witness question is unavailable or changed"),"{code}");
+        assert_eq!(sha.len(),64);
+        let private=anyhow::anyhow!("read /home/someone/secret/plan.json failed").context(initial_repair::Hold::EvidenceUnknown);
+        let (code,sha)=hold_cause(&private);
+        assert!(code.starts_with("withheld:") && !code.contains("someone"),"{code}");
+        assert_ne!(sha,hold_cause(&error).1);
+    }
     #[test]
     fn a_narrowing_repair_is_offered_only_when_unmapped_changes_are_the_whole_failure() {
         let marker = crate::self_improve::alignment::UNMAPPED_LOCATIONS;
@@ -919,6 +953,41 @@ mod tests {
         assert_eq!(observed.exit_code,Some(0),"{}",observed.stderr);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&observed.stdout).unwrap(),serde_json::json!({"compiler":"operator","private":"denied","write":"denied","network":"denied"}));
         assert_eq!(std::fs::read_to_string(source.join("protected.txt")).unwrap(),"original source");
+    }
+    /// #2445 — a verifier binary that shells out to `cargo run -p
+    /// augmentagent-cli` starts a nested cargo that never sees the top-level
+    /// `--config` flags. With an empty private CARGO_HOME it built the largest
+    /// crate with `jobs = nproc` and full debuginfo, and one rustc filled the
+    /// swapless 4 GiB run cgroup. The limits must reach every cargo in the
+    /// verifier's tree through the CARGO_HOME it inherits.
+    #[test]
+    fn nested_verifier_cargo_inherits_build_limits_from_private_cargo_home() {
+        let root=tempfile::tempdir().unwrap();
+        let runtime=root.path().join("runtime");std::fs::create_dir(&runtime).unwrap();
+        let cargo_home=prepare_verifier_cargo_home(&runtime).unwrap();
+        let probe=root.path().join("probe");std::fs::create_dir_all(probe.join("src")).unwrap();
+        std::fs::write(probe.join("Cargo.toml"),"[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        std::fs::write(probe.join("src/lib.rs"),"").unwrap();
+        std::fs::write(probe.join("build.rs"),"fn main() {\n    let get = |key: &str| std::env::var(key).unwrap_or_default();\n    println!(\"cargo:warning=limits jobs={} debug={}\", get(\"NUM_JOBS\"), get(\"DEBUG\"));\n}\n").unwrap();
+        let home=root.path().join("home");std::fs::create_dir(&home).unwrap();
+        let cargo=PathBuf::from(env!("CARGO"));
+        let mut command=std::process::Command::new(&cargo);
+        // Exactly what a nested `Command::new("cargo")` inherits from the
+        // sandbox: no `--config` flags, the private CARGO_HOME, no host config.
+        command.args(["build","--offline"]).current_dir(&probe).env_clear()
+            .env("PATH",std::env::var_os("PATH").unwrap_or_default()).env("HOME",&home)
+            .env("CARGO_HOME",&cargo_home).env("CARGO_TARGET_DIR",root.path().join("target"))
+            .env("TMPDIR",&runtime);
+        let rustc=cargo.with_file_name("rustc");
+        if rustc.exists() {command.env("RUSTC",rustc);}
+        for key in ["RUSTUP_HOME","RUSTUP_TOOLCHAIN"] {
+            if let Some(value)=std::env::var_os(key) {command.env(key,value);}
+        }
+        let output=command.output().unwrap();
+        let stderr=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"{stderr}");
+        assert!(stderr.contains("limits jobs=1 debug=false"),
+            "a nested verifier cargo ignored the verifier build limits: {stderr}");
     }
     #[test]
     fn harness_install_reuses_an_identical_pinned_file_and_names_a_conflict() {
@@ -1170,7 +1239,18 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
     workflow.checkpoint_qualification_source(prepared).await?;
     let legacy=prepared.proposal.contract.verifiers.iter().any(|v|!v.command.controller_asserted());
     let checked=if legacy {Err(anyhow::anyhow!("legacy in-process verifier requires independent behavioral-oracle migration"))}else {
-        qualify_original_baseline(root,control,prepared,workflow).await
+        match qualify_original_baseline(root,control,prepared,workflow).await {
+            // #2471: an own open PR is not parked or rescoped because the
+            // controller's witness contract changed. Re-establish acceptance
+            // on the same head with a witness for the current contract.
+            Err(error) if baseline_witness::controller_witness_changed(&error) && workflow.begin_witness_regeneration()? => {
+                warn!(workflow=%workflow.id(),head=%workflow.binding().head,"own PR: regenerating the acceptance witness for the current controller contract");
+                let regenerated=qualify_original_baseline(root,control,prepared,workflow).await;
+                workflow.end_witness_regeneration();
+                regenerated
+            }
+            other=>other,
+        }
     };
     match checked {
         Ok(())=>Ok(()),
@@ -1542,6 +1622,18 @@ mod initial_diagnostic_tests {
     }
 }
 
+/// #2471: which check produced an acceptance hold, for the worker log. The
+/// controller's own check messages are fixed text; a chain that could carry a
+/// path or other private text is reduced to a hash. The full diagnostic stays
+/// in the private scope-stage record.
+fn hold_cause(error:&anyhow::Error)->(String,String) {
+    let chain=format!("{error:#}");
+    let sha=amendment::digest(chain.as_bytes());
+    let safe=chain.len()<=600 && !chain.contains('/') && !chain.contains('\\')
+        && augmentagent_channel_core::public_report::validate("",&chain).is_ok();
+    (if safe {chain} else {format!("withheld:{}",&sha[..16])},sha)
+}
+
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
     if workflow.semantic_source_waiting()? {return Ok(Some(RunReport::held("Autoship waiting for original verification evidence; candidate and prior charges preserved".into())));}
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
@@ -1549,6 +1641,8 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     // make the workflow runnable or publish the underlying source/output.
     let original=error.downcast_ref::<verifier_execution::OriginalExecutionFailed>().map(|failure|failure.plan.as_str());
     workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),native_custody_failure(error),original).await?;
+    let (cause,cause_sha256)=hold_cause(error);
+    warn!(workflow=%workflow.id(),reason=hold.reason(),%cause,%cause_sha256,"initial acceptance hold recorded");
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&(
         "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
@@ -1578,6 +1672,8 @@ async fn persist_enrolled_acceptance_error(workflow:&mut workflow::WorkflowGuard
     if let Some(setup)=retained_setup_failure(error) {
         workflow.hold_enrolled_setup_failure(prepared,setup).await?;
     }else {workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;}
+    let (cause,cause_sha256)=hold_cause(error);
+    warn!(workflow=%workflow.id(),reason=hold.reason(),%cause,%cause_sha256,"enrolled acceptance hold recorded");
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
     let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});

@@ -235,15 +235,7 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
             .merge_allowance(chrono::Utc::now().timestamp_millis(), 5)
             .unwrap();
         let mode = std::env::var("CI_DISPATCH_MODE").unwrap();
-        let report = if mode == "unsupported" {
-            match ci_repair::prepare(&root, 1669, &mut workflow, &ci_repair::SharedReplay)
-                .await
-                .unwrap()
-            {
-                ci_repair::Preparation::Deferred(report) => report,
-                _ => panic!("diff-dependent recipe must not compare different suites"),
-            }
-        } else if mode == "missing" {
+        let report = if mode == "missing" {
             match ci_repair::preflight(&root, 1669, &mut workflow)
                 .await
                 .unwrap()
@@ -260,8 +252,6 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
         assert!(
             report.message.contains(if mode == "missing" {
                 "hosted_ci_logs_unavailable"
-            } else if mode == "unsupported" {
-                "ci_selection_contract_required"
             } else {
                 "ci_main_failure_dependency"
             }),
@@ -288,7 +278,8 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
     }
     child(TEST, "shared", true);
     child(TEST, "missing", false);
-    child(TEST, "unsupported", false);
+    // #2453: the diff-dependent `targeted` replay refusal is no longer a
+    // dependency; see targeted_test_panic_beside_an_environment_failure_goes_to_repair.
 }
 
 #[tokio::test]
@@ -448,13 +439,15 @@ struct Fixture {
     compiler: PathBuf,
 }
 fn setup(shared: bool) -> Fixture {
+    // The workflow store refuses symlinked paths; /tmp is one on macOS.
+    let tmp = Path::new("/tmp").canonicalize().unwrap();
     let root = tempfile::Builder::new()
         .prefix("ci-two-crate-")
-        .tempdir_in("/tmp")
+        .tempdir_in(&tmp)
         .unwrap();
     let control = tempfile::Builder::new()
         .prefix("ci-dispatch-control-")
-        .tempdir_in("/tmp")
+        .tempdir_in(&tmp)
         .unwrap();
     let sysroot = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -783,4 +776,179 @@ async fn unpushed_candidate_publishes_instead_of_infrastructure_retry() {
     }
     child(TEST, "unpushed", false);
     child(TEST, "moved", false);
+}
+
+/// #2453 production shape (PR #2378, workflow #2329): the required `targeted`
+/// job panics in two tests while another job fails on an apt mirror 429. The
+/// apt job is skipped as infrastructure, but the panic's paired replay refuses
+/// `targeted` because its suite depends on the diff (`ci-targeted.py`). That
+/// refusal was routed to `verification_infrastructure_retry`, labelled
+/// "shared CI environment prerequisite", and retried hourly forever. A replay
+/// that can never run is no reason to wait: repair the hosted test failure.
+#[tokio::test]
+async fn targeted_test_panic_beside_an_environment_failure_goes_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::targeted_test_panic_beside_an_environment_failure_goes_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| {
+            value["job_names"] = serde_json::json!(["bridge-suites", "targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+                "bridge-suites": "Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  429  Too Many Requests\n\
+                    E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu/dists/noble/InRelease  429  Too Many Requests\n\
+                    E: Some index files failed to download. They have been ignored, or old ones used instead.",
+            });
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        match ci_repair::prepare(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap() {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Deferred(report) => panic!("test panic parked as infrastructure: {}", report.message),
+            ci_repair::Preparation::Repair(_) => panic!("an unpaired failure has no head-local repair input"),
+        }
+        let after = snapshot(&control, &id);
+        assert_ne!(after.checkpoint.next.reason, "verification_infrastructure_retry");
+        assert_eq!(reruns(&control), 0, "a real test failure is never rerun as flakiness");
+        assert_eq!(after.model_calls, 0, "routing spends no model calls");
+        return;
+    }
+    child(TEST, "panic-and-apt", false);
+}
+
+/// #2454 (PR #2378, workflow #2329): the `targeted` panics route to repair,
+/// and the repair round now also learns which file outside the contract the
+/// failing check implicates (`notify.rs`, not the failing test itself).
+#[tokio::test]
+async fn targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        std::fs::create_dir_all(root.join("crates/augmentagent-cli/src")).unwrap();
+        for file in ["notify.rs", "notify_tests.rs"] {
+            std::fs::write(root.join("crates/augmentagent-cli/src").join(file), "// fixture\n").unwrap();
+        }
+        let head = commit(&root, "notify fixture");
+        update_scenario(&control, |value| {
+            value["head"] = head.clone().into();
+            value["job_names"] = serde_json::json!(["targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    add them to notify::PRODUCERS\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+            });
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let (preparation, scope) = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap();
+        assert!(matches!(preparation, ci_repair::Preparation::Continue), "the panic still routes to repair");
+        let scope = scope.expect("a repaired code failure carries its scope evidence");
+        assert_eq!(scope.files, vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
+        assert_eq!(scope.checks, vec!["targeted".to_string()]);
+        assert!(scope.tests.contains(&"notify_tests::registry_covers_every_producer_in_the_code".to_string()), "{:?}", scope.tests);
+        return;
+    }
+    child(TEST, "scope-evidence", false);
+}
+
+/// #2453: hosted CI infrastructure holds were unbounded (production reached
+/// six hourly retries on one head). Each hold still backs off, but after a
+/// bounded number on the same head the hold escalates to code repair, which
+/// merges main, rebuilds and pushes a head that reruns every job.
+#[tokio::test]
+async fn hosted_infrastructure_holds_are_bounded_then_escalate_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::hosted_infrastructure_holds_are_bounded_then_escalate_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        let mut at = None;
+        let mut holds = 0;
+        let escalated = loop {
+            let mut workflow = guard(&root, &control, at).await;
+            let id = workflow.id().to_owned();
+            match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+                ci_repair::Preflight::Continue => break id,
+                ci_repair::Preflight::Deferred(report) => {
+                    assert!(report.message.contains("hosted_ci_logs_unavailable"), "{}", report.message);
+                    holds += 1;
+                    assert!(holds <= 12, "infrastructure holds never escalate");
+                    at = Some(snapshot(&control, &id).checkpoint.next.eligible_at_ms + 1);
+                }
+                ci_repair::Preflight::Compare(_) => panic!("unavailable logs cannot be compared"),
+            }
+        };
+        assert!(holds >= 1, "a fresh infrastructure hold still backs off first");
+        assert_ne!(snapshot(&control, &escalated).checkpoint.next.reason, "verification_infrastructure_retry");
+        return;
+    }
+    child(TEST, "missing", false);
+}
+
+/// #2458 production shape (PR #2449, 2026-11-23 06:18Z): the workflow resumed
+/// ten minutes after pushing `62d22fa2`, while hosted CI on that head was still
+/// running. The reader answered `pending` and preflight filed it as a shared
+/// CI infrastructure failure: `failures` went to 5, so the retry slept a full
+/// hour, and six such polls would escalate CI that is merely running to code
+/// repair. Pending checks on the bound head are a short poll. They never
+/// count as an infrastructure failure or spend an infrastructure-hold slot,
+/// and green checks continue the workflow on the next poll.
+#[tokio::test]
+async fn pending_checks_after_a_push_wait_briefly_without_counting_infrastructure() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::pending_checks_after_a_push_wait_briefly_without_counting_infrastructure";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| value["pending"] = true.into());
+        let mut at = None;
+        // More polls than INFRA_HOLD_LIMIT: running CI must never escalate.
+        for poll in 0..(ci_repair::INFRA_HOLD_LIMIT + 3) {
+            let mut workflow = guard(&root, &control, at).await;
+            let id = workflow.id().to_owned();
+            let head = workflow.binding().head.clone();
+            let before = snapshot(&control, &id);
+            let started = chrono::Utc::now().timestamp_millis();
+            let report = match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+                ci_repair::Preflight::Deferred(report) => report,
+                ci_repair::Preflight::Continue => panic!("poll {poll}: pending checks continued as if green"),
+                ci_repair::Preflight::Compare(_) => panic!("poll {poll}: pending checks cannot be compared"),
+            };
+            assert!(report.message.contains("checks pending"), "poll {poll}: {}", report.message);
+            let after = snapshot(&control, &id);
+            assert_eq!((after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()),
+                ("hosted_ci_pending", "retry_verification"), "poll {poll}");
+            assert_eq!(after.checkpoint.stage, Stage::Reconcile, "poll {poll}");
+            let eligible = after.checkpoint.next.eligible_at_ms;
+            assert!(eligible >= started + 5 * 60_000 && eligible <= chrono::Utc::now().timestamp_millis() + 5 * 60_000,
+                "poll {poll}: pending checks wait five minutes, not a growing backoff ({eligible})");
+            assert!(after.lease_until_ms <= chrono::Utc::now().timestamp_millis(), "poll {poll}: the wait releases the slot");
+            assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+            assert_eq!(after.model_calls, before.model_calls);
+            let store = WorkflowStore::open(&control.join("workflow.db")).unwrap();
+            let events = store.events(&id).unwrap();
+            assert!(!events.iter().any(|event| event.1 == "verification_infrastructure_retry"),
+                "poll {poll}: pending checks were counted as an infrastructure failure");
+            assert!(!events.iter().any(|event| event.1 == "hosted_ci_code_failure"),
+                "poll {poll}: pending checks escalated to code repair");
+            let mut workflow = guard(&root, &control, Some(eligible + 1)).await;
+            assert_eq!(workflow.epoch_attempts(ci_repair::INFRA_HOLD_PURPOSE, &head).unwrap(), 0,
+                "poll {poll}: pending checks spent an infrastructure-hold slot");
+            workflow.finish().unwrap();
+            at = Some(eligible + 2);
+        }
+        // Checks finish green on the same head: the next poll continues.
+        update_scenario(&control, |value| {
+            value["pending"] = false.into();
+            value["job_names"] = serde_json::json!([]);
+            value["required_state"] = "SUCCESS".into();
+        });
+        let mut workflow = guard(&root, &control, at).await;
+        assert!(matches!(ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap(), ci_repair::Preflight::Continue),
+            "green checks on the bound head continue the workflow");
+        workflow.finish().unwrap();
+        return;
+    }
+    child(TEST, "pending", false);
 }

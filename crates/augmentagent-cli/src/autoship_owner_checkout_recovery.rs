@@ -299,6 +299,20 @@ pub(super) fn scope_keys(
 pub(super) fn cutover_seq(conn: &Connection, workflow: &str) -> Result<i64> {
     Ok(scope_frontier(conn, workflow)?.map_or(0, |(seq, _)| seq))
 }
+/// When the latest cutover was recorded. Controller files written before it
+/// belong to the archived original episode, exactly like its DB rows.
+pub(super) fn cutover_at_ms(conn: &Connection, workflow: &str) -> Result<Option<i64>> {
+    let seq = cutover_seq(conn, workflow)?;
+    if seq == 0 {
+        return Ok(None);
+    }
+    let at: i64 = conn.query_row(
+        "SELECT at_ms FROM workflow_event WHERE workflow=?1 AND seq=?2",
+        params![workflow, seq],
+        |r| r.get(0),
+    )?;
+    Ok(Some(at))
+}
 pub(super) fn native_attempts(conn: &Connection, workflow: &str) -> Result<Option<u64>> {
     let owner = owner_frontier(conn, workflow)?.is_some();
     let lost = super::terminal_parks::frontier(conn, workflow)?;

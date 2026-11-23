@@ -261,6 +261,12 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+/// #2451: #2421's worst-case model calls for one complete review attempt,
+/// the unit the per-binding review call budget is built from.
+pub(super) fn attempt_call_bound() -> u64 {
+    evidence_plan::worst_case_calls(evidence_plan::MAX_EVIDENCE_GROUPS_PER_ROLE)
+        .expect("the per-role evidence group cap is a small positive constant")
+}
 #[path="self_improve_review_source_ranges.rs"]
 mod source_ranges;
 #[path = "self_improve_review_group.rs"]

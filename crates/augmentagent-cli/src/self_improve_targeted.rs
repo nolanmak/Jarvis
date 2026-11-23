@@ -364,6 +364,7 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
         .context(CommandFailure {code:2,reason:"target-authorization-failed"})?;
     let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
     let before=store.snapshot(id)?.context(CommandFailure {code:2,reason:"workflow-not-found"})?;
+    let source_issue=match target {Target::Issue(number)=>Some(number),Target::Pr(_)=>None};
     let target=before.pr.map(Target::Pr).unwrap_or(target);
     let held=before.lease_until_ms>chrono::Utc::now().timestamp_millis()
         || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)?;
@@ -390,8 +391,14 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
             else {"active lease or unresolved operation; original evidence retained"})
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
-    let lifecycle=target_lifecycle(repo,repository,target).await
+    let mut lifecycle=target_lifecycle(repo,repository,target).await
         .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
+    if let (Lifecycle::Open,Some(issue),Target::Pr(pr))=(&lifecycle,source_issue,target) {
+        if close_obsolete_pr(repo,path,id,repository,issue,pr).await? {
+            lifecycle=target_lifecycle(repo,repository,target).await
+                .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
+        }
+    }
     let (stage,reason,evidence)=match lifecycle {
         Lifecycle::Open=>{
             crate::autoship_workflow::WorkflowStore::open(path)?.lift_target_fence(id)?;
@@ -417,6 +424,27 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
     Ok(())
+}
+
+/// #2461 (#1830 / PR #2091): the source issue closed while its PR stayed
+/// open. The PR can no longer ship anything the owner asked for; close it so
+/// the workflow retires. Owner pauses, inbox work and unresolved operations
+/// still hold it. Returns whether the PR was closed.
+async fn close_obsolete_pr(repo:&Path,path:&Path,id:&str,repository:&str,issue:u64,pr:u64)->Result<bool> {
+    if !matches!(target_lifecycle(repo,repository,Target::Issue(issue)).await,Ok(Lifecycle::Closed)) {return Ok(false);}
+    {
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+        if store.require_owner_dispatch(id).is_err() || !store.pending_operations(id)?.is_empty()
+            || store.merge_reconciliation_needed(id)? {
+            return Err(anyhow::anyhow!("source closed; obsolete PR held by owner control or unresolved operation")
+                .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
+        }
+    }
+    let comment=format!("Source issue #{issue} is closed, so this autoship PR is obsolete. Closing it; reopen the issue to request the work again.");
+    let (ok,_,_)=run(&gh_bin(),&["pr","close",&pr.to_string(),"--repo",repository,"--comment",&comment],repo).await?;
+    anyhow::ensure!(ok,"closing obsolete PR #{pr} failed");
+    info!(workflow=id,issue,pr,"source issue closed; obsolete PR closed");
+    Ok(true)
 }
 
 /// Settle unconfirmed Push intents of an idle workflow whose target is
