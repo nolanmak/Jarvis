@@ -141,6 +141,11 @@ pub(super) const INFRA_RERUN_LIMIT: u32 = 2;
 /// code repair, whose new head reruns every job.
 pub(super) const INFRA_HOLD_PURPOSE: &str = "hosted-ci-infra-hold";
 pub(super) const INFRA_HOLD_LIMIT: u32 = 6;
+/// #2458: polls of still-running checks per head. Five minutes apart this is
+/// two hours, longer than any required job's timeout; past it the head takes
+/// the bounded infrastructure hold above.
+pub(super) const PENDING_POLL_PURPOSE: &str = "hosted-ci-pending-poll";
+pub(super) const PENDING_POLL_LIMIT: u32 = 24;
 
 /// Where a hosted CI hold goes. Only infrastructure waits on the bounded
 /// `verification_infrastructure_retry`; a code failure goes to repair (merge
@@ -509,6 +514,17 @@ async fn defer(
     };
     Ok(RunReport::held(message))
 }
+/// #2458: checks still running on the bound head. Not an infrastructure
+/// failure: a fixed short wait that releases the worker slot.
+async fn pending(workflow: &mut workflow::WorkflowGuard, pr: u64) -> Result<RunReport> {
+    workflow.validate_before_side_effect()?;
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_pending",
+        "head":workflow.binding().head,"action":"poll_checks","outcome":WorkflowOutcome::DependencyWait,
+        "transition":"observation","shipping_authority":false}))?;
+    let eligible = workflow.defer_hosted_ci_pending().await?;
+    workflow.finish_ci_deferral()?;
+    Ok(RunReport::held(format!("PR #{pr}: checks pending on the bound head; poll again after {eligible}")))
+}
 pub(super) enum Hold {
     /// Go on to repair: merge main, rebuild and test in the verifier, push.
     Repair,
@@ -705,6 +721,14 @@ pub(super) async fn preflight(
         "diagnosis":observation,"transition":"observation","shipping_authority":false}))?;
     if let Some(reason) = observation.dependency {
         let reason = blocked_by_conflict(root, reason).await;
+        if reason == "hosted_ci_incomplete" && observation.state == "pending" {
+            let head = workflow.binding().head.clone();
+            if workflow.admit_epoch_attempt(PENDING_POLL_PURPOSE, &head, PENDING_POLL_LIMIT)? {
+                return Ok(Preflight::Deferred(pending(workflow, pr).await?));
+            }
+            workflow.audit_logger().record_controller(serde_json::json!({"kind":"hosted_ci_pending_exhausted",
+                "head":head,"limit":PENDING_POLL_LIMIT,"action":"infrastructure_hold","shipping_authority":false}))?;
+        }
         return Ok(match hold(workflow, pr, reason, &jobs(&observation), true).await? {
             Hold::Repair => Preflight::Continue,
             Hold::Deferred(report) => Preflight::Deferred(report),
