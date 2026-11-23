@@ -75,7 +75,7 @@ fn policy_hash_for(version:u32)->String {
 /// Retired byte-hash policies (`original-production-witness-v1` over source
 /// digests) that main deployed while the scoper identity was the frozen
 /// version-1 value, oldest first: cfa5393b, f0da445a, 5d4f09a4, 54c678e1,
-/// 8b1c9e64, 088b78c3, abbee4f1. They are recognized only to migrate a stored
+/// 8b1c9e64, 088b78c3, abbee4f1, b412366b. They are recognized only to migrate a stored
 /// qualification into `BYTE_HASH_MIGRATION_VERSION`, never under a later one.
 const BYTE_HASH_POLICIES:&[&str]=&[
     "b7d6b3a7551a32f615552aefc994b1f53b60ffd32909e8179ac06dc4561ac87f",
@@ -85,6 +85,7 @@ const BYTE_HASH_POLICIES:&[&str]=&[
     "897367c38e57e6a7567be3ee396553350c8955558c665f60db2962fd83348f9b",
     "b1573d6a90ccca333bdf414dc6dede12b7cab2b4a46f20081071b98f3a703e58",
     "a198632d7e74e6cf8f6ad00916a48e88e1ec3ce51cdf7db4231632f4b2b3b96a",
+    "210b313e324a276e89c469f9c2941c2d4d558895faf2f3544d27b4295a0a357c",
 ];
 const BYTE_HASH_MIGRATION_VERSION:u32=1;
 #[cfg(test)]
@@ -2664,7 +2665,7 @@ mod tests {
     /// Append only. A behaviour-preserving edit adds its fingerprint under the
     /// current versions; a change to what a qualification means bumps one.
     const WITNESS_SEMANTICS:&[(u32,u32,&str)]=&[
-        (1,1,"e23a9428e1364f50f91faed4cb276d626fc2eea6e43a5dbecf85969254ec15e1"),
+        (1,1,"39ca4dec60f1fc3a94bf07f135b2b55d5659b46753d8c33ac10f1e48afdc081c"),
     ];
     fn witness_source(file:&str)->&'static str {
         match file {
