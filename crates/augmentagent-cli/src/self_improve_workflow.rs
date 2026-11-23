@@ -2483,6 +2483,13 @@ impl WorkflowGuard {
     /// is needed; ancestry and the lease both protect intervening remote edits.
     /// The actual fresh publication entry, separately callable by its
     /// disposable-remote regression without invoking a model.
+    /// #2491: this workflow checkpointed a push of its exact current binding
+    /// and has not published that head yet.
+    pub(super) fn unpushed_publish_checkpoint(&self)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .unpushed_publish_checkpoint(self.id(),&self.binding)
+    }
+
     pub(super) async fn push_fresh(&mut self,repo:&Path,branch:&str,automatic:bool)->Result<String> {
         self.push_checked(branch,Some((repo,automatic))).await
     }
