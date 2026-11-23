@@ -47,6 +47,8 @@ pub(super) mod readiness;
 mod adjudicated;
 #[path = "self_improve_ci_scope.rs"]
 pub(super) mod ci_scope;
+#[path = "self_improve_own_pr_rescope.rs"]
+pub(super) mod own_pr_rescope;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
@@ -1243,7 +1245,10 @@ pub(super) async fn qualify_or_amend(reasoner:&FallbackReasoner,source:Acceptanc
             // #2471: an own open PR is not parked or rescoped because the
             // controller's witness contract changed. Re-establish acceptance
             // on the same head with a witness for the current contract.
-            Err(error) if baseline_witness::controller_witness_changed(&error) && workflow.begin_witness_regeneration()? => {
+            // #2491: the same bounded regeneration when the retained
+            // original measurement is gone (archived by a cutover) for the
+            // own PR head this workflow published.
+            Err(error) if baseline_witness::regenerates_own_pr_witness(&error) && workflow.begin_witness_regeneration()? => {
                 warn!(workflow=%workflow.id(),head=%workflow.binding().head,"own PR: regenerating the acceptance witness for the current controller contract");
                 let regenerated=qualify_original_baseline(root,control,prepared,workflow).await;
                 workflow.end_witness_regeneration();

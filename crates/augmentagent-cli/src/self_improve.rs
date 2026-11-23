@@ -7185,6 +7185,36 @@ async fn resume_draft_pr(
     let capacity_accounting = workflow.capacity_accounting(true)?;
     let outcome = async {
     workflow.bind_builder(reasoner.as_ref())?;
+    // #2488: read the checkpoint before this run moves it. A workflow that
+    // stopped for the owner after its bounded rescopes does no more work.
+    // The stop is a bounded wait autoship revisits itself (#2371): daily, or
+    // as soon as main or the issue's request changes.
+    let rescope_entry = workflow.current_checkpoint()?;
+    let (_, rescope_main, _) = run("git", &["rev-parse", "origin/main"], &worktree).await?;
+    let rescope_inputs = acceptance::own_pr_rescope::Inputs {
+        request: crate::autoship_review::digest(format!("{}\n{}", issue.title, issue.body).as_bytes()),
+        main: rescope_main.trim().to_owned(),
+    };
+    if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
+        return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; re-evaluated daily or when main or the issue changes")));
+    }
+    // #2491: a push this workflow checkpointed for the exact head it built
+    // goes first. The push is idempotent and pinned to that head, so a later
+    // acceptance hold can no longer strand finished work unpublished. It also
+    // makes the head the workflow's own published head, which #2477's bounded
+    // witness regeneration requires. A changed contract or source is a
+    // different binding and takes the normal path below.
+    if workflow.unpushed_publish_checkpoint()? {
+        if let Err(error) = workflow.push_fresh(repo_root, branch, expected_head.is_none()).await {
+            if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
+            if let Some(report) = linked_claims::report(&error) { return Ok(report); }
+            workflow.transition(Stage::Publish, "publishing_revision", "push", chrono::Utc::now().timestamp_millis() + 60_000).await?;
+            return Err(error.context("resume: checkpointed publication push deferred; candidate preserved"));
+        }
+        info!(pr, issue = issue.number, head = %workflow.binding().head, "resume: published the workflow's checkpointed head before acceptance");
+    }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
     let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
     let mut ci_findings = match ci_preparation {
@@ -7215,6 +7245,28 @@ async fn resume_draft_pr(
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
+    // #2488: the bounded amendments that could change the contract are spent
+    // and resuming it again only reaches the same refusal. Rescope from the
+    // recorded findings: a new revision on this branch and head, then repair,
+    // verify and review in it; past the bound, stop for the owner.
+    let mut rescope_notes = None;
+    if let Some(findings) = acceptance::own_pr_rescope::pending(&rescope_entry) {
+        let upheld = workflow.latest_review_receipt("resume-structured-")?
+            .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+            .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+        let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
+            pr, issue: issue.number, automatic: expected_head.is_none() };
+        match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
+            acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
+                info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
+                rescope_notes = notes;
+            }
+            acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+            }
+        }
+    }
     // #2454: a required check whose failure implicates files outside the
     // contract asks the amendment authority for exactly those files before any
     // repair round. A refusal rescopes; repair never retries the old scope.
@@ -7594,10 +7646,14 @@ async fn resume_draft_pr(
         // PR #2378 reviewed one head three times to reach the same verdict.
         let review_key = crate::autoship_workflow::review_binding_cap::binding_key(
             &workflow.binding().head, &workflow.binding().contract);
-        let recorded = previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
-            review, &workflow.binding().head, &workflow.binding().contract));
-        let review_route = workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
-            recorded.is_some(), rounds_done < revise_rounds())?;
+        // #2488: a rescope's carried findings are repaired once in the new
+        // scope, through the shared revise round, before any re-review.
+        let carried = if rounds_done < revise_rounds() { rescope_notes.take() } else { None };
+        let recorded = carried.clone().or_else(|| previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
+            review, &workflow.binding().head, &workflow.binding().contract)));
+        let review_route = if carried.is_some() { crate::autoship_workflow::review_binding_cap::Route::Repair }
+            else { workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
+                recorded.is_some(), rounds_done < revise_rounds())? };
         let mut capped_findings = None;
         {
             use crate::autoship_workflow::review_binding_cap::{Route, EXHAUSTED_BACKOFF_MS};
@@ -16331,6 +16387,54 @@ CODEX-REVIEW: lgtm").0);
             publishes, commits + 1,
             "every inline round plus the delegated integration commit must be pushed + commented (#895)"
         );
+    }
+
+    /// #2488: an own PR at `rescope_remaining_findings` is rescoped before
+    /// the resume moves its checkpoint, and before CI scope widening would
+    /// refuse the same files again. A workflow already stopped for the owner
+    /// does no work, and a rescope's carried findings feed the one shared
+    /// revise round rather than a new prompt or commit site.
+    #[test]
+    fn resume_rescopes_an_own_pr_from_its_recorded_findings() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let entry = at("let rescope_entry = workflow.current_checkpoint()?");
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
+        let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
+        let bound = at("workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;");
+        let rescoped = at("own_pr_rescope::run(");
+        let widened = at("acceptance::ci_scope::widen(");
+        let review = at("admit_review_binding(");
+        let carried = at("rescope_notes.take()");
+        assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
+        assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
+        assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2491 (PR #2449, 14:33Z): the resume ran acceptance preparation before
+    /// the push its own `publish` checkpoint was waiting for, and parked the
+    /// verified head unpublished. The checkpointed push comes first: after the
+    /// rescope gate reads the entry, and before the resume moves the
+    /// checkpoint or prepares acceptance.
+    #[test]
+    fn resume_pushes_its_checkpointed_head_before_acceptance() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
+        let pending = at("if workflow.unpushed_publish_checkpoint()? {");
+        let pushed = at("workflow.push_fresh(repo_root, branch, expected_head.is_none())");
+        let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
+        let prepared = at("acceptance::prepare_acceptance(");
+        let qualified = at("acceptance::qualify_or_amend(");
+        assert!(parked < pending && pending < pushed, "the checkpointed push must follow the owner-stop gate");
+        assert!(pushed < started && started < prepared && prepared < qualified,
+            "the checkpointed push must come before the resume re-establishes acceptance");
     }
 
     // --- #931 baseline check: a red `main` is not the builder's failure ----
