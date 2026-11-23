@@ -235,15 +235,7 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
             .merge_allowance(chrono::Utc::now().timestamp_millis(), 5)
             .unwrap();
         let mode = std::env::var("CI_DISPATCH_MODE").unwrap();
-        let report = if mode == "unsupported" {
-            match ci_repair::prepare(&root, 1669, &mut workflow, &ci_repair::SharedReplay)
-                .await
-                .unwrap()
-            {
-                ci_repair::Preparation::Deferred(report) => report,
-                _ => panic!("diff-dependent recipe must not compare different suites"),
-            }
-        } else if mode == "missing" {
+        let report = if mode == "missing" {
             match ci_repair::preflight(&root, 1669, &mut workflow)
                 .await
                 .unwrap()
@@ -260,8 +252,6 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
         assert!(
             report.message.contains(if mode == "missing" {
                 "hosted_ci_logs_unavailable"
-            } else if mode == "unsupported" {
-                "ci_selection_contract_required"
             } else {
                 "ci_main_failure_dependency"
             }),
@@ -288,7 +278,8 @@ async fn shared_failure_and_missing_logs_become_dependencies_without_paid_repair
     }
     child(TEST, "shared", true);
     child(TEST, "missing", false);
-    child(TEST, "unsupported", false);
+    // #2453: the diff-dependent `targeted` replay refusal is no longer a
+    // dependency; see targeted_test_panic_beside_an_environment_failure_goes_to_repair.
 }
 
 #[tokio::test]
@@ -783,4 +774,77 @@ async fn unpushed_candidate_publishes_instead_of_infrastructure_retry() {
     }
     child(TEST, "unpushed", false);
     child(TEST, "moved", false);
+}
+
+/// #2453 production shape (PR #2378, workflow #2329): the required `targeted`
+/// job panics in two tests while another job fails on an apt mirror 429. The
+/// apt job is skipped as infrastructure, but the panic's paired replay refuses
+/// `targeted` because its suite depends on the diff (`ci-targeted.py`). That
+/// refusal was routed to `verification_infrastructure_retry`, labelled
+/// "shared CI environment prerequisite", and retried hourly forever. A replay
+/// that can never run is no reason to wait: repair the hosted test failure.
+#[tokio::test]
+async fn targeted_test_panic_beside_an_environment_failure_goes_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::targeted_test_panic_beside_an_environment_failure_goes_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        update_scenario(&control, |value| {
+            value["job_names"] = serde_json::json!(["bridge-suites", "targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+                "bridge-suites": "Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  429  Too Many Requests\n\
+                    E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu/dists/noble/InRelease  429  Too Many Requests\n\
+                    E: Some index files failed to download. They have been ignored, or old ones used instead.",
+            });
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        match ci_repair::prepare(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap() {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Deferred(report) => panic!("test panic parked as infrastructure: {}", report.message),
+            ci_repair::Preparation::Repair(_) => panic!("an unpaired failure has no head-local repair input"),
+        }
+        let after = snapshot(&control, &id);
+        assert_ne!(after.checkpoint.next.reason, "verification_infrastructure_retry");
+        assert_eq!(reruns(&control), 0, "a real test failure is never rerun as flakiness");
+        assert_eq!(after.model_calls, 0, "routing spends no model calls");
+        return;
+    }
+    child(TEST, "panic-and-apt", false);
+}
+
+/// #2453: hosted CI infrastructure holds were unbounded (production reached
+/// six hourly retries on one head). Each hold still backs off, but after a
+/// bounded number on the same head the hold escalates to code repair, which
+/// merges main, rebuilds and pushes a head that reruns every job.
+#[tokio::test]
+async fn hosted_infrastructure_holds_are_bounded_then_escalate_to_repair() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::hosted_infrastructure_holds_are_bounded_then_escalate_to_repair";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        let mut at = None;
+        let mut holds = 0;
+        let escalated = loop {
+            let mut workflow = guard(&root, &control, at).await;
+            let id = workflow.id().to_owned();
+            match ci_repair::preflight(&root, 1669, &mut workflow).await.unwrap() {
+                ci_repair::Preflight::Continue => break id,
+                ci_repair::Preflight::Deferred(report) => {
+                    assert!(report.message.contains("hosted_ci_logs_unavailable"), "{}", report.message);
+                    holds += 1;
+                    assert!(holds <= 12, "infrastructure holds never escalate");
+                    at = Some(snapshot(&control, &id).checkpoint.next.eligible_at_ms + 1);
+                }
+                ci_repair::Preflight::Compare(_) => panic!("unavailable logs cannot be compared"),
+            }
+        };
+        assert!(holds >= 1, "a fresh infrastructure hold still backs off first");
+        assert_ne!(snapshot(&control, &escalated).checkpoint.next.reason, "verification_infrastructure_retry");
+        return;
+    }
+    child(TEST, "missing", false);
 }
