@@ -92,7 +92,7 @@ fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {Self::open_at(&path())}
-    fn open_at(state:&Path)->Result<Self> {
+    pub(super) fn open_at(state:&Path)->Result<Self> {
         WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
