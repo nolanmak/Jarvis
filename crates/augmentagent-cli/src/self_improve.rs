@@ -113,6 +113,8 @@ mod policy_hold;
 mod legacy_readmission;
 #[path = "self_improve_closed_targets.rs"]
 mod closed_targets;
+#[path = "self_improve_attempt_cap.rs"]
+mod attempt_cap;
 #[path="self_improve_scope_policy.rs"]
 mod scope_policy;
 #[path = "self_improve_owner_requalification.rs"]
@@ -1172,7 +1174,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None).await.ok();
+            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None, GaveUpNote::Reason).await.ok();
             continue;
         }
         if has_foreign_agent_pr(repo_root, number).await? {
@@ -6691,7 +6693,7 @@ async fn hold_unreviewable(
         // branch, so a failed label leaves the draft open and unmarked; the
         // next pass (at most once a UTC day) tries again.
         if !routing_allowed().await {return routing_held();}
-        match label_gave_up(repo_root, issue, &format!("held:{}", why.code()), automatic, Some(pr)).await {
+        match label_gave_up(repo_root, issue, &format!("held:{}", why.code()), automatic, Some(pr), GaveUpNote::Reason).await {
             Ok(()) => {
                 if !routing_allowed().await {return routing_held();}
                 close_gave_up_pr(repo_root, pr, issue, body).await;
@@ -7485,7 +7487,7 @@ async fn resume_draft_pr(
             )
             .await
             .unwrap_or_else(|_| Tally::uncounted());
-            if label_gave_up(repo_root, issue.number, "guard:blast-radius-diff", expected_head.is_none(), Some(pr)).await.is_err() {
+            if label_gave_up(repo_root, issue.number, "guard:blast-radius-diff", expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.is_err() {
                 return Ok(RunReport::held(format!("PR #{pr}: terminal labeling deferred")));
             }
                 // Preserve the draft and committed candidates for episode recovery.
@@ -7645,7 +7647,7 @@ async fn resume_draft_pr(
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
-                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.ok();
                 // Preserve the draft and committed candidates for episode recovery.
             }
             return Ok(RunReport::built(format!(
@@ -8041,7 +8043,7 @@ async fn resume_draft_pr(
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
-                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.ok();
                 // Preserve this PR for the durable adjudication/recovery path.
             }
             notify_review_unless(workflow.legacy_notice_suppressed(), &format!(
@@ -8512,6 +8514,18 @@ async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<Run
     Ok(None)
 }
 
+/// #2467: the held report a run returns while the global budget is spent.
+fn global_budget_hold(path: &Path, now: i64) -> Result<Option<RunReport>> {
+    let Some(store) = crate::autoship_workflow::WorkflowStore::open_read_only(path)? else { return Ok(None) };
+    let budget = store.global_model_budget(now)?;
+    Ok(budget.exhausted().then(|| {
+        let reopens = budget.reopens_at_ms.and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| format!("; reopens at {}", at.format("%Y-%m-%dT%H:%M:%SZ"))).unwrap_or_default();
+        RunReport::held(format!("global daily model-call budget spent ({} of {} in the rolling 24 hours){reopens}; no new paid work",
+            budget.used, budget.cap))
+    }))
+}
+
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
     let automatic_routing=selected.is_none();
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
@@ -8538,6 +8552,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     };
     note_current_issue(0); // This run has not committed to an issue yet (#954).
+    // #2467: with the global daily model budget spent, start no paid work.
+    // The merge sweep and finalize run on their own tick and keep going.
+    if !dry_run {
+        if let Some(report)=global_budget_hold(&workflow::path(),chrono::Utc::now().timestamp_millis())? {
+            return Ok(report);
+        }
+    }
 
     // Deployment evidence above deliberately uses the real deploy root. All
     // subsequent execution uses a clean controller pinned to fetched main;
@@ -8714,7 +8735,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // label it out of the selection pool immediately. Without this, the
         // unattended loop re-picks the same issue every tick: it head-of-line
         // blocks every other labeled issue and re-comments daily, forever.
-        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR, automatic_routing, None).await.ok();
+        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR, automatic_routing, None, GaveUpNote::Reason).await.ok();
         return Ok(RunReport::triage(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
@@ -9106,7 +9127,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         .await
         .ok();
         if attempts.exhausted() {
-            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: refused — diff hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -9210,7 +9231,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 return Ok(RunReport::built(format!(
                     "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
                     issue.number
@@ -9332,7 +9353,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9550,7 +9571,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         .await
                         .ok();
                         if attempts.exhausted() {
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                         }
                         if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -9592,7 +9613,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9637,7 +9658,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9720,7 +9741,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9772,7 +9793,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9805,7 +9826,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     )
                     .await
                     .ok();
-                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -9936,7 +9957,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                                 let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
                                 if attempts.exhausted() {
-                                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                                 }
                             }
                             return Ok(RunReport::built(message));
@@ -10389,7 +10410,7 @@ async fn record_hard_failure(
         )
         .await
         .ok();
-        label_gave_up(repo_root, issue, attempts.reason(), automatic, None).await.ok();
+        label_gave_up(repo_root, issue, attempts.reason(), automatic, None, GaveUpNote::Reason).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
@@ -10912,17 +10933,50 @@ async fn close_satisfied_issue(repo_root:&Path,issue:u64,base:&str,automatic:boo
     Ok(())
 }
 
-async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str, automatic:bool, pr:Option<u64>) -> Result<()> {
-    let gh = gh_bin();
-    // #1214 — the reason first: a labelled issue always says why, and a
-    // reason comment on an issue whose label then failed is harmless.
-    let note = format!(
+/// #2467 — what the reason comment carries. Every give-up goes through
+/// [`label_gave_up`]; the cap close-out adds its detail and, when a lost
+/// reply already put the comment on, labels without commenting again.
+pub(super) enum GaveUpNote<'a> {
+    /// The reason line only; a failed comment does not stop the label.
+    Reason,
+    /// Reason plus detail. The comment must succeed before the label.
+    Detailed(&'a str),
+    /// The comment is already on the issue: label only.
+    AlreadyPosted,
+}
+
+/// #1214 — the durable reason comment `label_gave_up` posts before it labels.
+fn gave_up_note(reason: &str, detail: &str) -> String {
+    let mut note = format!(
         "{GAVE_UP_REASON_MARKER_PREFIX}{reason} -->\nAuto-PR gave up on this issue: `{reason}`. \
          Remove the `{GAVE_UP_LABEL}` label, or run `augmentagent autopr readmit --reason <code>`, \
          to put it back in the pool."
     );
-    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before reason comment");
-    let _ = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
+    if !detail.is_empty() {
+        note.push_str("\n\n");
+        note.push_str(detail);
+    }
+    note
+}
+
+async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str, automatic:bool, pr:Option<u64>, note: GaveUpNote<'_>) -> Result<()> {
+    let gh = gh_bin();
+    // #1214 — the reason first: a labelled issue always says why, and a
+    // reason comment on an issue whose label then failed is harmless.
+    let (detail, required) = match note {
+        GaveUpNote::Reason => (Some(""), false),
+        GaveUpNote::Detailed(detail) => (Some(detail), true),
+        GaveUpNote::AlreadyPosted => (None, false),
+    };
+    if let Some(detail) = detail {
+        let note = gave_up_note(reason, detail);
+        debug_assert!(note.starts_with(GAVE_UP_REASON_MARKER_PREFIX));
+        anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before reason comment");
+        let posted = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
+        if required && !matches!(posted, Ok((true, _, _))) {
+            bail!("reason comment on #{issue} was not confirmed");
+        }
+    }
     anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before label");
     // #1037 L1 — the exit status is the answer: a caller that closes a draft
     // only once the label is on has to know when it is not.
@@ -12823,6 +12877,9 @@ impl AutoPrLoop {
                 // issue was fixed by hand stays queued forever (#2040, #2081).
                 if !dry_run {
                     if let Err(error)=closed_targets::sweep(root,&workflow::path()).await {warn!("closed-target sweep deferred: {error:#}");}
+                    // #2467: issues over their attempt or spend cap get one
+                    // comment, the label and retirement. Model-free.
+                    if let Err(error)=attempt_cap::sweep(root,&workflow::path()).await {warn!("give-up sweep deferred: {error:#}");}
                 }
                 merged
             })
@@ -19636,7 +19693,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert_eq!(t.n, 2, "the infra failure was not counted");
             assert!(t.exhausted());
             assert_eq!(t.reason(), format!("stuck:gate-red:{fp}"));
-            label_gave_up(&repo, 71002, t.reason(), false, None).await.unwrap();
+            label_gave_up(&repo, 71002, t.reason(), false, None, GaveUpNote::Reason).await.unwrap();
             let log = calls();
             assert!(log.contains("--add-label"), "{log}");
             let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
@@ -21301,13 +21358,13 @@ else:
             return;
         };
         let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
-        assert!(label_gave_up(&repo,70994,"held:synthetic",true,None).await.is_err());
+        assert!(label_gave_up(&repo,70994,"held:synthetic",true,None, GaveUpNote::Reason).await.is_err());
         let calls=gh_calls_1037(&root);
         assert_eq!(calls.iter().filter(|c|gh_call_is(c,&["issue","comment"])).count(),1,
             "actual reason comment did not precede the routing change");
         assert!(!calls.iter().any(|c|gh_call_is(c,&["issue","edit"])),"terminal label ignored a late issue routing change");
         let before=calls.len();
-        label_gave_up(&repo,70994,"held:synthetic",false,None).await.unwrap();
+        label_gave_up(&repo,70994,"held:synthetic",false,None, GaveUpNote::Reason).await.unwrap();
         assert!(gh_calls_1037(&root)[before..].iter().any(|c|gh_call_is(c,&["issue","edit"])),
             "automatic routing revoked explicit manual labeling");
     }

@@ -166,6 +166,7 @@ fn code(value:&str,fallback:&str)->String {
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
         "owner_execution_retry_pending"|"reconcile_runtime_retirement"|"owner_execution_retry_requested"|"resume_started"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker"|
+        "attempt_cap_reached"|"model_call_cap_reached"|"observable_decomposition_spent"|"give_up"|"give_up_cleared"|
         "linked_pr_claim_exists"|"linked_pr_inventory_unknown"|"reconcile_existing_pr"|"retry_github_inventory") {value.into()} else {fallback.into()}
 }
 
