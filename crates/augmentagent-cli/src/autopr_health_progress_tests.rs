@@ -227,3 +227,48 @@ fn health_workflow_fixtures_accept_a_symlinked_temp_root() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// #2373 guard: a CapacityWait is a wait, not a stall, but never an unbounded
+/// one. Six acceptance-ladder rows sat at reviewer capacity for up to 10 h
+/// with no health signal. Past the bound the watchdog alerts (and so
+/// escalates to the owner); a fresh capacity wait stays quiet.
+#[test]
+fn capacity_wait_older_than_the_bound_alerts_and_a_fresh_one_does_not() {
+    let t0 = 1_800_000_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().canonicalize().unwrap().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let binding = Binding { head: "a".repeat(40), contract: "contract-v1".into(), evidence_hash: "evidence-v1".into() };
+    let id = "owner/repo#2348";
+    store.register(id, "fixture", binding, t0).unwrap();
+    let lease = store.claim(id, "fixture", t0, HOUR_MS).unwrap().unwrap();
+    let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+    cp.stage = Stage::Scope;
+    cp.next = NextAction {
+        reason: "acceptance_strategy_reviewer_capacity".into(),
+        action: "escalate_acceptance".into(),
+        eligible_at_ms: t0 + 300_000,
+    };
+    store.checkpoint(&lease, &cp, t0 + 1).unwrap();
+    store.release(&lease, t0 + 2).unwrap();
+    drop(store);
+
+    let fresh = t0 + HOUR_MS;
+    let findings = analyze(&inputs(fresh, workflow_progress_at(&path, fresh)), &Thresholds::default());
+    assert!(!findings.iter().any(|f| f.code == "capacity-wait-stale"), "{findings:?}");
+
+    // A re-selected row that re-holds on the same wait does not reset the clock.
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let lease = store.claim(id, "fixture", t0 + 5 * HOUR_MS, HOUR_MS).unwrap().unwrap();
+    cp.next.eligible_at_ms = t0 + 5 * HOUR_MS + 300_000;
+    store.checkpoint(&lease, &cp, t0 + 5 * HOUR_MS + 1).unwrap();
+    store.release(&lease, t0 + 5 * HOUR_MS + 2).unwrap();
+    drop(store);
+
+    let late = t0 + 7 * HOUR_MS;
+    let findings = analyze(&inputs(late, workflow_progress_at(&path, late)), &Thresholds::default());
+    let stale = findings.iter().find(|f| f.code == "capacity-wait-stale")
+        .unwrap_or_else(|| panic!("a capacity wait past the bound must alert: {findings:?}"));
+    assert_eq!(stale.severity, Severity::Alert);
+    assert!(stale.detail.contains(id) && stale.detail.contains("acceptance_strategy_reviewer_capacity"), "{}", stale.detail);
+}

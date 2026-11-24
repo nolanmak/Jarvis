@@ -7,7 +7,22 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     if std::env::var_os(CHILD).is_none() {
         for case in [
             "lost",
+            "qualification",
+            "qualification-missing",
+            "qualification-bounced",
             "readiness",
+            "material-decision",
+            "scope-retry",
+            "build",
+            "verify",
+            "review",
+            "reconcile",
+            "intake",
+            "terminal",
+            "published",
+            "protected-held",
+            "publication-stage",
+            "pending-operation",
             "intact",
             "manual",
             "closed",
@@ -65,6 +80,12 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         "https://github.com/controller/repo.git",
     ]);
     std::fs::write(root.join("fixture.txt"), "synthetic baseline\n").unwrap();
+    if case=="qualification-bounced" {
+        std::fs::write(root.join("Cargo.lock"), "# synthetic verifier fixture\n").unwrap();
+        git(&["add","Cargo.lock"]);
+        augmentagent_test_support::write_executable(&root.join("rustc"),"#!/bin/sh\necho 'rustc 1.0.0 synthetic'\n").unwrap();
+        std::env::set_var("PATH",format!("{}:/usr/bin:/bin",root.display()));
+    }
     git(&["add", "fixture.txt"]);
     git(&[
         "-c",
@@ -146,6 +167,25 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         cp.next.reason = "readiness_assessment_invalid".into();
         cp.next.action = "await_readiness_input_change".into();
     }
+    match case.as_str() {
+        "material-decision" => {
+            cp.next.reason="material_external_decision_missing".into();
+            cp.next.action="await_request_or_main_change".into();
+        }
+        "scope-retry" => {
+            cp.next.reason="acceptance_registration_retry".into();
+            cp.next.action="rescope_executable_acceptance".into();
+        }
+        "intake" => cp.stage=Stage::Intake,
+        "build" => cp.stage=Stage::Build,
+        "verify" => cp.stage=Stage::Verify,
+        "review" => cp.stage=Stage::Review,
+        "reconcile" => cp.stage=Stage::Reconcile,
+        "terminal" => cp.stage=Stage::Merged,
+        "protected-held" => cp.stage=Stage::Held,
+        "publication-stage" => cp.stage=Stage::Publish,
+        _ => {},
+    }
     store
         .record_scope_stage_response(
             &lease,
@@ -177,6 +217,30 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .inspect_verifier_evidence(id)
         .native_admissions()
         .is_err());
+    let original_plan_body=json!({"version":1,"kind":"original_verifier_plan","workflow":id,"binding":binding,
+        "base":head,"environment":"synthetic verifier","executor":"synthetic executor",
+        "proposal":{"contract":{"schema_version":1,"revision":1,"issue":7,"criteria":[],"allowed_paths":[],"verifiers":[]},"files":{}}}).to_string();
+    let original_plan_key = {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&("original-verifier-plan-v1", &original_plan_body)).unwrap()
+            )
+        )
+    };
+    if case.starts_with("qualification") {
+        store
+            .record_verifier_evidence(
+                &lease,
+                &binding,
+                &original_plan_key,
+                "original_verifier_plan",
+                &original_plan_body,
+                4,
+            )
+            .unwrap();
+    }
     let source = issue(false);
     use sha2::Digest;
     let request_hash = format!(
@@ -206,6 +270,10 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         )
         .unwrap();
     store.checkpoint(&lease, &cp, 5).unwrap();
+    if case=="published" {store.attach_pr_in_repo(&lease,"controller/repo",42,5).unwrap();}
+    if case=="pending-operation" {
+        store.begin_operation(&lease,crate::autoship_workflow::OperationKind::CreatePr,&binding,5).unwrap();
+    }
     store.release(&lease, 6).unwrap();
     let original = store.snapshot(id).unwrap().unwrap();
     let events = store.events(id).unwrap();
@@ -221,6 +289,37 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'scope_stage_response_recorded','{',7)",[id]).unwrap();
     }
 
+    if matches!(case.as_str(), "qualification-missing" | "qualification-bounced") {
+        conn.execute(
+            "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
+            [id, &original_plan_key],
+        )
+        .unwrap();
+        use sha2::Digest;
+        let reference=crate::autoship_workflow::RetainedWitnessReference {plan:"1".repeat(64),result:"2".repeat(64),data:"3".repeat(64),prepared:"4".repeat(64),contract:"5".repeat(64)};
+        let policy = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                crate::autoship_workflow::RETAINED_REQUALIFICATION_RULE
+                    .as_bytes()
+            )
+        );
+        let cue_key = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&(
+                    "retained-qualification-recovery-v1",
+                    id,
+                    &reference,
+                    &policy
+                ))
+                .unwrap()
+            )
+        );
+        let cue = json!({"version":2,"key":cue_key,"judgment":reference.data.clone(),"policy":policy,"original_generation":1,"binding":binding,"qualification_required":true,
+            "source":{"kind":"retained_original_witness","evidence":reference,"owner_request_sha256":format!("{:x}",sha2::Sha256::digest(b"synthetic recovered owner request"))}});
+        conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'original_semantic_witness_recovered',?2,7)",rusqlite::params![id,cue.to_string()]).unwrap();
+    }
     if case != "intact" {
         git(&["worktree", "remove", "--force", old.to_str().unwrap()]);
     }
@@ -261,7 +360,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     }
     if matches!(
         case.as_str(),
-        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked"
+        "intact" | "manual" | "closed" | "lease" | "pause" | "missing-receipt" | "revoked" | "terminal" | "published" | "protected-held" | "publication-stage" | "pending-operation"
     ) {
         let before = store.snapshot(id).unwrap();
         let events = store.events(id).unwrap();
@@ -269,14 +368,19 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
             .await
             .unwrap_err();
         let expected = match case.as_str() {
-            "intact" | "missing-receipt" => "no-automatic-hold",
+            "intact" | "missing-receipt" | "terminal" | "published" | "protected-held" | "publication-stage" => "no-automatic-hold",
+            "pending-operation" => "pending-workflow-operation",
             "revoked" => "target-authorization-failed",
             "manual" => "autoship-manual",
             "closed" => "target-not-open",
             "lease" => "live-workflow-lease",
             _ => "explicit-owner-hold",
         };
-        assert_eq!(refusal(error), expected);
+        if case=="pending-operation" {
+            assert!(format!("{error:#}").contains(expected));
+        } else {
+            assert_eq!(refusal(error), expected);
+        }
         assert_eq!(store.snapshot(id).unwrap(), before);
         assert_eq!(store.events(id).unwrap(), events);
         if case != "missing-receipt" {
@@ -295,7 +399,7 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .contains("--request-id owner-checkout-7-generation-1"));
     let recovered = apply(&root, &request("continuity-fixture"))
         .await
-        .expect("owner can recover a missing held checkout without a legacy label");
+        .expect("owner can recover a missing pre-publication checkout without a legacy label");
     assert_eq!(recovered["accepted"], true);
     assert_eq!(
         apply(&root, &request("continuity-fixture")).await.unwrap()["replayed"],
@@ -437,6 +541,103 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), head);
     assert!(!plan.worktree.join("old-candidate.txt").exists());
+    if case=="qualification-bounced" {
+        requalification_tests::bounced(&root,&path,id,&plan,&head,&receipt_path,&receipt).await;
+        return;
+    }
+    if case.starts_with("qualification") {
+        let guard = workflow::WorkflowGuard::acquire_fixture(
+            &path,
+            workflow::Start {
+                repo_root: &root,
+                worktree: &plan.worktree,
+                repository: "controller/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: &plan.branch,
+                contract: "synthetic recovered owner request",
+                environment: "synthetic fresh environment",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let fresh=initial_preparation(&plan.worktree,&guard,crate::autoship_contract::AcceptanceSource::Issue(7),&head,"synthetic recovered owner request")
+            .expect("owner-authorized fresh scope must establish new qualification without superseded original evidence");
+        assert!(
+            !fresh.retained && fresh.saved.is_none(),
+            "old scope or qualification was adopted"
+        );
+        assert!(guard
+            .verifier_evidence_page("original_verifier_plan", 0)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .inspect_verifier_evidence(id)
+            .record(&original_plan_key, "original_verifier_plan")
+            .unwrap()
+            .is_none());
+        // New witnesses remain mandatory, and post-cutover missing evidence
+        // cannot be treated as a new empty episode or superseded history.
+        let mut new_plan: Value = serde_json::from_str(&original_plan_body).unwrap();
+        new_plan["binding"] = serde_json::to_value(guard.binding()).unwrap();
+        new_plan["executor"] = json!("synthetic fresh executor");
+        let body = new_plan.to_string();
+        let key = {
+            use sha2::Digest;
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&("original-verifier-plan-v1", &body)).unwrap()
+                )
+            )
+        };
+        guard
+            .record_verifier_evidence(&key, "original_verifier_plan", &body)
+            .unwrap();
+        assert_eq!(
+            guard
+                .verifier_evidence_page("original_verifier_plan", 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            initial_preparation(
+                &plan.worktree,
+                &guard,
+                crate::autoship_contract::AcceptanceSource::Issue(7),
+                &head,
+                "synthetic recovered owner request"
+            )
+            .is_err(),
+            "unaccounted fresh verifier plan became qualified"
+        );
+        conn.execute(
+            "DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",
+            [id, &key],
+        )
+        .unwrap();
+        assert!(guard
+            .verifier_evidence_page("original_verifier_plan", 0)
+            .is_err());
+        assert!(store
+            .inspect_verifier_evidence(id)
+            .record(&key, "original_verifier_plan")
+            .is_err());
+        let base_environment = format!(
+            "rustc fixture;cargo-lock:{};upstream-main:{};readiness-policy:fixture",
+            "a".repeat(64),
+            head
+        );
+        let old_environment = format!("{base_environment};owner-recovery:continuity-fixture");
+        let current_environment =
+            owner_checkout_recovery::environment(&path, "controller/repo", 7, base_environment)
+                .unwrap();
+        assert!(!recovery::same_initial_verifier_environment(&old_environment,&current_environment),"already re-held owner workflows must be eligible on the new policy without repeating readopt");
+        guard.finish().unwrap();
+        return;
+    }
     // Retry preparation before enrollment is bounded to the same clean main.
     recovery::prepare_issue_at(
         &path,
@@ -561,3 +762,6 @@ async fn continuity_lost_owner_recovery_preserves_original_and_restarts() {
     );
     assert_eq!(store.snapshot(id).unwrap(), after);
 }
+
+#[path="self_improve_owner_requalification_tests.rs"]
+mod requalification_tests;

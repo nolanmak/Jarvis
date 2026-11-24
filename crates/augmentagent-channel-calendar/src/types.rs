@@ -33,8 +33,28 @@ pub const GCAL_FIELD_ALLOWLIST: &[&str] = &[
     "attendees",
     "organizer",
     "conference_data",
+    "hangout_link",
     "html_link",
 ];
+
+/// #2514 — the conference join URL: `hangoutLink`, else the first `video`
+/// entry point. Only `https` URLs count, so a malformed provider value never
+/// reaches a card or an email. Callers decide whether the URL may leave the
+/// channel; [`MeetingPayload`] (the wiki projection) never carries it.
+pub fn join_url(hangout_link: Option<&str>, conference_data: Option<&ConferenceData>) -> Option<String> {
+    let https = |u: &str| {
+        let u = u.trim();
+        (u.starts_with("https://") && !u.chars().any(char::is_whitespace)).then(|| u.to_string())
+    };
+    hangout_link.and_then(https).or_else(|| {
+        conference_data?
+            .entry_points
+            .as_deref()?
+            .iter()
+            .filter(|p| p.entry_point_type.as_deref() == Some("video"))
+            .find_map(|p| p.uri.as_deref().and_then(https))
+    })
+}
 
 /// Raw Calendar event parsed from Composio's `GOOGLECALENDAR_EVENTS_LIST` /
 /// `GOOGLECALENDAR_EVENTS_GET` response. Holds every field we observe; do
@@ -75,6 +95,13 @@ pub struct CalendarEvent {
     pub hangout_link: Option<String>,
     #[serde(rename = "recurrence")]
     pub recurrence: Option<Vec<String>>,
+}
+
+impl CalendarEvent {
+    /// See [`join_url`].
+    pub fn join_url(&self) -> Option<String> {
+        join_url(self.hangout_link.as_deref(), self.conference_data.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -488,5 +515,32 @@ mod tests {
         // Belt-and-braces: ensure the allowlist marker is non-empty so a
         // well-meaning refactor doesn't silently drop it.
         assert!(!GCAL_FIELD_ALLOWLIST.is_empty());
+    }
+
+    #[test]
+    fn join_url_prefers_hangout_link_then_video_entry_point() {
+        let mut ev = CalendarEvent::default();
+        assert_eq!(ev.join_url(), None);
+        ev.conference_data = Some(ConferenceData {
+            entry_points: Some(vec![
+                EntryPoint { entry_point_type: Some("phone".into()), uri: Some("tel:+1-555-0100".into()), ..Default::default() },
+                EntryPoint { entry_point_type: Some("video".into()), uri: Some("https://meet.google.com/abc-defg-hij".into()), ..Default::default() },
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(ev.join_url().as_deref(), Some("https://meet.google.com/abc-defg-hij"));
+        ev.hangout_link = Some(" https://meet.google.com/xyz-abcd-efg ".into());
+        assert_eq!(ev.join_url().as_deref(), Some("https://meet.google.com/xyz-abcd-efg"));
+        ev.hangout_link = Some("javascript:alert(1)".into());
+        assert_eq!(ev.join_url().as_deref(), Some("https://meet.google.com/abc-defg-hij"), "non-https hangoutLink is ignored");
+    }
+
+    #[test]
+    fn join_url_never_reaches_meeting_payload() {
+        let mut ev = fixture_event_with_description();
+        ev.hangout_link = Some("https://meet.google.com/abc-defg-hij".into());
+        let p = MeetingPayload::from_event(&ev, "e", "primary").unwrap();
+        assert!(!format!("{p:?}").contains("meet.google.com"));
+        assert!(!render_meeting_body(&p).contains("meet.google.com"));
     }
 }

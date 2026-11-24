@@ -76,6 +76,24 @@ class CliTests(unittest.TestCase):
             self.assertEqual(mirror.call_count, 2)
             self.assertEqual(before, {p: p.read_bytes() for p in before})
 
+    def _s3_config(self, tools):
+        """The s3 settings `run` hands the exporter with only `tools` on PATH."""
+        with patch.object(cli.shutil, "which",
+                          lambda name: f"/usr/bin/{name}" if name in tools else None), \
+                patch.object(cli, "sync",
+                             return_value={"messages": 0, "conversations": 0}) as exporter:
+            self.assertEqual(cli.main(self.args + ["--s3-bucket", "private-bucket"]), 0)
+        return exporter.call_args.kwargs["s3"]
+
+    def test_conversion_cache_is_configured_even_without_sips(self):
+        with_sips = self._s3_config({"aws", "sips"})
+        self.assertIs(with_sips["converter"], cli.heic_to_jpeg)
+        # Nothing is converted without `sips`, but the cache is still swept so
+        # a JPEG queued by an earlier run is removed once it uploads.
+        without_sips = self._s3_config({"aws"})
+        self.assertNotIn("converter", without_sips)
+        self.assertEqual(without_sips["convert_dir"], with_sips["convert_dir"])
+
     def test_transport_only_sends_bundle_files(self):
         with patch.object(cli.subprocess, "run") as run:
             cli.mirror(self.out, "host:/private/bundle/")

@@ -399,24 +399,31 @@ fn browser_task_body(raw: &str, scroll: u8) -> Result<Value> {
 }
 
 fn token_file(path: &std::path::Path) -> Result<String> {
+    private_token_file(path, "NewsletterBuddy")
+}
+
+/// One token from an owner-owned, mode 0600, regular file opened without
+/// following symlinks. `label` names the integration in errors, which never
+/// quote the file's contents.
+pub(crate) fn private_token_file(path: &std::path::Path, label: &str) -> Result<String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut file = std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
-        .context("NewsletterBuddy credential file cannot be opened")?;
-    let metadata = file.metadata().context("NewsletterBuddy credential file metadata unavailable")?;
+        .with_context(|| format!("{label} credential file cannot be opened"))?;
+    let metadata = file.metadata().with_context(|| format!("{label} credential file metadata unavailable"))?;
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o777 != 0o600 || metadata.len() > 4096 {
-        bail!("NewsletterBuddy credential file must be owner-owned, regular, mode 0600 and at most 4096 bytes");
+        bail!("{label} credential file must be owner-owned, regular, mode 0600 and at most 4096 bytes");
     }
     let mut bytes = Vec::new();
     (&mut file).take(4097).read_to_end(&mut bytes)
-        .context("NewsletterBuddy credential file cannot be read")?;
-    if bytes.len() > 4096 { bail!("NewsletterBuddy credential file exceeds 4096 bytes"); }
+        .with_context(|| format!("{label} credential file cannot be read"))?;
+    if bytes.len() > 4096 { bail!("{label} credential file exceeds 4096 bytes"); }
     if bytes.last() == Some(&b'\n') { bytes.pop(); }
     if bytes.is_empty() || bytes.iter().any(|b| !b.is_ascii_graphic()) {
-        bail!("NewsletterBuddy credential file must contain one nonempty token");
+        bail!("{label} credential file must contain one nonempty token");
     }
-    Ok(String::from_utf8(bytes).context("NewsletterBuddy credential file must be ASCII")?)
+    String::from_utf8(bytes).with_context(|| format!("{label} credential file must be ASCII"))
 }
 
 struct Api {

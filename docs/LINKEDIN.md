@@ -81,13 +81,44 @@ LinkedIn invalidates `li_at` on:
 - Periodic idle expiry (weeks to months)
 - Suspicious-activity flag
 
-When it happens you'll see this in the daemon logs:
+When it happens the daemon tells you in the approval channel. The first read
+LinkedIn rejects (HTTP 401/403, or any redirect) posts one notice:
 
 ```
-WARN linkedin auth expired — run `augmentagent linkedin login`
+Important, from `linkedin`
+LinkedIn stopped reading
+reason: LinkedIn messages for <account> are not being read since <time>: <error>.
+New DMs are not triaged and message search is missing this channel. Harvest fresh
+cookies and run `augmentagent linkedin login --cookies-json <file>`. This repeats
+once a day until a read succeeds.
 ```
 
-The channel stops polling until you re-harvest. Gmail keeps running unaffected. To fix: repeat steps 1-3.
+While the session stays dead:
+
+- The notice is repeated at most once every 24 hours ("LinkedIn is still not
+  reading"), not on every poll.
+- `augmentagent doctor` reports `linkedin_session` as an error, so it exits
+  non-zero, and the daily digest ends with one line saying LinkedIn is not
+  being read.
+- Reads back off. The first rejection is retried after 60 seconds; every
+  further rejection doubles the pause, up to 6 hours. The dead cookie is not
+  replayed every minute.
+
+Nothing on the channel is read in that time: new DMs are not triaged and
+message search does not see them. Gmail and the other channels keep running.
+
+To fix: repeat steps 1-3. `linkedin login` probes the new cookies, saves them
+and clears the pause, so the next read goes out at once instead of waiting out
+the backoff. A running daemon loads its cookies at startup, as before, so it
+uses the new ones after its next restart. The first read that succeeds posts one "LinkedIn is reading again"
+notice and clears the `doctor` finding and the digest line. A login alone does
+not clear them: only a successful read does.
+
+This state is stored in the database (`linkedin_session_health`), so a daemon
+restart neither repeats the notice early nor forgets the outage. Throttling
+(HTTP 429) is not a dead session: it raises no notice and a login does not lift
+it. The notice covers the DM mailbox reads; the X, Instagram and other
+cookie-based channels do not raise it yet.
 
 ## Where the file lives on disk
 
@@ -208,6 +239,36 @@ augmentagent linkedin backfill --dry-run --max-pages 100
 augmentagent linkedin archive-status --category PRIMARY_INBOX
 ```
 
+### Backfill is slow on purpose
+
+Live polling reads a few pages every four hours. A history import that fires
+its page requests back to back is the one burst of traffic this channel can
+produce. One production session stopped working hours after an unpaced import
+of about 3,100 messages in an hour; that the import caused it is an inference,
+but reading slowly costs nothing. So `linkedin backfill` paces itself:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--page-delay-secs` | 5 | Minimum gap before each request. Up to as much again is added at random, so requests are 5 to 10 seconds apart. |
+| `--hourly-requests` | 60 | Backfill requests for the account in any 60 minutes. |
+| `--daily-requests` | 300 | Backfill requests for the account in any 24 hours. |
+| `--max-pages` | 100 | Upper bound for this one invocation. |
+
+The budget is stored per account in the database, so it holds across
+invocations and restarts. Live polling keeps priority: its reads are never
+delayed, refused or charged to this budget, and backfill also waits its delay
+after a live read before sending its own. When the budget is spent the run stops without sending anything further and
+prints `"stopped": "request_budget"` with `resume_at_ms` and `resume_at`
+(UTC). A run started before that time makes no requests, category discovery
+included. Backfill is resumable, so run it again after `resume_at`, for
+example from a timer.
+
+With the defaults a full import of a long history takes days. That is by
+design: 300 requests a day is one mailbox page or one thread page each. Raise
+the budgets only if you accept the risk described above. `--dry-run` uses an
+in-memory database, so its delay and budget apply within that one run only and
+its requests are not recorded in the durable budget.
+
 A rejected continuation (HTTP 400 or 410 on a request carrying a cursor) gets
 one automatic restart per mailbox or thread reconciliation. The restart keeps
 stored messages and deduplicates replayed IDs. Its allowance is durable across
@@ -223,8 +284,10 @@ while durable page counters advance only after a successful transaction.
 
 Authentication, redirect, and rate-limit failures pause archival reads for the
 whole account, including category discovery. The pause survives restarts and
-explicit category changes; `Retry-After` controls throttling, with a 60-second
-backoff for session failures. Inventory failures also persist a backoff.
+explicit category changes. `Retry-After` controls throttling. A rejected session
+(authentication or redirect) is retried after 60 seconds, then the pause doubles
+on each further rejection up to 6 hours, until `linkedin login` clears it (see
+"When cookies expire"). Other inventory failures persist a 60-second backoff.
 Search/status coverage includes `accounts` with the last error and retry time,
 even when discovery failed before any category was recorded. Successful reads
 begun after the pause clear its error; older concurrent requests cannot clear

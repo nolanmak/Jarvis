@@ -364,6 +364,7 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
         .context(CommandFailure {code:2,reason:"target-authorization-failed"})?;
     let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
     let before=store.snapshot(id)?.context(CommandFailure {code:2,reason:"workflow-not-found"})?;
+    let source_issue=match target {Target::Issue(number)=>Some(number),Target::Pr(_)=>None};
     let target=before.pr.map(Target::Pr).unwrap_or(target);
     let held=before.lease_until_ms>chrono::Utc::now().timestamp_millis()
         || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)?;
@@ -377,6 +378,11 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
                 let evidence=match target {Target::Pr(n)=>format!("github:pr:{n}:terminal"),Target::Issue(n)=>format!("github:issue:{n}:closed")};
                 crate::autoship_workflow::WorkflowStore::open(path)?.fence_closed_target(id,&evidence,chrono::Utc::now().timestamp_millis())?;
                 info!(workflow=id,"target closed outside autoship; new admissions fenced until quiescent retirement");
+                // #2279 — an idle workflow held only by Push intents that never
+                // reached the remote branch would otherwise wait forever.
+                if settle_unlanded_terminal_pushes(repo,path,id,repository,&before,&evidence).await? {
+                    return Box::pin(reconcile_terminal_target(repo,path,id,repository,target)).await;
+                }
                 true
             },
             Err(_)=>false,
@@ -385,8 +391,14 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
             else {"active lease or unresolved operation; original evidence retained"})
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
-    let lifecycle=target_lifecycle(repo,repository,target).await
+    let mut lifecycle=target_lifecycle(repo,repository,target).await
         .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
+    if let (Lifecycle::Open,Some(issue),Target::Pr(pr))=(&lifecycle,source_issue,target) {
+        if close_obsolete_pr(repo,path,id,repository,issue,pr).await? {
+            lifecycle=target_lifecycle(repo,repository,target).await
+                .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
+        }
+    }
     let (stage,reason,evidence)=match lifecycle {
         Lifecycle::Open=>{
             crate::autoship_workflow::WorkflowStore::open(path)?.lift_target_fence(id)?;
@@ -412,6 +424,54 @@ pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
             .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
     }
     Ok(())
+}
+
+/// #2461 (#1830 / PR #2091): the source issue closed while its PR stayed
+/// open. The PR can no longer ship anything the owner asked for; close it so
+/// the workflow retires. Owner pauses, inbox work and unresolved operations
+/// still hold it. Returns whether the PR was closed.
+async fn close_obsolete_pr(repo:&Path,path:&Path,id:&str,repository:&str,issue:u64,pr:u64)->Result<bool> {
+    if !matches!(target_lifecycle(repo,repository,Target::Issue(issue)).await,Ok(Lifecycle::Closed)) {return Ok(false);}
+    {
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+        if store.require_owner_dispatch(id).is_err() || !store.pending_operations(id)?.is_empty()
+            || store.merge_reconciliation_needed(id)? {
+            return Err(anyhow::anyhow!("source closed; obsolete PR held by owner control or unresolved operation")
+                .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
+        }
+    }
+    let comment=format!("Source issue #{issue} is closed, so this autoship PR is obsolete. Closing it; reopen the issue to request the work again.");
+    let (ok,_,_)=run(&gh_bin(),&["pr","close",&pr.to_string(),"--repo",repository,"--comment",&comment],repo).await?;
+    anyhow::ensure!(ok,"closing obsolete PR #{pr} failed");
+    info!(workflow=id,issue,pr,"source issue closed; obsolete PR closed");
+    Ok(true)
+}
+
+/// Settle unconfirmed Push intents of an idle workflow whose target is
+/// terminal, but only on a positive remote read of a different branch head.
+/// Unreadable, absent or matching refs keep the original fence.
+async fn settle_unlanded_terminal_pushes(repo:&Path,path:&Path,id:&str,repository:&str,
+    before:&crate::autoship_workflow::Snapshot,evidence:&str)->Result<bool> {
+    use crate::autoship_workflow::{OperationKind,WorkflowStore};
+    let now=chrono::Utc::now().timestamp_millis();
+    let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+    let pending=store.pending_operations(id)?;
+    if before.lease_until_ms>now || store.merge_reconciliation_needed(id)? || pending.is_empty()
+        || pending.iter().any(|operation|operation.kind!=OperationKind::Push) {return Ok(false);}
+    drop(store);
+    let (valid,_,_)=run("git",&["check-ref-format","--branch",&before.branch],repo).await?;
+    if !valid {return Ok(false);}
+    let (ok,out,_)=run(&gh_bin(),&["api",&format!("repos/{repository}/git/ref/heads/{}",before.branch),"--jq",".object.sha"],repo).await?;
+    let remote=out.trim();
+    if !ok || !matches!(remote.len(),40|64) || !remote.bytes().all(|b|b.is_ascii_hexdigit())
+        || pending.iter().any(|operation|operation.binding.head.eq_ignore_ascii_case(remote)) {return Ok(false);}
+    let mut store=WorkflowStore::open(path)?;
+    let Some(lease)=store.claim(id,"autoship-target-lifecycle",now,60_000)? else {return Ok(false)};
+    let settled=store.settle_unlanded_pushes(&lease,remote,evidence,now);
+    store.release(&lease,now)?;
+    let settled=settled?;
+    if settled>0 {info!(workflow=id,settled,remote_head=remote,"terminal target: unlanded Push intents settled; retirement may proceed");}
+    Ok(settled>0)
 }
 
 /// #1712 — owner cancel: durable retirement through the same fenced settle

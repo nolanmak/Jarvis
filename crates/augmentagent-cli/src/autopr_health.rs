@@ -143,6 +143,8 @@ pub struct HealthInputs {
     /// Active, unpaused workflows waiting on resource admission.
     pub resource_capacity_waits: Option<u64>,
     pub resource_capacity_wait_error: bool,
+    /// #2467 — the global rolling-24h model-call budget; `None` when unread.
+    pub global_model_budget: Option<crate::autoship_workflow::GlobalModelBudget>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
     /// #1708 — S's latest durable event per nonterminal workflow and whether
@@ -151,6 +153,43 @@ pub struct HealthInputs {
     /// Set when the worker store resolved but its events could not be read.
     /// Distinct from `None` progress with no error (not collected: quiet).
     pub workflow_progress_error: Option<String>,
+    /// #2468 — the controller release the worker runs. `None` when no pin is
+    /// recorded (not yet bootstrapped, or a host that does not pin).
+    pub autoship_pin: Option<AutoshipPin>,
+}
+
+/// #2468 — the pinned auto-ship controller against `origin/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoshipPin {
+    /// A full commit SHA, or "main" when the owner unpinned the worker.
+    pub pinned: String,
+    /// What the installed pinned binary was built from (the worker's stamp).
+    pub installed: Option<String>,
+    /// Commits on `origin/main` not in the pin; `None` when unknown.
+    pub main_ahead: Option<u64>,
+}
+
+impl AutoshipPin {
+    fn is_sha(&self) -> bool {
+        self.pinned.len() == 40 && self.pinned.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    /// The pin moved but its build is not installed yet.
+    fn pending(&self) -> bool {
+        self.is_sha() && self.installed.as_deref() != Some(self.pinned.as_str())
+    }
+    fn line(&self) -> String {
+        if !self.is_sha() {
+            return "autoship controller: unpinned (the worker follows main deploys)".into();
+        }
+        let short = |s: &str| s.chars().take(12).collect::<String>();
+        let ahead = self.main_ahead.map_or("an unknown number of".into(), |n| n.to_string());
+        let mut line = format!("autoship controller: pinned to {}; main is {ahead} commit(s) ahead", short(&self.pinned));
+        if self.pending() {
+            line.push_str(&format!("; pin move pending (installed: {})",
+                self.installed.as_deref().map_or("none".into(), short)));
+        }
+        line
+    }
 }
 
 /// #1708 — S runtime events as the watchdog reads them.
@@ -161,6 +200,9 @@ pub struct WorkflowProgress {
     /// S's persisted stage activity (effective inactivity deadline) for each
     /// workflow above that has one. Missing legacy activity is simply absent.
     pub activities: Vec<(String, crate::autoship_workflow::activity::Activity)>,
+    /// #2373: when each workflow now in a CapacityWait entered it. Repeated
+    /// re-holds of the same wait do not restart this clock.
+    pub capacity_waits: Vec<(String, i64)>,
 }
 
 impl WorkflowProgress {
@@ -203,12 +245,18 @@ pub fn workflow_progress_at(path: &Path, now_ms: i64) -> Option<WorkflowProgress
     let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
     let (events, inventory_complete) = store.latest_workflow_events(now_ms).ok()?;
     let mut activities = Vec::new();
+    let mut capacity_waits = Vec::new();
     for event in &events {
+        if matches!(event.outcome, augmentagent_channel_core::autoship_workflow_contract::WorkflowOutcome::CapacityWait) {
+            if let Some(since) = store.capacity_wait_since(&event.workflow_id).ok()? {
+                capacity_waits.push((event.workflow_id.clone(), since));
+            }
+        }
         if let Some(activity) = store.activity_status(&event.workflow_id).ok()? {
             activities.push((event.workflow_id.clone(), activity));
         }
     }
-    Some(WorkflowProgress { events, inventory_complete, activities })
+    Some(WorkflowProgress { events, inventory_complete, activities, capacity_waits })
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -226,6 +274,10 @@ pub struct Thresholds {
     /// #1708 — minutes an active, non-waiting workflow may go without S
     /// recording meaningful progress. Above every S stage budget.
     pub workflow_progress_stale_mins: i64,
+    /// #2373 — minutes a CapacityWait may last without useful progress. The
+    /// acceptance ladder falls back from a latched reviewer after 2 h, so a
+    /// wait past this has no automatic exit left and must reach the owner.
+    pub capacity_wait_stale_mins: i64,
 }
 
 impl Default for Thresholds {
@@ -249,6 +301,7 @@ impl Default for Thresholds {
             // S's largest stage budget is 90 min (verify); six hours without a
             // recorded gate or guarded step is not slow work.
             workflow_progress_stale_mins: 360,
+            capacity_wait_stale_mins: 360,
         }
     }
 }
@@ -539,6 +592,22 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
+    // #2468 — the owner moved the pin and the updater has not installed it.
+    if let Some(pin) = i.autoship_pin.as_ref().filter(|p| p.pending()) {
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "autoship-pin-pending",
+            detail: format!(
+                "the auto-ship worker is pinned to {} but its installed build is {}; \
+                 it keeps running the installed build until the pinned one is built",
+                pin.pinned, pin.installed.as_deref().unwrap_or("none")
+            ),
+            fix: "Check `update.log` for AUTOSHIP PIN lines; `scripts/autoship-pin.sh status` \
+                  shows the pin. A failed pinned build retries every updater tick."
+                .into(),
+        });
+    }
+
     if let Some(error) = &i.merge_allowance_error {
         out.push(Finding { severity: Severity::Alert, code: "merge-accounting-unavailable",
             detail: format!("Cannot read authoritative merge allowance: {error}"),
@@ -680,6 +749,27 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 fix: "Inspect each with `augmentagent autopr status --workflow ID`; a live lease without a recorded gate or guarded step is stuck, not slow.".into(),
             });
         }
+        // #2373 — a capacity wait is a wait, never a permanent park.
+        let capacity: Vec<String> = progress.events.iter()
+            .filter(|e| matches!(e.outcome, O::CapacityWait))
+            .filter_map(|e| {
+                let since = progress.capacity_waits.iter().find(|(id, _)| *id == e.workflow_id)?.1;
+                let mins = (now.timestamp_millis() - since) / 60_000;
+                (mins >= t.capacity_wait_stale_mins).then(|| {
+                    let stage = serde_json::to_value(e.stage).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                    format!("{} ({stage}: {}; waiting {} min)", e.workflow_id, e.reason_code, mins)
+                })
+            })
+            .collect();
+        if !capacity.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "capacity-wait-stale",
+                detail: format!("{} workflow(s) in a capacity wait past {} min: {}",
+                    capacity.len(), t.capacity_wait_stale_mins, capacity.iter().take(5).cloned().collect::<Vec<_>>().join("; ")),
+                fix: "No provider has served these for hours. Check `codex login status` / `claude` on the worker, `AUGMENTAGENT_AUTOPR_REVIEWERS`, and the reasoner-cooldowns.json file in the autoship state dir.".into(),
+            });
+        }
     }
 
     // #1037 — drafts held because no independent review is possible. From
@@ -771,8 +861,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         });
     }
 
+    if let Some(b) = i.global_model_budget.filter(|b| b.exhausted()) {
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "global-model-budget-exhausted",
+            detail: format!("{}. No new paid autoship work starts; merges and finalize continue.", global_budget_line(&b)),
+            fix: "Wait for the rolling window to reopen, or raise AUTOSHIP_GLOBAL_DAILY_MODEL_CALLS deliberately.".into(),
+        });
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity));
     out
+}
+
+/// #2467 — the global model budget as `autopr health` prints it.
+pub(crate) fn global_budget_line(b: &crate::autoship_workflow::GlobalModelBudget) -> String {
+    let reopens = b.reopens_at_ms.and_then(DateTime::from_timestamp_millis)
+        .map(|at| format!("; reopens {}", at.format("%Y-%m-%d %H:%M UTC"))).unwrap_or_default();
+    format!("global model calls (rolling 24h): {} of {} used; remaining: {}{reopens}", b.used, b.cap, b.remaining())
 }
 
 /// One Discord/stdout message for a set of findings. `None` when healthy —
@@ -781,6 +887,9 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
 /// budget, which is the first thing a reader asks when nothing shipped.
 pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     let mut out = report(findings).unwrap_or_else(|| "✓ auto-PR loop healthy".to_string());
+    if let Some(pin) = &i.autoship_pin {
+        out.push_str(&format!("\n{}", pin.line()));
+    }
     if let Some(r) = i.merge_allowance {
         out.push_str(&format!("\nconfirmed auto-merges today (UTC): {} of {}; remaining allowance: {}; pending capacity holds: {}; available to dispatch: {}",
             r.confirmed, r.cap, r.remaining, r.pending, r.available));
@@ -802,6 +911,9 @@ pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
         for (id, stage, why, _, wake) in blocked_workflows(progress).iter().take(20) {
             out.push_str(&format!("\n  blocked: {id} ({stage}): {why}; wakes: {wake}"));
         }
+    }
+    if let Some(b) = i.global_model_budget {
+        out.push_str(&format!("\n{}", global_budget_line(&b)));
     }
     if let Some(groups) = &i.gave_up_by_reason {
         let total: u32 = groups.iter().map(|(_, n)| n).sum();
@@ -1141,6 +1253,34 @@ fn deploy_state(repo_root: &Path, state_dir: &Path) -> (Option<bool>, Option<i64
     (Some(false), lag)
 }
 
+/// #2468 — the recorded pin (`~/.config/augmentagent/autoship-pin`), the
+/// build the worker has installed, and how far `origin/main` is ahead.
+fn autoship_pin_state(repo_root: &Path, config_dir: &Path, state_dir: &Path) -> Option<AutoshipPin> {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let pinned = read(config_dir.join("autoship-pin"))?;
+    let installed = read(state_dir.join("autoship-pinned-built"));
+    let mut pin = AutoshipPin { pinned, installed, main_ahead: None };
+    if pin.is_sha() {
+        pin.main_ahead = std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..origin/main", pin.pinned)])
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
+    }
+    Some(pin)
+}
+
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+        .join("augmentagent")
+}
+
 /// #1571 — a binary rebuilt under a running process reads as
 /// `/path (deleted)`; that is a pending restart, not a different binary.
 fn strip_deleted(exe: PathBuf) -> PathBuf {
@@ -1247,6 +1387,7 @@ struct WorkflowMetrics {
     unresolved_holds:Option<Vec<crate::autoship_workflow::UnresolvedMergeHold>>,
     capacity_waits:Option<u64>,
     capacity_wait_error:bool,
+    global_model_budget:Option<crate::autoship_workflow::GlobalModelBudget>,
 }
 fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfiguration,now:i64)
     ->anyhow::Result<WorkflowMetrics> {
@@ -1259,7 +1400,8 @@ fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfigurat
     let (capacity_waits,capacity_wait_error)=match store.resource_capacity_wait_count() {
         Ok(value)=>(Some(value),false),Err(_)=>(None,true),
     };
-    Ok(WorkflowMetrics{allowance,allowance_error,unresolved_holds,capacity_waits,capacity_wait_error})
+    let global_model_budget=store.global_model_budget(now).ok();
+    Ok(WorkflowMetrics{allowance,allowance_error,unresolved_holds,capacity_waits,capacity_wait_error,global_model_budget})
 }
 
 /// Gather everything the rules need from this box.
@@ -1294,6 +1436,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     let mut merge_store_path=None;
     let mut workflow_progress=None;
     let mut workflow_progress_error=None;
+    let mut global_model_budget=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
@@ -1305,7 +1448,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
                     .expect("native capacity report serializes")
             });
             match workflow_metrics(&config,now.timestamp_millis()) {
-                Ok(metrics)=>(metrics.allowance,metrics.allowance_error,metrics.unresolved_holds,native,metrics.capacity_waits,metrics.capacity_wait_error),
+                Ok(metrics)=>{global_model_budget=metrics.global_model_budget;(metrics.allowance,metrics.allowance_error,metrics.unresolved_holds,native,metrics.capacity_waits,metrics.capacity_wait_error)},
                 Err(_)=>(None,Some("worker workflow metrics unavailable".into()),None,native,None,true),
             }
         }
@@ -1350,9 +1493,11 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         native_state_capacity,
         resource_capacity_waits,
         resource_capacity_wait_error,
+        global_model_budget,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
         workflow_progress,
         workflow_progress_error,
+        autoship_pin: autoship_pin_state(repo_root, &config_dir(), &dir),
     }
 }
 
@@ -1637,6 +1782,46 @@ mod tests {
 
     /// #1214 C6 — the report groups labelled issues by reason, and the
     /// block's counts sum to the number of labelled issues.
+    /// #2468 — health names the pinned controller and how far main is
+    /// ahead of it, and warns only while a moved pin is not yet installed.
+    #[test]
+    fn health_shows_the_pinned_controller_and_main_lead() {
+        let sha = "a".repeat(40);
+        let mut i = healthy();
+        i.autoship_pin = Some(AutoshipPin { pinned: sha.clone(), installed: Some(sha.clone()), main_ahead: Some(17) });
+        let findings = analyze(&i, &Thresholds::default());
+        assert!(!findings.iter().any(|f| f.code == "autoship-pin-pending"), "{findings:?}");
+        let text = render_text(&findings, &i);
+        assert!(text.contains("autoship controller: pinned to aaaaaaaaaaaa; main is 17 commit(s) ahead"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        i.autoship_pin = Some(AutoshipPin { pinned: sha.clone(), installed: Some("b".repeat(40)), main_ahead: Some(3) });
+        let findings = analyze(&i, &Thresholds::default());
+        let pending = findings.iter().find(|f| f.code == "autoship-pin-pending").expect("pending pin is reported");
+        assert_eq!(pending.severity, Severity::Warn);
+        assert!(render_text(&findings, &i).contains("pin move pending (installed: bbbbbbbbbbbb)"));
+
+        i.autoship_pin = Some(AutoshipPin { pinned: "main".into(), installed: Some("main".into()), main_ahead: None });
+        let findings = analyze(&i, &Thresholds::default());
+        assert!(!findings.iter().any(|f| f.code == "autoship-pin-pending"));
+        assert!(render_text(&findings, &i).contains("autoship controller: unpinned"));
+    }
+
+    #[test]
+    fn autoship_pin_state_reads_pin_stamp_and_main_lead() {
+        let t = tempfile::tempdir().unwrap();
+        let (config, state) = (t.path().join("config"), t.path().join("state"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let repo = t.path().join("repo");
+        assert_eq!(autoship_pin_state(&repo, &config, &state), None, "no pin recorded: nothing to show");
+        let sha = "c".repeat(40);
+        std::fs::write(config.join("autoship-pin"), format!("{sha}\n")).unwrap();
+        std::fs::write(state.join("autoship-pinned-built"), format!("{sha}\n")).unwrap();
+        let pin = autoship_pin_state(&repo, &config, &state).unwrap();
+        assert_eq!((pin.pinned.as_str(), pin.installed.as_deref(), pin.main_ahead), (sha.as_str(), Some(sha.as_str()), None));
+    }
+
     #[test]
     fn text_output_groups_gave_up_issues_by_reason() {
         let mut i = HealthInputs::default();
@@ -1656,6 +1841,18 @@ mod tests {
         assert_eq!(total, 108, "{block}");
         i.gave_up_by_reason = None;
         assert!(!render_text(&[], &i).contains("gave-up by reason"));
+    }
+
+    /// #2467 — health shows the remaining global budget, and flags it spent.
+    #[test]
+    fn health_shows_the_remaining_global_model_budget() {
+        let mut i = healthy();
+        i.global_model_budget = Some(crate::autoship_workflow::GlobalModelBudget { used: 1_200, cap: 1_500, reopens_at_ms: None });
+        assert!(render_text(&[], &i).contains("global model calls (rolling 24h): 1200 of 1500 used; remaining: 300"));
+        assert!(!codes(&analyze(&i, &Thresholds::default())).contains(&"global-model-budget-exhausted"));
+        i.global_model_budget = Some(crate::autoship_workflow::GlobalModelBudget { used: 1_500, cap: 1_500, reopens_at_ms: Some(0) });
+        assert!(render_text(&[], &i).contains("remaining: 0; reopens 1970-01-01 00:00 UTC"));
+        assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"global-model-budget-exhausted"));
     }
 
     #[test]
@@ -1716,9 +1913,11 @@ mod tests {
             native_state_capacity: None,
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
+            global_model_budget: None,
             gave_up_by_reason: None,
             workflow_progress: Some(WorkflowProgress::default_complete()),
             workflow_progress_error: None,
+            autoship_pin: None,
         }
     }
 

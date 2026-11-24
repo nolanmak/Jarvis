@@ -456,7 +456,7 @@ pub fn parse_review_pass_with_sources(
     let response: Response =
         serde_json::from_str(raw).context("invalid structured review response")?;
     ensure!(
-        &response.binding == binding,
+        echo_names_head(&response.binding, binding),
         "review response changed binding"
     );
     actor.validate()?;
@@ -469,6 +469,10 @@ pub fn parse_review_pass_with_sources(
     if let Some(paths) = &response.missing_paths {
         ensure!(matches!(response.decision, Decision::Incomplete), "missing paths require incomplete decision");
         ensure!(paths.len() <= 16 && paths.iter().all(|p| !p.is_empty() && p.len() <= 4096), "invalid missing evidence paths");
+    }
+    let mut response = response;
+    if let Some(sources)=response.missing_sources.as_mut() {
+        for source in sources.iter_mut() {source_requests::repair_item_selector(&mut source.selector);}
     }
     if let Some(sources)=&response.missing_sources {
         ensure!(matches!(response.decision,Decision::Incomplete) && sources.len()<=16,"invalid source requests");
@@ -504,6 +508,20 @@ pub fn parse_review_pass_with_sources(
         coverage,
         findings: response.findings,
     }, sources))
+}
+
+/// #2385: the binding is the controller's own and every pass records it, never
+/// the reviewer's copy. Reviewers miscopy long controller hashes, so a copy
+/// that still names the requested head (exactly, by case, or by an unambiguous
+/// abbreviation of at least 12 hex digits) is accepted. An echo naming any
+/// other head answers a different candidate and is refused.
+fn echo_names_head(echo: &ReviewBinding, requested: &ReviewBinding) -> bool {
+    if echo == requested {
+        return true;
+    }
+    let echoed = echo.head.trim().to_ascii_lowercase();
+    let head = requested.head.to_ascii_lowercase();
+    !echoed.is_empty() && echoed.len() >= 12.min(head.len()) && head.starts_with(&echoed)
 }
 
 fn validate_findings(findings: &[Finding], criteria: &BTreeMap<String, String>) -> Result<()> {

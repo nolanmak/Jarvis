@@ -17,7 +17,7 @@ pub(super) fn candidate(
     let Some(s) = store.snapshot(&id)? else {
         return Ok(None);
     };
-    if s.pr.is_some() || !crate::autoship_workflow::awaits_initial_input(&s.checkpoint) {
+    if s.pr.is_some() || !crate::autoship_workflow::owner_checkout_recovery::restartable(&s.checkpoint) {
         return Ok(None);
     }
     let Some(c) = store.recovery_context(&id, &s.checkpoint.binding)? else {
@@ -149,7 +149,7 @@ pub(super) fn environment(
     original: String,
 ) -> Result<String> {
     Ok(match active(state, repository, number)? {
-        Some(plan) => format!("{original};owner-recovery:{}", plan.request_id),
+        Some(plan) => format!("{original};owner-recovery:{};owner-qualification:fresh-witness-v2", plan.request_id),
         None => original,
     })
 }
@@ -252,8 +252,9 @@ pub(super) fn list(state: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
-/// Only the unconsumed owner-authorized Intake supersedes old scheduling
-/// advice. A later assessment/attempt immediately restores ordinary backoff.
+/// The unconsumed owner Intake and pre-fresh-witness bounced scope receive
+/// one turn past old dependency advice. A current-policy claim consumes the
+/// latter through its protected context; normal scheduling and custody resume.
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
         return Ok(false);
@@ -263,9 +264,10 @@ pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<boo
         return Ok(false);
     };
     Ok(
-        snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Intake
+        (snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Intake
             && snapshot.checkpoint.next.reason == "owner_checkout_recovered"
-            && store.active_checkout_recovery(&id)?.is_some(),
+            && store.active_checkout_recovery(&id)?.is_some())
+            || store.owner_requalification_pending(&id)?,
     )
 }
 pub(super) fn issue_retries(
@@ -301,7 +303,7 @@ pub(super) fn scope_key(workflow_id: &str, key: String) -> Result<String> {
     let Some(store) = WorkflowStore::open_read_only(&workflow::path())? else {
         return Ok(key);
     };
-    Ok(match store.active_checkout_recovery(workflow_id)? {
+    let key=match store.active_checkout_recovery(workflow_id)? {
         Some(plan) => format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&(
@@ -311,5 +313,14 @@ pub(super) fn scope_key(workflow_id: &str, key: String) -> Result<String> {
             ))?)
         ),
         None => key,
-    })
+    };
+    store.scope_policy_key(workflow_id,key)
+}
+
+/// Re-admission changes bounded model-repair accounting, never original raw
+/// measurement provenance. Existing qualification contexts retain their keys.
+pub(super) fn repair_key(workflow_id:&str,key:String)->Result<String> {
+ let key=scope_key(workflow_id,key)?;
+ let Some(store)=WorkflowStore::open_read_only(&workflow::path())? else{return Ok(key)};
+ store.scope_policy_repair_key(workflow_id,key)
 }
