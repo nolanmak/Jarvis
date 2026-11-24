@@ -685,7 +685,8 @@ augmentagent calendar list-events --from 2026-07-09T00:00:00-04:00 --to 2026-07-
 - The output's `now:` header is the current local time. **Compute "today" / "tomorrow" / "Thursday" from that header**, then pass explicit `--from`/`--to` RFC3339 values (with the local UTC offset) for day-scoped questions.
 - `--json true` emits the structured event array when you need to post-process (includes `start_local`/`end_local` and an `all_day` flag).
 - Free/busy questions: an event blocks the user's time unless it is all-day or they declined it. Answer with **which events overlap the asked slot**, not a bare yes/no.
-- Privacy: the output carries titles, times, attendees, and conference platform only — never event descriptions or street addresses. Relay what it gives you; don't speculate about redacted or missing fields.
+- Privacy: the output carries titles, times, attendees, conference platform, and the conference join link only — never event descriptions or street addresses.
+- Meeting links: an event with a video room carries its join URL (`conference_url` in `--json true`; `[google_meet: https://meet.google.com/…]` in text). Use it when the user wants the link in a follow-up email or message — never hand out the `calendar/event?eid=…` page link as a join link. Relay what it gives you; don't speculate about redacted or missing fields.
 - If the command errors with "not connected" / `ConnectedAccountNotFound`, the Google Calendar toolkit isn't linked in Composio for that account. Tell the user their calendar isn't connected (the fix is on the operator side) — do **not** retry, and never fabricate a schedule.
 
 ### Creating calendar events
@@ -706,6 +707,7 @@ augmentagent calendar create-event \
 - Before proposing a time, check availability with `calendar list-events` for that day. The card itself also carries a ⚠ conflict warning if the slot collides with an existing busy event — mention any conflict to the user when you report the card.
 - `--attendees` is comma-separated emails. Resolve names to addresses via the wiki (`people/`) or by asking; **never invent an email address**.
 - Optional: `--description "agenda text"`, `--meet true` (attach a Google Meet room), `--account <email>` (defaults to the first active account).
+- With `--meet true`, the Approve receipt ends with `Meet link: https://meet.google.com/…`. If you need it later (e.g. for a follow-up email), read it from `calendar list-events --json true` (`conference_url`) for that event's window.
 - Missing details (duration? which Thursday? which Sarah?) — ask **one** compact clarifying question rather than guessing.
 - The Revise button is not supported for these cards yet: if the user wants changes after the card is up, tell them to Skip it and ask you again with the new details.
 

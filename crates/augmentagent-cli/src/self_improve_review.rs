@@ -796,8 +796,10 @@ async fn run_impl(
                 .map(|criterion| (criterion.id.clone(), criterion.requirement.clone()))
                 .collect()
         } else {
+            // #2464: a plan-bound workflow reviews against its plan criteria;
+            // hosted CI and this review are its proof.
             anyhow::ensure!(
-                context.workflow.is_none(),
+                context.workflow.is_none_or(|workflow| workflow.plan_mode()),
                 "production review requires executable acceptance evidence"
             );
             criteria
@@ -811,10 +813,14 @@ async fn run_impl(
         "reserved reviewer criterion collides with acceptance contract"
     );
     contract.insert("REGRESSION".into(), REGRESSION_REQUIREMENT.into());
-    let contract_hash = context
-        .acceptance_evidence
-        .map(|(_, receipt)| receipt.binding.contract_hash.clone())
-        .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
+    let plan_contract = context.workflow.filter(|workflow| workflow.plan_mode()).map(|workflow| workflow.binding().contract.clone());
+    let contract_hash = match context.acceptance_evidence {
+        Some((_, receipt)) => receipt.binding.contract_hash.clone(),
+        None => match plan_contract {
+            Some(plan) => plan,
+            None => aligned::digest(&serde_json::to_vec(&contract)?),
+        },
+    };
     let (callers,caller_plan)=complete_or_streamed_callers(&worktree,&head,&caller_symbols).await?;
     let rubric = review_calibration::active()?;
     let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;

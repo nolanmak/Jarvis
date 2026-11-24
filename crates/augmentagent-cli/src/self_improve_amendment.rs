@@ -501,7 +501,7 @@ struct AuthorityFacts<'a> {
     environments:&'a EnvironmentEvidence,adjudication:Option<&'a str>,
 }
 const VERIFIER_DISPUTE_TASK:&str="Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths.";
-const CI_SCOPE_TASK:&str="Determine whether the candidate needs the bound literal implementation files to pass a required hosted CI check that its own contribution breaks. This is a contract scope request, not a verifier dispute: do not judge whether a verifier is obsolete, and do not refuse because the failing check is outside the owner criteria. A required check must pass before the candidate can merge, so when the failure is caused by the candidate's own changes and its fix needs these files, adding them is necessary for the unchanged owner requirements. Preserve every previous criterion ID, exact requirement text, verifier and harness file; add only the bound literal files, never directories.";
+const CI_SCOPE_TASK:&str="Determine whether the candidate needs the bound literal implementation files to pass a required hosted CI check that its own contribution breaks. This is a contract scope request, not a verifier dispute: do not judge whether a verifier is obsolete, and do not refuse because the failing check is outside the owner criteria. A required check must pass before the candidate can merge, so when the failure is caused by the candidate's own changes and its fix needs these files, adding them is necessary for the unchanged owner requirements. Judge causation from all of the bound controller evidence; a null (unknown) candidate_regression is not evidence that main also fails. Preserve every previous criterion ID, exact requirement text, verifier and harness file; add only the bound literal files, never directories.";
 /// #2329: the authority's question. A CI scope request must not be framed as
 /// a verifier dispute; the old framing told it to "not expand implementation
 /// paths" and to reject implementation defects, so it refused every widening.
@@ -1556,6 +1556,42 @@ mod tests {
         // Equal current source-input fingerprints do not silently grandfather
         // historical assertions from a different controller engine.
         assert!(evidence.transition_required());
+    }
+
+    /// #2456 (workflows #2329, #2350): the authority refused because "the
+    /// bound controller evidence states candidate_regression=false". The
+    /// replay of the diff-dependent `targeted` suite was refused, so the
+    /// regression is unknown; the prompt says so, asks for it to be weighed
+    /// with the rest of the evidence, and carries main's green checks.
+    #[test]
+    fn a_ci_scope_prompt_weighs_an_unknown_regression_and_carries_green_main() {
+        let (_root, old) = fixture();
+        let tests = vec!["notify_tests::registry_covers_every_producer_in_the_code".to_string()];
+        let locations = vec!["crates/augmentagent-cli/src/notify_tests.rs:171:5".to_string()];
+        let files = vec!["crates/augmentagent-cli/src/notify.rs".to_string()];
+        let main = super::super::ci_scope::MainCheck { head: "b".repeat(40), basis: "all_main_checks", green: Some(true) };
+        let failure = super::super::ci_scope::Failure { tests: &tests, diagnostics: "panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5",
+            panic_locations: &locations, regression: super::super::ci_scope::Regression::of(false, Some("ci_selection_contract_required")), main: Some(&main) };
+        let bound = super::super::ci_scope::bound_request(old.baseline.registration.contract_hash(), &files, &files, failure).unwrap();
+        let environments = EnvironmentEvidence {
+            canonical_main: None, current_canonical_main: None,
+            original_base: "a".repeat(40), registered_baseline: "engine".into(),
+            registered_candidate: "engine".into(), current_original_baseline: "engine".into(),
+            current_candidate: "engine".into(), legacy_proof_migration: false,
+            current_sandbox_sha256: "s".repeat(64), current_exporter_sha256: "e".repeat(64),
+            current_registry_audit_sha256: "r".repeat(64),
+        };
+        let main_head = "b".repeat(40);
+        let prompt = authority_base_request(&old, AuthorityFacts { source: AcceptanceSource::Issue(42), request_context: "Issue #42",
+            failure: super::super::ci_scope::FAILURE, canonical_main: &main_head, scope_base: &main_head, head: &"c".repeat(40),
+            diff: "diff --git a/crates/augmentagent-cli/src/digest.rs b/crates/augmentagent-cli/src/digest.rs", upstream_paths: "",
+            environments: &environments, adjudication: Some(&bound) }).unwrap();
+        assert!(prompt.contains(r#""candidate_regression":null"#), "the request reads as a definite answer: {prompt}");
+        assert!(prompt.contains(r#""main_check":{"basis":"all_main_checks","green":true"#), "the green-main fact is missing: {prompt}");
+        assert!(prompt.contains("diff-dependent suite cannot be replayed locally"), "{prompt}");
+        for weighed in ["candidate_regression is null", "not evidence that main also fails", "main_check", "panic_locations"] {
+            assert!(prompt.contains(weighed), "the question does not weigh an unknown regression ({weighed}): {prompt}");
+        }
     }
 
     #[tokio::test]

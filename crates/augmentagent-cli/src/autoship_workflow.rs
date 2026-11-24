@@ -5,6 +5,9 @@
 pub(crate) mod acceptance_escalation;
 #[path="autoship_retry_policy.rs"]
 pub(crate) mod retry_policy;
+#[path="autoship_attempt_cap.rs"]
+pub(crate) mod attempt_cap;
+pub use attempt_cap::GlobalModelBudget;
 #[path="autoship_command_fairness.rs"]
 pub(crate) mod command_fairness;
 #[path="autoship_owner_requalification.rs"]
@@ -13,6 +16,8 @@ pub(crate) mod owner_requalification;
 pub(crate) mod scope_policy;
 #[path="autoship_terminal_parks.rs"]
 pub(crate) mod terminal_parks;
+#[path="autoship_scope_proof_gate.rs"]
+pub(crate) mod scope_proof_gate;
 #[path="autoship_witness_regeneration.rs"]
 pub(crate) mod witness_regeneration;
 #[path = "autoship_owner_checkout_recovery.rs"]
@@ -135,7 +140,8 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON};
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCOPE_STOP_ACTION, RESCOPE_STOP_MAIN_EVIDENCE,
+    RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -938,6 +944,7 @@ impl WorkflowStore {
         runtime_events::initialize(&conn)?;
         conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
         conn.execute_batch(command_fairness::SCHEMA)?;
+        conn.execute_batch(attempt_cap::SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -1212,6 +1219,11 @@ impl WorkflowStore {
             return Ok(None);
         }
         if purpose == ClaimPurpose::Productive && target_fence::fenced(&tx,workflow)? {return Ok(None);}
+        // #2467: no productive claim past the attempt or spend cap, after a
+        // give-up, or while the global daily model budget is spent. Merge
+        // reconciliation and finalize claim with their own purpose.
+        if purpose == ClaimPurpose::Productive && leased <= now_ms
+            && attempt_cap::productive_claim_refused(&tx,workflow,&cp,now_ms,attempt_cap::Caps::configured())? {return Ok(None);}
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
@@ -2030,6 +2042,23 @@ impl WorkflowStore {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// #2510: hand back one admitted attempt whose work never reached a
+    /// verdict because infrastructure refused it. Never below zero.
+    pub fn release_epoch_attempt(&mut self, lease: &Lease, purpose: &str, epoch: &str, now: i64) -> Result<bool> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len() <= 1024, "bounded epoch purpose required");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let key = format!("epoch:{epoch}");
+        let released = tx.execute("UPDATE bounded_attempt SET attempts=attempts-1 WHERE workflow=?1 AND purpose=?2 AND binding=?3 AND attempts>0",
+            params![lease.workflow, purpose, key])? == 1;
+        if released {
+            event(&tx, &lease.workflow, lease.generation, "epoch_attempt_released",
+                &serde_json::json!({"purpose":purpose,"epoch":epoch}).to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(released)
     }
 
     /// Check fencing immediately before a remote operation, in addition to

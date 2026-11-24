@@ -31,6 +31,7 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
@@ -109,6 +110,8 @@ use async_trait::async_trait;
 mod whatsapp_history;
 mod whatsapp_phone;
 mod socialapi_compose_identity;
+#[cfg(test)]
+mod socialapi_compose_identity_approver_tests;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -804,6 +807,14 @@ enum Cmd {
         tools: String,
         #[arg(long)]
         unfiltered: String,
+    },
+    /// Internal owner-authorized MCP server for TabAgent browser tools.
+    #[command(hide = true)]
+    TabagentTool {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        tools: String,
     },
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
@@ -3234,6 +3245,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::WebTool { ref conversation, ref tools, ref unfiltered } = cli.cmd {
         return web::tool::serve(conversation, tools, unfiltered == "1").await;
+    }
+    if let Cmd::TabagentTool { ref session, ref tools } = cli.cmd {
+        return tabagent_tool::serve(session, tools).await;
     }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
@@ -5962,6 +5976,7 @@ async fn main() -> Result<()> {
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
+        Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
@@ -10053,6 +10068,7 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     computer_ctx.channel_id = Some(serenity::model::id::ChannelId::new(1));
     computer_ctx.session_id = format!("local:{}", uuid::Uuid::new_v4());
     computer_tool::configure(&mut opts, &computer_ctx, &repo_root);
+    tabagent_tool::configure(&mut opts, &computer_ctx, &std::env::current_exe().context("current_exe")?);
     info!(wiki = %wiki_root.display(), "wiki ask");
     // #389 — same owner-rules preamble the Discord query path injects, so
     // CLI asks behave identically (and the injection is testable headless).
@@ -12040,6 +12056,7 @@ impl QueryHandler for WikiQuerier {
         let auth_bin = self.repo_root.join("target/release/augmentagent");
         #[cfg(not(test))]
         let auth_bin = std::env::current_exe()?;
+        tabagent_tool::configure(&mut opts, ctx, &auth_bin);
         composio_auth_tool::configure(
             &mut opts,
             ctx,
@@ -14722,13 +14739,17 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        // #2538 — only while still pending: a follow-up compose that retired
+        // this card mid-redraft must not be undone into a second live card.
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("revise: persist failed: {e}"),
+                }
+            }
+        }
         tracing::info!(action_id, "socialapi revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -15105,6 +15126,16 @@ impl ReplyApprover {
         }
     }
 
+    /// #2538 — before Send / Revise runs (and is audited), give a card a
+    /// follow-up social DM compose replaced a live action where that is safe.
+    fn reopen_replaced_social_card(&self, action_id: &str, take_over: bool) {
+        match socialapi_compose_identity::reopen_replaced_card(&self.store, action_id, take_over) {
+            Ok(true) => info!(action_id, take_over, "socialapi dm: reopened replaced card"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "socialapi dm: reopen replaced card failed: {e:#}"),
+        }
+    }
+
     fn skip_github(
         &self,
         action_id: &str,
@@ -15129,6 +15160,7 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.reopen_replaced_social_card(action_id, false);
         let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
@@ -15158,6 +15190,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
+        self.reopen_replaced_social_card(action_id, true);
         self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
@@ -15524,13 +15557,18 @@ impl ReplyApprover {
     }
 
     fn recover_calendar_receipt(action: &augmentagent_store::ActionWithEmail) -> ApprovalActionOutcome {
-        // #1436 appends these two terminal lines only after confirmed creation.
-        // Use the last suffix so proposal text cannot shadow the saved receipt.
+        // #1436 appends these terminal lines only after confirmed creation
+        // (#2514 adds an optional trailing `meet:` line). Use the last suffix
+        // so proposal text cannot shadow the saved receipt.
         let receipt = action.action.draft_body.as_deref()
             .and_then(|body| body.rsplit_once("\ncreated: "))
             .and_then(|(_, suffix)| suffix.split_once("\nevent ID: "))
-            .filter(|(_, id)| !id.is_empty() && !id.chars().any(char::is_whitespace));
-        let Some((link, event_id)) = receipt else {
+            .map(|(link, rest)| match rest.split_once("\nmeet: ") {
+                Some((id, url)) => (link, id, augmentagent_channel_calendar::join_url(Some(url), None)),
+                None => (link, rest, None),
+            })
+            .filter(|(_, id, _)| !id.is_empty() && !id.chars().any(char::is_whitespace));
+        let Some((link, event_id, join_url)) = receipt else {
             // Historical false-success rows have no ID. Never create on a sent
             // row or rewrite history based on the old empty-link placeholder.
             return ApprovalActionOutcome::Failed {
@@ -15540,6 +15578,7 @@ impl ReplyApprover {
         ApprovalActionOutcome::CalendarCreated {
             event_id: event_id.into(),
             html_link: Self::calendar_account_link(Some(link), &action.email.from),
+            join_url,
             organizer_account: action.email.from.clone(),
             already_existed: true,
         }
@@ -15581,8 +15620,23 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
+                // #2514 — surface the Meet join URL so a follow-up email can
+                // carry it. Google normally echoes it on insert; if a Meet was
+                // requested and the echo lacks it, read the event back once.
+                let join_url = match created.join_url() {
+                    Some(url) => Some(url),
+                    None if draft.create_meeting_room => self
+                        .calendar
+                        .get_event(entity_id, "primary", &event_id)
+                        .await
+                        .map_err(|e| tracing::warn!(action_id, event_id, "Meet link read-back failed: {e}"))
+                        .ok()
+                        .and_then(|ev| ev.join_url()),
+                    None => None,
+                };
+                let meet_line = join_url.as_deref().map(|u| format!("\nmeet: {u}")).unwrap_or_default();
                 let base_body = action.action.draft_body.clone().unwrap_or_default();
-                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}");
+                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}{meet_line}");
                 if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
@@ -15618,7 +15672,7 @@ impl ReplyApprover {
                     }
                 };
                 if !organizer_note.is_empty() {
-                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}");
+                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}{meet_line}");
                     let _ = self.store.update_action_status(action_id, ActionStatus::Sent, Some(&noted), None);
                 }
                 let _ = self
@@ -15633,6 +15687,7 @@ impl ReplyApprover {
                 ApprovalActionOutcome::CalendarCreated {
                     event_id,
                     html_link,
+                    join_url,
                     organizer_account: action.email.from.clone(),
                     already_existed: false,
                 }
@@ -21532,7 +21587,8 @@ async fn run_calendar_list_events(
 
     struct AccountEvents {
         email: String,
-        result: std::result::Result<Vec<(MeetingPayload, bool)>, String>,
+        // (payload, all_day, #2514 conference join URL)
+        result: std::result::Result<Vec<(MeetingPayload, bool, Option<String>)>, String>,
     }
 
     let mut per_account: Vec<AccountEvents> = Vec::new();
@@ -21542,7 +21598,7 @@ async fn run_calendar_list_events(
             .await
         {
             Ok(events) => {
-                let mut items: Vec<(MeetingPayload, bool)> = events
+                let mut items: Vec<(MeetingPayload, bool, Option<String>)> = events
                     .iter()
                     .filter(|ev| {
                         !ev.status
@@ -21561,10 +21617,10 @@ async fn run_calendar_list_events(
                             .as_ref()
                             .map(|s| s.date_time.is_none())
                             .unwrap_or(false);
-                        Some((p, all_day))
+                        Some((p, all_day, ev.join_url()))
                     })
                     .collect();
-                items.sort_by_key(|(p, _)| p.start);
+                items.sort_by_key(|(p, _, _)| p.start);
                 per_account.push(AccountEvents {
                     email: account.email.clone(),
                     result: Ok(items),
@@ -21621,7 +21677,7 @@ async fn run_calendar_list_events(
                 Ok(items) => serde_json::json!({
                     "email": a.email,
                     "error": serde_json::Value::Null,
-                    "events": items.iter().map(|(p, all_day)| serde_json::json!({
+                    "events": items.iter().map(|(p, all_day, conference_url)| serde_json::json!({
                         "event_id": p.event_id,
                         "summary": p.summary,
                         "start": p.start.to_rfc3339(),
@@ -21640,6 +21696,8 @@ async fn run_calendar_list_events(
                         // unanswered invite (`calendar rsvp` answers it).
                         "my_response": my_response(p),
                         "conference_kind": p.conference_kind,
+                        // #2514 — the join URL, so a follow-up can include it.
+                        "conference_url": conference_url,
                         "virtual_meeting": p.virtual_meeting,
                         "recurring_event_id": p.recurring_event_id,
                     })).collect::<Vec<_>>(),
@@ -21680,7 +21738,7 @@ async fn run_calendar_list_events(
                     items.len(),
                     if items.len() == 1 { "" } else { "s" }
                 );
-                for (p, all_day) in items {
+                for (p, all_day, conference_url) in items {
                     let local_start = p.start.with_timezone(&Local);
                     if *all_day {
                         println!(
@@ -21693,7 +21751,10 @@ async fn run_calendar_list_events(
                     let conf = p
                         .conference_kind
                         .as_deref()
-                        .map(|k| format!(" [{k}]"))
+                        .map(|k| match conference_url {
+                            Some(url) => format!(" [{k}: {url}]"),
+                            None => format!(" [{k}]"),
+                        })
                         .unwrap_or_default();
                     let reply = match my_response(p).as_deref() {
                         Some("needsAction") => " [invite: not answered]",

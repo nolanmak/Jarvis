@@ -56,6 +56,14 @@ elif '/actions/runs?' in endpoint:
     runs = [{'id': 100 + i, 'run_attempt': 1, 'head_sha': head, 'event': 'pull_request', 'path': path, 'repository': {'full_name': repository}, 'pull_requests': [{'number': 1669}]} for i, path in enumerate(paths)]
     if state.get('pending'): runs = []
     value = {'total_count': len(runs), 'workflow_runs': runs}
+elif '/check-runs' in endpoint and '/commits/' in endpoint:
+    # #2456: main's push checks; `targeted` runs on pull requests only.
+    sha = endpoint.split('/commits/')[1].split('/')[0]
+    if sha != state['base']: sys.exit(1)
+    actions = {'id': 15368, 'slug': 'github-actions'}
+    runs = [{'name': name, 'head_sha': sha, 'status': 'completed', 'conclusion': 'success', 'app': actions} for name in ('privacy', 'test')]
+    runs.append({'name': 'test', 'head_sha': sha, 'status': 'completed', 'conclusion': 'failure', 'app': {'id': 1, 'slug': 'other-app'}})
+    value = {'total_count': len(runs), 'check_runs': runs}
 elif '/actions/runs/' in endpoint and '/jobs?' in endpoint:
     run = int(endpoint.split('/actions/runs/')[1].split('/')[0]); path = paths[run - 100]
     names = sorted(expected[path])

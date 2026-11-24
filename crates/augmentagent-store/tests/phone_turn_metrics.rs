@@ -13,6 +13,11 @@ fn record(call: &str, turn: u64, recorded_ms: i64, first_speech: i64) -> PhoneTu
         outcome: TurnOutcome::Answered,
         queue_wait_ms: Some(10),
         t_first_token_ms: Some(first_speech - 20),
+        t_native_start_ms: None,
+        t_provider_start_ms: None,
+        t_source_execution_ms: None,
+        t_first_useful_fact_ms: None,
+        t_completion_ms: None,
         t_first_speech_ms: Some(first_speech),
         t_last_speech_ms: Some(first_speech + 1_000),
         tool_ms: None,
@@ -97,6 +102,78 @@ fn ac04_records_reject_identifiers_that_could_carry_private_text() {
     bad.t_first_speech_ms = Some(-5);
     assert!(store.phone_record_turn_metrics(&bad).is_err());
     assert!(store.phone_turn_metrics("call-a").unwrap().is_empty());
+}
+
+// #2169: each turn boundary is its own persisted offset. A blocked native
+// completion keeps the earlier source finding and voice handoff, and no field
+// restates the queue wait or the first token as the first useful fact.
+#[test]
+fn turn_boundaries_round_trip_independently_and_feed_the_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("metrics.db")).unwrap();
+    let mut blocked = record("call-a", 1, 1_000, 320);
+    blocked.outcome = TurnOutcome::Interrupted;
+    blocked.queue_wait_ms = Some(40);
+    blocked.t_first_token_ms = Some(250);
+    blocked.t_native_start_ms = Some(100);
+    blocked.t_provider_start_ms = Some(130);
+    blocked.t_source_execution_ms = Some(200);
+    blocked.t_first_useful_fact_ms = Some(300);
+    blocked.t_completion_ms = None;
+    assert!(store.phone_record_turn_metrics(&blocked).unwrap());
+    let stored = store.phone_turn_metrics("call-a").unwrap().remove(0);
+    assert_eq!(stored, blocked);
+    assert_eq!(
+        (
+            stored.queue_wait_ms,
+            stored.t_native_start_ms,
+            stored.t_provider_start_ms,
+            stored.t_source_execution_ms,
+            stored.t_first_token_ms,
+            stored.t_first_useful_fact_ms,
+            stored.t_first_speech_ms,
+            stored.t_completion_ms,
+        ),
+        (
+            Some(40),
+            Some(100),
+            Some(130),
+            Some(200),
+            Some(250),
+            Some(300),
+            Some(320),
+            None,
+        )
+    );
+
+    // Every offset, new or old, rejects a negative value.
+    type SetNegative = fn(&mut PhoneTurnMetrics);
+    let negative: [(&str, SetNegative); 6] = [
+        ("t_native_start_ms", |m| m.t_native_start_ms = Some(-1)),
+        ("t_provider_start_ms", |m| m.t_provider_start_ms = Some(-1)),
+        ("t_source_execution_ms", |m| m.t_source_execution_ms = Some(-1)),
+        ("t_first_useful_fact_ms", |m| m.t_first_useful_fact_ms = Some(-1)),
+        ("t_completion_ms", |m| m.t_completion_ms = Some(-1)),
+        ("audible_delta_ms", |m| m.audible_delta_ms = Some(-1)),
+    ];
+    for (field, set) in negative {
+        let mut bad = record("call-b", 1, 2_000, 320);
+        set(&mut bad);
+        assert!(store.phone_record_turn_metrics(&bad).is_err(), "{field}");
+    }
+    assert!(store.phone_turn_metrics("call-b").unwrap().is_empty());
+
+    let summary = store.phone_turn_metrics_summary(10).unwrap();
+    for (field, samples, p50) in [
+        ("t_native_start_ms", 1, Some(100)),
+        ("t_provider_start_ms", 1, Some(130)),
+        ("t_source_execution_ms", 1, Some(200)),
+        ("t_first_useful_fact_ms", 1, Some(300)),
+        ("t_completion_ms", 0, None),
+    ] {
+        let percentiles = summary.fields.iter().find(|f| f.field == field).unwrap();
+        assert_eq!((percentiles.samples, percentiles.p50), (samples, p50), "{field}");
+    }
 }
 
 // #1555 AC6: the three speculation fields round-trip, are validated, feed the

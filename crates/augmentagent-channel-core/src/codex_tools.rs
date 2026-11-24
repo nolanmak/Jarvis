@@ -291,6 +291,7 @@ impl BridgeLaunch {
             category: Option<String>,
             available_bytes: Option<u64>,
             required_bytes: Option<u64>,
+            detail: Option<String>,
         }
         let script = self
             .native_cwd
@@ -328,6 +329,7 @@ impl BridgeLaunch {
                     report.available_bytes,
                     report.required_bytes,
                 )
+                .map(|refusal| refusal.with_detail(report.detail.as_deref()))
             }) {
                 return refusal.fail(provider, logger);
             }
@@ -1317,6 +1319,43 @@ mod tests {
 #[cfg(test)]
 mod required_build_preflight_tests {
     use super::*;
+    /// #2532: every autoship build failed `mcp_start` with no reason. The
+    /// readiness refusal must carry the bridge's own denial.
+    #[tokio::test]
+    async fn build_preflight_mcp_start_reports_the_bridge_denial() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["work", "launch", "logs"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let mut opts = ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "");
+        opts.cwd = Some(root.path().join("work"));
+        opts.allowed_tools = vec!["Bash(cargo *)".into()];
+        let bridge = BridgeLaunch::prepare(&opts, &root.path().join("launch")).unwrap();
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bridge.policy_path).unwrap()).unwrap();
+        let agents = root.path().join("work/AGENTS.md").canonicalize().unwrap_or_else(|_| {
+            std::fs::write(root.path().join("work/AGENTS.md"), "x").unwrap();
+            root.path().join("work/AGENTS.md").canonicalize().unwrap()
+        });
+        policy["write_files"] = serde_json::json!([agents]);
+        policy["autoship_in_place_writes"] = true.into();
+        std::fs::write(&bridge.policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let logger = std::sync::Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                root.path().join("logs/audit.jsonl"),
+                root.path().join("anchors/anchor.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        logger.require_run_resources().unwrap();
+        let error = bridge.preflight_builds("codex", Some(&logger)).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("(mcp_start: Denied: credential and control files cannot be admitted)"),
+            "{error:#}"
+        );
+    }
+
     #[tokio::test]
     async fn required_build_preflight_refuses_before_model_admission_and_allocates_nothing() {
         use std::os::unix::fs::PermissionsExt;

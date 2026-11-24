@@ -47,6 +47,11 @@ mod tests {
             outcome: TurnOutcome::Answered,
             queue_wait_ms: Some(10),
             t_first_token_ms: Some(first_speech - 20),
+            t_native_start_ms: None,
+            t_provider_start_ms: None,
+            t_source_execution_ms: None,
+            t_first_useful_fact_ms: None,
+            t_completion_ms: None,
             t_first_speech_ms: Some(first_speech),
             t_last_speech_ms: Some(first_speech + 1_000),
             tool_ms: None,
@@ -80,7 +85,11 @@ mod tests {
         assert_eq!(*delta, "audible_delta_ms           3    290    290");
         let tool = lines.iter().find(|l| l.starts_with("tool_ms")).unwrap();
         assert_eq!(*tool, "tool_ms                    0      -      -");
-        assert_eq!(lines.len(), 2 + 9);
+        // #2169: the five per-turn latency marks get their own rows; this
+        // fixture records none of them.
+        let completion = lines.iter().find(|l| l.starts_with("t_completion_ms")).unwrap();
+        assert_eq!(*completion, "t_completion_ms            0      -      -");
+        assert_eq!(lines.len(), 2 + 14);
     }
 
     #[test]
