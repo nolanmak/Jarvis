@@ -12,6 +12,8 @@ mod family_wait_settlement;
 mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
+#[path = "self_improve_push_confirm.rs"]
+mod push_confirm;
 #[cfg(test)]
 #[path = "self_improve_family_budget_hold_tests.rs"]
 mod family_budget_hold_tests;
@@ -2629,10 +2631,10 @@ impl WorkflowGuard {
         let expected=format!("--force-with-lease={target}:{remote}");
         let refspec=format!("{}:{target}",operation.binding.head);
         let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
-        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
-        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
-            "push outcome not verified; preserved pending intent (command success: {pushed})");
-        let head=observed.context("Push observation unavailable")?;
+        // #2547: the ref API can lag a landed push; re-read before failing.
+        let (worktree,repository,target,destination)=(&self.worktree,&self.repository,&target,&destination);
+        let head=push_confirm::confirm_pushed_head(&operation.binding.head,pushed,push_confirm::PUSH_OBSERVATION_DELAY,
+            move||destination.head(worktree,repository,target)).await?;
         self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
         Ok(head)
     }
