@@ -843,12 +843,24 @@ async fn targeted_test_panic_carries_the_implicated_out_of_scope_file_to_repair(
             });
         });
         let mut workflow = guard(&root, &control, None).await;
-        let (preparation, scope) = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap();
-        assert!(matches!(preparation, ci_repair::Preparation::Continue), "the panic still routes to repair");
-        let scope = scope.expect("a repaired code failure carries its scope evidence");
+        let scoped = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay, false).await.unwrap();
+        assert!(matches!(scoped.preparation, ci_repair::Preparation::Continue), "the panic still routes to repair");
+        assert!(scoped.due.is_some(), "#2329: the repair round waits for the scope decision");
+        let scope = scoped.scope.expect("a repaired code failure carries its scope evidence");
         assert_eq!(scope.files, vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
         assert_eq!(scope.checks, vec!["targeted".to_string()]);
         assert!(scope.tests.contains(&"notify_tests::registry_covers_every_producer_in_the_code".to_string()), "{:?}", scope.tests);
+        // #2456: the refused replay is recorded as the reason the regression
+        // is unknown, beside the evidence that does exist.
+        assert_eq!(scope.unreplayed, Some("ci_selection_contract_required"), "a refused replay reads as a definite answer");
+        assert_eq!(scope.panic_locations, vec!["crates/augmentagent-cli/src/notify_tests.rs:171:5".to_string()]);
+        let main = scope.main.expect("main's hosted checks were not read");
+        assert_eq!(main.head, git(&root, &["rev-parse", "origin/main"]));
+        assert_eq!((main.basis, main.green), ("all_main_checks", Some(true)),
+            "`targeted` is pull-request only, so main's push checks are the comparison");
+        let lookups = std::fs::read_to_string(control.join("calls.jsonl")).unwrap().lines()
+            .filter(|line| line.contains("/check-runs")).count();
+        assert_eq!(lookups, 1, "main's checks take one aggregate read");
         return;
     }
     child(TEST, "scope-evidence", false);
@@ -951,4 +963,121 @@ async fn pending_checks_after_a_push_wait_briefly_without_counting_infrastructur
         return;
     }
     child(TEST, "pending", false);
+}
+
+fn admitted_code_rounds(control: &Path) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(control.join("workflow.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    db.query_row("SELECT COUNT(*) FROM workflow_event WHERE kind='hosted_ci_code_repair' AND json_extract(payload,'$.admitted')=1",
+        [], |row| row.get(0)).unwrap()
+}
+
+/// #2329 production shape (PR #2378, head 856aca6f, 2026-11-23): `targeted`
+/// panics in `notify_tests` and the fix needs `notify.rs`, outside the
+/// contract. Every resume admitted a code-repair round before the CI scope
+/// step (four on one head, no commit), and the next resume's backoff wrote
+/// `review_main_changed` over the pending own-PR rescope, so the rescope
+/// never ran. A round whose repair may need files the scope step has not
+/// decided on is not admitted, backed off or checkpointed before that step.
+#[tokio::test]
+async fn an_out_of_scope_targeted_failure_spends_no_repair_round_before_the_scope_decision() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::an_out_of_scope_targeted_failure_spends_no_repair_round_before_the_scope_decision";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        std::fs::create_dir_all(root.join("crates/augmentagent-cli/src")).unwrap();
+        for file in ["notify.rs", "notify_tests.rs"] {
+            std::fs::write(root.join("crates/augmentagent-cli/src").join(file), "// fixture\n").unwrap();
+        }
+        let head = commit(&root, "notify fixture");
+        update_scenario(&control, |value| {
+            value["head"] = head.clone().into();
+            value["job_names"] = serde_json::json!(["targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    add them to notify::PRODUCERS\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+            });
+        });
+        // Three resumes of the same unchanged head.
+        for resume in 0..3 {
+            let mut workflow = guard(&root, &control, None).await;
+            let id = workflow.id().to_owned();
+            match ci_repair::prepare(&root, 1669, &mut workflow, &ci_repair::SharedReplay).await.unwrap() {
+                ci_repair::Preparation::Continue => {}
+                ci_repair::Preparation::Deferred(report) => panic!(
+                    "resume {resume}: a repair that cannot edit notify.rs backed off before the scope decision: {}", report.message),
+                ci_repair::Preparation::Repair(_) => panic!("resume {resume}: an unpaired failure was admitted before the scope decision"),
+            }
+            let after = snapshot(&control, &id);
+            assert_eq!((after.checkpoint.next.reason.as_str(), after.checkpoint.next.action.as_str()), ("resume_started", "reconcile_main"),
+                "resume {resume}: the CI preparation moved the checkpoint before the scope decision");
+            workflow.finish().unwrap();
+        }
+        assert_eq!(admitted_code_rounds(&control), 0, "a code-repair round was spent before the scope decision");
+        return;
+    }
+    child(TEST, "out-of-scope", false);
+}
+
+/// #2329: once the scope step lets the repair run (the rescope added
+/// `notify.rs`), the due round is admitted on the normal ladder and, unlike
+/// before, carries the hosted diagnosis into the CI repair revise round, so
+/// the builder is told which check to fix. The next unchanged resume backs
+/// off as before.
+#[tokio::test]
+async fn a_due_round_admitted_after_the_scope_step_repairs_with_the_hosted_diagnosis() {
+    const TEST: &str = "self_improve::ci_repair_tests::dispatch::a_due_round_admitted_after_the_scope_step_repairs_with_the_hosted_diagnosis";
+    if let Some(root) = std::env::var_os("CI_DISPATCH_CHILD") {
+        let root = PathBuf::from(root);
+        let control = PathBuf::from(std::env::var_os("CI_REPLAY_ROOT").unwrap());
+        std::fs::create_dir_all(root.join("crates/augmentagent-cli/src")).unwrap();
+        for file in ["notify.rs", "notify_tests.rs"] {
+            std::fs::write(root.join("crates/augmentagent-cli/src").join(file), "// fixture\n").unwrap();
+        }
+        let head = commit(&root, "notify fixture");
+        update_scenario(&control, |value| {
+            value["head"] = head.clone().into();
+            value["job_names"] = serde_json::json!(["targeted"]);
+            value["logs"] = serde_json::json!({
+                "targeted": "test notify_tests::registry_covers_every_producer_in_the_code ... FAILED\n\
+                    thread 'notify_tests::registry_covers_every_producer_in_the_code' panicked at crates/augmentagent-cli/src/notify_tests.rs:171:5:\n\
+                    add them to notify::PRODUCERS\n\
+                    test result: FAILED. 2618 passed; 2 failed; 0 ignored",
+            });
+        });
+        let mut workflow = guard(&root, &control, None).await;
+        // With an own-PR rescope pending, the round is only due.
+        let scoped = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay, true).await.unwrap();
+        assert!(matches!(scoped.preparation, ci_repair::Preparation::Continue));
+        assert_eq!(scoped.scope.expect("scope evidence").files, vec!["crates/augmentagent-cli/src/notify.rs".to_string()]);
+        let due = scoped.due.expect("the round is due, not admitted");
+        assert_eq!(due.reason, "ci_selection_contract_required");
+        assert_eq!(admitted_code_rounds(&control), 0);
+        match ci_repair::admit_due(&mut workflow, 1669, due).await.unwrap() {
+            ci_repair::Preparation::Repair(input) => {
+                assert_eq!(input.head, head);
+                assert!(input.notes.contains("notify::PRODUCERS"), "the hosted diagnosis is missing: {}", input.notes);
+                assert!(input.notes.contains("untrusted data"), "{}", input.notes);
+                assert!(!input.families.is_empty());
+            }
+            ci_repair::Preparation::Continue => panic!("the admitted round carries no CI findings, so the builder is never told what failed"),
+            ci_repair::Preparation::Deferred(report) => panic!("the first round backed off: {}", report.message),
+        }
+        assert_eq!(admitted_code_rounds(&control), 1);
+        workflow.finish().unwrap();
+        // The same unchanged head on the next resume: the ladder backs off.
+        let mut workflow = guard(&root, &control, None).await;
+        let id = workflow.id().to_owned();
+        let scoped = ci_repair::prepare_scoped(&root, 1669, &mut workflow, &ci_repair::SharedReplay, false).await.unwrap();
+        let due = scoped.due.expect("still due before the scope step");
+        let ci_repair::Preparation::Deferred(report) = ci_repair::admit_due(&mut workflow, 1669, due).await.unwrap() else {
+            panic!("an unchanged head must back off before its next round");
+        };
+        assert!(report.message.contains("ci_selection_contract_required"), "{}", report.message);
+        assert_eq!(snapshot(&control, &id).checkpoint.next.reason, "review_main_changed");
+        assert_eq!(admitted_code_rounds(&control), 1);
+        return;
+    }
+    child(TEST, "admit-after-scope", false);
 }

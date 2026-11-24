@@ -123,8 +123,12 @@ where
 pub(super) struct OpenIssues(HashMap<u64, serde_json::Value>);
 impl OpenIssues {
     pub(super) async fn read(root: &Path, repository: &str) -> Option<Self> {
-        let raw = complete_repository_inventory(root, "issue", Some(repository), "number,labels,state").await.ok()?;
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
+        // #2512: title and body ride the same listing so a rescope stop can
+        // see an issue edit without another read.
+        let raw = complete_repository_inventory(root, "issue", Some(repository), "number,labels,state,title,body").await.ok()?;
+        Self::from_rows(serde_json::from_str(&raw).ok()?)
+    }
+    pub(super) fn from_rows(rows: Vec<serde_json::Value>) -> Option<Self> {
         let mut issues = HashMap::new();
         for row in rows {
             let number = row["number"].as_u64().filter(|n| *n > 0)?;
@@ -134,6 +138,14 @@ impl OpenIssues {
     }
     pub(super) fn get(&self, issue: u64) -> Option<&serde_json::Value> {
         self.0.get(&issue)
+    }
+    /// The issue's request hash as an own-PR rescope stop records it (#2512).
+    /// `None` when the listing lacks the issue or its text.
+    pub(super) fn request(&self, issue: u64) -> Option<String> {
+        let row = self.get(issue)?;
+        let title = row.get("title")?.as_str()?;
+        let body = match row.get("body")? { serde_json::Value::Null => "", body => body.as_str()? };
+        Some(acceptance::own_pr_rescope::request_digest(title, body))
     }
     /// Listed with an open state in this tick's inventory.
     pub(super) fn is_open(&self, issue: u64) -> bool {

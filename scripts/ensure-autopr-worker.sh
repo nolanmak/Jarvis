@@ -83,6 +83,18 @@ case "$(uname -s)" in
   Darwin) ensure_macos; exit ;;
   *) exit 0 ;;
 esac
+# #2468 — once a pinned build is installed, the worker runs it through
+# scripts/run-autoship-pinned.sh and watches the pinned stamp instead of
+# built-commit, so main deploys do not reload it. Unpinned: run-rs.sh.
+AUTOSHIP_PINNED_BINARY=""; AUTOSHIP_PINNED_STAMP=""
+if [ -f "$REPO_ROOT/scripts/lib/autoship-pin.sh" ]; then
+  # shellcheck source=lib/autoship-pin.sh
+  . "$REPO_ROOT/scripts/lib/autoship-pin.sh"
+  if autoship_pin_enabled && autoship_pin_ready; then
+    AUTOSHIP_PINNED_BINARY="$(autoship_pin_binary)"; AUTOSHIP_PINNED_STAMP="$(autoship_pin_stamp)"
+  fi
+fi
+export AUTOSHIP_PINNED_BINARY AUTOSHIP_PINNED_STAMP
 python3 - <<'PY'
 import os, pathlib, re, shlex, subprocess, tempfile, json, stat
 repo=pathlib.Path(os.environ['REPO_ROOT'])
@@ -161,6 +173,11 @@ if selected:
  value=selected.replace('\\','\\\\').replace('"','\\"')
  selection_text='# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n'
 shared_environment=environment_file(str(selection),True,literal=True)
+pinned=os.environ.get('AUTOSHIP_PINNED_BINARY','')
+launcher='run-autoship-pinned.sh' if pinned else 'run-rs.sh'
+if pinned:
+ extra.append('Environment="AUGMENTAGENT_AUTOSHIP_PINNED_BINARY='+escaped(pinned)+'"')
+ extra.append('Environment="AUGMENTAGENT_AUTOSHIP_DEPLOY_STAMP='+escaped(os.environ['AUTOSHIP_PINNED_STAMP'])+'"')
 extra.append(shared_environment)
 dry=os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
 if dry is None:
@@ -186,7 +203,7 @@ if show('Delegate')=='yes':
  delegation='Delegate=cpu memory pids\nDelegateSubgroup=daemon'
 # Path-valued directives consume a whole path, not a shell-style quoted
 # word. ExecStart and Environment use the quoted-word parser instead.
-values={'REPO_ROOT':escaped(str(repo)), 'WORKING_DIR':str(repo).replace('%','%%'),
+values={'REPO_ROOT':escaped(str(repo)), 'WORKING_DIR':str(repo).replace('%','%%'),'LAUNCHER':launcher,
  'LOG_DIR':str(log_dir).replace('%','%%'),
  'SERVICE_PATH':escaped(os.environ.get('PATH','/usr/bin:/bin')), 'DRY_RUN':dry,
  'EXTRA_ENV':'\n'.join(extra),

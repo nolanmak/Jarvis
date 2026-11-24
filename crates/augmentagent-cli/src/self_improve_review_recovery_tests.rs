@@ -48,7 +48,7 @@ async fn missing_approval_schedules_one_durable_review_request_across_polls() {
         store.release(&lease, 5).unwrap();
         opened_prs::record(1, 1604, &head, None);
         for _ in 0..3 {
-            let _ = find_resumable_draft(&root, None, false).await;
+            let _ = find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await;
         }
         let events = store.events(id).unwrap();
         assert_eq!(events.iter().filter(|event| event.1 == "review_recovery_scheduled").count(), 1,

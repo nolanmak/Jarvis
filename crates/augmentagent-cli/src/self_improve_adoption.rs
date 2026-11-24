@@ -354,6 +354,155 @@ pub(super) fn in_flight_retries(
     Ok(result)
 }
 
+/// #2495 — how close a due own PR is to merging. Lower runs first: the PR
+/// lane finishes work before it starts work. Only a scheduling rank; review,
+/// CI and merge authority are still decided by the resumed workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum FinishTier {
+    /// Every check on the bound head is green; only review or finalize remain.
+    GreenAwaitingReview,
+    /// At publish or waiting on hosted CI, and due.
+    PublishOrCiPending,
+    /// Any other due own-PR work (scope, build, ...): the #1532 rotation.
+    Other,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FinishPlan {
+    /// Due candidates ranked above [`FinishTier::Other`].
+    pub tiers: std::collections::BTreeMap<u64, FinishTier>,
+    /// `(workflow, bound head)` whose CI poll the green checks already answered.
+    pub expedite: Vec<(String, String)>,
+}
+
+/// Every non-advisory check in the shared inventory row's `statusCheckRollup`
+/// finished green. Missing, empty or unknown rows are not green.
+pub(super) fn rollup_green(row: &serde_json::Value) -> bool {
+    let Some(checks) = row.get("statusCheckRollup").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let text = |check: &serde_json::Value, key: &str| check.get(key).and_then(serde_json::Value::as_str).map(str::to_owned);
+    let mut required = checks.iter().filter(|check| {
+        !text(check, "name").or_else(|| text(check, "context")).is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit"))
+    }).peekable();
+    required.peek().is_some() && required.all(|check| match text(check, "__typename").as_deref() {
+        Some("CheckRun") => text(check, "status").as_deref() == Some("COMPLETED")
+            && matches!(text(check, "conclusion").as_deref(), Some("SUCCESS" | "SKIPPED" | "NEUTRAL")),
+        Some("StatusContext") => text(check, "state").as_deref() == Some("SUCCESS"),
+        _ => false,
+    })
+}
+
+/// Rank due own PRs from the tick's one PR inventory (no extra GitHub calls).
+/// Applies the same ownership, lease and in-flight checks as
+/// [`in_flight_retries`]; a green bound head also ends a `hosted_ci_pending`
+/// poll early, since the poll exists only to wait for that answer.
+pub(super) fn finish_plan(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    prs: &serde_json::Value,
+    now: i64,
+) -> Result<FinishPlan> {
+    use crate::autoship_workflow::{Stage, HOSTED_CI_PENDING_REASON};
+    let mut plan = FinishPlan::default();
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(plan);
+    };
+    let rows = prs.as_array().map(Vec::as_slice).unwrap_or_default();
+    for candidate in candidates.iter().filter(|c| c.ready_for_review()) {
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else { continue };
+        let Some(snapshot) = store.snapshot(&id)? else { continue };
+        if !candidate_source_matches(&id, candidate)
+            || snapshot.pr != Some(candidate.pr)
+            || snapshot.lease_until_ms > now
+            || !crate::autoship_workflow::resumes_existing_work(&snapshot)
+        {
+            continue;
+        }
+        let checkpoint = &snapshot.checkpoint;
+        let row = rows.iter().find(|row| row.get("number").and_then(serde_json::Value::as_u64) == Some(candidate.pr));
+        let green = row.is_some_and(|row| {
+            row.get("headRefOid").and_then(serde_json::Value::as_str) == Some(checkpoint.binding.head.as_str())
+                && candidate.head == checkpoint.binding.head
+                && rollup_green(row)
+        });
+        let ci_pending = checkpoint.next.reason == HOSTED_CI_PENDING_REASON
+            && checkpoint.next.action == "retry_verification";
+        let expedite = green && ci_pending && checkpoint.next.eligible_at_ms > now;
+        if checkpoint.next.eligible_at_ms > now && !expedite {
+            continue;
+        }
+        let tier = if green && matches!(checkpoint.stage, Stage::Review | Stage::Reconcile | Stage::AwaitChecks) {
+            FinishTier::GreenAwaitingReview
+        } else if ci_pending || matches!(checkpoint.stage, Stage::Publish | Stage::AwaitChecks) {
+            FinishTier::PublishOrCiPending
+        } else {
+            continue;
+        };
+        if expedite {
+            plan.expedite.push((id, checkpoint.binding.head.clone()));
+        }
+        plan.tiers.insert(candidate.pr, tier);
+    }
+    Ok(plan)
+}
+
+/// #2512 — an own-PR rescope stop whose issue request or main moved since it
+/// stopped is due now, before the eligibility gates below skip it for a day.
+/// `request` and `main` come from data the tick already has (the open-issue
+/// listing and the local `origin/main` ref): no GitHub reads.
+pub(super) fn wake_changed_rescope_stops(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    request: impl Fn(&AdoptedPr) -> Option<String>,
+    main: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut stops = Vec::new();
+    {
+        let Some(store) = WorkflowStore::open_read_only(path)? else { return Ok(Vec::new()) };
+        for candidate in candidates {
+            let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else { continue };
+            let Some(snapshot) = store.snapshot(&id)? else { continue };
+            if candidate_source_matches(&id, candidate)
+                && snapshot.pr == Some(candidate.pr)
+                && snapshot.lease_until_ms <= now
+                && snapshot.checkpoint.next.eligible_at_ms > now
+                && super::acceptance::own_pr_rescope::exhausted(&snapshot.checkpoint)
+            {
+                stops.push((id, request(candidate)));
+            }
+        }
+    }
+    let mut woken = Vec::new();
+    if stops.is_empty() {
+        return Ok(woken);
+    }
+    let mut store = WorkflowStore::open(path)?;
+    for (id, request) in stops {
+        if store.expedite_changed_rescope_stop(&id, request.as_deref(), main, now)? {
+            woken.push(id);
+        }
+    }
+    Ok(woken)
+}
+
+/// The oldest due PR of the nearest-to-done tier, or `None` when nothing is
+/// near done. `tiers` members are due in-flight work and belong in `retries`.
+pub(super) fn select_finishing(
+    candidates: &[AdoptedPr],
+    ledger: &AttemptLedger,
+    today: u64,
+    only: Option<u64>,
+    retries: &std::collections::BTreeSet<u64>,
+    tiers: &std::collections::BTreeMap<u64, FinishTier>,
+) -> Option<(u64, u64, String)> {
+    [FinishTier::GreenAwaitingReview, FinishTier::PublishOrCiPending].into_iter().find_map(|tier| {
+        let pool: Vec<AdoptedPr> = candidates.iter().filter(|c| tiers.get(&c.pr) == Some(&tier)).cloned().collect();
+        select_linked_with_retries(&pool, ledger, today, &Default::default(), only, 0, retries)
+    })
+}
+
 pub(super) fn select_linked_with_retries(
     candidates: &[AdoptedPr],
     ledger: &AttemptLedger,
@@ -791,3 +940,7 @@ mod review_recovery_regression {
 #[cfg(test)]
 #[path="self_improve_retry_adoption_tests.rs"]
 mod retry_adoption_tests;
+
+#[cfg(test)]
+#[path="self_improve_finish_first_tests.rs"]
+mod finish_first_tests;

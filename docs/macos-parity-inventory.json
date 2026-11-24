@@ -959,6 +959,20 @@
     "evidence": null
   },
   {
+    "id": "cli:tabagent-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Hidden MCP server for TabAgent browse and act tools in the owner's Chrome, attached to owner-authorized turns; proxies to the loopback TabAgent REST API with a scoped token read from a private file and never starts a TabAgent daemon.",
+    "macos_target": "Hidden MCP server for TabAgent browse and act tools in the owner's Chrome, attached to owner-authorized turns; proxies to the loopback TabAgent REST API with a scoped token read from a private file and never starts a TabAgent daemon.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic local HTTP responses"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent tabagent_tool on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:web-tool",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Hidden MCP server for web search, page fetch and the per-conversation provider pin, attached to turns whose model cannot run native web tools; credentials reach the child only through its environment.",

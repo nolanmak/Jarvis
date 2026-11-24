@@ -1347,6 +1347,15 @@ impl WorkflowGuard {
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
             anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            // #2467: a run admitted before the global budget or this issue's
+            // spend cap ran out stops at its next model call. It parks on the
+            // ordinary capacity retry; the claim gate keeps it there until the
+            // budget reopens, and the give-up sweep closes a capped issue.
+            if let Some(refusal)=store.paid_admission_refusal(&lease.workflow,millis())? {
+                capacity_flag.store(true,Ordering::SeqCst);
+                store.defer_run_capacity_observation(&lease,None,None,millis())?;
+                anyhow::bail!("resource_capacity: {refusal}; await_capacity checkpoint retained");
+            }
             let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_native_custody(&worktree,&custody)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
@@ -1964,6 +1973,16 @@ impl WorkflowGuard {
         )
     }
 
+    /// #2467: why the acceptance ladder must stop rather than run another
+    /// cycle: observable children were already published once, or the issue
+    /// used its tries.
+    pub(super) fn ladder_stop(&self)->Result<Option<&'static str>> {
+        use durable::attempt_cap;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        if store.observable_decomposition_spent(self.id())? {return Ok(Some(attempt_cap::DECOMPOSITION_SPENT_REASON));}
+        let usage=store.attempt_usage(self.id())?;
+        Ok((usage.tries()>=attempt_cap::max_tries()).then_some(attempt_cap::ATTEMPTS_REASON))
+    }
     /// `Some(at)` while this issue's rolling daily retry model budget is spent.
     pub(super) fn daily_budget_reopens_at(&self)->Result<Option<i64>> {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
@@ -2204,6 +2223,14 @@ impl WorkflowGuard {
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
             .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
+    }
+
+    /// #2510: return an attempt an infrastructure refusal never used. No
+    /// health check: a capacity refusal has already marked this guard, and
+    /// handing back a charge grants nothing. The lease is still fenced.
+    pub(super) fn release_epoch_attempt(&self,purpose:&str,epoch:&str)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .release_epoch_attempt(&self.lease,purpose,epoch,millis())
     }
 
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
@@ -2483,6 +2510,13 @@ impl WorkflowGuard {
     /// is needed; ancestry and the lease both protect intervening remote edits.
     /// The actual fresh publication entry, separately callable by its
     /// disposable-remote regression without invoking a model.
+    /// #2491: this workflow checkpointed a push of its exact current binding
+    /// and has not published that head yet.
+    pub(super) fn unpushed_publish_checkpoint(&self)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .unpushed_publish_checkpoint(self.id(),&self.binding)
+    }
+
     pub(super) async fn push_fresh(&mut self,repo:&Path,branch:&str,automatic:bool)->Result<String> {
         self.push_checked(branch,Some((repo,automatic))).await
     }
@@ -4618,8 +4652,10 @@ mod tests {
         write(&aliases.join("completed-fixture"),br#""session-completed""#);
         write(&aliases.join("interrupted-fixture"),br#""session-interrupted""#);
         let policy=root.path().join("policy.json");
-        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":1073741824u64,"max_sessions":3,"providers":{}})).unwrap());
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        // The interrupted scope-retired runtime is unresumable history and holds
+        // no reservation (#2506); only the completed one fills this 1 GiB budget.
         let full=augmentagent_channel_core::native_vm::state_capacity::inspect();
         assert!(full.available_fingerprint().is_none());assert!(known.exists(),"read-only inspection deleted runtime state");
         let fingerprint=serde_json::to_value(full).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();

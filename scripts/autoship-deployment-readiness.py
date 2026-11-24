@@ -21,12 +21,15 @@ KEYS={'AUGMENTAGENT_REPOSITORY_ALIASES','HOME','PATH','XDG_CONFIG_HOME','XDG_STA
       'AUGMENTAGENT_AUTOPR_AUTOMERGE','AUGMENTAGENT_REASONER_TIMEOUT_SECS','AUGMENTAGENT_RUN_RESOURCES','AUGMENTAGENT_RUN_MEMORY_BYTES',
       'AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES','AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES','AUGMENTAGENT_RUN_PIDS',
       'AUGMENTAGENT_RUN_CPU_PERCENT','AUGMENTAGENT_OPUS_MODEL','AUGMENTAGENT_MODEL_QWEN_ENABLED','AUGMENTAGENT_MODEL_GLM_ENABLED',
-      'AUGMENTAGENT_MODEL_YOLO_ENABLED'}
+      'AUGMENTAGENT_MODEL_YOLO_ENABLED','AUGMENTAGENT_AUTOSHIP_PINNED_BINARY'}
 KEYS.update('AUGMENTAGENT_MODEL_'+provider+'_'+tier for provider in ('CLAUDE','CODEX','QWEN','GLM','GEMINI','CEREBRAS') for tier in ('QUALITY','FAST'))
 # Resolution inputs have their own effective evidence below; cosmetic PATH
 # differences alone do not imply different provider executables.
 DECLARATION_KEYS=KEYS-{'HOME','PATH','XDG_CONFIG_HOME','XDG_STATE_HOME','CLAUDE_CLI','CODEX_CLI',
-                     'AUGMENTAGENT_NATIVE_VM_POLICY','AUGMENTAGENT_MODEL_SELECTION_CONFIG','AUGMENTAGENT_MODEL_ROUTER_CONFIG','AUGMENTAGENT_AUTOPR'}
+                     'AUGMENTAGENT_NATIVE_VM_POLICY','AUGMENTAGENT_MODEL_SELECTION_CONFIG','AUGMENTAGENT_MODEL_ROUTER_CONFIG','AUGMENTAGENT_AUTOPR',
+                     # #2468 — only the worker runs a pinned build; the executable
+                     # is checked per role below, not compared as configuration.
+                     'AUGMENTAGENT_AUTOSHIP_PINNED_BINARY'}
 
 class Refused(Exception):pass
 
@@ -94,7 +97,14 @@ def snapshot(role,pid,binary,binary_sha,policy,policy_sha,declaration,receipts):
         if actual!=str(policy):raise Refused('policy-selection-mismatch')
         if value.get('policy_sha256')!=policy_sha:raise Refused('policy-content-mismatch')
         if digest(private(Path(actual),2*1024**2))!=policy_sha:raise Refused('policy-selection-mismatch')
-        if os.readlink(proc/'exe')!=str(binary) or file_hash(proc/'exe')!=binary_sha:raise Refused('executable-mismatch')
+        expected,expected_sha=binary,binary_sha
+        pinned=config.get('AUGMENTAGENT_AUTOSHIP_PINNED_BINARY')
+        if pinned:
+            # #2468 — the worker runs its pinned controller build, not main's
+            # target/release; the daemon is never pinned.
+            if role!='worker' or not Path(pinned).is_absolute():raise Refused('executable-mismatch')
+            expected=Path(pinned).resolve(strict=True);expected_sha=file_hash(expected)
+        if os.readlink(proc/'exe')!=str(expected) or file_hash(proc/'exe')!=expected_sha:raise Refused('executable-mismatch')
         providers={}
         for provider in declaration['providers']:
             if provider in ('claude','codex','qwen','glm'):
@@ -112,7 +122,7 @@ def snapshot(role,pid,binary,binary_sha,policy,policy_sha,declaration,receipts):
         fingerprints={'state_root':str((state_home/'augmentagent').resolve()),'declarations':{key:config.get(key) for key in sorted(DECLARATION_KEYS)},'files':files,'providers':providers}
         if birth(pid)!=identity or (proc/'cwd').resolve(strict=True)!=cwd or private(receipts/(role+'.json'))!=raw:raise Refused('process-changed')
         return {'status':'configuration-observed','pid':pid,'birth':identity,'policy_sha256':policy_sha,
-                'executable_sha256':binary_sha,'configuration_sha256':digest(json.dumps(fingerprints,sort_keys=True).encode()),
+                'executable_sha256':expected_sha,'configuration_sha256':digest(json.dumps(fingerprints,sort_keys=True).encode()),
                 'provider_executable_sha256':providers}
     except Refused as error:return {'status':str(error),'pid':pid}
     except FileNotFoundError:return {'status':'process-evidence-missing','pid':pid}

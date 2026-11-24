@@ -144,6 +144,31 @@
         "configured MCP (memory, read-only)"
       ]
     },
+    "tabagent-mcp": {
+      "scope": "Owner-authorized turn only (Discord owner turns, relayed owner queries, local wiki ask); scoped TabAgent token read from a private file by the MCP child; browse and act in the owner's signed-in Chrome on the Legion with the session bound on argv. Actions rely on TabAgent's own gates (site approval, sensitive submit and purchase/send prompts in Chrome, kill switch) with no Jarvis-side approval, and keep the Codex bridge's mutation receipts. tabs attach, nav_wait for=fn and private or tailnet targets are refused before any request. No JavaScript, cookies, storage, network capture, uploads, downloads, auth tools or screenshots.",
+      "operations": [
+        "mcp__tabagent__tabs (list, new, select, close)",
+        "mcp__tabagent__nav_goto",
+        "mcp__tabagent__nav_wait",
+        "mcp__tabagent__page_snapshot",
+        "mcp__tabagent__page_markdown",
+        "mcp__tabagent__page_text",
+        "mcp__tabagent__page_find",
+        "mcp__tabagent__extract_table",
+        "mcp__tabagent__extract_links",
+        "mcp__tabagent__act_click",
+        "mcp__tabagent__act_type",
+        "mcp__tabagent__act_press",
+        "mcp__tabagent__act_select",
+        "mcp__tabagent__act_check",
+        "mcp__tabagent__act_hover",
+        "mcp__tabagent__act_scroll",
+        "mcp__tabagent__act_fill",
+        "mcp__tabagent__form_fill",
+        "mcp__tabagent__form_submit",
+        "mcp__tabagent__dialog_handle"
+      ]
+    },
     "web-mcp": {
       "scope": "Adds the Jarvis web MCP tools (search, fetch, and for owner-authorized normal turns the per-conversation provider pin) to a preset whose model cannot run native web tools, and removes the native WebSearch/WebFetch names. Every other permission of the wrapped preset is unchanged.",
       "operations": [
@@ -862,6 +887,24 @@
         "web::tool_tests::the_server_lists_exactly_the_tools_it_was_given"
       ],
       "provider_conformance": "pending: attached only for Qwen, GLM and the yolo profile; live receipt is the epic acceptance (#2220)"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/tabagent_tool.rs::configure_with",
+      "permission_profile": "tabagent-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the TabAgent browser MCP tools to an owner-authorized turn and keeps its model.",
+      "conformance": [
+        "tabagent_tool::tests::configure_requires_owner_channel_session_url_and_token",
+        "tabagent_tool::tests::configure_lists_exact_tools_and_never_sensitive_ones",
+        "tabagent_tool::tests::the_server_lists_exactly_the_tools_it_was_given",
+        "tabagent_tool::tests::proxy_refuses_attach_fn_wait_and_private_goto_before_any_request",
+        "tabagent_tool::tests::token_file_must_be_private_regular_file",
+        "tabagent_tool::tests::act_tools_are_listed_and_forwarded_unchanged",
+        "tabagent_tool::tests::act_tool_refusals_from_tabagent_are_verbatim_and_unretried",
+        "tabagent_tool::tests::prompt_says_when_to_browse_act_and_announce_consequential_steps"
+      ],
+      "provider_conformance": "pending: owner-run live receipt (tabagent_tool::tests::live_tabagent_reads_a_synthetic_page) against the paired TabAgent on the Legion"
     }
   ]
 }
