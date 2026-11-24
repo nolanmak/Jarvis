@@ -162,10 +162,11 @@ fn code(value:&str,fallback:&str)->String {
         "acceptance_strategies_exhausted"|"acceptance_decomposed_into_observable_children"|"escalate_acceptance"|"await_new_execution_inputs"|"await_child_completion"|
         "readiness_assessment_invalid"|"await_readiness_input_change"|"original_evidence_unrecoverable"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
-        "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
+        "review_main_changed"|"reconcile_main"|"hosted_ci_pending"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
         "owner_execution_retry_pending"|"reconcile_runtime_retirement"|"owner_execution_retry_requested"|"resume_started"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker"|
+        "attempt_cap_reached"|"model_call_cap_reached"|"observable_decomposition_spent"|"give_up"|"give_up_cleared"|
         "linked_pr_claim_exists"|"linked_pr_inventory_unknown"|"reconcile_existing_pr"|"retry_github_inventory") {value.into()} else {fallback.into()}
 }
 

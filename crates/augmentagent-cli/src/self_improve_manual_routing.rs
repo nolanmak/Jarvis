@@ -181,6 +181,18 @@ pub(super) async fn filter(root:&Path,candidates:&mut Vec<adoption::AdoptedPr>,i
             eligible.push(candidate);
         }
     }
+    // #2512: before the eligibility gate, wake rescope stops whose issue or
+    // main changed, from this listing and the local main ref (no GitHub read).
+    let main=match run("git",&["rev-parse","origin/main"],root).await {
+        Ok((true,out,_))=>Some(out.trim().to_owned()).filter(|head|!head.is_empty()),
+        _=>None,
+    };
+    let request=|candidate:&adoption::AdoptedPr|candidate.source_issue.and_then(|issue|
+        issues.get(&candidate.repository).and_then(Option::as_ref).and_then(|listed|listed.request(issue)));
+    match adoption::wake_changed_rescope_stops(&workflow::path(),&eligible,request,main.as_deref(),chrono::Utc::now().timestamp_millis()) {
+        Ok(woken)=>for id in woken {info!(workflow=%id,"issue or main changed since the rescope stop; re-checking now");},
+        Err(error)=>warn!("cannot re-check changed rescope stops: {error:#}"),
+    }
     if adoption::filter_owned_sources(&workflow::path(),&mut eligible).is_err() {
         warn!("protected PR source identity unavailable; deferring automatic selection");eligible.clear();
     }
