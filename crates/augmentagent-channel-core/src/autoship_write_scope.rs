@@ -345,6 +345,18 @@ mod tests {
 
 /// Controller-only activation after independently verified contract amendment.
 /// Candidate tools cannot write this private store or invoke this Rust API.
+/// #2464: the contract hash a worktree's write admission is registered under,
+/// or `None` before any registration.
+pub fn registered_contract(worktree: &Path) -> Result<Option<String>> {
+    let state = crate::state_dir::state_dir().context("scope control state unavailable")?;
+    let path = location(&state, &worktree.canonicalize()?);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(read(&path)?.contract_hash)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn replace_registered(
     worktree: &Path,
     expected_contract: &str,
