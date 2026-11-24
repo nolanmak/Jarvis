@@ -478,19 +478,7 @@ fn candidate_of(ev: &CalendarEvent, account: &str, window: &CandidateWindow) -> 
                 .as_deref()
                 .is_some_and(|e| e.trim().eq_ignore_ascii_case(account.trim()))
     });
-    let join_link = ev
-        .hangout_link
-        .clone()
-        .filter(|l| !l.trim().is_empty())
-        .or_else(|| {
-            ev.conference_data
-                .as_ref()?
-                .entry_points
-                .as_ref()?
-                .iter()
-                .find(|p| p.entry_point_type.as_deref() == Some("video"))
-                .and_then(|p| p.uri.clone())
-        });
+    let join_link = ev.join_url();
     let attendees = ev
         .attendees
         .as_deref()
