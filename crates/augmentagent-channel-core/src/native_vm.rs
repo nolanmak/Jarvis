@@ -902,7 +902,7 @@ mod tests {
             // Exercise release/cancellation with the real host supervisor and a
             // disposable marker-writing command. This is a controller-boundary
             // fixture, not native guest or provider acceptance.
-            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","teardown-proof-missing"] {
+            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","charged-release-unacknowledged","teardown-proof-missing"] {
                 let create=crate::native_session::Launch::Create{requested_id:None};
                 let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
                 let original=vm.session.clone();let effect=root.join(format!("{provider}-{case}-effect"));
@@ -929,6 +929,19 @@ mod tests {
                 if case=="release-ack-error" || case=="foreign-release-before-refusal" {write(&receipt.with_file_name("launch-continue"),b"admitted\n").unwrap();}
                 if case=="owner-refused" || case=="foreign-release-before-refusal" {
                     assert!(group.admit_model(provider,Some(&denied)).await.is_err());
+                }else if case=="charged-release-unacknowledged" {
+                    // The accounting authority commits the charge before its
+                    // acknowledgement can fail. This must preserve the fresh
+                    // runtime even though no dispatch artifact is published.
+                    let accounting=Arc::new(crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit"))));
+                    let charged=Arc::new(AtomicUsize::new(0));let counted=charged.clone();
+                    accounting.set_correlated_model_call_observer(Arc::new(move |_|{
+                        counted.fetch_add(1,Ordering::SeqCst);
+                        anyhow::bail!("charged release acknowledgement failed")
+                    })).unwrap();
+                    assert!(group.admit_model(provider,Some(&accounting)).await.is_err());
+                    assert_eq!(charged.load(Ordering::SeqCst),1,"{provider}/{case}: the model release was never charged");
+                    assert!(!receipt.with_file_name("launch-continue").exists(),"{provider}/{case}: the unacknowledged release still published dispatch");
                 }else if case!="cancel-before-release" && case!="teardown-proof-missing" {
                     let result=group.admit_model(provider,None).await;
                     assert_eq!(result.is_err(),case=="release-ack-error");
@@ -938,7 +951,11 @@ mod tests {
                 drop(group);child.wait().await.unwrap();drop(vm);
                 assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing","{provider}/{case}: supervisor cleanup proof missing");
                 assert_eq!(effect.exists(),released,"{provider}/{case}: release fixture did not exercise expected dispatch");
-                assert_eq!(original.exists(),released || case=="teardown-proof-missing","{provider}/{case}: uncertain/released runtime disposition incorrect");
+                assert_eq!(original.exists(),released || matches!(case,"teardown-proof-missing"|"charged-release-unacknowledged"),
+                    "{provider}/{case}: uncertain/released runtime disposition incorrect");
+                if case=="charged-release-unacknowledged" {
+                    assert!(original.join("owned.json").is_file(),"{provider}/{case}: charged release lost its ownership receipt");
+                }
                 if case=="teardown-proof-missing" {
                     // The fixture provider was never released and the original
                     // supervisor has now been waited/reaped. Remove only this
