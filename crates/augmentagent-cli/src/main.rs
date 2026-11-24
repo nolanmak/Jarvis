@@ -14737,13 +14737,17 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        // #2538 — only while still pending: a follow-up compose that retired
+        // this card mid-redraft must not be undone into a second live card.
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("revise: persist failed: {e}"),
+                }
+            }
+        }
         tracing::info!(action_id, "socialapi revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -15120,6 +15124,16 @@ impl ReplyApprover {
         }
     }
 
+    /// #2538 — before Send / Revise runs (and is audited), give a card a
+    /// follow-up social DM compose replaced a live action where that is safe.
+    fn reopen_replaced_social_card(&self, action_id: &str, take_over: bool) {
+        match socialapi_compose_identity::reopen_replaced_card(&self.store, action_id, take_over) {
+            Ok(true) => info!(action_id, take_over, "socialapi dm: reopened replaced card"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "socialapi dm: reopen replaced card failed: {e:#}"),
+        }
+    }
+
     fn skip_github(
         &self,
         action_id: &str,
@@ -15144,6 +15158,7 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.reopen_replaced_social_card(action_id, false);
         let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
@@ -15173,6 +15188,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
+        self.reopen_replaced_social_card(action_id, true);
         self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
