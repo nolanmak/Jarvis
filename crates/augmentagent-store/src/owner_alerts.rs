@@ -1,7 +1,7 @@
 //! Durable owner-alert contract shared by Discord and iMessage (#1392, #1393).
 //! Acknowledgment is visibility, never approval to send a reply or task completion.
 use crate::{Store, StoreError, StoreResult};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Urgency {
@@ -49,6 +49,29 @@ pub struct NewOwnerAlert<'a> {
     /// Usefulness cutoff, including for alerts with unknown deadlines.
     pub expires_at_ms: i64,
     pub text_after_ms: i64,
+}
+
+/// Rolling deduplication window for new-DM alerts: at most one per platform
+/// conversation per hour, including across restarts (#2422).
+pub const DM_ALERT_WINDOW_MS: i64 = 3_600_000;
+
+/// One inbound 1:1 DM whose policy verdict the shared evaluator in
+/// `augmentagent-channel-core` has already decided: `allow_priority` is set
+/// only for a sender that resolved to a wiki person on the owner's priority
+/// list, and `prior_inbound` is the inbound history the channel already knows.
+/// What is left is what only the store can answer — whether this conversation
+/// had prior inbound history, and whether its alert slot this hour is free.
+pub struct NewDmAlert<'a> {
+    pub platform: &'a str,
+    /// Stable per-platform conversation key; the dedupe window's identity.
+    pub conversation_id: &'a str,
+    /// Concise sender label; the raw handle when nothing better is known.
+    pub sender: &'a str,
+    pub source_url: &'a str,
+    pub timezone: &'a str,
+    pub allow_first_contact: bool,
+    pub allow_priority: bool,
+    pub prior_inbound: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +154,11 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
         INSERT OR IGNORE INTO owner_text_sender_health(singleton) VALUES(1);
         CREATE TABLE IF NOT EXISTS owner_text_failure_notice_limit (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),notified_at_ms INTEGER);
-        INSERT OR IGNORE INTO owner_text_failure_notice_limit(singleton) VALUES(1);",
+        INSERT OR IGNORE INTO owner_text_failure_notice_limit(singleton) VALUES(1);
+        CREATE TABLE IF NOT EXISTS owner_dm_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL,
+            conversation_id TEXT NOT NULL, inbound INTEGER NOT NULL DEFAULT 0,
+            alert_claimed_at_ms INTEGER, UNIQUE(platform, conversation_id));",
     )?;
     crate::owner_alert_digest::migrate(c)?;
     Ok(())
@@ -408,6 +435,62 @@ impl Store {
                 ],
             )
         })? == 1)
+    }
+
+    /// Record the inbound DM and, when the policy, the conversation's prior
+    /// history and this hour's claim all permit it, create the High owner
+    /// alert. Returns the new alert's ID, `None` when nothing qualified. The
+    /// claim is committed before the alert row, so the worst a failure between
+    /// them can do is cost this hour's alert — never a duplicate — and all the
+    /// alert insert would reject is checked up front, before any write (#2422).
+    pub fn create_dm_owner_alert(&self, dm: &NewDmAlert<'_>, now: i64) -> StoreResult<Option<String>> {
+        let blank = [dm.platform, dm.conversation_id, dm.sender]
+            .iter().any(|v| v.trim().is_empty() || v.contains('\0'));
+        let linked = dm.source_url.starts_with("https://") || dm.source_url.starts_with("http://");
+        if blank || !linked || dm.timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(StoreError::InvalidInput(
+                "DM alert requires a platform, conversation, sender, timezone and link".into()));
+        }
+        let claim = self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            // Counting the message is what answers "was there inbound history
+            // before this one?", and happens even when nothing may alert.
+            let (conversation, earlier, claimed_at): (i64, i64, Option<i64>) = tx.query_row(
+                "INSERT INTO owner_dm_conversations(platform,conversation_id,inbound)
+                VALUES(?1,?2,1) ON CONFLICT(platform,conversation_id)
+                DO UPDATE SET inbound=inbound+1 RETURNING id,inbound-1,alert_claimed_at_ms",
+                params![dm.platform, dm.conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let prior = dm.prior_inbound || earlier > 0;
+            // One winner per conversation-hour: the immediate transaction is
+            // what stops concurrent pollers and restarts from both alerting.
+            let claimed = (dm.allow_priority || (dm.allow_first_contact && !prior))
+                && !matches!(claimed_at, Some(at) if at > now - DM_ALERT_WINDOW_MS);
+            if claimed {
+                let sql = "UPDATE owner_dm_conversations SET alert_claimed_at_ms=?2 WHERE id=?1";
+                tx.execute(sql, params![conversation, now])?;
+            }
+            tx.commit()?;
+            Ok(claimed.then(|| format!("dm-alert:{conversation}:{now}")))
+        })?;
+        let Some(id) = claim else { return Ok(None) };
+        let (action, reason) = if dm.allow_priority {
+            ("Read the new direct message from a priority contact", "Owner-priority contact")
+        } else {
+            ("Read the first direct message from this sender", "First stored inbound contact")
+        };
+        self.insert_owner_alert(
+            &NewOwnerAlert {
+                id: &id, source_url: dm.source_url, action,
+                sender: &dm.sender.chars().take(120).collect::<String>(),
+                reason: &format!("{reason} on {}", dm.platform),
+                urgency: Urgency::High, due_at_ms: None, timezone: dm.timezone, meeting_id: None,
+                expires_at_ms: now + DM_ALERT_WINDOW_MS, text_after_ms: now,
+            },
+            now,
+        )?;
+        Ok(Some(id))
     }
 
     pub fn owner_alert(&self, id: &str) -> StoreResult<Option<OwnerAlert>> {

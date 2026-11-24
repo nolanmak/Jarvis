@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use augmentagent_channel_core::dm_alert::{self, DmAlertPolicy, DmEvent};
 use augmentagent_store::{PhoneIdentity, Store};
 use augmentagent_wiki::{
     merge_person_page, slug_from_email, IdentityIndex, PersonPatch, WikiLayout,
@@ -320,11 +321,63 @@ pub struct PollDelta {
     pub first_run: bool,
 }
 
+/// Wiki root the DM-alert evaluator resolves senders against. The poll loop
+/// never receives `--wiki-dir`, so the CLI exports it here instead (#2422).
+pub const WIKI_DIR_ENV: &str = "AUGMENTAGENT_WIKI_DIR";
+
+/// Everything one poll pass needs to evaluate new DMs, resolved once.
+struct DmAlertPass {
+    policy: DmAlertPolicy,
+    /// `None` when the configured wiki is unreadable, suppressing DM alerts
+    /// rather than calling a known person a stranger; an empty index (no wiki
+    /// configured) still allows first contacts.
+    index: Option<IdentityIndex>,
+    source_url: String,
+    now_ms: i64,
+}
+
+impl DmAlertPass {
+    fn open() -> Self {
+        let index = match std::env::var_os(WIKI_DIR_ENV).filter(|root| !root.is_empty()) {
+            None => Some(IdentityIndex::default()),
+            Some(root) => IdentityIndex::build(&WikiLayout::new(PathBuf::from(root)))
+                .inspect_err(|e| warn!(error = %e, "wiki index unavailable; skipping DM alerts"))
+                .ok(),
+        };
+        Self {
+            policy: DmAlertPolicy::from_env(), index,
+            source_url: dm_alert::dashboard_history_url(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Evaluate one newly observed entry against the shared policy, before
+    /// `poll_once` stores it. An evaluation failure is logged and swallowed:
+    /// a missed notification must never drop a message.
+    fn evaluate(&self, store: &Store, conv: &Conversation, entry: &MessageEntry, prior: bool) {
+        let Some(index) = self.index.as_ref() else { return };
+        let title = clean_title(&conv.title);
+        let mut event =
+            DmEvent::inbound_dm("imessage", &conv.identifier, &entry.sender, &self.source_url);
+        event.display_name = if title.is_empty() { &entry.sender } else { &title };
+        event.direct_message = !conv.is_group();
+        event.from_self = entry.sender == "me";
+        // A handle that is neither E.164 nor an Apple-ID address is a short
+        // code or service sender — the signal the page backfill refuses to page.
+        event.from_bot = !entry.sender.starts_with('+') && !entry.sender.contains('@');
+        event.prior_inbound = prior;
+        if let Err(e) = dm_alert::evaluate(store, &self.policy, &event, index, self.now_ms) {
+            warn!(conversation = %conv.identifier, error = %e, "new-DM alert evaluation failed");
+        }
+    }
+}
+
 /// Read every conversation's tail past the cursor, persist the messages as
 /// `emails` rows (historical `firstSeenAt`), advance the cursor.
 pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollDelta>)> {
     let mut stats = PollStats::default();
     let mut deltas = Vec::new();
+    let dm_alerts = DmAlertPass::open();
 
     let conversations = bundle.conversations()?;
     store.set_archive_newest_entry(
@@ -353,15 +406,23 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
             continue;
         }
 
+        // A conversation's whole history arriving at once is a backfill, not
+        // a new DM — the same reason `first_run` is kept off LLM ingest.
+        let backfill = seen == 0 && entries.len() > 1;
+        let mut prior_inbound = entries[..seen].iter().any(|e| e.sender != "me");
         let mut new_entries = Vec::new();
         for (idx, entry) in entries.iter().enumerate().skip(seen) {
             let email = synthetic_imessage_email(&conv, idx, entry);
             let ts_ms = DateTime::parse_from_rfc3339(&entry.timestamp)
                 .map(|t| t.timestamp_millis())
                 .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+            if !backfill {
+                dm_alerts.evaluate(store, &conv, entry, prior_inbound);
+            }
             if store.upsert_email_backfill(&email, ts_ms)? {
                 stats.emails_inserted += 1;
             }
+            prior_inbound |= entry.sender != "me";
             new_entries.push((idx, entry.clone()));
         }
         store.set_imessage_entries_seen(&conv.identifier, entries.len() as i64)?;
@@ -759,6 +820,47 @@ mod tests {
         assert_eq!(report.pages_updated, 1);
         let page = std::fs::read_to_string(layout.people_dir().join("jane.md")).unwrap();
         assert!(page.contains("iMessage group 'Ski Trip'"), "page:\n{page}");
+    }
+
+    /// #2422 — every new DM is evaluated against the policy before it is
+    /// stored: nothing until the owner opts the platform in, then one alert
+    /// for a conversation's first inbound contact and nothing after it.
+    #[test]
+    fn poll_alerts_once_on_a_new_dm_only_once_the_policy_opts_imessage_in() {
+        let (dir, _layout, store) = fresh_env();
+        let md = |handle: &str, tail: &str|
+            format!("---\n---\n\n### [2026-08-26T11:00:00-04:00] {handle}\nyo\n{tail}");
+        let reply = "\n### [2026-08-26T11:05:00-04:00] +14155550777\nstill there?\n";
+        let bundle = |handle: &str, name: &str, body: String| {
+            fixture_bundle(dir.path(), &[(handle, name, handle, body.as_str())])
+        };
+        let append = |name: &str, handle: &str| {
+            std::fs::write(dir.path().join(format!("conversations/{name}/messages.md")),
+                md(handle, reply)).unwrap();
+        };
+        let sql = "SELECT COUNT(*) FROM owner_alerts WHERE urgency='high'";
+        let high = || store.with_conn(|c| c.query_row(sql, [], |r| r.get::<_, i64>(0))).unwrap();
+
+        std::env::remove_var(dm_alert::POLICY_ENV);
+        let known = bundle("+14155550777", "Known", md("+14155550777", ""));
+        poll_once(&known, &store).unwrap();
+        assert_eq!(high(), 0, "no policy means no DM alert");
+        assert!(store.email_first_seen_at("imessage:+14155550777:0").unwrap().is_some());
+
+        // Opting in mid-conversation: the conversation already has stored
+        // inbound history, so its next message is not a first contact.
+        std::env::set_var(dm_alert::POLICY_ENV, "imessage=first-contact");
+        append("Known", "+14155550777");
+        poll_once(&known, &store).unwrap();
+        assert_eq!(high(), 0, "an established conversation is not a new DM");
+
+        let fresh = bundle("+14155550888", "Fresh", md("+14155550888", ""));
+        poll_once(&fresh, &store).unwrap();
+        assert_eq!(high(), 1, "a conversation's first inbound DM alerts");
+        append("Fresh", "+14155550888");
+        poll_once(&fresh, &store).unwrap();
+        assert_eq!(high(), 1, "at most one alert per conversation");
+        std::env::remove_var(dm_alert::POLICY_ENV);
     }
 
     #[test]
