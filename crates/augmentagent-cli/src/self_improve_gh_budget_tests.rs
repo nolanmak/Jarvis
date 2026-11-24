@@ -138,3 +138,24 @@ async fn github_calls_per_tick_do_not_grow_with_open_prs() {
         assert!(*count <= 3, "{kind} ran {count} times in one tick");
     }
 }
+
+/// #2512: the open-issue listing carries title and body in the same one call,
+/// and hashes an issue's request exactly as the resume records it in a
+/// rescope stop. A disagreement would read as an edit on every tick.
+#[test]
+fn the_open_issue_listing_hashes_a_request_like_the_rescope_stop() {
+    let listed = gh_budget::OpenIssues::from_rows(vec![
+        serde_json::json!({"number":7,"state":"OPEN","labels":[],"title":"Widget","body":"Fix the widget.\r\n- [ ] done"}),
+        serde_json::json!({"number":8,"state":"OPEN","labels":[],"title":"Empty","body":null}),
+        serde_json::json!({"number":9,"state":"OPEN","labels":[]}),
+    ]).unwrap();
+    assert_eq!(listed.request(7).as_deref(),
+        Some(crate::autoship_review::digest("Widget\nFix the widget.\r\n- [ ] done".as_bytes()).as_str()));
+    assert_eq!(listed.request(8), Some(acceptance::own_pr_rescope::request_digest("Empty", "")));
+    assert_eq!(listed.request(9), None, "a row without its text is unknown, not changed");
+    assert_eq!(listed.request(10), None);
+    let src = include_str!("self_improve_gh_budget.rs");
+    assert!(src.contains(r#"complete_repository_inventory(root, "issue", Some(repository), "number,labels,state,title,body")"#));
+    let resume = include_str!("self_improve.rs");
+    assert!(resume.contains("request: acceptance::own_pr_rescope::request_digest(&issue.title, &issue.body),"));
+}

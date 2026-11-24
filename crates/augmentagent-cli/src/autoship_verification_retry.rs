@@ -97,6 +97,12 @@ fn gate_passed_since(tx: &Transaction<'_>, lease: &Lease, after_seq: i64, after_
 /// backoff and no retry-cycle turn (PR #2449 waited an hour behind a
 /// `failures: 5` history because a fresh push had not finished CI).
 pub const HOSTED_CI_PENDING_REASON: &str = "hosted_ci_pending";
+/// #2490's single own-PR rescope stop and the inputs it records (#2512).
+pub const RESCOPE_STOP_REASON: &str = "own_pr_rescope_exhausted";
+pub const RESCOPE_STOP_ACTION: &str = "await_request_or_main_change";
+pub const RESCOPE_STOP_REQUEST_EVIDENCE: &str = "request:";
+pub const RESCOPE_STOP_MAIN_EVIDENCE: &str = "main:";
+const RESCOPE_STOP_WOKEN: &str = "rescope_stop_inputs_changed";
 pub const HOSTED_CI_PENDING_POLL_MS: i64 = 300_000;
 
 fn retryable_stage(stage: Stage) -> bool {
@@ -176,6 +182,54 @@ impl WorkflowStore {
         event(&tx, workflow, generation, "checkpoint", &checkpoint, now)?;
         event(&tx, workflow, generation, "hosted_ci_green_observed",
             &serde_json::json!({"version":1,"head":head,"eligible_at_ms":now}).to_string(), now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// #2512: an own-PR rescope stop (#2490) waits a day only while the
+    /// issue's request and main are what it recorded. When either observed
+    /// input differs, make the stop due now so the resume re-checks it; the
+    /// resume still decides the budget (an edit is a fresh budget, a main
+    /// change only re-checks). Only the eligibility time changes. A lease, an
+    /// owner pause, another checkpoint, unknown or unchanged inputs, and an
+    /// observation this stop was already woken for are all no-ops, so a hash
+    /// the resume records differently can wake it at most once.
+    pub fn expedite_changed_rescope_stop(&mut self, workflow: &str, request: Option<&str>, main: Option<&str>, now: i64) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, i64)> = tx.query_row(
+            "SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1", [workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let Some((raw, lease_until, generation)) = row else { return Ok(false) };
+        let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
+        let request = request.filter(|value| !value.is_empty());
+        let main = main.filter(|value| !value.is_empty());
+        let recorded = |prefix: &str, value: &str| checkpoint.evidence.iter().any(|item| item.strip_prefix(prefix) == Some(value));
+        let request_changed = request.is_some_and(|value| !recorded(RESCOPE_STOP_REQUEST_EVIDENCE, value));
+        let main_changed = main.is_some_and(|value| !recorded(RESCOPE_STOP_MAIN_EVIDENCE, value));
+        if lease_until > now
+            || checkpoint.stage != Stage::Scope
+            || checkpoint.next.reason != RESCOPE_STOP_REASON
+            || checkpoint.next.action != RESCOPE_STOP_ACTION
+            || checkpoint.next.eligible_at_ms <= now
+            || !(request_changed || main_changed)
+            || owner_control::read(&tx, workflow)?.is_some_and(|control| control.paused)
+        {
+            return Ok(false);
+        }
+        let observed = serde_json::json!({"request":request,"main":main});
+        let last: Option<String> = tx.query_row(
+            "SELECT payload FROM workflow_event WHERE workflow=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1",
+            params![workflow, RESCOPE_STOP_WOKEN], |r| r.get(0)).optional()?;
+        if last.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()).is_some_and(|prior| prior["observed"] == observed) {
+            return Ok(false);
+        }
+        checkpoint.next.eligible_at_ms = now;
+        let checkpoint = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1", params![workflow, checkpoint])?;
+        event(&tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+        event(&tx, workflow, generation, RESCOPE_STOP_WOKEN,
+            &serde_json::json!({"version":1,"observed":observed,"request_changed":request_changed,
+                "main_changed":main_changed,"eligible_at_ms":now}).to_string(), now)?;
         tx.commit()?;
         Ok(true)
     }

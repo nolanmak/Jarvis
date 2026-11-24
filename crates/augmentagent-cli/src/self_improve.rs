@@ -7219,7 +7219,7 @@ async fn resume_draft_pr(
     let rescope_entry = workflow.current_checkpoint()?;
     let (_, rescope_main, _) = run("git", &["rev-parse", "origin/main"], &worktree).await?;
     let rescope_inputs = acceptance::own_pr_rescope::Inputs {
-        request: crate::autoship_review::digest(format!("{}\n{}", issue.title, issue.body).as_bytes()),
+        request: acceptance::own_pr_rescope::request_digest(&issue.title, &issue.body),
         main: rescope_main.trim().to_owned(),
     };
     if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {

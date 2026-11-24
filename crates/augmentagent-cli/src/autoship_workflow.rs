@@ -135,7 +135,8 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON};
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCOPE_STOP_ACTION, RESCOPE_STOP_MAIN_EVIDENCE,
+    RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
