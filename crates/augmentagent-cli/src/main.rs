@@ -110,6 +110,8 @@ use async_trait::async_trait;
 mod whatsapp_history;
 mod whatsapp_phone;
 mod socialapi_compose_identity;
+#[cfg(test)]
+mod socialapi_compose_identity_approver_tests;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
