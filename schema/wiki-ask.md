@@ -517,6 +517,9 @@ augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
 - **Drop `--post` to preview.** Without it the command prints the drafted
   message and exits without touching anything — use that if the user only
   wants to see the wording.
+- **Revising a DM card:** run `socialapi dm --post` again for the same
+  conversation. The new card replaces your earlier pending DM card for that
+  conversation (the output says so); don't ask the user to skip the old one.
 - **Finding the id.** In order: (1) the inbound approval card, which shows the
   MessageId and carries the conversation/post id; (2)
   `mcp__memory__search_conversation_history`, which searches ingested messages
@@ -615,6 +618,7 @@ When the user asks "schedule a daily morning ping", "remind me every Monday to c
 - **Inspect:** `augmentagent loop list` — prints a table of active loops (id, status, interval, owner, prompt). Add `--all` to include stopped/paused rows, `--json` for parseable output. **Always run this first** when the user asks about loops; both to confirm what's actually scheduled and to resolve a fuzzy reference ("the hello world one") to a concrete UUID.
 - **Create (interval):** `augmentagent loop create --interval <secs|30m|2h|1d> --prompt "<text>"` — fixed cadence. Use for "every 30 minutes", "every 2 hours", "once a day". Owner + channel default to env-configured Discord identity. Add `--expires-in <duration>` for "for the next week" asks. Prints the loop UUID on stdout — surface it back to the user.
 - **Create (cron):** `augmentagent loop create --cron "<5-field>" --tz "<IANA>" --prompt "<text>"` — calendar-aligned cadence (every Monday at 9am EST, every weekday at noon, etc.). Use for any "every <weekday>" or specific "at <time>" ask. **Cron field order**: `min hour day-of-month month day-of-week`. **PREFER NAMES for day-of-week** (`MON`, `MON-FRI`, `SAT,SUN`) — numerics use Unix convention (0=Sun..6=Sat) which is converted internally but the names are unambiguous in the read-back. Examples: `--cron "0 9 * * MON"` for Monday 9am, `--cron "0 12 * * MON-FRI"` for weekdays at noon, `--cron "30 8 * * *"` for daily at 8:30. Mutually exclusive with `--interval`.
+- **Set up a scheduled scan:** when the user wants a recurring search whose matches are delivered ("watch my messages for X and email me", "every morning tell me who asked about Y", "flag anyone who mentions Z"), run `augmentagent loop guide` **first** and follow it. It prints the method (what to ask, how to write the criteria page, which `loop create` flags to use, how to preview) and the addresses findings may be emailed to. Do not improvise a scan from the plain create forms above, and never send a scan's emails yourself with `gmail send-now` or `gmail compose`: the daemon sends them.
 - **Stop one:** `augmentagent loop stop <id>` — flips the row to `status='stopped'`. The scheduler skips non-active rows on its next tick (within ~30s), so the user may see one final post before it goes quiet.
 - **Stop all:** `augmentagent loop stop --all` — stops every active loop in one shot. Reserve for explicit "kill everything" intent.
 
@@ -681,7 +685,8 @@ augmentagent calendar list-events --from 2026-07-09T00:00:00-04:00 --to 2026-07-
 - The output's `now:` header is the current local time. **Compute "today" / "tomorrow" / "Thursday" from that header**, then pass explicit `--from`/`--to` RFC3339 values (with the local UTC offset) for day-scoped questions.
 - `--json true` emits the structured event array when you need to post-process (includes `start_local`/`end_local` and an `all_day` flag).
 - Free/busy questions: an event blocks the user's time unless it is all-day or they declined it. Answer with **which events overlap the asked slot**, not a bare yes/no.
-- Privacy: the output carries titles, times, attendees, and conference platform only — never event descriptions or street addresses. Relay what it gives you; don't speculate about redacted or missing fields.
+- Privacy: the output carries titles, times, attendees, conference platform, and the conference join link only — never event descriptions or street addresses.
+- Meeting links: an event with a video room carries its join URL (`conference_url` in `--json true`; `[google_meet: https://meet.google.com/…]` in text). Use it when the user wants the link in a follow-up email or message — never hand out the `calendar/event?eid=…` page link as a join link. Relay what it gives you; don't speculate about redacted or missing fields.
 - If the command errors with "not connected" / `ConnectedAccountNotFound`, the Google Calendar toolkit isn't linked in Composio for that account. Tell the user their calendar isn't connected (the fix is on the operator side) — do **not** retry, and never fabricate a schedule.
 
 ### Creating calendar events
@@ -702,6 +707,7 @@ augmentagent calendar create-event \
 - Before proposing a time, check availability with `calendar list-events` for that day. The card itself also carries a ⚠ conflict warning if the slot collides with an existing busy event — mention any conflict to the user when you report the card.
 - `--attendees` is comma-separated emails. Resolve names to addresses via the wiki (`people/`) or by asking; **never invent an email address**.
 - Optional: `--description "agenda text"`, `--meet true` (attach a Google Meet room), `--account <email>` (defaults to the first active account).
+- With `--meet true`, the Approve receipt ends with `Meet link: https://meet.google.com/…`. If you need it later (e.g. for a follow-up email), read it from `calendar list-events --json true` (`conference_url`) for that event's window.
 - Missing details (duration? which Thursday? which Sarah?) — ask **one** compact clarifying question rather than guessing.
 - The Revise button is not supported for these cards yet: if the user wants changes after the card is up, tell them to Skip it and ask you again with the new details.
 
@@ -925,6 +931,7 @@ First run `augmentagent doc sign-lines <wiki-relative.pdf> [--page <1-based>]`: 
 Then `augmentagent doc sign <wiki-relative.pdf> --out <new-signed.pdf> --signature default --page <1-based> --anchor-text "<text under the line, e.g. the signer's printed name>" [--date YYYY-MM-DD]`
 posts a separate Approve & Sign card with a preview of the signed page and the unsigned PDF. The signature's ink is placed on that line automatically. Anchor text matches whole words, ignoring case only, so copy it from the line's `below` value. If it matches several lines, use `--line <n>` from `sign-lines` instead. If the signature would touch text or marks above the line, retry with a smaller `--width`. Never invent `--x/--y` coordinates when `sign-lines` reports a line; they are only for a page with no line, and they mean the bottom-left of the visible ink. A refusal (ambiguous anchor, no line, overlap with text) is the answer: tell the owner which lines exist rather than forcing a position.
 Nothing is signed until that card is approved. Changes to the document or signature require a fresh proposal. Signing appends the signature to the original file without re-encoding it, so the signed PDF is the original file plus the signature. The completed approval history supplies the signed PDF's ATTACH marker and hash; use that receipt to deliver the file. To email it, pass that exact signed path to `compose --attach`; that still needs the normal separate email approval. If the signed file doesn't exist, the card wasn't approved: check `approval_history` before telling the owner it was signed.
+**Word documents (.docx) are signed as Word.** An owner-attached `.docx` is saved unchanged like a PDF. `augmentagent doc sign-lines <wiki-relative.docx>` lists its signature lines (JSON: `line`, `text`, `kind`: a `line` such as "Signature: ____" or a table `cell` beside a "Signature" label). Then `augmentagent doc sign <wiki-relative.docx> --out <new-signed.docx> --signature default --line <n> [--date YYYY-MM-DD]` (no `--page`; `--anchor-text` matches a line's text). The signature replaces that line's blank or fills the cell; nothing else in the file changes. The card shows a preview of the signed line and the unsigned file. Never convert a .docx to PDF to sign it.
 Do not read, export, copy, or attempt to install signature image assets. Installation is operator-only. Do not bypass refusals, imitate a missing signature with typed text, or claim cryptographic/e-signature-platform verification.
 
 

@@ -441,6 +441,26 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyComplete)?;
             return Ok(None);
         }
+        // #2246 — a finding email one of the owner's loops sent to the owner's
+        // own address arrives here when that address is a connected account.
+        // It is the owner's own output, not correspondence: no alert, no
+        // triage, no draft and no model call.
+        if self.store.is_loop_delivery_email(&email.from, &email.subject, &email.body)? {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::LoopDelivery)?;
+            self.store.log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                None,
+                ActionStatus::Skipped,
+            )?;
+            self.store
+                .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+            println!("[skip:loop-delivery] {} from={}", email.message_id, email.from);
+            return Ok(Some(DispatchOutcome::Skipped));
+        }
         if !self.config.dry_run {
             crate::owner_alert_gate::arrival(&self.store,&email,self.config.wiki_root.as_deref(),chrono::Utc::now().timestamp_millis())?;
         }
@@ -982,6 +1002,20 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     "Draft a response using relevant conversation and cross-platform evidence.",
                     self.config.wiki_root.as_deref(),
                 ).await?;
+                // #2332 — the drafter looks at the images attached to the
+                // message it is answering. Draft stage only: triage sees ~70
+                // emails a day, mostly newsletters whose images are logos.
+                let draft_images = {
+                    let mut images = augmentagent_channel_core::images::PromptImages::default();
+                    for (ext, bytes) in self
+                        .gmail
+                        .image_attachments(entity_id, &email.message_id, augmentagent_channel_core::images::PromptImages::MAX)
+                        .await
+                    {
+                        images.push_bytes(&ext, &bytes);
+                    }
+                    images
+                };
                 let user_msg = code_mode_user_message(
                     &email,
                     &wiki_hint,
@@ -990,7 +1024,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     &archetype_block,
                     &resolve_outcome.block,
                 );
-                let user_msg = format!("{user_msg}\n\n{}", shared_draft_context.prompt());
+                let user_msg = format!("{user_msg}\n\n{}{}", shared_draft_context.prompt(), draft_images.prompt_lines());
                 // Opts mirror `draft_opts`' shape: same permission mode, no
                 // allowed_tools / add_dirs — the Deno sandbox is the tool
                 // surface, not the host claude CLI's Read/Grep/Glob.
@@ -1174,7 +1208,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     &archetype_block,
                     &resolve_outcome.block,
                 );
-                let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
+                let draft_prompt = format!("{draft_prompt}\n\n{}{}", shared_draft_context.prompt(), draft_images.prompt_lines());
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => {
                         let body = s.trim().to_string();
@@ -2199,6 +2233,86 @@ mod tests {
         assert_eq!(out.replied_dry_run, 1);
     }
 
+    /// #2332 — the drafter is shown the images attached to the message it is
+    /// answering; triage is not.
+    #[tokio::test]
+    async fn a_reply_draft_is_shown_the_messages_image_attachments() {
+        struct ImageGmail(StubGmail);
+        #[async_trait]
+        impl GmailApi for ImageGmail {
+            async fn fetch_unread(&self, e: &str, l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+                self.0.fetch_unread(e, l).await
+            }
+            async fn fetch_with_query(&self, e: &str, q: &str, l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+                self.0.fetch_with_query(e, q, l).await
+            }
+            async fn create_draft(&self, e: &str, t: &str, s: &str, b: &str, th: Option<&str>) -> Result<String, crate::gmail::GmailError> {
+                self.0.create_draft(e, t, s, b, th).await
+            }
+            async fn send_draft(&self, e: &str, d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+                self.0.send_draft(e, d).await
+            }
+            async fn delete_draft(&self, e: &str, d: &str) -> Result<(), crate::gmail::GmailError> {
+                self.0.delete_draft(e, d).await
+            }
+            async fn image_attachments(&self, _e: &str, message_id: &str, _max: usize) -> Vec<(String, Vec<u8>)> {
+                assert_eq!(message_id, "m-img");
+                vec![
+                    ("png".into(), b"\x89PNG fixture".to_vec()),
+                    // A format no model opens is dropped.
+                    ("heic".into(), b"fixture".to_vec()),
+                ]
+            }
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ImageGmail(StubGmail {
+            emails: vec![Email {
+                attachments: vec!["floorplan.png (image/png)".into()],
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m-img".into(),
+                thread_id: Some("t-img".into()),
+                from: "user@example.com".into(),
+                subject: "Floor plan".into(),
+                body: "Does this layout work for you?".into(),
+                date: "2026-04-13".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        }));
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"asks a question about the attached plan"}"#,
+            "The layout works.",
+        ]));
+        let ch = GmailChannel::dry_run(
+            store,
+            gmail,
+            reasoner.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        ch.poll_once().await.unwrap();
+        let prompts = reasoner.prompts.lock().unwrap();
+        assert!(!prompts[0].contains("IMAGE:"), "triage is not shown images");
+        let draft = prompts[1..]
+            .iter()
+            .find(|prompt| prompt.contains("IMAGE:"))
+            .expect("a draft prompt carries the image");
+        let marked: Vec<&str> = draft
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("IMAGE:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(marked.len(), 1, "one supported image: {marked:?}");
+        let path = std::path::Path::new(marked[0]);
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("aa-img-") && name.ends_with(".png"), "{name}");
+        assert!(!path.exists(), "the image file is removed after drafting");
+    }
+
     /// #1046 receipt path. A full dry-run reply poll through the REAL
     /// `ClaudeCliReasoner`, with `CLAUDE_CLI` pointed at an argv-recording
     /// stub: the code-mode draft spawn that `process_email` builds must pass
@@ -2512,6 +2626,61 @@ mod tests {
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
         // Email is terminally processed so the next tick won't re-spawn.
         assert!(store.is_email_complete("m-bot").unwrap());
+    }
+
+    /// #2246: the inbound copy of an email a loop sent to the owner's own
+    /// connected address is skipped before any model call, while a reply
+    /// that quotes it goes through triage as usual.
+    #[tokio::test]
+    async fn a_loop_delivery_arriving_in_a_connected_inbox_is_skipped_without_a_model_call() {
+        let (store, _f) = tmp_store();
+        let reference = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        store
+            .record_loop_delivery(reference, "loop-1", "sender@example.com", "owner@example.com", "Example Person asked about pricing")
+            .unwrap();
+        let body = format!("Details.\n\n{}\n", augmentagent_store::loop_delivery_footer("loop-1", reference));
+        let email = |id: &str, subject: &str| Email {
+            attachments: Vec::new(),
+            to: "owner@example.com".into(),
+            cc: String::new(),
+            message_id: id.into(),
+            thread_id: Some(format!("t-{id}")),
+            from: "Example Sender <sender@example.com>".into(),
+            subject: subject.into(),
+            body: body.clone(),
+            date: "2026-05-27".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let gmail = Arc::new(StubGmail {
+            emails: vec![
+                email("m-loop", "Example Person asked about pricing"),
+                email("m-reply", "Re: Example Person asked about pricing"),
+            ],
+        });
+        // One scripted reply only: the loop delivery must not consume it.
+        let reasoner = Arc::new(ScriptedReasoner::new([r#"{"decision":"skip","reason":"quoted copy"}"#]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner.clone(),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.skipped, 2);
+        assert_eq!(reasoner.prompts.lock().unwrap().len(), 1, "only the reply reaches the model");
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+        assert!(store.is_email_complete("m-loop").unwrap());
+        assert_eq!(store.email_guard_history("m-loop").unwrap(), "attempt 1: loop_delivery => skip");
+        assert_eq!(store.email_guard_history("m-reply").unwrap(), "", "a reply quoting the email is triaged normally");
     }
 
     /// #222: a Partiful "Registration Confirmed" event blast where the

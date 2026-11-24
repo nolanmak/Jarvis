@@ -145,14 +145,105 @@ pub(super) async fn run_for_subject(
         Ok(provider) => provider,
         Err(why) => return IndependentReview::unavailable(why),
     };
+    let guard = context.workflow;
+    let head = git(&worktree, &["rev-parse", "HEAD"]).await.ok().map(|h| h.trim().to_owned());
+    let mut provider = provider;
+    if let (Some(guard), Some(head), false) = (guard, head.as_deref(), origin.is_imported()) {
+        provider = structured_review_fallback(guard, head, provider);
+    }
     match run_inner(
         provider, &authors, issue, worktree, criteria, context, origin,
     )
     .await
     {
         Ok(review) => review,
-        Err(error) => unavailable_from_error(provider, error),
+        Err(error) => {
+            let review = unavailable_from_error(provider, error);
+            if let (Some(guard), Some(head), Some(why)) = (guard, head.as_deref(), review.why_unavailable.as_ref()) {
+                if counts_toward_fallback(why) {
+                    record_structured_failure(guard, head, provider);
+                }
+            }
+            review
+        }
     }
+}
+
+/// #2420: which unavailable reviews count toward the alternate-reviewer
+/// fallback: output a different reviewer may produce validly or within budget.
+fn counts_toward_fallback(why: &ReviewUnavailable) -> bool {
+    matches!(why, ReviewUnavailable::RecoveryRequired { .. } | ReviewUnavailable::EvidenceBudget { .. })
+}
+
+/// #2385: durable count of structured reviews by `provider` that needed
+/// controller recovery on this exact head. Immutable keyed records, bounded.
+fn structured_failure_key(head: &str, provider: augmentagent_channel_core::ProviderKind, n: u32) -> String {
+    aligned::digest(&serde_json::to_vec(&("structured-review-failure-v1", head, provider.name(), n)).unwrap_or_default())
+}
+fn structured_failures(guard: &workflow::WorkflowGuard, head: &str, provider: augmentagent_channel_core::ProviderKind) -> u32 {
+    let mut n = 0;
+    while n < 16 && matches!(guard.scope_stage_response(&structured_failure_key(head, provider, n)), Ok(Some(_))) {
+        n += 1;
+    }
+    n
+}
+fn record_structured_failure(guard: &workflow::WorkflowGuard, head: &str, provider: augmentagent_channel_core::ProviderKind) {
+    let n = structured_failures(guard, head, provider);
+    let body = serde_json::json!({"version":1,"kind":"structured_review_failure","head":head,"provider":provider.name(),"n":n}).to_string();
+    if let Err(error) = guard.record_scope_stage_response(&structured_failure_key(head, provider, n), &body) {
+        warn!("structured review failure could not be recorded: {error:#}");
+    }
+}
+/// #2385: never livelock one head on a reviewer whose structured output keeps
+/// failing validation. After the bound, the alternate native reviewer with
+/// capacity and fewer failures serves instead, with an audited event.
+fn structured_review_fallback(
+    guard: &workflow::WorkflowGuard,
+    head: &str,
+    selected: augmentagent_channel_core::ProviderKind,
+) -> augmentagent_channel_core::ProviderKind {
+    structured_review_fallback_with(guard, head, selected, &reviewer_pool(), reviewer_status)
+}
+
+fn structured_review_fallback_with(
+    guard: &workflow::WorkflowGuard,
+    head: &str,
+    selected: augmentagent_channel_core::ProviderKind,
+    pool: &[augmentagent_channel_core::ProviderKind],
+    status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
+) -> augmentagent_channel_core::ProviderKind {
+    let counts: Vec<_> = pool.iter().map(|p| (*p, structured_failures(guard, head, *p))).collect();
+    let count = |p| counts.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
+    let Some(alternate) = review_capacity::structured_fallback(pool, selected, count, &status) else {
+        // #2418: a due fallback that cannot switch must be visible, never
+        // indistinguishable from "not due yet".
+        if count(selected) >= review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK {
+            let candidates: serde_json::Map<String, serde_json::Value> = pool.iter().filter(|p| **p != selected)
+                .map(|p| (p.name().to_owned(), serde_json::Value::from(match status(*p) {
+                    ReviewerStatus::Ready if count(*p) >= count(selected) => "no_fewer_failures",
+                    ReviewerStatus::Ready => "not_native",
+                    ReviewerStatus::Latched(_) => "latched",
+                    ReviewerStatus::NotConfigured(_) => "unconfigured",
+                }))).collect();
+            let payload = serde_json::json!({"actor":"controller","kind":"review_fallback_unavailable","head":head,
+                "from":selected.name(),"failures":count(selected),"candidates":candidates,
+                "bound":review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK,"reason":"structured_review_validation"});
+            if let Err(error) = guard.audit_logger().record_controller(payload.clone()) {
+                warn!("review fallback audit unavailable: {error:#}");
+            }
+            warn!(head, fallback = %payload, "independent review fallback is due but no alternate reviewer can serve");
+        }
+        return selected;
+    };
+    let payload = serde_json::json!({"actor":"controller","kind":"review_fallback","head":head,
+        "from":selected.name(),"to":alternate.name(),"failures":{"from":count(selected),"to":count(alternate)},
+        "bound":review_capacity::STRUCTURED_FAILURES_BEFORE_FALLBACK,"reason":"structured_review_validation"});
+    if let Err(error) = guard.audit_logger().record_controller(payload.clone()) {
+        warn!("review fallback audit unavailable; keeping {}: {error:#}", selected.name());
+        return selected;
+    }
+    warn!(head, fallback = %payload, "independent review falls back to the alternate reviewer (review_fallback)");
+    alternate
 }
 
 async fn git_output(root:&Path,args:&[&str])->Result<(bool,String,String)> {
@@ -170,6 +261,12 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+/// #2451: #2421's worst-case model calls for one complete review attempt,
+/// the unit the per-binding review call budget is built from.
+pub(super) fn attempt_call_bound() -> u64 {
+    evidence_plan::worst_case_calls(evidence_plan::MAX_EVIDENCE_GROUPS_PER_ROLE)
+        .expect("the per-role evidence group cap is a small positive constant")
+}
 #[path="self_improve_review_source_ranges.rs"]
 mod source_ranges;
 #[path = "self_improve_review_group.rs"]
@@ -808,8 +905,18 @@ async fn run_impl(
         let mut stream=caller_plan.as_ref().map(|plan|plan.stream(&worktree));
         let mut batch_requests=requests.clone();
         let mut group_index=0usize;
-        loop {
+        'groups: loop {
         for original_request in &batch_requests {
+            // #2420: hard per-role cap; conclude from observed evidence.
+            if !evidence_plan::evidence_group_allowed(group_index) {
+                if let Some(workflow)=context.workflow {
+                    workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_bounded",
+                        "binding":binding,"role":role,"groups_observed":group_index,
+                        "cap":evidence_plan::MAX_EVIDENCE_GROUPS_PER_ROLE,"decision":"conclude_with_observed_evidence"}))?;
+                }
+                warn!(role=?role,groups=group_index,"independent review evidence group cap reached; concluding role from observed evidence");
+                break 'groups;
+            }
             let i=group_index; group_index+=1;
             let group=group_execution::execute_cached_evidence_group(group_execution::EvidenceGroupInput {
                 root:&worktree,inputs:&inputs,original_request,evidence_shards:&evidence_shards,
@@ -1053,10 +1160,27 @@ fn supplemental_context_matches(previous:&BTreeMap<String,String>,current:&BTree
     previous==current
 }
 
+/// Identical restatements merge. #2385: a reviewer that reuses an ID for
+/// different evidence (PR #2372 restated prior finding IDs) no longer fails
+/// the whole review: the later evidence keeps a deterministic distinct ID
+/// derived from its content, so no finding is hidden or merged away.
 fn deduplicate_findings(findings: Vec<aligned::Finding>) -> Result<Vec<aligned::Finding>> {
     let mut unique = BTreeMap::<String, aligned::Finding>::new();
-    for finding in findings {
+    for mut finding in findings {
         finding.validate()?;
+        if unique.get(&finding.id).is_some_and(|existing| {
+            existing.fingerprint().ok() != finding.fingerprint().ok()
+        }) {
+            let content = aligned::digest(&serde_json::to_vec(&(
+                &finding.criterion_id,
+                &finding.evidence_hash,
+                &finding.claim,
+                &finding.requested_change,
+                &finding.repair_target,
+            ))?);
+            finding.id = format!("{}~{}", finding.id, &content[..12]);
+            finding.validate()?;
+        }
         if let Some(existing) = unique.get_mut(&finding.id) {
             anyhow::ensure!(
                 existing.fingerprint()? == finding.fingerprint()?,
@@ -1425,6 +1549,45 @@ mod tests {
         assert!(err.to_string().contains("integrate current main"));
     }
 
+    /// #2418: the #2386 counter end to end through the durable guard, in the
+    /// production shape (pool codex,cerebras,claude; cerebras unconfigured;
+    /// two codex structured failures on head b260fb89). The next review runs
+    /// on claude with an audited `review_fallback`; another head starts at
+    /// zero. When the bound is reached but no alternate can serve, that is
+    /// audited as `review_fallback_unavailable` instead of passing silently.
+    #[tokio::test]
+    async fn structured_failures_switch_reviewer_or_audit_why_not() {
+        use augmentagent_channel_core::ProviderKind::{Cerebras, Claude, Codex};
+        let dir=candidate_fixture();
+        let control=tempfile::Builder::new().prefix("review-fallback-control-").tempdir_in("/tmp").unwrap();
+        let state=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&state,workflow::Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(2329),
+            pr:Some(2378),branch:"agent-fix/issue-2329",contract:"original owner contract",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let head="b260fb89e6fc8217e132623cc63b41348890935e";
+        let pool=[Codex,Cerebras,Claude];
+        let ready=|p| match p {Cerebras=>ReviewerStatus::NotConfigured("no key".into()),_=>ReviewerStatus::Ready};
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Codex,"no failures yet");
+        record_structured_failure(&guard,head,Codex);
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Codex,"one failure is not the bound");
+        record_structured_failure(&guard,head,Codex);
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,ready),Claude,"the 3rd review runs on claude");
+        assert_eq!(structured_review_fallback_with(&guard,&"c".repeat(40),Codex,&pool,ready),Codex,"failures are per head");
+        let latched=|p| match p {Claude=>ReviewerStatus::Latched(None),other=>ready(other)};
+        assert_eq!(structured_review_fallback_with(&guard,head,Codex,&pool,latched),Codex);
+        let records:Vec<serde_json::Value>=std::fs::read_to_string(guard.audit_logger().path()).unwrap().lines()
+            .map(|line|serde_json::from_str(line).unwrap()).collect();
+        let fallback:Vec<_>=records.iter().filter(|r|r["kind"]=="review_fallback").collect();
+        assert_eq!(fallback.len(),1);
+        assert_eq!((fallback[0]["from"].as_str(),fallback[0]["to"].as_str(),fallback[0]["head"].as_str()),(Some("codex"),Some("claude"),Some(head)));
+        let unavailable:Vec<_>=records.iter().filter(|r|r["kind"]=="review_fallback_unavailable").collect();
+        assert_eq!(unavailable.len(),1,"a due fallback that cannot switch must be visible");
+        assert_eq!(unavailable[0]["from"].as_str(),Some("codex"));
+        assert_eq!(unavailable[0]["candidates"]["claude"].as_str(),Some("latched"));
+        assert_eq!(unavailable[0]["candidates"]["cerebras"].as_str(),Some("unconfigured"));
+    }
+
     #[tokio::test]
     async fn review_unavailability_checkpoint_retains_typed_cause_without_private_details() {
         use crate::autoship_workflow::{WorkflowStore, Stage};
@@ -1776,6 +1939,18 @@ mod tests {
         assert!(pieces.iter().all(|p| p.len() <= 17));
     }
 
+    /// #2420: evidence-budget failures on one head count toward the claude
+    /// fallback like structured-validation failures; capacity, latches and a
+    /// moved main do not (another reviewer cannot fix those).
+    #[test]
+    fn evidence_failures_count_toward_the_reviewer_fallback() {
+        assert!(counts_toward_fallback(&ReviewUnavailable::RecoveryRequired { detail: "x".into() }));
+        assert!(counts_toward_fallback(&ReviewUnavailable::EvidenceBudget { detail: "x".into() }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::NoCapacity { reviewers: vec![], detail: "x".into() }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::Latched { until: vec![] }));
+        assert!(!counts_toward_fallback(&ReviewUnavailable::ProvenanceUnknown));
+    }
+
     #[test]
     fn identical_finding_ids_cannot_hide_new_evidence() {
         let first = aligned::Finding {
@@ -1796,8 +1971,21 @@ mod tests {
         let mut linked=first.clone();linked.conflicts_with.insert("F2".into());linked.repair_rounds=2;
         let merged=deduplicate_findings(vec![first.clone(),linked]).unwrap();
         assert!(merged[0].conflicts_with.contains("F2"));assert_eq!(merged[0].repair_rounds,2);
+        // #2385 (PR #2372, 2026-11-21 01:29Z): a reviewer restated prior
+        // finding ID F1 with different evidence. The new evidence is kept
+        // under a deterministic distinct ID instead of failing the review.
         let mut changed = first.clone();
         changed.evidence_hash = "proof2".into();
-        assert!(deduplicate_findings(vec![first, changed]).is_err());
+        let kept = deduplicate_findings(vec![first.clone(), changed.clone()]).unwrap();
+        assert_eq!(kept.len(), 2, "neither restatement may be hidden");
+        assert!(kept.iter().any(|f| f == &first), "the first holder keeps its ID");
+        let renamed = kept.iter().find(|f| f.id != "F1").unwrap();
+        assert!(renamed.id.starts_with("F1~"), "{}", renamed.id);
+        assert_eq!(renamed.evidence_hash, "proof2");
+        let again = deduplicate_findings(vec![first.clone(), changed.clone()]).unwrap();
+        assert_eq!(kept, again, "renumbering is deterministic");
+        // The same restatement seen again merges with its renumbered copy.
+        let thrice = deduplicate_findings(vec![first, changed.clone(), changed]).unwrap();
+        assert_eq!(thrice.len(), 2);
     }
 }

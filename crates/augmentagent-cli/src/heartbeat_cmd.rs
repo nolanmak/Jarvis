@@ -1,16 +1,17 @@
-//! `augmentagent heartbeat run-once|status` (#1317).
+//! `augmentagent heartbeat run-once|status|items|done|snooze` (#1317, #2285).
 //!
-//! `run-once` drives the same gates as the daemon's loop, so it is both the
-//! manual "wake now" and the way to try a checklist before enabling the
-//! loop (`--dry-run --force`). `status --check` is the liveness probe: it
-//! exits 1 when an enabled heartbeat has gone quiet, for cron or an
-//! external healthcheck to alert on.
+//! `run-once` drives the same gates as the daemon's daily sweep, so it is
+//! both the manual "sweep now" and the way to try a checklist before
+//! enabling the loop (`--dry-run --force`). `status --check` is the
+//! liveness probe: it exits 1 when an enabled heartbeat has gone quiet, for
+//! cron or an external healthcheck to alert on. `done` and `snooze` take the
+//! short ref printed on a notice item.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use augmentagent_heartbeat::store_ext::{HeartbeatRun, HeartbeatStore};
+use augmentagent_heartbeat::store_ext::{item_state, HeartbeatItem, HeartbeatRun, HeartbeatStore};
 use augmentagent_heartbeat::{checklist, HeartbeatConfig, HeartbeatRunner, RunOptions, RunReport};
 use augmentagent_store::Store;
 use clap::Subcommand;
@@ -18,10 +19,10 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HeartbeatOp {
-    /// Run one heartbeat now through the normal gates.
+    /// Run one sweep now through the normal gates.
     RunOnce {
-        /// Ignore the interval and active hours. The checklist, notice cap,
-        /// duplicate check and lease still apply.
+        /// Ignore the daily schedule and active hours. The checklist, notice
+        /// cap, item dedup and lease still apply.
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Ask the model but deliver nothing and record nothing.
@@ -34,10 +35,25 @@ pub enum HeartbeatOp {
     Status {
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Exit 1 when the heartbeat is enabled but has not run for three
-        /// intervals inside active hours.
+        /// Exit 1 when the heartbeat is enabled but has not run for over a
+        /// day inside active hours.
         #[arg(long, default_value_t = false)]
         check: bool,
+    },
+    /// List items the sweep surfaced, and their state.
+    Items {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a surfaced item done (by the ref on the notice, or its key).
+    Done { id: String },
+    /// Hide a surfaced item, then show it again after `for` (`3d`, `12h`).
+    Snooze {
+        id: String,
+        #[arg(long = "for", default_value = "3d")]
+        duration: String,
     },
 }
 
@@ -66,7 +82,8 @@ struct ChecklistView {
 #[derive(Serialize)]
 struct StatusView {
     enabled: bool,
-    interval_secs: u64,
+    sweep_at: String,
+    max_items: usize,
     active_hours: Option<String>,
     tz: Option<String>,
     daily_cap: u32,
@@ -76,6 +93,7 @@ struct StatusView {
     stale: bool,
     last_run: Option<HeartbeatRun>,
     runs: Vec<HeartbeatRun>,
+    items: Vec<HeartbeatItem>,
 }
 
 pub async fn run(cli: &crate::Cli, store: Arc<Store>, op: &HeartbeatOp) -> Result<()> {
@@ -117,13 +135,82 @@ pub async fn run(cli: &crate::Cli, store: Arc<Store>, op: &HeartbeatOp) -> Resul
             }
             if check && view.stale {
                 if !json {
-                    eprintln!("heartbeat is stale: no run in the last three intervals");
+                    eprintln!("heartbeat is stale: no sweep attempted in over a day");
                 }
                 std::process::exit(1);
             }
             Ok(())
         }
+        HeartbeatOp::Items { limit, json } => {
+            let items = store.recent_items(limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if items.is_empty() {
+                println!("no surfaced items yet");
+            } else {
+                for item in &items {
+                    println!("{}", describe_item(item));
+                }
+            }
+            Ok(())
+        }
+        HeartbeatOp::Done { ref id } => {
+            let item = one_item(&store, id)?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            store.set_item_state(&item.item_key, item_state::DONE, None, now_ms)?;
+            println!(
+                "done: {}",
+                item.summary.as_deref().unwrap_or(&item.item_key)
+            );
+            Ok(())
+        }
+        HeartbeatOp::Snooze {
+            ref id,
+            ref duration,
+        } => {
+            let secs = augmentagent_approval_discord::parse_interval(duration)
+                .filter(|s| *s > 0)
+                .with_context(|| format!("`{duration}` is not a duration like 3d or 12h"))?;
+            let item = one_item(&store, id)?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let until = now_ms + secs * 1000;
+            store.set_item_state(&item.item_key, item_state::SNOOZED, Some(until), now_ms)?;
+            println!(
+                "snoozed until {}: {}",
+                local_time(until),
+                item.summary.as_deref().unwrap_or(&item.item_key)
+            );
+            Ok(())
+        }
     }
+}
+
+/// The one item `id` (a ref or a key) names.
+fn one_item(store: &Store, id: &str) -> Result<HeartbeatItem> {
+    let mut found = store.find_items(id.trim())?;
+    match found.len() {
+        0 => anyhow::bail!("no heartbeat item `{id}`; see `augmentagent heartbeat items`"),
+        1 => Ok(found.remove(0)),
+        n => anyhow::bail!(
+            "`{id}` matches {n} items; use the full key from `heartbeat items --json`"
+        ),
+    }
+}
+
+fn describe_item(item: &HeartbeatItem) -> String {
+    let mut line = format!(
+        "{}  {:<8} {}",
+        item.item_ref,
+        item.state,
+        item.summary.as_deref().unwrap_or(&item.item_key)
+    );
+    if let Some(until) = item
+        .snooze_until_ms
+        .filter(|_| item.state == item_state::SNOOZED)
+    {
+        line.push_str(&format!("  (until {})", local_time(until)));
+    }
+    line
 }
 
 fn status_view(
@@ -135,7 +222,8 @@ fn status_view(
     let now = chrono::Utc::now();
     Ok(StatusView {
         enabled: config.enabled,
-        interval_secs: config.interval.as_secs(),
+        sweep_at: config.sweep_at_label(),
+        max_items: config.max_items,
         active_hours: config.active_hours.map(|w| w.to_string()),
         tz: config.tz.map(|tz| tz.name().to_string()),
         daily_cap: config.daily_cap,
@@ -148,6 +236,7 @@ fn status_view(
         stale: config.is_stale(store.last_attempt_ms()?, now),
         last_run: runs.first().cloned(),
         runs,
+        items: store.recent_items(10)?,
     })
 }
 
@@ -181,6 +270,9 @@ fn describe_report(report: &RunReport) -> String {
     if let Some(decision) = &report.decision {
         line.push_str(&format!(" · decision {decision}"));
     }
+    if let Some(n) = report.candidates {
+        line.push_str(&format!(" · {n} candidates"));
+    }
     if let Some(message) = &report.message {
         line.push_str(&format!("\n{message}"));
     }
@@ -203,9 +295,10 @@ fn print_status(view: &StatusView) {
         (None, _) => "active all day".into(),
     };
     println!(
-        "heartbeat: {} · every {}m · {window} · cap {}/day · timeout {}s",
+        "heartbeat: {} · daily sweep at {} · up to {} items · {window} · cap {}/day · timeout {}s",
         if view.enabled { "enabled" } else { "disabled" },
-        view.interval_secs / 60,
+        view.sweep_at,
+        view.max_items,
         view.daily_cap,
         view.timeout_secs,
     );
@@ -225,7 +318,13 @@ fn print_status(view: &StatusView) {
         println!("warning: {warning}");
     }
     if view.stale {
-        println!("STALE: no run in the last three intervals");
+        println!("STALE: no sweep attempted in over a day");
+    }
+    if !view.items.is_empty() {
+        println!("recent items (heartbeat done|snooze <ref>):");
+        for item in &view.items {
+            println!("  {}", describe_item(item));
+        }
     }
     if view.runs.is_empty() {
         println!("no runs yet");
@@ -287,6 +386,29 @@ mod tests {
                     json: true
                 }
             }
+        ));
+        let cli = crate::Cli::try_parse_from([
+            "augmentagent",
+            "heartbeat",
+            "snooze",
+            "a1b2c3",
+            "--for",
+            "7d",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            crate::Cmd::Heartbeat {
+                op: HeartbeatOp::Snooze { ref id, ref duration }
+            } if id == "a1b2c3" && duration == "7d"
+        ));
+        let cli =
+            crate::Cli::try_parse_from(["augmentagent", "heartbeat", "done", "a1b2c3"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            crate::Cmd::Heartbeat {
+                op: HeartbeatOp::Done { ref id }
+            } if id == "a1b2c3"
         ));
         let cli =
             crate::Cli::try_parse_from(["augmentagent", "heartbeat", "status", "--check"]).unwrap();

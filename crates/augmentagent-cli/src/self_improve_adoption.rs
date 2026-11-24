@@ -201,10 +201,10 @@ pub(super) fn episode_retries(
             result.insert(candidate.pr);
             continue;
         }
-        let retry_requested=matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
-            (crate::autoship_workflow::Stage::Verify,"verification_infrastructure_retry","retry_verification")
-            | (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
-            | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
+        let retry_requested=crate::autoship_workflow::retry_recovery::class(&snapshot.checkpoint).is_some()
+            || matches!((snapshot.checkpoint.stage,snapshot.checkpoint.next.reason.as_str(),snapshot.checkpoint.next.action.as_str()),
+                (crate::autoship_workflow::Stage::Publish,"bound_push_recovered","resume_preserved_work")
+                | (crate::autoship_workflow::Stage::Held,"automatic_pr_routing_held","retry_automatic_pr_routing"));
         let owned_candidate=(recovered.contains(&id) || retry_requested)
             && snapshot.pr==Some(candidate.pr)
             && snapshot.branch==candidate.branch && candidate.ready_for_review()
@@ -322,6 +322,187 @@ pub(super) async fn policy_reconciliation_retries(
     Ok(retries)
 }
 
+/// #2432 — open PRs whose workflow is already in flight and due. These pass
+/// the #851 daily ledger: it caps fresh starts, while resumed work is paced by
+/// its own lease and `eligible_at` backoff. A PR with no workflow record has
+/// no backoff of its own, so the ledger still paces it.
+pub(super) fn in_flight_retries(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    now: i64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(Default::default());
+    };
+    let mut result = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
+            continue;
+        };
+        let Some(snapshot) = store.snapshot(&id)? else {
+            continue;
+        };
+        if candidate_source_matches(&id, candidate)
+            && snapshot.pr == Some(candidate.pr)
+            && snapshot.lease_until_ms <= now
+            && snapshot.checkpoint.next.eligible_at_ms <= now
+            && crate::autoship_workflow::resumes_existing_work(&snapshot)
+        {
+            result.insert(candidate.pr);
+        }
+    }
+    Ok(result)
+}
+
+/// #2495 — how close a due own PR is to merging. Lower runs first: the PR
+/// lane finishes work before it starts work. Only a scheduling rank; review,
+/// CI and merge authority are still decided by the resumed workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum FinishTier {
+    /// Every check on the bound head is green; only review or finalize remain.
+    GreenAwaitingReview,
+    /// At publish or waiting on hosted CI, and due.
+    PublishOrCiPending,
+    /// Any other due own-PR work (scope, build, ...): the #1532 rotation.
+    Other,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FinishPlan {
+    /// Due candidates ranked above [`FinishTier::Other`].
+    pub tiers: std::collections::BTreeMap<u64, FinishTier>,
+    /// `(workflow, bound head)` whose CI poll the green checks already answered.
+    pub expedite: Vec<(String, String)>,
+}
+
+/// Every non-advisory check in the shared inventory row's `statusCheckRollup`
+/// finished green. Missing, empty or unknown rows are not green.
+pub(super) fn rollup_green(row: &serde_json::Value) -> bool {
+    let Some(checks) = row.get("statusCheckRollup").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let text = |check: &serde_json::Value, key: &str| check.get(key).and_then(serde_json::Value::as_str).map(str::to_owned);
+    let mut required = checks.iter().filter(|check| {
+        !text(check, "name").or_else(|| text(check, "context")).is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit"))
+    }).peekable();
+    required.peek().is_some() && required.all(|check| match text(check, "__typename").as_deref() {
+        Some("CheckRun") => text(check, "status").as_deref() == Some("COMPLETED")
+            && matches!(text(check, "conclusion").as_deref(), Some("SUCCESS" | "SKIPPED" | "NEUTRAL")),
+        Some("StatusContext") => text(check, "state").as_deref() == Some("SUCCESS"),
+        _ => false,
+    })
+}
+
+/// Rank due own PRs from the tick's one PR inventory (no extra GitHub calls).
+/// Applies the same ownership, lease and in-flight checks as
+/// [`in_flight_retries`]; a green bound head also ends a `hosted_ci_pending`
+/// poll early, since the poll exists only to wait for that answer.
+pub(super) fn finish_plan(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    prs: &serde_json::Value,
+    now: i64,
+) -> Result<FinishPlan> {
+    use crate::autoship_workflow::{Stage, HOSTED_CI_PENDING_REASON};
+    let mut plan = FinishPlan::default();
+    let Some(store) = WorkflowStore::open_read_only(path)? else {
+        return Ok(plan);
+    };
+    let rows = prs.as_array().map(Vec::as_slice).unwrap_or_default();
+    for candidate in candidates.iter().filter(|c| c.ready_for_review()) {
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else { continue };
+        let Some(snapshot) = store.snapshot(&id)? else { continue };
+        if !candidate_source_matches(&id, candidate)
+            || snapshot.pr != Some(candidate.pr)
+            || snapshot.lease_until_ms > now
+            || !crate::autoship_workflow::resumes_existing_work(&snapshot)
+        {
+            continue;
+        }
+        let checkpoint = &snapshot.checkpoint;
+        let row = rows.iter().find(|row| row.get("number").and_then(serde_json::Value::as_u64) == Some(candidate.pr));
+        let green = row.is_some_and(|row| {
+            row.get("headRefOid").and_then(serde_json::Value::as_str) == Some(checkpoint.binding.head.as_str())
+                && candidate.head == checkpoint.binding.head
+                && rollup_green(row)
+        });
+        let ci_pending = checkpoint.next.reason == HOSTED_CI_PENDING_REASON
+            && checkpoint.next.action == "retry_verification";
+        let expedite = green && ci_pending && checkpoint.next.eligible_at_ms > now;
+        if checkpoint.next.eligible_at_ms > now && !expedite {
+            continue;
+        }
+        let tier = if green && matches!(checkpoint.stage, Stage::Review | Stage::Reconcile | Stage::AwaitChecks) {
+            FinishTier::GreenAwaitingReview
+        } else if ci_pending || matches!(checkpoint.stage, Stage::Publish | Stage::AwaitChecks) {
+            FinishTier::PublishOrCiPending
+        } else {
+            continue;
+        };
+        if expedite {
+            plan.expedite.push((id, checkpoint.binding.head.clone()));
+        }
+        plan.tiers.insert(candidate.pr, tier);
+    }
+    Ok(plan)
+}
+
+/// #2512 — an own-PR rescope stop whose issue request or main moved since it
+/// stopped is due now, before the eligibility gates below skip it for a day.
+/// `request` and `main` come from data the tick already has (the open-issue
+/// listing and the local `origin/main` ref): no GitHub reads.
+pub(super) fn wake_changed_rescope_stops(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    request: impl Fn(&AdoptedPr) -> Option<String>,
+    main: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut stops = Vec::new();
+    {
+        let Some(store) = WorkflowStore::open_read_only(path)? else { return Ok(Vec::new()) };
+        for candidate in candidates {
+            let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else { continue };
+            let Some(snapshot) = store.snapshot(&id)? else { continue };
+            if candidate_source_matches(&id, candidate)
+                && snapshot.pr == Some(candidate.pr)
+                && snapshot.lease_until_ms <= now
+                && snapshot.checkpoint.next.eligible_at_ms > now
+                && super::acceptance::own_pr_rescope::exhausted(&snapshot.checkpoint)
+            {
+                stops.push((id, request(candidate)));
+            }
+        }
+    }
+    let mut woken = Vec::new();
+    if stops.is_empty() {
+        return Ok(woken);
+    }
+    let mut store = WorkflowStore::open(path)?;
+    for (id, request) in stops {
+        if store.expedite_changed_rescope_stop(&id, request.as_deref(), main, now)? {
+            woken.push(id);
+        }
+    }
+    Ok(woken)
+}
+
+/// The oldest due PR of the nearest-to-done tier, or `None` when nothing is
+/// near done. `tiers` members are due in-flight work and belong in `retries`.
+pub(super) fn select_finishing(
+    candidates: &[AdoptedPr],
+    ledger: &AttemptLedger,
+    today: u64,
+    only: Option<u64>,
+    retries: &std::collections::BTreeSet<u64>,
+    tiers: &std::collections::BTreeMap<u64, FinishTier>,
+) -> Option<(u64, u64, String)> {
+    [FinishTier::GreenAwaitingReview, FinishTier::PublishOrCiPending].into_iter().find_map(|tier| {
+        let pool: Vec<AdoptedPr> = candidates.iter().filter(|c| tiers.get(&c.pr) == Some(&tier)).cloned().collect();
+        select_linked_with_retries(&pool, ledger, today, &Default::default(), only, 0, retries)
+    })
+}
+
 pub(super) fn select_linked_with_retries(
     candidates: &[AdoptedPr],
     ledger: &AttemptLedger,
@@ -404,6 +585,21 @@ pub(super) async fn preflight(repo_root: &Path, pr: u64, branch: &str) -> Result
     Ok(true)
 }
 
+/// #2408: a candidate that does not descend from the PR head its workflow is
+/// bound to. Provenance, never infrastructure: it is re-based by resuming on
+/// the PR lane's checkout of that head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CandidateProvenanceDiverged {
+    pub adopted_head: String,
+    pub candidate_head: String,
+}
+impl std::fmt::Display for CandidateProvenanceDiverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("candidate is not a descendant of trusted adopted head")
+    }
+}
+impl std::error::Error for CandidateProvenanceDiverged {}
+
 /// Authorize the actual local descendant, never invent historical providers.
 pub(super) async fn origin_for_candidate(
     worktree: &Path,
@@ -443,10 +639,13 @@ pub(super) async fn origin_for_candidate(
         worktree,
     )
     .await?;
-    anyhow::ensure!(
-        descendant,
-        "candidate is not a descendant of trusted adopted head"
-    );
+    if !descendant {
+        return Err(CandidateProvenanceDiverged {
+            adopted_head: owned.head.clone(),
+            candidate_head: head.into(),
+        }
+        .into());
+    }
     let receipt = WorkflowStore::open(&workflow::path())?.issue_imported_origin(
         &owned.repository,
         pr,
@@ -484,6 +683,35 @@ pub(super) async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_prs_pass_the_daily_ledger_and_fresh_starts_do_not() {
+        use crate::autoship_workflow::{Binding,Checkpoint,NextAction,Stage,workflow_id};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let candidate=|issue:u64,pr:u64|AdoptedPr {repository:"owner/repo".into(),pr,source_issue:Some(issue),branch:format!("agent-fix/issue-{issue}"),
+            head:"a".repeat(40),base:"main".into(),author:"owner".into(),title:"t".into(),body:"b".into(),dependency:Dependency::Main};
+        // (issue, pr, stage, eligible_at): #2360's exact shape, a not-yet-due
+        // reconcile, and a scope-stage workflow that never attached its PR.
+        for (issue,pr,stage,attach,eligible) in [(7,42,Stage::Verify,true,0),(8,43,Stage::Reconcile,true,5_000),(9,44,Stage::Scope,false,0)] {
+            let id=workflow_id("owner/repo",issue).unwrap();
+            let binding=Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+            store.register(&id,&format!("agent-fix/issue-{issue}"),binding.clone(),0).unwrap();
+            let lease=store.claim(&id,"worker",0,1).unwrap().unwrap();
+            if attach {store.attach_pr_in_repo(&lease,"owner/repo",pr,0).unwrap();}
+            store.checkpoint(&lease,&Checkpoint {stage,binding,evidence:vec![],
+                next:NextAction {reason:"integration_checks_required".into(),action:"verify_integrated_head".into(),eligible_at_ms:eligible}},0).unwrap();
+            store.release(&lease,0).unwrap();
+        }
+        let candidates=vec![candidate(7,42),candidate(8,43),candidate(9,44),candidate(10,45)];
+        let ledger=AttemptLedger {day:100,issues:vec![7,8,9,10]};
+        let retries=in_flight_retries(&path,&candidates,1_000).unwrap();
+        assert_eq!(retries,[42].into_iter().collect(),"only the due in-flight PR is exempt");
+        assert_eq!(select_linked_with_retries(&candidates,&ledger,100,&Default::default(),None,0,&retries),
+            Some((42,7,"agent-fix/issue-7".into())),"a verify-stage PR sat behind the daily ledger (#2360, 2026-11-21)");
+        assert_eq!(in_flight_retries(&dir.path().join("missing.db"),&candidates,1_000).unwrap(),Default::default());
+    }
+
     #[test]
     fn due_owned_retries_survive_the_same_day_marker() {
         use crate::autoship_workflow::{Binding,NextAction,OperationKind,ResourceCharge,Stage};
@@ -708,3 +936,11 @@ mod review_recovery_regression {
             "review capacity hold disappeared behind the daily attempt filter instead of returning to guarded preflight");
     }
 }
+
+#[cfg(test)]
+#[path="self_improve_retry_adoption_tests.rs"]
+mod retry_adoption_tests;
+
+#[cfg(test)]
+#[path="self_improve_finish_first_tests.rs"]
+mod finish_first_tests;

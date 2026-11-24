@@ -4,9 +4,46 @@ use crate::autoship_workflow::{Snapshot, Stage};
 
 const REPEATED_SCOPE_CLAIMS:u64=3;
 
-fn scope_retry_age(snapshot:Option<&Snapshot>)->i64 {
-    snapshot.filter(|s|s.checkpoint.stage==Stage::Scope && s.attempts>=REPEATED_SCOPE_CLAIMS)
+/// #2394: a publication retry is stalled only once it has retried this long
+/// without meaningful progress. Claims spent on scope, build and review before
+/// the push are not a stalled publication (#2329 had six).
+const PUBLISH_STALL_MS:i64=30*60*1000;
+
+fn retry_age(snapshot:Option<&Snapshot>)->i64 {
+    snapshot.filter(|s|!publish_retry(Some(s)) || s.heartbeat_at_ms.saturating_sub(s.progress_at_ms)>=PUBLISH_STALL_MS)
+        .filter(|s|s.attempts>=REPEATED_SCOPE_CLAIMS && (s.checkpoint.stage==Stage::Scope
+        || (!matches!(s.checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired) && matches!(s.checkpoint.next.reason.as_str(),
+            "resource_capacity"|"verification_infrastructure_retry"|"publishing_revision"|"acceptance_registration_retry"))))
         .map_or(0,|s|s.heartbeat_at_ms.max(1))
+}
+
+/// #2279 — a candidate that was built, verified and reviewed but whose push
+/// never landed is the cheapest finished work: it needs no model call.
+pub(super) fn publish_retry(snapshot:Option<&Snapshot>)->bool {
+    snapshot.is_some_and(|s|s.checkpoint.stage==Stage::Publish
+        && s.checkpoint.next.reason=="publishing_revision" && s.checkpoint.next.action=="push")
+}
+
+/// Issues whose durable workflow awaits only a publication retry. These are
+/// exempt from the same-day attempt marker, like other recovery retries.
+pub(super) fn publish_retries(issues:&[RestIssue],controls:&workflow::FreshIssueControls,repository:&str)
+    ->std::collections::BTreeSet<u64> {
+    issues.iter().filter(|issue|publish_retry(controls.selection_snapshot(repository,issue.number).ok().flatten().as_ref()))
+        .map(|issue|issue.number).collect()
+}
+
+/// #2373: a due repeated retry yields to fresh peers, but only for this long
+/// after its last activity. Past it the retry goes ahead of fresh work, oldest
+/// first, so a busy queue can delay a capacity wait but never starve it. The
+/// picker takes the first viable candidate, so pure yielding meant twelve due
+/// reviewer-capacity rows were never selected while new issues kept arriving.
+const RETRY_STARVATION_MS:i64=2*60*60*1000;
+
+/// Sort key for one due candidate; lower is picked first.
+fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,i64,bool) {
+    let age=retry_age(snapshot);
+    let starved=age>0 && now.saturating_sub(age)>=RETRY_STARVATION_MS;
+    (!(publish_retry(snapshot) && age==0),!starved,research_filed,age,!recovered)
 }
 
 pub(super) fn candidates(
@@ -40,12 +77,19 @@ pub(super) fn candidates(
             }
         }
         // Preserve human/research and genuine recovery priorities. After
-        // three scope claims, a repeatedly deferred issue yields to less
+        // three claims, a repeatedly deferred issue yields to less
         // attempted peers; among such retries, the least recently active goes
         // first. Durable lease activity survives restart, unlike a poll cursor.
-        let key=(issue.research_filed,!recovered.contains(&issue.number),scope_retry_age(snapshot.as_ref()));
+        // #2279 — a due publication retry is finished work and goes first.
+        // A publication retry that has itself stalled (#2280's repeated-claim
+        // tier) keeps rotating with its peers instead of starving them.
+        let key=rank(snapshot.as_ref(),issue.research_filed,recovered.contains(&issue.number),now);
         ranked.push((key,issue));
     }
     ranked.sort_by_key(|(key,_)|*key);
     Ok(ranked.into_iter().map(|(_,issue)|issue).collect())
 }
+
+#[cfg(test)]
+#[path="self_improve_retry_rotation_tests.rs"]
+mod retry_rotation_tests;

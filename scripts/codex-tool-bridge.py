@@ -921,6 +921,25 @@ def literal_command_argv(command):
     return argv
 
 
+TABAGENT_READS = frozenset('mcp__tabagent__' + leaf for leaf in (
+    'page_snapshot', 'page_markdown', 'page_text', 'page_find', 'extract_table', 'extract_links'))
+TABAGENT_REPEATABLE = frozenset('mcp__tabagent__' + leaf for leaf in (
+    'act_click', 'act_type', 'act_press', 'act_select', 'act_check', 'act_hover',
+    'act_scroll', 'act_fill', 'form_fill', 'nav_goto', 'tabs', 'dialog_handle'))
+
+
+def repeatable_operation(name):
+    """Mutations whose identical repeat is a new, intended action (#2519).
+
+    Clicking the same ref after a scroll, scrolling twice or pressing a key
+    again are ordinary browser steps, so a completed or failed receipt must
+    not refuse or replace them. They stay journaled, so an unanswered
+    (`started`) one still requires reconciliation. form_submit is excluded:
+    an identical repeat is most likely a real double submission.
+    """
+    return name in TABAGENT_REPEATABLE
+
+
 def read_only_operation(name, arguments):
     """Known read contracts, not server-supplied advisory annotations.
 
@@ -932,6 +951,10 @@ def read_only_operation(name, arguments):
     # Their own permission hooks and operation contracts still apply on invocation.
     if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch', 'ToolSearch'):
         return True
+    # #2202: the Jarvis web tools only read. Explicit names, like the memory
+    # tools below; mcp__web__set_provider writes a pin and stays a mutation.
+    if name in ('mcp__web__search', 'mcp__web__fetch'):
+        return True
     # Browser jobs are asynchronous. Caching a status read as an external
     # mutation freezes the first "running" receipt forever. Keep the exact
     # status contract live; start/cancel/resume retain mutation protection.
@@ -939,6 +962,16 @@ def read_only_operation(name, arguments):
         return (arguments.get('operation') == 'status'
                 and isinstance(arguments.get('taskId'), str)
                 and set(arguments) == {'operation', 'taskId'})
+    # #2519: TabAgent page reads observe the live page. A second identical
+    # read after the page changes is a new observation, not a replayed
+    # effect. Explicit names; navigation and actions stay mutations.
+    if name in TABAGENT_READS:
+        return True
+    if name == 'mcp__tabagent__nav_wait':
+        # for=fn runs page JavaScript (the Jarvis proxy refuses it too).
+        return isinstance(arguments.get('for'), str) and arguments['for'] != 'fn'
+    if name == 'mcp__tabagent__tabs':
+        return arguments == {'action': 'list'}
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
     if name in ('mcp__memory__memory_search', 'mcp__memory__memory_recent',
@@ -1172,7 +1205,8 @@ class HandoffJournal:
     def execute(self, name, arguments, action):
         with self.locked():
             state = self.load()
-            for row in reversed(state['operations']):
+            # A repeatable action has no earlier receipt to return or retry.
+            for row in ([] if repeatable_operation(name) else reversed(state['operations'])):
                 if same_operation(row, name, arguments):
                     if row['status'] in ('not_applied', 'refused'):
                         break  # proven not run; preserve this row and append a new attempt
@@ -1225,10 +1259,13 @@ class HandoffJournal:
             if phase == 'PreToolUse':
                 if matching or any(row['status'] == 'started' for row in state['operations']):
                     raise ReconciliationRequired('unfinished primary operation requires reconciliation')
-                if any(row['status'] == 'failed' and same_operation(row, name, arguments)
+                # The primary saw its own earlier result; repeating a browser
+                # UI step is intended. Unanswered rows still block above.
+                repeatable = repeatable_operation(name)
+                if not repeatable and any(row['status'] == 'failed' and same_operation(row, name, arguments)
                        for row in state['operations']):
                     raise ReconciliationRequired('failed primary operation requires reconciliation before a retry')
-                if external_operation(name, arguments) and any(
+                if not repeatable and external_operation(name, arguments) and any(
                         same_operation(row, name, arguments)
                         and row['status'] == 'completed' for row in state['operations']):
                     raise CompletedOperation('external operation already completed for this request; use its prior receipt instead of repeating it')
@@ -1320,6 +1357,12 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        # #2217: a scratch-workspace profile. Its allowlisted host commands
+        # still run in the kernel sandbox with no network, but may write
+        # inside the policy's write roots, and they receive a fixed minimal
+        # environment instead of the profile's integration environment.
+        # Every other profile keeps read-only host commands.
+        self.workspace_shell = config.get('workspace_shell', False) is True
         self.write_files = set()
         for filename in config.get('write_files', []):
             path = Path(filename)
@@ -2058,6 +2101,9 @@ class Policy:
             snapshot = BuildSnapshot(self, directory / 'workspace') if build else None
             run_cwd = snapshot.root if snapshot else self.cwd
             run_env = dict(self.environment)
+            workspace_shell = self.workspace_shell and not service and not build
+            if workspace_shell:
+                run_env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(self.cwd), 'LANG': 'C.UTF-8'}
             runtime_reads = [str(resolved_executable)]
             dependency_roots = []
             if Path(argv[0]).name == 'git':
@@ -2160,7 +2206,8 @@ class Policy:
             policy_file = directory / 'policy.json'
             policy_file.write_text(json.dumps({'cwd': str(run_cwd),
                 'read_roots': [str(run_cwd), *dependency_roots] if snapshot else [str(p) for p in self.read_roots],
-                'write_roots': [str(run_cwd)] if snapshot else [],
+                'write_roots': [str(run_cwd)] if snapshot else (
+                    [str(p) for p in self.write_roots] if workspace_shell else []),
                 'runtime_reads': runtime_reads}))
             policy_file.chmod(0o600)
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:

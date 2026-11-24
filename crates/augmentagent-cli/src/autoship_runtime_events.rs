@@ -183,6 +183,26 @@ pub(super) fn project(
 impl WorkflowStore {
     /// All nonterminal shipping workflows. Read-only, no migration/backfill or
     /// inferred heartbeat progress. Missing legacy records mean unknown coverage.
+    /// #2373: when `workflow` entered its current, unbroken CapacityWait,
+    /// from its runtime event history (bounded scan). None when not waiting.
+    pub fn capacity_wait_since(&self, workflow: &str) -> Result<Option<i64>> {
+        if !exists(&self.conn)? {
+            return Ok(None);
+        }
+        let mut query = self.conn.prepare(
+            "SELECT payload FROM workflow_runtime_event WHERE workflow=?1 ORDER BY sequence DESC LIMIT 4096",
+        )?;
+        let rows = query.query_map([workflow], |r| r.get::<_, String>(0))?;
+        let mut since = None;
+        for raw in rows {
+            let event: WorkflowEvent = serde_json::from_str(&raw?)?;
+            if event.outcome != WorkflowOutcome::CapacityWait {
+                break;
+            }
+            since = Some(event.occurred_at_ms);
+        }
+        Ok(since)
+    }
     pub fn latest_workflow_events(&self, _now_ms: i64) -> Result<(Vec<WorkflowEvent>, bool)> {
         if !exists(&self.conn)? {
             return Ok((Vec::new(), false));

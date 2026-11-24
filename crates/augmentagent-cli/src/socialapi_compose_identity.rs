@@ -33,6 +33,54 @@ pub(super) fn prepare_card(
     Ok(email)
 }
 
+/// #2331 — pending owner-composed DM cards for `conversation`, oldest first:
+/// the cards a follow-up `socialapi dm --post` replaces. Only compose cards
+/// (the synthetic `compose:socialapi:dm:<conversation>` identity, with or
+/// without the per-card suffix), never the triage card for an inbound
+/// message, and never a card already armed with a send time.
+/// Cards created in the same millisecond keep their insertion order (ids are
+/// random, so ordering by id shuffled them).
+pub(super) fn pending_compose_cards(store: &Store, conversation: &str) -> Result<Vec<String>> {
+    let base = format!("compose:socialapi:dm:{conversation}");
+    let prefix = format!("{base}:");
+    Ok(store.with_conn(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT a.id FROM actions a JOIN emails e ON e.messageId = a.messageId
+            WHERE e.platform = 'socialapi' AND e.kind = 'dm' AND a.threadId = ?1
+              AND a.status = 'pending' AND a.scheduledAtMs IS NULL
+              AND (e.messageId = ?2 OR substr(e.messageId, 1, length(?3)) = ?3)
+            ORDER BY a.createdAt, a.rowid",
+        )?;
+        let rows = statement.query_map(
+            augmentagent_store::rusqlite::params![conversation, base, prefix],
+            |row| row.get(0),
+        )?;
+        rows.collect()
+    })?)
+}
+
+/// #2331 — retire the cards a follow-up compose replaced. Returns the ids
+/// actually retired: a card the owner approved or skipped in the meantime is
+/// left alone.
+pub(super) fn supersede_prior_compose_cards(store: &Store, prior: &[String]) -> Vec<String> {
+    prior
+        .iter()
+        .filter(|id| {
+            match store.mark_pending_superseded_by_ids(
+                std::slice::from_ref(*id),
+                "superseded by follow-up compose",
+            ) {
+                Ok(n) => n == 1,
+                Err(e) => {
+                    tracing::warn!(action_id = %id, "follow-up social DM: failed to supersede: {e}");
+                    false
+                }
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 fn conversation_account(store: &Store, thread: &str, requested: Option<&str>) -> Result<String> {
     let known: Vec<String> = store.with_conn(|conn| {
         let mut statement = conn.prepare(
@@ -288,5 +336,53 @@ mod tests {
                 .status,
             "pending"
         );
+    }
+
+    #[test]
+    fn a_follow_up_compose_retires_only_earlier_pending_compose_cards_for_that_conversation() {
+        let (_dir, store) = fixture();
+        // The inbound triage card for the same conversation is not a compose card.
+        let inbound = social_card_row("socialapi", "dm", "synthetic-trigger", CONVERSATION,
+            Some("synthetic-account"), "Synthetic peer", "Synthetic DM", "Synthetic context");
+        let triage = action(&store, &inbound);
+        // A pre-suffix legacy compose card and two current ones.
+        let legacy = social_card_row("socialapi", "dm", COMPOSE, CONVERSATION,
+            Some("synthetic-account"), "Synthetic peer", "Synthetic DM", "Synthetic context");
+        let legacy = action(&store, &legacy);
+        let first = action(&store, &card(&store, None));
+        let second = action(&store, &card(&store, None));
+        // A compose card for another conversation, and one already scheduled.
+        let other = social_card_row("socialapi", "dm", "compose:socialapi:dm:synthetic-conversation-2:x",
+            "synthetic-conversation-2", Some("synthetic-account"), "Other", "DM", "Context");
+        let other = action(&store, &other);
+        let scheduled = action(&store, &card(&store, None));
+        store.with_conn(|c| c.execute("UPDATE actions SET scheduledAtMs = 1 WHERE id = ?1", [&scheduled])).unwrap();
+
+        let prior = pending_compose_cards(&store, CONVERSATION).unwrap();
+        assert_eq!(prior, vec![legacy.clone(), first.clone(), second.clone()]);
+
+        // The owner approved one in the meantime: it is not retired.
+        store.update_action_status(&first, ActionStatus::Sent, None, None).unwrap();
+        let retired = supersede_prior_compose_cards(&store, &prior);
+        assert_eq!(retired, vec![legacy.clone(), second.clone()]);
+
+        let status = |id: &str| store.get_action_with_email(id).unwrap().unwrap().action.status;
+        assert_eq!(status(&legacy), "superseded");
+        assert_eq!(status(&second), "superseded");
+        assert_eq!(status(&first), "sent");
+        assert_eq!(status(&triage), "pending");
+        assert_eq!(status(&other), "pending");
+        assert_eq!(status(&scheduled), "pending");
+        assert!(pending_compose_cards(&store, CONVERSATION).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_conversation_id_with_like_wildcards_matches_only_itself() {
+        let (_dir, store) = fixture();
+        let row = |conv: &str| social_card_row("socialapi", "dm", &format!("compose:socialapi:dm:{conv}:x"),
+            conv, Some("synthetic-account"), "Peer", "DM", "Context");
+        let wild = action(&store, &row("conv_%"));
+        action(&store, &row("conv_ab"));
+        assert_eq!(pending_compose_cards(&store, "conv_%").unwrap(), vec![wild]);
     }
 }

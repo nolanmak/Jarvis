@@ -1,6 +1,9 @@
 #[path = "loop_memory.rs"]
 mod loop_memory;
 pub use loop_memory::{LoopFinding, LoopOccurrence};
+#[path = "loop_options.rs"]
+mod loop_options;
+pub use loop_options::{loop_delivery_footer, LoopOptions};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1056,6 +1059,8 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        // #2284 — owner messages for channels that never index them.
+        crate::owner_reply::migrate(conn)?;
         crate::phone::migrate(conn)?;
         crate::local_chat::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
@@ -1668,6 +1673,7 @@ impl Store {
             [],
         )?;
         loop_memory::migrate(conn)?;
+        loop_options::migrate(conn)?;
         // Auto-stop deadline (#104 follow-up). Nullable; pre-existing rows
         // migrate cleanly with `None` (run forever until manually stopped).
         if !column_exists(conn, "user_loops", "expires_at_ms")? {
@@ -1895,6 +1901,29 @@ impl Store {
                  holder         TEXT NOT NULL,\
                  expires_at_ms  INTEGER NOT NULL\
              )",
+            [],
+        )?;
+        // #2285 — what the daily sweep has already shown the model or the
+        // owner, so each item surfaces once. `state` is `offered` (the model
+        // passed on it), `surfaced`, `done` or `snoozed` (back after
+        // `snooze_until_ms`). `ref` is the short id printed on the notice;
+        // `item_at_ms` is when the underlying message arrived.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_items (\
+                 item_key         TEXT PRIMARY KEY,\
+                 ref              TEXT NOT NULL,\
+                 source           TEXT NOT NULL,\
+                 state            TEXT NOT NULL,\
+                 summary          TEXT,\
+                 item_at_ms       INTEGER,\
+                 first_seen_ms    INTEGER NOT NULL,\
+                 updated_ms       INTEGER NOT NULL,\
+                 snooze_until_ms  INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_heartbeat_items_ref ON heartbeat_items(ref)",
             [],
         )?;
 
@@ -2792,6 +2821,10 @@ impl Store {
     /// Insert email if new. Returns `true` when the row did not previously exist.
     /// Matches Node `upsertEmail` behavior in src/db.ts: preserves firstSeenAt on re-seen messages.
     pub fn upsert_email(&self, email: &Email) -> StoreResult<bool> {
+        // #2218 — a message from a yolo thread is never stored.
+        if crate::yolo_threads::blocks_discord_row(&email.platform, email.thread_id.as_deref(), &email.kind) {
+            return Ok(false);
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard
             .query_row(
@@ -2904,6 +2937,10 @@ impl Store {
     }
 
     pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
+        // #2218 — a message from a yolo thread is never stored.
+        if crate::yolo_threads::blocks_discord_row(&email.platform, email.thread_id.as_deref(), &email.kind) {
+            return Ok(false);
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard
             .query_row(
@@ -4817,7 +4854,8 @@ impl Store {
                     COALESCE(e.platform, ''), \
                     a.createdAt, \
                     e.accountEntityId, \
-                    a.messageId \
+                    a.messageId, \
+                    COALESCE(e.kind, '') \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4840,6 +4878,7 @@ impl Store {
                 created_at_ms: r.get(9)?,
                 account_entity_id: r.get(10)?,
                 message_id: r.get(11)?,
+                kind: r.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -7729,15 +7768,21 @@ impl Store {
     /// `armed_at_ms` = `COALESCE(status_updated_at, createdAt)`, the same
     /// arming-moment bound the engine's fire-time guard uses, so a reply the
     /// owner sent BEFORE deliberately arming the schedule never cancels it.
+    ///
+    /// #2284 — a scheduled *compose* (`emails.kind = 'compose'`) is left out:
+    /// the owner started that text, so their own messages never cancel it
+    /// (#1635/#1640 keep the same rule on the per-channel paths).
     pub fn scheduled_actions_for_reconcile(
         &self,
     ) -> StoreResult<Vec<(String, String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, threadId, COALESCE(status_updated_at, createdAt) \
-               FROM actions \
-              WHERE status = 'scheduled' AND threadId IS NOT NULL \
-              ORDER BY createdAt ASC",
+            "SELECT a.id, a.threadId, COALESCE(a.status_updated_at, a.createdAt) \
+               FROM actions a \
+               LEFT JOIN emails e ON e.messageId = a.messageId \
+              WHERE a.status = 'scheduled' AND a.threadId IS NOT NULL \
+                AND COALESCE(e.kind, '') != 'compose' \
+              ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -9302,6 +9347,9 @@ pub struct PendingActionRow {
     pub account_entity_id: Option<String>,
     /// The inbound's message id. #1701 — locates a Slack card in its thread.
     pub message_id: String,
+    /// `emails.kind` (empty when the join finds no email). #2284 — an
+    /// owner-started `compose` is never retired by the owner's own messages.
+    pub kind: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -9670,6 +9718,30 @@ mod tests {
         assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 42);
         store.set_imessage_entries_seen("+14155550123", 57).unwrap();
         assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 57);
+    }
+
+    #[test]
+    fn discord_messages_from_a_yolo_thread_are_never_stored_by_either_writer() {
+        let (store, dir) = fresh_store();
+        let registry = crate::yolo_threads::Registry::new(dir.path().join("yolo-threads.json"));
+        registry.record(1001, 77, 1).unwrap();
+        crate::yolo_threads::override_path_for_this_thread(Some(registry.path().to_path_buf()));
+        let discord = |message_id: &str, channel: &str| {
+            let mut email = sample_email(message_id);
+            email.platform = "discord".into();
+            email.kind = "guild_channel".into();
+            email.thread_id = Some(channel.into());
+            email
+        };
+        // The live path and the history sync both go through these two calls.
+        assert!(!store.upsert_email(&discord("9001", "1001")).unwrap());
+        assert!(!store.upsert_email_backfill(&discord("9002", "1001"), 1).unwrap());
+        assert_eq!(store.email_first_seen_at("9001").unwrap(), None);
+        assert_eq!(store.email_first_seen_at("9002").unwrap(), None);
+        // The parent channel and other platforms are stored as before.
+        assert!(store.upsert_email(&discord("9003", "77")).unwrap());
+        assert!(store.upsert_email_backfill(&sample_email("9004"), 1).unwrap());
+        crate::yolo_threads::override_path_for_this_thread(None);
     }
 
     #[test]

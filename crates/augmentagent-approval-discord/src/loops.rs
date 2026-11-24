@@ -85,6 +85,15 @@ pub trait LoopRunner: Send + Sync {
 
 #[path = "loop_coverage.rs"]
 mod coverage;
+#[path = "loop_delivery.rs"]
+mod delivery;
+pub use delivery::{
+    own_send_addresses, parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
+    LoopMailer, SELF_SEND_ENV,
+};
+#[cfg(test)]
+#[path = "loop_delivery_tests.rs"]
+mod delivery_tests;
 
 fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> String {
     // Until record_user_loop_run commits, retrying a crashed occurrence must
@@ -614,6 +623,12 @@ pub struct LoopScheduler {
     /// #1135 — spacing between re-nags within one open cycle. Seeded from the
     /// fixed daily `NAG_INTERVAL_SECS`; tests override this field directly.
     nag_interval_secs: i64,
+    /// #2246 — sends finding emails; `None` refuses email delivery.
+    mailer: Option<Arc<dyn LoopMailer>>,
+    /// #2246 — where `--prompt-file` paths resolve.
+    wiki_root: Option<std::path::PathBuf>,
+    /// #2246 — fixed allowlist for tests; `None` reads the environment.
+    self_send: Option<Vec<String>>,
 }
 
 impl LoopScheduler {
@@ -628,7 +643,22 @@ impl LoopScheduler {
             poster,
             tick_interval: Duration::from_secs(30),
             nag_interval_secs: NAG_INTERVAL_SECS,
+            mailer: None,
+            wiki_root: None,
+            self_send: None,
         }
+    }
+
+    /// #2246 — let loops email findings to allowlisted owner addresses.
+    pub fn with_mailer(mut self, mailer: Arc<dyn LoopMailer>) -> Self {
+        self.mailer = Some(mailer);
+        self
+    }
+
+    /// #2246 — the wiki that `--prompt-file` paths are read from.
+    pub fn with_wiki_root(mut self, wiki_root: std::path::PathBuf) -> Self {
+        self.wiki_root = Some(wiki_root);
+        self
     }
 
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -731,7 +761,32 @@ impl LoopScheduler {
         let cycle_ms = if due_at > 0 { due_at } else { now_millis() };
         let pause_after = pause_after_failures();
         let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
-        let occurrence = match coverage::prompt(&self.store, l).and_then(|prompt|
+        let options = match self.store.loop_options(&l.id) {
+            Ok(options) => options,
+            Err(error) => { warn!(loop_id = %l.id, "loop options unavailable: {error:#}"); return; }
+        };
+        // #2246 — a missing instructions file fails this occurrence without a
+        // model call. An occurrence that already has an answer only needs
+        // delivering, so it carries on with the stored prompt.
+        let base = match delivery::base_prompt(l, &options, self.wiki_root.as_deref()) {
+            Ok(base) => base,
+            Err(reason) => {
+                if !matches!(self.store.loop_delivery_answer(&request_id), Ok(Some(_))) {
+                    warn!(loop_id = %l.id, "loop prompt file unavailable: {reason}");
+                    match self.store.prepare_loop_occurrence(&l.id, &request_id, &l.prompt) {
+                        Ok(row) if row.state != "delivered" => {
+                            let _ = self.store.fail_loop_occurrence(&request_id, &reason, false, pause_after);
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(loop_id = %l.id, "loop journal unavailable: {error:#}"),
+                    }
+                    return;
+                }
+                l.prompt.clone()
+            }
+        };
+        let extra = delivery::prompt_extra(&self.store, l, &options, now_millis());
+        let occurrence = match coverage::prompt(&self.store, l, &base, &extra).and_then(|prompt|
             self.store.prepare_loop_occurrence(&l.id, &request_id, &prompt).map_err(Into::into)) {
             Ok(row) => row,
             Err(error) => { warn!(loop_id = %l.id, "loop journal unavailable: {error:#}"); return; }
@@ -754,16 +809,36 @@ impl LoopScheduler {
                 if let Err(error) = self.store.save_loop_answer(&request_id, &raw_answer) {
                     warn!(loop_id = %l.id, "loop answer journal failed: {error:#}"); return;
                 }
-                let (answer, findings) = coverage::decode(&raw_answer);
-                let duplicate = !l.nag_until_ack && !findings.is_empty()
-                    && findings.iter().all(|finding| self.store.loop_finding_covered(&l.id, &finding.fingerprint).unwrap_or(false));
+                let coverage::Decoded { mut answer, findings, empty_complete } = coverage::decode(&raw_answer);
+                // #2246 — only findings not yet reported (or keyed ones due
+                // again) are delivered and recorded.
+                let fresh = delivery::fresh(&self.store, l, &options, &findings, now_millis());
+                let duplicate = !l.nag_until_ack && !findings.is_empty() && fresh.is_empty();
+                let quiet = !l.nag_until_ack && options.quiet_when_empty && empty_complete;
+                if let Some(to) = options.email_to.as_deref().filter(|_| !fresh.is_empty()) {
+                    let allowlist = self.self_send.clone().unwrap_or_else(|| delivery::own_send_addresses(&self.store, &std::env::var(SELF_SEND_ENV).unwrap_or_default()));
+                    match delivery::email_findings(&self.store, self.mailer.as_ref(), &allowlist, l, &options, to, &request_id, &fresh).await {
+                        Ok(subjects) => answer = delivery::receipt(to, &subjects),
+                        Err(delivery::EmailError::Refused(reason)) => {
+                            warn!(loop_id = %l.id, "{reason}");
+                            let _ = self.store.fail_loop_occurrence(&request_id, &reason, false, pause_after);
+                            return;
+                        }
+                        Err(delivery::EmailError::Send(reason)) => {
+                            warn!(loop_id = %l.id, "{reason}");
+                            let _ = self.store.fail_loop_occurrence(&request_id, &reason, true, pause_after);
+                            return;
+                        }
+                    }
+                }
+                let findings = fresh;
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = loop_result_body(&header, &answer);
                 // #1135 — nag loops post with Acknowledge / Dismiss controls;
                 // everything else posts plain text. The buttons are keyed to
                 // the cycle they resolve: the already-open marker, or (on the
                 // first fire) the schedule time we're about to stamp below.
-                let posted = if duplicate {
+                let posted = if duplicate || quiet {
                     Ok(())
                 } else if l.nag_until_ack {
                     let cycle_id = l.nag_cycle_ms.unwrap_or(cycle_ms);
@@ -1288,9 +1363,9 @@ mod tests {
         let answer = coverage_report("complete", &"evidence αβγ ".repeat(8000), "fixture:v1");
         store.prepare_loop_occurrence(&row.id, "synthetic-occurrence", "prompt").unwrap();
         store.save_loop_answer("synthetic-occurrence", &answer).unwrap();
-        let (_, findings) = coverage::decode(&answer);
+        let findings = coverage::decode(&answer).findings;
         store.complete_loop_occurrence("synthetic-occurrence", &findings).unwrap();
-        let prompt = coverage::prompt(&store, &row).unwrap();
+        let prompt = coverage::prompt(&store, &row, &row.prompt, "").unwrap();
         assert!(prompt.len() < 16 * 1024);
         assert_eq!(store.loop_occurrences_since(0, 1).unwrap()[0].answer.as_deref(), Some(answer.as_str()));
         assert_eq!(store.loop_coverage(&row.id, 1).unwrap()[0].finding.len(), findings[0].finding.len());

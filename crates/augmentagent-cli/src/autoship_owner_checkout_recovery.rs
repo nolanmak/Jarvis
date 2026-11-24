@@ -9,6 +9,14 @@ pub(super) const SCHEMA:&str="CREATE TABLE IF NOT EXISTS owner_checkout_recovery
  base TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS active_checkout_recovery(workflow TEXT PRIMARY KEY,request_id TEXT NOT NULL REFERENCES owner_checkout_recovery(request_id));";
 
+/// Stage eligibility only; the adapter must still prove lost custody and owner
+/// authority. Publication and terminal/explicitly held workflows retain their
+/// separate recovery paths even when their physical checkout is unavailable.
+pub(crate) fn restartable(checkpoint: &Checkpoint) -> bool {
+    matches!(checkpoint.stage,
+        Stage::Intake | Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct OwnerCheckoutRecovery {
     pub request_id: String,
@@ -33,10 +41,9 @@ impl WorkflowStore {
         let ids = q
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| id.strip_prefix(prefix)?.parse().ok())
-            .collect())
+        let mut pending=ids.iter().filter_map(|id|id.strip_prefix(prefix)?.parse().ok()).collect::<Vec<_>>();
+        pending.extend(self.owner_requalification_retries(prefix)?);
+        Ok(pending)
     }
     pub(crate) fn recovery_snapshots(&self) -> Result<Vec<Snapshot>> {
         let mut query = self.conn.prepare("SELECT id FROM workflow ORDER BY id")?;
@@ -96,8 +103,8 @@ impl WorkflowStore {
             "explicit-owner-hold"
         );
         ensure!(
-            awaits_initial_input(&plan.original.checkpoint),
-            "not-an-initial-input-hold"
+            restartable(&plan.original.checkpoint),
+            "not-a-prepublication-checkout"
         );
         ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",[&plan.workflow],|r|r.get::<_,bool>(0))?,"pending-workflow-operation");
         let issue = plan
@@ -182,6 +189,24 @@ impl WorkflowStore {
 /// particular, malformed/orphaned old repair history must not poison the new
 /// owner-authorized episode. Missing evidence after cutover still fails closed.
 fn scope_frontier(
+    conn: &Connection,
+    workflow: &str,
+) -> Result<Option<(i64, std::collections::BTreeSet<String>)>> {
+    // #2356: an unrecoverable original is the same kind of cutover. The later
+    // frontier wins; the union of archived keys is never replayed.
+    let owner = owner_frontier(conn, workflow)?;
+    let lost = super::terminal_parks::frontier(conn, workflow)?;
+    Ok(match (owner, lost) {
+        (None, None) => None,
+        (Some(owner), None) => Some(owner),
+        (None, Some((seq, keys, _))) => Some((seq, keys)),
+        (Some((owner_seq, mut keys)), Some((seq, lost, _))) => {
+            keys.extend(lost);
+            Some((owner_seq.max(seq), keys))
+        }
+    })
+}
+fn owner_frontier(
     conn: &Connection,
     workflow: &str,
 ) -> Result<Option<(i64, std::collections::BTreeSet<String>)>> {
@@ -274,12 +299,34 @@ pub(super) fn scope_keys(
 pub(super) fn cutover_seq(conn: &Connection, workflow: &str) -> Result<i64> {
     Ok(scope_frontier(conn, workflow)?.map_or(0, |(seq, _)| seq))
 }
-pub(super) fn native_attempts(conn: &Connection, workflow: &str) -> Result<Option<u64>> {
-    if scope_frontier(conn, workflow)?.is_none() {
+/// When the latest cutover was recorded. Controller files written before it
+/// belong to the archived original episode, exactly like its DB rows.
+pub(super) fn cutover_at_ms(conn: &Connection, workflow: &str) -> Result<Option<i64>> {
+    let seq = cutover_seq(conn, workflow)?;
+    if seq == 0 {
         return Ok(None);
     }
-    let raw:String=conn.query_row("SELECT r.original_bounded_attempts FROM active_checkout_recovery a JOIN owner_checkout_recovery r USING(request_id) WHERE a.workflow=?1",[workflow],|r|r.get(0))?;
-    let original: std::collections::BTreeSet<(String, String)> = serde_json::from_str(&raw)?;
+    let at: i64 = conn.query_row(
+        "SELECT at_ms FROM workflow_event WHERE workflow=?1 AND seq=?2",
+        params![workflow, seq],
+        |r| r.get(0),
+    )?;
+    Ok(Some(at))
+}
+pub(super) fn native_attempts(conn: &Connection, workflow: &str) -> Result<Option<u64>> {
+    let owner = owner_frontier(conn, workflow)?.is_some();
+    let lost = super::terminal_parks::frontier(conn, workflow)?;
+    if !owner && lost.is_none() {
+        return Ok(None);
+    }
+    let mut original: std::collections::BTreeSet<(String, String)> = Default::default();
+    if owner {
+        let raw:String=conn.query_row("SELECT r.original_bounded_attempts FROM active_checkout_recovery a JOIN owner_checkout_recovery r USING(request_id) WHERE a.workflow=?1",[workflow],|r|r.get(0))?;
+        original.extend(serde_json::from_str::<std::collections::BTreeSet<(String, String)>>(&raw)?);
+    }
+    if let Some((_, _, bounded)) = lost {
+        original.extend(bounded);
+    }
     let mut q=conn.prepare("SELECT purpose,binding,attempts FROM bounded_attempt WHERE workflow=?1 AND substr(purpose,1,length(?2))=?2")?;
     let mut total = 0u64;
     for row in q.query_map(params![workflow, BASELINE_NATIVE_PURPOSE_PREFIX], |r| {

@@ -16,6 +16,7 @@ pub mod archive_live;
 pub mod archive_store;
 pub mod archive_sync;
 pub mod auth;
+pub mod backfill_pace;
 pub mod channel;
 pub mod connections;
 pub mod feed;
@@ -24,6 +25,7 @@ pub mod inbound;
 pub mod invitations;
 pub mod own_posts;
 pub mod posting;
+pub mod session_guard;
 pub mod types;
 
 pub use api::{

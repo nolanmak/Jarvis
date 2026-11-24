@@ -199,6 +199,8 @@ pub(super) async fn claimed_after_reconcile(repo:&Path,issue:u64,dry_run:bool)->
         let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
         observe_pushes(repo,&repository,&mut store).await?;
     }
+    // #2408: own-PR continuations are routed to the PR lane before this, so
+    // the fresh issue pipeline never builds for an issue with an open PR.
     has_open_agent_pr(repo,issue).await
 }
 
@@ -261,9 +263,26 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
             guard.transition(crate::autoship_workflow::Stage::Reconcile,"pending_publication_candidate_changed","reverify_candidate",now).await?;
             guard.finish()?;return Ok(());
         }
-        if guard.pending_operations()?.iter().any(|operation|operation.kind==OperationKind::Push) {
-            if !store.retryable_bound_push(&id)? {guard.finish()?;return Ok(());}
-            guard.push_fresh(repo,&request.branch,request.automatic).await?;
+        let pending_push=guard.pending_operations()?.iter().any(|operation|operation.kind==OperationKind::Push);
+        if pending_push && !store.retryable_bound_push(&id)? {guard.finish()?;return Ok(());}
+        // #2279 — a retained request whose push failed before any dispatch
+        // (destination, identity, transport) has no Push intent and stays at
+        // `publish / publishing_revision / push`. Push the exact retained head
+        // now; the compare-and-swap push observes an already-landed head
+        // without dispatching again. A finished push (creation uncertain) is
+        // never repeated.
+        let push_unfinished=snapshot.checkpoint.stage==crate::autoship_workflow::Stage::Publish
+            && snapshot.checkpoint.next.reason=="publishing_revision" && snapshot.checkpoint.next.action=="push"
+            && !store.pushed_head(&id,&request.head)?;
+        if pending_push || push_unfinished {
+            if let Err(error)=guard.push_fresh(repo,&request.branch,request.automatic).await {
+                if error.downcast_ref::<manual_routing::Hold>().is_some() || linked_claims::report(&error).is_some() {
+                    guard.finish()?;return Ok(());
+                }
+                guard.transition(crate::autoship_workflow::Stage::Publish,"publishing_revision","push",now+60_000).await?;
+                guard.finish()?;
+                return Err(error.context("retained publication push deferred; candidate and intent preserved"));
+            }
         }
         let result=publish(&guard,&request.worktree,&request.branch,&request.head,request.issue,
             &request.args.iter().map(String::as_str).collect::<Vec<_>>(),request.automatic).await;
@@ -321,6 +340,32 @@ async fn creation_facts(github:&mut impl Github,repository:&str,issue:u64,branch
     Ok(())
 }
 
+/// Durable publication intent for the exact checkpointed candidate. Saved
+/// before the first remote effect, so a candidate that was built and verified
+/// but could not be pushed (#2279) is retried by free reconciliation instead
+/// of waiting for the picker or being rebuilt from scope.
+fn retain_publication(guard:&workflow::WorkflowGuard,worktree:&Path,branch:&str,head:&str,issue:u64,args:&[&str],automatic:bool)->Result<()> {
+    anyhow::ensure!(
+        head == guard.binding().head,
+        "publication head is not the checkpointed candidate"
+    );
+    let (repository,retained,contract,environment)=guard.publication_inputs();
+    anyhow::ensure!(retained==worktree,"publication worktree differs from workflow");
+    guard.save_publication(&serde_json::to_string(&PendingPublication {repository:repository.into(),worktree:worktree.into(),issue,
+        branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),automatic,args:args.iter().map(|v|(*v).into()).collect()})?)
+}
+
+/// #2279 — the fresh pipeline's push: record the complete publication request
+/// first, then push. A failed push leaves a retained intent that
+/// `reconcile_pending` pushes and publishes once the cause is fixed, without
+/// another build, scope or model call.
+pub(super) async fn push_retained(
+    guard:&mut workflow::WorkflowGuard,repo:&Path,worktree:&Path,branch:&str,head:&str,issue:u64,args:&[&str],automatic:bool,
+)->Result<String> {
+    retain_publication(guard,worktree,branch,head,issue,args,automatic)?;
+    guard.push_fresh(repo,branch,automatic).await
+}
+
 pub(super) async fn publish(
     guard: &workflow::WorkflowGuard,
     worktree: &Path,
@@ -330,14 +375,8 @@ pub(super) async fn publish(
     args: &[&str],
     automatic:bool,
 ) -> Result<Published> {
-    anyhow::ensure!(
-        head == guard.binding().head,
-        "publication head is not the checkpointed candidate"
-    );
-    let (repository,retained,contract,environment)=guard.publication_inputs();
-    anyhow::ensure!(retained==worktree,"publication worktree differs from workflow");
-    guard.save_publication(&serde_json::to_string(&PendingPublication {repository:repository.into(),worktree:worktree.into(),issue,
-        branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),automatic,args:args.iter().map(|v|(*v).into()).collect()})?)?;
+    retain_publication(guard,worktree,branch,head,issue,args,automatic)?;
+    let repository=guard.publication_inputs().0;
     let operation = guard.intent(OperationKind::CreatePr)?;
     guard.validate_binding(guard.binding()).await?;
     // Direct identity survives the crash window after observe_remote commits
@@ -1436,6 +1475,107 @@ else:sys.exit(2)
         assert!(!store.has_pending_publication(&id).unwrap());
         assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);
         assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap().lines().count(),if lost {2}else{1});
+        std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
+    /// #2279 — a built, verified candidate whose push failed for an
+    /// infrastructure/identity reason (here: an unavailable destination) keeps
+    /// its publication request. Once the cause is fixed, free reconciliation
+    /// pushes the exact retained head and opens the PR: no rebuild, no scope,
+    /// no model call and no picker turn.
+    #[tokio::test]
+    async fn failed_push_then_later_retry_publishes_retained_candidate() {
+        const CHILD:&str="AUTOSHIP_PUBLISH_RETRY_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root=tempfile::Builder::new().prefix("autoship-publish-retry-").tempdir_in("/tmp").unwrap();let gh=root.path().join("gh.py");
+            augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+root=pathlib.Path(os.environ['AUTOSHIP_PUBLISH_RETRY_FIXTURE']);a=sys.argv[1:]
+with (root/'calls').open('a') as f:f.write(json.dumps(a)+'\n')
+def remote_head():
+    out=subprocess.run(['git','ls-remote','--heads',str(root/'remote.git'),'refs/heads/agent-fix/issue-1'],capture_output=True,text=True)
+    words=out.stdout.split()
+    return words[0] if out.returncode==0 and len(words)==2 else None
+def row():return dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',baseRefName='main',isCrossRepository=False,state='OPEN')
+if a[:2]==['repo','view']: print('owner/repo')
+elif a[:2]==['issue','view']: print(json.dumps({'state':'OPEN'}))
+elif a[:1]==['api'] and a[1].endswith('/issues/1'): print(json.dumps(dict(number=1,state='open',labels=[])))
+elif a[:1]==['api'] and '/git/ref/heads/agent-fix/issue-1' in a[1]:
+    head=remote_head()
+    if head is None:print('{"message":"Not Found"}');sys.exit(1)
+    print(json.dumps({'object':{'sha':head}}))
+elif a[:2]==['pr','view']:
+    if not (root/'creates').exists():sys.exit(1)
+    print(json.dumps(row()))
+elif a[:2]==['pr','create']:
+    with (root/'creates').open('a') as f:f.write('create\n')
+    print('https://github.com/owner/repo/pull/12')
+elif a[:2]==['pr','list']: print(json.dumps([row()] if (root/'creates').exists() else []))
+else:sys.exit(2)
+"#).unwrap();
+            std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::publication::tests::failed_push_then_later_retry_publishes_retained_candidate","--nocapture"])
+                .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
+                .output().unwrap();
+            assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            assert!(root.path().join("executed").exists());
+            return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap());let repo=root.join("repo");std::fs::create_dir(&repo).unwrap();
+        for args in [vec!["init","-q"],vec!["config","user.name","Fixture"],vec!["config","user.email","fixture@example.invalid"]] {
+            assert!(run("git",&args,&repo).await.unwrap().0);
+        }
+        std::fs::write(repo.join("source"),"verified candidate").unwrap();
+        assert!(run("git",&["add","source"],&repo).await.unwrap().0);
+        assert!(run("git",&["commit","-qm","candidate"],&repo).await.unwrap().0);
+        let head=run("git",&["rev-parse","HEAD"],&repo).await.unwrap().1.trim().to_owned();
+        assert!(run("git",&["update-ref","refs/remotes/origin/main",&head],&repo).await.unwrap().0);
+        std::fs::write(root.join("head"),&head).unwrap();
+        // The protected push destination is unavailable when the candidate is
+        // ready (the renamed-origin incident failed in the same place: before
+        // any Push intent or pack was dispatched).
+        let remote=root.join("remote.git");
+        assert!(run("git",&["remote","add","origin",remote.to_str().unwrap()],&repo).await.unwrap().0);
+        let worktree=root.join("retained-worker");let branch="agent-fix/issue-1";
+        assert!(run("git",&["worktree","add","-q","-b",branch,worktree.to_str().unwrap(),&head],&repo).await.unwrap().0);
+        let args=["pr","create","--head",branch,"--base","main","--title","fix: candidate (#1)","--body","Verified."];
+        let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&worktree,repository:"owner/repo",source_issue:Some(1),pr:None,branch,contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
+        guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid build.
+        // The fresh pipeline retains its exact publication request, then the
+        // push fails before dispatch.
+        assert!(publish(&guard,&worktree,branch,&head,1,&args,true).await.is_err(),"fixture published without a pushed branch");
+        assert!(guard.push_fresh(&repo,branch,true).await.is_err(),"unavailable destination fixture pushed");
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+        let stranded=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((stranded.checkpoint.stage,stranded.checkpoint.next.reason.as_str()),(crate::autoship_workflow::Stage::Publish,"publishing_revision"));
+        assert!(!store.pending_operations(&id).unwrap().iter().any(|operation|operation.kind==OperationKind::Push),
+            "failed destination check dispatched a Push intent");
+        assert!(pending_issue(&repo,1).await.unwrap(),"the built candidate lost its publication request");
+        // The cause is fixed later (e.g. repository alias rollout).
+        assert!(run("git",&["init","--bare","-q",remote.to_str().unwrap()],&repo).await.unwrap().0);
+        rusqlite::Connection::open(workflow::path()).unwrap().execute(
+            "UPDATE workflow SET checkpoint=json_set(checkpoint,'$.next.eligible_at_ms',0)",[]).unwrap();
+        reconcile_pending(&repo,false).await.unwrap();
+        let remote_head=run("git",&["ls-remote","--heads",remote.to_str().unwrap(),&format!("refs/heads/{branch}")],&repo).await.unwrap().1;
+        assert!(remote_head.starts_with(&head),"retry never pushed the retained candidate: {remote_head:?}; calls={}",
+            std::fs::read_to_string(root.join("calls")).unwrap_or_default());
+        assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap_or_default().lines().count(),1,"retry never opened the PR");
+        let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.pr,Some(12));
+        assert_eq!(after.checkpoint.binding,stranded.checkpoint.binding,"retry rebound or rebuilt the verified candidate");
+        assert_ne!(after.checkpoint.stage,crate::autoship_workflow::Stage::Scope,"retry fell back to scope");
+        assert_eq!(after.model_calls,1,"publication retry spent model work");
+        assert!(!store.has_pending_publication(&id).unwrap());
+        assert!(store.pending_operations(&id).unwrap().is_empty());
+        assert_eq!(rusqlite::Connection::open(workflow::path()).unwrap().query_row(
+            "SELECT COUNT(*) FROM operation WHERE workflow=?1 AND receipt=?2",[&id,&format!("git-head:{head}")],|r|r.get::<_,i64>(0)).unwrap(),1,
+            "exactly one confirmed Push of the retained head");
+        // A later pass is idempotent: no second push dispatch or PR.
+        reconcile_pending(&repo,false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
         std::fs::write(root.join("executed"),"ok").unwrap();
     }
 

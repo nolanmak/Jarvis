@@ -5,9 +5,10 @@
 # merged PR), the last one into a host already under memory pressure (#897).
 # Every restart re-runs each channel's first tick — exactly when the journal
 # replay fires. These drive the REAL updater against a throwaway repo with
-# `cargo` / `systemctl` stubbed, and assert two new deferrals behave exactly
-# like the #844 in-flight deferral: log `restart deferred: …`, withhold the
-# build stamp (#826 invariant), retry next tick.
+# `cargo` / `systemctl` stubbed, and assert the memory deferral (and an
+# opted-in restart cap) log `restart deferred: …`, withhold the build stamp
+# (#826 invariant) and retry next tick. #2271: the restart cap defaults to
+# 60/h, and a held auto-ship lane lock never defers the daemon restart.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -119,9 +120,21 @@ daemon_restarted && ok "low memory: a later tick restarts once memory recovers" 
                      || bad "low memory: …and writes the stamp then" "stamp absent"
 rm -rf "$TMP"
 
-# --- restart_budget_exhausted_defers ---------------------------------------
+# --- default_cap_does_not_defer (#2271) ------------------------------------
+# Three restarts in the last hour used to spend the 3/h default budget.
 make_case; spend_budget
-run_updater; rc=$?
+( unset AUGMENTAGENT_RESTARTS_PER_HOUR; run_updater ); rc=$?
+daemon_restarted && ok "default cap: three recent restarts do not defer" \
+                 || bad "default cap: three recent restarts do not defer" "no restart; $(tail -3 "$LOG_FILE")"
+[ -s "$STAMP_FILE" ] && ok "default cap: writes the stamp" || bad "default cap: writes the stamp" "stamp absent"
+grep -q "restart(s) in the last hour" "$LOG_FILE" \
+  && bad "default cap: logs no budget deferral" "$(grep 'last hour' "$LOG_FILE")" \
+  || ok "default cap: logs no budget deferral"
+rm -rf "$TMP"
+
+# --- restart_budget_exhausted_defers (explicit cap) --------------------------
+make_case; spend_budget
+AUGMENTAGENT_RESTARTS_PER_HOUR=3 run_updater; rc=$?
 daemon_restarted && bad "budget spent: does not restart the daemon" "systemctl restart was invoked" \
                  || ok "budget spent: does not restart the daemon"
 [ -s "$STAMP_FILE" ] && bad "budget spent: withholds the build stamp" "stamp written" \
@@ -131,14 +144,14 @@ grep -q "restart deferred" "$LOG_FILE" && ok "budget spent: logs 'restart deferr
 [ "$rc" -ne 0 ] && ok "budget spent: exits non-zero" || bad "budget spent: exits non-zero" "exit was 0"
 # Only restarts inside the last hour count.
 now=$(date +%s); printf '%s\n%s\n%s\n' "$((now-4000))" "$((now-5000))" "$((now-6000))" > "$HISTORY"
-run_updater
+AUGMENTAGENT_RESTARTS_PER_HOUR=3 run_updater
 daemon_restarted && ok "budget spent: restarts older than an hour do not count" \
                  || bad "budget spent: restarts older than an hour do not count" "still deferred"
 rm -rf "$TMP"
 
 # --- force_overrides_both --------------------------------------------------
 make_case; low_memory; spend_budget
-AUGMENTAGENT_RESTART_FORCE=1 run_updater; rc=$?
+AUGMENTAGENT_RESTARTS_PER_HOUR=3 AUGMENTAGENT_RESTART_FORCE=1 run_updater; rc=$?
 daemon_restarted && ok "force: restarts despite low memory and a spent budget" \
                  || bad "force: restarts despite low memory and a spent budget" "no restart"
 [ -s "$STAMP_FILE" ] && ok "force: writes the stamp" || bad "force: writes the stamp" "stamp absent"
@@ -154,10 +167,10 @@ daemon_restarted && ok "healthy: restarts" || bad "healthy: restarts" "no restar
   || bad "healthy: records the restart in restart-history" "history: $(cat "$HISTORY" 2>/dev/null)"
 rm -rf "$TMP"
 
-# --- in-flight run under XDG_STATE_HOME defers the restart (#1048) ----------
-# run_updater sets XDG_STATE_HOME=$TMP/state and HOME=$TMP. The Rust loop
-# resolves its lock as $XDG_STATE_HOME/augmentagent/self-improve.lock, so a
-# held lock there must defer, even though $HOME/.local/state has none.
+# --- held auto-ship lane lock does not defer the restart (#2271) ------------
+# The #844 deferral waited on the self-improve lock. Auto-ship runs in its own
+# worker unit now, so a live lane lock (here under XDG_STATE_HOME, where the
+# Rust loop takes it) must not hold the daemon deploy.
 make_case
 XDG_LOCK="$TMP/state/augmentagent/self-improve.lock"
 touch "$XDG_LOCK"
@@ -172,12 +185,12 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[1] + ".
   for _ in $(seq 1 50); do [ -e "$XDG_LOCK.held" ] && break; sleep 0.1; done
 fi
 ( unset AUGMENTAGENT_SELFIMPROVE_LOCK; run_updater ); rc=$?
-daemon_restarted && bad "xdg lock: does not restart under a live build" "systemctl restart was invoked" \
-                 || ok "xdg lock: does not restart under a live build"
-[ -s "$STAMP_FILE" ] && bad "xdg lock: withholds the build stamp" "stamp written" \
-                     || ok "xdg lock: withholds the build stamp"
-grep -q "self-improve run in flight" "$LOG_FILE" && ok "xdg lock: logs the in-flight deferral" \
-  || bad "xdg lock: logs the in-flight deferral" "$(tail -3 "$LOG_FILE")"
+daemon_restarted && ok "held lane lock: restarts the daemon anyway" \
+                 || bad "held lane lock: restarts the daemon anyway" "no restart; $(tail -3 "$LOG_FILE")"
+[ -s "$STAMP_FILE" ] && ok "held lane lock: writes the stamp" || bad "held lane lock: writes the stamp" "stamp absent"
+grep -q "self-improve run" "$LOG_FILE" \
+  && bad "held lane lock: logs no self-improve deferral" "$(grep 'self-improve run' "$LOG_FILE")" \
+  || ok "held lane lock: logs no self-improve deferral"
 # `flock -c` hands the locked fd to its child: stop the child first.
 pkill -P "$XDG_HOLDER" 2>/dev/null; kill "$XDG_HOLDER" 2>/dev/null; wait "$XDG_HOLDER" 2>/dev/null
 rm -rf "$TMP"
