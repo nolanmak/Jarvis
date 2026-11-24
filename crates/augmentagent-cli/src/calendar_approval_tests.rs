@@ -167,6 +167,7 @@ fn assert_calendar_account_receipt(
         event_id,
         html_link,
         already_existed,
+        ..
     } = outcome
     else {
         panic!("missing success receipt: {outcome:?}");
@@ -305,5 +306,51 @@ async fn legacy_sent_calendar_without_receipt_requires_verification_and_never_re
             .status,
         "sent"
     );
+    m.assert_async().await;
+}
+
+// #2514: a `--meet true` create surfaces the Meet join URL in the receipt,
+// the saved row, approval history, and a recovered (repeat-Approve) receipt.
+#[tokio::test]
+async fn calendar_receipt_surfaces_meet_join_url_and_recovers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("qa.db")).unwrap());
+    let id = proposal(&store);
+    let mut server = mockito::Server::new_async().await;
+    let m = server
+        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+        .with_status(200)
+        .with_body(
+            serde_json::json!({"successful":true,"data":{"response_data":{
+                "id":"event_2514",
+                "htmlLink":"https://www.google.com/calendar/event?eid=x",
+                "hangoutLink":"https://meet.google.com/abc-defg-hij",
+            }}})
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let mut approver = test_support::approver_with_store(store.clone());
+    approver.calendar =
+        Arc::new(ComposioCalendarClient::new("test".into()).with_base_url(server.url()));
+    let outcome = approver.approve(&id).await;
+    let ApprovalActionOutcome::CalendarCreated { join_url, .. } = &outcome else {
+        panic!("missing success receipt: {outcome:?}")
+    };
+    assert_eq!(join_url.as_deref(), Some("https://meet.google.com/abc-defg-hij"));
+    let text = augmentagent_approval_discord::outcome::describe(&outcome);
+    assert!(text.ends_with("Meet link: https://meet.google.com/abc-defg-hij"), "{text}");
+    let saved = store.get_action_with_email(&id).unwrap().unwrap().action.draft_body.unwrap();
+    assert!(saved.ends_with("\nevent ID: event_2514\nmeet: https://meet.google.com/abc-defg-hij"), "{saved}");
+    let history = store.approval_history(None, 20, Some(&id)).unwrap();
+    assert!(history[0].detail.contains("meet=https://meet.google.com/abc-defg-hij"), "{}", history[0].detail);
+
+    let recovered = approver.approve(&id).await;
+    let ApprovalActionOutcome::CalendarCreated { event_id, join_url, already_existed: true, .. } = &recovered else {
+        panic!("missing recovered receipt: {recovered:?}")
+    };
+    assert_eq!(event_id, "event_2514");
+    assert_eq!(join_url.as_deref(), Some("https://meet.google.com/abc-defg-hij"));
     m.assert_async().await;
 }
