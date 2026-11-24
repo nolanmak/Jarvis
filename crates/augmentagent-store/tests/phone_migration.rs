@@ -143,6 +143,76 @@ fn adding_phone_tables_preserves_sessions_history_and_pending_approvals() {
     }
 }
 
+// #2169: a pre-#2169 metrics table gains the per-turn boundary columns in
+// place. Its existing row stays readable with NULL boundaries across repeated
+// opens, and a new row can carry every boundary.
+#[test]
+fn turn_boundary_columns_are_added_to_a_pre_2169_metrics_table() {
+    use augmentagent_store::phone::{PhoneTurnMetrics, TurnOutcome, TurnProvider};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE phone_turn_metrics (
+                call_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                recorded_ms INTEGER NOT NULL, provider TEXT NOT NULL, outcome TEXT NOT NULL,
+                queue_wait_ms INTEGER, t_first_token_ms INTEGER, t_first_speech_ms INTEGER,
+                t_last_speech_ms INTEGER, tool_ms INTEGER, t_first_played_ms INTEGER,
+                t_last_played_ms INTEGER, audible_delta_ms INTEGER, commit_sha TEXT,
+                PRIMARY KEY(call_id, turn_id));
+             INSERT INTO phone_turn_metrics(call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms)
+             VALUES('call-old','phone:call-old:1',500,'native','answered',10,70);",
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        let store = Store::open(&path).unwrap();
+        let old = &store.phone_turn_metrics("call-old").unwrap()[0];
+        assert_eq!((old.queue_wait_ms, old.t_first_token_ms), (Some(10), Some(70)));
+        assert_eq!(old.t_native_start_ms, None);
+        assert_eq!(old.t_provider_start_ms, None);
+        assert_eq!(old.t_source_execution_ms, None);
+        assert_eq!(old.t_first_useful_fact_ms, None);
+        assert_eq!(old.t_completion_ms, None);
+    }
+    let store = Store::open(&path).unwrap();
+    let upgraded = PhoneTurnMetrics {
+        call_id: "call-new".into(),
+        turn_id: "phone:call-new:1".into(),
+        recorded_ms: 600,
+        provider: TurnProvider::Native,
+        outcome: TurnOutcome::Answered,
+        queue_wait_ms: Some(40),
+        t_first_token_ms: Some(250),
+        t_native_start_ms: Some(100),
+        t_provider_start_ms: Some(130),
+        t_source_execution_ms: Some(200),
+        t_first_useful_fact_ms: Some(300),
+        t_completion_ms: Some(900),
+        t_first_speech_ms: Some(320),
+        t_last_speech_ms: Some(950),
+        tool_ms: None,
+        t_first_played_ms: Some(410),
+        t_last_played_ms: Some(1_000),
+        audible_delta_ms: Some(90),
+        commit_sha: None,
+        speculated: false,
+        speculation_committed: false,
+        speculation_saved_ms: None,
+    };
+    assert!(store.phone_record_turn_metrics(&upgraded).unwrap());
+    assert_eq!(store.phone_turn_metrics("call-new").unwrap(), [upgraded]);
+    // The added columns keep their nonnegative constraint.
+    let conn = Connection::open(&path).unwrap();
+    assert!(conn
+        .execute(
+            "UPDATE phone_turn_metrics SET t_completion_ms=-1 WHERE call_id='call-new'",
+            [],
+        )
+        .is_err());
+}
+
 // #1556: a database whose end-reason table was created by #1557 (before
 // 'silence' was allowed) is rebuilt on open, keeping its rows.
 #[test]

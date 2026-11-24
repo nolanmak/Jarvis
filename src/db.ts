@@ -268,6 +268,34 @@ export function initDb(dbPath?: string): Database.Database {
     }
   }
 
+  // #2169: per-turn latency boundaries on phone_turn_metrics. Another
+  // Rust-daemon table, so this mirrors the Rust ALTERs only when the table is
+  // already present, leaving a compatible schema whichever daemon opens the
+  // database first. Each column is nullable: a turn that never reached a
+  // boundary records nothing for it.
+  const metricsTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_turn_metrics'")
+    .get() as { name: string } | undefined;
+  if (metricsTable) {
+    const metricCols = db.prepare("PRAGMA table_info(phone_turn_metrics)").all() as {
+      name: string;
+    }[];
+    for (const column of [
+      "t_native_start_ms",
+      "t_provider_start_ms",
+      "t_source_execution_ms",
+      "t_first_useful_fact_ms",
+      "t_completion_ms",
+    ]) {
+      if (!metricCols.some((c) => c.name === column)) {
+        db.exec(
+          `ALTER TABLE phone_turn_metrics ADD COLUMN ${column} INTEGER ` +
+            `CHECK(${column} IS NULL OR ${column} >= 0)`,
+        );
+      }
+    }
+  }
+
   return db;
 }
 
