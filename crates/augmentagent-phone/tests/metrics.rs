@@ -98,6 +98,63 @@ async fn queue_wait_adds_the_shared_conversation_queue_wait_to_pickup() {
     assert_eq!(record.queue_wait_ms, Some(0), "{record:?}");
 }
 
+// #2169: a native turn blocked before its final answer still records every
+// boundary it did reach, each with its own value. The queue wait and the first
+// token never stand in for the first useful fact.
+#[tokio::test(start_paused = true)]
+async fn ac2169_blocked_native_turn_keeps_every_boundary_distinct() {
+    let timer = TurnTimer::start();
+    advance(40).await;
+    timer.dequeued();
+    advance(60).await;
+    timer.native_started();
+    advance(30).await;
+    timer.provider_started();
+    advance(70).await;
+    timer.source_execution_started();
+    advance(50).await;
+    timer.first_token();
+    advance(50).await;
+    timer.first_useful_fact();
+    advance(20).await;
+    timer.speech_written(false);
+    advance(90).await;
+    timer.played(tokio::time::Instant::now());
+    // Repeated events never move a first-occurrence mark.
+    advance(500).await;
+    for _ in 0..2 {
+        timer.native_started();
+        timer.provider_started();
+        timer.source_execution_started();
+        timer.first_useful_fact();
+        timer.first_token();
+        timer.speech_written(false);
+    }
+    // The native final answer never arrives: nothing calls `completed`.
+    let record = timer.record(
+        "call-blocked",
+        "phone:call-blocked:1",
+        TurnProvider::Native,
+        TurnOutcome::Interrupted,
+        2_000,
+        None,
+    );
+    assert!(close(record.queue_wait_ms, 40), "{record:?}");
+    assert!(close(record.t_native_start_ms, 100), "{record:?}");
+    assert!(close(record.t_provider_start_ms, 130), "{record:?}");
+    assert!(close(record.t_source_execution_ms, 200), "{record:?}");
+    assert!(close(record.t_first_token_ms, 250), "{record:?}");
+    assert!(close(record.t_first_useful_fact_ms, 300), "{record:?}");
+    assert!(close(record.t_first_speech_ms, 320), "{record:?}");
+    assert!(close(record.t_first_played_ms, 410), "{record:?}");
+    assert_eq!(record.t_completion_ms, None, "{record:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = augmentagent_store::Store::open(dir.path().join("metrics.db")).unwrap();
+    assert!(store.phone_record_turn_metrics(&record).unwrap());
+    assert_eq!(store.phone_turn_metrics("call-blocked").unwrap()[0], record);
+}
+
 #[tokio::test(start_paused = true)]
 async fn ac04_record_from_a_turn_with_a_phone_number_contains_no_speech_or_long_digit_runs() {
     let mut session = RelaySession::new("call-redaction", "AC-test", "CA-test");
