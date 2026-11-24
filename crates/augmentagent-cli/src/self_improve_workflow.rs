@@ -530,7 +530,13 @@ fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<us
     for (workflow,generation,audit_path) in rows {
         let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
         match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
-            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            Ok(outcome) if outcome.verified()=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            // Unproved closure keeps the durable intent pending; the exact
+            // blocker and its authenticated recovery route are recorded.
+            Ok(outcome)=>if let Some(blocker)=outcome.blocker() {
+                warn!(workflow=%workflow,generation,pruned=outcome.pruned,session=%blocker.session,blocker=%blocker.blocker,
+                    recovery=%blocker.recovery,"native runtime retirement retained without proven producer closure");
+            },
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
@@ -4733,6 +4739,8 @@ mod tests {
             write(&session.join("lock"),b"");
         }
         write(&known.join("complete.json"),br#"{"version":1,"generation":"generation-a"}"#);
+        write(&known.join("producer-completion.json"),br#"{"version":1,"audit_path":"/original/audit","owner":{"workflow_id":"original","lease_generation":1},"writer_fence":1}"#);
+        write(&known.join("settled-result.json"),br#"{"version":1,"owner":{"workflow_id":"original","lease_generation":1},"durable":true}"#);
         let unknown_owned=std::fs::read(unknown.join("owned.json")).unwrap();
         let aliases=provider.join("aliases");std::fs::create_dir(&aliases).unwrap();
         write(&aliases.join("completed-fixture"),br#""session-completed""#);
@@ -4764,7 +4772,10 @@ mod tests {
         assert!(!known.exists());assert!(!aliases.join("completed-fixture").exists());
         assert!(unknown.exists());assert!(aliases.join("interrupted-fixture").exists());
         assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
-        assert!(!unknown.join("retired-owner.json").exists());
+        assert!(unknown.join("retired.json").exists(),"protected retirement evidence was removed");
+        for backfilled in ["retired-owner.json","producer-completion.json","settled-result.json"] {
+            assert!(!unknown.join(backfilled).exists(),"{backfilled} was backfilled onto an unproved runtime");
+        }
         let after=store.snapshot(id).unwrap().unwrap();
         assert_eq!(after.checkpoint.next.eligible_at_ms,33);assert_eq!(after.progress_at_ms,before.progress_at_ms);
         assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
