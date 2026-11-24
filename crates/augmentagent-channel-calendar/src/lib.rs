@@ -46,6 +46,6 @@ pub use reschedule::{RescheduleOutcome, RescheduleRequest, RESCHEDULE_CARD_KIND}
 pub use rsvp::{InviteDecision, RsvpRequest};
 pub use trigger::{CalendarTrigger, HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
 pub use types::{
-    render_meeting_body, truncate, CalendarEvent, EventTime, MeetingAttendee, RawAttendee,
+    join_url, render_meeting_body, truncate, CalendarEvent, EventTime, MeetingAttendee, RawAttendee,
     MeetingPayload, GCAL_FIELD_ALLOWLIST,
 };

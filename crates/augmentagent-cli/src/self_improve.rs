@@ -4156,9 +4156,10 @@ async fn find_resumable_draft(
     repo_root: &Path,
     only: Option<u64>,
     dry_run: bool,
+    ceiling: adoption::FinishTier,
 ) -> Option<(u64, u64, String)> {
     let stdout = complete_repository_inventory(repo_root, "pr", None,
-        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences")
+        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,statusCheckRollup")
         .await.ok()?;
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
     // Never treat a capped/malformed issue listing as absence of a hold.
@@ -4208,7 +4209,33 @@ async fn find_resumable_draft(
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
     // #2432 — in-flight PRs resume on their own backoff, not the daily ledger.
     retries.extend(adoption::in_flight_retries(&workflow::path(), &adopted, now).unwrap_or_default());
+    // #2495 — finish before starting: a due PR whose bound head is green, or
+    // one at publish/CI-pending, outranks the rotation, oldest first. Ranked
+    // from the same inventory, so no per-PR GitHub reads.
+    let plan = adoption::finish_plan(&workflow::path(), &adopted, &prs, now).unwrap_or_else(|error| {
+        warn!("finish-first ranking unavailable; using the rotation: {error:#}");
+        Default::default()
+    });
+    if !dry_run && !plan.expedite.is_empty() {
+        match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) {
+            Ok(mut store) => for (id, head) in &plan.expedite {
+                match store.expedite_hosted_ci_pending(id, head, now) {
+                    Ok(true) => info!(workflow=%id, %head, "hosted checks finished green on the bound head; CI poll is due now"),
+                    Ok(false) => {},
+                    Err(error) => warn!(workflow=%id, "cannot end the hosted CI poll early: {error:#}"),
+                }
+            },
+            Err(error) => warn!("cannot end hosted CI polls early: {error:#}"),
+        }
+    }
+    retries.extend(plan.tiers.keys().copied());
     let select = |cursor| {
+        if let Some(finishing) = adoption::select_finishing(&adopted, &ledger, utc_day_now(), only, &retries, &plan.tiers) {
+            return Some(finishing);
+        }
+        if ceiling < adoption::FinishTier::Other {
+            return None;
+        }
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
@@ -7192,7 +7219,7 @@ async fn resume_draft_pr(
     let rescope_entry = workflow.current_checkpoint()?;
     let (_, rescope_main, _) = run("git", &["rev-parse", "origin/main"], &worktree).await?;
     let rescope_inputs = acceptance::own_pr_rescope::Inputs {
-        request: crate::autoship_review::digest(format!("{}\n{}", issue.title, issue.body).as_bytes()),
+        request: acceptance::own_pr_rescope::request_digest(&issue.title, &issue.body),
         main: rescope_main.trim().to_owned(),
     };
     if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
@@ -7216,7 +7243,13 @@ async fn resume_draft_pr(
         info!(pr, issue = issue.number, head = %workflow.binding().head, "resume: published the workflow's checkpointed head before acceptance");
     }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
-    let (ci_preparation, ci_scope) = ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await?;
+    // #2329: with a rescope pending (or a failure implicating files outside
+    // the contract), the CI code-repair round is only `due` here. It is
+    // admitted after the scope decision below, so a repair confined to the
+    // old scope spends nothing and its backoff never replaces the rescope.
+    let mut rescope_findings = acceptance::own_pr_rescope::pending(&rescope_entry);
+    let ci_repair::Scoped { preparation: ci_preparation, scope: mut ci_scope, due: mut ci_due } =
+        ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay, rescope_findings.is_some()).await?;
     let mut ci_findings = match ci_preparation {
         ci_repair::Preparation::Continue => None,
         ci_repair::Preparation::Repair(input) => Some(input),
@@ -7250,41 +7283,67 @@ async fn resume_draft_pr(
     // recorded findings: a new revision on this branch and head, then repair,
     // verify and review in it; past the bound, stop for the owner.
     let mut rescope_notes = None;
-    if let Some(findings) = acceptance::own_pr_rescope::pending(&rescope_entry) {
-        let upheld = workflow.latest_review_receipt("resume-structured-")?
-            .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
-            .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
-        let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
-            pr, issue: issue.number, automatic: expected_head.is_none() };
-        match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
-            acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
-                info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
-                rescope_notes = notes;
-            }
-            acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
-                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-                return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+    // #2329: a refused CI scope amendment goes straight to the rescope in
+    // this same run (the second pass), instead of waiting for a later tick
+    // whose CI preparation could move the checkpoint first.
+    for _pass in 0..2 {
+        let rescoping = rescope_findings.is_some();
+        if let Some(findings) = rescope_findings.take() {
+            let upheld = workflow.latest_review_receipt("resume-structured-")?
+                .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+                .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+            let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
+                pr, issue: issue.number, automatic: expected_head.is_none() };
+            match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
+                acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
+                    info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
+                    rescope_notes = notes;
+                }
+                acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+                }
             }
         }
-    }
-    // #2454: a required check whose failure implicates files outside the
-    // contract asks the amendment authority for exactly those files before any
-    // repair round. A refusal rescopes; repair never retries the old scope.
-    if let Some(scope) = ci_scope {
+        // #2454: a required check whose failure implicates files outside the
+        // contract asks the amendment authority for exactly those files before
+        // any repair round. A refusal rescopes; repair never retries the old scope.
+        let Some(scope) = ci_scope.take() else { break };
         let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
             title: &issue.title, worktree: &worktree, control: &acceptance_control };
         // #2329: `Repair` means the failure reproduced on this head with the
-        // same pinned recipe while green main passes it.
-        let failure = acceptance::ci_scope::Failure { tests: &scope.tests, diagnostics: &scope.diagnostics, regression: ci_findings.is_some() };
+        // same pinned recipe while green main passes it. #2456: otherwise no
+        // paired replay ran, which is unknown, not "main also fails".
+        let regression = acceptance::ci_scope::Regression::of(ci_findings.is_some(), scope.unreplayed);
+        let failure = acceptance::ci_scope::Failure { tests: &scope.tests, diagnostics: &scope.diagnostics,
+            panic_locations: &scope.panic_locations, regression, main: scope.main.as_ref() };
         match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, failure, &mut workflow).await? {
-            acceptance::ci_scope::Widen::InScope => {}
+            acceptance::ci_scope::Widen::InScope => break,
             acceptance::ci_scope::Widen::Amended(paths) => {
                 info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
+                break;
             }
             acceptance::ci_scope::Widen::Rescoped(message) => {
-                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-                return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+                let pending = acceptance::own_pr_rescope::pending(&workflow.current_checkpoint()?);
+                if rescoping || pending.is_none() {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+                }
+                info!(pr, issue = issue.number, "resume: CI scope refused; rescoping the own PR now");
+                rescope_findings = pending;
+                ci_scope = Some(scope);
             }
+        }
+    }
+    // #2329: the scope now covers the failing check's files (or never needed
+    // them): only now does a due CI code-repair round spend a rung.
+    if let Some(due) = ci_due.take() {
+        match ci_repair::admit_due(&mut workflow, pr, due).await? {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Repair(input) => {
+                if ci_findings.is_none() { ci_findings = Some(input); }
+            }
+            ci_repair::Preparation::Deferred(report) => return Ok(report),
         }
     }
 
@@ -8428,7 +8487,7 @@ where F:FnOnce()->Fut,Fut:std::future::Future<Output=Result<Option<RunReport>>> 
 
 async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<RunReport>> {
     if let Some((pr, issue_no, resume_branch)) =
-        find_resumable_draft(repo_root, None, dry_run).await
+        find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other).await
     {
         let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
         return resume_draft_pr(
@@ -8525,7 +8584,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 RedMainPlan::Resume(n) => {
                     if lane != Lane::Build {
                         if let Some((pr, issue_no, resume_branch)) =
-                            find_resumable_draft(repo_root, Some(n), dry_run).await
+                            find_resumable_draft(repo_root, Some(n), dry_run, adoption::FinishTier::Other).await
                         {
                             info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
                             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
@@ -8580,8 +8639,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         &fair,
         resume_per_build(),
     );
-    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
-        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
+    // #2495 — an owed build turn still yields to finishing: near-done PRs
+    // (green bound head, publish, CI pending) are what that debt protects.
+    let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);
+    if let (None, Some(ceiling)) = (&red_main_issue, ceiling) {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run, ceiling).await {
             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run, None)
                 .await
@@ -10655,7 +10717,7 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
 /// #2444 — every PR reader shares one listing per tick, so it asks for the
 /// union of the fields any reader needs (including routing labels and closing
 /// references, which used to cost a `gh pr view` per open PR).
-const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels";
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels,statusCheckRollup";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
     let fields=if kind=="pr" {
@@ -11961,6 +12023,14 @@ impl FairSched {
         self.resume_reservations_since_build = self.resume_reservations_since_build.saturating_add(1);
     }
 
+    /// #2504 — an issue-lane turn (selected, scoped or parked, billed or not)
+    /// settles the debt. Unbilled scoping used to leave it standing, so the
+    /// issue lane kept the slot while due own PRs starved.
+    fn record_issue_turn(&mut self) {
+        self.resumes_since_build = 0;
+        self.resume_reservations_since_build = 0;
+    }
+
     fn record_billed(&mut self, resumed: bool) {
         if !resumed { self.resume_reservations_since_build = 0; }
         self.resumes_since_build = if resumed {
@@ -12054,6 +12124,16 @@ fn resume_per_build() -> u32 {
 /// #1532 — is this billed slot reserved for a new-issue build? Only the
 /// combined lane interleaves: the explicit lanes keep their single purpose,
 /// and with resume-first off there is nothing to interleave against.
+/// #2495 — the furthest-from-done PR work the PR lane may take this turn.
+/// `None` skips it (build lane, or resume-first off); an owed fresh-issue turn
+/// (#1532) still admits work that only needs finishing.
+fn resume_ceiling(lane: Lane, resume_first: bool, prefer_build: bool) -> Option<adoption::FinishTier> {
+    if lane == Lane::Build || !resume_first {
+        return None;
+    }
+    Some(if prefer_build { adoption::FinishTier::PublishOrCiPending } else { adoption::FinishTier::Other })
+}
+
 fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
     lane == Lane::Combined && resume_first && fair.resumes_since_build.max(fair.resume_reservations_since_build) >= per_build
 }
@@ -12986,6 +13066,10 @@ impl AutoPrLoop {
                 if let Ok(report) = &outcome {
                     if report.billed {
                         FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
+                    } else if !report.resumed && report.message != IDLE_MSG {
+                        // #2504: an unbilled issue-lane turn still took the
+                        // slot the debt reserved for it; own-PR work is next.
+                        FairSched::update_persist(&self.fair_path, FairSched::record_issue_turn);
                     }
                 }
                 match outcome {
@@ -13457,7 +13541,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         assert_eq!(allowance.confirmed, 0);
         assert_eq!(allowance.available, 5, "a paid retry is not a merged PR");
         let fair = FairSched::load(&fair_path);
-        let expected = if billed { if resumed { (3, 3) } else { (0, 0) } } else { (2, 3) };
+        // #2504: any issue-lane turn (selected, scoped or parked) settles the
+        // debt, billed or not; an unpaid PR turn leaves it unchanged.
+        let expected = if !resumed { (0, 0) } else if billed { (3, 3) } else { (2, 3) };
         assert_eq!((fair.resumes_since_build, fair.resume_reservations_since_build), expected,
             "held control flow must not erase a paid turn's fairness settlement");
     }
@@ -13486,6 +13572,82 @@ else:raise Exception('unexpected fixture call '+repr(args))
     #[tokio::test(start_paused = true)]
     async fn paid_completed_build_clears_resume_debt() {
         assert_turn_fairness(false, true, false).await;
+    }
+
+    /// #2504 — Legion 2026-11-23 20:20Z-20:40Z: autopr-fair.json read
+    /// {"resume_cursor":2449,"resumes_since_build":1,"resume_reservations_since_build":3}.
+    /// About ten fresh issues were scoped and parked unbilled, so the debt never
+    /// cleared and due own PRs (#2378, #2358, #2449) starved. An unbilled
+    /// issue-lane turn must settle the debt so own-PR work gets the next slot,
+    /// and own-PR work must come back at least every `per_build + 1` turns.
+    #[tokio::test(start_paused = true)]
+    async fn unbilled_issue_turns_cannot_starve_due_own_pr_work() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1);
+        let now = chrono::Utc::now();
+        worker.clock = Arc::new(move || now);
+        FairSched::update_persist(&worker.fair_path, |fair| {
+            fair.resume_cursor = 2449;
+            fair.resumes_since_build = 1;
+            fair.resume_reservations_since_build = 3;
+        });
+        let fair_path = worker.fair_path.clone();
+        assert!(prefer_build_now(Lane::Combined, true, &FairSched::load(&fair_path), 2), "fixture: the owed build turn");
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "fixture: tier (c) own-PR work is shut out while the debt stands");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let timer_stop = stop.clone();
+        let run = worker.run_with(stop, move || {
+            let turn = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if turn > 0 { return Ok(RunReport::idle()); }
+                // A fresh issue scoped and parked: unbilled, held, not a resume.
+                Ok(RunReport { message: "issue #2401: scoping parked awaiting input".into(),
+                    billed: false, held: true, resumed: false })
+            }
+        }, || async { 0 });
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            timer_stop.cancel();
+        };
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        let fair = FairSched::load(&fair_path);
+        assert_eq!((fair.resume_cursor, fair.resumes_since_build, fair.resume_reservations_since_build), (2449, 0, 0),
+            "an unbilled issue-lane turn must settle the resume debt");
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other),
+            "the next slot admits due tier (c) own-PR work");
+
+        // Bounded interleave: issue turns settle, PR reservations accrue; own-PR
+        // work is never more than one issue turn away.
+        let mut fair = FairSched::default();
+        let mut since_pr = 0;
+        for _ in 0..30 {
+            if prefer_build_now(Lane::Combined, true, &fair, 2) {
+                fair.record_issue_turn();
+                since_pr += 1;
+            } else {
+                fair.reserve_resume();
+                since_pr = 0;
+            }
+            assert!(since_pr <= 1, "own-PR work starved for {since_pr} consecutive issue turns");
+        }
+
+        // A stale owner whose lease expired does not keep the workflow.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let binding = crate::autoship_workflow::Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        store.register("owner/repo#2439", "agent-fix/issue-2439", binding, 0).unwrap();
+        assert!(store.claim("owner/repo#2439", "stale-worker", 0, 1_000).unwrap().is_some());
+        assert!(store.claim("owner/repo#2439", "worker", 500, 1_000).unwrap().is_none(), "a live lease is exclusive");
+        assert!(store.claim("owner/repo#2439", "worker", 1_001, 1_000).unwrap().is_some(),
+            "an expired lease with a stale owner is claimable");
     }
 
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
@@ -15805,9 +15967,22 @@ CODEX-REVIEW: lgtm").0);
         let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
+        // #2495: the resume-first block is gated by `resume_ceiling`. An owed
+        // build slot admits only finishing work (green head, publish, CI
+        // pending); ordinary drafts still yield the slot to a build.
         let resume_first = body
-            .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
+            .find("let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);")
             .expect("the resume-first block yields a reserved slot");
+        assert!(body[resume_first..].starts_with("let ceiling") && body.contains("find_resumable_draft(repo_root, None, dry_run, ceiling)"));
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "an owed build slot must not go to ordinary draft work");
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other));
+        assert_eq!(resume_ceiling(Lane::Build, true, false), None);
+        assert_eq!(resume_ceiling(Lane::Combined, false, false), None);
+        let fallback = &src[src.find("async fn waiting_issue_fallback(").expect("fallback")..];
+        let fallback = &fallback[..fallback.find("\n}\n").expect("fallback end")];
+        assert!(fallback.contains("find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other)"),
+            "with no build to run, the reserved slot falls back to any waiting draft");
         let pick=body.find("match select_issue_with_fallback(repo_root, dry_run, prefer_build, || waiting_issue_fallback(repo_root,dry_run)).await").expect("production picker and guarded waiting-work fallback");
         assert!(resume_first<pick,"resume-first still precedes reserved-slot issue selection");
 
@@ -16412,6 +16587,34 @@ CODEX-REVIEW: lgtm").0);
         assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
         assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
         assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2329 (PR #2378, head 856aca6f): the CI code-repair ladder ran before
+    /// the pending own-PR rescope and the CI scope step, so it spent four
+    /// rounds on a repair that could not edit `notify.rs` and its backoff
+    /// returned before the rescope (and overwrote it). The CI preparation is
+    /// told a rescope is pending; the rescope runs; the CI scope step runs; a
+    /// refusal there goes straight to the rescope in the same run; and only
+    /// then is a due CI repair round admitted, before the revise round uses it.
+    #[test]
+    fn resume_admits_a_due_ci_repair_round_only_after_the_scope_decision() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let pending = at("own_pr_rescope::pending(&rescope_entry)");
+        let prepared = at("ci_repair::prepare_scoped(");
+        let told = at("&ci_repair::SharedReplay, rescope_findings.is_some())");
+        let rescoped = at("own_pr_rescope::run(");
+        let widened = at("acceptance::ci_scope::widen(");
+        let straight = at("own_pr_rescope::pending(&workflow.current_checkpoint()?)");
+        let admitted = at("ci_repair::admit_due(");
+        let repaired = at("ci_findings.take()");
+        assert!(pending < prepared && prepared < told, "the CI preparation must know a rescope is pending");
+        assert!(told < rescoped && rescoped < widened, "the rescope runs before the CI scope step");
+        assert!(widened < straight && straight < admitted, "a refused CI scope must rescope before any repair round is admitted");
+        assert!(admitted < repaired, "the admitted round feeds the CI repair revise round");
     }
 
     /// #2491 (PR #2449, 14:33Z): the resume ran acceptance preparation before

@@ -135,7 +135,8 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON};
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCOPE_STOP_ACTION, RESCOPE_STOP_MAIN_EVIDENCE,
+    RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -2030,6 +2031,23 @@ impl WorkflowStore {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// #2510: hand back one admitted attempt whose work never reached a
+    /// verdict because infrastructure refused it. Never below zero.
+    pub fn release_epoch_attempt(&mut self, lease: &Lease, purpose: &str, epoch: &str, now: i64) -> Result<bool> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len() <= 1024, "bounded epoch purpose required");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let key = format!("epoch:{epoch}");
+        let released = tx.execute("UPDATE bounded_attempt SET attempts=attempts-1 WHERE workflow=?1 AND purpose=?2 AND binding=?3 AND attempts>0",
+            params![lease.workflow, purpose, key])? == 1;
+        if released {
+            event(&tx, &lease.workflow, lease.generation, "epoch_attempt_released",
+                &serde_json::json!({"purpose":purpose,"epoch":epoch}).to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(released)
     }
 
     /// Check fencing immediately before a remote operation, in addition to

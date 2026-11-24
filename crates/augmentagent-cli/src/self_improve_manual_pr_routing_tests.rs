@@ -541,7 +541,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let before=ids.map(|id|(initial.snapshot(id).unwrap(),initial.owner_control(id).unwrap(),initial.events(id).unwrap()));
         let prior_adoption=initial.adopted_pr("owner/repo",9).unwrap();drop(initial);
         let selected=if std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked" {
-            find_resumable_draft(&root,None,false).await.map(|p|p.0)
+            find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await.map(|p|p.0)
         }else {
             adopted_execution::next(&root,false).await.unwrap().map(|p|p.pr)
         };

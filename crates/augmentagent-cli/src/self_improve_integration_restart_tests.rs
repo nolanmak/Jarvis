@@ -104,7 +104,7 @@ async fn exercise(kind: &str, test: &str) {
                     );
                 }
                 assert_eq!(
-                    find_resumable_draft(&repo, None, false).await,
+                    find_resumable_draft(&repo, None, false, adoption::FinishTier::Other).await,
                     Some((1606, 1, "agent-fix/issue-1".into()))
                 );
                 assert_eq!(
@@ -150,10 +150,10 @@ async fn exercise(kind: &str, test: &str) {
                         .reason,
                     "resume_started"
                 );
-                assert_eq!(find_resumable_draft(&repo,Some(1),false).await,Some((1606,1,"agent-fix/issue-1".into())),
+                assert_eq!(find_resumable_draft(&repo, Some(1), false, adoption::FinishTier::Other).await,Some((1606,1,"agent-fix/issue-1".into())),
                     "a crashed resume lost its durable integration retry behind today's attempt ledger");
                 assert_eq!(
-                    find_resumable_draft(&repo, None, false).await,
+                    find_resumable_draft(&repo, None, false, adoption::FinishTier::Other).await,
                     Some((1607, 2, "agent-fix/issue-2".into())),
                     "the recovered integration job must not monopolize normal rotation"
                 );
