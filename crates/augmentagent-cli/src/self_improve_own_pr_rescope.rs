@@ -44,10 +44,10 @@ const COMMENT_PURPOSE: &str = "own-pr-rescope-comment";
 pub(crate) const ORIGIN: &str = "own_pr_rescope";
 /// The single stop checkpoint. #2371: never an owner-only park. It is a
 /// bounded wait autoship revisits: daily, or when main or the issue changes.
-pub(crate) const EXHAUSTED_REASON: &str = "own_pr_rescope_exhausted";
-pub(crate) const EXHAUSTED_ACTION: &str = "await_request_or_main_change";
-const REQUEST_EVIDENCE: &str = "request:";
-const MAIN_EVIDENCE: &str = "main:";
+pub(crate) const EXHAUSTED_REASON: &str = crate::autoship_workflow::RESCOPE_STOP_REASON;
+pub(crate) const EXHAUSTED_ACTION: &str = crate::autoship_workflow::RESCOPE_STOP_ACTION;
+const REQUEST_EVIDENCE: &str = crate::autoship_workflow::RESCOPE_STOP_REQUEST_EVIDENCE;
+const MAIN_EVIDENCE: &str = crate::autoship_workflow::RESCOPE_STOP_MAIN_EVIDENCE;
 const PATH_EVIDENCE: &str = "ci-scope-path:";
 /// #2508: written before registration so the rescope stays pending when an
 /// infrastructure refusal rewrites the checkpoint to `await_capacity`.
@@ -102,6 +102,12 @@ pub(crate) const REVISIT_MS: i64 = 24 * 3_600_000;
 pub(crate) struct Inputs {
     pub request: String,
     pub main: String,
+}
+
+/// The issue's request as a stop records it. The resume and the selection
+/// pass's open-issue listing (#2512) must hash the same text the same way.
+pub(crate) fn request_digest(title: &str, body: &str) -> String {
+    crate::autoship_review::digest(format!("{title}\n{body}").as_bytes())
 }
 
 /// Whether a stop is still waiting: unchanged main and request, and not yet
