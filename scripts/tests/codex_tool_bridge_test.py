@@ -4086,5 +4086,34 @@ class ReadAllowanceTests(unittest.TestCase):
             self.make_policy(handoff_path=str(self.inbox / 'aa-txt-99-0.md'))
 
 
+class InspectBuildReadinessTests(unittest.TestCase):
+    """#2532: a policy the bridge refuses must name why, not only `mcp_start`."""
+
+    def inspect(self, policy):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'policy.json'
+            path.write_text(json.dumps(policy(Path(temp))))
+            result = subprocess.run([sys.executable, '-I', str(Path(__file__).parents[1] / 'codex-tool-bridge.py'),
+                                     '--inspect-build-readiness', str(path)],
+                                    capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_refused_write_grant_reports_the_denial(self):
+        def policy(temp):
+            work = temp / 'work'
+            work.mkdir()
+            (work / 'AGENTS.md').write_text('x')
+            return {'cwd': str(work), 'write_roots': [], 'write_files': [str(work / 'AGENTS.md')],
+                    'autoship_in_place_writes': True, 'allowed_tools': ['Bash(cargo *)']}
+        report = self.inspect(policy)
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start',
+                                  'detail': 'Denied: credential and control files cannot be admitted'})
+
+    def test_unexpected_error_reports_only_its_type(self):
+        report = self.inspect(lambda temp: {'cwd': str(temp / 'PRIVATE-missing-cwd')})
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start', 'detail': 'FileNotFoundError'})
+
+
 if __name__ == '__main__':
     unittest.main()

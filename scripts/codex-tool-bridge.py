@@ -3247,8 +3247,13 @@ if __name__ == '__main__':
                        if key in ('available_bytes', 'required_bytes')
                        and type(value) is int and 0 <= value <= 2**64-1}
             print(json.dumps({'ready': False, 'category': error.category, **numbers}))
-        except Exception:
-            print(json.dumps({'ready': False, 'category': 'mcp_start'}))
+        except Exception as error:
+            # #2532: name the real failure. Only a Denied carries its fixed
+            # message; any other exception reports its type alone, so no
+            # path or value from the environment leaves the bridge.
+            detail = (f'Denied: {error.args[0]}' if type(error) is Denied and error.args
+                      and isinstance(error.args[0], str) else type(error).__name__)
+            print(json.dumps({'ready': False, 'category': 'mcp_start', 'detail': detail[:200]}))
         finally:
             if policy is not None:
                 policy.close()
