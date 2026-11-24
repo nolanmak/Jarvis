@@ -24,8 +24,8 @@ class Manager:
         subprocess.run(['systemctl','--user','--job-mode=fail','start',WORKER],check=True,
                        capture_output=True,text=True,timeout=20)
 
-def current_executable(repository,proc,pid):
-    binary=repository/'target/release/augmentagent'
+def current_executable(repository,proc,pid,binary=None):
+    binary=binary or repository/'target/release/augmentagent'
     expected=binary.lstat();actual=(proc/str(pid)/'exe').stat()
     return (stat.S_ISREG(expected.st_mode) and expected.st_uid==os.geteuid()
             and not expected.st_mode & 0o022
@@ -58,12 +58,22 @@ def managed(repository,worker):
                 and meta.st_nlink==1 and meta.st_size<=64*1024):return False
         if not fragment.read_text().startswith('# Managed by ensure-autopr-worker.sh\n'):return False
         match=re.match(r'^\{ path=(.*?) ; argv\[\]=(.*?) ; ',worker.get('ExecStart',''))
-        launcher=str(repository/'scripts/run-rs.sh')
-        return bool(match and Path(match[1]).resolve()==Path(launcher).resolve()
-                    and match[2] in [launcher+' auto-pr-worker --dry-run '+dry for dry in ('true','false')])
+        # #2468 — a pinned worker starts through run-autoship-pinned.sh.
+        for name in ('run-rs.sh','run-autoship-pinned.sh'):
+            launcher=str(repository/'scripts'/name)
+            if (match and Path(match[1]).resolve()==Path(launcher).resolve()
+                    and match[2] in [launcher+' auto-pr-worker --dry-run '+dry for dry in ('true','false')]):
+                return True
+        return False
     except (OSError,KeyError,ValueError):return False
 
-def recover(repository, state, proc, manager):
+def worker_executable(repository,proc,pid,pinned):
+    # #2468 — the worker may run its pinned build instead of target/release.
+    if current_executable(repository,proc,pid):return True
+    try:return bool(pinned) and current_executable(repository,proc,pid,pinned)
+    except OSError:return False
+
+def recover(repository, state, proc, manager, pinned=None):
     before=manager.properties(WORKER)
     if not eligible(before):return {'state':'not-eligible'}
     original_host=host(repository,state,proc,manager)
@@ -78,7 +88,7 @@ def recover(repository, state, proc, manager):
         after=manager.properties(WORKER)
         try:
             pid=int(after.get('MainPID','0'))
-            if after.get('ActiveState')=='active' and pid>1 and current_executable(repository,proc,pid):
+            if after.get('ActiveState')=='active' and pid>1 and worker_executable(repository,proc,pid,pinned):
                 command=(proc/str(pid)/'cmdline').read_bytes().split(b'\0')
                 group=(proc/str(pid)/'cgroup').read_text()
                 if (b'auto-pr-worker' in command and any(WORKER in line.split('/') for line in group.splitlines())
@@ -93,9 +103,10 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repository',type=Path,required=True)
     parser.add_argument('--state',type=Path,required=True)
+    parser.add_argument('--worker-binary',type=Path,help='the pinned auto-ship build (#2468)')
     args=parser.parse_args()
     try:
-        result=recover(args.repository,args.state,Path('/proc'),Manager())
+        result=recover(args.repository,args.state,Path('/proc'),Manager(),args.worker_binary)
         print(json.dumps(result))
         if result['state']=='held':raise SystemExit(3)
     except (OSError,RuntimeError,subprocess.SubprocessError):

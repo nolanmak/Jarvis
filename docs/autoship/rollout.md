@@ -395,3 +395,21 @@ batch, a successful Git-ref read from the same repository establishes Git-data
 access; otherwise the controller requires a valid main-ref observation. An
 inaccessible main ref, service error or rate limit stops the batch and preserves
 all effects. An authorized absent ref still yields to later observable pushes.
+
+## Pinned controller release (#2468)
+
+The auto-ship worker runs a build of a pinned commit, not main's head. Main
+keeps deploying the daemon and everything else every five minutes; the worker's
+binary changes only when the pin moves.
+
+- Pin: `~/.config/augmentagent/autoship-pin` (a full SHA, or `main` to unpin).
+- Build: `/mnt/build/augmentagent-autoship-pinned/{src,target,bin}`; the worker
+  unit runs `scripts/run-autoship-pinned.sh` and reloads on
+  `~/.local/state/augmentagent/autoship-pinned-built`, not `built-commit`.
+- First deploy with no pin: the updater pins the build that deploy installs and
+  copies its binary, so the rollout reloads the worker exactly as before.
+- Move it: `scripts/autoship-pin.sh <sha|tag>` (must be on origin/main). It
+  records the pin and starts one updater run, which builds, installs, and lets
+  the worker reload at its next safe point. `scripts/autoship-pin.sh status`
+  shows the pin and how far main is ahead; so does `augmentagent autopr-health`.
+- Unpin: `scripts/autoship-pin.sh main`.

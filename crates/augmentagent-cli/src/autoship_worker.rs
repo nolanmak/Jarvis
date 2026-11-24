@@ -62,6 +62,18 @@ fn deployment_stamp(path:&Path)->Option<String> {
         }
     }
 }
+/// #2468: set on a pinned worker's unit (scripts/lib/autoship-pin.sh). It
+/// names the stamp of the pinned build, which changes only when the owner
+/// moves the pin, so merges to main no longer reload the worker.
+pub const DEPLOY_STAMP_ENV: &str = "AUGMENTAGENT_AUTOSHIP_DEPLOY_STAMP";
+/// The deploy stamp this worker reloads on: the pinned stamp when one is
+/// configured, otherwise the updater's `built-commit` (unpinned, #2303).
+fn deployment_stamp_path(pinned:Option<std::ffi::OsString>,state:Option<PathBuf>)->Option<PathBuf> {
+    match pinned.filter(|path|!path.is_empty()) {
+        Some(path)=>Some(PathBuf::from(path)),
+        None=>state.map(|state|state.join("built-commit")),
+    }
+}
 impl UpgradeWatch {
     pub fn current() -> Result<Self> {
         let path = std::env::current_exe()?;
@@ -76,9 +88,10 @@ impl UpgradeWatch {
         if let Some(policy)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") {paths.push(PathBuf::from(policy));}
         let configuration=paths.into_iter().map(|path|Ok((path.clone(),configuration_stamp(&path)?))).collect::<Result<Vec<_>>>()?;
         // #2303: record the deploy this process started under, so only a
-        // later deploy (never the same stamp) requests a reload.
-        let deployment=crate::build_storage::state_dir().ok().map(|state|{
-            let stamp=state.join("built-commit");let seen=deployment_stamp(&stamp);(stamp,seen)});
+        // later deploy (never the same stamp) requests a reload. #2468: a
+        // pinned worker watches its own install stamp instead of main's.
+        let deployment=deployment_stamp_path(std::env::var_os(DEPLOY_STAMP_ENV),
+            crate::build_storage::state_dir().ok()).map(|stamp|{let seen=deployment_stamp(&stamp);(stamp,seen)});
         Ok(Self {path,identity: (metadata.dev(), metadata.ino()),configuration,deployment})
     }
     pub fn changed(&self) -> Result<bool> {
@@ -423,6 +436,26 @@ mod tests {
         assert!(!watch.changed().unwrap());
         std::fs::write(&fresh,"cccc\n").unwrap();
         assert!(watch.changed().unwrap(),"the first stamp ever written is a deploy too");
+    }
+    /// #2468: a pinned worker watches the pinned build's stamp. A main
+    /// deploy (a new `built-commit`) is not a reason to reload; moving the
+    /// pin is.
+    #[test]
+    fn a_pinned_worker_reloads_on_its_pin_and_ignores_main_deploys() {
+        let t=tempfile::tempdir().unwrap();
+        let state=t.path().join("state");std::fs::create_dir(&state).unwrap();
+        let built=state.join("built-commit");std::fs::write(&built,"aaaa\n").unwrap();
+        let pinned=state.join("autoship-pinned-built");std::fs::write(&pinned,"pppp\n").unwrap();
+        assert_eq!(deployment_stamp_path(None,Some(state.clone())),Some(built.clone()),"unpinned: main's stamp");
+        assert_eq!(deployment_stamp_path(Some("".into()),Some(state.clone())),Some(built.clone()),"an empty value is not a pin");
+        let stamp=deployment_stamp_path(Some(pinned.clone().into_os_string()),Some(state.clone())).unwrap();
+        assert_eq!(stamp,pinned);
+        let binary=t.path().join("worker");std::fs::write(&binary,"pinned executable").unwrap();
+        let watch=UpgradeWatch::at(&binary).with_deployment_stamp(&stamp);
+        std::fs::write(&built,"bbbb\n").unwrap();
+        assert!(!watch.changed().unwrap(),"a main deploy must not reload a pinned worker");
+        std::fs::write(&pinned,"qqqq\n").unwrap();
+        assert!(watch.changed().unwrap(),"a moved pin is a deploy to load");
     }
     /// The replacement process records the stamp it started under, so the
     /// same deploy can never restart it again: rewriting the same commit

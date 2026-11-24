@@ -151,6 +151,43 @@ pub struct HealthInputs {
     /// Set when the worker store resolved but its events could not be read.
     /// Distinct from `None` progress with no error (not collected: quiet).
     pub workflow_progress_error: Option<String>,
+    /// #2468 — the controller release the worker runs. `None` when no pin is
+    /// recorded (not yet bootstrapped, or a host that does not pin).
+    pub autoship_pin: Option<AutoshipPin>,
+}
+
+/// #2468 — the pinned auto-ship controller against `origin/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoshipPin {
+    /// A full commit SHA, or "main" when the owner unpinned the worker.
+    pub pinned: String,
+    /// What the installed pinned binary was built from (the worker's stamp).
+    pub installed: Option<String>,
+    /// Commits on `origin/main` not in the pin; `None` when unknown.
+    pub main_ahead: Option<u64>,
+}
+
+impl AutoshipPin {
+    fn is_sha(&self) -> bool {
+        self.pinned.len() == 40 && self.pinned.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    /// The pin moved but its build is not installed yet.
+    fn pending(&self) -> bool {
+        self.is_sha() && self.installed.as_deref() != Some(self.pinned.as_str())
+    }
+    fn line(&self) -> String {
+        if !self.is_sha() {
+            return "autoship controller: unpinned (the worker follows main deploys)".into();
+        }
+        let short = |s: &str| s.chars().take(12).collect::<String>();
+        let ahead = self.main_ahead.map_or("an unknown number of".into(), |n| n.to_string());
+        let mut line = format!("autoship controller: pinned to {}; main is {ahead} commit(s) ahead", short(&self.pinned));
+        if self.pending() {
+            line.push_str(&format!("; pin move pending (installed: {})",
+                self.installed.as_deref().map_or("none".into(), short)));
+        }
+        line
+    }
 }
 
 /// #1708 — S runtime events as the watchdog reads them.
@@ -553,6 +590,22 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
+    // #2468 — the owner moved the pin and the updater has not installed it.
+    if let Some(pin) = i.autoship_pin.as_ref().filter(|p| p.pending()) {
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "autoship-pin-pending",
+            detail: format!(
+                "the auto-ship worker is pinned to {} but its installed build is {}; \
+                 it keeps running the installed build until the pinned one is built",
+                pin.pinned, pin.installed.as_deref().unwrap_or("none")
+            ),
+            fix: "Check `update.log` for AUTOSHIP PIN lines; `scripts/autoship-pin.sh status` \
+                  shows the pin. A failed pinned build retries every updater tick."
+                .into(),
+        });
+    }
+
     if let Some(error) = &i.merge_allowance_error {
         out.push(Finding { severity: Severity::Alert, code: "merge-accounting-unavailable",
             detail: format!("Cannot read authoritative merge allowance: {error}"),
@@ -816,6 +869,9 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
 /// budget, which is the first thing a reader asks when nothing shipped.
 pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     let mut out = report(findings).unwrap_or_else(|| "✓ auto-PR loop healthy".to_string());
+    if let Some(pin) = &i.autoship_pin {
+        out.push_str(&format!("\n{}", pin.line()));
+    }
     if let Some(r) = i.merge_allowance {
         out.push_str(&format!("\nconfirmed auto-merges today (UTC): {} of {}; remaining allowance: {}; pending capacity holds: {}; available to dispatch: {}",
             r.confirmed, r.cap, r.remaining, r.pending, r.available));
@@ -1176,6 +1232,34 @@ fn deploy_state(repo_root: &Path, state_dir: &Path) -> (Option<bool>, Option<i64
     (Some(false), lag)
 }
 
+/// #2468 — the recorded pin (`~/.config/augmentagent/autoship-pin`), the
+/// build the worker has installed, and how far `origin/main` is ahead.
+fn autoship_pin_state(repo_root: &Path, config_dir: &Path, state_dir: &Path) -> Option<AutoshipPin> {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let pinned = read(config_dir.join("autoship-pin"))?;
+    let installed = read(state_dir.join("autoship-pinned-built"));
+    let mut pin = AutoshipPin { pinned, installed, main_ahead: None };
+    if pin.is_sha() {
+        pin.main_ahead = std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..origin/main", pin.pinned)])
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
+    }
+    Some(pin)
+}
+
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+        .join("augmentagent")
+}
+
 /// #1571 — a binary rebuilt under a running process reads as
 /// `/path (deleted)`; that is a pending restart, not a different binary.
 fn strip_deleted(exe: PathBuf) -> PathBuf {
@@ -1388,6 +1472,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
         workflow_progress,
         workflow_progress_error,
+        autoship_pin: autoship_pin_state(repo_root, &config_dir(), &dir),
     }
 }
 
@@ -1672,6 +1757,46 @@ mod tests {
 
     /// #1214 C6 — the report groups labelled issues by reason, and the
     /// block's counts sum to the number of labelled issues.
+    /// #2468 — health names the pinned controller and how far main is
+    /// ahead of it, and warns only while a moved pin is not yet installed.
+    #[test]
+    fn health_shows_the_pinned_controller_and_main_lead() {
+        let sha = "a".repeat(40);
+        let mut i = healthy();
+        i.autoship_pin = Some(AutoshipPin { pinned: sha.clone(), installed: Some(sha.clone()), main_ahead: Some(17) });
+        let findings = analyze(&i, &Thresholds::default());
+        assert!(!findings.iter().any(|f| f.code == "autoship-pin-pending"), "{findings:?}");
+        let text = render_text(&findings, &i);
+        assert!(text.contains("autoship controller: pinned to aaaaaaaaaaaa; main is 17 commit(s) ahead"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        i.autoship_pin = Some(AutoshipPin { pinned: sha.clone(), installed: Some("b".repeat(40)), main_ahead: Some(3) });
+        let findings = analyze(&i, &Thresholds::default());
+        let pending = findings.iter().find(|f| f.code == "autoship-pin-pending").expect("pending pin is reported");
+        assert_eq!(pending.severity, Severity::Warn);
+        assert!(render_text(&findings, &i).contains("pin move pending (installed: bbbbbbbbbbbb)"));
+
+        i.autoship_pin = Some(AutoshipPin { pinned: "main".into(), installed: Some("main".into()), main_ahead: None });
+        let findings = analyze(&i, &Thresholds::default());
+        assert!(!findings.iter().any(|f| f.code == "autoship-pin-pending"));
+        assert!(render_text(&findings, &i).contains("autoship controller: unpinned"));
+    }
+
+    #[test]
+    fn autoship_pin_state_reads_pin_stamp_and_main_lead() {
+        let t = tempfile::tempdir().unwrap();
+        let (config, state) = (t.path().join("config"), t.path().join("state"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let repo = t.path().join("repo");
+        assert_eq!(autoship_pin_state(&repo, &config, &state), None, "no pin recorded: nothing to show");
+        let sha = "c".repeat(40);
+        std::fs::write(config.join("autoship-pin"), format!("{sha}\n")).unwrap();
+        std::fs::write(state.join("autoship-pinned-built"), format!("{sha}\n")).unwrap();
+        let pin = autoship_pin_state(&repo, &config, &state).unwrap();
+        assert_eq!((pin.pinned.as_str(), pin.installed.as_deref(), pin.main_ahead), (sha.as_str(), Some(sha.as_str()), None));
+    }
+
     #[test]
     fn text_output_groups_gave_up_issues_by_reason() {
         let mut i = HealthInputs::default();
@@ -1754,6 +1879,7 @@ mod tests {
             gave_up_by_reason: None,
             workflow_progress: Some(WorkflowProgress::default_complete()),
             workflow_progress_error: None,
+            autoship_pin: None,
         }
     }
 
