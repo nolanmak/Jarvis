@@ -121,13 +121,24 @@ fn configure_lists_exact_tools_and_never_sensitive_ones() {
             "mcp__tabagent__page_find",
             "mcp__tabagent__extract_table",
             "mcp__tabagent__extract_links",
+            "mcp__tabagent__act_click",
+            "mcp__tabagent__act_type",
+            "mcp__tabagent__act_press",
+            "mcp__tabagent__act_select",
+            "mcp__tabagent__act_check",
+            "mcp__tabagent__act_hover",
+            "mcp__tabagent__act_scroll",
+            "mcp__tabagent__act_fill",
+            "mcp__tabagent__form_fill",
+            "mcp__tabagent__form_submit",
+            "mcp__tabagent__dialog_handle",
         ]
     );
     assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("tabagent") && tool.contains('*')));
     for never in [
-        "js_eval", "cookies_get", "storage_get", "network_get", "network_list", "act_upload",
-        "downloads_read", "downloads_list", "page_screenshot", "act_click", "act_type",
-        "form_fill", "form_submit", "dialog_handle", "auth_login", "session_end",
+        "js_eval", "cookies_get", "storage_get", "network_get", "network_list", "network_waitFor",
+        "act_upload", "act_drag", "act_dblclick", "downloads_read", "downloads_list", "downloads_wait",
+        "page_screenshot", "auth_login", "auth_fill", "session_end", "console_list",
     ] {
         assert!(!listed.iter().any(|tool| tool.ends_with(never)), "{never}");
         assert!(!TOOLS.contains(&never), "{never}");
@@ -415,6 +426,129 @@ async fn per_call_deadline_is_below_bridge_cap_and_call_cap_is_enforced() {
         .filter(|r| r.url.path() == "/v1/page.text")
         .count();
     assert_eq!(reached, CALL_CAP / 2);
+}
+
+/// One representative call per action tool and the REST route it must reach.
+fn act_calls() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        ("act_click", json!({"ref": "e3"}), "/v1/act.click"),
+        ("act_type", json!({"text": "hello", "ref": "e4", "submit": true}), "/v1/act.type"),
+        ("act_press", json!({"key": "Enter"}), "/v1/act.press"),
+        ("act_select", json!({"ref": "e5", "values": ["Large"]}), "/v1/act.select"),
+        ("act_check", json!({"ref": "e6", "checked": true}), "/v1/act.check"),
+        ("act_hover", json!({"ref": "e7"}), "/v1/act.hover"),
+        ("act_scroll", json!({"dy": 800}), "/v1/act.scroll"),
+        ("act_fill", json!({"ref": "e8", "value": "Synthetic Name"}), "/v1/act.fill"),
+        ("form_fill", json!({"fields": {"Name": "Synthetic Name", "Subscribe": true, "Tags": ["a", "b"]}}), "/v1/form.fill"),
+        ("form_submit", json!({"ref": "e9"}), "/v1/form.submit"),
+        ("dialog_handle", json!({"action": "accept", "promptText": "ok"}), "/v1/dialog.handle"),
+    ]
+}
+
+#[tokio::test]
+async fn act_tools_are_listed_and_forwarded_unchanged() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})))
+        .mount(&mock)
+        .await;
+    let server = server_for(&mock.uri(), TOOLS);
+    let reply = server
+        .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await
+        .unwrap();
+    let names: Vec<String> = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    let calls = act_calls();
+    for (tool, arguments, _) in &calls {
+        assert!(names.iter().any(|name| name == tool), "{tool} not listed");
+        assert!(TOOLS.contains(tool), "{tool}");
+        // Every argument the call uses is in the advertised schema.
+        let schema = tool_schema(tool);
+        assert_eq!(schema["inputSchema"]["additionalProperties"], false, "{tool}");
+        for key in arguments.as_object().unwrap().keys() {
+            assert!(schema["inputSchema"]["properties"].get(key).is_some(), "{tool}.{key}");
+        }
+        // No Jarvis-side approval: the call goes straight to TabAgent.
+        let (error, body) = text(&server.handle(&call(2, tool, arguments.clone())).await.unwrap());
+        assert!(!error, "{tool} -> {body}");
+        assert!(body.starts_with(UNTRUSTED_MARKER), "{tool} -> {body}");
+    }
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), calls.len());
+    for (request, (tool, arguments, route)) in requests.iter().zip(&calls) {
+        assert_eq!(request.url.path(), *route, "{tool}");
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(&sent, arguments, "{tool} arguments changed on the way");
+        assert_eq!(request.headers.get("x-tabagent-session").unwrap(), SESSION);
+    }
+    // Unknown arguments are still refused before any request.
+    let before = mock.received_requests().await.unwrap().len();
+    let (error, _) = text(&server.handle(&call(3, "act_click", json!({"ref": "e1", "session": "other"}))).await.unwrap());
+    assert!(error);
+    assert_eq!(mock.received_requests().await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn act_tool_refusals_from_tabagent_are_verbatim_and_unretried() {
+    for (code, status, message) in [
+        ("PERMISSION_DENIED", 403, "Site example.com is not approved for act"),
+        ("PROMPT_TIMEOUT", 408, "Nobody answered the purchase prompt within 120s"),
+        ("KILLED", 409, "TabAgent is paused (kill switch)"),
+    ] {
+        let calls = act_calls();
+        for (tool, arguments, _) in &calls {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    json!({"ok": false, "error": {"code": code, "message": message}}),
+                ))
+                .mount(&mock)
+                .await;
+            let server = server_for(&mock.uri(), TOOLS);
+            let (error, body) = text(&server.handle(&call(1, tool, arguments.clone())).await.unwrap());
+            // TabAgent's code and message reach the model unchanged.
+            assert!(error && body.contains(&format!("{code}: {message}")), "{tool} {code} -> {body}");
+            assert!(body.contains("Do not retry"), "{tool} {code} -> {body}");
+            assert_eq!(mock.received_requests().await.unwrap().len(), 1, "{tool} {code} was retried");
+        }
+    }
+    // After KILLED the next action never reaches TabAgent.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(
+            json!({"ok": false, "error": {"code": "KILLED", "message": "paused"}}),
+        ))
+        .mount(&mock)
+        .await;
+    let server = server_for(&mock.uri(), TOOLS);
+    server.handle(&call(1, "form_submit", json!({}))).await.unwrap();
+    let (error, body) = text(&server.handle(&call(2, "act_click", json!({"ref": "e1"}))).await.unwrap());
+    assert!(error && body.contains("stopped"), "{body}");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+}
+
+#[test]
+fn prompt_says_when_to_browse_act_and_announce_consequential_steps() {
+    let bin = std::path::Path::new("/fixture/augmentagent");
+    let (_dir, file) = private_file("fixture-scoped-value");
+    let mut opts = ask();
+    configure_with(&mut opts, &ctx(true), bin, &env_with(&file, None));
+    let prompt = &opts.system_prompt;
+    for needle in [
+        "web search/fetch",
+        "click, type, fill and submit forms",
+        "when the owner asks",
+        "state exactly what will be done",
+        "<<<PAGE_DATA",
+        "approve it in Chrome on the Legion",
+    ] {
+        assert!(prompt.contains(needle), "prompt lacks {needle:?}");
+    }
 }
 
 #[test]
