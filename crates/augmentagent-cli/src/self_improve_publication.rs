@@ -362,6 +362,7 @@ fn retain_publication(guard:&workflow::WorkflowGuard,worktree:&Path,branch:&str,
 pub(super) async fn push_retained(
     guard:&mut workflow::WorkflowGuard,repo:&Path,worktree:&Path,branch:&str,head:&str,issue:u64,args:&[&str],automatic:bool,
 )->Result<String> {
+    guard.checkpoint_publication_candidate(head).await?;
     retain_publication(guard,worktree,branch,head,issue,args,automatic)?;
     guard.push_fresh(repo,branch,automatic).await
 }
@@ -1576,6 +1577,100 @@ else:sys.exit(2)
         // A later pass is idempotent: no second push dispatch or PR.
         reconcile_pending(&repo,false).await.unwrap();
         assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
+        std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
+    /// #2536 — #2503 built 710 lines, ran the one over-cap shrink, then parked
+    /// (main moved during the 70-minute shrink). A parked candidate leaves the
+    /// stages before Stage 4 commits and checkpoints it, so the last
+    /// checkpoint still bound the build base. Publication committed the
+    /// shrunk tree and the guard refused it as "not the checkpointed
+    /// candidate", throwing the build back to scope. The committed shrink
+    /// output must become the checkpointed candidate, be pushed and open a
+    /// PR; a head that is not the worktree's HEAD is still refused.
+    #[tokio::test]
+    async fn over_cap_shrink_then_parked_publish_pushes_committed_candidate() {
+        const CHILD:&str="AUTOSHIP_SHRINK_PUBLISH_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root=tempfile::Builder::new().prefix("autoship-shrink-publish-").tempdir().unwrap();let gh=root.path().join("gh.py");
+            augmentagent_test_support::write_executable(&gh,r#"#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+root=pathlib.Path(os.environ['AUTOSHIP_SHRINK_PUBLISH_FIXTURE']);a=sys.argv[1:]
+with (root/'calls').open('a') as f:f.write(json.dumps(a)+'\n')
+def remote_head():
+    out=subprocess.run(['git','ls-remote','--heads',str(root/'remote.git'),'refs/heads/agent-fix/issue-1'],capture_output=True,text=True)
+    words=out.stdout.split()
+    return words[0] if out.returncode==0 and len(words)==2 else None
+def row():return dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=remote_head(),headRefName='agent-fix/issue-1',baseRefName='main',isCrossRepository=False,state='OPEN')
+if a[:2]==['repo','view']: print('owner/repo')
+elif a[:2]==['issue','view']: print(json.dumps({'state':'OPEN'}))
+elif a[:1]==['api'] and a[1].endswith('/issues/1'): print(json.dumps(dict(number=1,state='open',labels=[])))
+elif a[:1]==['api'] and '/git/ref/heads/agent-fix/issue-1' in a[1]:
+    head=remote_head()
+    if head is None:print('{"message":"Not Found"}');sys.exit(1)
+    print(json.dumps({'object':{'sha':head}}))
+elif a[:2]==['pr','view']:
+    if not (root/'creates').exists():sys.exit(1)
+    print(json.dumps(row()))
+elif a[:2]==['pr','create']:
+    with (root/'creates').open('a') as f:f.write('create\n')
+    print('https://github.com/owner/repo/pull/12')
+elif a[:2]==['pr','list']: print(json.dumps([row()] if (root/'creates').exists() else []))
+else:sys.exit(2)
+"#).unwrap();
+            std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::publication::tests::over_cap_shrink_then_parked_publish_pushes_committed_candidate","--nocapture"])
+                .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
+                .output().unwrap();
+            assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            assert!(root.path().join("executed").exists());
+            return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap());let repo=root.join("repo");std::fs::create_dir(&repo).unwrap();
+        for args in [vec!["init","-q"],vec!["config","user.name","Fixture"],vec!["config","user.email","fixture@example.invalid"]] {
+            assert!(run("git",&args,&repo).await.unwrap().0);
+        }
+        std::fs::write(repo.join("source"),"baseline\n").unwrap();
+        assert!(run("git",&["add","source"],&repo).await.unwrap().0);
+        assert!(run("git",&["commit","-qm","baseline"],&repo).await.unwrap().0);
+        let base=run("git",&["rev-parse","HEAD"],&repo).await.unwrap().1.trim().to_owned();
+        assert!(run("git",&["update-ref","refs/remotes/origin/main",&base],&repo).await.unwrap().0);
+        let remote=root.join("remote.git");
+        assert!(run("git",&["init","--bare","-q",remote.to_str().unwrap()],&repo).await.unwrap().0);
+        assert!(run("git",&["remote","add","origin",remote.to_str().unwrap()],&repo).await.unwrap().0);
+        let worktree=root.join("fresh-worker");let branch="agent-fix/issue-1";
+        assert!(run("git",&["worktree","add","-q","-b",branch,worktree.to_str().unwrap(),&base],&repo).await.unwrap().0);
+        let args=["pr","create","--draft","--head",branch,"--base","main","--title","fix: candidate (#1)","--body","Parked."];
+        let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&worktree,repository:"owner/repo",source_issue:Some(1),pr:None,branch,contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
+        // Build: the last checkpoint binds the base; the build is staged only.
+        guard.transition(crate::autoship_workflow::Stage::Build,"plan_registered","build",0).await.unwrap();
+        std::fs::write(worktree.join("source"),(0..710).map(|n|format!("line {n}\n")).collect::<String>()).unwrap();
+        assert!(run("git",&["add","-A"],&worktree).await.unwrap().0);
+        // Over-cap shrink trims the staged tree.
+        std::fs::write(worktree.join("source"),(0..400).map(|n|format!("line {n}\n")).collect::<String>()).unwrap();
+        assert!(run("git",&["add","-A"],&worktree).await.unwrap().0);
+        // The run parks before Stage 4, so publication makes the first commit.
+        assert!(run("git",&["commit","-qm","fix: candidate (#1)"],&worktree).await.unwrap().0);
+        let head=run("git",&["rev-parse","HEAD"],&worktree).await.unwrap().1.trim().to_owned();
+        assert_ne!(guard.binding().head,head,"fixture must start from the stale build binding");
+        push_retained(&mut guard,&repo,&worktree,branch,&head,1,&args,true).await
+            .expect("committed shrink output must be the checkpointed candidate");
+        // Integrity: a head that is not the worktree's HEAD is still refused.
+        let refused=push_retained(&mut guard,&repo,&worktree,branch,&base,1,&args,true).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("not the checkpointed candidate"),"{refused:#}");
+        let remote_head=run("git",&["ls-remote","--heads",remote.to_str().unwrap(),&format!("refs/heads/{branch}")],&repo).await.unwrap().1;
+        assert!(remote_head.starts_with(&head),"shrunk candidate was not pushed: {remote_head:?}");
+        let published=publish(&guard,&worktree,branch,&head,1,&args,true).await.expect("parked candidate opens its draft");
+        assert_eq!(published.number,12);
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+        let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.binding.head,head,"checkpoint does not bind the published candidate");
+        assert_ne!(after.checkpoint.stage,crate::autoship_workflow::Stage::Scope,"publish fell back to scope");
+        assert_eq!(after.pr,Some(12));
+        assert!(!store.has_pending_publication(&id).unwrap());
         std::fs::write(root.join("executed"),"ok").unwrap();
     }
 

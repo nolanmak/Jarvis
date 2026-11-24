@@ -146,3 +146,94 @@ fn due_publish_retry_outranks_fresh_work_despite_earlier_claims() {
     assert!(rank(None, false, false, later) < rank(Some(&publish), false, true, later),
         "a stalled publication still yields to fresh peers (#2280)");
 }
+
+fn issue(number: u64) -> RestIssue {
+    RestIssue {
+        number,
+        title: "Synthetic widget".into(),
+        body: "Synthetic request".into(),
+        author: "fixture-owner".into(),
+        association: "OWNER".into(),
+        research_filed: false,
+    }
+}
+
+/// Register `number` and leave it at `stage/reason/action` after `claims`
+/// claims. A `held_ms` lease is left in place (not due) instead of released.
+fn park(store: &mut crate::autoship_workflow::WorkflowStore, number: u64, stage: Stage, reason: &str, action: &str,
+    claims: u32, at: i64, held_ms: Option<i64>) {
+    let id = format!("owner/repo#{number}");
+    let binding = Binding { head: "head".into(), contract: "contract".into(), evidence_hash: "evidence".into() };
+    store.register(&id, &format!("agent-fix/issue-{number}"), binding.clone(), at).unwrap();
+    for round in 0..claims {
+        let now = at + i64::from(round);
+        let lease = store.claim(&id, "fixture-worker", now, held_ms.unwrap_or(1_000)).unwrap().unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.stage = stage;
+        cp.next = NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, now).unwrap();
+        if held_ms.is_none() || round + 1 < claims { store.release(&lease, now).unwrap(); }
+    }
+}
+
+fn picker_order(path: &Path, issues: &[u64], now: i64) -> Vec<u64> {
+    let controls = workflow::FreshIssueControls::open_at(path).unwrap();
+    candidates(issues.iter().map(|n| issue(*n)).collect(), &Default::default(), &controls, "owner/repo", now)
+        .unwrap().into_iter().map(|issue| issue.number).collect()
+}
+
+/// 2026-11-24 Legion: #2388 sat at build/plan_registered, due, while every
+/// tick planned another issue. Starved scope retries (attempts >= 3, idle for
+/// hours) outranked the planned row, so each tick paid for one more plan and
+/// the planned work never got its build turn.
+#[test]
+fn after_a_plan_the_next_selection_builds_that_workflow_not_a_new_issue() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("workflow.db");
+    let t0 = 1_795_500_000_000;
+    let now = t0 + 4 * 3_600_000;
+    {
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        // A starved scope retry (oldest-first tier) and a just-planned issue.
+        park(&mut store, 2412, Stage::Scope, "trusted_request_acquired", "scope_request", 6, t0, None);
+        park(&mut store, 2388, Stage::Build, "plan_registered", "build", 5, now - 60_000, None);
+    }
+    // 2500 is fresh: never planned.
+    let order = picker_order(&path, &[2500, 2412, 2388], now);
+    assert_eq!(order.first(), Some(&2388), "planned work must be built before planning another issue: {order:?}");
+}
+
+#[test]
+fn no_new_issue_is_planned_while_planned_unbuilt_work_is_at_the_bound() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("workflow.db");
+    let t0 = 1_795_500_000_000;
+    let now = t0 + 4 * 3_600_000;
+    {
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        park(&mut store, 2412, Stage::Scope, "trusted_request_acquired", "scope_request", 6, t0, None);
+        // Three planned workflows, each still leased after its failed build.
+        for number in [2388, 2414, 2411] {
+            park(&mut store, number, Stage::Build, "plan_registered", "build", 2, now - 60_000, Some(600_000));
+        }
+        // Work past planning (an own PR in verify) still resumes.
+        park(&mut store, 2300, Stage::Verify, "integration_checks_required", "verify_integrated_head", 2, now - 60_000, None);
+    }
+    let order = picker_order(&path, &[2500, 2412, 2388, 2414, 2411, 2300], now);
+    assert_eq!(order, vec![2300], "with {MAX_PLANNED_UNBUILT} planned-unbuilt workflows nothing new may be planned");
+
+    // Below the bound, planning resumes; a planned row still leads when due.
+    let order = picker_order(&path, &[2500, 2412, 2388, 2414, 2300], now);
+    assert!(order.contains(&2500) && order.contains(&2412), "below the bound fresh issues stay selectable: {order:?}");
+}
+
+/// The bound and the build-first order read only the selection snapshots the
+/// picker already holds: no GitHub call is added per candidate or per tick.
+#[test]
+fn build_first_selection_adds_no_github_calls() {
+    let source = include_str!("self_improve_picker_fairness.rs");
+    let body = source.split("#[cfg(test)]").next().unwrap();
+    for needle in ["gh_bin", "run(", "\"api\"", "Command::new"] {
+        assert!(!body.contains(needle), "picker fairness must stay a read-only snapshot filter: found {needle}");
+    }
+}
