@@ -32,6 +32,11 @@ pub(crate) struct Grants {
     pub files: Vec<PathBuf>,
 }
 const CONTROLS: &[&str] = &[".git", ".claude", ".mcp.json", ".github", ".gitmodules"];
+/// Path components the tool bridge refuses to admit as a write grant
+/// (`CONTROL_PARTS` and the `.env` rule in `scripts/codex-tool-bridge.py`).
+/// A grant the bridge refuses fails the whole bridge before any tool runs, so
+/// the controller never issues one (#2532).
+const BRIDGE_CONTROL_PARTS: &[&str] = &[".codex", ".ssh", ".gnupg", ".aws", ".azure"];
 fn relative(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()
@@ -43,8 +48,16 @@ fn relative(path: &str) -> Result<()> {
     Ok(())
 }
 fn control(path: &Path) -> bool {
-    path.components()
-        .any(|c| CONTROLS.iter().any(|name| c.as_os_str() == *name))
+    path.components().any(|c| {
+        let name = c.as_os_str();
+        let text = name.to_string_lossy();
+        CONTROLS.iter().chain(BRIDGE_CONTROL_PARTS).any(|control| name == *control)
+            || text == ".env"
+            || text.starts_with(".env.")
+            || crate::codex_tools::PROTECTED_INJECTION_NAMES
+                .iter()
+                .any(|protected| text.eq_ignore_ascii_case(protected))
+    })
 }
 fn location(state: &Path, worktree: &Path) -> PathBuf {
     state.join("autoship-write-admission").join(format!(
@@ -304,6 +317,39 @@ mod tests {
         assert_eq!(fs::read_dir(root.path()).unwrap().count(),0,"rejected publication created candidate files");
     }
 
+    /// #2532: plan mode admits every top-level tracked path, which includes
+    /// `AGENTS.md` and `.env.example`. The tool bridge refuses any write grant
+    /// on a control, credential or instruction file and then fails its whole
+    /// build readiness check (`mcp_start`), so no such grant may be issued.
+    #[test]
+    fn grants_never_include_paths_the_tool_bridge_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("docs/nested")).unwrap();
+        fs::create_dir_all(root.path().join("ops/.codex")).unwrap();
+        for file in ["AGENTS.md", ".env.example", "README.md", "docs/guide.md",
+                     "docs/nested/claude.md", "docs/nested/keep.md", "ops/run.sh", "ops/.codex/config.toml"] {
+            fs::write(root.path().join(file), "x").unwrap();
+        }
+        let declared = |path: &str, directory: bool| DeclaredPath { path: path.into(), directory };
+        register_at(state.path(), root.path(), "plan:contract", vec![
+            declared("AGENTS.md", false), declared(".env.example", false), declared(".env", false),
+            declared("README.md", false), declared("docs", true), declared("ops", true),
+        ], vec![]).unwrap();
+        let result = grants(state.path(), root.path()).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for refused in ["AGENTS.md", ".env.example", ".env", "docs/nested/claude.md", "ops/.codex/config.toml"] {
+            assert!(!result.files.contains(&root.join(refused)), "{refused} was granted: {result:?}");
+            assert!(!result.directories.iter().any(|dir| root.join(refused).starts_with(dir)),
+                "{refused} is writable through a directory grant: {result:?}");
+        }
+        assert!(!root.join(".env").exists(), "a refused literal file was precreated");
+        assert!(result.files.contains(&root.join("README.md")));
+        assert!(result.files.contains(&root.join("docs/nested/keep.md")));
+        assert!(result.files.contains(&root.join("ops/run.sh")));
+        assert!(result.files.contains(&root.join("docs/guide.md")));
+    }
+
     #[test]
     fn pinned_ancestors_are_split_and_new_literal_files_precreated() {
         let root = tempfile::tempdir().unwrap();
@@ -345,6 +391,18 @@ mod tests {
 
 /// Controller-only activation after independently verified contract amendment.
 /// Candidate tools cannot write this private store or invoke this Rust API.
+/// #2464: the contract hash a worktree's write admission is registered under,
+/// or `None` before any registration.
+pub fn registered_contract(worktree: &Path) -> Result<Option<String>> {
+    let state = crate::state_dir::state_dir().context("scope control state unavailable")?;
+    let path = location(&state, &worktree.canonicalize()?);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(read(&path)?.contract_hash)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn replace_registered(
     worktree: &Path,
     expected_contract: &str,

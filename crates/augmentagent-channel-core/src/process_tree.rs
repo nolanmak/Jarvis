@@ -105,6 +105,12 @@ impl ProcessGroup {
             observer(resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("observed command requires a correlated resource scope"))?)?;
         }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
+        // The accounting authority commits the model call before this
+        // controller can accept its acknowledgement, so from the first
+        // admission attempt cancellation or any error may hide a released
+        // model. Never clear this flag or infer nonrelease from a
+        // missing/partial acknowledgement afterwards.
+        self.release_attempted.store(true,Ordering::SeqCst);
         if model { if let Some(logger)=logger {
             match &resource_identity {
                 Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
@@ -113,10 +119,6 @@ impl ProcessGroup {
         } }
         // Publish only complete, synced admission bytes. Both the supervisor
         // and native VM can observe this path immediately after creation.
-        // From the first publication attempt, cancellation or any error may
-        // hide a released model. Never clear this flag or infer nonrelease
-        // from a missing/partial acknowledgement afterwards.
-        self.release_attempted.store(true,Ordering::SeqCst);
         let mut proceed=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||std::io::Error::other("admission directory missing"))?)?;
         proceed.write_all(b"admitted\n")?;
         proceed.as_file().sync_all()?;

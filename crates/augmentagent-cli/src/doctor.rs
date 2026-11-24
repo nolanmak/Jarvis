@@ -225,6 +225,9 @@ pub async fn run(
         |flag| std::env::var(flag).ok().as_deref() == Some("1"),
     ));
     findings.push(yolo_profile_finding(augmentagent_channel_core::yolo::readiness()));
+    findings.push(tabagent_finding(
+        crate::tabagent_tool::readiness(&|name| std::env::var(name).ok()).await,
+    ));
     findings.push(check_message_index(&store));
     findings.push(check_linkedin_session(&store));
     findings.push(check_embeddings_provider());
@@ -967,6 +970,19 @@ fn socialapi_key_present() -> bool {
         |r| r.get(0),
     );
     matches!(val, Ok(v) if !v.trim().is_empty())
+}
+
+/// TabAgent browser tools: token file and `/v1/health`. Optional, so never
+/// an error; an unreachable bridge is a warning (Chrome or TabAgent is down).
+fn tabagent_finding(readiness: crate::tabagent_tool::Readiness) -> Finding {
+    use crate::tabagent_tool::Readiness;
+    let hint = Some("see docs/TABAGENT.md");
+    match readiness {
+        Readiness::NotConfigured => Finding::ok("tabagent", "not configured (optional; no TabAgent token file)"),
+        Readiness::Unusable(why) => Finding::warn("tabagent", format!("TabAgent tools disabled: {why}"), hint),
+        Readiness::Offline(why) => Finding::warn("tabagent", format!("browser offline: {why}"), Some("tabagent serve (on the Legion)")),
+        Readiness::Ready(what) => Finding::ok("tabagent", what),
+    }
 }
 
 /// #1102 — structured message index coverage. Warn-only: search still

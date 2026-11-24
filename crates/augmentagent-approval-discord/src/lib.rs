@@ -132,6 +132,8 @@ pub enum ApprovalActionOutcome {
         organizer_account: String,
         event_id: String,
         html_link: Option<String>,
+        /// #2514 — the Meet join URL (`--meet true`), for follow-up messages.
+        join_url: Option<String>,
         /// A repeated Approve recovered the saved receipt; no new write/nudge.
         already_existed: bool,
     },

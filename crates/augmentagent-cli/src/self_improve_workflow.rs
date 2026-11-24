@@ -12,6 +12,8 @@ mod family_wait_settlement;
 mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
+#[path = "self_improve_push_confirm.rs"]
+mod push_confirm;
 #[cfg(test)]
 #[path = "self_improve_family_budget_hold_tests.rs"]
 mod family_budget_hold_tests;
@@ -92,7 +94,7 @@ fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {Self::open_at(&path())}
-    fn open_at(state:&Path)->Result<Self> {
+    pub(super) fn open_at(state:&Path)->Result<Self> {
         WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
@@ -333,6 +335,9 @@ enum AcceptanceAuthority {
     Unbound,
     RecoveryOnly,
     Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
+    /// #2464: scope proof gate off. A recorded plan, criteria and allowed
+    /// paths admit the builder; proof comes from the build itself.
+    Plan,
 }
 
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -527,7 +532,13 @@ fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<us
     for (workflow,generation,audit_path) in rows {
         let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
         match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
-            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            Ok(outcome) if outcome.verified()=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            // Unproved closure keeps the durable intent pending; the exact
+            // blocker and its authenticated recovery route are recorded.
+            Ok(outcome)=>if let Some(blocker)=outcome.blocker() {
+                warn!(workflow=%workflow,generation,pruned=outcome.pruned,session=%blocker.session,blocker=%blocker.blocker,
+                    recovery=%blocker.recovery,"native runtime retirement retained without proven producer closure");
+            },
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
@@ -870,7 +881,11 @@ impl SweepGuard {
                 })
                 .last()
         };
+        // #2464: a plan-bound candidate has no executable receipt; hosted CI
+        // and the recorded independent approval are its merge evidence.
+        let plan_bound = crate::autoship_workflow::scope_proof_gate::plan_contract(&inner.binding.contract);
         let checked = async {
+            if plan_bound { return Ok(()); }
             let reference = reference.context("protected acceptance checkpoint missing")?;
             acceptance::assert_sweep_receipt(
                 &worktree,
@@ -1347,6 +1362,15 @@ impl WorkflowGuard {
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
             anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            // #2467: a run admitted before the global budget or this issue's
+            // spend cap ran out stops at its next model call. It parks on the
+            // ordinary capacity retry; the claim gate keeps it there until the
+            // budget reopens, and the give-up sweep closes a capped issue.
+            if let Some(refusal)=store.paid_admission_refusal(&lease.workflow,millis())? {
+                capacity_flag.store(true,Ordering::SeqCst);
+                store.defer_run_capacity_observation(&lease,None,None,millis())?;
+                anyhow::bail!("resource_capacity: {refusal}; await_capacity checkpoint retained");
+            }
             let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_native_custody(&worktree,&custody)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
@@ -1362,6 +1386,8 @@ impl WorkflowGuard {
                     AcceptanceAuthority::RecoveryOnly=>anyhow::bail!("baseline_witness_unqualified: recovery metadata cannot authorize a builder"),
                     AcceptanceAuthority::Unbound if state.checkpoint.binding.contract.starts_with("registered:") || matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review)=>anyhow::bail!("baseline_witness_unqualified: builder admission requires protected original-production qualification"),
                     AcceptanceAuthority::Unbound=>{},
+                    AcceptanceAuthority::Plan=>anyhow::ensure!(crate::autoship_workflow::scope_proof_gate::plan_contract(&state.checkpoint.binding.contract)
+                        || !matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review),"plan admission belongs to another contract"),
                 }
             }
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
@@ -1616,6 +1642,32 @@ impl WorkflowGuard {
 
     /// This metadata is needed by independent repair of an invalid legacy
     /// verifier. It deliberately grants no builder/verification/merge proof.
+    /// #2464: bind the scoped plan instead of a qualified executable
+    /// contract. Registers the plan's write admission (replacing an older
+    /// contract's, so a stuck branch keeps its commits) and admits builders
+    /// under a `plan:<sha256>` contract. Only valid with the gate off.
+    pub(super) fn bind_plan(&mut self,plan:&super::plan_proof::Plan)->Result<()> {
+        use crate::autoship_workflow::scope_proof_gate;
+        anyhow::ensure!(!scope_proof_gate::enabled(),"plan binding requires {}=off",scope_proof_gate::ENV);
+        self.healthy_lease()?;
+        let contract=plan.contract()?;
+        let allowed=plan.write_admission(&self.worktree)?;
+        use augmentagent_channel_core::autoship_write_scope as write_scope;
+        match write_scope::registered_contract(&self.worktree)? {
+            None=>write_scope::register(&self.worktree,&contract,allowed,Vec::new())?,
+            Some(previous)=>write_scope::replace_registered(&self.worktree,&previous,&contract,allowed,Vec::new())?,
+        }
+        self.contract=contract;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Plan;
+        self.audit_event("scope_plan_bound",serde_json::json!({"contract":self.contract,"criteria":plan.criteria.len(),
+            "declared_paths":plan.declared_paths,"switch":scope_proof_gate::ENV}))
+    }
+
+    /// Whether this workflow builds from a plan (#2464), not a registered contract.
+    pub(super) fn plan_mode(&self)->bool {
+        self.acceptance_authority.lock().is_ok_and(|authority|matches!(*authority,AcceptanceAuthority::Plan))
+    }
+
     pub(super) fn bind_acceptance_for_recovery(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
         self.bind_acceptance_identity(prepared)?;
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
@@ -1964,6 +2016,16 @@ impl WorkflowGuard {
         )
     }
 
+    /// #2467: why the acceptance ladder must stop rather than run another
+    /// cycle: observable children were already published once, or the issue
+    /// used its tries.
+    pub(super) fn ladder_stop(&self)->Result<Option<&'static str>> {
+        use durable::attempt_cap;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        if store.observable_decomposition_spent(self.id())? {return Ok(Some(attempt_cap::DECOMPOSITION_SPENT_REASON));}
+        let usage=store.attempt_usage(self.id())?;
+        Ok((usage.tries()>=attempt_cap::max_tries()).then_some(attempt_cap::ATTEMPTS_REASON))
+    }
     /// `Some(at)` while this issue's rolling daily retry model budget is spent.
     pub(super) fn daily_budget_reopens_at(&self)->Result<Option<i64>> {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
@@ -2206,6 +2268,14 @@ impl WorkflowGuard {
             .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
     }
 
+    /// #2510: return an attempt an infrastructure refusal never used. No
+    /// health check: a capacity refusal has already marked this guard, and
+    /// handing back a charge grants nothing. The lease is still fenced.
+    pub(super) fn release_epoch_attempt(&self,purpose:&str,epoch:&str)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .release_epoch_attempt(&self.lease,purpose,epoch,millis())
+    }
+
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
     }
@@ -2445,6 +2515,21 @@ impl WorkflowGuard {
         Ok(ladder)
     }
 
+    /// #2536: a parked fresh candidate leaves `'stages` before Stage 4's
+    /// commit and checkpoint, so the last checkpoint still binds the build
+    /// base. Publication commits that tree; bind the exact committed head
+    /// (recomputed from the worktree, like every checkpoint) before the
+    /// publication intent is retained. A head that is not the worktree's
+    /// HEAD still fails the publication guard.
+    pub(super) async fn checkpoint_publication_candidate(&mut self,head:&str)->Result<()> {
+        if self.binding.head==head {return Ok(());}
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_owner_dispatch(self.id())?;
+        let evidence=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.lease.workflow)?.context("workflow missing")?.checkpoint.evidence;
+        self.checkpoint(Stage::Publish,"publishing_revision","push",millis(),&evidence).await
+    }
+
     /// Transition stage while retaining the receipt set that reviewers saw.
     pub(super) async fn transition(
         &mut self,
@@ -2546,10 +2631,10 @@ impl WorkflowGuard {
         let expected=format!("--force-with-lease={target}:{remote}");
         let refspec=format!("{}:{target}",operation.binding.head);
         let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
-        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
-        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
-            "push outcome not verified; preserved pending intent (command success: {pushed})");
-        let head=observed.context("Push observation unavailable")?;
+        // #2547: the ref API can lag a landed push; re-read before failing.
+        let (worktree,repository,target,destination)=(&self.worktree,&self.repository,&target,&destination);
+        let head=push_confirm::confirm_pushed_head(&operation.binding.head,pushed,push_confirm::PUSH_OBSERVATION_DELAY,
+            move||destination.head(worktree,repository,target)).await?;
         self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
         Ok(head)
     }
@@ -2719,6 +2804,10 @@ pub(super) async fn git_binding(
             .strip_prefix("registered:")
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(str::to_owned)
+            // #2464: a plan contract stays recognizable in the binding.
+            .or_else(|| contract.strip_prefix(crate::autoship_workflow::scope_proof_gate::PLAN_CONTRACT_PREFIX)
+                .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(|_| contract.to_owned()))
             .unwrap_or_else(|| format!("{:x}", Sha256::digest(contract.as_bytes()))),
         evidence_hash: format!("{:x}", Sha256::digest(evidence)),
     })
@@ -2965,6 +3054,53 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_repo()->tempfile::TempDir {
+        let tmp=std::fs::canonicalize("/tmp").unwrap();
+        let root=tempfile::tempdir_in(&tmp).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/phone.rs"),"pub fn format(n:&str)->String {n.into()}\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","main"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+            let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();assert!(out.status.success());
+        }
+        root
+    }
+
+    /// #2464 AC: a feature issue (nothing to observe on main) reaches a
+    /// build attempt from one scope response. The old gate refuses the same
+    /// builder until an original-production witness qualifies.
+    #[tokio::test]
+    async fn a_feature_issue_with_no_defect_on_main_reaches_a_build_attempt_in_one_scope_call() {
+        let repo=plan_repo();let state=tempfile::tempdir().unwrap();let state=state.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:Some(2464),pr:None,branch:"fixture",
+            contract:"Add E.164 phone formatting",environment:"frontend environment"};
+        // Gate on: the scoped request cannot admit a builder at Build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(true));
+        let mut old=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        old.transition(Stage::Build,"criteria_registered","build",0).await.unwrap();
+        let refused=old.audit_logger().model_call_admitted("codex").unwrap_err();
+        assert!(format!("{refused:#}").contains("baseline_witness_unqualified"),"{refused:#}");
+        let scope=ScopeOutcome {fixable:true,complexity:Complexity::Simple,est_diff_lines:Some(30),guarded_paths:false,
+            body:"ALLOWED-PATHS: src/phone.rs\nFormat numbers as E.164.".into(),criteria:vec!["Numbers render as E.164".into()],relevance:Relevance::Current};
+        let plan=super::super::plan_proof::Plan::from_scope("Add E.164 phone formatting",Some(&scope),&scope.criteria);
+        assert!(old.bind_plan(&plan).is_err(),"the plan path must not run with the gate on");
+        old.finish().unwrap();
+        // Gate off (default): bind the one scope response's plan and build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(false));
+        let mut guard=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        guard.transition(Stage::Scope,"trusted_request_acquired","scope_request",0).await.unwrap();
+        guard.bind_plan(&plan).unwrap();
+        guard.transition(Stage::Build,"plan_registered","build",0).await.unwrap();
+        assert!(guard.plan_mode());
+        assert!(crate::autoship_workflow::scope_proof_gate::plan_contract(&guard.binding().contract),"{}",guard.binding().contract);
+        guard.audit_logger().model_call_admitted("codex").expect("the builder is admitted from the plan");
+        let snapshot=WorkflowStore::open(&state).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.stage,Stage::Build);
+        assert_eq!(snapshot.checkpoint.next.reason,"plan_registered");
+        assert_eq!(snapshot.model_calls,1,"one admitted builder call; no witness, amendment or ladder call");
+        guard.finish().unwrap();
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(None);
+    }
 
     #[test]
     fn daily_ledger_holds_fresh_starts_but_not_in_flight_issues() {
@@ -4620,13 +4756,17 @@ mod tests {
             write(&session.join("lock"),b"");
         }
         write(&known.join("complete.json"),br#"{"version":1,"generation":"generation-a"}"#);
+        write(&known.join("producer-completion.json"),br#"{"version":1,"audit_path":"/original/audit","owner":{"workflow_id":"original","lease_generation":1},"writer_fence":1}"#);
+        write(&known.join("settled-result.json"),br#"{"version":1,"owner":{"workflow_id":"original","lease_generation":1},"durable":true}"#);
         let unknown_owned=std::fs::read(unknown.join("owned.json")).unwrap();
         let aliases=provider.join("aliases");std::fs::create_dir(&aliases).unwrap();
         write(&aliases.join("completed-fixture"),br#""session-completed""#);
         write(&aliases.join("interrupted-fixture"),br#""session-interrupted""#);
         let policy=root.path().join("policy.json");
-        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":1073741824u64,"max_sessions":3,"providers":{}})).unwrap());
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        // The interrupted scope-retired runtime is unresumable history and holds
+        // no reservation (#2506); only the completed one fills this 1 GiB budget.
         let full=augmentagent_channel_core::native_vm::state_capacity::inspect();
         assert!(full.available_fingerprint().is_none());assert!(known.exists(),"read-only inspection deleted runtime state");
         let fingerprint=serde_json::to_value(full).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();
@@ -4649,7 +4789,10 @@ mod tests {
         assert!(!known.exists());assert!(!aliases.join("completed-fixture").exists());
         assert!(unknown.exists());assert!(aliases.join("interrupted-fixture").exists());
         assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
-        assert!(!unknown.join("retired-owner.json").exists());
+        assert!(unknown.join("retired.json").exists(),"protected retirement evidence was removed");
+        for backfilled in ["retired-owner.json","producer-completion.json","settled-result.json"] {
+            assert!(!unknown.join(backfilled).exists(),"{backfilled} was backfilled onto an unproved runtime");
+        }
         let after=store.snapshot(id).unwrap().unwrap();
         assert_eq!(after.checkpoint.next.eligible_at_ms,33);assert_eq!(after.progress_at_ms,before.progress_at_ms);
         assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);

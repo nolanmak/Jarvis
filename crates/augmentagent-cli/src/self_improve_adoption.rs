@@ -447,6 +447,46 @@ pub(super) fn finish_plan(
     Ok(plan)
 }
 
+/// #2512 — an own-PR rescope stop whose issue request or main moved since it
+/// stopped is due now, before the eligibility gates below skip it for a day.
+/// `request` and `main` come from data the tick already has (the open-issue
+/// listing and the local `origin/main` ref): no GitHub reads.
+pub(super) fn wake_changed_rescope_stops(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    request: impl Fn(&AdoptedPr) -> Option<String>,
+    main: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut stops = Vec::new();
+    {
+        let Some(store) = WorkflowStore::open_read_only(path)? else { return Ok(Vec::new()) };
+        for candidate in candidates {
+            let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else { continue };
+            let Some(snapshot) = store.snapshot(&id)? else { continue };
+            if candidate_source_matches(&id, candidate)
+                && snapshot.pr == Some(candidate.pr)
+                && snapshot.lease_until_ms <= now
+                && snapshot.checkpoint.next.eligible_at_ms > now
+                && super::acceptance::own_pr_rescope::exhausted(&snapshot.checkpoint)
+            {
+                stops.push((id, request(candidate)));
+            }
+        }
+    }
+    let mut woken = Vec::new();
+    if stops.is_empty() {
+        return Ok(woken);
+    }
+    let mut store = WorkflowStore::open(path)?;
+    for (id, request) in stops {
+        if store.expedite_changed_rescope_stop(&id, request.as_deref(), main, now)? {
+            woken.push(id);
+        }
+    }
+    Ok(woken)
+}
+
 /// The oldest due PR of the nearest-to-done tier, or `None` when nothing is
 /// near done. `tiers` members are due in-flight work and belong in `retries`.
 pub(super) fn select_finishing(

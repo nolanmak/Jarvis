@@ -1,94 +1,156 @@
-use std::sync::Arc;
+use anyhow::Result;
+use augmentagent_store::{ActionStatus, Store};
 
-use augmentagent_approval_discord::imessage_owner::OwnerSurface;
-use augmentagent_store::{
-    imessage_owner::{OwnerContext, OwnerEvent},
-    Store,
-};
+#[allow(clippy::too_many_arguments)]
+fn social_card_row(
+    _platform: &str,
+    _kind: &str,
+    _message_id: &str,
+    _thread_id: &str,
+    _account: Option<&str>,
+    _counterparty: &str,
+    _subject: &str,
+    _body: &str,
+) -> augmentagent_store::Email {
+    unreachable!("the observation only calls pending-compose selection and retirement")
+}
 
-fn event(revision: i64) -> OwnerEvent {
-    OwnerEvent {
-        binding_revision: revision,
-        rowid: 1,
-        created_at_ms: 1,
-        guid: "fixture-event".into(),
-        chat_guid: "fixture-chat".into(),
-        sender: "owner@example.invalid".into(),
-        from_me: false,
-        kind: "text".into(),
-        target_guid: None,
-        body: "fixture question".into(),
+#[path = "../socialapi_compose_identity.rs"]
+mod socialapi_compose_identity;
+
+const CONVERSATION: &str = "contract-conversation";
+const LEGACY_MESSAGE: &str = "compose:socialapi:dm:contract-conversation";
+const FIRST_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:first";
+const SECOND_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:second";
+const RACED_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:raced";
+const TRIAGE_MESSAGE: &str = "contract-inbound";
+const OTHER_MESSAGE: &str = "compose:socialapi:dm:other-conversation:card";
+const SCHEDULED_MESSAGE: &str = "compose:socialapi:dm:contract-conversation:scheduled";
+const LEGACY: &str = "d0000000-0000-0000-0000-000000000001";
+const FIRST: &str = "c0000000-0000-0000-0000-000000000002";
+const SECOND: &str = "b0000000-0000-0000-0000-000000000003";
+const RACED: &str = "a0000000-0000-0000-0000-000000000004";
+
+fn seed_email(store: &Store, message_id: &str, thread_id: &str) -> Result<()> {
+    store.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, firstSeenAt, platform, kind) VALUES (?1, ?2, 'contract-peer', 'contract subject', 'contract body', 0, 'socialapi', 'dm')",
+            augmentagent_store::rusqlite::params![message_id, thread_id],
+        )?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn add_action(store: &Store, message_id: &str, thread_id: &str) -> Result<String> {
+    Ok(store.log_action(
+        message_id,
+        Some(thread_id),
+        "contract-peer",
+        "contract subject",
+        Some("contract body"),
+        Some("contract draft"),
+        ActionStatus::Pending,
+    )?)
+}
+
+fn label(id: &str) -> &'static str {
+    match id {
+        LEGACY => "legacy",
+        FIRST => "first",
+        SECOND => "second",
+        RACED => "raced",
+        _ => "unknown",
     }
 }
 
-fn main() {
-    let store = Arc::new(Store::open(":memory:").unwrap());
-    let first = store
-        .bind_imessage_owner("fixture-chat", "owner@example.invalid", false, 0)
-        .unwrap();
-    store
-        .enqueue_imessage_owner_output(first.revision, "fixture-output", "fixture output", None, 1)
-        .unwrap();
-    store.disable_imessage_owner().unwrap();
-    let rejected = store
-        .accept_imessage_owner_events(first.revision, 1, &[event(first.revision)], 2)
-        .is_err();
-    let unclaimable = store.claim_imessage_outbox().unwrap().is_none();
+fn action_id_for(store: &Store, message_id: &str) -> Result<String> {
+    Ok(store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id FROM actions WHERE messageId = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+    })?)
+}
 
-    let active = store
-        .bind_imessage_owner("fixture-chat", "owner@example.invalid", false, 0)
-        .unwrap();
-    let long = "x".repeat(400);
-    store.report_imessage_owner_capture_error(&long).unwrap();
-    store.report_imessage_owner_runtime(true, Some(&long), 3).unwrap();
-    store.report_imessage_owner_runtime(false, Some(&long), 3).unwrap();
-    let status = store.imessage_owner_status(3).unwrap();
-    let diagnostic_lengths = ["capture_error", "mirror_error", "dispatch_error"]
+fn main() -> Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "augmentagent-autoship-case-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&directory)?;
+    let store = Store::open(directory.join("contract.db"))?;
+
+    for (message, thread) in [
+        (TRIAGE_MESSAGE, CONVERSATION),
+        (LEGACY_MESSAGE, CONVERSATION),
+        (FIRST_MESSAGE, CONVERSATION),
+        (SECOND_MESSAGE, CONVERSATION),
+        (RACED_MESSAGE, CONVERSATION),
+        (OTHER_MESSAGE, "other-conversation"),
+        (SCHEDULED_MESSAGE, CONVERSATION),
+    ] {
+        seed_email(&store, message, thread)?;
+        add_action(&store, message, thread)?;
+    }
+
+    store.with_conn(|conn| {
+        for (id, message) in [
+            (LEGACY, LEGACY_MESSAGE),
+            (FIRST, FIRST_MESSAGE),
+            (SECOND, SECOND_MESSAGE),
+            (RACED, RACED_MESSAGE),
+        ] {
+            conn.execute(
+                "UPDATE actions SET id = ?1, createdAt = 1000 WHERE messageId = ?2",
+                augmentagent_store::rusqlite::params![id, message],
+            )?;
+        }
+        conn.execute(
+            "UPDATE actions SET scheduledAtMs = 1 WHERE messageId = ?1",
+            [SCHEDULED_MESSAGE],
+        )?;
+        Ok(())
+    })?;
+
+    let prior = socialapi_compose_identity::pending_compose_cards(&store, CONVERSATION)?;
+    let order: Vec<&str> = prior.iter().map(|id| label(id)).collect();
+
+    store.update_action_status(FIRST, ActionStatus::Sent, None, None)?;
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE actions SET scheduledAtMs = 2 WHERE id = ?1",
+            [RACED],
+        )?;
+        Ok(())
+    })?;
+    let retired = socialapi_compose_identity::supersede_prior_compose_cards(&store, &prior);
+    let retired: Vec<&str> = retired.iter().map(|id| label(id)).collect();
+
+    let status = |id: &str| -> Result<String> {
+        Ok(store.get_action_with_email(id)?.unwrap().action.status)
+    };
+    let statuses = vec![
+        status(LEGACY)?,
+        status(FIRST)?,
+        status(SECOND)?,
+        status(&action_id_for(&store, TRIAGE_MESSAGE)?)?,
+        status(&action_id_for(&store, OTHER_MESSAGE)?)?,
+        status(&action_id_for(&store, SCHEDULED_MESSAGE)?)?,
+        status(RACED)?,
+    ];
+
+    let remaining: Vec<&str> = socialapi_compose_identity::pending_compose_cards(&store, CONVERSATION)?
         .iter()
-        .map(|key| status[*key].as_str().map(str::len).unwrap_or(0))
-        .collect::<Vec<_>>();
+        .map(|id| label(id))
+        .collect();
 
-    let context_a = OwnerContext {
-        revision: active.revision,
-        config_digest: "fixture-digest-a".into(),
-        guild_id: 11,
-        channel_id: 12,
-        approval_channel_id: 13,
-        owner_id: 14,
-        bot_id: 15,
-    };
-    store.configure_imessage_owner_context(&context_a).unwrap();
-    let context_b = OwnerContext {
-        config_digest: "fixture-digest-b".into(),
-        ..context_a.clone()
-    };
-    let drift_rejected = store.configure_imessage_owner_context(&context_b).is_err();
-    let preserved = store.imessage_owner_context().unwrap().unwrap().config_digest == "fixture-digest-a";
-    let drift_surface = OwnerSurface::for_origin(store.clone(), "fixture-digest-b".into());
-    let inactive_before_reenrollment = !drift_surface.active();
-    store.disable_imessage_owner().unwrap();
-    let reenrolled = store
-        .bind_imessage_owner("fixture-chat", "owner@example.invalid", false, 0)
-        .unwrap();
-    let context_b_reenrolled = OwnerContext {
-        revision: reenrolled.revision,
-        ..context_b
-    };
-    store.configure_imessage_owner_context(&context_b_reenrolled).unwrap();
-    let active_after_reenrollment = drift_surface.active();
-
-    let help = augmentagent_approval_discord::imessage_owner::HELP;
-    let controls = ["status", "cancel", "reset", "help"]
-        .into_iter()
-        .filter(|control| help.contains(control))
-        .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::json!([
-            [rejected, unclaimable],
-            diagnostic_lengths,
-            [drift_rejected, preserved, inactive_before_reenrollment, active_after_reenrollment],
-            controls,
-        ])
-    );
+    println!("{}", serde_json::json!([order, retired, statuses, remaining]));
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
 }

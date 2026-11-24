@@ -142,12 +142,14 @@ impl ReplyApprover {
             ApprovalActionOutcome::CalendarCreated {
                 event_id,
                 html_link,
+                join_url,
                 ..
             } => (
                 "completed",
                 format!(
-                    "event_id={event_id}; link={}",
-                    html_link.as_deref().unwrap_or("")
+                    "event_id={event_id}; link={}; meet={}",
+                    html_link.as_deref().unwrap_or(""),
+                    join_url.as_deref().unwrap_or("")
                 ),
             ),
             ApprovalActionOutcome::CalendarResponded { response, .. } => {
