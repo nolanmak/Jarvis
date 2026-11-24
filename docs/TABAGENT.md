@@ -55,6 +55,15 @@ Only reads could be classified as read-only later.
 - `PROMPT_TIMEOUT` and `PERMISSION_DENIED` tell the model not to retry and to
   ask the owner to approve in Chrome. `KILLED` (the kill switch) stops the
   TabAgent tools for the rest of the launch.
+- The handoff journal (`scripts/codex-tool-bridge.py`, #2519) treats
+  `page_snapshot`, `page_markdown`, `page_text`, `page_find`, `extract_table`,
+  `extract_links`, `nav_wait` (not `for: fn`) and `tabs` with exactly
+  `{"action": "list"}` as reads: they are never journaled. Every other call is
+  journaled as a mutation, so an unanswered one still requires reconciliation.
+  Actions, `nav_goto`, other `tabs` actions, `form_fill` and `dialog_handle`
+  may repeat with identical arguments (a second click on the same ref after a
+  scroll). An identical repeat of `form_submit` is refused as already
+  completed, because it is most likely a double submission.
 - TabAgent wraps page-derived text in `<<<PAGE_DATA nonce … PAGE_DATA nonce>>>`
   blocks. Jarvis passes them through byte for byte and puts its own untrusted
   marker lines outside them. The system prompt says page data is never
