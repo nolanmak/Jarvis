@@ -113,3 +113,118 @@ fn a_hosted_ci_pending_workflow_whose_checks_turned_green_is_due_now() {
     assert_eq!(select_finishing(&candidates, &ledger, 1, None, &retries, &plan.tiers),
         Some((42, 7, "agent-fix/issue-7".into())));
 }
+
+// #2512 — an own-PR rescope stop (#2490) waits a day only while main and the
+// issue's request are unchanged. Production shape (2026-11-23): workflows
+// #2329 and #2439 sat at `own_pr_rescope_exhausted` with eligible_at 24h out
+// after both issues were edited and main moved twice; the picker skipped them
+// as "not due", so the resume that compares the inputs never ran.
+const REQUEST: &str = "request-a";
+const MAIN: &str = "main-a";
+
+fn stopped(store: &mut WorkflowStore, issue: u64, pr: u64, eligible: i64) -> String {
+    let id = workflow_id("owner/repo", issue).unwrap();
+    let binding = Binding {head:HEAD.into(),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+    store.register(&id, &format!("agent-fix/issue-{issue}"), binding.clone(), 0).unwrap();
+    let lease = store.claim(&id, "worker", 0, 1).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, "owner/repo", pr, 0).unwrap();
+    let evidence = vec!["own-pr-rescope:2/2".into(), format!("request:{REQUEST}"), format!("main:{MAIN}")];
+    store.checkpoint(&lease, &Checkpoint {stage:Stage::Scope,binding,evidence,
+        next:NextAction {reason:"own_pr_rescope_exhausted".into(),action:"await_request_or_main_change".into(),eligible_at_ms:eligible}}, 0).unwrap();
+    store.release(&lease, 0).unwrap();
+    id
+}
+
+fn eligible_at(path: &Path, id: &str) -> i64 {
+    WorkflowStore::open(path).unwrap().snapshot(id).unwrap().unwrap().checkpoint.next.eligible_at_ms
+}
+
+#[test]
+fn an_issue_edit_makes_a_rescope_stop_due_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let now = 10_000;
+    let day = now + 24 * 3_600_000;
+    let id = stopped(&mut WorkflowStore::open(&path).unwrap(), 7, 42, day);
+    let candidates = vec![candidate(7, 42)];
+    let woken = wake_changed_rescope_stops(&path, &candidates, |_| Some("request-b".into()), Some(MAIN), now).unwrap();
+    assert_eq!(woken, vec![id.clone()]);
+    let snapshot = WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+    assert_eq!((snapshot.checkpoint.stage, snapshot.checkpoint.next.reason.as_str(), snapshot.checkpoint.next.action.as_str(),
+        snapshot.checkpoint.next.eligible_at_ms), (Stage::Scope, "own_pr_rescope_exhausted", "await_request_or_main_change", now),
+        "only the eligibility time changes; the resume decides the fresh budget");
+    assert!(snapshot.checkpoint.evidence.contains(&format!("request:{REQUEST}")), "the recorded inputs are the resume's to replace");
+    assert!(WorkflowStore::open(&path).unwrap().claim(&id, "worker", now, 1).unwrap().is_some(), "the stop is due now");
+}
+
+#[test]
+fn a_main_change_makes_a_rescope_stop_due_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let now = 10_000;
+    let day = now + 24 * 3_600_000;
+    let id = stopped(&mut WorkflowStore::open(&path).unwrap(), 7, 42, day);
+    let candidates = vec![candidate(7, 42)];
+    assert_eq!(wake_changed_rescope_stops(&path, &candidates, |_| Some(REQUEST.into()), Some("main-b"), now).unwrap(), vec![id.clone()]);
+    assert_eq!(eligible_at(&path, &id), now);
+}
+
+#[test]
+fn an_unchanged_rescope_stop_keeps_its_daily_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let now = 10_000;
+    let day = now + 24 * 3_600_000;
+    let id = stopped(&mut WorkflowStore::open(&path).unwrap(), 7, 42, day);
+    let candidates = vec![candidate(7, 42)];
+    assert!(wake_changed_rescope_stops(&path, &candidates, |_| Some(REQUEST.into()), Some(MAIN), now).unwrap().is_empty());
+    // Unknown inputs (issue absent from the listing, main unreadable) are not a change.
+    assert!(wake_changed_rescope_stops(&path, &candidates, |_| None, None, now).unwrap().is_empty());
+    assert_eq!(eligible_at(&path, &id), day);
+    // A different wait is never touched by this wake.
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let other = workflow(&mut store, 8, 43, Stage::Scope, "rescope_remaining_findings", "rescope_remaining_findings", day);
+    assert!(!store.expedite_changed_rescope_stop(&other, Some("request-b"), Some("main-b"), now).unwrap());
+    assert_eq!(eligible_at(&path, &other), day);
+}
+
+#[test]
+fn a_paused_or_leased_rescope_stop_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let now = 10_000;
+    let day = now + 24 * 3_600_000;
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let paused = stopped(&mut store, 7, 42, day);
+    let leased = stopped(&mut store, 8, 43, day);
+    store.set_owner_pause(&paused, "github:owner", 0, true, now).unwrap();
+    // A worker holds this one (taken once due, still held); waking it would race the lease.
+    let _held = store.claim(&leased, "worker", day, 60_000).unwrap().expect("fixture lease");
+    drop(store);
+    let candidates = vec![candidate(7, 42), candidate(8, 43)];
+    assert!(wake_changed_rescope_stops(&path, &candidates, |_| Some("request-b".into()), Some("main-b"), now).unwrap().is_empty());
+    assert_eq!(eligible_at(&path, &paused), day);
+    assert_eq!(eligible_at(&path, &leased), day);
+}
+
+#[test]
+fn a_repeated_observation_wakes_a_rescope_stop_once() {
+    // If the resume and the listing ever disagreed on the request hash, a wake
+    // per tick would resume the stop every tick. One wake per observed inputs.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let now = 10_000;
+    let day = now + 24 * 3_600_000;
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let id = stopped(&mut store, 7, 42, day);
+    assert!(store.expedite_changed_rescope_stop(&id, Some(REQUEST), Some("main-b"), now).unwrap());
+    // The resume runs and stops again, recording what it saw (here: main-a still).
+    let lease = store.claim(&id, "worker", now, 1).unwrap().unwrap();
+    let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+    checkpoint.next.eligible_at_ms = day + 1;
+    store.checkpoint(&lease, &checkpoint, now).unwrap();
+    store.release(&lease, now).unwrap();
+    assert!(!store.expedite_changed_rescope_stop(&id, Some(REQUEST), Some("main-b"), now + 2).unwrap(), "same observation twice");
+    assert_eq!(eligible_at(&path, &id), day + 1);
+    assert!(store.expedite_changed_rescope_stop(&id, Some(REQUEST), Some("main-c"), now + 3).unwrap(), "a new main is a new change");
+}
