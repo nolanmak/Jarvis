@@ -16,6 +16,8 @@ pub(crate) mod owner_requalification;
 pub(crate) mod scope_policy;
 #[path="autoship_terminal_parks.rs"]
 pub(crate) mod terminal_parks;
+#[path="autoship_scope_proof_gate.rs"]
+pub(crate) mod scope_proof_gate;
 #[path="autoship_witness_regeneration.rs"]
 pub(crate) mod witness_regeneration;
 #[path = "autoship_owner_checkout_recovery.rs"]
