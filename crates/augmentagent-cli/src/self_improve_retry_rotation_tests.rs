@@ -227,6 +227,73 @@ fn no_new_issue_is_planned_while_planned_unbuilt_work_is_at_the_bound() {
     assert!(order.contains(&2500) && order.contains(&2412), "below the bound fresh issues stay selectable: {order:?}");
 }
 
+/// 2026-11-24 Legion: #2436's draft PR #2540 sat at reconcile /
+/// hosted_ci_pending / retry_verification, due with all checks green, while
+/// every tick handed the single slot to another hour-long planned build. It
+/// never got its review turn, so the merge sweep never merged it. Finishing a
+/// published PR must beat starting new builds (#2531 starved it).
+#[test]
+fn published_pr_awaiting_its_next_step_outranks_planned_builds() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("workflow.db");
+    let t0 = 1_795_500_000_000;
+    let now = t0 + 4 * 3_600_000;
+    {
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        park(&mut store, 2424, Stage::Build, "plan_registered", "build", 1, now - 60_000, None);
+        park(&mut store, 2425, Stage::Build, "plan_registered", "build", 1, now - 60_000, None);
+        park(&mut store, 2436, Stage::Reconcile, "hosted_ci_pending", "retry_verification", 8, now - 120_000, None);
+        let lease = store.claim("owner/repo#2436", "fixture-worker", now - 60_000, 1_000).unwrap().unwrap();
+        store.attach_pr(&lease, 2540, now - 60_000).unwrap();
+        store.release(&lease, now - 60_000).unwrap();
+    }
+    let order = picker_order(&path, &[2500, 2424, 2425, 2436], now);
+    assert_eq!(order.first(), Some(&2436), "a published PR's next step must beat new builds: {order:?}");
+    assert_eq!(&order[1..3], &[2424, 2425], "planned builds still lead fresh planning: {order:?}");
+}
+
+#[test]
+fn post_publish_stages_with_a_pr_rank_between_publish_retries_and_planned_builds() {
+    let snap = |stage, reason: &str, action: &str, pr| Snapshot {
+        workflow: "owner/repo#1".into(),
+        branch: "candidate".into(),
+        pr,
+        checkpoint: Checkpoint {
+            stage,
+            binding: Binding { head: "head".into(), contract: "contract".into(), evidence_hash: "evidence".into() },
+            evidence: vec![],
+            next: NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: 0 },
+        },
+        attempts: 1,
+        wall_ms: 0,
+        model_calls: 0,
+        tokens: 0,
+        heartbeat_at_ms: 100,
+        progress_at_ms: 100,
+        lease_until_ms: 0,
+        generation: 1,
+    };
+    let now = 10 * 3_600_000;
+    let planned = snap(Stage::Build, "plan_registered", "build", None);
+    let publish = snap(Stage::Publish, "publishing_revision", "push", Some(7));
+    for (stage, reason, action) in [
+        (Stage::Reconcile, "hosted_ci_pending", "retry_verification"),
+        (Stage::Reconcile, "review_main_changed", "review"),
+        (Stage::AwaitChecks, "ci_pending", "await_checks"),
+        (Stage::Review, "review_required", "review"),
+        (Stage::Merge, "merge_ready", "merge"),
+    ] {
+        let finishing = snap(stage, reason, action, Some(7));
+        let key = rank(Some(&finishing), false, false, now);
+        assert!(key < rank(Some(&planned), false, false, now), "{stage:?}/{reason}: must outrank a planned build");
+        assert!(rank(Some(&publish), false, false, now) < key, "{stage:?}: a fresh publish retry still goes first");
+        // Without a published PR the stage alone earns no promotion.
+        let unpublished = snap(stage, reason, action, None);
+        assert!(rank(Some(&planned), false, false, now) < rank(Some(&unpublished), false, false, now),
+            "{stage:?} without a PR keeps the #2531 order");
+    }
+}
+
 /// The bound and the build-first order read only the selection snapshots the
 /// picker already holds: no GitHub call is added per candidate or per tick.
 #[test]
