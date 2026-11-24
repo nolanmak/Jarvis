@@ -194,6 +194,28 @@ export function initDb(dbPath?: string): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_socialapi_webhook_events_unprocessed
       ON socialapi_webhook_events(processed, received_at_ms);
+    -- #2387: durable Gmail compose queue. A compose the in-loop 429 backoff
+    -- (#1493) could not push through is parked here and swept again at/after
+    -- retry_after; approval_card_post_receipts authorizes exactly one
+    -- approval-card post per compose idempotency key. Column-for-column
+    -- identical to crates/augmentagent-store/src/store.rs::migrate(), which
+    -- owns this schema.
+    CREATE TABLE IF NOT EXISTS gmail_compose_queue (
+      entity      TEXT NOT NULL,
+      payload     TEXT NOT NULL,
+      retry_after INTEGER NOT NULL,
+      attempt     INTEGER NOT NULL DEFAULT 0,
+      idem_key    TEXT NOT NULL UNIQUE,
+      status      TEXT NOT NULL CHECK (status IN ('queued', 'retrying', 'landed', 'gave_up', 'unknown')),
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_gmail_compose_queue_due
+      ON gmail_compose_queue(status, retry_after);
+    CREATE TABLE IF NOT EXISTS approval_card_post_receipts (
+      idem_key  TEXT PRIMARY KEY,
+      posted_at INTEGER NOT NULL
+    );
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
