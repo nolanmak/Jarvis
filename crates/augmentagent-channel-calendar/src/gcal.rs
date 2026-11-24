@@ -61,6 +61,18 @@ pub struct CreatedEvent {
     /// response omitted attendees.
     #[serde(default)]
     pub attendees: Option<Vec<RawAttendee>>,
+    /// #2514 — echoed Meet join URL; read through [`CreatedEvent::join_url`].
+    #[serde(default, rename = "hangoutLink")]
+    pub hangout_link: Option<String>,
+    #[serde(default, rename = "conferenceData")]
+    pub conference_data: Option<crate::types::ConferenceData>,
+}
+
+impl CreatedEvent {
+    /// #2514 — the Meet join URL the provider attached, if any.
+    pub fn join_url(&self) -> Option<String> {
+        crate::types::join_url(self.hangout_link.as_deref(), self.conference_data.as_ref())
+    }
 }
 
 /// An attendee's answer to an invite (#1224). Google's `responseStatus`
@@ -1109,6 +1121,7 @@ mod tests {
                 response_status: Some("accepted".into()),
                 ..Default::default()
             }]),
+            ..Default::default()
         };
         assert!(!ensure_organizer_accepted(&client, "ent", "primary", &already).await.unwrap());
         patch.assert_async().await; // still exactly one PATCH
