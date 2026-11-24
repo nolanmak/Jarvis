@@ -15,6 +15,15 @@ pub(super) fn planned_unbuilt(snapshot:Option<&Snapshot>)->bool {
     snapshot.is_some_and(|s|s.checkpoint.stage==Stage::Build && s.checkpoint.next.action=="build" && s.pr.is_none())
 }
 
+/// #2543: an open, published PR that needs only its next post-publish step
+/// (reconcile, await checks, review, merge). This is the cheapest path to a
+/// merge; #2531 ranked it behind every planned build, so a draft PR with green
+/// checks (#2540) waited behind hour-long builds and never got its review.
+pub(super) fn finishing_published(snapshot:Option<&Snapshot>)->bool {
+    snapshot.is_some_and(|s|s.pr.is_some()
+        && matches!(s.checkpoint.stage,Stage::Reconcile|Stage::AwaitChecks|Stage::Review|Stage::Merge))
+}
+
 /// #2394: a publication retry is stalled only once it has retried this long
 /// without meaningful progress. Claims spent on scope, build and review before
 /// the push are not a stalled publication (#2329 had six).
@@ -53,10 +62,14 @@ const RETRY_STARVATION_MS:i64=2*60*60*1000;
 /// Sort key for one due candidate; lower is picked first.
 /// #2530: finish before starting: after a due publication retry, a due planned
 /// workflow is built before any retry or fresh issue is planned.
-fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,bool,i64,bool) {
+/// #2543: finishing an already-published PR goes before starting a build. A
+/// stalled one (repeated-claim age) keeps rotating with its peers, like a
+/// stalled publication retry.
+fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,bool,bool,i64,bool) {
     let age=retry_age(snapshot);
     let starved=age>0 && now.saturating_sub(age)>=RETRY_STARVATION_MS;
-    (!(publish_retry(snapshot) && age==0),!planned_unbuilt(snapshot),!starved,research_filed,age,!recovered)
+    (!(publish_retry(snapshot) && age==0),!(finishing_published(snapshot) && age==0),!planned_unbuilt(snapshot),
+        !starved,research_filed,age,!recovered)
 }
 
 pub(super) fn candidates(
