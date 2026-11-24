@@ -925,21 +925,23 @@ mod tests {
                 let denied=crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit")));
                 denied.set_dispatch_observer(Arc::new(||anyhow::bail!("owner-paused"))).unwrap();
                 let denied=Arc::new(denied);
-                // The accounting authority charges the model call before the
-                // controller can accept its acknowledgement, so a refused
-                // receipt leaves a committed release with no dispatch artifact.
-                let charged=Arc::new(AtomicUsize::new(0));
-                let counted=charged.clone();
-                let accounting=crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-accounting")));
-                accounting.set_correlated_model_call_observer(Arc::new(move |_|{counted.fetch_add(1,Ordering::SeqCst);Ok("charged receipt".into())})).unwrap();
-                let accounting=Arc::new(accounting);
                 if case=="teardown-proof-missing" {std::fs::create_dir(&receipt).unwrap();}
                 if case=="release-ack-error" || case=="foreign-release-before-refusal" {write(&receipt.with_file_name("launch-continue"),b"admitted\n").unwrap();}
                 if case=="owner-refused" || case=="foreign-release-before-refusal" {
                     assert!(group.admit_model(provider,Some(&denied)).await.is_err());
                 }else if case=="charged-release-unacknowledged" {
+                    // The accounting authority commits the charge before its
+                    // acknowledgement can fail. This must preserve the fresh
+                    // runtime even though no dispatch artifact is published.
+                    let accounting=Arc::new(crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit"))));
+                    let charged=Arc::new(AtomicUsize::new(0));let counted=charged.clone();
+                    accounting.set_correlated_model_call_observer(Arc::new(move |_|{
+                        counted.fetch_add(1,Ordering::SeqCst);
+                        anyhow::bail!("charged release acknowledgement failed")
+                    })).unwrap();
                     assert!(group.admit_model(provider,Some(&accounting)).await.is_err());
                     assert_eq!(charged.load(Ordering::SeqCst),1,"{provider}/{case}: the model release was never charged");
+                    assert!(!receipt.with_file_name("launch-continue").exists(),"{provider}/{case}: the unacknowledged release still published dispatch");
                 }else if case!="cancel-before-release" && case!="teardown-proof-missing" {
                     let result=group.admit_model(provider,None).await;
                     assert_eq!(result.is_err(),case=="release-ack-error");
