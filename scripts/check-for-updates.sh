@@ -19,6 +19,9 @@
 #   target/release/augmentagent. A systemd drop-in that overrides ExecStart
 #   (never do that to pin a rollout) is reported as DEPLOY PINNED, alerted
 #   once, and the restart is skipped until the override is retired.
+# - #2468: the auto-ship worker does not follow main. It runs a build of the
+#   commit pinned in ~/.config/augmentagent/autoship-pin (lib/autoship-pin.sh),
+#   rebuilt and reloaded only when that pin moves (scripts/autoship-pin.sh).
 #
 # Optional remote release builder: AUGMENTAGENT_REMOTE_BUILD_HOST opts in.
 # Setup, restricted SSH protocol and failure behavior: scripts/remote-builder/setup.sh.
@@ -96,6 +99,16 @@ notify_owner() {
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
 . "$REPO_ROOT/scripts/lib/update-build.sh"
+# #2468 — the auto-ship worker runs a pinned build that main deploys never
+# move. Absent library (partial fixtures, older checkouts): no pinning.
+if [ -f "$REPO_ROOT/scripts/lib/autoship-pin.sh" ]; then
+  # shellcheck source=lib/autoship-pin.sh
+  . "$REPO_ROOT/scripts/lib/autoship-pin.sh"
+else
+  AUTOSHIP_PIN_CHANGED=0
+  reconcile_autoship_pin() { AUTOSHIP_PIN_CHANGED=0; }
+  autoship_pin_after_provision() { :; }
+fi
 
 # Artifact repair is independent of the executable's capability or health.
 secure_release_artifacts() {
@@ -113,7 +126,8 @@ reconcile_worker_provisioning() {
       if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
         log "AUTO-SHIP WORKER PROVISIONING FAILED — retry pending independently of build stamp"
         return 1
-      fi ;;
+      fi
+      autoship_pin_after_provision || return 1 ;;
     *) log "auto-ship worker capability unavailable; skipping provisioning" ;;
   esac
   rm -f "$PROVISION_PENDING"
@@ -124,8 +138,10 @@ reconcile_worker_recovery() {
   # This is runtime reconciliation, independent of provisioning/build stamps.
   # The helper proves the live daemon's external mode and process birth before
   # starting only a managed worker that exhausted systemd's restart allowance.
+  local pinned=()
+  if declare -F autoship_pin_binary >/dev/null; then pinned=(--worker-binary "$(autoship_pin_binary)"); fi
   if ! python3 "$REPO_ROOT/scripts/recover-autopr-worker.py" \
-      --repository "$REPO_ROOT" --state "$AUGMENTAGENT_STATE_DIR" >> "$LOG" 2>&1; then
+      --repository "$REPO_ROOT" --state "$AUGMENTAGENT_STATE_DIR" ${pinned[@]+"${pinned[@]}"} >> "$LOG" 2>&1; then
     log "AUTO-SHIP WORKER RECOVERY FAILED — retry on the next normal update tick"
     return 1
   fi
@@ -250,6 +266,14 @@ apply_update() {
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # #2468 — the worker's pinned build is reconciled against the pin, never
+  # against this deploy: an unchanged pin leaves its binary and stamp alone,
+  # so merging to main does not reload the worker. target/release now holds
+  # $TARGET's build, which bootstraps the first pin without a second compile.
+  # A failed pinned build never blocks the rest of the deploy.
+  reconcile_autoship_pin "$TARGET" "$TARGET" ||
+    log "pinned auto-ship worker unchanged this tick; retrying next tick"
 
   # Installer/template fixes need provisioning even when Cargo output is
   # cached or only scripts changed. This reloads configuration without
@@ -499,7 +523,11 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
-    if [ -e "$PROVISION_PENDING" ]; then
+    # #2468 — a moved pin is applied here: target/release is LOCAL's
+    # verified build, so pinning LOCAL itself needs no compile.
+    reconcile_autoship_pin "$LOCAL" "$LOCAL" ||
+      log "pinned auto-ship worker unchanged this tick; retrying next tick"
+    if [ -e "$PROVISION_PENDING" ] || [ "$AUTOSHIP_PIN_CHANGED" = 1 ]; then
       reconcile_worker_provisioning || exit 1
     fi
     reconcile_native_selection

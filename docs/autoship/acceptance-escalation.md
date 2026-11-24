@@ -42,25 +42,58 @@ and stable marker precede its RPC; retry scans for the exact body before posting
 again. A lost response leaves reconciliation runnable. Nothing is inferred to
 have passed, and no owner requirement is removed.
 
-## Never giving up (#2289)
+## Bounded ladder (#2289, bounded by #2467)
 
-A confirmed summary is not terminal. Each exhausted cycle records an immutable
-`acceptance_strategy_cycle_exhausted` response and schedules the next cycle as
-`acceptance_strategy_backoff` / `escalate_acceptance`. Cycles walk a repeating
-ladder: split into observable children (the #2281 rung above, cycle 0), re-scope
-from the failure evidence, switch provider order, shrink to the smallest
-observable first child, and a fresh plan from current main. Every rung still
-requires all original criteria verbatim. Later cycles use fresh strategy and
-decomposition keys. Cycle 0 keeps #2281's keys so its recorded outcomes replay.
-The summary is posted once, not once per cycle.
+A confirmed summary is not terminal by itself. Each exhausted cycle records an
+immutable `acceptance_strategy_cycle_exhausted` response and schedules the next
+cycle as `acceptance_strategy_backoff` / `escalate_acceptance`. Cycles walk the
+ladder once: split into observable children (the #2281 rung above, cycle 0),
+re-scope from the failure evidence, switch provider order, shrink to the
+smallest observable first child, and a fresh plan from current main. The ladder
+does not wrap around. Every rung still requires all original criteria verbatim.
+Cycle 0 keeps #2281's keys so its recorded outcomes replay. The summary is
+posted once, not once per cycle.
 
 Backoff is 30 minutes and doubles per cycle, capped at 6 hours. Before a cycle
 spends a model call, the per-issue rolling 24-hour model budget is checked
 (`AUTOSHIP_DAILY_MODEL_CALLS`, default 48). A spent budget waits as
 `acceptance_strategy_budget_wait` until the oldest charge ages out. A legacy
 `acceptance_strategies_exhausted` row is admitted to the next cycle
-automatically. Only closing the issue or an owner pause stops the loop, and
-backoff rows yield to fresh work through their `eligible_at` time.
+automatically.
+
+## Attempt and spend caps (#2467)
+
+Each exhausted ladder cycle is one try, and so is each scope→build→verify cycle
+that ends without a merge (repairs inside one cycle do not count again). Tries
+and charged model calls are derived from the durable workflow history, so
+workflows that predate the caps are counted the same way.
+
+- `AUTOSHIP_MAX_TRIES`, default 3 tries per issue.
+- `AUTOSHIP_MAX_ISSUE_MODEL_CALLS`, default 300 model calls per issue.
+- `AUTOSHIP_GLOBAL_DAILY_MODEL_CALLS`, default 1,500 model calls per rolling
+  24 hours across every workflow. `autopr health` prints what is left.
+
+A malformed or zero value falls back to the default. When the ladder reaches the
+attempt cap, or would decompose a parent into observable children a second time
+(decomposition runs at most once per issue), it checkpoints a `give_up` stop
+instead of another cycle. Past either cap no productive claim is made and no new
+model call is admitted. A try already running at the attempt cap may finish; a
+PR waiting for checks or merge is never given up.
+
+The model-free give-up sweep then closes the issue out once: one comment through
+the existing `agent-gave-up` path (reason code `cap:attempts`,
+`cap:model-calls` or `cap:decomposition`, what was tried, the last blocker
+reasons and the calls spent), the `agent-gave-up` label, and retirement of the
+workflow, which releases its native sessions and leases through the ordinary
+terminal path. The decision is recorded before the comment, so a restart resumes
+the close-out instead of commenting again. On deploy, workflows already over a
+cap are closed out the same way, a few per sweep pass.
+
+Editing the issue, or removing the label (by hand or with `autopr readmit`),
+clears the give-up: the caps count again from that moment and the workflow
+starts over from intake. While the global budget is spent, runs hold before
+selecting work; the merge sweep and finalize keep running, since they spend no
+model calls.
 
 Owner pause, live leases, checkout identity, original native custody, uncertain
 publication operations, and family resource policy still fence dispatch. The

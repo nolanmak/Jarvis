@@ -31,6 +31,7 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
@@ -804,6 +805,14 @@ enum Cmd {
         tools: String,
         #[arg(long)]
         unfiltered: String,
+    },
+    /// Internal owner-authorized MCP server for TabAgent browser tools.
+    #[command(hide = true)]
+    TabagentTool {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        tools: String,
     },
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
@@ -3234,6 +3243,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::WebTool { ref conversation, ref tools, ref unfiltered } = cli.cmd {
         return web::tool::serve(conversation, tools, unfiltered == "1").await;
+    }
+    if let Cmd::TabagentTool { ref session, ref tools } = cli.cmd {
+        return tabagent_tool::serve(session, tools).await;
     }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
@@ -5962,6 +5974,7 @@ async fn main() -> Result<()> {
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
+        Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
@@ -10053,6 +10066,7 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     computer_ctx.channel_id = Some(serenity::model::id::ChannelId::new(1));
     computer_ctx.session_id = format!("local:{}", uuid::Uuid::new_v4());
     computer_tool::configure(&mut opts, &computer_ctx, &repo_root);
+    tabagent_tool::configure(&mut opts, &computer_ctx, &std::env::current_exe().context("current_exe")?);
     info!(wiki = %wiki_root.display(), "wiki ask");
     // #389 — same owner-rules preamble the Discord query path injects, so
     // CLI asks behave identically (and the injection is testable headless).
@@ -12040,6 +12054,7 @@ impl QueryHandler for WikiQuerier {
         let auth_bin = self.repo_root.join("target/release/augmentagent");
         #[cfg(not(test))]
         let auth_bin = std::env::current_exe()?;
+        tabagent_tool::configure(&mut opts, ctx, &auth_bin);
         composio_auth_tool::configure(
             &mut opts,
             ctx,
