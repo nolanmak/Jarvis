@@ -31,6 +31,7 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
