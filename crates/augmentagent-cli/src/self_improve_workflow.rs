@@ -2206,6 +2206,14 @@ impl WorkflowGuard {
             .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
     }
 
+    /// #2510: return an attempt an infrastructure refusal never used. No
+    /// health check: a capacity refusal has already marked this guard, and
+    /// handing back a charge grants nothing. The lease is still fenced.
+    pub(super) fn release_epoch_attempt(&self,purpose:&str,epoch:&str)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .release_epoch_attempt(&self.lease,purpose,epoch,millis())
+    }
+
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
     }
