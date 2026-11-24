@@ -352,6 +352,10 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
             return Ok(());
         }
 
+        // Shared DM-alert policy (#1643) — every admission check above has
+        // already run, and nothing durable has happened to this message yet.
+        self.evaluate_dm_alert(handle, msg);
+
         let email = message_to_email(handle, msg, sub);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
@@ -553,6 +557,39 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
                 Ok(())
             }
         }
+    }
+
+    /// Hand an eligible inbound 1:1 DM to the shared DM-alert policy. Group
+    /// and channel posts, this bot's own echoes, other bots and the owner's
+    /// control DM never alert, whatever subscription routed them to triage.
+    /// The chat id is the dedupe subject; the sender's wiki slug (when the
+    /// identity index resolves one) lets an owner `person:` priority match.
+    fn evaluate_dm_alert(&self, handle: &BotHandle, msg: &Message) {
+        if !msg.chat.is_private() || msg.chat.id == handle.owner_chat_id {
+            return;
+        }
+        let Some(from) = msg.from.as_ref().filter(|u| !u.is_bot && u.id != handle.bot_id) else {
+            return;
+        };
+        let label = from.display_label();
+        let slugs: Vec<String> = self
+            .identity_index
+            .as_ref()
+            .and_then(|index| index.lookup(PLATFORM, &from.id.to_string()))
+            .map(|page| vec![page.slug.clone()])
+            .unwrap_or_default();
+        augmentagent_channel_core::dm_alerts::evaluate(
+            &self.store,
+            &augmentagent_channel_core::dm_alerts::InboundDm {
+                platform: PLATFORM,
+                conversation: &msg.chat.id.to_string(),
+                handles: &[],
+                person_slugs: &slugs,
+                sender_label: &label,
+                source_url: &format!("https://web.telegram.org/a/#{}", msg.chat.id),
+            },
+            now_millis(),
+        );
     }
 
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
@@ -1028,6 +1065,78 @@ mod tests {
             },
             None,
         )
+    }
+
+    fn owner_alerts(store: &Store) -> i64 {
+        store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM owner_alerts", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// The DM-alert policy (#1643) runs before any downstream work: with
+    /// persistence broken the alert still lands. Only an eligible inbound
+    /// 1:1 DM may produce one.
+    #[tokio::test]
+    async fn dm_alerts_precede_persistence_and_skip_groups_bots_and_the_owner_chat() {
+        use augmentagent_store::owner_alerts::Urgency;
+        std::env::set_var(augmentagent_channel_core::dm_alerts::ENABLED, "1");
+        let (store, _f) = tmp_store();
+        store
+            .set_owner_alert_priority("person:priority-contact", Urgency::High)
+            .unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::create_dir(wiki.path().join("people")).unwrap();
+        std::fs::write(
+            wiki.path().join("people/priority-contact.md"),
+            "---\nidentities:\n  telegram: [\"55501\", \"55502\"]\n---\n",
+        )
+        .unwrap();
+        let index = IdentityIndex::build(&augmentagent_wiki::WikiLayout::new(
+            wiki.path().to_path_buf(),
+        ))
+        .unwrap();
+        let mut ch = build_channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        ch.identity_index = Some(Arc::new(index));
+
+        let h = handle();
+        let subs = vec![
+            sub(SubscriptionMode::Priority, "55501"),
+            sub(SubscriptionMode::Priority, "55502"),
+            sub(SubscriptionMode::Priority, "-100"),
+        ];
+        let by_chat = index_subs_by_chat(&subs);
+        let mut out = PollOutcome::default();
+        let dm = sample_msg(1, 55_501, "are we still on for tomorrow?");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out.priority_skipped, 1, "triage is unchanged");
+        assert_eq!(owner_alerts(&store), 1, "the eligible 1:1 DM alerts");
+
+        store
+            .with_conn(|c| c.execute("DROP TABLE emails", []))
+            .unwrap();
+        let second = sample_msg(2, 55_502, "ping");
+        let result = ch.dispatch_message(&h, &second, &by_chat, &mut out).await;
+        assert!(result.is_err(), "persistence is broken");
+        assert_eq!(owner_alerts(&store), 2, "the alert precedes persistence");
+
+        let mut group = sample_msg(3, -100, "team chatter");
+        group.chat.chat_type = "supergroup".into();
+        let mut bot = sample_msg(4, 55_501, "automated notice");
+        bot.from.as_mut().unwrap().is_bot = true;
+        for msg in [group, bot, sample_msg(5, 12_345, "note to self")] {
+            let _ = ch.dispatch_message(&h, &msg, &by_chat, &mut out).await;
+        }
+        assert_eq!(
+            owner_alerts(&store),
+            2,
+            "groups, other bots and the owner's own chat never alert"
+        );
     }
 
     #[tokio::test]

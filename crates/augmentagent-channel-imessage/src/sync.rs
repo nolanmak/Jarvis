@@ -353,6 +353,14 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
             continue;
         }
 
+        // Shared DM-alert policy (#1643), evaluated before this batch's rows
+        // land and before the conversation's delta goes downstream. Owner
+        // transcripts are already excluded above; a first-run history is
+        // backlog rather than an arriving message.
+        if !conv.is_group() && seen > 0 && entries[seen..].iter().any(|e| e.sender != "me") {
+            evaluate_dm_alert(store, &conv);
+        }
+
         let mut new_entries = Vec::new();
         for (idx, entry) in entries.iter().enumerate().skip(seen) {
             let email = synthetic_imessage_email(&conv, idx, entry);
@@ -373,6 +381,34 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
         });
     }
     Ok((stats, deltas))
+}
+
+/// iMessage has no addressable per-conversation web URL, so owner alerts
+/// carry the sender label and reference the Messages app itself.
+const DM_ALERT_SOURCE: &str = "https://support.apple.com/guide/messages/welcome/mac";
+
+/// Hand an eligible inbound 1:1 conversation to the shared DM-alert policy.
+/// The conversation identifier is both the dedupe subject and the sender's
+/// handle (an E.164 phone or an Apple-ID address).
+fn evaluate_dm_alert(store: &Store, conv: &Conversation) {
+    let handle = conv
+        .participants
+        .first()
+        .cloned()
+        .unwrap_or_else(|| conv.identifier.clone());
+    augmentagent_channel_core::dm_alerts::evaluate(
+        store,
+        &augmentagent_channel_core::dm_alerts::InboundDm {
+            platform: "imessage",
+            conversation: &conv.identifier,
+            handles: &[handle],
+            person_slugs: &[],
+            // An untitled conversation falls back to the handle downstream.
+            sender_label: &conv.title,
+            source_url: DM_ALERT_SOURCE,
+        },
+        chrono::Utc::now().timestamp_millis(),
+    );
 }
 
 /// One synthetic `Email` for a whole conversation delta — the wiki ingest
@@ -866,6 +902,75 @@ mod tests {
         let email = batched_delta_email(&delta);
         assert!(email.body.len() <= 9_000);
         assert!(email.body.contains("2026-08-26T11:04"), "newest entry kept");
+    }
+
+    fn owner_alerts(store: &Store) -> i64 {
+        store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM owner_alerts", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    fn append(root: &std::path::Path, conv_dir: &str, entry: &str) {
+        let path = root.join("conversations").join(conv_dir).join("messages.md");
+        let mut md = std::fs::read_to_string(&path).unwrap();
+        md.push('\n');
+        md.push_str(entry);
+        std::fs::write(&path, md).unwrap();
+    }
+
+    /// The DM-alert policy (#1643) runs before this batch's rows land: with
+    /// persistence broken the alert still lands. Only a new inbound entry of
+    /// a 1:1 conversation may produce one.
+    #[test]
+    fn dm_alerts_precede_persistence_for_new_inbound_one_to_one_entries_only() {
+        use augmentagent_store::owner_alerts::Urgency;
+        std::env::set_var(augmentagent_channel_core::dm_alerts::ENABLED, "1");
+        let (dir, _layout, store) = fresh_env();
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[
+                ("+14155550123", "John_Smith", "John Smith", DM_MD),
+                ("+14155550456", "Jane_Doe", "Jane Doe", DM_MD),
+                ("chat999", "Ski_Trip", "Ski Trip", DM_MD),
+            ],
+        );
+        // Every handle in the bundle resolves to the same prioritized person,
+        // so only the channel's own exclusions can keep an alert from landing.
+        for phone in ["+14155550123", "+14155550456", "+14155550999"] {
+            store
+                .upsert_phone_identity(&PhoneIdentity {
+                    phone: phone.into(),
+                    person_slug: "john-smith".into(),
+                    display_name: None,
+                    source: "test".into(),
+                })
+                .unwrap();
+        }
+        store
+            .set_owner_alert_priority("person:john-smith", Urgency::High)
+            .unwrap();
+
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(owner_alerts(&store), 0, "a first-run history is backlog");
+
+        for conv in ["John_Smith", "Ski_Trip"] {
+            append(dir.path(), conv, "### [2026-08-27T09:00:00-04:00] me\nnote\n");
+        }
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(owner_alerts(&store), 0, "self-authored entries never alert");
+
+        for conv in ["John_Smith", "Ski_Trip"] {
+            append(dir.path(), conv, "### [2026-08-27T09:30:00-04:00] +14155550123\nstill on?\n");
+        }
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(owner_alerts(&store), 1, "only the 1:1 conversation alerts");
+
+        store
+            .with_conn(|c| c.execute("DROP TABLE emails", []))
+            .unwrap();
+        append(dir.path(), "Jane_Doe", "### [2026-08-27T10:00:00-04:00] +14155550456\nhi?\n");
+        assert!(poll_once(&bundle, &store).is_err(), "persistence is broken");
+        assert_eq!(owner_alerts(&store), 2, "the alert precedes persistence");
     }
 
     #[test]

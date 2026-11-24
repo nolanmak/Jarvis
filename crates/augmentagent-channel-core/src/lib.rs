@@ -21,6 +21,7 @@ pub mod codex_tools;
 mod native_tool_readiness;
 pub mod cooldown;
 pub mod decision;
+pub mod dm_alerts;
 pub mod draft_context;
 pub mod draft_evidence;
 pub mod draft_workflow;

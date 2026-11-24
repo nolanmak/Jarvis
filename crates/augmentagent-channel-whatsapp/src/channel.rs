@@ -353,6 +353,10 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             return Ok(());
         }
 
+        // Shared DM-alert policy (#1643) — every admission guard above has
+        // already run, and nothing durable has happened to this message yet.
+        self.evaluate_dm_alert(&msg);
+
         let email = msg.into_email(&self.config.phone);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
@@ -781,6 +785,37 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
         }
     }
 
+    /// Hand an admitted inbound 1:1 message to the shared DM-alert policy.
+    /// The bare chat JID is both the dedupe subject and a selector-shaped
+    /// handle; its E.164 user also resolves a phone-indexed person priority.
+    fn evaluate_dm_alert(&self, msg: &WaMessage) {
+        let chat_jid = msg.chat.bare();
+        let user = msg.chat.user();
+        let digits = !user.is_empty() && user.bytes().all(|b| b.is_ascii_digit());
+        let mut handles = vec![chat_jid.clone()];
+        if digits {
+            handles.push(format!("+{user}"));
+        }
+        let source = if digits {
+            format!("https://wa.me/{user}")
+        } else {
+            "https://web.whatsapp.com/".to_string()
+        };
+        augmentagent_channel_core::dm_alerts::evaluate(
+            &self.store,
+            &augmentagent_channel_core::dm_alerts::InboundDm {
+                platform: PLATFORM,
+                conversation: &chat_jid,
+                handles: &handles,
+                person_slugs: &[],
+                // Empty push names fall back to the handle in the evaluator.
+                sender_label: &msg.push_name,
+                source_url: &source,
+            },
+            now_millis(),
+        );
+    }
+
     fn maybe_ingest(
         &self,
         email: &Email,
@@ -1015,6 +1050,62 @@ mod tests {
             from_me: false,
             metadata: Default::default(),
         }
+    }
+
+    fn owner_alerts(store: &Store) -> i64 {
+        store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM owner_alerts", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// The DM-alert policy (#1643) runs before any downstream work: with
+    /// persistence broken the alert still lands. Only an eligible inbound
+    /// 1:1 message may produce one, so the deliberately wide selectors below
+    /// must stay unmatched for group, broadcast and outbound traffic.
+    #[tokio::test]
+    async fn dm_alerts_precede_durable_work_and_skip_groups_broadcasts_and_outbound() {
+        use augmentagent_store::owner_alerts::Urgency;
+        std::env::set_var(augmentagent_channel_core::dm_alerts::ENABLED, "1");
+        let (store, _f) = tmp_store();
+        for chat in ["15551234567@s.whatsapp.net", "15557654321@s.whatsapp.net"] {
+            store.allow_whatsapp_inbound(chat).unwrap();
+        }
+        for selector in ["domain:s.whatsapp.net", "domain:g.us", "1234567890@broadcast"] {
+            store
+                .set_owner_alert_priority(selector, Urgency::High)
+                .unwrap();
+        }
+        let ch = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+
+        let mut group = msg("group", "team chatter");
+        group.chat = Jid::new("120363001234567890@g.us");
+        let mut broadcast = msg("broadcast", "status update");
+        broadcast.chat = Jid::new("1234567890@broadcast");
+        let mut outbound = msg("outbound", "sent by me");
+        outbound.from_me = true;
+        for m in [msg("dm", "are we still on for tomorrow?"), group, broadcast, outbound] {
+            ch.inbox.lock().await.push(m);
+        }
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.errors, 0);
+        assert_eq!(out.skipped, 1, "only the eligible DM is triaged");
+        assert_eq!(out.groups_dropped, 2, "group and broadcast stay dropped");
+        assert_eq!(owner_alerts(&store), 1, "the eligible 1:1 DM alerts");
+
+        store
+            .with_conn(|c| c.execute("DROP TABLE emails", []))
+            .unwrap();
+        let mut second = msg("dm2", "ping");
+        second.chat = Jid::new("15557654321@s.whatsapp.net");
+        second.sender = Jid::new("15557654321@s.whatsapp.net");
+        ch.inbox.lock().await.push(second);
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.errors, 1, "persistence is broken");
+        assert_eq!(owner_alerts(&store), 2, "the alert precedes persistence");
     }
 
     #[tokio::test]
