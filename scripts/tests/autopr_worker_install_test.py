@@ -172,6 +172,57 @@ if 'show' in sys.argv:
             self.assertNotEqual(result.returncode,0)
             self.assertIn('preserving unmanaged unit',result.stderr)
 
+    def test_installed_pinned_build_runs_the_worker_and_its_stamp_drives_reloads(self):
+        """#2468: once a pinned build is installed the unit runs it and the
+        worker watches the pinned stamp; unpinned or not installed, run-rs.sh."""
+        with tempfile.TemporaryDirectory() as temporary:
+            base=Path(temporary);repo=base/'repo'
+            (repo/'scripts/systemd').mkdir(parents=True);(repo/'scripts/lib').mkdir()
+            for name in ('ensure-autopr-worker.sh','secure-release-executables.py','systemd/augmentagent-autopr.service','lib/autoship-pin.sh'):
+                shutil.copy(ROOT/'scripts'/name,repo/'scripts'/name)
+            release=repo/'target/release';release.mkdir(parents=True)
+            for name in ('augmentagent','augmentagent-mcp-memory'):
+                (release/name).write_text('#!/bin/sh\nexit 0\n');(release/name).chmod(0o755)
+            tools=base/'bin';tools.mkdir()
+            (tools/'systemctl').write_text('#!/bin/sh\nexit 0\n');(tools/'systemctl').chmod(0o700)
+            (tools/'uname').write_text('#!/bin/sh\necho Linux\n');(tools/'uname').chmod(0o700)
+            pin_root=base/'build volume/pinned'
+            env=dict(os.environ,PATH=str(tools)+os.pathsep+os.environ['PATH'],XDG_CONFIG_HOME=str(base/'config'),
+                     XDG_STATE_HOME=str(base/'state'),AUGMENTAGENT_AUTOSHIP_PIN_ROOT=str(pin_root))
+            env.pop('AUGMENTAGENT_AUTOSHIP_PIN',None)
+            unit=base/'config/systemd/user/augmentagent-autopr.service'
+            def render():
+                subprocess.run(['bash',str(repo/'scripts/ensure-autopr-worker.sh')],env=env,check=True,capture_output=True)
+                return unit.read_text()
+            # No pin installed yet: the unpinned launcher, no pinned stamp.
+            worker=render()
+            self.assertIn('/scripts/run-rs.sh" auto-pr-worker',worker)
+            self.assertNotIn('AUGMENTAGENT_AUTOSHIP_DEPLOY_STAMP',worker)
+            sha='a'*40
+            (base/'config/augmentagent').mkdir(parents=True,exist_ok=True)
+            (base/'config/augmentagent/autoship-pin').write_text(sha+'\n')
+            (base/'state/augmentagent').mkdir(parents=True,exist_ok=True)
+            (base/'state/augmentagent/autoship-pinned-built').write_text(sha+'\n')
+            self.assertIn('/scripts/run-rs.sh" auto-pr-worker',render(),'a stamp without a pinned binary is not ready')
+            (pin_root/'bin').mkdir(parents=True)
+            shutil.copy(release/'augmentagent',pin_root/'bin/augmentagent');(pin_root/'bin/augmentagent').chmod(0o755)
+            worker=render()
+            self.assertIn(f'ExecStart="{repo}/scripts/run-autoship-pinned.sh" auto-pr-worker --dry-run',worker)
+            self.assertIn(f'Environment="AUGMENTAGENT_AUTOSHIP_PINNED_BINARY={pin_root}/bin/augmentagent"',worker)
+            self.assertIn(f'Environment="AUGMENTAGENT_AUTOSHIP_DEPLOY_STAMP={base}/state/augmentagent/autoship-pinned-built"',worker)
+            # A moved pin still building keeps the worker on its pinned build.
+            (base/'config/augmentagent/autoship-pin').write_text('b'*40+'\n')
+            self.assertIn('run-autoship-pinned.sh',render())
+            # Unpinned: back to the main deploy build.
+            (base/'config/augmentagent/autoship-pin').write_text('main\n')
+            worker=render()
+            self.assertIn('/scripts/run-rs.sh" auto-pr-worker',worker)
+            self.assertNotIn('AUGMENTAGENT_AUTOSHIP',worker)
+            # The kill switch wins over an installed pin.
+            (base/'config/augmentagent/autoship-pin').write_text(sha+'\n')
+            env['AUGMENTAGENT_AUTOSHIP_PIN']='off'
+            self.assertNotIn('AUGMENTAGENT_AUTOSHIP',render())
+
 WORKER_LABEL='com.nolanmak.augmentagent.autopr'
 DAEMON_LABEL='com.nolanmak.augmentagent'
 
