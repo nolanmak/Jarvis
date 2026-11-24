@@ -237,10 +237,59 @@ fn producer_closure(root:&Path,session:&Path)->Result<Closure> {
 /// charged at its actual stored bytes rather than a live session reservation,
 /// and admission evicts the oldest of it when a new session needs the room.
 struct RetiredHistory { provider:PathBuf, session:PathBuf, bytes:u64, retired_at:std::time::SystemTime }
-struct Inventory { reserving:usize, history:Vec<RetiredHistory> }
+/// `running` runtimes hold their session lock and reserve a full session.
+/// Idle resumable runtimes cost their stored bytes; history is evictable.
+struct Inventory { running:usize, idle:usize, idle_bytes:u64, history:Vec<RetiredHistory> }
 impl Inventory {
     fn history_bytes(&self)->u64 { self.history.iter().fold(0u64,|total,entry|total.saturating_add(entry.bytes)) }
-    fn retained(&self)->usize { self.reserving.saturating_add(self.history.len()) }
+    fn retained(&self)->usize { self.running.saturating_add(self.idle).saturating_add(self.history.len()) }
+    fn idle(&mut self,session:&Path)->Result<()> {
+        self.idle+=1;
+        self.idle_bytes=self.idle_bytes.saturating_add(tree_bytes(session)?);
+        Ok(())
+    }
+    /// Bytes the budget must hold for `additional` new running sessions.
+    fn reserved(&self,additional:usize)->u64 {
+        (self.running.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES).saturating_add(self.idle_bytes)
+    }
+    fn report(&self,additional:usize,max_sessions:usize,max_state_bytes:u64,stored:u64,free:u64)->state_capacity::Report {
+        state_capacity::observed(self.running,self.idle,self.idle_bytes,self.history.len(),self.history_bytes(),additional,
+            max_sessions,max_state_bytes,stored,free)
+    }
+}
+/// Whether a launcher holds this session's lock, for marker-only observation.
+/// On Linux this reads /proc/locks and never touches the lock, so it cannot
+/// make a concurrent launcher's non-blocking acquisition fail; evidence that
+/// cannot be read counts as running. A missing lock file was never launched.
+fn session_lock_observed(session:&Path)->Result<bool> {
+    let lock=session.join("lock");
+    let info=match lock.symlink_metadata() {
+        Ok(info)=>info,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),
+        Err(error)=>return Err(error.into()),
+    };
+    ensure!(info.is_file(),"native session lock is not a file");
+    #[cfg(target_os="linux")]
+    { Ok(std::fs::read_to_string("/proc/locks").map(|locks|flock_listed(&locks,info.ino())).unwrap_or(true)) }
+    #[cfg(not(target_os="linux"))]
+    {
+        let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&lock)?;
+        let free=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)}==0;
+        if free {unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_UN)};}
+        Ok(!free)
+    }
+}
+/// A /proc/locks FLOCK entry on this inode. The device is deliberately not
+/// matched (procfs and stat disagree on some filesystems): a collision only
+/// over-reserves, never under-reserves.
+#[cfg_attr(not(target_os="linux"),allow(dead_code))]
+fn flock_listed(locks:&str,inode:u64)->bool {
+    let suffix=format!(":{inode}");
+    locks.lines().any(|line|{
+        let fields=line.split_whitespace().collect::<Vec<_>>();
+        let fields=if fields.get(1)==Some(&"->") {&fields[1..]} else {&fields[..]};
+        fields.get(1)==Some(&"FLOCK") && fields.get(5).is_some_and(|id|id.ends_with(&suffix))
+    })
 }
 fn scope_retired_interrupted(session:&Path)->bool {
     session.join("owned.json").is_file() && session.join("retired.json").is_file()
@@ -266,7 +315,7 @@ fn remove_session(provider:&Path,session:&Path)->Result<()> {
 /// proven by each session lock. Without it, this is a marker-only observation
 /// that never creates or takes session locks, so it cannot disturb a launcher.
 fn scan(root:&Path,reclaim:bool) -> Result<Inventory> {
-    let mut inventory=Inventory{reserving:0,history:Vec::new()};
+    let mut inventory=Inventory{running:0,idle:0,idle_bytes:0,history:Vec::new()};
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
@@ -281,7 +330,9 @@ fn scan(root:&Path,reclaim:bool) -> Result<Inventory> {
                 Ok(RetiredHistory{provider:provider.clone(),bytes:tree_bytes(&session)?,session,retired_at})
             };
             if !reclaim {
-                if scope_retired_interrupted(&session) {inventory.history.push(history(session)?);} else {inventory.reserving+=1;}
+                if session_lock_observed(&session)? {inventory.running+=1;}
+                else if scope_retired_interrupted(&session) {inventory.history.push(history(session)?);}
+                else {inventory.idle(&session)?;}
                 continue;
             }
             let closed=matches!(producer_closure(root,&session)?,Closure::Verified);
@@ -292,9 +343,11 @@ fn scan(root:&Path,reclaim:bool) -> Result<Inventory> {
             let available=unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0;
             if closed && available {
                 remove_session(&provider,&session)?;
-            } else if available && scope_retired_interrupted(&session) {
+            } else if !available {
+                inventory.running+=1;
+            } else if scope_retired_interrupted(&session) {
                 inventory.history.push(history(session)?);
-            } else {inventory.reserving+=1;}
+            } else {inventory.idle(&session)?;}
         }
     }
     inventory.history.sort_by(|a,b|a.retired_at.cmp(&b.retired_at).then_with(||a.session.cmp(&b.session)));
@@ -302,23 +355,24 @@ fn scan(root:&Path,reclaim:bool) -> Result<Inventory> {
 }
 fn prune_and_count(root:&Path) -> Result<usize> { Ok(scan(root,true)?.retained()) }
 
-/// Native admission under the exclusive state lock. Only live or resumable
-/// runtimes hold session reservations. When the budget or disk cannot also
-/// hold the retained history, the oldest unresumable history is evicted
-/// (re-proving it is unlocked) until the new session fits.
+/// Native admission under the exclusive state lock. Only running (locked)
+/// runtimes and the `additional` sessions about to run hold full session
+/// reservations; idle resumable runtimes cost their stored bytes. When the
+/// budget or disk cannot also hold the retained history, the oldest
+/// unresumable history is evicted (re-proving it is unlocked) until the new
+/// session fits. Locked and resumable runtimes are never evicted.
 fn admit_capacity(root:&Path,additional:usize,max_sessions:usize,max_state_bytes:u64)->Result<state_capacity::Report> {
     let mut inventory=scan(root,true)?;
-    let reserved=|inventory:&Inventory|(inventory.reserving.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES);
     let mut stored=tree_bytes(root)?;
     let mut free=available_bytes(root)?;
     let mut evicted=0usize;
-    while !inventory.history.is_empty() && (reserved(&inventory).saturating_add(inventory.history_bytes())>max_state_bytes
+    while !inventory.history.is_empty() && (inventory.reserved(additional).saturating_add(inventory.history_bytes())>max_state_bytes
         || stored>max_state_bytes || free<SESSION_BYTES) {
         let oldest=inventory.history.remove(0);
         let lock=std::fs::OpenOptions::new().read(true).write(true).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW).open(oldest.session.join("lock"))?;
         if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 || !scope_retired_interrupted(&oldest.session) {
-            inventory.reserving+=1;
+            inventory.running+=1;
             continue;
         }
         remove_session(&oldest.provider,&oldest.session)?;
@@ -327,8 +381,7 @@ fn admit_capacity(root:&Path,additional:usize,max_sessions:usize,max_state_bytes
         free=available_bytes(root)?;
     }
     if evicted>0 {std::fs::File::open(root)?.sync_all()?;}
-    Ok(state_capacity::observed(inventory.reserving,inventory.history.len(),inventory.history_bytes(),additional,
-        max_sessions,max_state_bytes,stored,free))
+    Ok(inventory.report(additional,max_sessions,max_state_bytes,stored,free))
 }
 
 /// Finish already-authorized retirement through the same locked pruning path
@@ -501,7 +554,9 @@ impl Launch {
         policy_readiness::refresh_grant(&policy, provider, profile)?;
         let state_lock=StateLock::acquire(&root)?;
         ensure!(!owner_retired(&root,owner_logger.path(),&audit_owner)?,"native runtime owner has been retired");
-        let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
+        // A resumed runtime is idle (unlocked) until its launcher runs it, so
+        // it reserves a running session exactly like a fresh one.
+        let additional=1;
         let capacity=admit_capacity(&root,additional,policy.max_sessions,policy.max_state_bytes)?;
         if capacity.exhausted() {
             crate::run_resources::admission_failed_observation(provider,opts.audit_logger.as_ref(),
@@ -903,6 +958,9 @@ mod tests {
         std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.join("state.lock")).unwrap();
         let original=session(&root,"session-retained","/private/credential/path",false);
+        // A running runtime (its launcher holds the session lock) reserves a full session.
+        let running=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(original.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         let policy=temp.path().join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":root,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
         let before=std::fs::read(original.join("owned.json")).unwrap();
@@ -921,6 +979,13 @@ mod tests {
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
         let missing=serde_json::to_value(state_capacity::inspect_at(None)).unwrap();
         assert_eq!(missing["status"],"policy-unobserved");
+        // Once idle, the same resumable runtime costs only its stored bytes.
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_UN)},0);
+        let idle=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(idle["running_sessions"],0);
+        assert_eq!(idle["idle_resumable_sessions"],1);
+        assert_eq!(idle["required_reserved_bytes"],SESSION_BYTES+idle["idle_resumable_bytes"].as_u64().unwrap());
+        assert!(original.exists());
     }
     /// Real native admission must retain the precise storage observation and
     /// return a resource hold before executable preparation or model dispatch.
@@ -940,6 +1005,8 @@ mod tests {
         let state=root.join("state");
         for path in [&state,&root.join("logs"),&root.join("anchors")] {std::fs::create_dir(path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
         let original=session(&state,"session-retained","/original/audit",false);
+        let running=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(original.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         let before=std::fs::read(original.join("owned.json")).unwrap();
         let policy=root.join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":state,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
@@ -1119,13 +1186,76 @@ mod tests {
         let resumable=session(&root,"session-resumable","/audit/live",true);
         let report=serde_json::to_value(admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()).unwrap();
         assert_eq!(report["status"],"capacity-observed","{report}");
-        assert_eq!(report["retained_sessions"],2,"running and resumable runtimes keep reservations: {report}");
+        assert_eq!(report["retained_sessions"],2,"running and resumable runtimes are retained: {report}");
+        assert_eq!(report["running_sessions"],1,"only the locked runtime reserves a full session: {report}");
+        assert_eq!(report["idle_resumable_sessions"],1);
         assert!(running.exists() && resumable.exists());
-        // 3 reservations leave 5 GiB for history: the oldest unlocked history goes first.
-        assert!(!history[1].exists() && !history[2].exists() && !history[3].exists());
-        assert!(history[4..].iter().all(|path|path.exists()));
-        assert_eq!(report["retired_history_sessions"],4);
+        // 2 reservations plus the idle runtime's bytes leave under 6 GiB for
+        // history: the oldest unlocked history goes first.
+        assert!(!history[1].exists() && !history[2].exists());
+        assert!(history[3..].iter().all(|path|path.exists()));
+        assert_eq!(report["retired_history_sessions"],5);
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
+    }
+    /// Production state after #2523 released 24 scope parks: 8 resumable,
+    /// unlocked runtimes (1 claude, 7 codex) holding 27,560,846 bytes in total
+    /// each reserved a full GiB, so 8 + 1 new = 9 GiB against the 8 GiB budget
+    /// refused every native run although the worker runs one session at a time.
+    /// Only a running (locked) runtime reserves a GiB; an idle one costs its bytes.
+    #[test]
+    fn idle_resumable_sessions_cost_stored_bytes_and_only_running_sessions_reserve() {
+        const STORED:u64=27_560_846;
+        let temp=tempfile::tempdir().unwrap();
+        let root=private_state_root(temp.path());
+        let sessions=(0..8).map(|index|{
+            let provider=if index==0 {"claude"}else{"codex"};
+            let path=root.join(provider).join(format!("session-resumable-{index}"));
+            std::fs::create_dir_all(&path).unwrap();
+            write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":"/audit/live","owner":{"workflow_id":format!("workflow-{index}"),"lease_generation":1}})).unwrap()).unwrap();
+            write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();
+            path
+        }).collect::<Vec<_>>();
+        let metadata=tree_bytes(&root).unwrap();
+        assert!(metadata<STORED);
+        let padding=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(sessions[1].join("guest-state.img")).unwrap();
+        padding.set_len(STORED-metadata).unwrap();
+        assert_eq!(tree_bytes(&root).unwrap(),STORED);
+        let policy=production_policy(temp.path(),&root);
+        let observed=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(observed["status"],"capacity-observed","idle resumable sessions blocked new native work: {observed}");
+        assert_eq!(observed["blockers"],serde_json::json!([]));
+        let admitted=serde_json::to_value(admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()).unwrap();
+        assert_eq!(admitted["status"],"capacity-observed","idle resumable sessions blocked admission: {admitted}");
+        assert_eq!(admitted["blockers"],serde_json::json!([]));
+        assert_eq!(admitted["running_sessions"],0);
+        assert_eq!(admitted["idle_resumable_sessions"],8);
+        assert_eq!(admitted["idle_resumable_bytes"],STORED);
+        assert_eq!(admitted["required_reserved_bytes"],SESSION_BYTES+STORED);
+        assert!(sessions.iter().all(|path|path.exists()),"admission never removes resumable runtimes");
+        // The same eight while running each hold a full reservation and block.
+        let locks=sessions.iter().map(|path|{
+            let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path.join("lock")).unwrap();
+            assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            lock
+        }).collect::<Vec<_>>();
+        for report in [state_capacity::inspect_at(Some(&policy)),admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()] {
+            let report=serde_json::to_value(report).unwrap();
+            assert_eq!(report["status"],"capacity-exhausted","{report}");
+            assert_eq!(report["blockers"],serde_json::json!(["reserved-bytes"]));
+            assert_eq!(report["running_sessions"],8);
+            assert_eq!(report["required_reserved_bytes"],9*SESSION_BYTES);
+        }
+        assert!(sessions.iter().all(|path|path.exists()),"locked runtimes are never touched");
+        for lock in &locks {assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);}
+    }
+    #[test]
+    fn proc_locks_flock_entries_mark_only_their_inode_running() {
+        let locks="1: FLOCK  ADVISORY  WRITE 4242 103:02:5678 0 EOF\n1: -> FLOCK  ADVISORY  WRITE 4243 103:02:5678 0 EOF\n2: POSIX  ADVISORY  WRITE 99 103:02:9999 0 EOF\n3: OFDLCK ADVISORY  READ  -1 00:1a:7777 0 EOF\n";
+        assert!(flock_listed(locks,5678));
+        assert!(!flock_listed(locks,9999),"POSIX record locks are not session locks");
+        assert!(!flock_listed(locks,7777));
+        assert!(!flock_listed(locks,678),"inode suffix must match whole");
+        assert!(!flock_listed("",5678));
     }
     #[test]
     fn scope_retirement_does_not_guess_interrupted_session_safe() {
