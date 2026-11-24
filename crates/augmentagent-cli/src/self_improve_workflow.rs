@@ -333,6 +333,9 @@ enum AcceptanceAuthority {
     Unbound,
     RecoveryOnly,
     Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
+    /// #2464: scope proof gate off. A recorded plan, criteria and allowed
+    /// paths admit the builder; proof comes from the build itself.
+    Plan,
 }
 
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -870,7 +873,11 @@ impl SweepGuard {
                 })
                 .last()
         };
+        // #2464: a plan-bound candidate has no executable receipt; hosted CI
+        // and the recorded independent approval are its merge evidence.
+        let plan_bound = crate::autoship_workflow::scope_proof_gate::plan_contract(&inner.binding.contract);
         let checked = async {
+            if plan_bound { return Ok(()); }
             let reference = reference.context("protected acceptance checkpoint missing")?;
             acceptance::assert_sweep_receipt(
                 &worktree,
@@ -1371,6 +1378,8 @@ impl WorkflowGuard {
                     AcceptanceAuthority::RecoveryOnly=>anyhow::bail!("baseline_witness_unqualified: recovery metadata cannot authorize a builder"),
                     AcceptanceAuthority::Unbound if state.checkpoint.binding.contract.starts_with("registered:") || matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review)=>anyhow::bail!("baseline_witness_unqualified: builder admission requires protected original-production qualification"),
                     AcceptanceAuthority::Unbound=>{},
+                    AcceptanceAuthority::Plan=>anyhow::ensure!(crate::autoship_workflow::scope_proof_gate::plan_contract(&state.checkpoint.binding.contract)
+                        || !matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review),"plan admission belongs to another contract"),
                 }
             }
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
@@ -1625,6 +1634,32 @@ impl WorkflowGuard {
 
     /// This metadata is needed by independent repair of an invalid legacy
     /// verifier. It deliberately grants no builder/verification/merge proof.
+    /// #2464: bind the scoped plan instead of a qualified executable
+    /// contract. Registers the plan's write admission (replacing an older
+    /// contract's, so a stuck branch keeps its commits) and admits builders
+    /// under a `plan:<sha256>` contract. Only valid with the gate off.
+    pub(super) fn bind_plan(&mut self,plan:&super::plan_proof::Plan)->Result<()> {
+        use crate::autoship_workflow::scope_proof_gate;
+        anyhow::ensure!(!scope_proof_gate::enabled(),"plan binding requires {}=off",scope_proof_gate::ENV);
+        self.healthy_lease()?;
+        let contract=plan.contract()?;
+        let allowed=plan.write_admission(&self.worktree)?;
+        use augmentagent_channel_core::autoship_write_scope as write_scope;
+        match write_scope::registered_contract(&self.worktree)? {
+            None=>write_scope::register(&self.worktree,&contract,allowed,Vec::new())?,
+            Some(previous)=>write_scope::replace_registered(&self.worktree,&previous,&contract,allowed,Vec::new())?,
+        }
+        self.contract=contract;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Plan;
+        self.audit_event("scope_plan_bound",serde_json::json!({"contract":self.contract,"criteria":plan.criteria.len(),
+            "declared_paths":plan.declared_paths,"switch":scope_proof_gate::ENV}))
+    }
+
+    /// Whether this workflow builds from a plan (#2464), not a registered contract.
+    pub(super) fn plan_mode(&self)->bool {
+        self.acceptance_authority.lock().is_ok_and(|authority|matches!(*authority,AcceptanceAuthority::Plan))
+    }
+
     pub(super) fn bind_acceptance_for_recovery(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
         self.bind_acceptance_identity(prepared)?;
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
@@ -2746,6 +2781,10 @@ pub(super) async fn git_binding(
             .strip_prefix("registered:")
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(str::to_owned)
+            // #2464: a plan contract stays recognizable in the binding.
+            .or_else(|| contract.strip_prefix(crate::autoship_workflow::scope_proof_gate::PLAN_CONTRACT_PREFIX)
+                .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(|_| contract.to_owned()))
             .unwrap_or_else(|| format!("{:x}", Sha256::digest(contract.as_bytes()))),
         evidence_hash: format!("{:x}", Sha256::digest(evidence)),
     })
@@ -2992,6 +3031,53 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_repo()->tempfile::TempDir {
+        let tmp=std::fs::canonicalize("/tmp").unwrap();
+        let root=tempfile::tempdir_in(&tmp).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/phone.rs"),"pub fn format(n:&str)->String {n.into()}\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","main"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+            let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();assert!(out.status.success());
+        }
+        root
+    }
+
+    /// #2464 AC: a feature issue (nothing to observe on main) reaches a
+    /// build attempt from one scope response. The old gate refuses the same
+    /// builder until an original-production witness qualifies.
+    #[tokio::test]
+    async fn a_feature_issue_with_no_defect_on_main_reaches_a_build_attempt_in_one_scope_call() {
+        let repo=plan_repo();let state=tempfile::tempdir().unwrap();let state=state.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:Some(2464),pr:None,branch:"fixture",
+            contract:"Add E.164 phone formatting",environment:"frontend environment"};
+        // Gate on: the scoped request cannot admit a builder at Build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(true));
+        let mut old=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        old.transition(Stage::Build,"criteria_registered","build",0).await.unwrap();
+        let refused=old.audit_logger().model_call_admitted("codex").unwrap_err();
+        assert!(format!("{refused:#}").contains("baseline_witness_unqualified"),"{refused:#}");
+        let scope=ScopeOutcome {fixable:true,complexity:Complexity::Simple,est_diff_lines:Some(30),guarded_paths:false,
+            body:"ALLOWED-PATHS: src/phone.rs\nFormat numbers as E.164.".into(),criteria:vec!["Numbers render as E.164".into()],relevance:Relevance::Current};
+        let plan=super::super::plan_proof::Plan::from_scope("Add E.164 phone formatting",Some(&scope),&scope.criteria);
+        assert!(old.bind_plan(&plan).is_err(),"the plan path must not run with the gate on");
+        old.finish().unwrap();
+        // Gate off (default): bind the one scope response's plan and build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(false));
+        let mut guard=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        guard.transition(Stage::Scope,"trusted_request_acquired","scope_request",0).await.unwrap();
+        guard.bind_plan(&plan).unwrap();
+        guard.transition(Stage::Build,"plan_registered","build",0).await.unwrap();
+        assert!(guard.plan_mode());
+        assert!(crate::autoship_workflow::scope_proof_gate::plan_contract(&guard.binding().contract),"{}",guard.binding().contract);
+        guard.audit_logger().model_call_admitted("codex").expect("the builder is admitted from the plan");
+        let snapshot=WorkflowStore::open(&state).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.stage,Stage::Build);
+        assert_eq!(snapshot.checkpoint.next.reason,"plan_registered");
+        assert_eq!(snapshot.model_calls,1,"one admitted builder call; no witness, amendment or ladder call");
+        guard.finish().unwrap();
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(None);
+    }
 
     #[test]
     fn daily_ledger_holds_fresh_starts_but_not_in_flight_issues() {
