@@ -33,6 +33,11 @@ pub(crate) const MAX_RESCOPES: u32 = 2;
 /// rescope. Infrastructure refusals (#2508) spend neither.
 const TRY_PURPOSE: &str = "own-pr-rescope-try";
 const MAX_TRIES: u32 = 3;
+/// #2510: registrations started for one rescope (same contract and head),
+/// admitted before `register` and handed back only on an infrastructure
+/// refusal, so a run that dies mid-registration still counts toward
+/// [`MAX_TRIES`].
+const STARTED_PURPOSE: &str = "own-pr-rescope-started";
 /// One owner comment per blocked head.
 const COMMENT_PURPOSE: &str = "own-pr-rescope-comment";
 /// Top-level marker of a controller-built rescope request.
@@ -140,7 +145,7 @@ pub(crate) fn next_proposal(old: &ContractProposal, add: &[String]) -> Result<Co
 /// same revision after their own backoff, spending neither a rescope nor a
 /// try. Registration rejected on its merits, an unreproduced baseline or a
 /// refused authority are verdicts, and spend the budget.
-fn infrastructure_refusal(error: &anyhow::Error, capacity_seen: bool) -> bool {
+pub(super) fn infrastructure_refusal(error: &anyhow::Error, capacity_seen: bool) -> bool {
     capacity_seen
         || error.downcast_ref::<CiInfrastructureDeferred>().is_some()
         || matches!(error.downcast_ref::<initial_repair::Hold>(), Some(initial_repair::Hold::InfrastructureUnavailable))
@@ -291,6 +296,10 @@ pub(crate) async fn run<R: Rescope>(
             .filter(|item| !item.starts_with(REGISTERING_EVIDENCE)).cloned().collect();
         evidence.push(format!("{REGISTERING_EVIDENCE}{}", findings.reason));
         workflow.checkpoint(Stage::Scope, &findings.reason, ACTION, 0, &evidence).await?;
+        if !workflow.admit_epoch_attempt(STARTED_PURPOSE, &attempt, MAX_TRIES)? {
+            return needs_owner(rescope, workflow, findings, &key, inputs, format!(
+                "registering the rescoped contract failed or was interrupted {MAX_TRIES} times")).await;
+        }
         let next = match rescope.register(prepared, workflow, &bound, &request.add).await {
             Ok(next) => {
                 spend(workflow, &key, &attempt, first)?;
@@ -299,6 +308,7 @@ pub(crate) async fn run<R: Rescope>(
             Err(error) => {
                 let capacity = logger.resource_capacity_seen();
                 if infrastructure_refusal(&error, capacity) {
+                    workflow.release_epoch_attempt(STARTED_PURPOSE, &attempt)?;
                     // Spend nothing. A capacity refusal already holds the
                     // workflow at `await_capacity` with the rescope still
                     // pending; any other keeps it pending for the retry.
@@ -425,6 +435,8 @@ mod tests {
         fail: Option<&'static str>,
         /// Registrations refused for native runtime capacity before any succeeds.
         capacity: std::sync::atomic::AtomicU32,
+        /// Registrations that never return, like a run killed mid-activation.
+        hang: std::sync::atomic::AtomicU32,
     }
     #[async_trait::async_trait]
     impl Rescope for Scripted {
@@ -436,6 +448,9 @@ mod tests {
                 workflow.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,
                     "native_state":{"status":"capacity-exhausted","capacity_fingerprint":"a".repeat(64)}}))?;
                 bail!("native runtime capacity exhausted: 8 of 8 GiB reserved");
+            }
+            if self.hang.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+                std::future::pending::<()>().await;
             }
             if let Some(error) = self.fail { bail!("{error}"); }
             Ok(measured(&self.root, &self.control, &self.base, next_proposal(&prepared.proposal, add)?))
@@ -496,7 +511,7 @@ mod tests {
             branch: "agent-fix/issue-2329", contract: prepared.baseline.registration.contract_hash(), environment: "environment-a",
         }).await.unwrap().unwrap();
         workflow.bind_acceptance(&prepared, control.path()).unwrap();
-        let rescope = Scripted { root: root.path().to_owned(), control: control.path().to_owned(), base, registered: Mutex::new(vec![]), comments: Mutex::new(vec![]), fail, capacity: 0.into() };
+        let rescope = Scripted { root: root.path().to_owned(), control: control.path().to_owned(), base, registered: Mutex::new(vec![]), comments: Mutex::new(vec![]), fail, capacity: 0.into(), hang: 0.into() };
         Lane { root, control, prepared, workflow, rescope, inputs: Inputs { request: "request-a".into(), main: "main-a".into() } }
     }
 
@@ -521,9 +536,14 @@ mod tests {
             self.workflow.epoch_attempts(PURPOSE, &key(&self.prepared, &self.inputs).unwrap()).unwrap()
         }
         fn tries(&self, head: &str) -> u32 {
-            let attempt = amendment::digest(&serde_json::to_vec(&("own-pr-rescope-try-v1", key(&self.prepared, &self.inputs).unwrap(),
-                self.prepared.baseline.registration.contract_hash(), head)).unwrap());
-            self.workflow.epoch_attempts(TRY_PURPOSE, &attempt).unwrap()
+            self.workflow.epoch_attempts(TRY_PURPOSE, &self.attempt(head)).unwrap()
+        }
+        fn started(&self, head: &str) -> u32 {
+            self.workflow.epoch_attempts(STARTED_PURPOSE, &self.attempt(head)).unwrap()
+        }
+        fn attempt(&self, head: &str) -> String {
+            amendment::digest(&serde_json::to_vec(&("own-pr-rescope-try-v1", key(&self.prepared, &self.inputs).unwrap(),
+                self.prepared.baseline.registration.contract_hash(), head)).unwrap())
         }
         /// The next autoship tick: a fresh guard once the capacity backoff
         /// is due (the refused guard is unusable, as in production).
@@ -774,6 +794,7 @@ mod tests {
             lane.next_tick(now).await;
             assert_eq!(lane.rescopes(), 0, "capacity refusal {refusal} spent a rescope");
             assert_eq!(lane.tries(&head), 0, "capacity refusal {refusal} counted as a registration try");
+            assert_eq!(lane.started(&head), 0, "capacity refusal {refusal} kept its started registration");
             findings = pending(&lane.workflow.current_checkpoint().unwrap())
                 .unwrap_or_else(|| panic!("the rescope is no longer pending after capacity refusal {refusal}"));
             assert_eq!((findings.reason.as_str(), findings.paths.as_slice(), findings.head.as_str()),
@@ -792,6 +813,36 @@ mod tests {
         assert!(registered.iter().all(|(_, add)| add == &vec![NOTIFY.to_string()]), "a retry asked for another revision: {registered:?}");
         let after = lane.snapshot();
         assert_eq!((after.checkpoint.stage, after.checkpoint.next.reason.as_str()), (Stage::Verify, "own_pr_rescoped"));
+    }
+
+    /// #2510: a run that dies mid-registration reaches no verdict and no
+    /// infrastructure refusal. Each such start still counts, so a revision
+    /// whose registration always crashes stops after [`MAX_TRIES`] instead of
+    /// retrying forever, and spends no rescope doing it.
+    #[tokio::test]
+    async fn registrations_interrupted_mid_flight_still_count_toward_the_try_cap() {
+        if parent("registrations_interrupted_mid_flight_still_count_toward_the_try_cap") { return; }
+        let mut lane = lane(None).await;
+        lane.rescope.hang.store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let findings = lane.refused(&[NOTIFY]).await;
+        let head = findings.head.clone();
+        let mut now = chrono::Utc::now().timestamp_millis();
+        for crash in 1..=MAX_TRIES {
+            let control = lane.control.path().to_owned();
+            let inputs = lane.inputs.clone();
+            let interrupted = tokio::time::timeout(std::time::Duration::from_millis(500),
+                run(&lane.rescope, &mut lane.prepared, &control, &findings, None, &inputs, &mut lane.workflow)).await;
+            assert!(interrupted.is_err(), "registration {crash} returned instead of hanging");
+            now += 2 * 3_600_000;
+            lane.next_tick(now).await;
+            assert_eq!(lane.started(&head), crash, "interrupted registration {crash} was not counted");
+            assert_eq!(lane.rescopes(), 0, "an interrupted registration spent a rescope");
+            assert!(pending(&lane.workflow.current_checkpoint().unwrap()).is_some(), "the rescope is no longer pending after crash {crash}");
+        }
+        let Outcome::NeedsOwner(blocker) = lane.run(&findings, None).await else { panic!("a fourth interrupted registration was started") };
+        assert!(blocker.contains(&format!("{MAX_TRIES} times")), "{blocker}");
+        assert_eq!(lane.rescope.registered.lock().unwrap().len() as u32, MAX_TRIES);
+        assert!(exhausted(&lane.snapshot().checkpoint));
     }
 
     #[test]
