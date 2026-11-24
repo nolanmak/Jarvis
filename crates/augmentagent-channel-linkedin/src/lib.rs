@@ -26,6 +26,7 @@ pub mod invitations;
 pub mod own_posts;
 pub mod posting;
 pub mod session_guard;
+pub mod thread_url_resolution;
 pub mod types;
 
 pub use api::{
@@ -60,6 +61,10 @@ pub use own_posts::{
 pub use posting::{
     build_normshares_body, max_images, PostDraft, PostImage, ShareUrn, Visibility,
     DEFAULT_MAX_IMAGES, DEFAULT_MEDIA_UPLOAD_PATH,
+};
+pub use thread_url_resolution::{
+    parse_thread_url, resolve_thread_url, resolve_thread_url_report, session_advice, SessionAdvice,
+    ThreadUrlError, ThreadUrlResolution, PROFILE_URL_UNAVAILABLE, RECONNECT_NOTE,
 };
 pub use types::{
     is_linkedin_email, Dm, FeedPost, Invitation, MemberUrn, PostComment,

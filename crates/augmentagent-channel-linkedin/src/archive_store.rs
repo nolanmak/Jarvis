@@ -1,5 +1,5 @@
 //! Atomic page persistence. No network, LLM, broker, or send calls belong here.
-use crate::archive::{Conversation, Message, Page};
+use crate::archive::{Conversation, Message, Page, Participant};
 use augmentagent_store::{
     rusqlite::{params, OptionalExtension},
     Store,
@@ -143,6 +143,37 @@ pub fn coverage(store: &Store, account: &str, category: &str) -> anyhow::Result<
             category,
             augmentagent_messages::EXTRACTOR_VERSION,
         )
+    })?)
+}
+
+/// Account-scoped membership of one archived conversation, as last observed by
+/// a sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerLookup {
+    /// The single non-owner participant of a direct conversation.
+    Peer(Participant),
+    /// Archived, but no one person follows from it: a group chat, several
+    /// non-owner participants, or a snapshot that recorded no peer at all.
+    Ambiguous { peers: usize, group: bool },
+    /// Never observed for this account, or no longer retained.
+    Unknown,
+}
+
+/// Read-only peer lookup for a stored conversation id. Never searches another
+/// account: the same remote id in a second mailbox is a different conversation.
+/// The owner is the account identifier itself, because sync records the mailbox
+/// member urn both as `account` and among the conversation participants.
+pub fn direct_peer(store: &Store, account: &str, conversation: &str) -> anyhow::Result<PeerLookup> {
+    Ok(store.with_conn(|c| {
+        let Some(group)=c.query_row("SELECT group_chat FROM linkedin_archive_conversations WHERE account=?1 AND urn=?2",params![account,conversation],|r|r.get::<_,bool>(0)).optional()? else {
+            return Ok(PeerLookup::Unknown);
+        };
+        let mut q=c.prepare("SELECT urn,name FROM linkedin_archive_participants WHERE account=?1 AND conversation=?2 AND urn<>?1 ORDER BY urn")?;
+        let peers=q.query_map(params![account,conversation],|r|Ok(Participant{urn:r.get(0)?,name:r.get(1)?}))?.collect::<Result<Vec<_>,_>>()?;
+        Ok(match peers.as_slice() {
+            [peer] if !group => PeerLookup::Peer(peer.clone()),
+            peers => PeerLookup::Ambiguous{peers:peers.len(),group},
+        })
     })?)
 }
 

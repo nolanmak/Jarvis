@@ -2797,6 +2797,17 @@ enum LinkedinOp {
         #[arg(long)]
         json: bool,
     },
+    /// Resolve a `/messaging/thread/<id>/` URL to the archived participant.
+    ///
+    /// Offline and read-only (#2503): the opaque conversation id is looked up
+    /// in the participant snapshots `backfill` already stored. Live
+    /// conversation lookup stays disabled until the session path is qualified,
+    /// so a thread the archive never saw is reported, never requested.
+    ResolveThreadUrl {
+        url: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Archive-only, resumable import. No drafts, cards or sends.
     Backfill {
         /// Omit to enumerate every category reported by the mailbox API.
@@ -5012,6 +5023,14 @@ async fn main() -> Result<()> {
                 linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh,
                     linkedin_archive::pacing(*page_delay_secs,*hourly_requests,*daily_requests)).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
+            LinkedinOp::ResolveThreadUrl { url, json } => {
+                // Read-only: the member urn only names the archive scope, and
+                // no credential is promoted or repaired for an offline lookup.
+                let auth = augmentagent_channel_linkedin::LinkedInAuth::load_read_only(&std::env::current_dir()?)?;
+                print!("{}", augmentagent_channel_linkedin::resolve_thread_url_report(
+                    &store, &auth.member_urn, url, *json)?);
+                Ok(())
+            },
             LinkedinOp::Dm {
                 conversation_urn,
                 with,
