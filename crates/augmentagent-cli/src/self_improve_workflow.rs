@@ -1347,6 +1347,15 @@ impl WorkflowGuard {
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
             anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            // #2467: a run admitted before the global budget or this issue's
+            // spend cap ran out stops at its next model call. It parks on the
+            // ordinary capacity retry; the claim gate keeps it there until the
+            // budget reopens, and the give-up sweep closes a capped issue.
+            if let Some(refusal)=store.paid_admission_refusal(&lease.workflow,millis())? {
+                capacity_flag.store(true,Ordering::SeqCst);
+                store.defer_run_capacity_observation(&lease,None,None,millis())?;
+                anyhow::bail!("resource_capacity: {refusal}; await_capacity checkpoint retained");
+            }
             let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_native_custody(&worktree,&custody)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
@@ -1964,6 +1973,16 @@ impl WorkflowGuard {
         )
     }
 
+    /// #2467: why the acceptance ladder must stop rather than run another
+    /// cycle: observable children were already published once, or the issue
+    /// used its tries.
+    pub(super) fn ladder_stop(&self)->Result<Option<&'static str>> {
+        use durable::attempt_cap;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        if store.observable_decomposition_spent(self.id())? {return Ok(Some(attempt_cap::DECOMPOSITION_SPENT_REASON));}
+        let usage=store.attempt_usage(self.id())?;
+        Ok((usage.tries()>=attempt_cap::max_tries()).then_some(attempt_cap::ATTEMPTS_REASON))
+    }
     /// `Some(at)` while this issue's rolling daily retry model budget is spent.
     pub(super) fn daily_budget_reopens_at(&self)->Result<Option<i64>> {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?

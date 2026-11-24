@@ -5,6 +5,9 @@
 pub(crate) mod acceptance_escalation;
 #[path="autoship_retry_policy.rs"]
 pub(crate) mod retry_policy;
+#[path="autoship_attempt_cap.rs"]
+pub(crate) mod attempt_cap;
+pub use attempt_cap::GlobalModelBudget;
 #[path="autoship_command_fairness.rs"]
 pub(crate) mod command_fairness;
 #[path="autoship_owner_requalification.rs"]
@@ -939,6 +942,7 @@ impl WorkflowStore {
         runtime_events::initialize(&conn)?;
         conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
         conn.execute_batch(command_fairness::SCHEMA)?;
+        conn.execute_batch(attempt_cap::SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -1213,6 +1217,11 @@ impl WorkflowStore {
             return Ok(None);
         }
         if purpose == ClaimPurpose::Productive && target_fence::fenced(&tx,workflow)? {return Ok(None);}
+        // #2467: no productive claim past the attempt or spend cap, after a
+        // give-up, or while the global daily model budget is spent. Merge
+        // reconciliation and finalize claim with their own purpose.
+        if purpose == ClaimPurpose::Productive && leased <= now_ms
+            && attempt_cap::productive_claim_refused(&tx,workflow,&cp,now_ms,attempt_cap::Caps::configured())? {return Ok(None);}
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;

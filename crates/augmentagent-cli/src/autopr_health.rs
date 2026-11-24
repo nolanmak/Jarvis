@@ -143,6 +143,8 @@ pub struct HealthInputs {
     /// Active, unpaused workflows waiting on resource admission.
     pub resource_capacity_waits: Option<u64>,
     pub resource_capacity_wait_error: bool,
+    /// #2467 — the global rolling-24h model-call budget; `None` when unread.
+    pub global_model_budget: Option<crate::autoship_workflow::GlobalModelBudget>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
     /// #1708 — S's latest durable event per nonterminal workflow and whether
@@ -859,8 +861,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         });
     }
 
+    if let Some(b) = i.global_model_budget.filter(|b| b.exhausted()) {
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "global-model-budget-exhausted",
+            detail: format!("{}. No new paid autoship work starts; merges and finalize continue.", global_budget_line(&b)),
+            fix: "Wait for the rolling window to reopen, or raise AUTOSHIP_GLOBAL_DAILY_MODEL_CALLS deliberately.".into(),
+        });
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity));
     out
+}
+
+/// #2467 — the global model budget as `autopr health` prints it.
+pub(crate) fn global_budget_line(b: &crate::autoship_workflow::GlobalModelBudget) -> String {
+    let reopens = b.reopens_at_ms.and_then(DateTime::from_timestamp_millis)
+        .map(|at| format!("; reopens {}", at.format("%Y-%m-%d %H:%M UTC"))).unwrap_or_default();
+    format!("global model calls (rolling 24h): {} of {} used; remaining: {}{reopens}", b.used, b.cap, b.remaining())
 }
 
 /// One Discord/stdout message for a set of findings. `None` when healthy —
@@ -893,6 +911,9 @@ pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
         for (id, stage, why, _, wake) in blocked_workflows(progress).iter().take(20) {
             out.push_str(&format!("\n  blocked: {id} ({stage}): {why}; wakes: {wake}"));
         }
+    }
+    if let Some(b) = i.global_model_budget {
+        out.push_str(&format!("\n{}", global_budget_line(&b)));
     }
     if let Some(groups) = &i.gave_up_by_reason {
         let total: u32 = groups.iter().map(|(_, n)| n).sum();
@@ -1366,6 +1387,7 @@ struct WorkflowMetrics {
     unresolved_holds:Option<Vec<crate::autoship_workflow::UnresolvedMergeHold>>,
     capacity_waits:Option<u64>,
     capacity_wait_error:bool,
+    global_model_budget:Option<crate::autoship_workflow::GlobalModelBudget>,
 }
 fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfiguration,now:i64)
     ->anyhow::Result<WorkflowMetrics> {
@@ -1378,7 +1400,8 @@ fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfigurat
     let (capacity_waits,capacity_wait_error)=match store.resource_capacity_wait_count() {
         Ok(value)=>(Some(value),false),Err(_)=>(None,true),
     };
-    Ok(WorkflowMetrics{allowance,allowance_error,unresolved_holds,capacity_waits,capacity_wait_error})
+    let global_model_budget=store.global_model_budget(now).ok();
+    Ok(WorkflowMetrics{allowance,allowance_error,unresolved_holds,capacity_waits,capacity_wait_error,global_model_budget})
 }
 
 /// Gather everything the rules need from this box.
@@ -1413,6 +1436,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
     let mut merge_store_path=None;
     let mut workflow_progress=None;
     let mut workflow_progress_error=None;
+    let mut global_model_budget=None;
     let (merge_allowance,merge_allowance_error,merge_unresolved_holds,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
         match crate::autoship_deployment::worker_workflow_configuration().await {
         Ok(config)=>{
@@ -1424,7 +1448,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
                     .expect("native capacity report serializes")
             });
             match workflow_metrics(&config,now.timestamp_millis()) {
-                Ok(metrics)=>(metrics.allowance,metrics.allowance_error,metrics.unresolved_holds,native,metrics.capacity_waits,metrics.capacity_wait_error),
+                Ok(metrics)=>{global_model_budget=metrics.global_model_budget;(metrics.allowance,metrics.allowance_error,metrics.unresolved_holds,native,metrics.capacity_waits,metrics.capacity_wait_error)},
                 Err(_)=>(None,Some("worker workflow metrics unavailable".into()),None,native,None,true),
             }
         }
@@ -1469,6 +1493,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
         native_state_capacity,
         resource_capacity_waits,
         resource_capacity_wait_error,
+        global_model_budget,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
         workflow_progress,
         workflow_progress_error,
@@ -1818,6 +1843,18 @@ mod tests {
         assert!(!render_text(&[], &i).contains("gave-up by reason"));
     }
 
+    /// #2467 — health shows the remaining global budget, and flags it spent.
+    #[test]
+    fn health_shows_the_remaining_global_model_budget() {
+        let mut i = healthy();
+        i.global_model_budget = Some(crate::autoship_workflow::GlobalModelBudget { used: 1_200, cap: 1_500, reopens_at_ms: None });
+        assert!(render_text(&[], &i).contains("global model calls (rolling 24h): 1200 of 1500 used; remaining: 300"));
+        assert!(!codes(&analyze(&i, &Thresholds::default())).contains(&"global-model-budget-exhausted"));
+        i.global_model_budget = Some(crate::autoship_workflow::GlobalModelBudget { used: 1_500, cap: 1_500, reopens_at_ms: Some(0) });
+        assert!(render_text(&[], &i).contains("remaining: 0; reopens 1970-01-01 00:00 UTC"));
+        assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"global-model-budget-exhausted"));
+    }
+
     #[test]
     fn df_avail_parses_gnu_and_bsd_posix_layouts() {
         // GNU `df -P -k`
@@ -1876,6 +1913,7 @@ mod tests {
             native_state_capacity: None,
             resource_capacity_waits: None,
             resource_capacity_wait_error: false,
+            global_model_budget: None,
             gave_up_by_reason: None,
             workflow_progress: Some(WorkflowProgress::default_complete()),
             workflow_progress_error: None,
