@@ -66,7 +66,12 @@ fn configure_requires_owner_channel_session_url_and_token() {
     let mut no_session = ask();
     configure_with(&mut no_session, &no_session_ctx, bin, &env);
     let mut bad_url = ask();
-    configure_with(&mut bad_url, &ctx(true), bin, &env_with(&file, Some("https://tabagent.example.ts.net")));
+    configure_with(
+        &mut bad_url,
+        &ctx(true),
+        bin,
+        &env_with(&file, Some("https://tabagent.example.ts.net")),
+    );
     let mut no_file = ask();
     let missing = file.with_file_name("absent.token");
     configure_with(&mut no_file, &ctx(true), bin, &env_with(&missing, None));
@@ -107,7 +112,12 @@ fn configure_lists_exact_tools_and_never_sensitive_ones() {
     let bin = std::path::Path::new("/fixture/augmentagent");
     let (_dir, file) = private_file("fixture-scoped-value");
     let mut opts = ask();
-    configure_with(&mut opts, &ctx(true), bin, &env_with(&file, Some("http://127.0.0.1:47615")));
+    configure_with(
+        &mut opts,
+        &ctx(true),
+        bin,
+        &env_with(&file, Some("http://127.0.0.1:47615")),
+    );
     let listed = tabagent_tools(&opts);
     assert_eq!(
         listed,
@@ -134,11 +144,28 @@ fn configure_lists_exact_tools_and_never_sensitive_ones() {
             "mcp__tabagent__dialog_handle",
         ]
     );
-    assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("tabagent") && tool.contains('*')));
+    assert!(!opts
+        .allowed_tools
+        .iter()
+        .any(|tool| tool.contains("tabagent") && tool.contains('*')));
     for never in [
-        "js_eval", "cookies_get", "storage_get", "network_get", "network_list", "network_waitFor",
-        "act_upload", "act_drag", "act_dblclick", "downloads_read", "downloads_list", "downloads_wait",
-        "page_screenshot", "auth_login", "auth_fill", "session_end", "console_list",
+        "js_eval",
+        "cookies_get",
+        "storage_get",
+        "network_get",
+        "network_list",
+        "network_waitFor",
+        "act_upload",
+        "act_drag",
+        "act_dblclick",
+        "downloads_read",
+        "downloads_list",
+        "downloads_wait",
+        "page_screenshot",
+        "auth_login",
+        "auth_fill",
+        "session_end",
+        "console_list",
     ] {
         assert!(!listed.iter().any(|tool| tool.ends_with(never)), "{never}");
         assert!(!TOOLS.contains(&never), "{never}");
@@ -149,7 +176,10 @@ fn configure_lists_exact_tools_and_never_sensitive_ones() {
         TOOLS.join(",")
     );
     // The serving side drops anything outside the phase 1 list, too.
-    assert_eq!(served_tools("tabs,js_eval,page_screenshot,cookies_get,page_text"), ["tabs", "page_text"]);
+    assert_eq!(
+        served_tools("tabs,js_eval,page_screenshot,cookies_get,page_text"),
+        ["tabs", "page_text"]
+    );
 }
 
 fn server_for(base: &str, tools: &[&str]) -> Server {
@@ -169,7 +199,10 @@ fn text(reply: &Value) -> (bool, String) {
     let result = &reply["result"];
     (
         result["isError"].as_bool().unwrap_or(false),
-        result["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
     )
 }
 
@@ -197,15 +230,24 @@ async fn the_server_lists_exactly_the_tools_it_was_given() {
         json!(["list", "new", "select", "close"])
     );
     // A tool not handed to this process is neither listed nor accepted.
-    let reply = server.handle(&call(2, "nav_goto", json!({"url": "https://example.com"}))).await.unwrap();
+    let reply = server
+        .handle(&call(2, "nav_goto", json!({"url": "https://example.com"})))
+        .await
+        .unwrap();
     assert_eq!(text(&reply), (true, "unknown tool".into()));
-    let reply = server.handle(&call(3, "js_eval", json!({"code": "1"}))).await.unwrap();
+    let reply = server
+        .handle(&call(3, "js_eval", json!({"code": "1"})))
+        .await
+        .unwrap();
     assert_eq!(text(&reply), (true, "unknown tool".into()));
     assert!(server
         .handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         .await
         .is_none());
-    let reply = server.handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "nope"})).await.unwrap();
+    let reply = server
+        .handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "nope"}))
+        .await
+        .unwrap();
     assert_eq!(reply["error"]["code"], -32601);
 }
 
@@ -214,17 +256,33 @@ async fn proxy_sends_scoped_token_and_session_headers_and_never_spawns() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/page.text"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {"text": "hello"}})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": {"text": "hello"}})),
+        )
         .mount(&mock)
         .await;
     let server = server_for(&mock.uri(), TOOLS);
-    let (error, body) = text(&server.handle(&call(1, "page_text", json!({"tabId": 7}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "page_text", json!({"tabId": 7})))
+            .await
+            .unwrap(),
+    );
     assert!(!error, "{body}");
     let requests: Vec<Request> = mock.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
-    let header = |name: &str| request.headers.get(name).map(|v| v.to_str().unwrap().to_string());
-    assert_eq!(header("authorization").as_deref(), Some("Bearer fixture-scoped-value"));
+    let header = |name: &str| {
+        request
+            .headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    assert_eq!(
+        header("authorization").as_deref(),
+        Some("Bearer fixture-scoped-value")
+    );
     assert_eq!(header("x-tabagent-session").as_deref(), Some(SESSION));
     assert_eq!(header("x-tabagent-client").as_deref(), Some("jarvis"));
     let port = mock.address().port();
@@ -237,9 +295,17 @@ async fn proxy_sends_scoped_token_and_session_headers_and_never_spawns() {
     let closed = listener.local_addr().unwrap().port();
     drop(listener);
     let offline = server_for(&format!("http://127.0.0.1:{closed}"), TOOLS);
-    let (error, body) = text(&offline.handle(&call(2, "page_text", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &offline
+            .handle(&call(2, "page_text", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(error && body.contains("browser offline"), "{body}");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", closed)).is_err(), "nothing was spawned on the port");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", closed)).is_err(),
+        "nothing was spawned on the port"
+    );
     // The proxy has no way to start a process at all.
     let source = include_str!("tabagent_tool.rs");
     for spawn in ["process::Command", "Command::new", "tokio::process"] {
@@ -272,21 +338,38 @@ async fn proxy_refuses_attach_fn_wait_and_private_goto_before_any_request() {
     let server = server_for(&mock.uri(), TOOLS);
     let refused = [
         ("tabs", json!({"action": "attach"})),
-        ("tabs", json!({"action": "new", "url": "http://192.168.1.1/admin"})),
-        ("tabs", json!({"action": "new", "url": "file:///etc/passwd"})),
+        (
+            "tabs",
+            json!({"action": "new", "url": "http://192.168.1.1/admin"}),
+        ),
+        (
+            "tabs",
+            json!({"action": "new", "url": "file:///etc/passwd"}),
+        ),
         ("tabs", json!({})),
         ("nav_wait", json!({"for": "fn", "value": "() => true"})),
-        ("nav_goto", json!({"url": "http://127.0.0.1:47615/v1/status"})),
+        (
+            "nav_goto",
+            json!({"url": "http://127.0.0.1:47615/v1/status"}),
+        ),
         ("nav_goto", json!({"url": "http://localhost:3000"})),
         ("nav_goto", json!({"url": "http://legion.example.ts.net/"})),
-        ("nav_goto", json!({"url": "http://169.254.169.254/latest/meta-data"})),
+        (
+            "nav_goto",
+            json!({"url": "http://169.254.169.254/latest/meta-data"}),
+        ),
         ("nav_goto", json!({"url": "javascript:alert(1)"})),
         ("nav_goto", json!({})),
         ("page_text", json!({"tabId": 1, "session": "someone-else"})),
         ("page_snapshot", "not an object".into()),
     ];
     for (tool, arguments) in refused {
-        let (error, body) = text(&server.handle(&call(1, tool, arguments.clone())).await.unwrap());
+        let (error, body) = text(
+            &server
+                .handle(&call(1, tool, arguments.clone()))
+                .await
+                .unwrap(),
+        );
         assert!(error, "{tool} {arguments} -> {body}");
     }
     assert!(mock.received_requests().await.unwrap().is_empty());
@@ -294,8 +377,14 @@ async fn proxy_refuses_attach_fn_wait_and_private_goto_before_any_request() {
     // Allowed shapes go through, with REST names and clamped timeouts.
     for (tool, arguments) in [
         ("tabs", json!({"action": "list"})),
-        ("tabs", json!({"action": "new", "url": "https://example.com/"})),
-        ("nav_goto", json!({"url": "https://example.com/a", "timeout": 600000})),
+        (
+            "tabs",
+            json!({"action": "new", "url": "https://example.com/"}),
+        ),
+        (
+            "nav_goto",
+            json!({"url": "https://example.com/a", "timeout": 600000}),
+        ),
         ("nav_wait", json!({"for": "text", "value": "Done"})),
     ] {
         let (error, body) = text(&server.handle(&call(2, tool, arguments)).await.unwrap());
@@ -303,10 +392,16 @@ async fn proxy_refuses_attach_fn_wait_and_private_goto_before_any_request() {
     }
     let requests = mock.received_requests().await.unwrap();
     let paths: Vec<_> = requests.iter().map(|r| r.url.path().to_string()).collect();
-    assert_eq!(paths, ["/v1/tabs", "/v1/tabs", "/v1/nav.goto", "/v1/nav.wait"]);
+    assert_eq!(
+        paths,
+        ["/v1/tabs", "/v1/tabs", "/v1/nav.goto", "/v1/nav.wait"]
+    );
     let goto: Value = serde_json::from_slice(&requests[2].body).unwrap();
     // TabAgent's own wait ends before the proxy's deadline does.
-    assert!(goto["timeout"].as_u64().unwrap() < CALL_DEADLINE_SECS * 1000, "{goto}");
+    assert!(
+        goto["timeout"].as_u64().unwrap() < CALL_DEADLINE_SECS * 1000,
+        "{goto}"
+    );
 }
 
 #[tokio::test]
@@ -316,13 +411,19 @@ async fn page_data_blocks_pass_through_unchanged_with_jarvis_marker_outside() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/page.markdown"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"ok": true, "result": {"markdown": block, "title": title}}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": {"markdown": block, "title": title}})),
+        )
         .mount(&mock)
         .await;
     let server = server_for(&mock.uri(), TOOLS);
-    let (error, body) = text(&server.handle(&call(1, "page_markdown", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "page_markdown", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(!error, "{body}");
     // Byte for byte: no entity encoding, no JSON escaping of the block.
     assert!(body.contains(block), "{body}");
@@ -349,10 +450,22 @@ async fn prompt_timeout_permission_denied_and_killed_are_terminal_and_unretried(
             .mount(&mock)
             .await;
         let server = server_for(&mock.uri(), TOOLS);
-        let (error, body) = text(&server.handle(&call(1, "nav_goto", json!({"url": "https://example.com"}))).await.unwrap());
-        assert!(error && body.contains(code) && body.contains("Do not retry"), "{body}");
+        let (error, body) = text(
+            &server
+                .handle(&call(1, "nav_goto", json!({"url": "https://example.com"})))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            error && body.contains(code) && body.contains("Do not retry"),
+            "{body}"
+        );
         assert!(body.contains("TabAgent side panel"), "{body}");
-        assert_eq!(mock.received_requests().await.unwrap().len(), 1, "{code} was retried");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            1,
+            "{code} was retried"
+        );
     }
 
     // KILLED ends this launch's TabAgent use: later calls never reach the bridge.
@@ -364,9 +477,22 @@ async fn prompt_timeout_permission_denied_and_killed_are_terminal_and_unretried(
         .mount(&mock)
         .await;
     let server = server_for(&mock.uri(), TOOLS);
-    let (error, body) = text(&server.handle(&call(1, "page_text", json!({}))).await.unwrap());
-    assert!(error && body.contains("KILLED") && body.contains("Do not retry"), "{body}");
-    let (error, body) = text(&server.handle(&call(2, "tabs", json!({"action": "list"}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "page_text", json!({})))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        error && body.contains("KILLED") && body.contains("Do not retry"),
+        "{body}"
+    );
+    let (error, body) = text(
+        &server
+            .handle(&call(2, "tabs", json!({"action": "list"})))
+            .await
+            .unwrap(),
+    );
     assert!(error && body.contains("stopped"), "{body}");
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 
@@ -379,16 +505,26 @@ async fn prompt_timeout_permission_denied_and_killed_are_terminal_and_unretried(
         .mount(&mock)
         .await;
     let server = server_for(&mock.uri(), TOOLS);
-    let (error, body) = text(&server.handle(&call(1, "page_text", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "page_text", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(error && body.contains("browser offline"), "{body}");
-    let (error, _) = text(&server.handle(&call(2, "page_text", json!({}))).await.unwrap());
+    let (error, _) = text(
+        &server
+            .handle(&call(2, "page_text", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(error);
     assert_eq!(mock.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn per_call_deadline_is_below_bridge_cap_and_call_cap_is_enforced() {
-    assert!(CALL_DEADLINE_SECS <= 90 && CALL_DEADLINE_SECS < BRIDGE_CAP_SECS);
+    const _: () = assert!(CALL_DEADLINE_SECS <= 90 && CALL_DEADLINE_SECS < BRIDGE_CAP_SECS);
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/page.snapshot"))
@@ -401,22 +537,44 @@ async fn per_call_deadline_is_below_bridge_cap_and_call_cap_is_enforced() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/page.text"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {"text": "t"}})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {"text": "t"}})),
+        )
         .mount(&mock)
         .await;
     let slow = server_for(&mock.uri(), TOOLS).with_deadline(std::time::Duration::from_millis(300));
     let started = std::time::Instant::now();
-    let (error, body) = text(&slow.handle(&call(1, "page_snapshot", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &slow
+            .handle(&call(1, "page_snapshot", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
-    assert!(error && body.contains("did not answer") && body.contains("Do not retry"), "{body}");
+    assert!(
+        error && body.contains("did not answer") && body.contains("Do not retry"),
+        "{body}"
+    );
 
     let server = server_for(&mock.uri(), TOOLS);
     for n in 0..CALL_CAP as u64 {
         // Refused calls count too.
-        let arguments = if n % 2 == 0 { json!({}) } else { json!({"bogus": 1}) };
-        server.handle(&call(n, "page_text", arguments)).await.unwrap();
+        let arguments = if n % 2 == 0 {
+            json!({})
+        } else {
+            json!({"bogus": 1})
+        };
+        server
+            .handle(&call(n, "page_text", arguments))
+            .await
+            .unwrap();
     }
-    let (error, body) = text(&server.handle(&call(99, "page_text", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(99, "page_text", json!({})))
+            .await
+            .unwrap(),
+    );
     assert_eq!((error, body.as_str()), (true, CAP_REACHED));
     let reached = mock
         .received_requests()
@@ -432,16 +590,40 @@ async fn per_call_deadline_is_below_bridge_cap_and_call_cap_is_enforced() {
 fn act_calls() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         ("act_click", json!({"ref": "e3"}), "/v1/act.click"),
-        ("act_type", json!({"text": "hello", "ref": "e4", "submit": true}), "/v1/act.type"),
+        (
+            "act_type",
+            json!({"text": "hello", "ref": "e4", "submit": true}),
+            "/v1/act.type",
+        ),
         ("act_press", json!({"key": "Enter"}), "/v1/act.press"),
-        ("act_select", json!({"ref": "e5", "values": ["Large"]}), "/v1/act.select"),
-        ("act_check", json!({"ref": "e6", "checked": true}), "/v1/act.check"),
+        (
+            "act_select",
+            json!({"ref": "e5", "values": ["Large"]}),
+            "/v1/act.select",
+        ),
+        (
+            "act_check",
+            json!({"ref": "e6", "checked": true}),
+            "/v1/act.check",
+        ),
         ("act_hover", json!({"ref": "e7"}), "/v1/act.hover"),
         ("act_scroll", json!({"dy": 800}), "/v1/act.scroll"),
-        ("act_fill", json!({"ref": "e8", "value": "Synthetic Name"}), "/v1/act.fill"),
-        ("form_fill", json!({"fields": {"Name": "Synthetic Name", "Subscribe": true, "Tags": ["a", "b"]}}), "/v1/form.fill"),
+        (
+            "act_fill",
+            json!({"ref": "e8", "value": "Synthetic Name"}),
+            "/v1/act.fill",
+        ),
+        (
+            "form_fill",
+            json!({"fields": {"Name": "Synthetic Name", "Subscribe": true, "Tags": ["a", "b"]}}),
+            "/v1/form.fill",
+        ),
         ("form_submit", json!({"ref": "e9"}), "/v1/form.submit"),
-        ("dialog_handle", json!({"action": "accept", "promptText": "ok"}), "/v1/dialog.handle"),
+        (
+            "dialog_handle",
+            json!({"action": "accept", "promptText": "ok"}),
+            "/v1/dialog.handle",
+        ),
     ]
 }
 
@@ -469,12 +651,23 @@ async fn act_tools_are_listed_and_forwarded_unchanged() {
         assert!(TOOLS.contains(tool), "{tool}");
         // Every argument the call uses is in the advertised schema.
         let schema = tool_schema(tool);
-        assert_eq!(schema["inputSchema"]["additionalProperties"], false, "{tool}");
+        assert_eq!(
+            schema["inputSchema"]["additionalProperties"], false,
+            "{tool}"
+        );
         for key in arguments.as_object().unwrap().keys() {
-            assert!(schema["inputSchema"]["properties"].get(key).is_some(), "{tool}.{key}");
+            assert!(
+                schema["inputSchema"]["properties"].get(key).is_some(),
+                "{tool}.{key}"
+            );
         }
         // No Jarvis-side approval: the call goes straight to TabAgent.
-        let (error, body) = text(&server.handle(&call(2, tool, arguments.clone())).await.unwrap());
+        let (error, body) = text(
+            &server
+                .handle(&call(2, tool, arguments.clone()))
+                .await
+                .unwrap(),
+        );
         assert!(!error, "{tool} -> {body}");
         assert!(body.starts_with(UNTRUSTED_MARKER), "{tool} -> {body}");
     }
@@ -488,7 +681,16 @@ async fn act_tools_are_listed_and_forwarded_unchanged() {
     }
     // Unknown arguments are still refused before any request.
     let before = mock.received_requests().await.unwrap().len();
-    let (error, _) = text(&server.handle(&call(3, "act_click", json!({"ref": "e1", "session": "other"}))).await.unwrap());
+    let (error, _) = text(
+        &server
+            .handle(&call(
+                3,
+                "act_click",
+                json!({"ref": "e1", "session": "other"}),
+            ))
+            .await
+            .unwrap(),
+    );
     assert!(error);
     assert_eq!(mock.received_requests().await.unwrap().len(), before);
 }
@@ -496,8 +698,16 @@ async fn act_tools_are_listed_and_forwarded_unchanged() {
 #[tokio::test]
 async fn act_tool_refusals_from_tabagent_are_verbatim_and_unretried() {
     for (code, status, message) in [
-        ("PERMISSION_DENIED", 403, "Site example.com is not approved for act"),
-        ("PROMPT_TIMEOUT", 408, "Nobody answered the purchase prompt within 120s"),
+        (
+            "PERMISSION_DENIED",
+            403,
+            "Site example.com is not approved for act",
+        ),
+        (
+            "PROMPT_TIMEOUT",
+            408,
+            "Nobody answered the purchase prompt within 120s",
+        ),
         ("KILLED", 409, "TabAgent is paused (kill switch)"),
     ] {
         let calls = act_calls();
@@ -510,24 +720,46 @@ async fn act_tool_refusals_from_tabagent_are_verbatim_and_unretried() {
                 .mount(&mock)
                 .await;
             let server = server_for(&mock.uri(), TOOLS);
-            let (error, body) = text(&server.handle(&call(1, tool, arguments.clone())).await.unwrap());
+            let (error, body) = text(
+                &server
+                    .handle(&call(1, tool, arguments.clone()))
+                    .await
+                    .unwrap(),
+            );
             // TabAgent's code and message reach the model unchanged.
-            assert!(error && body.contains(&format!("{code}: {message}")), "{tool} {code} -> {body}");
+            assert!(
+                error && body.contains(&format!("{code}: {message}")),
+                "{tool} {code} -> {body}"
+            );
             assert!(body.contains("Do not retry"), "{tool} {code} -> {body}");
-            assert_eq!(mock.received_requests().await.unwrap().len(), 1, "{tool} {code} was retried");
+            assert_eq!(
+                mock.received_requests().await.unwrap().len(),
+                1,
+                "{tool} {code} was retried"
+            );
         }
     }
     // After KILLED the next action never reaches TabAgent.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(
-            json!({"ok": false, "error": {"code": "KILLED", "message": "paused"}}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(
+                json!({"ok": false, "error": {"code": "KILLED", "message": "paused"}}),
+            ),
+        )
         .mount(&mock)
         .await;
     let server = server_for(&mock.uri(), TOOLS);
-    server.handle(&call(1, "form_submit", json!({}))).await.unwrap();
-    let (error, body) = text(&server.handle(&call(2, "act_click", json!({"ref": "e1"}))).await.unwrap());
+    server
+        .handle(&call(1, "form_submit", json!({})))
+        .await
+        .unwrap();
+    let (error, body) = text(
+        &server
+            .handle(&call(2, "act_click", json!({"ref": "e1"})))
+            .await
+            .unwrap(),
+    );
     assert!(error && body.contains("stopped"), "{body}");
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }
@@ -565,13 +797,22 @@ fn token_file_must_be_private_regular_file() {
     for invalid in ["", "\n", "one two", "one\ntwo", " lead"] {
         std::fs::write(&file, invalid).unwrap();
         let error = read_token(&file).unwrap_err().to_string();
-        assert!(!error.contains("one two") && error.contains("TabAgent"), "{error}");
+        assert!(
+            !error.contains("one two") && error.contains("TabAgent"),
+            "{error}"
+        );
     }
     // Default location follows XDG_CONFIG_HOME, then HOME.
     let xdg = |name: &str| (name == "XDG_CONFIG_HOME").then(|| "/fixture/config".to_string());
-    assert_eq!(token_path(&xdg), Some("/fixture/config/augmentagent/tabagent.token".into()));
+    assert_eq!(
+        token_path(&xdg),
+        Some("/fixture/config/augmentagent/tabagent.token".into())
+    );
     let home = |name: &str| (name == "HOME").then(|| "/fixture/home".to_string());
-    assert_eq!(token_path(&home), Some("/fixture/home/.config/augmentagent/tabagent.token".into()));
+    assert_eq!(
+        token_path(&home),
+        Some("/fixture/home/.config/augmentagent/tabagent.token".into())
+    );
     // An unsafe file disables the tools instead of falling back.
     let bin = std::path::Path::new("/fixture/augmentagent");
     std::fs::write(&file, "fixture-scoped-value").unwrap();
@@ -591,10 +832,25 @@ async fn live_tabagent_reads_a_synthetic_page() {
     let base = validate_bridge_url(&lookup(URL_ENV).unwrap_or_else(|| DEFAULT_URL.into())).unwrap();
     let credential = read_token(&token_path(&lookup).unwrap()).unwrap();
     let page = lookup("TABAGENT_LIVE_FIXTURE_URL").unwrap_or_else(|| "https://example.com/".into());
-    let server = Server::new(base, credential, format!("live:{}", uuid::Uuid::new_v4()), TOOLS.iter().map(|t| t.to_string()).collect());
-    let (error, body) = text(&server.handle(&call(1, "tabs", json!({"action": "new", "url": page}))).await.unwrap());
+    let server = Server::new(
+        base,
+        credential,
+        format!("live:{}", uuid::Uuid::new_v4()),
+        TOOLS.iter().map(|t| t.to_string()).collect(),
+    );
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "tabs", json!({"action": "new", "url": page})))
+            .await
+            .unwrap(),
+    );
     assert!(!error, "{body}");
-    let (error, body) = text(&server.handle(&call(2, "page_markdown", json!({}))).await.unwrap());
+    let (error, body) = text(
+        &server
+            .handle(&call(2, "page_markdown", json!({})))
+            .await
+            .unwrap(),
+    );
     assert!(!error && body.contains("<<<PAGE_DATA"), "{body}");
     server.end_session().await;
 }
