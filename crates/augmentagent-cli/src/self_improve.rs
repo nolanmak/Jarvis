@@ -160,6 +160,8 @@ mod observation_wake;
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
+#[path = "self_improve_plan_proof.rs"]
+mod plan_proof;
 #[path = "self_improve_alignment.rs"]
 mod alignment;
 #[path = "self_improve_push_destination.rs"]
@@ -2894,6 +2896,14 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
 
 
 struct InitialPreparation {retained:bool,context:String,saved:Option<InitialScopeSnapshot>}
+
+/// #2464 plan mode: reuse a recorded scope for this episode if there is one,
+/// but never require retained qualification or a repair budget preflight.
+fn plan_initial_preparation(root:&Path,workflow:&workflow::WorkflowGuard,base:&str)->Result<InitialPreparation> {
+    let context=acceptance::initial_scope_context(root,workflow,base)?;
+    let saved=read_initial_scope(&context,|key|workflow.recorded_scope_stage_response(key)).ok().flatten();
+    Ok(InitialPreparation {retained:false,context,saved})
+}
 
 /// Choose the existing original episode before any readiness or scoping call.
 fn initial_preparation(root:&Path,workflow:&workflow::WorkflowGuard,source:crate::autoship_contract::AcceptanceSource,
@@ -7214,6 +7224,9 @@ async fn resume_draft_pr(
     let capacity_accounting = workflow.capacity_accounting(true)?;
     let outcome = async {
     workflow.bind_builder(reasoner.as_ref())?;
+    // #2464: with the scope proof gate off the PR repairs from a plan; no
+    // witness, amendment, rescope registration or ladder runs on this path.
+    let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();
     // #2488: read the checkpoint before this run moves it. A workflow that
     // stopped for the owner after its bounded rescopes does no more work.
     // The stop is a bounded wait autoship revisits itself (#2371): daily, or
@@ -7224,7 +7237,7 @@ async fn resume_draft_pr(
         request: acceptance::own_pr_rescope::request_digest(&issue.title, &issue.body),
         main: rescope_main.trim().to_owned(),
     };
-    if acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
+    if !plan_mode && acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
         return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; re-evaluated daily or when main or the issue changes")));
     }
     // #2491: a push this workflow checkpointed for the exact head it built
@@ -7261,6 +7274,20 @@ async fn resume_draft_pr(
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+    let mut prepared_slot: Option<acceptance::PreparedAcceptance> = None;
+    let mut rescope_notes = None;
+    if plan_mode {
+        // #2464: a pending rescope's upheld findings become this run's repair
+        // notes on the same branch and head; nothing is re-registered.
+        if let Some(findings) = rescope_findings.take() {
+            rescope_notes = workflow.latest_review_receipt("resume-structured-")?
+                .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+                .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+        }
+        if resumed_criteria.is_empty() { resumed_criteria.push(format!("{}\n{}", issue.title, issue.body)); }
+        let resumed_plan = plan_proof::Plan::from_scope(&acceptance_scope, None, &resumed_criteria);
+        workflow.bind_plan(&resumed_plan)?;
+    } else {
     // Leave the legacy parked status before any paid preparation. If that
     // preparation fails, the unchanged old policy cannot buy another wake.
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
@@ -7284,7 +7311,6 @@ async fn resume_draft_pr(
     // and resuming it again only reaches the same refusal. Rescope from the
     // recorded findings: a new revision on this branch and head, then repair,
     // verify and review in it; past the bound, stop for the owner.
-    let mut rescope_notes = None;
     // #2329: a refused CI scope amendment goes straight to the rescope in
     // this same run (the second pass), instead of waiting for a later tick
     // whose CI preparation could move the checkpoint first.
@@ -7336,6 +7362,8 @@ async fn resume_draft_pr(
                 ci_scope = Some(scope);
             }
         }
+    }
+    prepared_slot = Some(prepared_acceptance);
     }
     // #2329: the scope now covers the failing check's files (or never needed
     // them): only now does a due CI code-repair round spend a rung.
@@ -7697,9 +7725,19 @@ async fn resume_draft_pr(
             }
         }
 
-        let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
-            &mut prepared_acceptance, &acceptance_control, &mut workflow).await?;
+        let acceptance_receipt = match prepared_slot.as_mut() {
+            Some(prepared_acceptance) => {
+                let receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
+            prepared_acceptance, &acceptance_control, &mut workflow).await?;
         resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                Some(receipt)
+            }
+            None => {
+                // #2464: the PR's own tests are the proof, recorded here.
+                summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, resume_base.trim(), &summary, &workflow).await?.note());
+                None
+            }
+        };
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
         // #2451: at most N review attempts per (head, contract). A rejection
@@ -7751,7 +7789,7 @@ async fn resume_draft_pr(
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &plan_proof::harness_files(prepared_slot.as_ref())))
             .await
         {
             Ok(r) => parse_review_output(&r),
@@ -7783,16 +7821,18 @@ async fn resume_draft_pr(
         // reason to skip it and repeat the same repair debate indefinitely.
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
-            0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+            0, Some(&workflow), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await;
         // #2451: charge what this attempt actually spent to its binding.
         workflow.charge_review_binding_calls(&review_key, workflow.model_calls()?.saturating_sub(review_calls_before))?;
         if let Some(structured) = &independent.structured {
+            if let Some(prepared_acceptance) = prepared_slot.as_mut() {
             if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
-                &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
+                &issue.title, &worktree, prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                 verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await??;
                 continue 'resume;
+            }
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
@@ -7849,9 +7889,12 @@ async fn resume_draft_pr(
             &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
         workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
             &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
+        // #2464: no episode ladder in plan mode; review rounds and the #2452
+        // cap bound the work.
+        let episode_session = if let Some(prepared_acceptance) = prepared_slot.as_ref() {
         let evaluated = episode::evaluate(&mut workflow,&independent,
             prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
-        let episode_session = match &evaluated.decision {
+        match &evaluated.decision {
             crate::autoship_episode::Decision::FreshSession { .. } => {
                 let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
                 if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
@@ -7872,7 +7915,8 @@ async fn resume_draft_pr(
                 return Ok(RunReport::built(format!("PR #{pr}: review evidence recovery queued; candidate preserved")));
             }
             _ => None,
-        };
+        }
+        } else { None };
         if independent.approved() {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
@@ -7927,7 +7971,9 @@ async fn resume_draft_pr(
                 return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
             }
             workflow.push(branch).await?;
-            acceptance::assert_receipt_current(&worktree,&prepared_acceptance,&acceptance_receipt).await?;
+            if let (Some(prepared_acceptance), Some(acceptance_receipt)) = (prepared_slot.as_ref(), acceptance_receipt.as_ref()) {
+            acceptance::assert_receipt_current(&worktree,prepared_acceptance,acceptance_receipt).await?;
+            }
             // Preserve approval for a future explicit merge authorization too.
             opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             if workflow.published_pr_ready(pr,&independent).await? {
@@ -7975,7 +8021,9 @@ async fn resume_draft_pr(
             };
             workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
             anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
-            acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
+            if let (Some(prepared_acceptance), Some(acceptance_receipt)) = (prepared_slot.as_ref(), acceptance_receipt.as_ref()) {
+            acceptance::assert_receipt_current(&worktree, prepared_acceptance, acceptance_receipt).await?;
+            }
             if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
                 manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
                 return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
@@ -8779,16 +8827,21 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let outcome = async {
     workflow_guard.require_fresh_issue(repo_root).await?;
     workflow_guard.bind_builder(reasoner.as_ref())?;
+    // #2464: with the scope proof gate off, scope writes a plan and the build
+    // carries the proof; the witness, amendment and ladder never run here.
+    let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();
+    if !plan_mode {
     if let Some(report)=acceptance_escalation::execute(repo_root,&worktree,&issue,&mut workflow_guard).await? {return Ok(report);}
+    }
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
     let owner_request=acceptance_owner_request(&issue);
-    let initial=match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
+    let initial=if plan_mode {plan_initial_preparation(&worktree,&workflow_guard,candidate_base)?} else {match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
         Ok(initial)=>initial,
         Err(error)=>{if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
-    };
+    }};
     let retained_preparation=initial.retained;
     let scope_context=initial.context;
     let saved_scope=initial.saved;
@@ -8856,6 +8909,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
     scope_prompt.push_str(scope_policy::SCOPING_POLICY);
+    if plan_mode {scope_prompt.push_str(plan_proof::SCOPE_PLAN_POLICY);}
     let mut readiness_decisions=None;
     if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
@@ -8892,6 +8946,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }};
     workflow_guard.require_fresh_issue(repo_root).await?;
     if saved_scope.is_none() {if let Some(s) = &mut scope {
+        if s.relevance == Relevance::Overtaken && plan_mode {
+            // #2464: no registered observation can prove main satisfies the
+            // request in plan mode; build it and let review judge.
+            s.relevance=Relevance::Current;
+        }
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
             if let Some(base)=acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
                 workflow_guard.validate_before_side_effect()?;
@@ -8956,6 +9015,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
+    let mut prepared_slot: Option<acceptance::PreparedAcceptance> = None;
+    if plan_mode {
+        // #2464: one scope call is enough. Bind the plan, criteria and
+        // allowed paths and go straight to the build.
+        if criteria.is_empty() { criteria.push(owner_request.clone()); }
+        let scoped_plan = plan_proof::Plan::from_scope(&owner_request, scope.as_ref(), &criteria);
+        workflow_guard.bind_plan(&scoped_plan)?;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Build, "plan_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+    } else {
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, candidate_base, &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
@@ -8975,12 +9043,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     workflow_guard.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+    prepared_slot = Some(prepared_acceptance);
+    }
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+    let prompt = match &prepared_slot {
+        Some(prepared_acceptance) => format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
-        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
+        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?),
+        None => format!("{}{}", build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria), plan_proof::BUILD_PROOF_POLICY),
+    };
     workflow_guard.require_fresh_issue(repo_root).await?;
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
@@ -9364,8 +9437,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
         }
 
-        acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-            &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+        match prepared_slot.as_mut() {
+            Some(prepared_acceptance) => acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+            prepared_acceptance, &acceptance_control, &mut workflow_guard).await?),
+            // #2464: the build's own tests are the proof, recorded here.
+            None => summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, candidate_base, &summary, &workflow_guard).await?.note()),
+        }
 
         // Stage 3 (#653): QA review of the diff by the stronger tier. Since
         // #1488 a reject is not terminal: its notes drive revision rounds,
@@ -9373,7 +9450,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // before the dry-run exit so dry runs exercise the full pipeline.
         workflow_guard.require_fresh_issue(repo_root).await?;
         match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &plan_proof::harness_files(prepared_slot.as_ref())))
             .await
         {
             Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -9409,7 +9486,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
             workflow_guard.require_fresh_issue(repo_root).await?;
             let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await;
+                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -9443,14 +9520,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // receipt/review. Re-enter all verification and review stages before
             // the episode controller may consume the new revision.
             let adjudicated = independent.as_ref().and_then(|review| review.structured.clone());
-            if let Some(review) = adjudicated {
+            if let (Some(review), Some(prepared_acceptance)) = (adjudicated, prepared_slot.as_mut()) {
                 if acceptance::apply_adjudicated_amendment(reasoner.as_ref(), crate::autoship_contract::AcceptanceSource::Issue(issue.number),
-                    &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
+                    &issue.title, &worktree, prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
                     independent = None; acceptance_receipt = None; qa_ok = false;
                     review_notes.clear(); findings_override = None; pending_guard = None;
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                     acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
-                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                        prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                     verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await??;
                     let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
@@ -9470,13 +9547,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     workflow_guard.require_fresh_issue(repo_root).await?;
                     independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
                         qa_ok, &review_notes, round, None, 0, Some(&workflow_guard),
-                        acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                        acceptance_receipt.as_ref().map(|receipt| (&*prepared_acceptance, receipt))).await);
                     continue;
                 }
             }
             let mut episode_session = None;
             if findings_override.is_none() {
-                if let Some(review) = independent.as_ref() {
+                if let (Some(review), Some(prepared_acceptance)) = (independent.as_ref(), prepared_slot.as_ref()) {
                     let evaluated = episode::evaluate(&mut workflow_guard,review,
                         prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
                     match &evaluated.decision {
@@ -9675,14 +9752,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     gated = touches_verify_gated_path(&names2);
                     lines = lines2;
                     summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
-                    acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                    match prepared_slot.as_mut() {
+                        Some(prepared_acceptance) => acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+                        prepared_acceptance, &acceptance_control, &mut workflow_guard).await?),
+                        None => summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, candidate_base, &format!("{summary}\n{rev_summary}"), &workflow_guard).await?.note()),
+                    }
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
                     workflow_guard.require_fresh_issue(repo_root).await?;
                     match reasoner
-                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &plan_proof::harness_files(prepared_slot.as_ref())))
                         .await
                     {
                         Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -9704,7 +9784,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         let previous = independent.as_ref().and_then(|r| r.structured.clone());
                         workflow_guard.require_fresh_issue(repo_root).await?;
                         independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -10305,8 +10385,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     workflow_guard.validate_binding(workflow_guard.binding()).await?;
-    acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
+    // #2464: a plan-bound merge rests on the green required checks above and
+    // the independent approval; there is no executable receipt to assert.
+    if let Some(prepared_acceptance) = prepared_slot.as_ref() {
+    acceptance::assert_receipt_current(&worktree, prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
+    }
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
     let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?,publication::MergeRouting {automatic:automatic_routing,source_issue:Some(issue.number)}).await;
     if let Ok(Some(receipt)) = &mutation {
@@ -16644,6 +16728,51 @@ CODEX-REVIEW: lgtm").0);
         assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
         assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
         assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2464: both lanes branch on the one switch. With it on they prepare,
+    /// qualify and (for issues) climb the ladder exactly as before; with it
+    /// off, the plan is bound before any of that and none of it runs.
+    #[test]
+    fn the_scope_proof_gate_switch_guards_the_witness_amendment_and_ladder() {
+        let src = include_str!("self_improve.rs");
+        for lane in ["async fn run_selected(", "async fn resume_draft_pr("] {
+            let start = src.find(lane).expect(lane);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{lane} lacks {needle}"));
+            let switch = at("let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();");
+            let plan = at(".bind_plan(&");
+            let prepared = at("acceptance::prepare_acceptance(");
+            let qualified = at("acceptance::qualify_or_amend(");
+            assert!(switch < plan && plan < prepared && prepared < qualified, "{lane}: the plan branch must precede the old gate");
+            assert!(body[plan..prepared].contains("} else {"), "{lane}: the old gate must be the gate-on branch");
+            assert!(!body[switch..prepared].contains("verify_with_repair("), "{lane}: no witness verification on the plan path");
+        }
+        let start = src.find("async fn run_selected(").unwrap();
+        let issue = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(issue.contains("if !plan_mode {\n    if let Some(report)=acceptance_escalation::execute("), "the ladder runs only with the gate on");
+        assert!(issue.contains("plan_proof::record_build_proof("), "the build records its test proof");
+    }
+
+    /// #2464 AC (#2329, #2350, #2439): an own PR stopped after its rescopes
+    /// (for example on `baseline_witness_invalid`) is not held for a day with
+    /// the gate off. Its pending findings become repair notes on the same
+    /// branch and head, routed through the one shared revise round.
+    #[test]
+    fn an_own_pr_stopped_on_rescope_registration_repairs_in_plan_mode() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let parked = at("if !plan_mode && acceptance::own_pr_rescope::parked(&rescope_entry");
+        let plan = at("if plan_mode {");
+        let notes = at("rescope_notes = workflow.latest_review_receipt(\"resume-structured-\")?");
+        let bound = at("workflow.bind_plan(&resumed_plan)?;");
+        let rescoped = at("own_pr_rescope::run(");
+        let carried = at("rescope_notes.take()");
+        let review = at("admit_review_binding(");
+        assert!(parked < plan && plan < notes && notes < bound && bound < rescoped, "the plan branch runs before any rescope registration");
+        assert!(carried < review, "the carried findings route the repair before any re-review");
     }
 
     /// #2329 (PR #2378, head 856aca6f): the CI code-repair ladder ran before

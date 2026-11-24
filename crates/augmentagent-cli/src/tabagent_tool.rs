@@ -62,7 +62,7 @@ pub const CALL_DEADLINE_SECS: u64 = 90;
 /// Largest `timeout` (ms) passed on to TabAgent, so its wait ends first.
 const TOOL_TIMEOUT_MAX_MS: u64 = 60_000;
 /// Tool calls one launch accepts, counted whether or not they succeed.
-pub const CALL_CAP: usize = 40;
+pub const CALL_CAP: usize = 200;
 pub const CAP_REACHED: &str = "TabAgent call limit for this turn reached";
 /// Rendered results above this are refused rather than cut, because a cut
 /// would leave a PAGE_DATA block unterminated.

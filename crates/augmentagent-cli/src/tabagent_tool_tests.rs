@@ -854,3 +854,10 @@ async fn live_tabagent_reads_a_synthetic_page() {
     assert!(!error && body.contains("<<<PAGE_DATA"), "{body}");
     server.end_session().await;
 }
+
+/// A real multi-step application (CVP: 7 steps, several fields each, plus
+/// snapshots and retries) took more than 40 calls in one turn and stalled.
+#[test]
+fn call_cap_fits_a_multi_step_application() {
+    assert!(CALL_CAP >= 150, "CALL_CAP {CALL_CAP} is too low for a long form");
+}

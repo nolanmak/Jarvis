@@ -18,7 +18,13 @@ pub(super) async fn migrate(root:&Path,dry_run:bool)->Result<usize> {
     let unrecoverable=store.reverify_unrecoverable_original_evidence(&repository,chrono::Utc::now().timestamp_millis(),
         |worktree|worktree.try_exists().unwrap_or(false))?;
     if unrecoverable>0 {info!(count=unrecoverable,"original verifier evidence unrecoverable; re-verifying from scratch under current policy");}
-    Ok(count+ladder+readiness+unrecoverable)
+    // #2464: with the scope proof gate off, proof-gate parks build or repair
+    // on their next turn instead of waiting out a witness/ladder backoff.
+    let released=if crate::autoship_workflow::scope_proof_gate::enabled() {0} else {
+        store.release_scope_proof_parks(&repository,chrono::Utc::now().timestamp_millis())?
+    };
+    if released>0 {info!(count=released,"scope proof gate off: released proof-gate scope parks to build or repair");}
+    Ok(count+ladder+readiness+unrecoverable+released)
 }
 pub(super) fn pending(state: &Path, repository: &str, number: u64) -> Result<bool> {
     let Some(store) = WorkflowStore::open_read_only(state)? else {
@@ -33,7 +39,8 @@ pub(super) fn retries(state: &Path, repository: &str) -> Result<std::collections
     };
     let mut retries=store.scope_policy_retries(repository)?;
     retries.extend(store.acceptance_escalation_retries(repository)?);
-    retries.extend(store.terminal_park_retries(repository,chrono::Utc::now().timestamp_millis())?);Ok(retries)
+    retries.extend(store.terminal_park_retries(repository,chrono::Utc::now().timestamp_millis())?);
+    retries.extend(store.scope_proof_released_retries(repository,chrono::Utc::now().timestamp_millis())?);Ok(retries)
 }
 pub(super) async fn readiness_blocked(
     root: &Path,
