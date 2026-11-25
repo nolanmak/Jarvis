@@ -1343,6 +1343,19 @@ class HandoffTests(unittest.TestCase):
                                 lambda: submits.append(1) or {'content': [{'type': 'text', 'text': 'ok'}]})
             self.assertEqual(len(submits), 1)
 
+    def test_tabagent_captcha_and_handoff_repeat_and_stay_journaled(self):
+        # nolanmak/tabagent#61: "retry once" after CAPTCHA_UNSOLVED and a new
+        # handoff after the owner cancelled are new, intended actions.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for leaf, arguments in (('captcha_solve', {'tabId': 7}),
+                                    ('auth_handoff', {'tabId': 7, 'reason': 'Scan your ID'})):
+                self.assertFalse(bridge.read_only_operation('mcp__tabagent__' + leaf, arguments))
+                self.assertTrue(bridge.repeatable_operation('mcp__tabagent__' + leaf))
+                for identifier in ('first', 'again'):
+                    self.primary_call(journal, 'mcp__tabagent__' + leaf, arguments, leaf + identifier)
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['completed'] * 4)
+
     def test_tabagent_repeated_identical_form_submit_is_still_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
@@ -2041,6 +2054,59 @@ for line in sys.stdin:
             start=time.monotonic()
             with self.assertRaisesRegex(bridge.Readiness, 'JARVIS_READINESS:mcp_timeout'): server.tools()
             self.assertLess(time.monotonic()-start,3)
+
+    def slow_fixture(self, root):
+        fake = root / 'slow.py'
+        fake.write_text("""import json,sys,time
+for line in sys.stdin:
+ v=json.loads(line)
+ if 'id' not in v: continue
+ m=v['method']
+ if m=='initialize': r={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+ elif m=='tools/list': r={'tools':[{'name':name,'inputSchema':{'type':'object','properties':{}}} for name in ['wait_human','search']]}
+ elif m=='tools/call':
+  time.sleep(0.6); r={'content':[{'type':'text','text':'SLOW_OK'}]}
+ else: r={}
+ print(json.dumps({'jsonrpc':'2.0','id':v['id'],'result':r}),flush=True)
+""")
+        return fake
+
+    def test_declared_tool_timeout_outlasts_the_server_default_for_that_tool_only(self):
+        # nolanmak/tabagent#61: auth_handoff waits for a person; only the
+        # tools a server names get a longer wait than its 120 s-capped default.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self.slow_fixture(Path(tmp))
+            def server_with(tool_timeouts):
+                policy = bridge.Policy({'cwd': tmp, 'allowed_tools': ['mcp__fixture__wait_human', 'mcp__fixture__search'],
+                    'settings': {'mcpServers': {'fixture': {'command': sys.executable, 'args': ['-I', str(fake)],
+                        'timeout': 0.3, 'toolTimeouts': tool_timeouts}}}})
+                server = bridge.Server(policy)
+                self.addCleanup(server.close)
+                return server
+            server = server_with({'wait_human': 5})
+            result = server.dispatch({'method': 'tools/call', 'params': {'name': 'mcp__fixture__wait_human', 'arguments': {}}})
+            self.assertEqual(result['content'][0]['text'], 'SLOW_OK')
+            other = server_with({'wait_human': 5})
+            timed_out = other.dispatch({'method': 'tools/call', 'params': {'name': 'mcp__fixture__search', 'arguments': {}}})
+            self.assertTrue(timed_out['isError'])
+            self.assertIn('JARVIS_READINESS:mcp_timeout', timed_out['content'][0]['text'])
+
+    def test_declared_tool_timeouts_are_validated_and_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self.slow_fixture(Path(tmp))
+            def remote(tool_timeouts):
+                policy = bridge.Policy({'cwd': tmp, 'allowed_tools': ['mcp__fixture__wait_human'],
+                    'settings': {'mcpServers': {'fixture': {'command': sys.executable, 'args': ['-I', str(fake)],
+                        'toolTimeouts': tool_timeouts}}}})
+                client = bridge.Remote(policy.settings['mcpServers']['fixture'], policy)
+                self.addCleanup(client.close)
+                return client
+            self.assertEqual(remote({'wait_human': 10 ** 6}).tool_timeout('wait_human'), bridge.MCP_TOOL_TIMEOUT_MAX)
+            self.assertEqual(remote({'wait_human': 1995}).tool_timeout('wait_human'), 1995)
+            self.assertEqual(remote({}).tool_timeout('wait_human'), 30)
+            for bad in ({'wait_human': 0}, {'wait_human': 'long'}, {'wait_human': True}, ['wait_human']):
+                with self.assertRaises(bridge.Denied):
+                    remote(bad)
 
     def test_missing_declared_remote_tool_fails_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4084,6 +4150,35 @@ class ReadAllowanceTests(unittest.TestCase):
     def test_handoff_state_cannot_match_a_read_allowance(self):
         with self.assertRaisesRegex(bridge.Denied, 'outside model tool scopes'):
             self.make_policy(handoff_path=str(self.inbox / 'aa-txt-99-0.md'))
+
+
+class InspectBuildReadinessTests(unittest.TestCase):
+    """#2532: a policy the bridge refuses must name why, not only `mcp_start`."""
+
+    def inspect(self, policy):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'policy.json'
+            path.write_text(json.dumps(policy(Path(temp))))
+            result = subprocess.run([sys.executable, '-I', str(Path(__file__).parents[1] / 'codex-tool-bridge.py'),
+                                     '--inspect-build-readiness', str(path)],
+                                    capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_refused_write_grant_reports_the_denial(self):
+        def policy(temp):
+            work = temp / 'work'
+            work.mkdir()
+            (work / 'AGENTS.md').write_text('x')
+            return {'cwd': str(work), 'write_roots': [], 'write_files': [str(work / 'AGENTS.md')],
+                    'autoship_in_place_writes': True, 'allowed_tools': ['Bash(cargo *)']}
+        report = self.inspect(policy)
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start',
+                                  'detail': 'Denied: credential and control files cannot be admitted'})
+
+    def test_unexpected_error_reports_only_its_type(self):
+        report = self.inspect(lambda temp: {'cwd': str(temp / 'PRIVATE-missing-cwd')})
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start', 'detail': 'FileNotFoundError'})
 
 
 if __name__ == '__main__':

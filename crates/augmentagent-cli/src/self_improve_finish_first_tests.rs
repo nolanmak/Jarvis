@@ -228,3 +228,48 @@ fn a_repeated_observation_wakes_a_rescope_stop_once() {
     assert_eq!(eligible_at(&path, &id), day + 1);
     assert!(store.expedite_changed_rescope_stop(&id, Some(REQUEST), Some("main-c"), now + 3).unwrap(), "a new main is a new change");
 }
+
+/// #2547 — production state of workflow #2424 / PR #2545 (2026-11-24): the
+/// approved revision's Push was dispatched at publish/publishing_revision/push,
+/// its first observation failed, and the turn ended without releasing its
+/// lease. After the lease expired the idle observer recorded the landed head.
+/// That PR must be the PR lane's next finish, even after today's attempt.
+#[test]
+fn an_observed_publish_retry_on_an_open_own_pr_is_selected_to_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let id = workflow_id("owner/repo", 2424).unwrap();
+    let binding = Binding {head:HEAD.into(),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+    store.register(&id, "agent-fix/issue-2424", binding.clone(), 0).unwrap();
+    let lease = store.claim(&id, "worker", 1, 545_000).unwrap().unwrap();
+    store.attach_pr_in_repo(&lease, "owner/repo", 2545, 2).unwrap();
+    store.checkpoint(&lease, &Checkpoint {stage:Stage::Publish,binding:binding.clone(),evidence:vec![],
+        next:NextAction {reason:"publishing_revision".into(),action:"push".into(),eligible_at_ms:3}}, 3).unwrap();
+    store.begin_bound_push(&lease, &binding, "https://github.com/owner/repo.git", "refs/heads/agent-fix/issue-2424", 4).unwrap();
+    // The guard was dropped, not released: the lease simply runs out.
+    let candidates = vec![candidate(2424, 2545)];
+    let prs = inventory(&[(2545, HEAD, "SUCCESS")]);
+    let mut held = candidates.clone();
+    filter_owned_sources(&path, &mut held).unwrap();
+    assert!(held.is_empty(), "fixture: an unconfirmed Push keeps automatic selection away");
+
+    let now = 600_000;
+    let pending = store.pending_push_observations("owner/repo", now, 32).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(store.observe_idle_push(&pending[0], HEAD, now).unwrap(), "the idle observer records the landed head");
+    let snapshot = store.snapshot(&id).unwrap().unwrap();
+    assert_eq!((snapshot.checkpoint.stage, snapshot.checkpoint.next.reason.as_str(), snapshot.pr),
+        (Stage::Publish, "publishing_revision", Some(2545)), "the checkpoint is the stranded production one");
+    assert!(!store.unpushed_publish_checkpoint(&id, &binding).unwrap(), "the resumed turn continues to review, not another push");
+
+    let mut eligible = candidates.clone();
+    filter_owned_sources(&path, &mut eligible).unwrap();
+    assert_eq!(eligible, candidates, "owned PR #2545 stayed unavailable for automatic selection");
+    let plan = finish_plan(&path, &eligible, &prs, now).unwrap();
+    assert_eq!(plan.tiers.get(&2545), Some(&FinishTier::PublishOrCiPending));
+    let ledger = AttemptLedger {day:1,issues:vec![2424]};
+    let retries = plan.tiers.keys().copied().collect();
+    assert_eq!(select_finishing(&eligible, &ledger, 1, None, &retries, &plan.tiers),
+        Some((2545, 2424, "agent-fix/issue-2424".into())), "the PR lane must finish #2545 before new work");
+}

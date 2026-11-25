@@ -12,6 +12,8 @@ mod family_wait_settlement;
 mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
+#[path = "self_improve_push_confirm.rs"]
+mod push_confirm;
 #[cfg(test)]
 #[path = "self_improve_family_budget_hold_tests.rs"]
 mod family_budget_hold_tests;
@@ -92,7 +94,7 @@ fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {Self::open_at(&path())}
-    fn open_at(state:&Path)->Result<Self> {
+    pub(super) fn open_at(state:&Path)->Result<Self> {
         WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
@@ -2513,6 +2515,21 @@ impl WorkflowGuard {
         Ok(ladder)
     }
 
+    /// #2536: a parked fresh candidate leaves `'stages` before Stage 4's
+    /// commit and checkpoint, so the last checkpoint still binds the build
+    /// base. Publication commits that tree; bind the exact committed head
+    /// (recomputed from the worktree, like every checkpoint) before the
+    /// publication intent is retained. A head that is not the worktree's
+    /// HEAD still fails the publication guard.
+    pub(super) async fn checkpoint_publication_candidate(&mut self,head:&str)->Result<()> {
+        if self.binding.head==head {return Ok(());}
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_owner_dispatch(self.id())?;
+        let evidence=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.lease.workflow)?.context("workflow missing")?.checkpoint.evidence;
+        self.checkpoint(Stage::Publish,"publishing_revision","push",millis(),&evidence).await
+    }
+
     /// Transition stage while retaining the receipt set that reviewers saw.
     pub(super) async fn transition(
         &mut self,
@@ -2614,10 +2631,10 @@ impl WorkflowGuard {
         let expected=format!("--force-with-lease={target}:{remote}");
         let refspec=format!("{}:{target}",operation.binding.head);
         let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
-        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
-        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
-            "push outcome not verified; preserved pending intent (command success: {pushed})");
-        let head=observed.context("Push observation unavailable")?;
+        // #2547: the ref API can lag a landed push; re-read before failing.
+        let (worktree,repository,target,destination)=(&self.worktree,&self.repository,&target,&destination);
+        let head=push_confirm::confirm_pushed_head(&operation.binding.head,pushed,push_confirm::PUSH_OBSERVATION_DELAY,
+            move||destination.head(worktree,repository,target)).await?;
         self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
         Ok(head)
     }

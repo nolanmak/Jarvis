@@ -8,6 +8,20 @@ pub(crate) struct Refusal {
     available: Option<u64>,
     required: Option<u64>,
     started: bool,
+    /// #2532: the bridge's bounded, sanitized reason for an `mcp_start`.
+    detail: Option<String>,
+}
+
+/// Keep a bridge-reported detail only when it is short and made of plain
+/// words, so no path or value can reach the turn error or a PR comment.
+fn sanitized_detail(detail: &str) -> Option<String> {
+    let detail = detail.trim();
+    (!detail.is_empty()
+        && detail.len() <= 200
+        && detail
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _.,:;'()-".contains(c)))
+    .then(|| detail.to_owned())
 }
 impl Refusal {
     pub(crate) fn category(
@@ -33,7 +47,13 @@ impl Refusal {
             available,
             required,
             started: false,
+            detail: None,
         })
+    }
+    /// Attach the bridge's reason for a readiness failure (#2532).
+    pub(crate) fn with_detail(mut self, detail: Option<&str>) -> Self {
+        self.detail = detail.and_then(sanitized_detail);
+        self
     }
     pub(crate) fn tool(name: &str, failed: bool, content: &str) -> Option<Self> {
         if !failed || name != "mcp__jarvis__Bash" {
@@ -98,7 +118,10 @@ impl Refusal {
             crate::run_resources::admission_failed_observation(provider, logger, evidence)
         } else {
             Err(crate::reasoner::ReasonerError::Local {
-                message:format!("{provider}: native build tool readiness unavailable ({}); inspect execution configuration",self.category)
+                message:match &self.detail {
+                    Some(detail)=>format!("{provider}: native build tool readiness unavailable ({}: {detail}); inspect execution configuration",self.category),
+                    None=>format!("{provider}: native build tool readiness unavailable ({}); inspect execution configuration",self.category),
+                }
             }.into())
         }
     }
@@ -107,6 +130,21 @@ impl Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mcp_start_names_the_bridge_reason_but_never_a_path() {
+        let message = |detail: Option<&str>| {
+            Refusal::category("mcp_start", None, None).unwrap().with_detail(detail)
+                .fail("codex", None).unwrap_err().to_string()
+        };
+        assert!(message(Some("Denied: credential and control files cannot be admitted"))
+            .contains("(mcp_start: Denied: credential and control files cannot be admitted)"));
+        assert!(message(Some("FileNotFoundError")).contains("(mcp_start: FileNotFoundError)"));
+        for withheld in [None, Some("Denied: /home/PRIVATE/path"), Some(""), Some(&*"x".repeat(201))] {
+            let text = message(withheld);
+            assert!(text.contains("(mcp_start)"), "{text}");
+            assert!(!text.contains("PRIVATE"), "{text}");
+        }
+    }
     #[test]
     fn only_failed_controller_bash_results_can_yield_a_turn() {
         let text = "JARVIS_READINESS:build_scratch_space PRIVATE_PATH_AND_COMMAND";

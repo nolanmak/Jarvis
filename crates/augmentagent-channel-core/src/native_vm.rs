@@ -51,6 +51,19 @@ pub mod state_capacity;
 pub fn declared_native_auth(provider:&str)->Result<bool> {
     declared_auth(readiness::credentials(provider))
 }
+/// The in-VM relay's `jarvis` server entry. It keeps the host launch's Codex
+/// wait (raised for long human-in-the-loop tools, nolanmak/tabagent#61),
+/// bounded to what the host bridge can ever declare.
+fn relayed_jarvis_server(host: &str) -> String {
+    let max = crate::codex_tools::MCP_TOOL_TIMEOUT_MAX_SECS + 60;
+    let secs = host.split_once("tool_timeout_sec=")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .map_or(crate::codex_tools::BRIDGE_TOOL_TIMEOUT_SECS,
+            |secs| secs.clamp(crate::codex_tools::BRIDGE_TOOL_TIMEOUT_SECS, max));
+    format!("mcp_servers.jarvis={{command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec={secs},default_tools_approval_mode=\"approve\"}}")
+}
+
 #[cfg(test)]
 fn native_auth_at(path:&Path,provider:&str,environment:impl Fn(&str)->Option<String>)->Result<bool> {
     declared_auth(readiness::credentials_at(Some(path),provider,chrono::Utc::now().timestamp_millis(),environment))
@@ -607,7 +620,7 @@ impl Launch {
         let mut index = 0;
         while index < arguments.len() {
             if arguments[index].starts_with("mcp_servers.jarvis=") {
-                arguments[index] = "mcp_servers.jarvis={command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}".into();
+                arguments[index] = relayed_jarvis_server(&arguments[index]);
             } else if let Some(raw) = arguments[index].strip_prefix("model_instructions_file=") {
                 let path: String = serde_json::from_str(raw)?;
                 let guest = format!("/native/asset-{}",assets.len());
@@ -745,6 +758,15 @@ impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&self.sess
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relayed_jarvis_server_keeps_the_host_wait_within_bounds() {
+        let host = |secs: &str| format!("mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",\"/x/tool-bridge.py\",\"/p\"],required=true,startup_timeout_sec=120,tool_timeout_sec={secs},default_tools_approval_mode=\"approve\"}}");
+        for (given, kept) in [("900", "900"), ("2070", "2070"), ("99999", "2460"), ("5", "900"), ("x", "900")] {
+            let relayed = relayed_jarvis_server(&host(given));
+            assert!(relayed.contains(&format!("tool_timeout_sec={kept},")), "{given}: {relayed}");
+            assert!(relayed.contains("/native/mcp-relay.py") && !relayed.contains("/x/tool-bridge.py"));
+        }
+    }
     fn session(root:&Path,name:&str,owner:&str,complete:bool)->PathBuf {
         let path=root.join("codex").join(name);
         std::fs::create_dir_all(&path).unwrap();
@@ -902,7 +924,7 @@ mod tests {
             // Exercise release/cancellation with the real host supervisor and a
             // disposable marker-writing command. This is a controller-boundary
             // fixture, not native guest or provider acceptance.
-            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","teardown-proof-missing"] {
+            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","charged-release-unacknowledged","teardown-proof-missing"] {
                 let create=crate::native_session::Launch::Create{requested_id:None};
                 let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
                 let original=vm.session.clone();let effect=root.join(format!("{provider}-{case}-effect"));
@@ -929,6 +951,19 @@ mod tests {
                 if case=="release-ack-error" || case=="foreign-release-before-refusal" {write(&receipt.with_file_name("launch-continue"),b"admitted\n").unwrap();}
                 if case=="owner-refused" || case=="foreign-release-before-refusal" {
                     assert!(group.admit_model(provider,Some(&denied)).await.is_err());
+                }else if case=="charged-release-unacknowledged" {
+                    // The accounting authority commits the charge before its
+                    // acknowledgement can fail. This must preserve the fresh
+                    // runtime even though no dispatch artifact is published.
+                    let accounting=Arc::new(crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit"))));
+                    let charged=Arc::new(AtomicUsize::new(0));let counted=charged.clone();
+                    accounting.set_correlated_model_call_observer(Arc::new(move |_|{
+                        counted.fetch_add(1,Ordering::SeqCst);
+                        anyhow::bail!("charged release acknowledgement failed")
+                    })).unwrap();
+                    assert!(group.admit_model(provider,Some(&accounting)).await.is_err());
+                    assert_eq!(charged.load(Ordering::SeqCst),1,"{provider}/{case}: the model release was never charged");
+                    assert!(!receipt.with_file_name("launch-continue").exists(),"{provider}/{case}: the unacknowledged release still published dispatch");
                 }else if case!="cancel-before-release" && case!="teardown-proof-missing" {
                     let result=group.admit_model(provider,None).await;
                     assert_eq!(result.is_err(),case=="release-ack-error");
@@ -938,7 +973,11 @@ mod tests {
                 drop(group);child.wait().await.unwrap();drop(vm);
                 assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing","{provider}/{case}: supervisor cleanup proof missing");
                 assert_eq!(effect.exists(),released,"{provider}/{case}: release fixture did not exercise expected dispatch");
-                assert_eq!(original.exists(),released || case=="teardown-proof-missing","{provider}/{case}: uncertain/released runtime disposition incorrect");
+                assert_eq!(original.exists(),released || matches!(case,"teardown-proof-missing"|"charged-release-unacknowledged"),
+                    "{provider}/{case}: uncertain/released runtime disposition incorrect");
+                if case=="charged-release-unacknowledged" {
+                    assert!(original.join("owned.json").is_file(),"{provider}/{case}: charged release lost its ownership receipt");
+                }
                 if case=="teardown-proof-missing" {
                     // The fixture provider was never released and the original
                     // supervisor has now been waited/reaped. Remove only this

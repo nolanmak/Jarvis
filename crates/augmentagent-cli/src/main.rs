@@ -31,6 +31,7 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_handoff;
 mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -110,6 +111,8 @@ use async_trait::async_trait;
 mod whatsapp_history;
 mod whatsapp_phone;
 mod socialapi_compose_identity;
+#[cfg(test)]
+mod socialapi_compose_identity_approver_tests;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -814,6 +817,10 @@ enum Cmd {
         #[arg(long)]
         tools: String,
     },
+    /// Print the loopback URL for TabAgent's `handoff.webhook`: Jarvis posts
+    /// each remote-handoff link it receives there to the owner in Discord.
+    /// Run `tabagent config handoff.webhook "$(augmentagent tabagent-handoff-url)"`.
+    TabagentHandoffUrl,
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
     ComposioAuthTool,
@@ -3247,6 +3254,9 @@ async fn main() -> Result<()> {
     if let Cmd::TabagentTool { ref session, ref tools } = cli.cmd {
         return tabagent_tool::serve(session, tools).await;
     }
+    if let Cmd::TabagentHandoffUrl = cli.cmd {
+        return tabagent_handoff::print_url();
+    }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
             let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
@@ -4058,6 +4068,13 @@ async fn main() -> Result<()> {
                 }
             } else { None };
 
+
+            // nolanmak/tabagent#61: TabAgent's remote-handoff link → the owner's Discord.
+            if !dry_run {
+                if let Some(webhook) = tabagent_handoff::start(shutdown.clone()).await {
+                    tasks.push(webhook);
+                }
+            }
 
             if phone.is_none() {
                 if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
@@ -5975,6 +5992,7 @@ async fn main() -> Result<()> {
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
         Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
+        Cmd::TabagentHandoffUrl => tabagent_handoff::print_url(),
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
@@ -14737,13 +14755,17 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        // #2538 — only while still pending: a follow-up compose that retired
+        // this card mid-redraft must not be undone into a second live card.
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("revise: persist failed: {e}"),
+                }
+            }
+        }
         tracing::info!(action_id, "socialapi revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -15120,6 +15142,16 @@ impl ReplyApprover {
         }
     }
 
+    /// #2538 — before Send / Revise runs (and is audited), give a card a
+    /// follow-up social DM compose replaced a live action where that is safe.
+    fn reopen_replaced_social_card(&self, action_id: &str, take_over: bool) {
+        match socialapi_compose_identity::reopen_replaced_card(&self.store, action_id, take_over) {
+            Ok(true) => info!(action_id, take_over, "socialapi dm: reopened replaced card"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "socialapi dm: reopen replaced card failed: {e:#}"),
+        }
+    }
+
     fn skip_github(
         &self,
         action_id: &str,
@@ -15144,6 +15176,7 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.reopen_replaced_social_card(action_id, false);
         let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
@@ -15173,6 +15206,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
+        self.reopen_replaced_social_card(action_id, true);
         self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
@@ -17000,6 +17034,10 @@ async fn start_discord_broker(
             .and_then(|s| s.parse().ok())
             .unwrap_or(channel_id),
     );
+    let extra_query_channel_ids = parse_channel_id_list(
+        std::env::var("DISCORD_EXTRA_CHANNEL_IDS").ok().as_deref(),
+    )
+    .context("DISCORD_EXTRA_CHANNEL_IDS must be comma-separated numeric channel ids")?;
     let allowed_user_id: Option<u64> = std::env::var("DISCORD_ALLOWED_USER_ID")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -17022,6 +17060,7 @@ async fn start_discord_broker(
         bot_token: token,
         channel_id,
         query_channel_id,
+        extra_query_channel_ids,
         allowed_user_id,
         query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
@@ -21518,6 +21557,33 @@ fn build_calendar_alert_sink(
         return None;
     }
     Some(Arc::new(notify::RoutedAlertSink::new(router)))
+}
+
+/// Comma/whitespace-separated Discord channel ids; empty or unset = none.
+fn parse_channel_id_list(raw: Option<&str>) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for part in raw.unwrap_or("").split([',', ' ', '\n', '\t']).map(str::trim).filter(|p| !p.is_empty()) {
+        let id: u64 = part.parse().with_context(|| format!("not a channel id: {part:?}"))?;
+        anyhow::ensure!(id != 0, "channel id 0 is invalid");
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod channel_id_list_tests {
+    use super::parse_channel_id_list;
+
+    #[test]
+    fn parses_dedupes_and_rejects_garbage() {
+        assert!(parse_channel_id_list(None).unwrap().is_empty());
+        assert!(parse_channel_id_list(Some(" , ")).unwrap().is_empty());
+        assert_eq!(parse_channel_id_list(Some("11, 22 11,33")).unwrap(), vec![11, 22, 33]);
+        assert!(parse_channel_id_list(Some("11,abc")).is_err());
+        assert!(parse_channel_id_list(Some("0")).is_err());
+    }
 }
 
 /// #399 — read-only schedule lookup for query mode ("what's on my calendar
