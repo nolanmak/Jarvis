@@ -370,6 +370,18 @@ fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
     (collect_files(&files, &root), manifest)
 }
 
+/// The preset callsites the `autoship_case` binary target reports out of its
+/// own `include_str!` of the manifest. Cargo builds the package's binaries
+/// before an integration test that names one, so reading this forces a focused
+/// `--test capability_inventory` run to compile that embed too: `src/bin/`
+/// resolves one directory level deeper than this `tests/` file, and an embed
+/// copied across without that level names no file and fails the build.
+fn autoship_case_callsites() -> BTreeSet<String> {
+    let observed = std::process::Command::new(env!("CARGO_BIN_EXE_autoship_case")).output().unwrap();
+    assert!(observed.status.success(), "autoship case failed: {}", String::from_utf8_lossy(&observed.stderr));
+    serde_json::from_slice(&observed.stdout).unwrap()
+}
+
 #[test]
 fn inventory_accounts_for_every_production_preset_and_wrapper() {
     let (found, manifest) = scan_workspace();
@@ -389,58 +401,7 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
         assert!(manifest["profiles"][profile].is_object(), "unknown permission profile: {profile}");
     }
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
-}
-
-/// `include_str!` resolves against the embedding file, so the capability
-/// manifest embed, copied out of this `tests/` target into an `src/bin/`
-/// autoship adapter, gains a directory level and names nothing. Compiling the
-/// adapter is the only other check on that path, and a focused run of one
-/// crate's tests never builds another crate's binaries, so resolve every
-/// embedded path here.
-fn unresolved_embeds(crates: &Path) -> Vec<String> {
-    let mut files = BTreeSet::new();
-    rust_files(crates, &mut files);
-    let mut unresolved = Vec::new();
-    for file in &files {
-        let source = std::fs::read_to_string(file).unwrap();
-        for opening in ["include_str!(\"", "include_bytes!(\""] {
-            for (at, _) in source.match_indices(opening) {
-                let embedded = source[at + opening.len()..].split('"').next().unwrap();
-                if !file.parent().unwrap().join(embedded).exists() {
-                    unresolved.push(format!("{}: {embedded}", file.display()));
-                }
-            }
-        }
-    }
-    unresolved
-}
-
-#[test]
-fn every_embedded_file_resolves_from_the_target_that_embeds_it() {
-    let unresolved = unresolved_embeds(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
-    assert!(unresolved.is_empty(), "embedded paths name no file: {unresolved:#?}");
-}
-
-/// The reported case: the capability manifest embedded in the `autoship_case`
-/// binary target with this target's `tests/` depth, where `src/bin/` needs one
-/// level more.
-#[test]
-fn an_unresolved_manifest_embed_in_a_bin_target_is_reported() {
-    let repo = tempfile::tempdir().unwrap();
-    let crates = repo.path().join("crates");
-    let adapter = crates.join("augmentagent-cli/src/bin/autoship_case.rs");
-    std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
-    std::fs::write(repo.path().join("docs/reasoner-capabilities.json"), "{}").unwrap();
-    let embed = |levels| format!("const MANIFEST: &str = include_str!(\"{levels}docs/reasoner-capabilities.json\");\n");
-
-    std::fs::write(&adapter, embed("../../../")).unwrap();
-    let reported = unresolved_embeds(&crates);
-    assert_eq!(reported.len(), 1, "{reported:#?}");
-    assert!(reported[0].ends_with("bin/autoship_case.rs: ../../../docs/reasoner-capabilities.json"), "{reported:#?}");
-
-    std::fs::write(&adapter, embed("../../../../")).unwrap();
-    assert!(unresolved_embeds(&crates).is_empty(), "a resolvable embed was reported");
+    assert_eq!(autoship_case_callsites(), declared, "the autoship_case target embedded a different capability manifest");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
