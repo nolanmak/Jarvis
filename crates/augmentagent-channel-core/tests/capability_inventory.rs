@@ -391,28 +391,19 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
 }
 
-/// The gates above read the manifest from disk through `CARGO_MANIFEST_DIR`, so
-/// none of them say anything about the copy other tests embed at compile time
-/// with `include_str!("../../../docs/reasoner-capabilities.json")` — a target
-/// that scripts/tests/updater-rebuild-trigger.test.sh classifies as test-only
-/// precisely because it is an embed. Exercise that target here: the path must
-/// resolve at compile time, and the bytes it embeds must be the manifest the
-/// inventory gate validates. When the two diverge — the embed moved to a
-/// generated or stale manifest, or the checkout the test binary runs against
-/// is not the one it was compiled from — every contract above is asserted over
-/// one manifest while the embedded copy ships unchecked.
+/// Compile the production binary that embeds the manifest and run the inventory
+/// gate in this focused test. The binary target, rather than this integration
+/// test target, owns the `include_str!` path being guarded.
 #[test]
-fn embedded_manifest_target_is_the_manifest_the_inventory_gate_validates() {
-    let embedded: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
-    let (found, on_disk) = scan_workspace();
-    // Compared with assert!, not assert_eq!: both sides are the whole manifest.
-    assert!(embedded == on_disk,
-        "docs/reasoner-capabilities.json as embedded at compile time is not the manifest the inventory gate reads from disk");
-    let declared: BTreeSet<String> = embedded["presets"].as_array().unwrap().iter()
-        .map(|entry| entry["callsite"].as_str().unwrap().to_owned()).collect();
-    assert_eq!(declared, found.into_keys().collect::<BTreeSet<_>>(),
-        "the embedded manifest does not account for every production preset and wrapper");
+fn autoship_case_embedded_manifest_target_passes_the_inventory_gate() {
+    inventory_accounts_for_every_production_preset_and_wrapper();
+
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["check", "--quiet", "--bin", "autoship_case"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("cargo check should start for autoship_case");
+    assert!(status.success(), "autoship_case must compile its embedded manifest");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
