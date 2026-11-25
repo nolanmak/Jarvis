@@ -384,6 +384,7 @@ fn autoship_case_callsites() -> BTreeSet<String> {
 
 #[test]
 fn inventory_accounts_for_every_production_preset_and_wrapper() {
+    let embedded_callsites = autoship_case_callsites();
     let (found, manifest) = scan_workspace();
     let found: BTreeSet<String> = found.into_keys().collect();
     let entries = manifest["presets"].as_array().unwrap();
@@ -401,7 +402,7 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
         assert!(manifest["profiles"][profile].is_object(), "unknown permission profile: {profile}");
     }
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
-    assert_eq!(autoship_case_callsites(), declared, "the autoship_case target embedded a different capability manifest");
+    assert_eq!(embedded_callsites, declared, "the autoship_case target embedded a different capability manifest");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
