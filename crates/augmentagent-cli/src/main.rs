@@ -17035,9 +17035,9 @@ async fn start_discord_broker(
             .unwrap_or(channel_id),
     );
     let extra_query_channel_ids = parse_channel_id_list(
-        std::env::var("DISCORD_EXTRA_QUERY_CHANNEL_IDS").ok().as_deref(),
+        std::env::var("DISCORD_EXTRA_CHANNEL_IDS").ok().as_deref(),
     )
-    .context("DISCORD_EXTRA_QUERY_CHANNEL_IDS must be comma-separated numeric channel ids")?;
+    .context("DISCORD_EXTRA_CHANNEL_IDS must be comma-separated numeric channel ids")?;
     let allowed_user_id: Option<u64> = std::env::var("DISCORD_ALLOWED_USER_ID")
         .ok()
         .and_then(|s| s.parse().ok());
