@@ -69,7 +69,8 @@ pub const BRIDGE_CAP_SECS: u64 = 120;
 /// strands an uncertain receipt. TabAgent's own prompt wait is 120 s.
 pub const CALL_DEADLINE_SECS: u64 = 90;
 /// `captcha_solve`: TabAgent's solver is capped at 120 s, after a checkbox
-/// click that polls for about 6 s.
+/// click that polls for about 6 s. `act_click` and `form_submit` get the same
+/// deadline because autoCaptcha solves a blocking CAPTCHA inside them.
 pub const CAPTCHA_DEADLINE_SECS: u64 = 160;
 /// `auth_handoff`: TabAgent's remote handoff waits 30 min (after a possible
 /// 120 s site approval prompt). This deadline leaves TabAgent's own answer
@@ -143,6 +144,8 @@ pub(crate) fn configure_with(
         "timeout": BRIDGE_CAP_SECS,
         // Read by the Codex bridge: the only tools allowed past its 120 s cap.
         "toolTimeouts": {
+            "act_click": CAPTCHA_DEADLINE_SECS + BRIDGE_SLACK_SECS,
+            "form_submit": CAPTCHA_DEADLINE_SECS + BRIDGE_SLACK_SECS,
             "captcha_solve": CAPTCHA_DEADLINE_SECS + BRIDGE_SLACK_SECS,
             "auth_handoff": HANDOFF_DEADLINE_SECS + BRIDGE_SLACK_SECS,
         },
@@ -202,7 +205,7 @@ pub fn validate_bridge_url(raw: &str) -> Result<reqwest::Url, String> {
 /// This process's deadline for one call to `tool`.
 pub fn call_deadline(tool: &str) -> Duration {
     Duration::from_secs(match tool {
-        "captcha_solve" => CAPTCHA_DEADLINE_SECS,
+        "captcha_solve" | "act_click" | "form_submit" => CAPTCHA_DEADLINE_SECS,
         "auth_handoff" => HANDOFF_DEADLINE_SECS,
         _ => CALL_DEADLINE_SECS,
     })
@@ -543,7 +546,7 @@ impl Server {
 
     fn deadline_for(&self, tool: &str) -> Duration {
         match tool {
-            "captcha_solve" => self.captcha_deadline,
+            "captcha_solve" | "act_click" | "form_submit" => self.captcha_deadline,
             "auth_handoff" => self.handoff_deadline,
             _ => self.deadline,
         }

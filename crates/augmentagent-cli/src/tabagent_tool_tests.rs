@@ -99,7 +99,8 @@ fn configure_requires_owner_channel_session_url_and_token() {
     // wait, a little past this process's own deadline for them.
     assert_eq!(
         server["toolTimeouts"],
-        json!({"captcha_solve": CAPTCHA_DEADLINE_SECS + 15, "auth_handoff": HANDOFF_DEADLINE_SECS + 15})
+        json!({"act_click": CAPTCHA_DEADLINE_SECS + 15, "form_submit": CAPTCHA_DEADLINE_SECS + 15,
+               "captcha_solve": CAPTCHA_DEADLINE_SECS + 15, "auth_handoff": HANDOFF_DEADLINE_SECS + 15})
     );
     // The turn's channel and the route file let the handoff webhook post the
     // link where the owner is talking (crate::tabagent_handoff).
@@ -887,9 +888,13 @@ fn human_paced_tools_get_longer_deadlines_and_nothing_else_does() {
     // TabAgent's remote handoff waits 30 min, plus its 120 s approval prompt.
     const _: () = assert!(HANDOFF_DEADLINE_SECS >= 30 * 60 + 120);
     const _: () = assert!(HANDOFF_DEADLINE_SECS + 15 <= 2400, "the Codex bridge caps a declared wait at 2400 s");
-    assert_eq!(call_deadline("captcha_solve").as_secs(), CAPTCHA_DEADLINE_SECS);
+    // autoCaptcha solves a blocking CAPTCHA inside a click or submit.
+    for tool in ["captcha_solve", "act_click", "form_submit"] {
+        assert_eq!(call_deadline(tool).as_secs(), CAPTCHA_DEADLINE_SECS, "{tool}");
+    }
     assert_eq!(call_deadline("auth_handoff").as_secs(), HANDOFF_DEADLINE_SECS);
-    for tool in TOOLS.iter().filter(|t| !matches!(**t, "captcha_solve" | "auth_handoff")) {
+    let long = ["captcha_solve", "act_click", "form_submit", "auth_handoff"];
+    for tool in TOOLS.iter().filter(|t| !long.contains(*t)) {
         assert_eq!(call_deadline(tool).as_secs(), CALL_DEADLINE_SECS, "{tool}");
     }
 }
@@ -929,11 +934,13 @@ async fn captcha_solve_and_auth_handoff_reach_tabagent_with_their_own_deadline()
         .respond_with(slow(json!({"solved": true, "vendor": "hcaptcha", "method": "solver"})))
         .mount(&mock)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/act.click"))
-        .respond_with(slow(json!({})))
-        .mount(&mock)
-        .await;
+    for route in ["/v1/act.click", "/v1/form.submit", "/v1/act.type"] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(slow(json!({})))
+            .mount(&mock)
+            .await;
+    }
     let long = std::time::Duration::from_secs(5);
     let server = server_for(&mock.uri(), TOOLS).with_deadlines(std::time::Duration::from_millis(250), long, long);
     let (error, body) = text(
@@ -950,8 +957,13 @@ async fn captcha_solve_and_auth_handoff_reach_tabagent_with_their_own_deadline()
             .unwrap(),
     );
     assert!(!error && body.contains("hcaptcha"), "{body}");
+    // A click or submit may solve a CAPTCHA inline (autoCaptcha).
+    for (id, tool) in [(5, "act_click"), (6, "form_submit")] {
+        let (error, body) = text(&server.handle(&call(id, tool, json!({"ref": "e3"}))).await.unwrap());
+        assert!(!error, "{tool}: {body}");
+    }
     // The short default still applies to every other tool.
-    let (error, body) = text(&server.handle(&call(3, "act_click", json!({"ref": "e3"}))).await.unwrap());
+    let (error, body) = text(&server.handle(&call(3, "act_type", json!({"text": "x", "ref": "e3"}))).await.unwrap());
     assert!(error && body.contains("did not answer"), "{body}");
     let requests = mock.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -961,7 +973,7 @@ async fn captcha_solve_and_auth_handoff_reach_tabagent_with_their_own_deadline()
     // reason is required; nothing is sent without it.
     let (error, body) = text(&server.handle(&call(4, "auth_handoff", json!({"tabId": 7}))).await.unwrap());
     assert!(error && body.contains("reason is required"), "{body}");
-    assert_eq!(mock.received_requests().await.unwrap().len(), 3);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 5);
 }
 
 #[tokio::test]

@@ -52,8 +52,9 @@ Only reads could be classified as read-only later.
 - Jarvis never starts TabAgent. If nothing listens, or the extension is not
   connected, the tool returns "browser offline".
 - Each call has a 90 s deadline, below the Codex bridge's 120 s cap, and a
-  `timeout` argument is capped at 60 s. Two tools wait for longer:
-  `captcha_solve` 160 s (TabAgent's solver cap is 120 s) and `auth_handoff`
+  `timeout` argument is capped at 60 s. Some tools wait for longer:
+  `captcha_solve`, `act_click` and `form_submit` 160 s (TabAgent's solver cap
+  is 120 s, and autoCaptcha solves inside clicks and submits) and `auth_handoff`
   33 min (TabAgent's remote handoff waits 30 min, after a possible 120 s
   approval prompt). The server entry declares them in `toolTimeouts`; the
   Codex bridge honours those for the named tools only (capped at 2400 s), and
