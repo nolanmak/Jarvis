@@ -96,7 +96,7 @@ class DeploymentTests(unittest.TestCase):
                 'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'policy_sha256':m.digest(policy.read_bytes()),'dry_run':False,'external':True,
                 'config':{'AUGMENTAGENT_AUTOPR':'1','HOME':str(root),'PATH':'/usr/bin:/bin','AUGMENTAGENT_NATIVE_VM_POLICY':str(policy),
                           'CLAUDE_CLI':'/usr/bin/true','CODEX_CLI':'/usr/bin/true','AUGMENTAGENT_RUN_RESOURCES':'1'}} for role,child in children.items()}
-            for case in ('matched','provider-update','provider-drift','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift'):
+            for case in ('matched','provider-update','provider-drift','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift','pinned-worker','pinned-wrong-binary','pinned-daemon'):
                 with self.subTest(case=case):
                     current=json.loads(json.dumps(values))
                     if case=='worker-missing-policy':current['worker']['config'].pop('AUGMENTAGENT_NATIVE_VM_POLICY')
@@ -106,6 +106,10 @@ class DeploymentTests(unittest.TestCase):
                     if case=='route-drift':
                         route=root/'router.json';write(route,{'mode':'direct','api_key':'do-not-output-this-value'})
                         current['worker']['config']['AUGMENTAGENT_MODEL_ROUTER_CONFIG']=str(route)
+                    # #2468 — a pinned worker is checked against its own build.
+                    if case=='pinned-worker':current['worker']['config']['AUGMENTAGENT_AUTOSHIP_PINNED_BINARY']=str(binary)
+                    if case=='pinned-wrong-binary':current['worker']['config']['AUGMENTAGENT_AUTOSHIP_PINNED_BINARY']='/usr/bin/true'
+                    if case=='pinned-daemon':current['daemon']['config']['AUGMENTAGENT_AUTOSHIP_PINNED_BINARY']=str(binary)
                     if case=='stale':current['worker']['birth']='0'
                     if case=='dry-run':current['worker']['dry_run']=True
                     if case=='secret-field':current['worker']['config']['API_KEY']='do-not-output-this-value'
@@ -134,7 +138,9 @@ class DeploymentTests(unittest.TestCase):
                         return result
                     with patch.object(m,'snapshot',side_effect=snapshot_during_update):
                         report=m.inspect(expected,selection,receipts,pid_for)
-                    self.assertEqual(report['matches'],case in ('matched','provider-update'),report)
+                    self.assertEqual(report['matches'],case in ('matched','provider-update','pinned-worker'),report)
+                    if case=='pinned-wrong-binary':self.assertEqual(report['services']['worker']['status'],'executable-mismatch')
+                    if case=='pinned-daemon':self.assertEqual(report['services']['daemon']['status'],'executable-mismatch')
                     self.assertFalse(report['live_verified'])
                     if case=='matched':self.assertEqual(report['status'],'configuration-matched')
                     if case=='worker-missing-policy':self.assertEqual(report['services']['worker']['status'],'policy-not-selected')

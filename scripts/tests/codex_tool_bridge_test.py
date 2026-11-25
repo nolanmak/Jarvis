@@ -1229,6 +1229,243 @@ class HandoffTests(unittest.TestCase):
                 journal.observe_hook({**event, 'hook_event_name': 'PostToolUse', 'tool_response': 'running'})
             self.assertEqual(journal.inspect(), [])
 
+    # #2519: TabAgent browser tools. Pure page reads must stay live (a re-read
+    # after the page changes is a new observation, not a replayed effect), and
+    # UI actions legitimately repeat with identical arguments.
+    TABAGENT_READS = {
+        'page_snapshot': {'mode': 'interactive', 'maxTokens': 3000},
+        'page_markdown': {'maxChars': 2500},
+        'page_text': {},
+        'page_find': {'by': 'role', 'value': 'textbox'},
+        'extract_table': {'index': 0, 'format': 'json'},
+        'extract_links': {'filter': '/in/', 'limit': 20},
+        'nav_wait': {'for': 'text', 'value': 'Add a comment'},
+    }
+
+    @staticmethod
+    def primary_call(journal, name, arguments, identifier, response='synthetic-ok'):
+        event = {'tool_name': name, 'tool_input': arguments, 'tool_use_id': identifier}
+        journal.observe_hook({**event, 'hook_event_name': 'PreToolUse'})
+        journal.observe_hook({**event, 'hook_event_name': 'PostToolUse', 'tool_response': response})
+
+    def test_tabagent_reads_remain_live_and_unjournaled(self):
+        for leaf, arguments in self.TABAGENT_READS.items():
+            with self.subTest(tool=leaf):
+                self.assertTrue(bridge.read_only_operation('mcp__tabagent__' + leaf, arguments))
+        # nav_wait for=fn runs page JavaScript; it is never a read.
+        self.assertFalse(bridge.read_only_operation('mcp__tabagent__nav_wait', {'for': 'fn', 'value': 'x'}))
+        self.assertFalse(bridge.read_only_operation('mcp__tabagent__nav_wait', {'value': 'x'}))
+        for leaf in ('nav_goto', 'act_click', 'act_type', 'act_press', 'act_select', 'act_check',
+                     'act_hover', 'act_scroll', 'act_fill', 'form_fill', 'form_submit', 'dialog_handle',
+                     'unknown_tool'):
+            with self.subTest(tool=leaf):
+                self.assertFalse(bridge.read_only_operation('mcp__tabagent__' + leaf, {'ref': 'e1'}))
+        # Names are exact, not a prefix or another server's tool.
+        self.assertFalse(bridge.read_only_operation('mcp__tabagent__page_find_and_click', {}))
+        self.assertFalse(bridge.read_only_operation('mcp__other__page_find', {}))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for leaf, arguments in self.TABAGENT_READS.items():
+                for identifier in ('read-1', 'read-2'):
+                    self.primary_call(journal, 'mcp__tabagent__' + leaf, arguments, leaf + identifier)
+            self.assertEqual(journal.inspect(), [])
+
+    def test_tabagent_tab_list_is_live_while_tab_changes_are_journaled(self):
+        name = 'mcp__tabagent__tabs'
+        self.assertTrue(bridge.read_only_operation(name, {'action': 'list'}))
+        for action in ('new', 'select', 'close', 'unknown'):
+            self.assertFalse(bridge.read_only_operation(name, {'action': action}))
+        self.assertFalse(bridge.read_only_operation(name, {'action': 'list', 'url': 'https://example.test/'}))
+        self.assertFalse(bridge.read_only_operation(name, {}))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            self.primary_call(journal, name, {'action': 'list'}, 'list-1')
+            self.primary_call(journal, name, {'action': 'new', 'url': 'https://example.test/'}, 'new-1')
+            self.primary_call(journal, name, {'action': 'list'}, 'list-2')
+            self.primary_call(journal, name, {'action': 'close', 'tabId': 7}, 'close-1')
+            self.assertEqual([(row['tool'], row['status']) for row in journal.inspect()],
+                             [(name, 'completed'), (name, 'completed')])
+
+    def test_tabagent_repeated_identical_click_is_allowed_and_journaled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for identifier in ('click-1', 'click-2', 'click-3'):
+                self.primary_call(journal, 'mcp__tabagent__act_click', {'ref': 'e45'}, identifier)
+            for leaf, arguments in (('act_scroll', {'dy': 1600}), ('act_press', {'key': 'Enter'}),
+                                    ('nav_goto', {'url': 'https://example.test/'}),
+                                    ('tabs', {'action': 'select', 'tabId': 7}),
+                                    ('dialog_handle', {'action': 'accept'}),
+                                    ('form_fill', {'fields': [{'ref': 'e3', 'value': 'synthetic'}]})):
+                for identifier in ('first', 'again'):
+                    self.primary_call(journal, 'mcp__tabagent__' + leaf, arguments, leaf + identifier)
+            rows = journal.load()['operations']
+            self.assertEqual(len(rows), 15)
+            self.assertTrue(all(row['status'] == 'completed' for row in rows))
+            # A UI action that returned an error was seen by the primary; it
+            # may retry the same element (for example after a re-snapshot).
+            failed = {'tool_name': 'mcp__tabagent__act_click', 'tool_input': {'ref': 'e9'},
+                      'tool_use_id': 'failed-click'}
+            journal.observe_hook({**failed, 'hook_event_name': 'PreToolUse'})
+            journal.observe_hook({**failed, 'hook_event_name': 'PostToolUseFailure', 'error': 'stale ref'})
+            self.primary_call(journal, 'mcp__tabagent__act_click', {'ref': 'e9'}, 'retry-click')
+            self.assertEqual([row['status'] for row in journal.load()['operations']][-2:], ['failed', 'completed'])
+
+    def test_tabagent_click_still_needs_reconciliation_after_an_uncertain_crash(self):
+        # Exempting UI actions from repeat dedupe must not exempt them from
+        # crash reconciliation: an unanswered click still blocks mutations.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.observe_hook({'tool_name': 'mcp__tabagent__act_click', 'tool_input': {'ref': 'e45'},
+                'tool_use_id': 'crashed-click', 'hook_event_name': 'PreToolUse'})
+            with self.assertRaises(bridge.ReconciliationRequired):
+                journal.observe_hook({'tool_name': 'mcp__tabagent__act_click', 'tool_input': {'ref': 'e45'},
+                    'tool_use_id': 'after-crash', 'hook_event_name': 'PreToolUse'})
+            with self.assertRaises(bridge.ReconciliationRequired):
+                journal.execute('mcp__tabagent__act_click', {'ref': 'e45'}, lambda: 'blind-replay')
+            # Reads stay available so the model can inspect the page.
+            self.primary_call(journal, 'mcp__tabagent__page_snapshot', {'mode': 'interactive'}, 'inspect')
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['started'])
+
+    def test_tabagent_repeated_click_runs_again_through_the_bridge(self):
+        # The Codex path executes through HandoffJournal.execute: a completed
+        # click must run again instead of returning the stale first receipt.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            clicks = []
+            for _ in range(2):
+                journal.execute('mcp__tabagent__act_click', {'ref': 'e45'},
+                                lambda: clicks.append(1) or {'content': [{'type': 'text', 'text': 'ok'}]})
+            self.assertEqual(len(clicks), 2)
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['completed', 'completed'])
+            submits = []
+            for _ in range(2):
+                journal.execute('mcp__tabagent__form_submit', {'ref': 'e3'},
+                                lambda: submits.append(1) or {'content': [{'type': 'text', 'text': 'ok'}]})
+            self.assertEqual(len(submits), 1)
+
+    def test_tabagent_captcha_and_handoff_repeat_and_stay_journaled(self):
+        # nolanmak/tabagent#61: "retry once" after CAPTCHA_UNSOLVED and a new
+        # handoff after the owner cancelled are new, intended actions.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for leaf, arguments in (('captcha_solve', {'tabId': 7}),
+                                    ('auth_handoff', {'tabId': 7, 'reason': 'Scan your ID'})):
+                self.assertFalse(bridge.read_only_operation('mcp__tabagent__' + leaf, arguments))
+                self.assertTrue(bridge.repeatable_operation('mcp__tabagent__' + leaf))
+                for identifier in ('first', 'again'):
+                    self.primary_call(journal, 'mcp__tabagent__' + leaf, arguments, leaf + identifier)
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['completed'] * 4)
+
+    def test_tabagent_repeated_identical_form_submit_is_still_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            self.primary_call(journal, 'mcp__tabagent__form_submit', {'ref': 'e3'}, 'submit-1')
+            before = journal.path.read_bytes()
+            with self.assertRaises(bridge.CompletedOperation):
+                journal.observe_hook({'tool_name': 'mcp__tabagent__form_submit', 'tool_input': {'ref': 'e3'},
+                    'tool_use_id': 'submit-2', 'hook_event_name': 'PreToolUse'})
+            self.assertEqual(journal.path.read_bytes(), before)
+            # A different form is a different operation.
+            self.primary_call(journal, 'mcp__tabagent__form_submit', {'ref': 'e8'}, 'submit-3')
+
+    def test_issue_2519_browser_sequence_completes_without_stranding(self):
+        # The recorded #2519 turn: snapshot, click the Comment button, read the
+        # page, scroll to the same ref, click it again, then repeat an earlier
+        # identical page_find. The second click and the repeated read were
+        # refused as "already completed"; every call below must now run.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            sequence = [
+                ('tabs', {'action': 'new', 'url': 'https://example.test/search'}),
+                ('extract_links', {'filter': '/in/', 'limit': 20}),
+                ('nav_goto', {'url': 'https://example.test/activity', 'waitUntil': 'load'}),
+                ('page_markdown', {'maxChars': 2500}),
+                ('act_scroll', {'dy': 1600}),
+                ('page_snapshot', {'mode': 'interactive', 'maxTokens': 3000}),
+                ('act_click', {'ref': 'e45'}),
+                ('page_find', {'by': 'text', 'value': 'Add a comment'}),
+                ('page_find', {'by': 'role', 'value': 'textbox'}),
+                ('page_snapshot', {'mode': 'interactive', 'diff': True, 'maxTokens': 1500}),
+                ('page_find', {'by': 'role', 'value': 'button', 'name': 'Comment'}),
+                ('act_scroll', {'ref': 'e45'}),
+                ('act_click', {'ref': 'e45'}),
+                ('page_find', {'by': 'role', 'value': 'textbox'}),
+                ('act_type', {'ref': 'e9', 'text': 'synthetic comment'}),
+                ('page_snapshot', {'mode': 'interactive', 'maxTokens': 3000}),
+                ('act_click', {'ref': 'e50'}),
+                ('tabs', {'action': 'list'}),
+                ('tabs', {'action': 'close', 'tabId': 7}),
+            ]
+            for index, (leaf, arguments) in enumerate(sequence):
+                with self.subTest(step=index, tool=leaf):
+                    self.primary_call(journal, 'mcp__tabagent__' + leaf, arguments, 'step-%d' % index)
+            rows = journal.load()['operations']
+            self.assertTrue(all(row['status'] == 'completed' for row in rows))
+            self.assertEqual([row['tool'].split('__')[-1] for row in rows],
+                             ['tabs', 'nav_goto', 'act_scroll', 'act_click', 'act_scroll',
+                              'act_click', 'act_type', 'act_click', 'tabs'])
+            # Ordinary mutations after the browser work still go through.
+            self.primary_call(journal, 'Bash', {'command': 'synthetic-cli create'}, 'after-browser')
+
+    def test_denied_pre_tool_use_never_leaves_a_row_that_blocks_later_calls(self):
+        submit = {'tool_name': 'mcp__tabagent__form_submit', 'tool_input': {'ref': 'e3'}}
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            self.primary_call(journal, submit['tool_name'], submit['tool_input'], 'submit-1')
+            failed = {'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli submit'},
+                      'tool_use_id': 'failed'}
+            journal.observe_hook({**failed, 'hook_event_name': 'PreToolUse'})
+            journal.observe_hook({**failed, 'hook_event_name': 'PostToolUseFailure', 'error': 'exit 1'})
+            before = journal.path.read_bytes()
+            denials = [
+                (bridge.CompletedOperation, {**submit, 'tool_use_id': 'dup-submit'}),
+                (bridge.ReconciliationRequired, {**failed, 'tool_use_id': 'blind-retry'}),
+                (bridge.Denied, {**submit, 'tool_use_id': ''}),
+            ]
+            for error, event in denials:
+                with self.subTest(event=event['tool_use_id']):
+                    with self.assertRaises(error):
+                        journal.observe_hook({**event, 'hook_event_name': 'PreToolUse'})
+                    self.assertEqual(journal.path.read_bytes(), before)
+                    # Should a Post event ever follow the denied call, it
+                    # cannot create or resolve a row either.
+                    for phase in ('PostToolUse', 'PostToolUseFailure'):
+                        with self.assertRaises(bridge.Denied):
+                            journal.observe_hook({**event, 'hook_event_name': phase,
+                                                  'tool_response': 'late', 'error': 'denied'})
+                        self.assertEqual(journal.path.read_bytes(), before)
+            # Later reads and mutations, including UI repeats, all proceed.
+            self.primary_call(journal, 'mcp__tabagent__page_find', {'by': 'role', 'value': 'textbox'}, 'read')
+            self.primary_call(journal, 'mcp__tabagent__act_click', {'ref': 'e45'}, 'click-1')
+            self.primary_call(journal, 'mcp__tabagent__act_click', {'ref': 'e45'}, 'click-2')
+            self.primary_call(journal, 'Bash', {'command': 'synthetic-cli other'}, 'other')
+            self.assertFalse(any(row['status'] == 'started' for row in journal.load()['operations']))
+
+    def test_denied_hook_cli_call_leaves_journal_usable(self):
+        # The same contract through the installed --handoff-hook entry point:
+        # a duplicate submit exits 2 (deny) and the next calls still pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'operations.json'
+            def hook(event):
+                return subprocess.run([sys.executable, '-I', str(SPEC.origin), '--handoff-hook', str(path)],
+                                      input=json.dumps(event), capture_output=True, text=True)
+            submit = {'tool_name': 'mcp__tabagent__form_submit', 'tool_input': {'ref': 'e3'}}
+            for event in ({**submit, 'tool_use_id': 's1', 'hook_event_name': 'PreToolUse'},
+                          {**submit, 'tool_use_id': 's1', 'hook_event_name': 'PostToolUse', 'tool_response': 'ok'}):
+                self.assertEqual(hook(event).returncode, 0)
+            denied = hook({**submit, 'tool_use_id': 's2', 'hook_event_name': 'PreToolUse'})
+            self.assertEqual(denied.returncode, 2)
+            self.assertIn('already completed', denied.stderr)
+            for identifier in ('c1', 'c2'):
+                click = {'tool_name': 'mcp__tabagent__act_click', 'tool_input': {'ref': 'e45'},
+                         'tool_use_id': identifier}
+                self.assertEqual(hook({**click, 'hook_event_name': 'PreToolUse'}).returncode, 0)
+                self.assertEqual(hook({**click, 'hook_event_name': 'PostToolUse',
+                                       'tool_response': 'ok'}).returncode, 0)
+            read = {'tool_name': 'mcp__tabagent__page_find', 'tool_input': {'by': 'role', 'value': 'textbox'},
+                    'tool_use_id': 'r1', 'hook_event_name': 'PreToolUse'}
+            self.assertEqual(hook(read).returncode, 0)
+
     def test_operator_reconciliation_records_observed_completion_without_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
@@ -1817,6 +2054,59 @@ for line in sys.stdin:
             start=time.monotonic()
             with self.assertRaisesRegex(bridge.Readiness, 'JARVIS_READINESS:mcp_timeout'): server.tools()
             self.assertLess(time.monotonic()-start,3)
+
+    def slow_fixture(self, root):
+        fake = root / 'slow.py'
+        fake.write_text("""import json,sys,time
+for line in sys.stdin:
+ v=json.loads(line)
+ if 'id' not in v: continue
+ m=v['method']
+ if m=='initialize': r={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+ elif m=='tools/list': r={'tools':[{'name':name,'inputSchema':{'type':'object','properties':{}}} for name in ['wait_human','search']]}
+ elif m=='tools/call':
+  time.sleep(0.6); r={'content':[{'type':'text','text':'SLOW_OK'}]}
+ else: r={}
+ print(json.dumps({'jsonrpc':'2.0','id':v['id'],'result':r}),flush=True)
+""")
+        return fake
+
+    def test_declared_tool_timeout_outlasts_the_server_default_for_that_tool_only(self):
+        # nolanmak/tabagent#61: auth_handoff waits for a person; only the
+        # tools a server names get a longer wait than its 120 s-capped default.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self.slow_fixture(Path(tmp))
+            def server_with(tool_timeouts):
+                policy = bridge.Policy({'cwd': tmp, 'allowed_tools': ['mcp__fixture__wait_human', 'mcp__fixture__search'],
+                    'settings': {'mcpServers': {'fixture': {'command': sys.executable, 'args': ['-I', str(fake)],
+                        'timeout': 0.3, 'toolTimeouts': tool_timeouts}}}})
+                server = bridge.Server(policy)
+                self.addCleanup(server.close)
+                return server
+            server = server_with({'wait_human': 5})
+            result = server.dispatch({'method': 'tools/call', 'params': {'name': 'mcp__fixture__wait_human', 'arguments': {}}})
+            self.assertEqual(result['content'][0]['text'], 'SLOW_OK')
+            other = server_with({'wait_human': 5})
+            timed_out = other.dispatch({'method': 'tools/call', 'params': {'name': 'mcp__fixture__search', 'arguments': {}}})
+            self.assertTrue(timed_out['isError'])
+            self.assertIn('JARVIS_READINESS:mcp_timeout', timed_out['content'][0]['text'])
+
+    def test_declared_tool_timeouts_are_validated_and_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self.slow_fixture(Path(tmp))
+            def remote(tool_timeouts):
+                policy = bridge.Policy({'cwd': tmp, 'allowed_tools': ['mcp__fixture__wait_human'],
+                    'settings': {'mcpServers': {'fixture': {'command': sys.executable, 'args': ['-I', str(fake)],
+                        'toolTimeouts': tool_timeouts}}}})
+                client = bridge.Remote(policy.settings['mcpServers']['fixture'], policy)
+                self.addCleanup(client.close)
+                return client
+            self.assertEqual(remote({'wait_human': 10 ** 6}).tool_timeout('wait_human'), bridge.MCP_TOOL_TIMEOUT_MAX)
+            self.assertEqual(remote({'wait_human': 1995}).tool_timeout('wait_human'), 1995)
+            self.assertEqual(remote({}).tool_timeout('wait_human'), 30)
+            for bad in ({'wait_human': 0}, {'wait_human': 'long'}, {'wait_human': True}, ['wait_human']):
+                with self.assertRaises(bridge.Denied):
+                    remote(bad)
 
     def test_missing_declared_remote_tool_fails_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3860,6 +4150,35 @@ class ReadAllowanceTests(unittest.TestCase):
     def test_handoff_state_cannot_match_a_read_allowance(self):
         with self.assertRaisesRegex(bridge.Denied, 'outside model tool scopes'):
             self.make_policy(handoff_path=str(self.inbox / 'aa-txt-99-0.md'))
+
+
+class InspectBuildReadinessTests(unittest.TestCase):
+    """#2532: a policy the bridge refuses must name why, not only `mcp_start`."""
+
+    def inspect(self, policy):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'policy.json'
+            path.write_text(json.dumps(policy(Path(temp))))
+            result = subprocess.run([sys.executable, '-I', str(Path(__file__).parents[1] / 'codex-tool-bridge.py'),
+                                     '--inspect-build-readiness', str(path)],
+                                    capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_refused_write_grant_reports_the_denial(self):
+        def policy(temp):
+            work = temp / 'work'
+            work.mkdir()
+            (work / 'AGENTS.md').write_text('x')
+            return {'cwd': str(work), 'write_roots': [], 'write_files': [str(work / 'AGENTS.md')],
+                    'autoship_in_place_writes': True, 'allowed_tools': ['Bash(cargo *)']}
+        report = self.inspect(policy)
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start',
+                                  'detail': 'Denied: credential and control files cannot be admitted'})
+
+    def test_unexpected_error_reports_only_its_type(self):
+        report = self.inspect(lambda temp: {'cwd': str(temp / 'PRIVATE-missing-cwd')})
+        self.assertEqual(report, {'ready': False, 'category': 'mcp_start', 'detail': 'FileNotFoundError'})
 
 
 if __name__ == '__main__':

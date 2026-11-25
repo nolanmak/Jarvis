@@ -48,6 +48,17 @@ python3 "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/target/re
 
 python3 "$REPO_ROOT/scripts/pdf-runtime.py" || die "PDF runtime provisioning failed"
 
+# Provision the auto-ship worker (the only auto-ship execution path, #2275)
+# when this build has it, with the same dry-run setting as the daemon.
+ensure_autopr_worker() {
+  local worker_help=""
+  worker_help=$("$REPO_ROOT/target/release/augmentagent" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      AUGMENTAGENT_AUTOSTART_DRY_RUN="$DRY_RUN" bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" ;;
+  esac
+}
+
 install_macos() {
   source "$REPO_ROOT/scripts/lib/launchd-install.sh"
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -123,9 +134,13 @@ install_macos() {
 </plist>
 PLIST_EOF
   launchd_install "$LABEL" "$PLIST" "$CANDIDATE" true
+  # #2275 — auto-ship runs only in the worker. Register it after the daemon
+  # restarted on this build, as the Linux path orders the worker unit.
+  ensure_autopr_worker
 
   log "Installed."
   log "  Label:     $LABEL"
+  log "  Worker:    com.nolanmak.augmentagent.autopr (auto-ship)"
   log "  Plist:     $PLIST"
   log "  Logs:      $LOG_DIR/"
   log "  Status:    launchctl print gui/$(id -u)/$LABEL | head -30"
@@ -196,12 +211,7 @@ UNIT_EOF
     log "Resource configuration failed; refusing to restart with an unverified policy."
     return 1
   fi
-  local worker_help=""
-  worker_help=$("$REPO_ROOT/target/release/augmentagent" auto-pr-worker --help 2>/dev/null) || true
-  case "$worker_help" in
-    *'Usage: augmentagent auto-pr-worker'*)
-      AUGMENTAGENT_AUTOSTART_DRY_RUN="$DRY_RUN" bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" ;;
-  esac
+  ensure_autopr_worker
 
   log "Enabling + (re)starting $UNIT_NAME"
   systemctl --user enable "$UNIT_NAME" >/dev/null

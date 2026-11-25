@@ -86,9 +86,19 @@ pub(super) async fn filter(
                 Some(value) if value.as_str() == Some("CONFLICTING") => {
                     Some(IntegrationReason::Conflict)
                 }
+                // #2458: an approved PR awaiting checks that is only BEHIND
+                // belongs to the merge sweep, which merges main in and keeps
+                // the approval. Re-integration would drop that approval and
+                // re-enter acceptance preparation (PR #2449 went back to scope).
+                Some(value) if value.as_str() == Some("MERGEABLE") && sweep_finalizes(&snapshot.checkpoint, row) => None,
                 Some(value) if value.as_str() == Some("MERGEABLE") => {
                     if !base.is_empty()
                         && (snapshot.checkpoint.next.reason.starts_with("integration_")
+                            || store.integration_admission_interrupted(
+                                &id,
+                                &candidate.head,
+                                base,
+                            )?
                             || reviewed_base.as_ref().is_some_and(|old| old != base)
                             || snapshot.checkpoint.next.reason == "parent_merged_child_retargeted"
                             || matches!(
@@ -168,6 +178,14 @@ pub(super) async fn filter(
     }
     *candidates = retained;
     Ok(ready)
+}
+
+/// #2458: the merge sweep, not re-integration, finishes an approved PR that
+/// waits on checks and is clean but BEHIND main.
+pub(super) fn sweep_finalizes(cp: &crate::autoship_workflow::Checkpoint, row: &serde_json::Value) -> bool {
+    cp.stage == crate::autoship_workflow::Stage::AwaitChecks
+        && row.get("mergeable").and_then(serde_json::Value::as_str) == Some("MERGEABLE")
+        && super::finalize::merge_state(row) == super::finalize::MergeState::Behind
 }
 
 /// New integration work cannot reuse an approving publication receipt while

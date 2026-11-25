@@ -175,8 +175,19 @@ pub(super) async fn execute_evidence_group(
             }
         }
         group_hashes.push(pass.coverage.prompt_hash.clone());
+        // #2420: the bounded recovery is spent. Conclude the group from what
+        // was observed (retained findings still block) instead of failing a
+        // whole review on one unresolved source request.
+        let concluded = recovery_attempt == 1 && !pass.completed;
+        if concluded {
+            if let Some(workflow)=workflow {
+                workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_unavailable",
+                    "binding":binding,"group":i,"role":role,"request_hash":request.coverage.prompt_hash,
+                    "unresolved_sources":missing,"decision":"conclude_with_observed_evidence"}))?;
+            }
+        }
         if group_review
-            .observe(pass.completed, pass.findings)
+            .observe(pass.completed || concluded, pass.findings)
             .with_context(|| format!("evidence group {i} still needs {missing:?}"))?
         {
             break;

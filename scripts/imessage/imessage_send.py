@@ -281,7 +281,9 @@ class Sender:
             self._report(entry, _outcome("failed", reason="owner alert expired before dispatch"))
             return
         self._write_journal(entry)
-        cmd = [OSASCRIPT, "-e", SCRIPTS[kind], body, entry["target"]]
+        # Message text can start with a hyphen. End option parsing before
+        # either data argument so osascript cannot treat text as CLI flags.
+        cmd = [OSASCRIPT, "-e", SCRIPTS[kind], "--", body, entry["target"]]
         try:
             done = self.runner(cmd, capture_output=True, text=True, timeout=self.send_timeout_s)
         except subprocess.TimeoutExpired:

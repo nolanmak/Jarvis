@@ -86,28 +86,31 @@ fn is_query_thread(kind: ChannelType, parent: Option<ChannelId>, query: ChannelI
         && parent == Some(query)
 }
 
-async fn is_query_conversation(ctx: &Context, msg: &Message, query: Option<ChannelId>) -> bool {
-    is_query_channel(ctx, msg.guild_id, msg.channel_id, query).await
+async fn is_query_conversation(ctx: &Context, msg: &Message, queries: &[ChannelId]) -> bool {
+    is_query_channel(ctx, msg.guild_id, msg.channel_id, queries).await
 }
 
+/// `channel_id` is one of `queries` or a thread directly under one.
 async fn is_query_channel(
     ctx: &Context,
     guild_id: Option<serenity::all::GuildId>,
     channel_id: ChannelId,
-    query: Option<ChannelId>,
+    queries: &[ChannelId],
 ) -> bool {
-    let Some(query) = query else { return false; };
-    if channel_id == query { return true; }
+    if queries.is_empty() { return false; }
+    if queries.contains(&channel_id) { return true; }
     let Some(guild_id) = guild_id else { return false; };
-    if let Some(guild) = ctx.cache.guild(guild_id) {
-        if let Some(thread) = guild.threads.iter().find(|thread| thread.id == channel_id) {
-            return is_query_thread(thread.kind, thread.parent_id, query);
-        }
-    }
-    match channel_id.to_channel(&ctx.http).await {
-        Ok(Channel::Guild(channel)) => is_query_thread(channel.kind, channel.parent_id, query),
-        _ => false,
-    }
+    let cached = ctx.cache.guild(guild_id).and_then(|guild| {
+        guild.threads.iter().find(|thread| thread.id == channel_id).map(|t| (t.kind, t.parent_id))
+    });
+    let (kind, parent) = match cached {
+        Some(found) => found,
+        None => match channel_id.to_channel(&ctx.http).await {
+            Ok(Channel::Guild(channel)) => (channel.kind, channel.parent_id),
+            _ => return false,
+        },
+    };
+    queries.iter().any(|query| is_query_thread(kind, parent, *query))
 }
 
 pub struct Handler {
@@ -125,7 +128,7 @@ impl Handler {
         let Some(guild_id) = command.guild_id else {
             return "Voice requires a server channel; group calls and DMs are unsupported.".into();
         };
-        if !is_query_channel(ctx, Some(guild_id), command.channel_id, self.state.query_channel_id).await {
+        if !is_query_channel(ctx, Some(guild_id), command.channel_id, &self.state.conversation_channels()).await {
             return "Run `/voice` from the configured conversation channel or one of its threads.".into();
         }
         let Some(bridge) = &self.state.voice_bridge else {
@@ -477,7 +480,20 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        // #2398 — a question the owner relayed through a trusted webhook.
+        // Decided first, from the webhook id alone, because the message is
+        // bot-authored and never carries the owner's id. `Some` only for a
+        // listed webhook posting in the query channel itself.
+        let relay = crate::relay::relayed_query(&crate::relay::trusted_ids(), crate::relay::Facts {
+            webhook_id: msg.webhook_id.map(|id| id.get()),
+            application_id: msg.application_id.map(|id| id.get()),
+            channel_id: msg.channel_id.get(),
+            is_dm: msg.guild_id.is_none(),
+            query_channel_id: self.state.query_channel_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()),
+            owner_configured: self.state.allowed_user_id.is_some(),
+        });
+        if msg.author.bot && relay.is_none() {
             if self.state.bot_user_id.get()==Some(&msg.author.id) {
                 if let Some(store)=self.state.store.as_ref() {
                     let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
@@ -499,7 +515,7 @@ impl EventHandler for Handler {
             return;
         };
 
-        if !is_authorized(self.state.allowed_user_id, msg.author.id) {
+        if relay.is_none() && !is_authorized(self.state.allowed_user_id, msg.author.id) {
             debug!(
                 "ignoring message from unauthorized user {} (allowlist configured: {})",
                 msg.author.id.get(),
@@ -509,23 +525,62 @@ impl EventHandler for Handler {
         }
 
         let is_dm = msg.guild_id.is_none();
-        let in_query_channel = is_query_conversation(&ctx, &msg, self.state.query_channel_id).await;
+        let in_query_channel = is_query_conversation(&ctx, &msg, &self.state.conversation_channels()).await;
         if !is_dm && !in_query_channel {
             return;
         }
 
         let user_text = msg.content.trim().to_string();
+        // #2398 — a relayed message is a question and nothing else. Text that
+        // would be an owner command is refused here, before any dispatcher,
+        // and every dispatcher below is also skipped for it.
+        if let Some(webhook_id) = relay {
+            info!(via_relay = true, webhook_id, channel_id = %msg.channel_id, msg_id = %msg.id,
+                "discord query relayed through trusted webhook");
+            if crate::relay::is_command_like(&user_text) {
+                info!(via_relay = true, webhook_id, "relayed command refused");
+                let builder = CreateMessage::new().content(crate::relay::NO_COMMANDS)
+                    .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+                if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                    warn!("failed to post relay command refusal");
+                }
+                return;
+            }
+        }
+        let relayed = relay.is_some();
+        // #2219 — the yolo-thread gate. In a yolo thread only `/yolo`,
+        // `/search` and plain text (a yolo turn) are handled; no other owner
+        // command runs there. An unreadable registry pauses every thread under
+        // the query channel; DMs and the query channel itself can never be
+        // yolo threads and are unaffected.
+        let is_query_root = self.state.query_channel_id == Some(msg.channel_id);
+        let thread_mark = augmentagent_store::yolo_threads::mark(msg.channel_id.get());
+        let yolo_thread = thread_mark == augmentagent_store::yolo_threads::ThreadMark::Yes;
+        // Extra conversation channels are roots too: never yolo threads.
+        let is_conversation_root = is_query_root || self.state.extra_query_channel_ids.contains(&msg.channel_id);
+        if thread_mark == augmentagent_store::yolo_threads::ThreadMark::Unknown && !is_dm && !is_conversation_root {
+            let builder = CreateMessage::new()
+                .content(format!("Yolo thread registry is unreadable ({}); threads are paused until it is fixed.",
+                    augmentagent_store::yolo_threads::config_path().display()))
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post yolo registry notice");
+            }
+            return;
+        }
         let autoship_context = crate::autoship::Context {
             bot: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
             owner: self.state.allowed_user_id.map(|id| id.get()),
             author: msg.author.id.get(), channel: msg.channel_id.get(), message: msg.id.get(),
             guild: msg.guild_id.map(|id| id.get()),
         };
+        if !yolo_thread && !relayed {
         match crate::autoship::dispatch(handler.as_ref(), &crate::autoship::DiscordTransport(Arc::clone(&ctx.http)),
             &autoship_context, &user_text).await {
             Ok(false) => {},
             Ok(true) => return,
             Err(_) => { warn!("autoship command or delivery failed; message withheld from ordinary chat"); return; }
+        }
         }
         // #1496: consume phone setup before attachments, history, native turn
         // claims or model inference, even if the phone adapter is unavailable.
@@ -536,7 +591,10 @@ impl EventHandler for Handler {
             author_id: msg.author.id.get(),
             message_id: msg.id.get(),
         };
-        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+        let phone_reply = if yolo_thread || relayed { None } else {
+            crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await
+        };
+        if let Some(reply) = phone_reply {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
@@ -547,11 +605,50 @@ impl EventHandler for Handler {
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
+        let model_reply = if yolo_thread || relayed { None } else {
+            crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await
+        };
+        if let Some(reply) = model_reply {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
                 warn!("failed to post model command reply: {error}");
+            }
+            return;
+        }
+        // #2208 — other owner text commands (`/search`). Same position and
+        // rules as the model command above: owner only, never model input.
+        let command_ctx = crate::owner_text::OwnerCommandCtx {
+            guild_id: msg.guild_id.map(|guild| guild.get()),
+            channel_id: msg.channel_id.get(),
+            message_id: msg.id.get(),
+            is_dm,
+            is_query_channel: is_query_root,
+            query_channel_id: self.state.query_channel_id.map(|channel| channel.get()),
+        };
+        let owner_command = if relayed { None } else { handler.owner_text_command(command_ctx, &user_text).await };
+        if let Some(outcome) = owner_command {
+            let reply = match outcome {
+                crate::owner_text::OwnerCommandOutcome::Reply(reply) => reply,
+                crate::owner_text::OwnerCommandOutcome::OpenYoloThread { intro } => {
+                    open_yolo_thread(&ctx.http, &msg, &intro).await
+                }
+            };
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
+                warn!("failed to post owner command reply: {error}");
+            }
+            return;
+        }
+        // Anything else that looks like a command does not run in a yolo
+        // thread. Bare words that are commands elsewhere (`model …`,
+        // `loop …`) are plain text here.
+        if yolo_thread && user_text.split_whitespace().next().is_some_and(|first| first.starts_with('/') || first.starts_with('!')) {
+            let builder = CreateMessage::new().content(crate::owner_text::NOT_IN_YOLO_THREAD)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post yolo thread command refusal");
             }
             return;
         }
@@ -561,7 +658,7 @@ impl EventHandler for Handler {
             docs,
             mut rejected,
         } = partition_attachments(&msg.attachments);
-        let compute_enabled = self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
+        let compute_enabled = !yolo_thread && self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
             && matches!(std::env::var("AUGMENTAGENT_COMPUTE_ENABLED").as_deref(), Ok("true" | "1"));
         let compute_files: Vec<_> = if compute_enabled {
             msg.attachments.iter().filter(|a| crate::compute_inputs::eligible(
@@ -590,7 +687,7 @@ impl EventHandler for Handler {
         // `!journal` — ShadowNote journaling write-back (#428).
         // Handled inline, never routed to wiki-ask. The slow
         // path (compose LLM call + KMS + AppSync) runs off the event loop.
-        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text) {
+        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text).filter(|_| !relayed) {
             use crate::journal_cmd::{JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
             let ops = self.state.journal_ops.clone();
             let ctx_for_history = ctx.clone();
@@ -648,7 +745,7 @@ impl EventHandler for Handler {
         // refusal in `process_loops::handle` covers the no-allowlist case
         // (without an allowlist, *anyone* DMing the bot could kill host
         // processes — refuse the command entirely in that mode).
-        if user_text == "!loops" || user_text.starts_with("!loops ") {
+        if !relayed && (user_text == "!loops" || user_text.starts_with("!loops ")) {
             let allowlist_active = self.state.allowed_user_id.is_some();
             let text = user_text.clone();
             let http = ctx.http.clone();
@@ -673,7 +770,7 @@ impl EventHandler for Handler {
         // inline; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
         // as long as it's word-bounded (so `loops are nice` isn't matched).
-        if crate::loops::match_loop_prefix(&user_text).is_some() {
+        if !yolo_thread && !relayed && crate::loops::match_loop_prefix(&user_text).is_some() {
             let owner = msg.author.id.get().to_string();
             let channel_ref = msg.channel_id.get().to_string();
             let subcommand = crate::loops::match_loop_prefix(&user_text)
@@ -726,13 +823,15 @@ impl EventHandler for Handler {
         tokio::spawn(async move {
             // Fetch recent messages in this channel/DM so follow-up questions
             // see the prior exchange. Bounded by age + char cap inside the fn.
-            let history = fetch_conversation_context(
+            // #2219 — everything this turn does runs under the yolo flag when
+            // the message is in a yolo thread; the isolation checks key on it.
+            let history = crate::interaction::yolo_turn(yolo_thread, fetch_conversation_context(
                 &ctx_for_history,
                 channel_id,
                 msg_id,
                 bot_user_id,
                 allowed_user_id,
-            )
+            ))
             .await;
 
             // Download attachments to /tmp so the reasoner's Read tool can open
@@ -740,6 +839,17 @@ impl EventHandler for Handler {
             // and warn about the rest. PDF/DOCX attachments are converted to
             // text via pdftotext/pandoc and join downloaded_txts so the prompt
             // path treats them uniformly.
+            // #2219 — a yolo turn takes no attachments: PDF and DOCX
+            // attachments are registered under the wiki, which normal turns
+            // read, and the model is text-only.
+            let had_attachments = !images.is_empty() || !text_files.is_empty() || !docs.is_empty();
+            // #2398 — nor does a relayed query: documents are registered
+            // under the wiki, which is a change the owner did not make.
+            let (images, text_files, docs) = if yolo_thread || relayed {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                (images, text_files, docs)
+            };
             let downloaded_imgs = download_images(&images, msg_id.get()).await;
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
             let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
@@ -747,6 +857,15 @@ impl EventHandler for Handler {
             downloaded_txts.extend(extracted_docs.text.iter().cloned());
 
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            if yolo_thread && had_attachments {
+                current.push_str("\n[attachments are not available in a yolo thread]");
+            }
+            if let Some(webhook_id) = relay {
+                if had_attachments {
+                    current.push_str("\n[attachments on a relayed message are not read]");
+                }
+                current = format!("{}{current}", crate::relay::prompt_note(webhook_id));
+            }
             for notice in &extracted_docs.notices {
                 current.push('\n');
                 current.push_str(notice);
@@ -783,10 +902,17 @@ impl EventHandler for Handler {
             let result = run_with_typing(
                 &http,
                 channel_id,
-                crate::interaction::owner_history(
+                crate::interaction::yolo_turn(yolo_thread, crate::interaction::owner_history(
                     allowed_user_id.is_some() && (is_dm || in_query_channel),
-                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current)))),
             ).await;
+            // Every message posted for a yolo turn starts with this line.
+            // A reply to a relayed query says so on its first line.
+            let yolo_tag = if yolo_thread {
+                Some(handler.yolo_tag())
+            } else {
+                relayed.then(|| crate::relay::REPLY_TAG.to_string())
+            };
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
@@ -815,17 +941,25 @@ impl EventHandler for Handler {
                         answer.push_str("\n\n");
                         answer.push_str(f);
                     }
+                    let chunks = chunk_for_discord(&answer);
+                    let chunks = match &yolo_tag {
+                        Some(tag) => crate::owner_text::tag_chunks(tag, chunks, DISCORD_MSG_LIMIT),
+                        None => chunks,
+                    };
                     send_chunks_reply_chain(
                         &http,
                         channel_id,
                         msg_id,
-                        chunk_for_discord(&answer),
+                        chunks,
                         attachments,
                         "wiki answer chunk",
                     )
                     .await;
                     let final_spoken = handler.take_final_spoken(&audit_ctx.session_id);
-                    if !final_spoken && !answer.trim().is_empty() && answer.len() <= 12_000 {
+                    // #2218 — an answer in a yolo thread is never spoken.
+                    let yolo_thread = augmentagent_store::yolo_threads::closed_to_normal_turns(
+                        augmentagent_store::yolo_threads::mark(channel_id.get()), true);
+                    if !final_spoken && !yolo_thread && !answer.trim().is_empty() && answer.len() <= 12_000 {
                         if let (Some(bridge), Some(guild)) = (&voice_bridge, guild_id) {
                             let guild = guild.to_string();
                             let conversation = format!("{guild}:{}", channel_id.get());
@@ -853,6 +987,9 @@ impl EventHandler for Handler {
                             })
                     });
                     let mut err_msg = failed_turn_reply(&e, interrupted);
+                    if let Some(tag) = &yolo_tag {
+                        err_msg = format!("{tag}\nfailed: {err_msg}");
+                    }
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
                         err_msg.push_str(f);
@@ -1266,9 +1403,11 @@ impl EventHandler for Handler {
                             }
                             return;
                         }
-                        let at_ms = match crate::timeparse::resolve_token(
+                        // #2286 — the owner's zone, the same one the select's
+                        // placeholder names and confirmations show.
+                        let at_ms = match crate::timeparse::resolve_token_in(
                             &token,
-                            chrono::Local::now(),
+                            chrono::Utc::now().with_timezone(&crate::timeparse::owner_zone()),
                         ) {
                             Ok(v) => v,
                             Err(msg) => {
@@ -1552,9 +1691,9 @@ impl EventHandler for Handler {
                     let ctx_clone = ctx.clone();
                     let modal_clone = modal.clone();
                     tokio::spawn(async move {
-                        let at_ms = match crate::timeparse::parse_send_at(
+                        let at_ms = match crate::timeparse::parse_send_at_in(
                             &input,
-                            chrono::Local::now(),
+                            chrono::Utc::now().with_timezone(&crate::timeparse::owner_zone()),
                         ) {
                             Ok(v) => v,
                             Err(msg) => {
@@ -2177,6 +2316,14 @@ async fn delete_notice_message(
 /// (auto-triage replies, non-gmail platforms) and no `attachment` → the body
 /// passes through unchanged. Public since #501: the Back-to-queue repost in
 /// the CLI reuses it so the reposted card matches the Revise repost exactly.
+/// The `--send-at` proposal of a card that is still `pending` (an armed
+/// schedule has its own notice; a resolved row has no card).
+fn pending_send_at_proposal(store: &augmentagent_store::Store, action_id: &str) -> Option<i64> {
+    let at_ms = store.action_scheduled_at(action_id).ok().flatten()?;
+    let row = store.get_action_with_email(action_id).ok().flatten()?;
+    (row.action.status == "pending").then_some(at_ms)
+}
+
 pub fn append_envelope_markers(
     body: String,
     store: Option<&augmentagent_store::Store>,
@@ -2203,6 +2350,15 @@ pub fn append_envelope_markers(
         if let Some(subject) = env.subject.as_deref() {
             markers.push_str(&format!("\n[subject: {subject}]"));
         }
+    }
+    // #1640 — a still-pending card carrying a `--send-at` proposal: Approve
+    // arms a schedule, so every redraw (queued post, reminder, Revise) must
+    // show when it will send, not only the first post.
+    if let Some(at_ms) = store.and_then(|s| pending_send_at_proposal(s, action_id)) {
+        markers.push_str(&format!(
+            "\n[sends: {}]",
+            crate::timeparse::format_local_send_time(at_ms)
+        ));
     }
     // #1188 — a file attached to the (replacement) draft is shown as its own
     // display marker so the redrawn card names exactly what Approve will send.
@@ -2821,7 +2977,7 @@ async fn extract_doc_attachments(attachments: &[Attachment], msg_id: u64, signab
         };
         record_original_name(&in_path, &att.filename).await;
         // Preserve main's owner-only signing workflow alongside retained originals.
-        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf | DocKind::Docx)) {
             match tokio::fs::read(&in_path).await {
                 Ok(bytes) => if let Some(note) = stage_signable_upload(root, &att.filename, &bytes) {
                     out.notices.push(note);
@@ -2874,6 +3030,15 @@ fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<St
         augmentagent_docs::signing::stage_owner_upload(root, &state, filename, bytes)
     });
     match staged {
+        Ok(path) if path.extension().and_then(|e| e.to_str()) == Some("docx") => {
+            info!(file = %filename, path = %path.display(), "owner Word document staged for signing");
+            Some(format!(
+                "original Word document saved unchanged at {}; to sign this exact file run `augmentagent doc sign-lines {}` then `augmentagent doc sign {} --out <new-signed.docx> --line <n>` (or --anchor-text \"<text of that line>\")",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
+        }
         Ok(path) => {
             info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
             Some(format!(
@@ -2933,6 +3098,7 @@ struct HistoryTurn {
 
 fn is_model_control_text(text: &str) -> bool {
     matches!(text.split_whitespace().next(), Some("/model" | "model"))
+        || crate::owner_text::is_owner_text_command(text)
 }
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
@@ -2964,6 +3130,38 @@ async fn fetch_conversation_context(
     }
 }
 
+/// #2219 — create the yolo thread for a `/yolo` command and return the text
+/// to reply with in the parent channel. The thread is recorded in the
+/// registry before the intro is posted, so there is never a moment when a
+/// message in it could be handled as a normal turn. A thread that could not
+/// be recorded is deleted; if that fails too it is labelled as an ordinary
+/// thread, which is all an unrecorded thread is.
+async fn open_yolo_thread(http: &Arc<Http>, msg: &Message, intro: &str) -> String {
+    use serenity::all::{AutoArchiveDuration, CreateThread};
+    let name = format!("yolo-{}", chrono::Local::now().format("%Y%m%d-%H%M"));
+    let builder = CreateThread::new(name).auto_archive_duration(AutoArchiveDuration::OneDay);
+    let thread = match msg.channel_id.create_thread_from_message(http, msg.id, builder).await {
+        Ok(thread) => thread,
+        Err(error) => {
+            warn!("yolo thread creation failed: {error}");
+            return "Could not create the yolo thread. Jarvis needs the Create Public Threads permission in this channel.".into();
+        }
+    };
+    let registry = augmentagent_store::yolo_threads::Registry::system();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    if let Err(error) = registry.record(thread.id.get(), msg.channel_id.get(), now) {
+        if thread.id.delete(http).await.is_err() {
+            let _ = thread.id.send_message(http, CreateMessage::new()
+                .content("This thread could not be registered and is an ordinary thread.")).await;
+        }
+        return error.to_string();
+    }
+    if let Err(error) = thread.id.send_message(http, CreateMessage::new().content(intro)).await {
+        warn!("failed to post yolo thread intro: {error}");
+    }
+    format!("Yolo thread opened: <#{}>", thread.id.get())
+}
+
 /// Shared bounded owner-only history for text and phone session bootstrap.
 /// Private setup controls and their replies use the same filter on both paths.
 pub async fn fetch_owner_history(
@@ -2973,6 +3171,21 @@ pub async fn fetch_owner_history(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> anyhow::Result<String> {
+    // #2218 — a yolo thread's messages are history for yolo turns only. Every
+    // caller that is not one (phone bootstrap, iMessage owner, voice start)
+    // gets nothing, so they cannot seed a normal turn with yolo content. An
+    // unreadable registry closes guild channels and leaves DMs alone.
+    if !crate::interaction::is_yolo_turn() {
+        use augmentagent_store::yolo_threads::{mark, ThreadMark};
+        let closed = match mark(channel_id.get()) {
+            ThreadMark::Yes => true,
+            ThreadMark::No => false,
+            ThreadMark::Unknown => !matches!(channel_id.to_channel(http).await, Ok(serenity::all::Channel::Private(_))),
+        };
+        if closed {
+            return Ok(String::new());
+        }
+    }
     let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
     if let Some(before) = before { builder = builder.before(before); }
     let messages = channel_id.messages(http, builder).await
@@ -3390,6 +3603,26 @@ mod tests {
             .unwrap();
         s.set_action_envelope(&id, to, cc, bcc).unwrap();
         (s, id, f)
+    }
+
+    /// Review of #2196: a card with a `--send-at` proposal is redrawn (queued
+    /// post, reminder, Revise) through this renderer, so the proposal must
+    /// show on every redraw while the card is pending, and not once armed.
+    #[test]
+    fn a_pending_send_time_proposal_shows_on_every_redraw() {
+        let (s, id, _f) = store_with_envelope(None, None, None);
+        let at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        assert!(!append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None)
+            .contains("[sends:"));
+        s.set_action_scheduled_at(&id, Some(at)).unwrap();
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None);
+        let want = format!("[sends: {}]", crate::timeparse::format_local_send_time(at));
+        assert!(out.contains(&want), "{out}");
+        assert!(out.starts_with("body"), "{out}");
+        // Armed: the schedule notice speaks for it; the card marker is gone.
+        assert!(s.schedule_action(&id, at, "test").unwrap());
+        assert!(!append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None)
+            .contains("[sends:"));
     }
 
     #[test]
@@ -3980,6 +4213,27 @@ mod tests {
         assert!(history.contains("> /model set glm is quoted text"), "{history}");
         assert!(history.contains("/models is a different word"), "{history}");
         assert!(history.contains("What did I ask you to remember?"), "{history}");
+    }
+
+    #[test]
+    fn search_commands_and_their_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "Find the lantern vendor".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "user", body: "/search provider exa".into(), id: 2, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Search and fetch pinned to exa".into(), id: 3, reply_to: Some(2) },
+            HistoryTurn { role: "user", body: "/search nonsense".into(), id: 4, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Usage: /search".into(), id: 5, reply_to: Some(4) },
+            HistoryTurn { role: "user", body: "search for blue lanterns".into(), id: 6, reply_to: None },
+            HistoryTurn { role: "user", body: "/searching is a different word".into(), id: 7, reply_to: None },
+        ];
+        let history = format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP);
+        for hidden in ["/search provider exa", "pinned to exa", "/search nonsense", "Usage: /search"] {
+            assert!(!history.contains(hidden), "{hidden} leaked: {history}");
+        }
+        // The bare word and other words are ordinary messages.
+        for kept in ["Find the lantern vendor", "search for blue lanterns", "/searching is a different word"] {
+            assert!(history.contains(kept), "{kept} missing: {history}");
+        }
     }
 
     #[test]

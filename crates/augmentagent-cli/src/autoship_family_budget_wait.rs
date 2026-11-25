@@ -167,19 +167,18 @@ impl WorkflowStore {
         let Some(snapshot) = self.snapshot(workflow)? else {
             return Ok(None);
         };
-        if !active(snapshot.checkpoint.stage) {
-            return Ok(None);
-        }
-        let Some(wait) = latest(&self.conn, workflow)? else {
-            return Ok(None);
-        };
-        let reason = wait.reason()?;
-        Ok((wait.generation == snapshot.generation
-            && wait.binding == snapshot.checkpoint.binding
-            && snapshot.checkpoint.next.reason == reason.as_str()
-            && snapshot.checkpoint.next.action == reason.next().action)
-            .then_some(wait))
+        current(&self.conn, workflow, snapshot.generation, &snapshot.checkpoint)
     }
+}
+
+/// Share exact active-wait recognition with transactional lease settlement.
+pub(crate) fn current(conn: &Connection, workflow: &str, generation: i64, cp: &Checkpoint) -> Result<Option<Wait>> {
+    if !active(cp.stage) { return Ok(None); }
+    let Some(wait) = latest(conn, workflow)? else { return Ok(None); };
+    let reason = wait.reason()?;
+    Ok((wait.generation == generation && wait.binding == cp.binding
+        && cp.next.reason == reason.as_str() && cp.next.action == reason.next().action)
+        .then_some(wait))
 }
 
 /// Budget-only scheduling. A free reconciliation may rotate the lease without

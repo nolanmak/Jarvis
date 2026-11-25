@@ -35,68 +35,152 @@ impl ImessageSendConfig {
     }
 }
 
+/// How an iMessage send claims its action row (#1640).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImessageClaim {
+    /// Approve on a pending card: `pending → sending`.
+    Approve,
+    /// The scheduled-send engine at fire time: `scheduled → sending`, only
+    /// once the row is due.
+    Due { now_ms: i64 },
+    /// Send now on a scheduled card: `scheduled → sending` immediately.
+    SendNow,
+}
+
 impl ReplyApprover {
-    /// Every refusal happens before the claim, so a refused card stays
-    /// `pending` and can be approved again once the cause is fixed.
+    /// Approve on an iMessage card. A compose carrying a live `--send-at`
+    /// proposal arms the schedule instead of sending, as Gmail does (#502,
+    /// #1640). Otherwise every refusal happens before the claim, so a refused
+    /// card stays `pending` and can be approved again once the cause is fixed.
     pub(crate) async fn approve_imessage(
         &self,
         action_id: &str,
         action: ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        let failed = |message: String| ApprovalActionOutcome::Failed { message };
+        if let Ok(Some(at_ms)) = self.store.action_scheduled_at(action_id) {
+            if crate::send_at_proposal_is_live(at_ms, chrono::Utc::now().timestamp_millis()) {
+                return self.run_schedule(action_id, at_ms).await;
+            }
+        }
+        self.send_imessage(action_id, action, ImessageClaim::Approve).await
+    }
+
+    /// The checks every iMessage send needs, wherever it starts: sending is
+    /// on, the thread resolves to a target, that conversation may receive
+    /// sends, and the draft has text once card markers are removed. Schedule
+    /// runs them before arming so the engine never claims a row it can only
+    /// fail (#1640); the fire runs them again because any of them can change
+    /// in between.
+    pub(crate) fn imessage_preflight(
+        &self,
+        action: &ActionWithEmail,
+    ) -> Result<(augmentagent_channel_imessage::ImessageTarget, String), String> {
         if !self.imessage.send_enabled {
-            return failed(format!(
+            return Err(format!(
                 "iMessage sending is off; set {}=1 on the agent to enable it",
                 augmentagent_channel_imessage::ENV_SEND_ENABLED
             ));
         }
         let Some(bundle_dir) = self.imessage.bundle_dir.as_deref() else {
-            return failed(
-                "no iMessage bundle configured; set AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),
-            );
+            return Err("no iMessage bundle configured; set AUGMENTAGENT_IMESSAGE_REPO_DIR".into());
         };
-        let conversations =
-            match augmentagent_channel_imessage::Bundle::open(bundle_dir).conversations() {
-                Ok(c) => c,
-                Err(e) => return failed(format!("reading the iMessage bundle: {e:#}")),
-            };
+        let conversations = augmentagent_channel_imessage::Bundle::open(bundle_dir)
+            .conversations()
+            .map_err(|e| format!("reading the iMessage bundle: {e:#}"))?;
         let thread_id = action.email.thread_id.as_deref().unwrap_or_default();
-        let target = match augmentagent_channel_imessage::resolve_target(thread_id, &conversations)
-        {
-            Ok(t) => t,
-            Err(e) => return failed(format!("cannot send: {e}")),
-        };
+        let target = augmentagent_channel_imessage::resolve_target(thread_id, &conversations)
+            .map_err(|e| format!("cannot send: {e}"))?;
         // Keyed on the chat identifier for groups too, so owner defaults and
         // denials apply the same way (#1738); the guid is only the target.
-        let allowed = self.store.is_imessage_outbound_allowed(&target.conversation);
-        match allowed {
+        match self.store.is_imessage_outbound_allowed(&target.conversation) {
             Ok(true) => {}
             Ok(false) => {
-                return failed(format!(
+                return Err(format!(
                     "this conversation is not allowed to receive sends; run \
                      `augmentagent imessage allow-outbound {}` to allow it",
                     target.conversation
                 ))
             }
-            Err(e) => return failed(format!("checking the outbound allowlist: {e}")),
+            Err(e) => return Err(format!("checking the outbound allowlist: {e}")),
         }
         let Some(draft) = action.action.draft_body.as_deref() else {
-            return failed("no draft body on action; cannot send".into());
+            return Err("no draft body on action; cannot send".into());
         };
         let body = augmentagent_approval_discord::strip_assumes_for_send(draft);
         if body.trim().is_empty() {
-            return failed("draft is empty after removing card markers; cannot send".into());
+            return Err("draft is empty after removing card markers; cannot send".into());
         }
+        Ok((target, body))
+    }
 
-        match self.store.claim_action_for_send(
-            action_id,
-            ActionStatus::Pending,
-            crate::decision_source(),
-        ) {
-            Ok(true) => {}
-            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
-            Err(e) => return failed(format!("claim for send failed: {e}")),
-        }
+    /// Claim the row and queue exactly one outbox row for the Mac sender.
+    /// Approve refuses before claiming. A scheduled send claims first and
+    /// then re-checks: a refusal found at fire time (the conversation was
+    /// denied, sending turned off) ends the schedule as a retry-exempt error
+    /// that names the cause, with no outbox row (#1640 AC-2). Enqueueing
+    /// happens only now, never when the schedule is armed: the outbox drops
+    /// rows the Mac has not picked up within an hour.
+    pub(crate) async fn send_imessage(
+        &self,
+        action_id: &str,
+        action: ActionWithEmail,
+        claim: ImessageClaim,
+    ) -> ApprovalActionOutcome {
+        let failed = |message: String| ApprovalActionOutcome::Failed { message };
+        let (target, body) = match claim {
+            ImessageClaim::Approve => {
+                let checked = match self.imessage_preflight(&action) {
+                    Ok(checked) => checked,
+                    Err(message) => return failed(message),
+                };
+                match self.store.claim_action_for_send(
+                    action_id,
+                    ActionStatus::Pending,
+                    crate::decision_source(),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+                    Err(e) => return failed(format!("claim for send failed: {e}")),
+                }
+                checked
+            }
+            ImessageClaim::Due { .. } | ImessageClaim::SendNow => {
+                let (source, claimed) = match claim {
+                    ImessageClaim::Due { now_ms } => (
+                        "scheduled-send-engine",
+                        self.store.claim_due_action_for_send(action_id, now_ms, "scheduled-send-engine"),
+                    ),
+                    _ => (
+                        crate::decision_source(),
+                        self.store.claim_action_for_send(
+                            action_id,
+                            ActionStatus::Scheduled,
+                            crate::decision_source(),
+                        ),
+                    ),
+                };
+                match claimed {
+                    Ok(true) => {}
+                    Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+                    Err(e) => return failed(format!("claim for send failed: {e}")),
+                }
+                // Re-read after the claim: Revise can change a scheduled
+                // draft, and the fire must send the text the owner last saw.
+                let fresh = self.handle_load(action_id).unwrap_or(action);
+                match self.imessage_preflight(&fresh) {
+                    Ok(checked) => checked,
+                    Err(message) => {
+                        let _ = self.store.finish_send_error(
+                            action_id,
+                            &message,
+                            Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                            source,
+                        );
+                        return failed(message);
+                    }
+                }
+            }
+        };
         let item = NewImessageOutboxItem {
             action_id,
             target: &target.target,
@@ -118,7 +202,7 @@ impl ReplyApprover {
                 augmentagent_store::rusqlite::params![action_id, body],
             )
         });
-        tracing::info!(action_id, "imessage reply queued for the Mac sender");
+        tracing::info!(action_id, ?claim, "imessage send queued for the Mac sender");
         ApprovalActionOutcome::Approved
     }
 
@@ -210,6 +294,7 @@ pub(crate) enum OutboxOp {
 /// `error`. Returns the rows that changed so the daemon can notify.
 pub(crate) fn reconcile_outbox(store: &Store) -> anyhow::Result<Vec<ImessageOutboxItem>> {
     let now = chrono::Utc::now().timestamp_millis();
+    crate::owner_alerts::enqueue_digest(store,now)?;
     store.enqueue_owner_alert_texts(now)?;
     store.reconcile_owner_alert_texts(now)?;
     let claim_timeout_ms = env_secs(ENV_CLAIM_TIMEOUT_SECS, DEFAULT_CLAIM_TIMEOUT_SECS) * 1000;
@@ -328,14 +413,15 @@ pub(crate) fn run_outbox(store: &Store, op: &OutboxOp) -> anyhow::Result<()> {
             let item = if augmentagent_channel_imessage::send_enabled() {
                 match store.claim_owner_alert_text(now)? {
                     Some(item) => Some(item),
-                    None => store.claim_imessage_outbox()?,
+                    None => match store.claim_owner_alert_digest(now)? { Some(item)=>Some(item),None=>store.claim_imessage_outbox()? },
                 }
             } else {
                 None
             };
             let send_by_ms = match item.as_ref() {
                 Some(item) => store.owner_alert_for_outbox(item.id)?.map(|a|
-                    (now + 5_000).min(a.expires_at_ms).min(a.due_at_ms.unwrap_or(i64::MAX))),
+                    (now + 5_000).min(a.expires_at_ms).min(a.due_at_ms.unwrap_or(i64::MAX)))
+                    .or(store.owner_alert_digest_deadline(item.id)?.map(|d|(now+5_000).min(d))),
                 None => None,
             };
             println!("{}", claim_json(item.as_ref(), send_by_ms));
@@ -705,6 +791,138 @@ mod tests {
             )
         );
         assert_eq!(status(&f.store, &id), "sending");
+    }
+
+    // ---- #1640: scheduled iMessage sends ----
+
+    fn in_an_hour() -> i64 {
+        chrono::Utc::now().timestamp_millis() + 3_600_000
+    }
+
+    fn scheduled_at(store: &Store, id: &str) -> Option<i64> {
+        store.action_scheduled_at(id).unwrap()
+    }
+
+    async fn fire(f: &Fixture, id: &str, now_ms: i64) -> augmentagent_channel_email::PlatformFire {
+        use augmentagent_channel_email::ScheduledPlatformSender;
+        assert!(f.approver.handles(PLATFORM), "the engine must route iMessage rows here");
+        f.approver.fire_due(id, now_ms).await
+    }
+
+    /// AC-1: scheduling arms the row with no outbox row; nothing goes out
+    /// before it is due; when due exactly one outbox row appears and the
+    /// action goes `sending` (the Mac's `outbox complete` makes it `sent`).
+    #[tokio::test]
+    async fn a_scheduled_imessage_is_queued_only_when_due() {
+        use augmentagent_channel_email::PlatformFire;
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "Happy birthday!");
+        let at = in_an_hour();
+        let out = f.approver.run_schedule(&id, at).await;
+        assert!(matches!(out, ApprovalActionOutcome::Scheduled { .. }), "{out:?}");
+        assert_eq!(status(&f.store, &id), "scheduled");
+        assert_eq!(scheduled_at(&f.store, &id), Some(at));
+        assert_eq!(outbox_len(&f.store), 0, "never enqueued at arm time");
+
+        assert_eq!(fire(&f, &id, at - 1).await, PlatformFire::LostClaim, "not due yet");
+        assert_eq!(outbox_len(&f.store), 0);
+
+        assert_eq!(fire(&f, &id, at).await, PlatformFire::Sent);
+        let rows = f.store.list_imessage_outbox(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].action_id.as_str(), rows[0].body.as_str()), (id.as_str(), "Happy birthday!"));
+        assert_eq!(status(&f.store, &id), "sending");
+
+        // A second tick finds nothing to do: exactly one send.
+        assert_eq!(fire(&f, &id, at + 60_000).await, PlatformFire::LostClaim);
+        assert_eq!(outbox_len(&f.store), 1);
+        // Review of #2196: a Mac offline past the engine grace does not turn
+        // the queued send into a stuck-send error; the outbox owns its
+        // timeout (reconcile_outbox), as for an approved send.
+        let much_later = chrono::Utc::now().timestamp_millis() + 2 * 3_600_000;
+        assert!(!f.store.stuck_sending_actions(much_later, 600_000).unwrap().contains(&id));
+    }
+
+    /// Pre-arm refusals: a schedule that could never send is refused and the
+    /// card stays pending.
+    #[tokio::test]
+    async fn scheduling_refuses_what_could_never_send() {
+        let f = fixture(true);
+        let id = seed(&f.store, PHONE, "hi");
+        let msg = failed_message(f.approver.run_schedule(&id, in_an_hour()).await);
+        assert!(msg.contains("allow-outbound"), "{msg}");
+        assert_eq!(status(&f.store, &id), "pending");
+
+        let off = fixture(false);
+        off.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&off.store, PHONE, "hi");
+        let msg = failed_message(off.approver.run_schedule(&id, in_an_hour()).await);
+        assert!(msg.contains("AUGMENTAGENT_IMESSAGE_SEND_ENABLED"), "{msg}");
+        assert_eq!(status(&off.store, &id), "pending");
+    }
+
+    /// AC-2: the conversation is denied between scheduling and the fire: the
+    /// row ends as a retry-exempt error naming the allowlist, no outbox row.
+    #[tokio::test]
+    async fn a_conversation_denied_after_scheduling_fails_the_send_without_queueing() {
+        use augmentagent_channel_email::PlatformFire;
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "see you at 9");
+        let at = in_an_hour();
+        assert!(matches!(f.approver.run_schedule(&id, at).await, ApprovalActionOutcome::Scheduled { .. }));
+        f.store.deny_imessage_outbound(PHONE).unwrap();
+        match fire(&f, &id, at).await {
+            PlatformFire::Failed(msg) => assert!(msg.contains("allow-outbound"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(status(&f.store, &id), "error");
+        let row = f.store.get_action_with_email(&id).unwrap().unwrap();
+        assert!(row.action.error_message.as_deref().unwrap_or("").contains("allow-outbound"));
+        assert!(row.retry_count >= augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT as i64);
+        assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    /// AC-3: send now, reschedule and cancel on a scheduled iMessage card.
+    #[tokio::test]
+    async fn send_now_reschedule_and_cancel_work_on_a_scheduled_imessage() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+
+        let now_id = seed_at(&f.store, PHONE, 1, "sending early");
+        assert!(matches!(f.approver.run_schedule(&now_id, in_an_hour()).await, ApprovalActionOutcome::Scheduled { .. }));
+        assert!(matches!(f.approver.run_send_now(&now_id).await, ApprovalActionOutcome::Approved));
+        assert_eq!(status(&f.store, &now_id), "sending");
+        assert_eq!(outbox_len(&f.store), 1);
+
+        let moved = seed_at(&f.store, PHONE, 2, "later");
+        assert!(matches!(f.approver.run_schedule(&moved, in_an_hour()).await, ApprovalActionOutcome::Scheduled { .. }));
+        let later = in_an_hour() + 3_600_000;
+        let out = f.approver.run_reschedule(&moved, later).await;
+        assert!(matches!(out, ApprovalActionOutcome::Scheduled { .. }), "{out:?}");
+        assert_eq!(scheduled_at(&f.store, &moved), Some(later));
+
+        let dropped = seed_at(&f.store, PHONE, 3, "never mind");
+        assert!(matches!(f.approver.run_schedule(&dropped, in_an_hour()).await, ApprovalActionOutcome::Scheduled { .. }));
+        f.approver.run_cancel_schedule(&dropped).await;
+        assert_eq!(status(&f.store, &dropped), "rejected");
+        assert_eq!(outbox_len(&f.store), 1, "only the send-now row was queued");
+    }
+
+    /// `imessage compose --send-at`: the proposal rides on the pending row,
+    /// and Approve arms the schedule instead of sending now.
+    #[tokio::test]
+    async fn approving_a_compose_with_a_send_time_arms_the_schedule() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "Good luck today!");
+        let at = in_an_hour();
+        f.store.set_action_scheduled_at(&id, Some(at)).unwrap();
+        let out = f.approver.run_approve(&id).await;
+        assert!(matches!(out, ApprovalActionOutcome::Scheduled { .. }), "{out:?}");
+        assert_eq!(status(&f.store, &id), "scheduled");
+        assert_eq!(outbox_len(&f.store), 0);
     }
 
     #[tokio::test]

@@ -149,6 +149,8 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
              ON imessage_outbox(status, id);\
          CREATE INDEX IF NOT EXISTS idx_imessage_outbox_target \
              ON imessage_outbox(target, status);\
+         CREATE INDEX IF NOT EXISTS idx_imessage_outbox_sent_guid \
+             ON imessage_outbox(message_guid) WHERE status='sent' AND message_guid IS NOT NULL;\
          CREATE TABLE IF NOT EXISTS imessage_outbound_allowlist (\
              identifier    TEXT PRIMARY KEY,\
              enabled_at_ms INTEGER NOT NULL\
@@ -244,6 +246,7 @@ impl Store {
             "UPDATE imessage_outbox SET status = 'claimed', claimed_at_ms = ?1 \
               WHERE id = (SELECT id FROM imessage_outbox WHERE status = 'queued' \
                           AND NOT EXISTS (SELECT 1 FROM owner_alert_texts WHERE outbox_id=imessage_outbox.id) \
+                          AND NOT EXISTS (SELECT 1 FROM owner_alert_digests WHERE outbox_id=imessage_outbox.id) \
                           ORDER BY id LIMIT 1) \
                 AND status = 'queued' \
              RETURNING {COLUMNS}"
@@ -317,6 +320,7 @@ impl Store {
                     error_detail = 'expired before the Mac sender picked it up' \
               WHERE status = 'queued' AND created_at_ms < ?1 \
                 AND NOT EXISTS (SELECT 1 FROM owner_alert_texts WHERE outbox_id=imessage_outbox.id) \
+                          AND NOT EXISTS (SELECT 1 FROM owner_alert_digests WHERE outbox_id=imessage_outbox.id) \
              RETURNING {COLUMNS}"
         );
         let now = now_millis();

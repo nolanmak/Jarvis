@@ -6,7 +6,7 @@ fn origin()->DiscordOrigin {DiscordOrigin{bot:11,owner:22,channel:33,message:1}}
 
 struct Fixture {path:std::path::PathBuf,_root:tempfile::TempDir,id:String,lease:Lease}
 fn fixture()->(WorkflowStore,Fixture) {
-    let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+    let root=tempfile::tempdir().unwrap();let path=root.path().canonicalize().unwrap().join("state.db");
     let mut store=WorkflowStore::open(&path).unwrap();
     let request=submission::Request{repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged};
     let id=store.submit_authorized("cli-request","github:owner",&request,1).unwrap().workflow;

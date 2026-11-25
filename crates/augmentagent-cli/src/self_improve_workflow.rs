@@ -5,8 +5,15 @@ use super::*;
 mod stage_activity;
 #[path = "self_improve_family_dispatch_control.rs"]
 mod family_dispatch_control;
+#[path = "self_improve_family_wait_settlement.rs"]
+mod family_wait_settlement;
+#[cfg(test)]
+#[path = "self_improve_family_wait_settlement_tests.rs"]
+mod family_wait_settlement_tests;
 #[path = "self_improve_family_budget_hold.rs"]
 mod family_budget_hold;
+#[path = "self_improve_push_confirm.rs"]
+mod push_confirm;
 #[cfg(test)]
 #[path = "self_improve_family_budget_hold_tests.rs"]
 mod family_budget_hold_tests;
@@ -87,7 +94,7 @@ fn classify_issue_history_error(error:anyhow::Error)->anyhow::Error {
 pub(super) struct FreshIssueControls {store:Option<WorkflowStore>,state:PathBuf}
 impl FreshIssueControls {
     pub(super) fn open()->Result<Self> {Self::open_at(&path())}
-    fn open_at(state:&Path)->Result<Self> {
+    pub(super) fn open_at(state:&Path)->Result<Self> {
         WorkflowStore::open_read_only(state).and_then(|store| {
             if let Some(store)=store.as_ref() {
                 // Empty is not a canonical workflow. Reuse the real reader
@@ -114,12 +121,43 @@ impl FreshIssueControls {
     pub(super) fn require_current_history(&self)->Result<()> {
         Self::reopen(&self.state,self.store.is_some()).map(|_|())
     }
-    pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
-        (||->Result<bool> {
+    pub(super) fn selection_snapshot(&self,repository:&str,issue:u64)->Result<Option<durable::Snapshot>> {
+        (||->Result<Option<durable::Snapshot>> {
             let id=durable::workflow_id(repository,issue)?;
-            let snapshot=self.store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
-            Ok(snapshot.is_some_and(|snapshot|matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
+            self.store.as_ref().map(|store|store.snapshot(&id)).transpose().map(Option::flatten)
         })().map_err(|error|classify_issue_history_error(error).context(OwnerControlUnavailable))
+    }
+    /// Read existing protected execution paths; this cannot mint a receipt or
+    /// admit a replacement when a retained checkout has disappeared.
+    pub(super) fn selection_checkout(&self, repository:&str, issue:u64)->Result<()> {
+        (|| -> Result<()> {
+            let Some(store)=self.store.as_ref() else {return Ok(())};
+            let id=durable::workflow_id(repository,issue)?;
+            let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
+            let Some(context)=store.recovery_context(&id,&snapshot.checkpoint.binding)? else {return Ok(())};
+            anyhow::ensure!(context.workflow==id && context.repository.eq_ignore_ascii_case(repository)
+                && context.binding==snapshot.checkpoint.binding,"selection checkout context differs");
+            let Err(error)=checkout_identity::check_recorded(&self.state,&id,&context.worktree,repository,&snapshot.branch) else {return Ok(())};
+            // #2349 — scope-stage work whose recorded checkout path is gone is
+            // selectable; productive preparation re-establishes continuity.
+            if checkout_continuity::selectable(store,&self.state,&id,repository,&error) {
+                info!(issue,reason=%error,"checkout continuity lost on scope-stage work; select to re-establish from current main");
+                return Ok(());
+            }
+            Err(error)
+        })().map_err(classify_issue_history_error)
+    }
+    /// #851/#2432 — the daily ledger holds a fresh start only. An issue whose
+    /// workflow is already in flight resumes; an unreadable history keeps the
+    /// ledger's hold, since the spend guard is the safe side.
+    pub(super) fn daily_ledger_holds(&self,ledger:&AttemptLedger,today:u64,repository:&str,issue:u64,retry_due:bool)->bool {
+        ledger.attempted_today(today,issue) && !retry_due
+            && !self.selection_snapshot(repository,issue).ok().flatten()
+                .is_some_and(|snapshot|durable::resumes_existing_work(&snapshot))
+    }
+    pub(super) fn terminal(&self,repository:&str,issue:u64)->Result<bool> {
+        Ok(self.selection_snapshot(repository,issue)?.is_some_and(|snapshot|
+            matches!(snapshot.checkpoint.stage,Stage::Merged|Stage::Retired)))
     }
     /// Fairness preview only: unchanged initial holds are skipped unless exact
     /// native custody has recovered. Read the same context/environment/binding inputs,
@@ -133,6 +171,7 @@ impl FreshIssueControls {
             let Some(store)=self.store.as_ref() else{return Ok(None)};
             let id=durable::workflow_id(repository,issue.number)?;
             let Some(snapshot)=store.snapshot(&id)? else{return Ok(None)};
+            if store.scope_policy_pending(&id)? || store.acceptance_escalation_pending(&id)? {return Ok(None);}
             if snapshot.pr.is_some() || !durable::awaits_initial_input(&snapshot.checkpoint) {return Ok(None);}
             let context=store.recovery_context(&id,&snapshot.checkpoint.binding)?
                 .context("held issue execution context unavailable")?;
@@ -146,15 +185,14 @@ impl FreshIssueControls {
         async move {
             let result=async {
                 let Some((snapshot,context,request))=inspected? else{return Ok(false)};
-                let expected=workspace::candidate_parent(&root).await?
-                    .join(format!("{}-issue-{}",lane_from_env().worktree_name(),number));
+                let (expected,expected_branch)=owner_checkout_recovery::layout(&root,&state,&repository,number).await?;
                 recovery::existing_checkout(&root,&context.worktree).await?;
                 anyhow::ensure!(context.worktree.canonicalize()?==expected.canonicalize()?
-                    && snapshot.branch==format!("{BRANCH_PREFIX}{number}"),"held issue checkout differs from execution lane");
+                    && snapshot.branch==expected_branch,"held issue checkout differs from execution lane");
                 let (ok,branch,_)=run("git",&["symbolic-ref","--quiet","--short","HEAD"],&context.worktree).await?;
                 anyhow::ensure!(ok && branch.trim()==snapshot.branch,"held issue branch differs");
                 let upstream=remote_main_head(&root,&repository).await?;
-                let current_environment=recovery::environment_identity(&context.worktree,&upstream).await?;
+                let current_environment=owner_checkout_recovery::environment(&state,&repository,number,recovery::environment_identity(&context.worktree,&upstream).await?)?;
                 if !recovery_context_matches(&context,&request,&expected,&current_environment,true) {return Ok(false);}
                 let binding=existing_candidate_binding(&context.worktree,&context.contract,&context.environment,Some(&snapshot)).await?;
                 // A genuine recovery cue arriving during Git inspection must
@@ -227,10 +265,13 @@ pub(super) struct WorkflowGuard {
     accounted_ms: Arc<AtomicU64>,
     capacity_exhausted: Arc<AtomicBool>,
     family_budget_wait: Arc<AtomicBool>,
+    family_wait_released: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
     acceptance_authority:Arc<Mutex<AcceptanceAuthority>>,
     acceptance_source:Option<crate::autoship_contract::AcceptanceSource>,
+    /// #2471: set only while an admitted own-PR witness regeneration runs.
+    witness_regeneration:Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -294,6 +335,9 @@ enum AcceptanceAuthority {
     Unbound,
     RecoveryOnly,
     Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
+    /// #2464: scope proof gate off. A recorded plan, criteria and allowed
+    /// paths admit the builder; proof comes from the build itself.
+    Plan,
 }
 
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -317,6 +361,11 @@ pub(super) struct CapacityAccounting {
     resumed: bool,
     generation: i64,
     family_budget_wait: Arc<AtomicBool>,
+    lease: Lease,
+    heartbeat: tokio_util::sync::CancellationToken,
+    started: std::time::Instant,
+    accounted_ms: Arc<AtomicU64>,
+    released: Arc<AtomicBool>,
 }
 impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
@@ -336,10 +385,20 @@ impl CapacityAccounting {
             Ok(_)=>return outcome,
             Err(error)=>error,
         };
-        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
+        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else {
+            let checkpoint=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
+                .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+            if durable::retry_recovery::class(&checkpoint).is_some() {
+                return self.retry_report(format!("Autoship deferred {} turn; preserved work will retry automatically",checkpoint.next.reason));
+            }
+            return outcome;
+        };
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+        if checkpoint.next.reason=="retry_cycle_exhausted" {
+            return self.retry_report("Autoship retry cycle exhausted; preserved request scheduled for automatic rescoping".into());
+        }
         anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
             && checkpoint.next.action == "retry_verification"
             && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
@@ -369,7 +428,7 @@ impl CapacityAccounting {
                 else if source_waiting {format!("Autoship waiting for original verification evidence; candidate and prior charges preserved ({paid} model admissions this run)")}
                 else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
-            held: source_waiting || paid == 0,
+            held: true,
             resumed: self.resumed,
         }))
     }
@@ -473,7 +532,13 @@ fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<us
     for (workflow,generation,audit_path) in rows {
         let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
         match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
-            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            Ok(outcome) if outcome.verified()=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            // Unproved closure keeps the durable intent pending; the exact
+            // blocker and its authenticated recovery route are recorded.
+            Ok(outcome)=>if let Some(blocker)=outcome.blocker() {
+                warn!(workflow=%workflow,generation,pruned=outcome.pruned,session=%blocker.session,blocker=%blocker.blocker,
+                    recovery=%blocker.recovery,"native runtime retirement retained without proven producer closure");
+            },
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
@@ -534,6 +599,9 @@ fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
 pub(super) struct SweepGuard {
     inner: Option<WorkflowGuard>,
     reviewed_base: Option<String>,
+    /// #2458: after a carried main update, the head the protected acceptance
+    /// receipt binds (the reviewed origin), not the merge commit.
+    acceptance_head: Option<String>,
     source: crate::autoship_contract::AcceptanceSource,
     branch: String,
     worktree_lock: Mutex<Option<RunLock>>,
@@ -707,7 +775,18 @@ impl SweepGuard {
             family_budget_wait: Arc::new(AtomicBool::new(false)),
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
+        };
+        // A head produced by a carried main update was reviewed at its origin.
+        let carried = if existing.is_some() {
+            inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
+                .filter(|update| update.updated_head.as_deref() == Some(head))
+        } else { None };
+        let (reviewed_base, acceptance_head) = match carried {
+            Some(update) => (Some(update.main), Some(update.origin_head)),
+            None => (reviewed_base, None),
         };
         inner.install_model_accounting()?;
         inner.audit_event("sweep_claimed", serde_json::json!({}))?;
@@ -715,6 +794,7 @@ impl SweepGuard {
         Ok(Some(Self {
             inner: Some(inner),
             reviewed_base,
+            acceptance_head,
             source: issue
                 .map(crate::autoship_contract::AcceptanceSource::Issue)
                 .unwrap_or(crate::autoship_contract::AcceptanceSource::PullRequest(pr)),
@@ -724,6 +804,17 @@ impl SweepGuard {
     }
 
     pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
+        self.validate_remote_at(repo, pr, expected, true).await.map(|_| ())
+    }
+
+    /// #2458: every check `validate_remote` makes except that main is
+    /// unchanged since review: the PR is BEHIND and main is about to be
+    /// merged in. Returns the current main.
+    pub(super) async fn validate_for_main_update(&self, repo: &Path, pr: u64, expected: &str) -> Result<String> {
+        self.validate_remote_at(repo, pr, expected, false).await
+    }
+
+    async fn validate_remote_at(&self, repo: &Path, pr: u64, expected: &str, reviewed_main: bool) -> Result<String> {
         let inner = self.inner.as_ref().context("released sweep lease")?;
         inner.validate_before_side_effect()?;
         anyhow::ensure!(
@@ -734,8 +825,9 @@ impl SweepGuard {
             .reviewed_base
             .as_deref()
             .context("recorded approval lacks a structured integration base; refresh review")?;
+        let main = remote_main_head(repo, &inner.repository).await?;
         anyhow::ensure!(
-            remote_main_head(repo, &inner.repository).await? == reviewed_base,
+            !reviewed_main || main == reviewed_base,
             "main changed since review; integrate and verify the candidate again"
         );
         let (ok, head, _) = run(
@@ -789,7 +881,11 @@ impl SweepGuard {
                 })
                 .last()
         };
+        // #2464: a plan-bound candidate has no executable receipt; hosted CI
+        // and the recorded independent approval are its merge evidence.
+        let plan_bound = crate::autoship_workflow::scope_proof_gate::plan_contract(&inner.binding.contract);
         let checked = async {
+            if plan_bound { return Ok(()); }
             let reference = reference.context("protected acceptance checkpoint missing")?;
             acceptance::assert_sweep_receipt(
                 &worktree,
@@ -797,7 +893,7 @@ impl SweepGuard {
                     .workflow_acceptance,
                 self.source,
                 &reference,
-                expected,
+                self.acceptance_head.as_deref().unwrap_or(expected),
             )
             .await
         }
@@ -826,7 +922,48 @@ impl SweepGuard {
             return Err(error).context("sweep approval invalidated; verification repair queued");
         }
         // Network and artifact reads can span lease expiry; fence immediately before mutation.
-        inner.validate_before_side_effect()
+        inner.validate_before_side_effect()?;
+        Ok(main)
+    }
+
+    /// #2458: durably record the main GitHub is about to merge into the
+    /// approved head, before asking it to.
+    pub(super) fn request_main_update(&self, main: &str) -> Result<()> {
+        let inner = self.inner.as_ref().context("released sweep lease")?;
+        inner.validate_before_side_effect()?;
+        let base = self.reviewed_base.as_deref().context("recorded approval lacks a structured integration base")?;
+        inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .record_main_update_request(&inner.lease, &inner.binding, main, base, millis())?;
+        inner.audit_event("main_update_requested", serde_json::json!({"main":main,"reviewed_base":base}))
+    }
+
+    /// #2458: GitHub merged main into the approved head. Verify the new PR
+    /// head is exactly that clean merge, move the resume checkout onto it and
+    /// carry the approval. Afterwards this lease validates and merges `updated`.
+    pub(super) async fn carry_main_update(&mut self, repo: &Path, updated: &str) -> Result<()> {
+        let inner = self.inner.as_mut().context("released sweep lease")?;
+        inner.validate_before_side_effect()?;
+        let update = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
+            .filter(|update| update.updated_head.is_none() && update.reviewed_head == inner.binding.head)
+            .context("no pending main update for the approved head")?;
+        let (ok, _, _) = workspace::preparation_git(repo, &["fetch", "--no-write-fetch-head", "origin", &self.branch,
+            "+refs/heads/main:refs/remotes/origin/main"]).await?;
+        anyhow::ensure!(ok, "cannot fetch the updated PR head");
+        let fetched = git_evidence(repo, &["rev-parse", "--verify", &format!("origin/{}^{{commit}}", self.branch)]).await?;
+        anyhow::ensure!(fetched.eq_ignore_ascii_case(updated), "PR head moved past the main update");
+        super::finalize::verify_main_merge(repo, &update.reviewed_head, updated, &update.main).await?;
+        let pr = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(inner.id())?.context("sweep workflow missing")?.pr.context("main update needs its PR")?;
+        advance_resume_checkout(repo, pr, &update.reviewed_head, updated).await?;
+        inner.validate_before_side_effect()?;
+        let carried = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .carry_main_update(&inner.lease, &inner.binding, updated, &update.main, millis())?;
+        inner.audit_event("main_update_carried", serde_json::json!({"reviewed_head":update.reviewed_head,
+            "updated_head":updated,"main":update.main}))?;
+        inner.binding = carried;
+        self.reviewed_base = Some(update.main);
+        self.acceptance_head = Some(update.origin_head);
+        Ok(())
     }
 
     pub(super) fn validate_note_dispatch(&self)->Result<()> {
@@ -963,6 +1100,8 @@ impl WorkflowGuard {
         Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
     async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
+        // #2354: never claim the next workflow with a deploy pending.
+        crate::autoship_worker::safe_point().await;
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -992,9 +1131,15 @@ impl WorkflowGuard {
         anyhow::ensure!(!existing.as_ref().is_some_and(|snapshot|snapshot.checkpoint.next.reason=="original_semantic_witness_recovered")
             || semantic.is_some() || retained.is_some(),"semantic recovery source reference is missing");
         let context=if let Some(snapshot)=&existing {
+            // #2279 — a verified candidate whose push failed before dispatch
+            // keeps its scoped contract; the raw request must not rebind it
+            // to `inputs_changed` and send finished work back to scope.
             let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
+                || (snapshot.checkpoint.stage==Stage::Publish && snapshot.checkpoint.next.reason=="publishing_revision"
+                    && snapshot.checkpoint.next.action=="push")
                 || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered"
-                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some();
+                || snapshot.checkpoint.next.reason=="original_semantic_witness_recovered" || semantic.is_some()
+                || store.acceptance_escalation_pending(&id)?;
             if relevant || store.retryable_bound_push(&id)? {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
         }else{None};
         let initial_wait=existing.as_ref().is_some_and(|snapshot|durable::awaits_initial_input(&snapshot.checkpoint));
@@ -1031,6 +1176,10 @@ impl WorkflowGuard {
         let snapshot = store
             .snapshot(&id)?
             .context("registered workflow missing")?;
+        // Only productive acquisition may migrate old scope holds. Owner
+        // turns intentionally run native work under a paused owner grant;
+        // reconciliation must preserve its original evidence and authority.
+        if mode==AcquireMode::Productive {store.reconsider_scope_policy(&lease,now)?;}
         // A new commit/contract invalidates approvals, not workflow ownership.
         // Preserve historical evidence in append-only events, not as current
         // receipts that a new build could accidentally reuse.
@@ -1085,9 +1234,11 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             family_budget_wait: Arc::new(AtomicBool::new(false)),
+            family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::RecoveryOnly)),
             acceptance_source:source_from_workflow(&id),
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
         };
         if let Some(context)=guard.execution_context(&guard.binding)? {
             let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
@@ -1159,7 +1310,9 @@ impl WorkflowGuard {
             .snapshot(self.id())?.context("capacity workflow missing")?.model_calls;
         Ok(CapacityAccounting { store:self.store.clone(), audit:self.audit.clone(),
             workflow:self.id().into(), calls_before, resumed, generation:self.lease.generation,
-            family_budget_wait:self.family_budget_wait.clone() })
+            family_budget_wait:self.family_budget_wait.clone(), lease:self.lease.clone(),
+            heartbeat:self.heartbeat.clone(), started:self.started,
+            accounted_ms:self.accounted_ms.clone(), released:self.family_wait_released.clone() })
     }
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
@@ -1209,6 +1362,15 @@ impl WorkflowGuard {
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let current=store.snapshot(&lease.workflow)?.context("workflow missing")?;
             anyhow::ensure!(!matches!(current.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
+            // #2467: a run admitted before the global budget or this issue's
+            // spend cap ran out stops at its next model call. It parks on the
+            // ordinary capacity retry; the claim gate keeps it there until the
+            // budget reopens, and the give-up sweep closes a capped issue.
+            if let Some(refusal)=store.paid_admission_refusal(&lease.workflow,millis())? {
+                capacity_flag.store(true,Ordering::SeqCst);
+                store.defer_run_capacity_observation(&lease,None,None,millis())?;
+                anyhow::bail!("resource_capacity: {refusal}; await_capacity checkpoint retained");
+            }
             let custody=store.baseline_native_custody(&lease,&current.checkpoint.binding,millis())?;
             acceptance::require_retained_native_custody(&worktree,&custody)?;
             if !augmentagent_channel_core::native_session::is_fresh_review() {
@@ -1224,6 +1386,8 @@ impl WorkflowGuard {
                     AcceptanceAuthority::RecoveryOnly=>anyhow::bail!("baseline_witness_unqualified: recovery metadata cannot authorize a builder"),
                     AcceptanceAuthority::Unbound if state.checkpoint.binding.contract.starts_with("registered:") || matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review)=>anyhow::bail!("baseline_witness_unqualified: builder admission requires protected original-production qualification"),
                     AcceptanceAuthority::Unbound=>{},
+                    AcceptanceAuthority::Plan=>anyhow::ensure!(crate::autoship_workflow::scope_proof_gate::plan_contract(&state.checkpoint.binding.contract)
+                        || !matches!(state.checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review),"plan admission belongs to another contract"),
                 }
             }
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
@@ -1284,7 +1448,8 @@ impl WorkflowGuard {
         let guard = Self { state:state.clone(),checkout_identity:Arc::new(Mutex::new(None)),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),released:false };
+            witness_regeneration:Arc::new(AtomicBool::new(false)),
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),family_budget_wait:Arc::new(AtomicBool::new(false)),family_wait_released:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
         guard.spawn_renewal();
@@ -1415,6 +1580,26 @@ impl WorkflowGuard {
     pub(super) fn id(&self) -> &str {
         &self.lease.workflow
     }
+    /// The durable checkpoint as it stands, before this run moves it.
+    pub(super) fn current_checkpoint(&self) -> Result<Checkpoint> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?
+            .context("workflow missing")?
+            .checkpoint)
+    }
+    /// #2430: the PR branch this workflow publishes to.
+    pub(super) fn branch(&self) -> Result<String> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?
+            .context("workflow missing")?
+            .branch)
+    }
     /// #1714: when the durable outbox routes this workflow, legacy
     /// `notify_review` must stay silent so the owner is not told twice.
     pub(super) fn legacy_notice_suppressed(&self) -> bool {
@@ -1457,6 +1642,32 @@ impl WorkflowGuard {
 
     /// This metadata is needed by independent repair of an invalid legacy
     /// verifier. It deliberately grants no builder/verification/merge proof.
+    /// #2464: bind the scoped plan instead of a qualified executable
+    /// contract. Registers the plan's write admission (replacing an older
+    /// contract's, so a stuck branch keeps its commits) and admits builders
+    /// under a `plan:<sha256>` contract. Only valid with the gate off.
+    pub(super) fn bind_plan(&mut self,plan:&super::plan_proof::Plan)->Result<()> {
+        use crate::autoship_workflow::scope_proof_gate;
+        anyhow::ensure!(!scope_proof_gate::enabled(),"plan binding requires {}=off",scope_proof_gate::ENV);
+        self.healthy_lease()?;
+        let contract=plan.contract()?;
+        let allowed=plan.write_admission(&self.worktree)?;
+        use augmentagent_channel_core::autoship_write_scope as write_scope;
+        match write_scope::registered_contract(&self.worktree)? {
+            None=>write_scope::register(&self.worktree,&contract,allowed,Vec::new())?,
+            Some(previous)=>write_scope::replace_registered(&self.worktree,&previous,&contract,allowed,Vec::new())?,
+        }
+        self.contract=contract;
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::Plan;
+        self.audit_event("scope_plan_bound",serde_json::json!({"contract":self.contract,"criteria":plan.criteria.len(),
+            "declared_paths":plan.declared_paths,"switch":scope_proof_gate::ENV}))
+    }
+
+    /// Whether this workflow builds from a plan (#2464), not a registered contract.
+    pub(super) fn plan_mode(&self)->bool {
+        self.acceptance_authority.lock().is_ok_and(|authority|matches!(*authority,AcceptanceAuthority::Plan))
+    }
+
     pub(super) fn bind_acceptance_for_recovery(&mut self,prepared:&acceptance::PreparedAcceptance)->Result<()> {
         self.bind_acceptance_identity(prepared)?;
         *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
@@ -1727,6 +1938,24 @@ impl WorkflowGuard {
             .require_independent_native_session(provider,session)
     }
 
+    /// #2451: decide whether this binding may be reviewed again; consumes an
+    /// attempt only when admitted. Refusals are audited with their route.
+    pub(super) fn admit_review_binding(&self, key: &str, per_attempt_bound: u64, has_findings: bool,
+        repair_round_left: bool) -> Result<crate::autoship_workflow::review_binding_cap::Route> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_review_binding(&self.lease,key,per_attempt_bound,has_findings,repair_round_left,millis())
+    }
+    pub(super) fn charge_review_binding_calls(&self, key: &str, calls: u64) -> Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .charge_review_binding_calls(&self.lease,key,calls,millis())
+    }
+    /// Durable model admissions charged to this workflow so far.
+    pub(super) fn model_calls(&self) -> Result<u64> {
+        Ok(self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?.context("workflow missing")?.model_calls)
+    }
     pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
@@ -1787,6 +2016,26 @@ impl WorkflowGuard {
         )
     }
 
+    /// #2467: why the acceptance ladder must stop rather than run another
+    /// cycle: observable children were already published once, or the issue
+    /// used its tries.
+    pub(super) fn ladder_stop(&self)->Result<Option<&'static str>> {
+        use durable::attempt_cap;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        if store.observable_decomposition_spent(self.id())? {return Ok(Some(attempt_cap::DECOMPOSITION_SPENT_REASON));}
+        let usage=store.attempt_usage(self.id())?;
+        Ok((usage.tries()>=attempt_cap::max_tries()).then_some(attempt_cap::ATTEMPTS_REASON))
+    }
+    /// `Some(at)` while this issue's rolling daily retry model budget is spent.
+    pub(super) fn daily_budget_reopens_at(&self)->Result<Option<i64>> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .daily_budget_reopens_at(self.id(),millis(),durable::retry_policy::daily_model_calls())
+    }
+    pub(super) async fn begin_acceptance_escalation(&mut self)->Result<Option<durable::acceptance_escalation::Material>> {
+        self.validate_before_side_effect()?;self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .begin_acceptance_escalation(&self.lease,&self.binding,millis())
+    }
     pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
         self.hold_initial_acceptance_custody(reason,action,false).await
     }
@@ -1993,6 +2242,19 @@ impl WorkflowGuard {
             .epoch_attempts(&self.lease,purpose,epoch,millis())
     }
 
+    /// #2471: admit one bounded regeneration of the acceptance witness for
+    /// the own open PR head this workflow published. Refused for issue-only
+    /// work, an unpublished head, or past the per-head bound.
+    pub(super) fn begin_witness_regeneration(&self)->Result<bool> {
+        self.check_resource_policy()?;
+        let admitted=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_own_pr_witness_regeneration(&self.lease,&self.repository,&self.binding.head,millis())?;
+        if admitted {self.witness_regeneration.store(true,Ordering::SeqCst);}
+        Ok(admitted)
+    }
+    pub(super) fn end_witness_regeneration(&self) {self.witness_regeneration.store(false,Ordering::SeqCst);}
+    pub(super) fn regenerating_witness(&self)->bool {self.witness_regeneration.load(Ordering::SeqCst)}
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,
@@ -2006,6 +2268,14 @@ impl WorkflowGuard {
             .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
     }
 
+    /// #2510: return an attempt an infrastructure refusal never used. No
+    /// health check: a capacity refusal has already marked this guard, and
+    /// handing back a charge grants nothing. The lease is still fenced.
+    pub(super) fn release_epoch_attempt(&self,purpose:&str,epoch:&str)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .release_epoch_attempt(&self.lease,purpose,epoch,millis())
+    }
+
     pub(super) fn scope_stage_response(&self,key:&str)->Result<Option<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.scope_stage_response(&self.lease,&self.binding,key,millis())
     }
@@ -2016,6 +2286,10 @@ impl WorkflowGuard {
     pub(super) fn scope_stage_response_keys(&self,after:&str)->Result<Vec<String>> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .scope_stage_response_keys(&self.lease,&self.binding,after,millis())
+    }
+    /// #2373: audited, once per key. True when this call recorded it.
+    pub(super) fn record_reviewer_fallback(&self,key:&str,payload:&serde_json::Value)->Result<bool> {
+        self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_reviewer_fallback(&self.lease,&self.binding,key,payload,millis())
     }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
@@ -2199,6 +2473,16 @@ impl WorkflowGuard {
         Ok(eligible)
     }
 
+    /// #2458: checks still running on the bound head wait a short poll.
+    pub(super) async fn defer_hosted_ci_pending(&mut self)->Result<i64> {
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        let eligible=self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .defer_hosted_ci_pending(&self.lease,&self.binding,millis())?;
+        self.audit_event("hosted_ci_pending_wait",serde_json::json!({"eligible_at_ms":eligible}))?;
+        Ok(eligible)
+    }
+
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
         let message=format!("{error:#}");
         let Some(code)=infra_failure_reason(&message) else {return Ok(None);};
@@ -2211,6 +2495,39 @@ impl WorkflowGuard {
             "failure_code":code,"dependency_sha256":dependency,"eligible_at_ms":eligible,
             "failure_sha256":format!("{:x}",Sha256::digest(message.as_bytes()))}))?;
         Ok(Some(eligible))
+    }
+
+    /// #2315: a hosted CI code failure takes a repair round now or waits on
+    /// the #2301 backoff ladder, on the main-reconciliation cue. Never the
+    /// infrastructure retry, never terminal.
+    pub(super) async fn code_repair_round(&mut self,reason:&str,immediate:bool)
+        ->Result<crate::autoship_workflow::ci_code_repair::Ladder> {
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        let ladder=self.store.lock().map_err(|_|anyhow::anyhow!("workflow code repair store poisoned"))?
+            .code_repair_round(&self.lease,&self.binding,reason,immediate,millis())?;
+        self.audit_event("hosted_ci_code_failure",match ladder {
+            crate::autoship_workflow::ci_code_repair::Ladder::Repair(round)=>serde_json::json!({
+                "reason":reason,"round":round,"action":"merge_main_rebuild_and_repair"}),
+            crate::autoship_workflow::ci_code_repair::Ladder::Wait(eligible)=>serde_json::json!({
+                "reason":reason,"action":"reconcile_main","eligible_at_ms":eligible}),
+        })?;
+        Ok(ladder)
+    }
+
+    /// #2536: a parked fresh candidate leaves `'stages` before Stage 4's
+    /// commit and checkpoint, so the last checkpoint still binds the build
+    /// base. Publication commits that tree; bind the exact committed head
+    /// (recomputed from the worktree, like every checkpoint) before the
+    /// publication intent is retained. A head that is not the worktree's
+    /// HEAD still fails the publication guard.
+    pub(super) async fn checkpoint_publication_candidate(&mut self,head:&str)->Result<()> {
+        if self.binding.head==head {return Ok(());}
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .require_owner_dispatch(self.id())?;
+        let evidence=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.lease.workflow)?.context("workflow missing")?.checkpoint.evidence;
+        self.checkpoint(Stage::Publish,"publishing_revision","push",millis(),&evidence).await
     }
 
     /// Transition stage while retaining the receipt set that reviewers saw.
@@ -2236,7 +2553,14 @@ impl WorkflowGuard {
             .checkpoint
             .evidence;
         self.checkpoint(stage, reason, action, eligible_at_ms, &evidence)
-            .await
+            .await?;
+        // #2354: the checkpoint is durable and the next step is not yet
+        // claimed, so a pending deploy may restart the worker here. Waiting
+        // and terminal stages end their tick normally instead.
+        if !matches!(stage,Stage::Merged|Stage::Retired|Stage::Held|Stage::AwaitChecks) {
+            crate::autoship_worker::safe_point().await;
+        }
+        Ok(())
     }
 
     /// Publish detached resumed work with a remote-head precondition. A lost
@@ -2244,6 +2568,13 @@ impl WorkflowGuard {
     /// is needed; ancestry and the lease both protect intervening remote edits.
     /// The actual fresh publication entry, separately callable by its
     /// disposable-remote regression without invoking a model.
+    /// #2491: this workflow checkpointed a push of its exact current binding
+    /// and has not published that head yet.
+    pub(super) fn unpushed_publish_checkpoint(&self)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .unpushed_publish_checkpoint(self.id(),&self.binding)
+    }
+
     pub(super) async fn push_fresh(&mut self,repo:&Path,branch:&str,automatic:bool)->Result<String> {
         self.push_checked(branch,Some((repo,automatic))).await
     }
@@ -2300,10 +2631,10 @@ impl WorkflowGuard {
         let expected=format!("--force-with-lease={target}:{remote}");
         let refspec=format!("{}:{target}",operation.binding.head);
         let (pushed,_,_)=run("git",&["-c",hook.config(),"push",&expected,"origin",&refspec],&self.worktree).await?;
-        let observed=destination.head(&self.worktree,&self.repository,&target).await?;
-        anyhow::ensure!(observed.as_deref()==Some(operation.binding.head.as_str()),
-            "push outcome not verified; preserved pending intent (command success: {pushed})");
-        let head=observed.context("Push observation unavailable")?;
+        // #2547: the ref API can lag a landed push; re-read before failing.
+        let (worktree,repository,target,destination)=(&self.worktree,&self.repository,&target,&destination);
+        let head=push_confirm::confirm_pushed_head(&operation.binding.head,pushed,push_confirm::PUSH_OBSERVATION_DELAY,
+            move||destination.head(worktree,repository,target)).await?;
         self.observe_remote(&operation,&format!("git-head:{head}"),None)?;
         Ok(head)
     }
@@ -2341,7 +2672,7 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
-        if !self.released { self.release_after_teardown()?; }
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) { self.release_after_teardown()?; }
         Ok(())
     }
 
@@ -2349,7 +2680,8 @@ impl WorkflowGuard {
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
         anyhow::ensure!(matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")),
+            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")
+            | (durable::HOSTED_CI_PENDING_REASON,"retry_verification")),
             "no durable CI deferral to release");
         self.release_after_teardown()
     }
@@ -2381,9 +2713,9 @@ impl WorkflowGuard {
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
         self.heartbeat.cancel();
-        if !self.released {
-            // Best-effort final usage accounting, never release/cleanup here:
-            // dropping an async task is not proof its descendants are gone.
+        if !self.released && !self.family_wait_released.load(Ordering::SeqCst) {
+            // Best-effort final usage and retry scheduling, never release or
+            // cleanup: dropping a task is not descendant teardown evidence.
             if let Ok(mut store) = self.store.lock() {
                 if let Err(error) = charge_elapsed(
                     &mut store,
@@ -2393,6 +2725,9 @@ impl Drop for WorkflowGuard {
                     millis(),
                 ) {
                     warn!(workflow=%self.lease.workflow,"autoship interrupted usage accounting failed: {error}");
+                }
+                if let Err(error)=store.record_retry_completion(&self.lease,millis()) {
+                    warn!(workflow=%self.lease.workflow,"autoship retry schedule retained without new authority: {error}");
                 }
             }
         }
@@ -2469,6 +2804,10 @@ pub(super) async fn git_binding(
             .strip_prefix("registered:")
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(str::to_owned)
+            // #2464: a plan contract stays recognizable in the binding.
+            .or_else(|| contract.strip_prefix(crate::autoship_workflow::scope_proof_gate::PLAN_CONTRACT_PREFIX)
+                .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(|_| contract.to_owned()))
             .unwrap_or_else(|| format!("{:x}", Sha256::digest(contract.as_bytes()))),
         evidence_hash: format!("{:x}", Sha256::digest(evidence)),
     })
@@ -2476,6 +2815,8 @@ pub(super) async fn git_binding(
 
 /// Canonical trusted repository identity shared by both execution lanes.
 pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
+    // #2444: the repository identity cannot change while the process runs.
+    let name = gh_budget::repository_name(repo_root, || async {
     let (ok, out, _) = run(
         &gh_bin(),
         &[
@@ -2497,7 +2838,9 @@ pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
         "canonical GitHub repository identity unavailable"
     );
-    Ok(name.to_ascii_lowercase())
+    Ok(name.to_owned())
+    }).await?;
+    repository_identity::Policy::from_env()?.canonical(&name)
 }
 
 async fn untracked_evidence(worktree: &Path) -> Result<Vec<(String, String)>> {
@@ -2576,6 +2919,27 @@ pub(super) async fn resume_worktree_path(repo_root:&Path,pr:u64)->Result<PathBuf
     Ok(path)
 }
 
+/// #2458: a resume checkout left on the approved head follows GitHub's merge
+/// of main, so later validation and any resumed work see the PR head. Only a
+/// clean checkout at exactly `from` moves, and only forward to `to`.
+async fn advance_resume_checkout(repo_root: &Path, pr: u64, from: &str, to: &str) -> Result<()> {
+    let path = resume_worktree_path(repo_root, pr).await?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    recovery::existing_checkout(repo_root, &path).await?;
+    let head = git_evidence(&path, &["rev-parse", "HEAD"]).await?;
+    if head.eq_ignore_ascii_case(to) {
+        return Ok(());
+    }
+    anyhow::ensure!(head.eq_ignore_ascii_case(from), "resume checkout holds another candidate");
+    let (ok, status, _) = run("git", &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], &path).await?;
+    anyhow::ensure!(ok && status.trim().is_empty(), "resume checkout has unpublished changes");
+    let (ok, _, error) = run("git", &["merge", "--ff-only", "-q", to], &path).await?;
+    anyhow::ensure!(ok, "resume checkout cannot follow the main update: {}", error.trim());
+    Ok(())
+}
+
 pub(super) async fn prepare_resume_worktree_at_head(
     repo_root:&Path, pr:u64, branch:&str, expected_head:Option<&str>,
 )->Result<PathBuf> {
@@ -2634,12 +2998,42 @@ async fn prepare_resume_candidate_at(
     };
     let Some(mismatch) = error.downcast_ref::<RetainedHeadMismatch>() else { return Err(error); };
     let Some(store) = WorkflowStore::open_read_only(state)? else { return Err(error); };
-    let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
-        &mismatch.published, &mismatch.actual, millis())? else { return Err(error); };
-    let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
-    anyhow::ensure!(descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded,
-        "retained candidate does not extend its recorded publication; candidate preserved");
-    Ok(mismatch.path.clone())
+    let now = millis();
+    if let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
+        &mismatch.published, &mismatch.actual, now)? {
+        // Exact-head binding: only the recorded candidate, and only when it
+        // extends the publication this workflow itself confirmed.
+        let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
+        if descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded {
+            return Ok(mismatch.path.clone());
+        }
+    }
+    // #2279 — an unrecorded or non-descendant candidate is never published.
+    // Retrying the same refusal every tick held the PR forever; once the
+    // workflow is idle and due, set the candidate aside under a durable ref
+    // and resume from the authorized PR head, which re-verifies on main.
+    if !store.retained_candidate_due(repository, pr, branch, now)? { return Err(error); }
+    drop(store);
+    rebuild_from_published(mismatch, pr).await
+}
+
+async fn rebuild_from_published(mismatch: &RetainedHeadMismatch, pr: u64) -> Result<PathBuf> {
+    let path = &mismatch.path;
+    let (clean, status, _) = run("git", &["status", "--porcelain", "--untracked-files=no"], path).await?;
+    anyhow::ensure!(clean && status.trim().is_empty(),
+        "retained candidate has uncommitted edits; candidate preserved");
+    anyhow::ensure!(git_evidence(path, &["rev-parse", "HEAD"]).await?.eq_ignore_ascii_case(&mismatch.actual),
+        "retained candidate changed during rebuild; candidate preserved");
+    let preserved = format!("refs/autoship/preserved/pr-{pr}/{}", mismatch.actual);
+    let (saved, _, _) = run("git", &["update-ref", &preserved, &mismatch.actual], path).await?;
+    anyhow::ensure!(saved, "cannot preserve retained candidate; candidate preserved");
+    let (switched, _, error) = run("git", &["checkout", "--quiet", "--detach", &mismatch.published], path).await?;
+    anyhow::ensure!(switched, "cannot resume from authorized PR head: {error}; candidate preserved at {preserved}");
+    anyhow::ensure!(git_evidence(path, &["rev-parse", "HEAD"]).await?.eq_ignore_ascii_case(&mismatch.published),
+        "rebuild did not reach the authorized PR head; candidate preserved at {preserved}");
+    warn!(pr, preserved = %preserved, published = %mismatch.published,
+        "retained candidate is not a recorded descendant of its publication; set aside and resuming from the authorized PR head");
+    Ok(path.clone())
 }
 
 #[derive(Debug)]
@@ -2660,6 +3054,80 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_repo()->tempfile::TempDir {
+        let tmp=std::fs::canonicalize("/tmp").unwrap();
+        let root=tempfile::tempdir_in(&tmp).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/phone.rs"),"pub fn format(n:&str)->String {n.into()}\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","main"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+            let out=std::process::Command::new("/usr/bin/git").args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();assert!(out.status.success());
+        }
+        root
+    }
+
+    /// #2464 AC: a feature issue (nothing to observe on main) reaches a
+    /// build attempt from one scope response. The old gate refuses the same
+    /// builder until an original-production witness qualifies.
+    #[tokio::test]
+    async fn a_feature_issue_with_no_defect_on_main_reaches_a_build_attempt_in_one_scope_call() {
+        let repo=plan_repo();let state=tempfile::tempdir().unwrap();let state=state.path().join("workflow.db");
+        let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:Some(2464),pr:None,branch:"fixture",
+            contract:"Add E.164 phone formatting",environment:"frontend environment"};
+        // Gate on: the scoped request cannot admit a builder at Build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(true));
+        let mut old=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        old.transition(Stage::Build,"criteria_registered","build",0).await.unwrap();
+        let refused=old.audit_logger().model_call_admitted("codex").unwrap_err();
+        assert!(format!("{refused:#}").contains("baseline_witness_unqualified"),"{refused:#}");
+        let scope=ScopeOutcome {fixable:true,complexity:Complexity::Simple,est_diff_lines:Some(30),guarded_paths:false,
+            body:"ALLOWED-PATHS: src/phone.rs\nFormat numbers as E.164.".into(),criteria:vec!["Numbers render as E.164".into()],relevance:Relevance::Current};
+        let plan=super::super::plan_proof::Plan::from_scope("Add E.164 phone formatting",Some(&scope),&scope.criteria);
+        assert!(old.bind_plan(&plan).is_err(),"the plan path must not run with the gate on");
+        old.finish().unwrap();
+        // Gate off (default): bind the one scope response's plan and build.
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(Some(false));
+        let mut guard=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        guard.transition(Stage::Scope,"trusted_request_acquired","scope_request",0).await.unwrap();
+        guard.bind_plan(&plan).unwrap();
+        guard.transition(Stage::Build,"plan_registered","build",0).await.unwrap();
+        assert!(guard.plan_mode());
+        assert!(crate::autoship_workflow::scope_proof_gate::plan_contract(&guard.binding().contract),"{}",guard.binding().contract);
+        guard.audit_logger().model_call_admitted("codex").expect("the builder is admitted from the plan");
+        let snapshot=WorkflowStore::open(&state).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.stage,Stage::Build);
+        assert_eq!(snapshot.checkpoint.next.reason,"plan_registered");
+        assert_eq!(snapshot.model_calls,1,"one admitted builder call; no witness, amendment or ladder call");
+        guard.finish().unwrap();
+        crate::autoship_workflow::scope_proof_gate::set_gate_for_test(None);
+    }
+
+    #[test]
+    fn daily_ledger_holds_fresh_starts_but_not_in_flight_issues() {
+        let data=tempfile::tempdir().unwrap();let path=data.path().join("workflow.db");
+        {
+            let mut store=WorkflowStore::open(&path).unwrap();
+            // #7: #2360's shape on 2026-11-21. #8: a scope-stage start with no PR.
+            for (issue,stage,pr) in [(7,Stage::Verify,Some(2372)),(8,Stage::Scope,None)] {
+                let id=durable::workflow_id("owner/repo",issue).unwrap();
+                let binding=Binding {head:"h".into(),contract:"c".into(),evidence_hash:"e".into()};
+                store.register(&id,"fixture",binding.clone(),0).unwrap();
+                let lease=store.claim(&id,"fixture",0,1).unwrap().unwrap();
+                if let Some(pr)=pr {store.attach_pr_in_repo(&lease,"owner/repo",pr,0).unwrap();}
+                store.checkpoint(&lease,&durable::Checkpoint {stage,binding,evidence:vec![],
+                    next:durable::NextAction {reason:"integration_checks_required".into(),action:"verify_integrated_head".into(),eligible_at_ms:0}},0).unwrap();
+                store.release(&lease,0).unwrap();
+            }
+        }
+        let controls=FreshIssueControls::open_at(&path).unwrap();
+        let ledger=AttemptLedger {day:100,issues:vec![7,8,9]};
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",7,false),"in-flight verify sat behind the ledger");
+        assert!(controls.daily_ledger_holds(&ledger,100,"owner/repo",8,false),"a second fresh start the same day is still capped");
+        assert!(controls.daily_ledger_holds(&ledger,100,"owner/repo",9,false),"no workflow is a fresh start");
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",9,true),"a due retry keeps its existing exemption");
+        assert!(!controls.daily_ledger_holds(&ledger,100,"owner/repo",10,false),"unlisted issues are untouched");
+        assert!(!controls.daily_ledger_holds(&ledger,101,"owner/repo",8,false),"the ledger resets each UTC day");
+    }
 
     #[test]
     fn source_failure_diagnostics_survive_owned_binding_rotation_and_deduplicate_each_binding() {
@@ -2893,16 +3361,85 @@ mod tests {
             "a changed remote resolution must not use retained-candidate recovery");
         assert!(run("git", &["checkout", "--orphan", "unrelated-fixture"], &candidate).await.unwrap().0);
         assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "unrelated root"], &candidate).await.unwrap().0);
-        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+        let unrelated_head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
+        // #2279: an unrecorded local head never inherits the old recovery
+        // authority. An idle, due workflow sets it aside under a durable ref
+        // and resumes from the authorized PR head instead of holding forever.
+        let rebuilt = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("an unrecorded head must rebuild from the authorized PR head, not hold");
+        assert_eq!(rebuilt, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), published,
             "an unrecorded local head cannot inherit the old recovery authority");
+        assert_eq!(git_evidence(dir.path(), &["rev-parse", &format!("refs/autoship/preserved/pr-42/{unrelated_head}")]).await.unwrap(),
+            unrelated_head, "the set-aside candidate must be preserved as evidence");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before, "rebuild preparation must not rewrite workflow state");
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"), "rebuild must not publish the set-aside candidate");
+        assert!(run("git", &["checkout", "--quiet", "--detach", &unrelated_head], &candidate).await.unwrap().0);
         let mut unrelated = retained;
-        unrelated.head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
-        let next_lease = store.claim(&lease.workflow, "fixture-authority", 40, 60_000).unwrap().unwrap();
+        unrelated.head = unrelated_head.clone();
+        let next_lease = store.claim(&lease.workflow, "fixture-authority", millis(), 600_000).unwrap().unwrap();
         checkpoint.binding = unrelated;
         store.checkpoint(&next_lease, &checkpoint, 41).unwrap();
+        // While another worker holds the lease the candidate stays in place.
+        let leased = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await;
+        assert!(leased.is_err(), "a leased workflow's candidate must be preserved, not rebuilt");
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), unrelated_head);
         store.release(&next_lease, 42).unwrap();
-        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+        let rebuilt = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("a recorded non-descendant rebuilds from the authorized PR head");
+        assert_eq!(rebuilt, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), published,
             "matching protected metadata cannot replace publication ancestry");
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"));
+    }
+
+    /// #2279 — built and verified, then the push failed before any dispatch:
+    /// the workflow sits at `publish / publishing_revision / push`. Resuming
+    /// it must keep the recorded candidate (a verified descendant of the
+    /// workflow's own confirmed publication) instead of refusing every tick.
+    #[tokio::test]
+    async fn push_failed_publish_candidate_resumes_as_recorded_descendant() {
+        let dir = repo();
+        let state = control_dir();
+        let database = state.path().join("workflow.db");
+        let remote = state.path().join("remote.git");
+        assert!(run("git", &["init", "--bare", "-q", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["remote", "add", "origin", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["push", "origin", "HEAD:fixture"], dir.path()).await.unwrap().0);
+        let published = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let candidate = prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.unwrap();
+        let original = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut store = WorkflowStore::open(&database).unwrap();
+        store.register("owner/repo/pr/42", "fixture", original.clone(), 10).unwrap();
+        let lease = store.claim("owner/repo/pr/42", "original-worker", 20, 60_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 42, 21).unwrap();
+        let pushed = store.begin_operation(&lease, OperationKind::Push, &original, 22).unwrap();
+        store.complete_operation(&lease, &pushed.id, &format!("git-head:{published}"), 23).unwrap();
+        std::fs::write(candidate.join("code.txt"), "verified revision\n").unwrap();
+        assert!(run("git", &["add", "code.txt"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "verified revision"], &candidate).await.unwrap().0);
+        let verified = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding = verified.clone();
+        checkpoint.stage = Stage::Publish;
+        checkpoint.next = NextAction { reason: "publishing_revision".into(), action: "push".into(), eligible_at_ms: 30 };
+        store.checkpoint(&lease, &checkpoint, 24).unwrap();
+        store.release(&lease, 25).unwrap();
+        let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+        let resumed = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("a verified push-failed candidate must resume for publication");
+        assert_eq!(resumed, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), verified.head);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before);
+        // An unconfirmed Push intent still fences resume (outcome unknown).
+        let fenced = store.claim(&lease.workflow, "fence", 40, 60_000).unwrap().unwrap();
+        store.begin_operation(&fenced, OperationKind::Push, &verified, 41).unwrap();
+        store.release(&fenced, 42).unwrap();
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "an unknown Push outcome must not be resumed or rebuilt");
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), verified.head);
     }
 
     #[tokio::test]
@@ -3131,6 +3668,45 @@ mod tests {
             logger.model_call_admitted("claude").is_err(),
             "released workflow cannot admit unaccounted spend"
         );
+    }
+
+    /// #2354: a productive stage transition is a restart-safe point. With a
+    /// deploy pending, the checkpoint is durably written first and only then
+    /// does the tick park, before the next step starts. Waiting and terminal
+    /// transitions finish their tick normally.
+    #[tokio::test]
+    async fn a_productive_transition_parks_for_a_deploy_after_its_checkpoint() {
+        let dir = repo();
+        // A canonical (non-symlinked) private directory, so the fixture also
+        // runs where /tmp is a symlink.
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let points = crate::autoship_worker::SafePoints::new(
+            Arc::new(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp)),
+            tokio_util::sync::CancellationToken::new());
+        let start = || Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(7), pr: None, branch: "fix/seven", contract: "C1", environment: "rust-a",
+        };
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis()).await.unwrap().unwrap();
+        let id = guard.id().to_owned();
+        points.scope(guard.transition(Stage::Build, "scoped", "build", 0)).await
+            .expect("no deploy pending: the transition completes");
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        points.scope(guard.transition(Stage::Held, "provider_capacity", "retry", 0)).await
+            .expect("a waiting transition ends its tick normally");
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(2),
+            points.scope(guard.transition(Stage::Review, "candidate_verified", "review", 0))).await;
+        assert!(parked.is_err(), "a productive transition with a deploy pending must park the tick");
+        tokio::time::timeout(std::time::Duration::from_secs(1), points.parked()).await
+            .expect("the worker is told the tick parked");
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage, Stage::Review,
+            "the checkpoint is durable before the tick parks");
     }
 
     #[tokio::test]
@@ -3929,6 +4505,33 @@ mod tests {
         audit.protected_health().unwrap();
     }
 
+    /// #2408 production shape (#2329 at 11:54:52Z): "alignment reviewer
+    /// unavailable: origin: candidate is not a descendant of trusted adopted
+    /// head" was deferred as acceptance infrastructure and retried forever.
+    /// It is provenance: reroute to the PR lane, never an infrastructure wait.
+    #[tokio::test]
+    async fn provenance_divergence_reroutes_instead_of_infrastructure_retry() {
+        let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {
+            repo_root:directory.path(),worktree:directory.path(),repository:"owner/repo",
+            source_issue:Some(2329),pr:Some(2378),branch:"fixture",contract:"C1",environment:"rust-a"
+        },millis()).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Verify,"verification_started","run_verifier",0,&["receipt".into()]).await.unwrap();
+        let error=anyhow::Error::new(adoption::CandidateProvenanceDiverged {
+            adopted_head:"1801".repeat(10),candidate_head:"1027".repeat(10)})
+            .context("alignment reviewer unavailable: origin")
+            .context("acceptance infrastructure unavailable");
+        let outcome=CiGateResult(Err(error)).for_workflow(&mut guard).await;
+        let error=match outcome { Err(error)=>error, Ok(other)=>panic!("provenance became a gate result: {other:?}") };
+        assert!(error.downcast_ref::<CiInfrastructureDeferred>().is_none(), "provenance misfiled as infrastructure: {error:#}");
+        let store=WorkflowStore::open(&path).unwrap();
+        let cp=store.snapshot(guard.id()).unwrap().unwrap().checkpoint;
+        assert_eq!((cp.stage,cp.next.reason.as_str(),cp.next.action.as_str()),
+            (Stage::Reconcile,"candidate_provenance_diverged","resume_preserved_pr"));
+        assert!(!store.events(guard.id()).unwrap().iter().any(|(_,kind,_,_)|kind=="verification_infrastructure_retry"));
+        assert_eq!(durable::retry_recovery::class(&cp),Some("provenance"),"a bounded automatic retry class, not a park");
+    }
+
     #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
         for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {
@@ -4153,13 +4756,17 @@ mod tests {
             write(&session.join("lock"),b"");
         }
         write(&known.join("complete.json"),br#"{"version":1,"generation":"generation-a"}"#);
+        write(&known.join("producer-completion.json"),br#"{"version":1,"audit_path":"/original/audit","owner":{"workflow_id":"original","lease_generation":1},"writer_fence":1}"#);
+        write(&known.join("settled-result.json"),br#"{"version":1,"owner":{"workflow_id":"original","lease_generation":1},"durable":true}"#);
         let unknown_owned=std::fs::read(unknown.join("owned.json")).unwrap();
         let aliases=provider.join("aliases");std::fs::create_dir(&aliases).unwrap();
         write(&aliases.join("completed-fixture"),br#""session-completed""#);
         write(&aliases.join("interrupted-fixture"),br#""session-interrupted""#);
         let policy=root.path().join("policy.json");
-        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":1073741824u64,"max_sessions":3,"providers":{}})).unwrap());
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        // The interrupted scope-retired runtime is unresumable history and holds
+        // no reservation (#2506); only the completed one fills this 1 GiB budget.
         let full=augmentagent_channel_core::native_vm::state_capacity::inspect();
         assert!(full.available_fingerprint().is_none());assert!(known.exists(),"read-only inspection deleted runtime state");
         let fingerprint=serde_json::to_value(full).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();
@@ -4182,7 +4789,10 @@ mod tests {
         assert!(!known.exists());assert!(!aliases.join("completed-fixture").exists());
         assert!(unknown.exists());assert!(aliases.join("interrupted-fixture").exists());
         assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
-        assert!(!unknown.join("retired-owner.json").exists());
+        assert!(unknown.join("retired.json").exists(),"protected retirement evidence was removed");
+        for backfilled in ["retired-owner.json","producer-completion.json","settled-result.json"] {
+            assert!(!unknown.join(backfilled).exists(),"{backfilled} was backfilled onto an unproved runtime");
+        }
         let after=store.snapshot(id).unwrap().unwrap();
         assert_eq!(after.checkpoint.next.eligible_at_ms,33);assert_eq!(after.progress_at_ms,before.progress_at_ms);
         assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
@@ -4382,7 +4992,7 @@ mod initial_acceptance_hold_tests {
         }
         let id=guard.id().to_owned();guard.finish().unwrap();
         let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();drop(store);
+        let before=store.snapshot(&id).unwrap().unwrap();drop(store);
         std::fs::write(upstream.join("unrelated.md"),"manual intake routing changed elsewhere\n").unwrap();
         git(&upstream,&["add","unrelated.md"]).await;
         git(&upstream,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","unrelated main advance"]).await;
@@ -4400,13 +5010,18 @@ mod initial_acceptance_hold_tests {
             assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
             resumed.finish().unwrap();return;
         }
-        assert!(next.is_none(),"upstream-only environment change revived the exhausted original verifier");
+        // A planning lease may now escalate to children. The original verifier
+        // remains exhausted: its binding, evidence and charges are unchanged.
+        let mut resumed=next.expect("exhausted verifier could not escalate planning");
+        let original=resumed.begin_acceptance_escalation().await.unwrap().unwrap();
+        assert_eq!(original.original,before.checkpoint);
         let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
-        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);
-        assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);assert_eq!(store.events(&id).unwrap(),events);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.attempts,before.attempts+1);assert_eq!(after.model_calls,3);assert_eq!(after.tokens,before.tokens);
+        drop(store);resumed.finish().unwrap();
     }
     #[tokio::test]
-    async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
+    async fn unchanged_initial_acceptance_waits_preserve_admission_and_accounting_after_restart() {
         for (reason,action) in [
             ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
             ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
@@ -4421,18 +5036,36 @@ mod initial_acceptance_hold_tests {
                     let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
                     assert!(output.status.success());
                 }
-                let path=control.path().join("workflow.db");
+                // SQLite NOFOLLOW rejects macOS /tmp symlinks; exercise the same
+                // admission/accounting assertions on both platforms.
+                let path=control.path().canonicalize().unwrap().join("workflow.db");
                 let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
                     source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
                 let now=millis();
                 let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
+                guard.store.lock().unwrap().charge(&guard.lease,"original-verifier-work",
+                    crate::autoship_workflow::ResourceCharge {model_calls:3,tokens:111,wall_ms:700},now).unwrap();
                 guard.hold_initial_acceptance(reason,action).await.unwrap();
                 let id=guard.id().to_owned();guard.finish().unwrap();
                 let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                 let original=before.snapshot(&id).unwrap().unwrap();
                 let events=before.events(&id).unwrap();drop(before);
+                let mut planning_claims = 0;
                 for offset in [1000,86_400_000,2*86_400_000] {
                     let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
+                    // #2370: a declined amendment enters the same ladder.
+                    if matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined") && pr.is_none() {
+                        let planning=next.expect("unpublished exhausted hold did not admit planning");
+                        // A lease is an attempt even when no model work is done.
+                        // Recovery must retain all paid work and the exhausted
+                        // verifier checkpoint across every restart/day change.
+                        planning_claims += 1;
+                        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+                        assert_eq!(after.attempts,original.attempts+planning_claims);
+                        assert_eq!(after.checkpoint,original.checkpoint);assert_eq!(after.model_calls,original.model_calls);assert_eq!(after.tokens,original.tokens);
+                        assert!(after.wall_ms>=original.wall_ms,"elapsed work accounting was reset");
+                        drop(store);planning.finish().unwrap();continue;
+                    }
                     assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
                     let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                     let after=store.snapshot(&id).unwrap().unwrap();
@@ -4454,7 +5087,7 @@ mod initial_acceptance_hold_tests {
                 let mut changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
                 let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                 let after=store.snapshot(&id).unwrap().unwrap();
-                assert_eq!(after.attempts,original.attempts+1);
+                assert_eq!(after.attempts,original.attempts+planning_claims+1);
                 assert_eq!(after.checkpoint.stage,Stage::Reconcile);
                 assert_eq!(after.checkpoint.next.reason,"inputs_changed");
                 assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
@@ -4508,3 +5141,7 @@ mod initial_acceptance_hold_tests {
 #[cfg(test)]
 #[path = "self_improve_hold_outcome_tests.rs"]
 mod hold_outcome_tests;
+
+#[cfg(test)]
+#[path="self_improve_retry_drop_tests.rs"]
+mod retry_drop_tests;

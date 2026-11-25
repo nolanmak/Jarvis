@@ -53,6 +53,21 @@ class WorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(self.starts,['start'])
         self.assertEqual(self.run_recovery()['state'],'not-eligible')
         self.assertEqual(self.starts,['start'])
+    def test_pinned_worker_launcher_and_build_are_recovery_proof(self):
+        # #2468 — the worker runs its pinned build through its own launcher.
+        pinned=self.root/'pinned/bin/augmentagent';pinned.parent.mkdir(parents=True)
+        pinned.write_text('pinned executable');pinned.chmod(0o700)
+        exe=self.proc/'45/exe';exe.unlink();exe.symlink_to(pinned)
+        launcher=str(self.repository/'scripts/run-autoship-pinned.sh')
+        self.worker['ExecStart']=f'{{ path={launcher} ; argv[]={launcher} auto-pr-worker --dry-run false ; ignore_errors=no ; }}'
+        self.assertEqual(recovery.recover(self.repository,self.state,self.proc,self.manager,pinned)['state'],'recovered')
+        self.assertEqual(self.starts,['start'])
+    def test_pinned_worker_without_its_build_is_not_recovery_proof(self):
+        pinned=self.root/'pinned/bin/augmentagent';pinned.parent.mkdir(parents=True)
+        pinned.write_text('pinned executable');pinned.chmod(0o700)
+        exe=self.proc/'45/exe';exe.unlink();exe.symlink_to(pinned)
+        with patch.object(recovery.time,'sleep'),patch.object(recovery.time,'monotonic',side_effect=[0,0,11]):
+            with self.assertRaisesRegex(RuntimeError,'identity is unverified'):self.run_recovery()
     def test_owner_stop_disable_active_worker_and_pending_stop_are_preserved(self):
         for change in [{'ActiveState':'inactive'},{'UnitFileState':'disabled'},
                        {'ActiveState':'active','MainPID':'45'},{'Job':'42 /job/42'}, {'Result':'exit-code'}]:

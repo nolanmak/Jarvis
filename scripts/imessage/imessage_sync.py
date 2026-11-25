@@ -51,6 +51,51 @@ def source_staleness(db_path, now=None, threshold=SOURCE_STALE_AFTER_S):
 # storing: uploading them cost more than half of every queue drain.
 SKIP_ATTACHMENT_SUFFIXES = (".pluginpayloadattachment",)
 
+# iPhone photos arrive as HEIC, which the drafting models cannot open. With a
+# converter configured they are uploaded as JPEG instead (#2332).
+CONVERT_SUFFIXES = (".heic", ".heif")
+
+
+def heic_to_jpeg(src, dest):
+    """Convert with macOS `sips`. True when `dest` was written."""
+    import subprocess
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    try:
+        done = subprocess.run(
+            ["sips", "-s", "format", "jpeg", str(src), "--out", str(partial)],
+            capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        done = None
+    if done is None or done.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        return False
+    partial.replace(dest)
+    return True
+
+
+def export_convert_dir(convert_dir, state_path):
+    """Converted copies of one export live in a subdirectory of their own,
+    named after its state file. Sweeping copies after a drain must not delete
+    a copy that another bundle sharing the cache still has queued."""
+    digest = hashlib.sha256(str(Path(state_path).resolve()).encode()).hexdigest()
+    return Path(convert_dir) / digest[:16]
+
+
+def converted_attachment(local, att_id, name, converter, convert_dir):
+    """(path, name) of a JPEG copy of a HEIC attachment, or None when it is
+    not one, no converter is configured, or the conversion failed (the
+    original is then uploaded as before)."""
+    if not converter or not convert_dir or local.suffix.lower() not in CONVERT_SUFFIXES:
+        return None
+    new_name = Path(name or local.name).stem + ".jpg"
+    dest = Path(convert_dir) / f"{att_id}-{slugify(new_name)}"
+    if (dest.exists() and dest.stat().st_size > 0) or converter(local, dest):
+        return dest, new_name
+    return None
+
+
 UPLOAD_WORKERS = 8      # one `aws s3 cp` per file; the cold start dominates
 UPLOAD_BUDGET_S = 90.0  # leave the queue for the next run rather than overrun it
 
@@ -458,6 +503,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
     pending = [item for item in state.get("pending_uploads", [])
                if is_uploadable(item["path"])]
+    convert_dir = (export_convert_dir(s3["convert_dir"], state_path)
+                   if s3 and s3.get("convert_dir") else None)
 
     for ident, entry in index.items():
         entry.setdefault("dir", ident)
@@ -541,8 +588,14 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
         attach_lines = []
         for att_id, mime, name, filename in attachments:
-            line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             local = Path(filename).expanduser() if filename else None
+            if s3 and local and local.exists() and is_uploadable(local):
+                converted = converted_attachment(
+                    local, att_id, name, s3.get("converter"), convert_dir)
+                if converted:
+                    local, name = converted
+                    mime = "image/jpeg"
+            line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             if s3 and local and local.exists() and is_uploadable(local):
                 key = attachment_key(index[ident]["dir"], att_id, name)
                 line += f" s3://{s3['bucket']}/{key}"
@@ -581,6 +634,15 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         pending = drain_uploads(
             pending, s3["bucket"], s3["uploader"],
             deadline=time.monotonic() + UPLOAD_BUDGET_S)
+
+    # Converted copies are only needed until they are uploaded. Sweeping this
+    # export's own subdirectory runs even without a converter configured, so a
+    # copy queued by an earlier run is cleaned up once it uploads.
+    if convert_dir and convert_dir.is_dir():
+        waiting = {item["path"] for item in pending}
+        for copy in convert_dir.iterdir():
+            if str(copy) not in waiting:
+                copy.unlink(missing_ok=True)
 
     state["pending_uploads"] = pending
     state["synced_at"] = datetime.now().astimezone().isoformat(timespec="seconds")

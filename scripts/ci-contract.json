@@ -292,7 +292,7 @@
       "shell": "bash"
     },
     "macos/platform-macos/30": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "macos/platform-macos/31": {
@@ -372,7 +372,7 @@
       "shell": "bash"
     },
     "model-router/dashboard/5": {
-      "body": "python3 -m unittest discover -s scripts/tests -p model_router_install_test.py",
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
       "shell": "bash"
     },
     "model-router/dashboard/6": {
@@ -387,16 +387,20 @@
       "body": "python3 -m unittest scripts.tests.macos_parity_inventory_test -v",
       "shell": "bash"
     },
+    "model-router/installer/11": {
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
+      "shell": "bash"
+    },
     "model-router/installer/2": {
       "body": "sw_vers",
       "shell": "bash"
     },
     "model-router/installer/3": {
-      "body": "python3 -m unittest discover -s scripts/tests -p model_router_install_test.py -v",
+      "body": "python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v",
       "shell": "bash"
     },
     "model-router/installer/4": {
-      "body": "bash scripts/tests/model-router-uninstall.test.sh",
+      "body": "bash -n scripts/install-omniroute.sh",
       "shell": "bash"
     },
     "model-router/installer/5": {
@@ -420,18 +424,12 @@
       "shell": "bash"
     },
     "model-router/pinned-gateway/1": {
-      "body": "bash scripts/build-model-router-image.sh",
-      "shell": "bash",
-      "vm_provisioning": [
-        "docker-daemon-images"
-      ]
+      "body": "python3 -B -m unittest discover -s scripts/tests -p model_router_retirement_test.py -v",
+      "shell": "bash"
     },
     "model-router/pinned-gateway/2": {
-      "body": "python3 scripts/tests/run_model_router_image_fixture.py",
-      "shell": "bash",
-      "vm_provisioning": [
-        "docker-daemon-images"
-      ]
+      "body": "python3 -B -m unittest discover -s scripts/tests -p omniroute_install_test.py -v",
+      "shell": "bash"
     },
     "no-gmail-authors/check/1": {
       "body": "range=\"${CI_CONTRACT_BASE}..${CI_CONTRACT_HEAD}\"\nbad=$(git log --format='%ae %ce' \"$range\" | tr ' ' '\\n' | grep -iE 'gmail\\.com' | sort -u || true)\nif [ -n \"$bad\" ]; then\n  echo \"::error::Commit(s) in this PR use a personal gmail author/committer address:\"\n  echo \"$bad\"\n  echo \"Commit as the nolanmak GitHub noreply instead \u2014 see docs/PUBLISH.md.\"\n  exit 1\nfi\necho \"OK: no gmail author/committer emails in this PR's commits.\"\n",
@@ -530,7 +528,7 @@
       "shell": "bash"
     },
     "platform/platform/32": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/33": {
@@ -549,7 +547,7 @@
       ]
     },
     "platform/platform/4": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: disk_pressure:: autoship_worktree_cleanup:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/auto_pr_worker_status_test.py\npython3 scripts/tests/autopr_worker_install_test.py\npython3 scripts/tests/autopr_worker_recovery_test.py\npython3 scripts/tests/updater_worker_provision_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
+      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: disk_pressure:: autoship_worktree_cleanup:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/autopr_worker_install_test.py\npython3 scripts/tests/autopr_worker_recovery_test.py\npython3 scripts/tests/updater_worker_provision_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/5": {
@@ -714,6 +712,10 @@
     },
     "rust/channels/26": {
       "body": "cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/27": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent -- yolo_acceptance_tests:: yolo_isolation_tests::\ncargo test -p augmentagent-approval-discord --lib yolo_isolation_tests::\ncargo test -p augmentagent-store --lib yolo\n",
       "shell": "bash"
     },
     "rust/channels/3": {
@@ -1869,7 +1871,10 @@
       "events": {
         "pull_request": {
           "paths": [
-            "crates/augmentagent-channel-core/**",
+            "README.md",
+            "docs/**",
+            "scripts/**",
+            "crates/**",
             "crates/augmentagent-approval-discord/**",
             "crates/augmentagent-cli/**",
             "scripts/runpod-adapter/**",
@@ -1879,16 +1884,17 @@
             "views/model-*",
             "test/modelRouter*",
             "scripts/*model-router*",
+            "scripts/*omniroute*",
+            "scripts/lib/omniroute_install.py",
+            "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
             "scripts/macos_parity_inventory.py",
             "docs/macos-parity-inventory.json",
             "scripts/tests/model_router*",
             "scripts/tests/runpod_adapter_install_test.py",
-            "scripts/tests/run_model_router_image_fixture.py",
             "scripts/tests/verify_codex_redirect.py",
             "scripts/tests/test_verify_codex_redirect.py",
-            "sidecars/9router/**",
             ".github/workflows/model-router.yml",
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
@@ -1903,7 +1909,10 @@
             "main"
           ],
           "paths": [
-            "crates/augmentagent-channel-core/**",
+            "README.md",
+            "docs/**",
+            "scripts/**",
+            "crates/**",
             "crates/augmentagent-approval-discord/**",
             "crates/augmentagent-cli/**",
             "scripts/runpod-adapter/**",
@@ -1913,16 +1922,17 @@
             "views/model-*",
             "test/modelRouter*",
             "scripts/*model-router*",
+            "scripts/*omniroute*",
+            "scripts/lib/omniroute_install.py",
+            "scripts/tests/omniroute_install_test.py",
             "scripts/*runpod-adapter*",
             "scripts/lib/install-launchd-plist.sh",
             "scripts/macos_parity_inventory.py",
             "docs/macos-parity-inventory.json",
             "scripts/tests/model_router*",
             "scripts/tests/runpod_adapter_install_test.py",
-            "scripts/tests/run_model_router_image_fixture.py",
             "scripts/tests/verify_codex_redirect.py",
             "scripts/tests/test_verify_codex_redirect.py",
-            "sidecars/9router/**",
             ".github/workflows/model-router.yml",
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
@@ -2052,6 +2062,10 @@
             },
             {
               "command_id": "model-router/installer/10"
+            },
+            {
+              "command_id": "model-router/installer/11",
+              "name": "Optional OmniRoute installer contracts"
             }
           ],
           "strategy": {
@@ -2076,18 +2090,18 @@
             },
             {
               "command_id": "model-router/pinned-gateway/1",
-              "name": "Build pinned 9Router with the reconciliation patch"
+              "name": "Verify retired provisioners stay absent"
             },
             {
               "command_id": "model-router/pinned-gateway/2",
-              "name": "Exercise account failover, request identity and media refusal"
+              "name": "Verify pinned optional gateway installer"
             }
           ],
-          "timeout-minutes": 30
+          "timeout-minutes": 5
         }
       },
       "role": "validation",
-      "sha256": "b5e498f8b8a5e91cb16e0e8d7e3ace842b7677b4e4418fe1c55f11057d85ea8a"
+      "sha256": "ed55a1f011912fb82060b86ceddbe28e520d4bbbb8104ee1c8cc898e69d3d395"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},
@@ -2687,6 +2701,12 @@
             {
               "command_id": "rust/channels/26",
               "name": "WhatsApp Rust channel lint"
+            },
+            {
+              "command_id": "rust/channels/27",
+              "if": "runner.os == 'Linux'",
+              "name": "Yolo isolation acceptance",
+              "shell": "bash"
             }
           ],
           "strategy": {
@@ -3131,7 +3151,7 @@
         }
       },
       "role": "validation",
-      "sha256": "6a03425098d8ed81bcfa0e28901b00509e339c0b76bafc6965df224f71d1e1fc"
+      "sha256": "58ab1cf3528735e23a7c6a84999bef2e2b8d1589949d4f822c782dfeadd226f0"
     },
     ".github/workflows/targeted.yml": {
       "defaults": {},

@@ -1,5 +1,15 @@
 # Original baseline witness qualification
 
+> **Off by default since #2464.** This gate runs only with
+> `AUTOSHIP_SCOPE_PROOF_GATE=on`. With the switch off (the default), scope
+> writes a plan, acceptance criteria and allowed paths, and the build starts
+> from them. Proof moves to the build: the builder's new or changed tests fail
+> on base and pass on the head (recorded by the builder, checked against the
+> diff by the controller), required hosted CI is green, and the independent
+> cross-provider review approves. Rows parked in scope on a witness,
+> qualification, ladder or amendment reason are released to build or repair
+> on their next turn. The #2467 caps still apply.
+
 Autoship must establish a production defect before it admits a builder. A
 pinned program producing different output on two revisions is insufficient:
 the original revision might have selected no tests, while candidate-owned tests

@@ -40,8 +40,13 @@ augmentagent imessage alerts policy --followup-seconds 600 \
   --prepare-first-seconds 3600 --prepare-last-seconds 900 --max-notices 6
 ```
 
-Priorities are exact bare email addresses: `high`, `critical`, or `routine` (mute
-new proactive classification). Changing a priority reconsiders prior eligible
+Priorities accept a bare email, wiki person slug (`matt` or `person:matt`), or
+exact domain (`example.test`, `@example.test`, `domain:example.test`). Levels are
+`high`, `critical`, or `routine` (mute new proactive classification). Domains do
+not include subdomains. An exact email wins over a person, which wins over a
+domain; a mute wins equal-specificity ties. Person selectors resolve every email
+identity on the current wiki page, including identities added later. Pass the
+same `--wiki-dir` used by the daemon when saving a person selector. Changing a priority reconsiders prior eligible
 messages. Already-created tasks retain their lifecycle; resolve unwanted ones.
 The schedule is stored in SQLite and survives restart. A one-shot
 `augmentagent imessage alerts dispatch` evaluates the same Discord schedule.
@@ -53,6 +58,68 @@ Critical texts are immediately eligible; high texts wait 600 seconds by default
 (`AUGMENTAGENT_ALERT_TEXT_DELAY_SECS`). A Discord failure accelerates text
 eligibility. With texts disabled or the Mac unavailable, Discord reminders remain
 active. Sent, failed, unknown, expired, and cancelled text outcomes remain distinct.
+
+## Optional email gate and High digest
+
+Existing classification and sending defaults remain unchanged. Set
+`AUGMENTAGENT_ALERT_EMAIL_GATES=1` in the daemon environment to enable the additive
+email gate and the default digest schedule, `09:00,17:00`. This does not enable
+text delivery: the existing verified owner text policy and
+`AUGMENTAGENT_IMESSAGE_SEND_ENABLED` opt-ins are still required.
+
+```sh
+augmentagent --wiki-dir ./wiki imessage alerts priority matt high
+augmentagent imessage alerts priority example.test --urgency high
+augmentagent imessage alerts priority newsletter@example.test routine
+```
+
+With the gate enabled, priority senders qualify on arrival without a request,
+consequence, or deadline quote. They do not wait for model triage. A person with
+an explicit `relationship: active-collaborator` or `relationship: close-contact`
+line also qualifies as High on a concrete request alone. Affirmative prose such
+as “Active collaborator on agent projects.” or “Close contact from the community.”
+is supported; hypothetical, former, and negated descriptions do not qualify.
+The same request from an unknown person follows the existing evidence rules.
+Ambiguous identities shared by multiple people do not infer a relationship.
+The exact request and relationship source line are retained in alert evidence.
+The deterministic request recognizer accepts direct forms such as “can you send”,
+“please review”, and “need you to confirm”; it does not treat every question as a
+request. Unsupported phrasings continue through ordinary model assessment.
+
+`AUGMENTAGENT_ALERT_HIGH_DIGEST=09:00,17:00` can independently enable/customize
+the digest; an explicitly empty value disables it, including when the email gate
+is enabled. Times use `AUGMENTAGENT_ALERT_TIMEZONE` (UTC if unset). At each local
+minute, one durable batch contains up to the oldest 20 open, unexpired,
+unsnoozed High alerts not individually sent, in flight, or of unknown delivery.
+Acknowledged, resolved, Critical and Routine items are excluded. An empty batch
+sends nothing. The body is refreshed at claim, so acknowledgment or an individual
+text arriving after scheduling removes that item. A batch expires five minutes
+after its slot; restart never resends a claimed/sent/unknown batch. A missed slot
+is not replayed hours later. DST's repeated local minute produces one batch.
+The existing sender's five-second dispatch deadline also applies to digests.
+
+## Offline calibration
+
+No provider calls, database mutations, or sends are needed. On the machine that
+holds the live database, run the exporter with read-only SQLite (enforced by URI
+`mode=ro` and `query_only=ON`), piping its private output to the development
+machine. Restrict the destination file to mode 0600. Then run locally:
+
+```sh
+python3 scripts/export-owner-alert-calibration.py --db data.db --wiki wiki --days 30 > snapshot.jsonl
+augmentagent imessage alerts calibrate --input snapshot.jsonl
+```
+
+The CLI handles calibration before opening its normal database. The JSON report
+contains aggregate counts/rates only, never subjects, addresses, or body text.
+It compares retained triaged emails in the last 30 days: the baseline is recorded
+High/Critical alert outcomes; the revised result applies the exact deterministic
+priority/relationship rules while holding the recorded legacy result fixed.
+It uses current wiki relationships/priorities, so it is a counterfactual rather
+than a reconstruction of historical wiki state. It does not replay model calls
+or measure phone delivery, and cannot recover emails no longer retained. Delete
+the private input after use. Record only the report on the issue; the owner can
+then enable `AUGMENTAGENT_ALERT_EMAIL_GATES` and/or choose digest times.
 
 ## Controls and recovery
 

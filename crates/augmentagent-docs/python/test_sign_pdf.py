@@ -1,9 +1,16 @@
 import base64
 import io
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import patch
 import unittest
 from PIL import Image
 from reportlab.pdfgen import canvas
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
+                           IndirectObject, NameObject)
 import sign_pdf
 
 
@@ -21,6 +28,42 @@ def request(pages=1, text='Agreement for services'):
     im.save(image, 'PNG')
     return dict(pdf=base64.b64encode(source.getvalue()).decode(), png=base64.b64encode(image.getvalue()).decode(),
                 page=pages, x=72, y=80, width=144, date='2026-10-12')
+
+
+def shared_resources_request(pages=3, xobjects=2, inherited=False):
+    data = request(pages)
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(base64.b64decode(data['pdf']))))
+    forms = DictionaryObject()
+    ids = set()
+    for index in range(xobjects):
+        form = DecodedStreamObject()
+        form.set_data(b'0 0 10 10 re f\n')
+        form.update({NameObject('/Type'): NameObject('/XObject'),
+                     NameObject('/Subtype'): NameObject('/Form'),
+                     NameObject('/BBox'): ArrayObject(writer.pages[0].mediabox),
+                     NameObject('/Resources'): DictionaryObject()})
+        ref = writer._add_object(form)
+        forms[NameObject(f'/Shared{index}')] = ref
+        ids.add(ref.idnum)
+    resources = DictionaryObject(dict(writer.pages[0]['/Resources'].items()))
+    resources[NameObject('/XObject')] = writer._add_object(forms)
+    resources_ref = writer._add_object(resources)
+    parent = writer.pages[0]['/Parent']
+    parent_ref = parent.indirect_reference
+    if inherited:
+        parent[NameObject('/Resources')] = resources_ref
+    for page in writer.pages:
+        if inherited:
+            del page['/Resources']
+        else:
+            page[NameObject('/Resources')] = resources_ref
+        drawing = DecodedStreamObject()
+        drawing.set_data(b'q 1 0 0 1 100 100 cm /Shared0 Do Q\n')
+        page[NameObject('/Contents')] = ArrayObject([page.raw_get('/Contents'), writer._add_object(drawing)])
+    output = io.BytesIO()
+    writer.write(output)
+    data.update(pdf=base64.b64encode(output.getvalue()).decode(), page=1)
+    return data, ids, (parent_ref.idnum, resources_ref.idnum)
 
 
 class SigningTests(unittest.TestCase):
@@ -81,6 +124,66 @@ class SigningTests(unittest.TestCase):
                 signed = sign_pdf.process(dict(data, width=width), 'sign')
                 self.assertTrue(signed.startswith(source))
                 self.assertIn('2026-10-12', PdfReader(io.BytesIO(signed)).pages[2].extract_text())
+
+    def test_verifier_resolves_shared_objects_once_per_reader(self):
+        data, ids, _ = shared_resources_request(pages=4)
+        source = base64.b64decode(data['pdf'])
+        original = PdfReader(io.BytesIO(source))
+        signed = PdfReader(io.BytesIO(source))
+        calls = {}
+        get_object = IndirectObject.get_object
+        def counted(ref):
+            if ref.idnum in ids:
+                key = (id(ref.pdf), ref.idnum, ref.generation)
+                calls[key] = calls.get(key, 0) + 1
+            return get_object(ref)
+        with patch.object(IndirectObject, 'get_object', counted):
+            sign_pdf.verify_other_pages(original, signed, 0)
+        self.assertEqual(len(calls), 2 * len(ids))
+        self.assertEqual(set(calls.values()), {1}, calls)
+
+    def test_hundred_pages_sharing_two_thousand_xobjects_sign_under_five_seconds(self):
+        data, _, _ = shared_resources_request(pages=100, xobjects=2000)
+        start = time.monotonic()
+        signed = sign_pdf.process(data, 'sign')
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5, f'shared-resource signing took {elapsed:.3f}s')
+        self.assertTrue(signed.startswith(base64.b64decode(data['pdf'])))
+
+    def test_inherited_resources_preserve_sibling_pixels_and_original_objects(self):
+        data, _, shared_ids = shared_resources_request(inherited=True)
+        source = base64.b64decode(data['pdf'])
+        # Inspect the raw page tree before pypdf flattens inherited attributes.
+        root = PdfReader(io.BytesIO(source)).trailer['/Root']['/Pages']
+        self.assertIn('/Resources', root)
+        self.assertTrue(all('/Resources' not in ref.get_object() for ref in root['/Kids']))
+        signed = sign_pdf.process(data, 'sign')
+        self.assertTrue(signed.startswith(source))
+        result = PdfReader(io.BytesIO(signed))
+        for object_id in shared_ids:
+            self.assertLess(result.xref[0][object_id], len(source), 'shared object redefined in append')
+        self.assertIn('2026-10-12', result.pages[0].extract_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, pdf in [('original', source), ('signed', signed)]:
+                path = root / (label + '.pdf')
+                path.write_bytes(pdf)
+                subprocess.run(['pdftoppm', '-r', '72', '-f', '2', '-l', '3', '-png',
+                                str(path), str(root / label)], check=True, capture_output=True)
+            for page in (2, 3):
+                with Image.open(root / f'original-{page}.png') as a, Image.open(root / f'signed-{page}.png') as b:
+                    self.assertEqual(a.size, b.size)
+                    self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_verifier_cache_cannot_hide_an_unsigned_resource_change(self):
+        data, ids, _ = shared_resources_request()
+        source = base64.b64decode(data['pdf'])
+        original = PdfReader(io.BytesIO(source))
+        signed = PdfReader(io.BytesIO(source))
+        shared = signed.get_object(next(iter(ids)))
+        shared.set_data(b'0 0 50 50 re f\n')
+        with self.assertRaisesRegex(ValueError, 'change page 2'):
+            sign_pdf.verify_other_pages(original, signed, 0)
 
     def test_invalid_placement_and_documents(self):
         for change in ({'page':0}, {'page':2}, {'x':-1}, {'y':790}, {'width':0}, {'x':float('nan')}, {'pdf':'broken'}, {'png':'broken'}):

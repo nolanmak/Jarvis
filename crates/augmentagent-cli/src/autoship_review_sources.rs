@@ -53,6 +53,39 @@ impl ReviewSourceRequest {
         Ok(())
     }
 }
+/// #2418: repair a requested Rust item name that is not a literal identifier
+/// (a path, a call, generics, a keyword prefix or a macro bang) to the item's
+/// identifier, or ask for the whole admitted file when none remains. The
+/// path stays admission-checked and budget-bounded at resolution, and an
+/// absent item already resolves to the whole file (#2386).
+pub(super) fn repair_item_selector(selector: &mut ReviewSourceSelector) {
+    let ReviewSourceSelector::RustItem { name } = selector else { return };
+    if syn::parse_str::<syn::Ident>(name).is_ok() {
+        return;
+    }
+    let mut text = name.trim();
+    for keyword in ["pub(crate) ", "pub ", "async ", "unsafe ", "fn ", "struct ", "enum ", "trait ", "impl ",
+        "mod ", "const ", "static ", "type ", "union ", "macro_rules! "] {
+        if let Some(rest) = text.strip_prefix(keyword) {
+            text = rest.trim_start();
+        }
+    }
+    // A qualified path names its last segment; `<T as Trait>::m` names `m`.
+    let path_end = text.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '#'))
+        .filter(|end| !text[..*end].is_empty())
+        .unwrap_or(text.len());
+    let candidate = if text.starts_with('<') {
+        text.rsplit("::").next().unwrap_or("")
+    } else {
+        text[..path_end].rsplit("::").next().unwrap_or("")
+    };
+    let candidate: String = candidate.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '#').collect();
+    *selector = match syn::parse_str::<syn::Ident>(&candidate) {
+        Ok(_) if !candidate.is_empty() => ReviewSourceSelector::RustItem { name: candidate },
+        _ => ReviewSourceSelector::WholeFile,
+    };
+}
+
 /// Enforce exact enum wire fields even for the internally tagged unit variant.
 pub(super) fn validate_selector_wire(value: &serde_json::Value) -> Result<()> {
     let selector = value
@@ -153,11 +186,45 @@ mod tests {
         boundary["path"] = "p".repeat(4096).into();
         assert!(parse(boundary).is_ok());
     }
+    /// #2418 (PR #2378, head b260fb89, 15:28Z and 16:15Z): codex asked for a
+    /// `rust_item` whose name was not a literal identifier, and the whole
+    /// review failed with "source item must be a literal Rust identifier:
+    /// unexpected token". Production does not retain the raw response; these
+    /// are the name shapes that produce exactly that syn error.
+    #[test]
+    fn malformed_rust_item_names_are_repaired_not_rejected() {
+        for (raw, repaired) in [
+            ("OwnerAlerts::post_digest", Some("post_digest")),
+            ("post_digest()", Some("post_digest")),
+            ("AlertDayDigest<'a>", Some("AlertDayDigest")),
+            ("crate::owner_alert_digest::AlertDayDigest", Some("AlertDayDigest")),
+            ("fn post_digest(&self)", Some("post_digest")),
+            ("impl OwnerAlerts", Some("OwnerAlerts")),
+            ("foo.*", Some("foo")),
+            ("declare_digest!", Some("declare_digest")),
+            ("::", None),
+            ("<T as Trait>::method", Some("method")),
+            ("impl", None),
+        ] {
+            if matches!(raw, "OwnerAlerts::post_digest" | "post_digest()" | "AlertDayDigest<'a>") {
+                let error = syn::parse_str::<syn::Ident>(raw).unwrap_err().to_string();
+                assert_eq!(error, "unexpected token", "{raw}: fixture matches the production error");
+            }
+            let (pass, requests) = parse(source(serde_json::json!({"kind":"rust_item","name":raw})))
+                .unwrap_or_else(|error| panic!("{raw} rejected the review: {error:#}"));
+            assert!(!pass.completed);
+            let expected = match repaired {
+                Some(name) => ReviewSourceSelector::RustItem { name: name.into() },
+                None => ReviewSourceSelector::WholeFile,
+            };
+            assert_eq!(requests[0].selector, expected, "{raw}");
+            assert_eq!(requests[0].path, "src/logic.rs", "the admitted path is unchanged");
+        }
+    }
     #[test]
     fn strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds() {
         for selector in [
             serde_json::json!({"kind":"whole_file","name":"ignored"}),
-            serde_json::json!({"kind":"rust_item","name":"foo.*"}),
             serde_json::json!({"kind":"bytes","start_byte":3,"end_byte":3}),
             serde_json::json!({"kind":"bytes","start_byte":-1,"end_byte":4}),
             serde_json::json!({"kind":"bytes","start_byte":0.5,"end_byte":4}),

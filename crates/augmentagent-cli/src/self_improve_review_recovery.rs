@@ -32,7 +32,15 @@ pub(super) fn observe(
     let Some(record) = record.filter(|record| record.pr == pr) else {
         return Ok(None);
     };
-    if record.head != head {
+    // #2383: the controller may integrate main into its own draft after the
+    // publication record (PR #2372: recorded 424b…, pushed dd17…). That exact
+    // head is still the protected workflow binding, which is the custody the
+    // reconciler below requires anyway. Any other head stays unproven.
+    // #2448: a workflow that carries a retained local candidate (a scope-stage
+    // amendment retry kept in the PR checkout) is bound past the PR head. The
+    // head its own latest confirmed Push published is equally its custody,
+    // whether or not the workflow is due to run right now (#2475).
+    if record.head != head && !controller_bound_head(path, repository, pr, branch, head)? {
         info!(
             pr,
             outcome = "dependency_wait",
@@ -59,6 +67,26 @@ pub(super) fn observe(
     // controls and retained revisions) keep their existing admission path.
     // A review request never supersedes another recovery authority.
     store.reconcile_review_recovery(repository, pr, branch, head, readiness(), now)
+}
+
+fn controller_bound_head(path: &Path, repository: &str, pr: u64, branch: &str, head: &str) -> Result<bool> {
+    let store = WorkflowStore::open(path)?;
+    let Some(id) = store.resolve_pr(repository, pr)? else {
+        return Ok(false);
+    };
+    let Some(snapshot) = store.snapshot(&id)? else {
+        return Ok(false);
+    };
+    if head.is_empty() {
+        return Ok(false);
+    }
+    if snapshot.checkpoint.binding.head == head {
+        return Ok(true);
+    }
+    // #2475: the provenance half of the resume executor's retained-candidate
+    // proof. Whether the workflow may resume now (lease, retry delay, stage)
+    // is scheduling; reconcile_review_recovery applies those gates itself.
+    store.published_by_workflow(repository, pr, branch, head)
 }
 
 pub(super) fn filter(

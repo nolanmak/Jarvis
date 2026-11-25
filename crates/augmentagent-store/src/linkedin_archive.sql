@@ -75,3 +75,17 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_page_stats (
 CREATE TABLE IF NOT EXISTS linkedin_archive_inventory (
  account TEXT PRIMARY KEY, observed_at_ms INTEGER NOT NULL, categories_json TEXT NOT NULL
 );
+-- Whether the session still reads, behind the owner notice and login backoff.
+-- last_notice_ms is the last "stopped" notice the owner was sent.
+CREATE TABLE IF NOT EXISTS linkedin_session_health (
+ account TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
+ dead_since_ms INTEGER, last_error TEXT, last_notice_ms INTEGER,
+ recovery_pending INTEGER NOT NULL DEFAULT 0
+);
+-- One row per archive request in the last day. Backfill rows are its request
+-- budget; live rows only space the next backfill request.
+CREATE TABLE IF NOT EXISTS linkedin_archive_requests (
+ account TEXT NOT NULL, at_ms INTEGER NOT NULL, backfill INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS linkedin_archive_requests_recent
+ ON linkedin_archive_requests(account,at_ms);

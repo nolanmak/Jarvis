@@ -77,6 +77,7 @@ async fn calendar_success_posts_receipt_then_deletes_card() {
                 organizer_account: "owner+work@example.test".into(),
                 event_id: "evt-1436".into(),
                 html_link: link.map(str::to_string),
+                join_url: None,
                 already_existed: false,
             },
             expected, 200, 1,
@@ -91,6 +92,7 @@ async fn undelivered_success_receipt_keeps_the_card() {
             organizer_account: "owner+work@example.test".into(),
             event_id: "evt-1436".into(),
             html_link: None,
+            join_url: None,
             already_existed: false,
         },
         "Calendar event created on owner+work@example.test (primary calendar). Event ID: evt-1436.",
@@ -107,6 +109,7 @@ async fn recovered_calendar_receipt_is_delivered_before_retiring_card() {
             organizer_account: "owner+work@example.test".into(),
             event_id: "evt-1436".into(),
             html_link: Some("https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test".into()),
+            join_url: None,
             already_existed: true,
         },
         "Calendar event already created on owner+work@example.test (primary calendar): https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test (event ID: evt-1436).",
@@ -258,4 +261,19 @@ async fn approve_reply_names_the_card_and_logs_the_resolution() {
         lines[0]
     );
     assert!(!text.contains("synthetic signed letter"), "payload must not reach the log");
+}
+
+#[tokio::test]
+async fn calendar_receipt_carries_the_meet_join_url() {
+    deliver(
+        ApprovalActionOutcome::CalendarCreated {
+            organizer_account: "owner+work@example.test".into(),
+            event_id: "evt-2514".into(),
+            html_link: None,
+            join_url: Some("https://meet.google.com/abc-defg-hij".into()),
+            already_existed: false,
+        },
+        "Calendar event created on owner+work@example.test (primary calendar). Event ID: evt-2514. Meet link: https://meet.google.com/abc-defg-hij",
+        200, 1,
+    ).await;
 }

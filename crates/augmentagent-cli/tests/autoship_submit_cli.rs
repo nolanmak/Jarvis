@@ -770,3 +770,51 @@ fn cancel_refuses_active_work_completed_merges_and_unauthorized_owners() {
     assert_eq!(body(status(other.path(),&id),0)["stage"],"queued");
     assert_eq!(body(control(other.path(),"cancel","owner/repo#999"),2)["reason"],"workflow-not-found");
 }
+
+fn readopt_pr(root: &Path, request_id: &str, reason: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root)
+        .env("FIXTURE",root).env("GH_BIN",root.join("gh"))
+        .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
+        .env("XDG_STATE_HOME",root.join("state"))
+        .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("state/workflow.db"))
+        .args(["autopr","readopt","--repo","owner/repo","--pr","42","--reason",reason,"--request-id",request_id,"--json"])
+        .output().unwrap()
+}
+
+#[test]
+fn explicit_pr_readoption_records_fresh_authority_and_preserves_owner_pause() {
+    let root=fixture();
+    let initial=body(invoke(root.path(),&["--pr","42","--request-id","original"]),0);
+    let id=initial["workflow"].as_str().unwrap();
+    let paused=body(control(root.path(),"pause",id),0)["owner_control"].clone();
+    let adopted=body(readopt_pr(root.path(),"adopt-1","Owner requests fresh review"),0);
+    assert_eq!(adopted["accepted"],true);assert_eq!(adopted["complete"],false);
+    assert_eq!(adopted["workflow"],id);assert_eq!(adopted["replayed"],false);
+    assert_eq!(adopted["next_action"],"fresh_review_and_ci");
+    let replay=body(readopt_pr(root.path(),"adopt-1","Owner requests fresh review"),0);
+    assert_eq!(replay["workflow"],id);assert_eq!(replay["replayed"],true);
+    assert_eq!(body(status(root.path(),id),3)["owner_control"],paused);
+    let conflict=body(readopt_pr(root.path(),"adopt-1","Different purpose"),2);
+    assert_eq!(conflict["reason"],"request-id-conflict");
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    let row:(String,String,String,String)=conn.query_row("SELECT target,principal,status,prior_hold FROM owner_readoption WHERE request_id='adopt-1'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!((&*row.0,&*row.1,&*row.2),("pr","github:owner","applied"));
+    let provenance:serde_json::Value=serde_json::from_str(&row.3).unwrap();
+    assert_eq!(provenance["head"],"a".repeat(40));assert_eq!(provenance["origin"],"cli");
+    assert_eq!(conn.query_row("SELECT count(*) FROM command_job",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert!(!root.path().join(".self-improve-worktrees").exists());
+    let before:i64=conn.query_row("SELECT count(*) FROM command_request",[],|r|r.get(0)).unwrap();
+    conn.execute_batch("CREATE TRIGGER deny_readoption BEFORE INSERT ON owner_readoption BEGIN SELECT RAISE(ABORT,'audit unavailable'); END;").unwrap();
+    let refused=body(readopt_pr(root.path(),"audit-failed","Fresh review"),4);
+    assert_eq!(refused["accepted"],false);
+    assert_eq!(conn.query_row("SELECT count(*) FROM command_request",[],|r|r.get::<_,i64>(0)).unwrap(),before,"audit failure left partial admission authority");
+}
+
+#[test]
+fn explicit_pr_readoption_rejects_forks_and_unauthorized_targets_without_state() {
+    for scenario in [r#"{"fork":true}"#,r#"{"permission":"READ"}"#,r#"{"pr_state":"CLOSED"}"#] {
+        let root=fixture();std::fs::write(root.path().join("scenario.json"),scenario).unwrap();
+        assert_eq!(body(readopt_pr(root.path(),"adopt-1","Fresh review"),2)["accepted"],false);
+        assert!(!root.path().join("state").exists(),"rejected target created durable authority");
+    }
+}

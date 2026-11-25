@@ -528,7 +528,7 @@ mod tests {
     async fn amendment_source_and_construction_task_reach_actual_authority_call() {
         let (root,control,base,custody)=fixture().await;
         let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
-        let request=super::construction_request("Original proposal is disputed; retain criteria.",&evidence).unwrap();
+        let request=super::construction_request("Original proposal is disputed; retain criteria.",&evidence,false).unwrap();
         let expected="c".repeat(64);let calls=std::sync::atomic::AtomicUsize::new(0);
         let (decision,_)=super::authority_response(root.path(),&base,&expected,&request,|prompt| {
             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
@@ -539,7 +539,7 @@ mod tests {
             async move {Ok((raw,"scripted-independent-authority".into()))}
         },||panic!("valid completed refusal cannot spend a correction call")).await.unwrap();
         assert!(!decision.approved);assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
-        assert!(super::construction_request(&"x".repeat(512*1024),&evidence).is_err(),"oversized complete request passed construction preflight");
+        assert!(super::construction_request(&"x".repeat(512*1024),&evidence,false).is_err(),"oversized complete request passed construction preflight");
     }
 
     #[tokio::test]
@@ -570,7 +570,7 @@ mod tests {
         let key=digest(&serde_json::to_vec(&("original-source-data-replay-v1",&current["scope_context_hash"],&current["scope_request_hash"])).unwrap());
         let reads=std::cell::Cell::new(0);
         let (request,_)=super::sourced_authority_request(root.path(),control.path(),&prepared,&custody,None,
-            "Failure: verifier environment changed; re-register baseline",|requested| {
+            "Failure: verifier environment changed; re-register baseline",false,|requested| {
                 assert_eq!(requested,key,"positive context chose another recorded mapping");reads.set(reads.get()+1);Ok(Some(replay.clone()))
             }).await.expect("qualified positive context cannot deliver historical source to amendment authority");
         assert_eq!(reads.get(),1);
@@ -682,7 +682,7 @@ mod tests {
         let evidence=read_bounded(&recovery.worktree,&control,base,&custody,context,replay.as_deref(),super::super::source_budget(&prompt).unwrap()).await.unwrap();
         assert_eq!(evidence.sources.len(),8);assert!(evidence.coverage.starts_with("complete selected original files"));
         let bytes=serde_json::to_vec(&evidence).unwrap();
-        let constructed=super::super::construction_request(&prompt,&evidence).unwrap();
+        let constructed=super::super::construction_request(&prompt,&evidence,false).unwrap();
         let actual_request=super::super::initial_authority_request(&constructed).unwrap();
         let total=actual_request.len()+super::super::AUTHORITY_SYSTEM.len();
         assert!(total+super::super::CORRECTION_RESERVE<=super::super::REQUEST_LIMIT);
