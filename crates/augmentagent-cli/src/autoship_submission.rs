@@ -348,6 +348,14 @@ impl WorkflowStore {
         let id: Option<String> = tx.query_row(
             &due_command_sql(&tx)?,
             params![repository,now], |row| row.get(0)).optional()?;
+        // Finishing beats starting: a starting command job gives its turn to
+        // due finishing work on the automatic lane, for a bounded wait.
+        if let Some(id) = &id {
+            if super::command_fairness::yields_to_finishing(&tx, &repository, id, now)? {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
         if let Some(id) = &id {
             tx.execute("DELETE FROM command_resource_refusal WHERE workflow=?1", [id])?;
             tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)

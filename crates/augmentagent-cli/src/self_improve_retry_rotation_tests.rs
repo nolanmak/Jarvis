@@ -326,3 +326,47 @@ fn build_first_selection_adds_no_github_calls() {
         assert!(!body.contains(needle), "picker fairness must stay a read-only snapshot filter: found {needle}");
     }
 }
+
+/// 2026-11-25 Legion: #2556 (workflow #2343) and #2553 (workflow #2387) were
+/// due finishing rows past the repeated-claim bound. A stalled one rotates,
+/// but once it has waited past the starvation bound it must beat planned
+/// builds again, or 34 planned rows keep it waiting forever.
+#[test]
+fn starved_stalled_finishing_rows_outrank_planned_builds() {
+    let snap = |stage, reason: &str, action: &str, pr, heartbeat: i64, progress: i64| Snapshot {
+        workflow: "owner/repo#2343".into(),
+        branch: "candidate".into(),
+        pr,
+        checkpoint: Checkpoint {
+            stage,
+            binding: Binding { head: "head".into(), contract: "contract".into(), evidence_hash: "evidence".into() },
+            evidence: vec![],
+            next: NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: 0 },
+        },
+        attempts: 8,
+        wall_ms: 0,
+        model_calls: 0,
+        tokens: 0,
+        heartbeat_at_ms: heartbeat,
+        progress_at_ms: progress,
+        lease_until_ms: 0,
+        generation: 1,
+    };
+    let now = 10 * 3_600_000;
+    let planned = snap(Stage::Build, "plan_registered", "build", None, now - 60_000, now - 60_000);
+    // Stalled 3h ago (repeated-claim age > 0), untouched since.
+    let stalled_at = now - 3 * 3_600_000;
+    let finishing = snap(Stage::Reconcile, "verification_infrastructure_retry", "retry_verification", Some(2556),
+        stalled_at, stalled_at - 3_600_000);
+    assert!(retry_age(Some(&finishing)) > 0, "fixture must be a stalled row");
+    assert!(rank(Some(&finishing), false, false, now) < rank(Some(&planned), false, false, now),
+        "a starved finishing row must beat a planned build");
+    let publish = snap(Stage::Publish, "publishing_revision", "push", Some(2553), stalled_at, stalled_at - 3_600_000);
+    assert!(retry_age(Some(&publish)) > 0, "fixture must be a stalled publication");
+    assert!(rank(Some(&publish), false, false, now) < rank(Some(&planned), false, false, now),
+        "a starved publish retry must beat a planned build");
+    // Recently stalled rows still rotate behind planned work (#2280).
+    let recent = snap(Stage::Reconcile, "verification_infrastructure_retry", "retry_verification", Some(2556),
+        now - 60_000, now - 3_600_000);
+    assert!(rank(Some(&planned), false, false, now) < rank(Some(&recent), false, false, now));
+}
