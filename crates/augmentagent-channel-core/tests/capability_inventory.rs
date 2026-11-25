@@ -391,6 +391,21 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
 }
 
+/// #1449: the `autoship_case` target embeds this manifest with a compile-time
+/// `include_str!`, and nothing but compiling that target resolves the path.
+/// Cargo builds the package's binaries before it runs an integration test and
+/// names the artifact in `CARGO_BIN_EXE_<bin>` — this package's binary, never
+/// a same-named one from another package — so requiring it here fails the
+/// inventory gate when that target is gone or its manifest path stops
+/// resolving, instead of leaving it to a later build.
+#[test]
+fn autoship_case_target_compiles_before_the_inventory_gate() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_autoship_case"));
+    assert!(binary.is_file(), "the autoship_case target must build, embedded manifest included: {}",
+        binary.display());
+    inventory_accounts_for_every_production_preset_and_wrapper();
+}
+
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
 /// the owner's interactive model and bills their subscription. Every
 /// production construction must pin a model, and the manifest must document
