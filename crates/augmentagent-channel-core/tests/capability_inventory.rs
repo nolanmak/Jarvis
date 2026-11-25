@@ -391,19 +391,28 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
 }
 
-/// #1449: the `autoship_case` target embeds this manifest with a compile-time
-/// `include_str!`, and nothing but compiling that target resolves the path.
-/// Cargo builds the package's binaries before it runs an integration test and
-/// names the artifact in `CARGO_BIN_EXE_<bin>` — this package's binary, never
-/// a same-named one from another package — so requiring it here fails the
-/// inventory gate when that target is gone or its manifest path stops
-/// resolving, instead of leaving it to a later build.
+/// The gates above read the manifest from disk through `CARGO_MANIFEST_DIR`, so
+/// none of them say anything about the copy other tests embed at compile time
+/// with `include_str!("../../../docs/reasoner-capabilities.json")` — a target
+/// that scripts/tests/updater-rebuild-trigger.test.sh classifies as test-only
+/// precisely because it is an embed. Exercise that target here: the path must
+/// resolve at compile time, and the bytes it embeds must be the manifest the
+/// inventory gate validates. When the two diverge — the embed moved to a
+/// generated or stale manifest, or the checkout the test binary runs against
+/// is not the one it was compiled from — every contract above is asserted over
+/// one manifest while the embedded copy ships unchecked.
 #[test]
-fn autoship_case_target_compiles_before_the_inventory_gate() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_autoship_case"));
-    assert!(binary.is_file(), "the autoship_case target must build, embedded manifest included: {}",
-        binary.display());
-    inventory_accounts_for_every_production_preset_and_wrapper();
+fn embedded_manifest_target_is_the_manifest_the_inventory_gate_validates() {
+    let embedded: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
+    let (found, on_disk) = scan_workspace();
+    // Compared with assert!, not assert_eq!: both sides are the whole manifest.
+    assert!(embedded == on_disk,
+        "docs/reasoner-capabilities.json as embedded at compile time is not the manifest the inventory gate reads from disk");
+    let declared: BTreeSet<String> = embedded["presets"].as_array().unwrap().iter()
+        .map(|entry| entry["callsite"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(declared, found.into_keys().collect::<BTreeSet<_>>(),
+        "the embedded manifest does not account for every production preset and wrapper");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
