@@ -294,6 +294,28 @@ fn post_publish_stages_with_a_pr_rank_between_publish_retries_and_planned_builds
     }
 }
 
+/// 2026-11-24 Legion: #2424's draft PR #2545 sat at review / resource_capacity
+/// with green checks (attempts well past the repeated-claim bound) while the
+/// slot went to a fresh planned build of #2416. Waiting for capacity is not a
+/// stall: the published PR must still outrank planned builds.
+#[test]
+fn published_pr_waiting_for_capacity_outranks_planned_builds() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("workflow.db");
+    let t0 = 1_795_500_000_000;
+    let now = t0 + 4 * 3_600_000;
+    {
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        park(&mut store, 2416, Stage::Build, "plan_registered", "build", 1, now - 60_000, None);
+        park(&mut store, 2424, Stage::Review, "resource_capacity", "await_capacity", 8, now - 120_000, None);
+        let lease = store.claim("owner/repo#2424", "fixture-worker", now - 60_000, 1_000).unwrap().unwrap();
+        store.attach_pr(&lease, 2545, now - 60_000).unwrap();
+        store.release(&lease, now - 60_000).unwrap();
+    }
+    let order = picker_order(&path, &[2500, 2416, 2424], now);
+    assert_eq!(order.first(), Some(&2424), "a published PR waiting for the slot must beat new builds: {order:?}");
+}
+
 /// The bound and the build-first order read only the selection snapshots the
 /// picker already holds: no GitHub call is added per candidate or per tick.
 #[test]

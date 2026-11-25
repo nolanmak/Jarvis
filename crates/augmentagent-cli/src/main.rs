@@ -17040,6 +17040,10 @@ async fn start_discord_broker(
             .and_then(|s| s.parse().ok())
             .unwrap_or(channel_id),
     );
+    let extra_query_channel_ids = parse_channel_id_list(
+        std::env::var("DISCORD_EXTRA_CHANNEL_IDS").ok().as_deref(),
+    )
+    .context("DISCORD_EXTRA_CHANNEL_IDS must be comma-separated numeric channel ids")?;
     let allowed_user_id: Option<u64> = std::env::var("DISCORD_ALLOWED_USER_ID")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -17062,6 +17066,7 @@ async fn start_discord_broker(
         bot_token: token,
         channel_id,
         query_channel_id,
+        extra_query_channel_ids,
         allowed_user_id,
         query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
@@ -21558,6 +21563,33 @@ fn build_calendar_alert_sink(
         return None;
     }
     Some(Arc::new(notify::RoutedAlertSink::new(router)))
+}
+
+/// Comma/whitespace-separated Discord channel ids; empty or unset = none.
+fn parse_channel_id_list(raw: Option<&str>) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for part in raw.unwrap_or("").split([',', ' ', '\n', '\t']).map(str::trim).filter(|p| !p.is_empty()) {
+        let id: u64 = part.parse().with_context(|| format!("not a channel id: {part:?}"))?;
+        anyhow::ensure!(id != 0, "channel id 0 is invalid");
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod channel_id_list_tests {
+    use super::parse_channel_id_list;
+
+    #[test]
+    fn parses_dedupes_and_rejects_garbage() {
+        assert!(parse_channel_id_list(None).unwrap().is_empty());
+        assert!(parse_channel_id_list(Some(" , ")).unwrap().is_empty());
+        assert_eq!(parse_channel_id_list(Some("11, 22 11,33")).unwrap(), vec![11, 22, 33]);
+        assert!(parse_channel_id_list(Some("11,abc")).is_err());
+        assert!(parse_channel_id_list(Some("0")).is_err());
+    }
 }
 
 /// #399 — read-only schedule lookup for query mode ("what's on my calendar
