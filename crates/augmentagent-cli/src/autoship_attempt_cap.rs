@@ -306,10 +306,42 @@ pub(crate) fn give_up_reason(conn: &Connection, workflow: &str, checkpoint: &Che
     if usage.calls >= caps.issue_calls {
         return Ok(Some(CALLS_REASON.into()));
     }
-    if usage.tries() >= caps.tries && matches!(checkpoint.stage, Stage::Intake | Stage::Scope) {
+    if usage.tries() >= caps.tries
+        && (matches!(checkpoint.stage, Stage::Intake | Stage::Scope) || build_discarded(conn, workflow, checkpoint)?)
+    {
         return Ok(Some(ATTEMPTS_REASON.into()));
     }
     Ok(None)
+}
+
+/// Checkpoint reason of a scoped plan waiting for its build.
+const PLAN_REGISTERED: &str = "plan_registered";
+
+/// Whether the try that reached `build / plan_registered` already ran its
+/// build and threw it away. A refused build (#1725: over the diff cap, and the
+/// shrink did not fix it) writes no new checkpoint, so the workflow rests at
+/// the plan, unleased, with the build's model calls charged after it. That is
+/// a finished try, not one in flight: the next claim re-scopes and builds
+/// again. Without this the cap only ever saw `build`, never `scope`, and the
+/// issue rebuilt the same oversized diff forever (17 tries on #1725).
+fn build_discarded(conn: &Connection, workflow: &str, checkpoint: &Checkpoint) -> Result<bool> {
+    if checkpoint.stage != Stage::Build || checkpoint.next.reason != PLAN_REGISTERED {
+        return Ok(false);
+    }
+    let Some(planned) = conn.query_row(
+        "SELECT MAX(seq) FROM workflow_event WHERE workflow=?1 AND kind='checkpoint'",
+        [workflow],
+        |r| r.get::<_, Option<i64>>(0),
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_event e JOIN resource_charge c ON c.workflow=e.workflow AND c.id=e.payload
+           WHERE e.workflow=?1 AND e.kind='resource_charged' AND e.seq>?2 AND c.model_calls>0)",
+        params![workflow, planned],
+        |r| r.get(0),
+    )?)
 }
 
 /// Whether a productive claim of `workflow` at `checkpoint` is refused. Merge
@@ -758,6 +790,43 @@ mod tests {
         assert_eq!(store.attempt_usage(ID).unwrap(), Usage { since_ms: 12, ..Usage::default() });
         assert!(store.give_up(ID).unwrap().is_none());
         assert!(store.claim_productive(ID, "next", 13, 100).unwrap().is_some(), "cleared issue is claimable again");
+    }
+
+    /// 2026-11-25 Legion: #1725 rested at build / plan_registered after each
+    /// build came back ~9,500 lines over the diff cap and was thrown away. Every
+    /// claim re-scoped and rebuilt (17 tries, 68 calls) because the cap only
+    /// closed issues resting at scope. A discarded build is a finished try.
+    #[test]
+    fn repeated_discarded_builds_resting_at_the_plan_reach_the_attempt_cap() {
+        let (_dir, mut store) = store();
+        store.register(ID, "branch", binding(), 1).unwrap();
+        let mut at = 10;
+        // One claim of the production loop: re-scope, plan, build, discard.
+        let cycle = |store: &mut WorkflowStore, built: bool, at: &mut i64| {
+            step(store, ID, Stage::Reconcile, "inputs_changed", *at);
+            step(store, ID, Stage::Scope, "trusted_request_acquired", *at + 1);
+            step(store, ID, Stage::Build, PLAN_REGISTERED, *at + 2);
+            if built {
+                charge(store, ID, &format!("model-call:{at}"), 2, *at + 3);
+            }
+            *at += 10;
+        };
+        cycle(&mut store, true, &mut at);
+        cycle(&mut store, true, &mut at);
+        cycle(&mut store, false, &mut at);
+        let planned = store.snapshot(ID).unwrap().unwrap().checkpoint;
+        assert_eq!(store.attempt_usage(ID).unwrap().tries(), 3);
+        assert_eq!(give_up_reason(&store.conn, ID, &planned, CAPS).unwrap(), None,
+            "the third plan has not been built yet; it gets its build");
+        assert!(!productive_claim_refused(&store.conn, ID, &planned, at, CAPS).unwrap());
+        charge(&mut store, ID, "model-call:third", 2, at);
+        let discarded = store.snapshot(ID).unwrap().unwrap().checkpoint;
+        assert_eq!((discarded.stage, discarded.next.reason.as_str()), (Stage::Build, PLAN_REGISTERED));
+        assert_eq!(give_up_reason(&store.conn, ID, &discarded, CAPS).unwrap().as_deref(), Some(ATTEMPTS_REASON),
+            "a third discarded build must close the issue, not start a fourth");
+        assert!(productive_claim_refused(&store.conn, ID, &discarded, at + 1, CAPS).unwrap());
+        assert!(store.claim_productive(ID, "next", at + 2, 100).unwrap().is_none(), "no fourth build");
+        assert_eq!(store.give_ups_due("owner/repo", at + 3, CAPS).unwrap(), vec![(ID.to_owned(), ATTEMPTS_REASON.to_owned())]);
     }
 
     #[test]
