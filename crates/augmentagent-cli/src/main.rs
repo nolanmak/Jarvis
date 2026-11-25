@@ -31,6 +31,7 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_handoff;
 mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -816,6 +817,10 @@ enum Cmd {
         #[arg(long)]
         tools: String,
     },
+    /// Print the loopback URL for TabAgent's `handoff.webhook`: Jarvis posts
+    /// each remote-handoff link it receives there to the owner in Discord.
+    /// Run `tabagent config handoff.webhook "$(augmentagent tabagent-handoff-url)"`.
+    TabagentHandoffUrl,
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
     ComposioAuthTool,
@@ -3255,6 +3260,9 @@ async fn main() -> Result<()> {
     if let Cmd::TabagentTool { ref session, ref tools } = cli.cmd {
         return tabagent_tool::serve(session, tools).await;
     }
+    if let Cmd::TabagentHandoffUrl = cli.cmd {
+        return tabagent_handoff::print_url();
+    }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
             let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
@@ -4066,6 +4074,13 @@ async fn main() -> Result<()> {
                 }
             } else { None };
 
+
+            // nolanmak/tabagent#61: TabAgent's remote-handoff link → the owner's Discord.
+            if !dry_run {
+                if let Some(webhook) = tabagent_handoff::start(shutdown.clone()).await {
+                    tasks.push(webhook);
+                }
+            }
 
             if phone.is_none() {
                 if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
@@ -5983,6 +5998,7 @@ async fn main() -> Result<()> {
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
         Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
+        Cmd::TabagentHandoffUrl => tabagent_handoff::print_url(),
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
