@@ -95,6 +95,20 @@ fn configure_requires_owner_channel_session_url_and_token() {
     assert_eq!(server["env"][URL_ENV], DEFAULT_URL);
     assert_eq!(server["env"][TOKEN_FILE_ENV], file.display().to_string());
     assert_eq!(server["timeout"], BRIDGE_CAP_SECS);
+    // nolanmak/tabagent#61: only the two human-paced tools get a longer bridge
+    // wait, a little past this process's own deadline for them.
+    assert_eq!(
+        server["toolTimeouts"],
+        json!({"act_click": CAPTCHA_DEADLINE_SECS + 15, "form_submit": CAPTCHA_DEADLINE_SECS + 15,
+               "captcha_solve": CAPTCHA_DEADLINE_SECS + 15, "auth_handoff": HANDOFF_DEADLINE_SECS + 15})
+    );
+    // The turn's channel and the route file let the handoff webhook post the
+    // link where the owner is talking (crate::tabagent_handoff).
+    assert_eq!(server["env"][crate::tabagent_handoff::CHANNEL_ENV], "42");
+    assert!(server["env"][crate::tabagent_handoff::ROUTE_ENV]
+        .as_str()
+        .unwrap()
+        .ends_with("tabagent-handoff-route.json"));
     // The credential itself never leaves the file: not on argv, not in env.
     assert!(!settings.to_string().contains("fixture-scoped-value"));
     assert!(opts.system_prompt.contains("TabAgent"));
@@ -142,6 +156,8 @@ fn configure_lists_exact_tools_and_never_sensitive_ones() {
             "mcp__tabagent__form_fill",
             "mcp__tabagent__form_submit",
             "mcp__tabagent__dialog_handle",
+            "mcp__tabagent__captcha_solve",
+            "mcp__tabagent__auth_handoff",
         ]
     );
     assert!(!opts
@@ -860,4 +876,167 @@ async fn live_tabagent_reads_a_synthetic_page() {
 #[test]
 fn call_cap_fits_a_multi_step_application() {
     assert!(CALL_CAP >= 150, "CALL_CAP {CALL_CAP} is too low for a long form");
+}
+
+// ---------------------------------------------------------------------------
+// nolanmak/tabagent#61 Part C: captcha_solve and auth_handoff
+// ---------------------------------------------------------------------------
+
+#[test]
+fn human_paced_tools_get_longer_deadlines_and_nothing_else_does() {
+    const _: () = assert!(CAPTCHA_DEADLINE_SECS >= 120 && CAPTCHA_DEADLINE_SECS > CALL_DEADLINE_SECS);
+    // TabAgent's remote handoff waits 30 min, plus its 120 s approval prompt.
+    const _: () = assert!(HANDOFF_DEADLINE_SECS >= 30 * 60 + 120);
+    const _: () = assert!(HANDOFF_DEADLINE_SECS + 15 <= 2400, "the Codex bridge caps a declared wait at 2400 s");
+    // autoCaptcha solves a blocking CAPTCHA inside a click or submit.
+    for tool in ["captcha_solve", "act_click", "form_submit"] {
+        assert_eq!(call_deadline(tool).as_secs(), CAPTCHA_DEADLINE_SECS, "{tool}");
+    }
+    assert_eq!(call_deadline("auth_handoff").as_secs(), HANDOFF_DEADLINE_SECS);
+    let long = ["captcha_solve", "act_click", "form_submit", "auth_handoff"];
+    for tool in TOOLS.iter().filter(|t| !long.contains(*t)) {
+        assert_eq!(call_deadline(tool).as_secs(), CALL_DEADLINE_SECS, "{tool}");
+    }
+}
+
+#[test]
+fn captcha_and_handoff_schemas_take_only_a_tab_ref_and_reason() {
+    let captcha = tool_schema("captcha_solve");
+    assert_eq!(captcha["inputSchema"]["required"], json!([]));
+    let keys: Vec<_> = captcha["inputSchema"]["properties"].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["ref", "tabId"]);
+    let handoff = tool_schema("auth_handoff");
+    assert_eq!(handoff["inputSchema"]["required"], json!(["reason"]));
+    let keys: Vec<_> = handoff["inputSchema"]["properties"].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["reason", "tabId"]);
+    let description = handoff["description"].as_str().unwrap();
+    for needle in ["30 min", "Discord", "ID"] {
+        assert!(description.contains(needle), "auth_handoff description lacks {needle:?}");
+    }
+    assert!(captcha["description"].as_str().unwrap().contains("auth_handoff"));
+}
+
+#[tokio::test]
+async fn captcha_solve_and_auth_handoff_reach_tabagent_with_their_own_deadline() {
+    let mock = MockServer::start().await;
+    let slow = |result: Value| {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"ok": true, "result": result}))
+            .set_delay(std::time::Duration::from_millis(700))
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/auth.handoff"))
+        .respond_with(slow(json!({"done": true})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/captcha.solve"))
+        .respond_with(slow(json!({"solved": true, "vendor": "hcaptcha", "method": "solver"})))
+        .mount(&mock)
+        .await;
+    for route in ["/v1/act.click", "/v1/form.submit", "/v1/act.type"] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(slow(json!({})))
+            .mount(&mock)
+            .await;
+    }
+    let long = std::time::Duration::from_secs(5);
+    let server = server_for(&mock.uri(), TOOLS).with_deadlines(std::time::Duration::from_millis(250), long, long);
+    let (error, body) = text(
+        &server
+            .handle(&call(1, "auth_handoff", json!({"tabId": 7, "reason": "Scan your ID for NVIDIA"})))
+            .await
+            .unwrap(),
+    );
+    assert!(!error && body.contains("done"), "{body}");
+    let (error, body) = text(
+        &server
+            .handle(&call(2, "captcha_solve", json!({"tabId": 7, "ref": "e4"})))
+            .await
+            .unwrap(),
+    );
+    assert!(!error && body.contains("hcaptcha"), "{body}");
+    // A click or submit may solve a CAPTCHA inline (autoCaptcha).
+    for (id, tool) in [(5, "act_click"), (6, "form_submit")] {
+        let (error, body) = text(&server.handle(&call(id, tool, json!({"ref": "e3"}))).await.unwrap());
+        assert!(!error, "{tool}: {body}");
+    }
+    // The short default still applies to every other tool.
+    let (error, body) = text(&server.handle(&call(3, "act_type", json!({"text": "x", "ref": "e3"}))).await.unwrap());
+    assert!(error && body.contains("did not answer"), "{body}");
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent, json!({"tabId": 7, "reason": "Scan your ID for NVIDIA"}));
+    let sent: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(sent, json!({"tabId": 7, "ref": "e4"}));
+    // reason is required; nothing is sent without it.
+    let (error, body) = text(&server.handle(&call(4, "auth_handoff", json!({"tabId": 7}))).await.unwrap());
+    assert!(error && body.contains("reason is required"), "{body}");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn captcha_unsolved_keeps_reason_and_hint_for_the_model() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/captcha.solve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": {
+            "code": "CAPTCHA_UNSOLVED", "message": "unsupported_vendor: Arkose",
+            "hint": "TabAgent does not solve this CAPTCHA type. Use auth.handoff so the user can finish it."}})))
+        .mount(&mock)
+        .await;
+    let server = server_for(&mock.uri(), TOOLS);
+    let (error, body) = text(&server.handle(&call(1, "captcha_solve", json!({}))).await.unwrap());
+    assert!(error, "{body}");
+    assert!(body.starts_with("CAPTCHA_UNSOLVED: unsupported_vendor"), "{body}");
+    assert!(body.contains("Hint: TabAgent does not solve") && body.contains("auth_handoff"), "{body}");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn auth_handoff_records_the_turn_channel_for_the_webhook_before_it_waits() {
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let route = dir.path().join("tabagent-handoff-route.json");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let probe = std::sync::Arc::clone(&seen);
+    let route_at_request = route.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/auth.handoff"))
+        .respond_with(move |_: &Request| {
+            *probe.lock().unwrap() = std::fs::read_to_string(&route_at_request).ok();
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {"done": true}}))
+        })
+        .mount(&mock)
+        .await;
+    let server = server_for(&mock.uri(), TOOLS).with_route(route.clone(), 42);
+    let (error, _) = text(&server.handle(&call(1, "auth_handoff", json!({"reason": "Passkey"}))).await.unwrap());
+    assert!(!error);
+    let written: Value = serde_json::from_str(seen.lock().unwrap().as_deref().expect("route written before the request")).unwrap();
+    assert_eq!(written["channel"], 42);
+    assert!(written["atMs"].as_i64().unwrap() > 0);
+    assert_eq!(std::fs::metadata(&route).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn prompt_explains_auto_captcha_and_the_phone_handoff() {
+    let bin = std::path::Path::new("/fixture/augmentagent");
+    let (_dir, file) = private_file("fixture-scoped-value");
+    let mut opts = ask();
+    configure_with(&mut opts, &ctx(true), bin, &env_with(&file, None));
+    let prompt = &opts.system_prompt;
+    for needle in [
+        "CAPTCHAs are solved automatically",
+        "captcha_solve",
+        "CAPTCHA_UNSOLVED",
+        "auth_handoff",
+        "ID or selfie",
+        "passkey",
+        "Discord",
+        "30 minutes",
+        "fresh page_snapshot",
+    ] {
+        assert!(prompt.contains(needle), "prompt lacks {needle:?}");
+    }
 }

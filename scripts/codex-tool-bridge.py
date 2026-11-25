@@ -925,7 +925,14 @@ TABAGENT_READS = frozenset('mcp__tabagent__' + leaf for leaf in (
     'page_snapshot', 'page_markdown', 'page_text', 'page_find', 'extract_table', 'extract_links'))
 TABAGENT_REPEATABLE = frozenset('mcp__tabagent__' + leaf for leaf in (
     'act_click', 'act_type', 'act_press', 'act_select', 'act_check', 'act_hover',
-    'act_scroll', 'act_fill', 'form_fill', 'nav_goto', 'tabs', 'dialog_handle'))
+    'act_scroll', 'act_fill', 'form_fill', 'nav_goto', 'tabs', 'dialog_handle',
+    # nolanmak/tabagent#61: a second solve after CAPTCHA_UNSOLVED, or a new
+    # handoff after the owner cancelled one, is a new, intended action.
+    'captcha_solve', 'auth_handoff'))
+# A server's `toolTimeouts` may give named tools a longer wait than the 120 s
+# default cap (TabAgent's auth_handoff waits for a person). Codex's own
+# tool_timeout_sec for this bridge is raised to match (codex_tools.rs).
+MCP_TOOL_TIMEOUT_MAX = 2400
 
 
 def repeatable_operation(name):
@@ -2726,6 +2733,12 @@ class Remote:
         self.timeout = min(float(config.get('timeout', 30)), 120)
         if self.timeout <= 0:
             raise Denied('invalid MCP timeout')
+        declared = config.get('toolTimeouts', {})
+        if not isinstance(declared, dict) or not all(
+                isinstance(key, str) and type(value) in (int, float) and value > 0
+                for key, value in declared.items()):
+            raise Denied('invalid MCP tool timeouts')
+        self.tool_timeouts = {key: min(float(value), MCP_TOOL_TIMEOUT_MAX) for key, value in declared.items()}
         if config.get('type', 'stdio') == 'http':
             from urllib.parse import urlparse
             parsed = urlparse(config.get('url', ''))
@@ -2751,22 +2764,27 @@ class Remote:
     def notify(self, method, params):
         self.exchange({'jsonrpc': '2.0', 'method': method, 'params': params}, False)
 
+    def tool_timeout(self, leaf):
+        return self.tool_timeouts.get(leaf, self.timeout)
+
     def request(self, method, params):
+        timeout = self.tool_timeout(params.get('name')) if method == 'tools/call' else None
         self.sequence += 1
         message = {'jsonrpc': '2.0', 'id': self.sequence, 'method': method, 'params': params}
-        reply = self.exchange(message, True)
+        reply = self.exchange(message, True, timeout)
         if reply.get('id') != self.sequence or 'error' in reply or not isinstance(reply.get('result'), dict):
             raise Denied('MCP returned an invalid or failed response')
         return reply['result']
 
-    def exchange(self, message, expect_response):
+    def exchange(self, message, expect_response, timeout=None):
         import time
         import select
+        timeout = self.timeout if timeout is None else timeout
         data = (json.dumps(message) + '\n').encode()
         if self.process is None:
             from urllib.error import URLError
             try:
-                return self.http(data, expect_response)
+                return self.http(data, expect_response, timeout)
             except TimeoutError as error:
                 raise Readiness('mcp_timeout') from error
             except URLError as error:
@@ -2778,7 +2796,7 @@ class Remote:
         self.process.stdin.write(data)
         if not expect_response:
             return None
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + timeout
         while True:
             if b'\n' in self.buffer:
                 line, self.buffer = self.buffer.split(b'\n', 1)
@@ -2805,7 +2823,7 @@ class Remote:
             if len(self.buffer) > MAX_FILE_BYTES:
                 raise Denied('MCP response exceeds size limit')
 
-    def http(self, data, expect_response):
+    def http(self, data, expect_response, timeout=None):
         import urllib.request
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -2817,7 +2835,8 @@ class Remote:
         if self.session is not None:
             headers['Mcp-Session-Id'] = self.session
         request = urllib.request.Request(self.config['url'], data=data, headers=headers, method='POST')
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=self.timeout) as response:
+        with urllib.request.build_opener(NoRedirect()).open(
+                request, timeout=self.timeout if timeout is None else timeout) as response:
             session = response.headers.get('Mcp-Session-Id')
             if session:
                 self.session = session

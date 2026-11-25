@@ -21,10 +21,12 @@ The model gets these MCP tools, named `mcp__tabagent__<tool>`:
 | `extract_table`, `extract_links` | Read only. |
 | `act_click`, `act_type`, `act_press`, `act_select`, `act_check`, `act_hover`, `act_scroll`, `act_fill` | Forwarded as given. |
 | `form_fill`, `form_submit`, `dialog_handle` | Forwarded as given. |
+| `captcha_solve` | `{tabId?, ref?}`. Checkbox click, then TabAgent's solver (CapSolver, vision fallback). Returns solved, vendor and method, never the token. |
+| `auth_handoff` | `{tabId?, reason}`. Hands the tab to the owner for an ID or selfie check, passkey, payment step or an unsolved CAPTCHA, and waits until they press Done or Cancel. See [CAPTCHAs and handoffs](#captchas-and-handoffs). |
 
 Jarvis never offers `js_eval`, cookies, storage, network capture, uploads
-(`act_upload`), downloads, `auth_*`, screenshots, `act_drag` or
-`act_dblclick`.
+(`act_upload`), downloads, the other `auth_*` tools (`auth_login`,
+`auth_fill`, ...), screenshots, `act_drag` or `act_dblclick`.
 
 Jarvis adds no approval of its own for actions. Their safety comes from
 TabAgent: per-site approval, the sensitive-action prompts in Chrome (forms
@@ -50,8 +52,14 @@ Only reads could be classified as read-only later.
 - Jarvis never starts TabAgent. If nothing listens, or the extension is not
   connected, the tool returns "browser offline".
 - Each call has a 90 s deadline, below the Codex bridge's 120 s cap, and a
-  `timeout` argument is capped at 60 s. A launch accepts 40 calls. Failed
-  calls are never retried.
+  `timeout` argument is capped at 60 s. Some tools wait for longer:
+  `captcha_solve`, `act_click` and `form_submit` 160 s (TabAgent's solver cap
+  is 120 s, and autoCaptcha solves inside clicks and submits) and `auth_handoff`
+  33 min (TabAgent's remote handoff waits 30 min, after a possible 120 s
+  approval prompt). The server entry declares them in `toolTimeouts`; the
+  Codex bridge honours those for the named tools only (capped at 2400 s), and
+  Codex's own wait for the bridge grows to match (`bridge_tool_timeout_secs`).
+  A launch accepts 200 calls. Failed calls are never retried.
 - `PROMPT_TIMEOUT` and `PERMISSION_DENIED` tell the model not to retry and to
   ask the owner to approve in Chrome. `KILLED` (the kill switch) stops the
   TabAgent tools for the rest of the launch.
@@ -60,8 +68,8 @@ Only reads could be classified as read-only later.
   `extract_links`, `nav_wait` (not `for: fn`) and `tabs` with exactly
   `{"action": "list"}` as reads: they are never journaled. Every other call is
   journaled as a mutation, so an unanswered one still requires reconciliation.
-  Actions, `nav_goto`, other `tabs` actions, `form_fill` and `dialog_handle`
-  may repeat with identical arguments (a second click on the same ref after a
+  Actions, `nav_goto`, other `tabs` actions, `form_fill`, `dialog_handle`,
+  `captcha_solve` and `auth_handoff` may repeat with identical arguments (a second click on the same ref after a
   scroll). An identical repeat of `form_submit` is refused as already
   completed, because it is most likely a double submission.
 - TabAgent wraps page-derived text in `<<<PAGE_DATA nonce … PAGE_DATA nonce>>>`
@@ -101,6 +109,53 @@ Only reads could be classified as read-only later.
      that is set.
 5. Run `augmentagent doctor`. The `tabagent` row checks the token file and
    `GET /v1/health`. It shows a warning, not an error, when TabAgent is down.
+
+## CAPTCHAs and handoffs
+
+nolanmak/tabagent#61. The owner drives Jarvis from Discord on a phone, so a
+CAPTCHA must not stop a task, and the only steps that wait for a person are
+ones only the owner can do.
+
+- **CAPTCHAs.** `autoCaptcha` is on for the `jarvis` token
+  (`tabagent token auto-captcha jarvis on`), so `act_click` and `form_submit`
+  solve a blocking hCaptcha, reCAPTCHA or Turnstile on their own. The model
+  calls `captcha_solve` only when one still blocks. `CAPTCHA_UNSOLVED` comes
+  back with TabAgent's reason and hint; hints that say `auth.handoff` are
+  shown to the model as `auth_handoff`.
+- **Handoffs.** For an ID or selfie check, a passkey, a payment confirmation,
+  a phone approval or a CAPTCHA TabAgent could not solve, the model calls
+  `auth_handoff` with a reason. With `handoff.remote on`, TabAgent opens a
+  one-time phone page for that tab on the Legion's Tailscale address and
+  POSTs `{event: "handoff.start", origin, reason, url, expiresAt, session}` to
+  its `handoff.webhook`. Jarvis receives it and posts the link, origin, reason
+  and expiry to the owner in Discord. The call returns when the owner taps
+  Done or Cancel, or after 30 min.
+- **The webhook.** `serve` listens on `127.0.0.1:47625`
+  (`AUGMENTAGENT_TABAGENT_HANDOFF_PORT`, `0` turns it off) when the TabAgent
+  token file and `DISCORD_BOT_TOKEN` + `DISCORD_CHANNEL_ID` are set. Only a
+  loopback peer with a loopback `Host` header is served. TabAgent's webhook
+  carries no credential, so the path does: `/tabagent/handoff/<secret>`, a
+  256-bit value created in `~/.local/state/augmentagent/tabagent-handoff.secret`
+  (0600) on first use.
+- **Where the link goes.** `auth_handoff` records its turn's channel just
+  before it calls TabAgent. The link goes to that channel when it is the
+  owner's (`DISCORD_CHANNEL_ID`, `DISCORD_QUERY_CHANNEL_ID`, or a DM with
+  `DISCORD_ALLOWED_USER_ID`), otherwise to `DISCORD_CHANNEL_ID`. Never to
+  Slack or a webhook. The link takes over that tab until the handoff ends, so
+  it is never logged, and the message suppresses link previews and mentions.
+  The model never sees the link.
+
+One-time setup on the Legion, after this is deployed:
+
+```sh
+tabagent config handoff.remote on        # already on
+tabagent config handoff.webhook "$(~/AugmentAgent/target/release/augmentagent tabagent-handoff-url)"
+tabagent token auto-captcha jarvis on    # already on
+```
+
+`augmentagent tabagent-handoff-url` creates the secret if needed and prints
+`http://127.0.0.1:47625/tabagent/handoff/<secret>`. TabAgent reads its
+config on every handoff, so no restart is needed.
 
 ## Approvals and the kill switch
 
