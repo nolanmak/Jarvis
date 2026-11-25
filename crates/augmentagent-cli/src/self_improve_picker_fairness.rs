@@ -73,10 +73,14 @@ const RETRY_STARVATION_MS:i64=2*60*60*1000;
 /// #2543: finishing an already-published PR goes before starting a build. A
 /// stalled one (repeated-claim age) keeps rotating with its peers, like a
 /// stalled publication retry.
+/// A stalled finishing row rotates with its peers, but once it has waited
+/// past the #2373 starvation bound it gets its finishing tier back. Ranked
+/// only by age, it stayed behind every planned build forever (#2556).
 fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,bool,bool,i64,bool) {
     let age=retry_age(snapshot);
     let starved=age>0 && now.saturating_sub(age)>=RETRY_STARVATION_MS;
-    (!(publish_retry(snapshot) && age==0),!(finishing_published(snapshot) && (age==0 || awaiting_capacity(snapshot))),
+    (!(publish_retry(snapshot) && (age==0 || starved)),
+        !(finishing_published(snapshot) && (age==0 || starved || awaiting_capacity(snapshot))),
         !planned_unbuilt(snapshot),
         !starved,research_filed,age,!recovered)
 }
