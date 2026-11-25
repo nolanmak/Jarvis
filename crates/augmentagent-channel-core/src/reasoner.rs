@@ -1551,6 +1551,18 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        // #1788 — classify a host stop (deploy restart, OOM kill) from the
+        // status itself, before cleanup accounting or the audit drain can
+        // fail first and put their own error in its place: a call the host
+        // killed mid tool use fails both. Cleanup still happens — the
+        // supervisor reaps descendants as the group drops, and the unmatched
+        // intent tickets stay durable orphan evidence.
+        if let Some(signal) = interrupted_by_signal(&status) {
+            warn!("claude stopped by signal {signal}");
+            let _ = process_group.resource_outcome("claude", audit_logger.as_ref());
+            // #1774 — typed so the chain neither latches nor fails over.
+            return Err(CallError::Other(interrupted_error("claude", signal)));
+        }
         let resources = process_group.resource_outcome("claude", audit_logger.as_ref());
         drop(process_group);
         resources?;
@@ -1567,11 +1579,6 @@ impl ClaudeCliReasoner {
                 let _ = err.read_to_string(&mut stderr_buf).await;
             }
             warn!("claude exited {status:?}: {stderr_buf}");
-            // #1774 — a host kill (deploy restart) is not a provider
-            // failure: typed so the chain neither latches nor fails over.
-            if let Some(signal) = interrupted_by_signal(&status) {
-                return Err(CallError::Other(interrupted_error("claude", signal)));
-            }
             if is_cli_api_error(&final_text) {
                 // The request was refused, so the session itself is intact:
                 // release it rather than letting the dropped lease mark the
@@ -5718,6 +5725,36 @@ exit 1
         let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
         assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:#}");
+    }
+
+    /// #1788 — the CLI is SIGKILLed mid tool call, so its unmatched intent
+    /// ticket makes the post-exit audit drain fail too. The host stop is
+    /// what happened: observe it before the drain failure can take its
+    /// place and be classified as a provider outage.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_even_when_the_audit_drain_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let use_event = serde_json::json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","id":"killed-mid-call","name":"Bash","input":{"command":"true"}}]}});
+        let bin = stub_cli(&dir, "fake-claude-killed-mid-tool",
+            &format!("cat >/dev/null\nprintf '%s\\n' '{use_event}'\nkill -KILL $$\n"));
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = Arc::new(AuditLogger::protected(
+            dir.path().join("logs/audit.jsonl"),
+            dir.path().join("anchors/anchor.json"),
+            &[],
+        ).unwrap());
+        let mut opts = dummy_opts();
+        opts.audit_logger = Some(logger.clone());
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&opts, "x").await.unwrap_err();
+        let typed = ReasonerError::find_in(&err).expect("typed for the fallback chain");
+        assert!(
+            matches!(typed, ReasonerError::Interrupted { provider, signal: 9 } if provider == "claude"),
+            "{err:#}"
+        );
+        assert!(!typed.is_provider_side(), "a host stop never latches claude");
+        assert!(logger.protected_health().is_err(), "the dropped intent ticket must stay evidence");
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the
