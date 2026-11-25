@@ -121,14 +121,22 @@ fn verified_windows(
     );
     let mut result = vec![];
     let mut seen = BTreeSet::new();
+    let mut invented = 0usize;
     for window in &selection.windows {
         anyhow::ensure!(
             !window.finding_ids.is_empty() && window.finding_ids.is_subset(finding_ids),
             "window references missing/unknown finding"
         );
-        let body = source
+        // #2554: a key absent from this request's supplied segments carries no
+        // bytes the controller can verify. Drop that window rather than the
+        // whole selection; fail only if nothing valid remains.
+        let Some(body) = source
             .get(&window.source_key)
-            .context("selector invented a source key")?;
+            .filter(|_| supplied.iter().any(|s| s.source_key == window.source_key))
+        else {
+            invented += 1;
+            continue;
+        };
         let (start, end) = byte_range(body, &window.span)?;
         // A response cannot claim inspection of a range omitted from its own
         // actual request, even if the controller possesses the other bytes.
@@ -154,6 +162,10 @@ fn verified_windows(
         );
         result.push(serde_json::json!({"source_key":window.source_key,"source_sha256":aligned::digest(body.as_bytes()),"start_byte":start,"end_byte":end,"finding_ids":window.finding_ids,"text":&body[start..end]}));
     }
+    anyhow::ensure!(
+        invented == 0 || !result.is_empty(),
+        "selector invented a source key and left no valid evidence window"
+    );
     anyhow::ensure!(
         serde_json::to_vec(&result)?.len() <= budget,
         "selected windows exceed assigned evidence budget"
@@ -691,6 +703,24 @@ mod tests {
         assert!(
             serde_json::from_str::<Selection>(r#"{"windows":[],"decision":"approve"}"#).is_err()
         );
+    }
+    #[test]
+    fn invented_source_key_is_dropped_when_valid_evidence_remains() {
+        // #2545/#2546: one invented key among valid windows exhausted the
+        // selector corrections. Drop it; fail only when nothing valid is left.
+        let source = BTreeMap::from([("source".into(), "a\nb\n".into()), ("other".into(), "c\n".into())]);
+        let all = segments(&source);
+        let supplied: Vec<_> = all.iter().filter(|s| s.source_key == "source").cloned().collect();
+        let window = |key: &str| Window { source_key: key.into(), finding_ids: ids(), span: Span::Lines { start_line: 1, end_line: 1 } };
+        let selection = Selection { windows: vec![window("crates/invented.rs"), window("source"), window("other")] };
+        let windows = verified_windows(&selection, &source, &supplied, &ids(), 4096).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["source_key"], "source");
+        assert_eq!(windows[0]["text"], "a\n");
+        let only_invented = Selection { windows: vec![window("crates/invented.rs"), window("other")] };
+        assert!(verified_windows(&only_invented, &source, &supplied, &ids(), 4096).is_err());
+        let empty = Selection { windows: vec![] };
+        assert!(verified_windows(&empty, &source, &supplied, &ids(), 4096).unwrap().is_empty(), "an empty selection still means no relevant evidence");
     }
     #[test]
     fn actual_serialized_prompt_and_result_limits_include_escaping_and_system() {
