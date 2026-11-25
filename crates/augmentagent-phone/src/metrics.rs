@@ -13,6 +13,13 @@ use tokio::time::Instant;
 struct Marks {
     dequeued: Option<Instant>,
     first_token: Option<Instant>,
+    /// #2169 boundaries. Each is a first-occurrence mark, independent of the
+    /// others: a turn may reach any subset of them, in any order.
+    native_start: Option<Instant>,
+    provider_start: Option<Instant>,
+    source_execution: Option<Instant>,
+    first_useful_fact: Option<Instant>,
+    completion: Option<Instant>,
     first_speech: Option<Instant>,
     last_speech: Option<Instant>,
     first_played: Option<Instant>,
@@ -54,6 +61,40 @@ impl TurnTimer {
     pub fn first_token(&self) {
         self.update(|m| {
             m.first_token.get_or_insert_with(Instant::now);
+        });
+    }
+    /// The turn was submitted to the native agent. Idempotent; never implied
+    /// by the first token, which the agent may emit much later.
+    pub fn native_started(&self) {
+        self.update(|m| {
+            m.native_start.get_or_insert_with(Instant::now);
+        });
+    }
+    /// The voice provider accepted the turn (session or response started).
+    /// Recorded separately from `native_started`: both can happen in one turn.
+    pub fn provider_started(&self) {
+        self.update(|m| {
+            m.provider_start.get_or_insert_with(Instant::now);
+        });
+    }
+    /// A source (tool or delegated read) began executing for this turn.
+    pub fn source_execution_started(&self) {
+        self.update(|m| {
+            m.source_execution.get_or_insert_with(Instant::now);
+        });
+    }
+    /// The first fact the owner could act on became available — a source
+    /// finding or an answer, never merely the first token of either.
+    pub fn first_useful_fact(&self) {
+        self.update(|m| {
+            m.first_useful_fact.get_or_insert_with(Instant::now);
+        });
+    }
+    /// The turn's own work finished. A turn blocked on the native agent leaves
+    /// this unset; its earlier marks still stand.
+    pub fn completed(&self) {
+        self.update(|m| {
+            m.completion.get_or_insert_with(Instant::now);
         });
     }
     /// A user-facing speech frame was written to the socket.
@@ -148,6 +189,11 @@ impl TurnTimer {
                 pickup.saturating_add(i64::try_from(marks.queue.as_millis()).unwrap_or(i64::MAX))
             }),
             t_first_token_ms: offset(self.started, marks.first_token),
+            t_native_start_ms: offset(self.started, marks.native_start),
+            t_provider_start_ms: offset(self.started, marks.provider_start),
+            t_source_execution_ms: offset(self.started, marks.source_execution),
+            t_first_useful_fact_ms: offset(self.started, marks.first_useful_fact),
+            t_completion_ms: offset(self.started, marks.completion),
             t_first_speech_ms,
             t_last_speech_ms: offset(self.started, marks.last_speech),
             tool_ms: (marks.tool > Duration::ZERO)

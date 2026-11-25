@@ -51,6 +51,19 @@ pub mod state_capacity;
 pub fn declared_native_auth(provider:&str)->Result<bool> {
     declared_auth(readiness::credentials(provider))
 }
+/// The in-VM relay's `jarvis` server entry. It keeps the host launch's Codex
+/// wait (raised for long human-in-the-loop tools, nolanmak/tabagent#61),
+/// bounded to what the host bridge can ever declare.
+fn relayed_jarvis_server(host: &str) -> String {
+    let max = crate::codex_tools::MCP_TOOL_TIMEOUT_MAX_SECS + 60;
+    let secs = host.split_once("tool_timeout_sec=")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .map_or(crate::codex_tools::BRIDGE_TOOL_TIMEOUT_SECS,
+            |secs| secs.clamp(crate::codex_tools::BRIDGE_TOOL_TIMEOUT_SECS, max));
+    format!("mcp_servers.jarvis={{command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec={secs},default_tools_approval_mode=\"approve\"}}")
+}
+
 #[cfg(test)]
 fn native_auth_at(path:&Path,provider:&str,environment:impl Fn(&str)->Option<String>)->Result<bool> {
     declared_auth(readiness::credentials_at(Some(path),provider,chrono::Utc::now().timestamp_millis(),environment))
@@ -139,8 +152,183 @@ pub(crate) fn retire(session:&Path) {
         let _=write(&session.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}");
     }
 }
-fn prune_and_count(root:&Path) -> Result<usize> {
-    let mut count=0;
+/// One runtime whose closure could not be proved, with the exact blocker and
+/// the authenticated recovery route that could still settle it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetainedRuntime {
+    pub session: String,
+    pub blocker: &'static str,
+    pub recovery: &'static str,
+}
+
+/// Structured outcome of one bounded retirement pass. Only `pruned` runtimes
+/// were verified closed against their original producer evidence; every
+/// `retained` entry keeps its runtime, ownership bytes and alias untouched.
+#[derive(Debug, Default, Serialize)]
+pub struct RetirementOutcome {
+    pub authorized: usize,
+    pub pruned: usize,
+    pub retained: Vec<RetainedRuntime>,
+}
+impl RetirementOutcome {
+    /// True only when no runtime of this owner is still awaiting proof, so the
+    /// durable retirement intent may be marked complete.
+    pub fn verified(&self) -> bool { self.retained.is_empty() }
+    pub fn blocker(&self) -> Option<&RetainedRuntime> { self.retained.first() }
+}
+
+enum Closure { Verified, Retained(&'static str) }
+
+fn retained_runtime(session:&Path,blocker:&'static str)->RetainedRuntime {
+    RetainedRuntime {
+        session:session.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        blocker,
+        recovery:match blocker {
+            "active_session"|"resumed_session"=>"release the live native runtime, then request fenced workflow owner retirement",
+            "unsettled_durable_result"=>"record durable settlement of the authenticated upstream result/export",
+            "session_lock_held"=>"retry the locked pruning service once the conflicting native operation releases its session lock",
+            _=>"fenced workflow owner retirement bound to the original audit generation and lease",
+        },
+    }
+}
+
+/// Fail closed: evidence that cannot be read as an owner-private JSON record is
+/// treated as absent rather than as proof of closure.
+fn evidence(session:&Path,name:&str)->Option<serde_json::Value> {
+    let path=session.join(name);
+    if !path.symlink_metadata().is_ok_and(|info|info.is_file()) {return None;}
+    serde_json::from_slice(&private(&path).ok()?).ok()
+}
+
+/// Retirement markers, readonly labels, absent processes, expired leases and
+/// unsupported legacy records are observations. They describe a runtime; they
+/// never authorize deleting it, replaying it or backfilling its original
+/// execution binding from today's policy.
+fn observed_blocker(session:&Path)->&'static str {
+    for (name,blocker) in [("legacy-retirement.json","unsupported_legacy_evidence"),
+        ("readonly.json","readonly_label_only"),("lease.json","lease_observation_only"),
+        ("process.json","process_observation_only")] {
+        if session.join(name).exists() {return blocker;}
+    }
+    if !session.join("retired.json").exists() {return "no_retirement_intent";}
+    if !session.join("complete.json").exists() {return "retired_marker_only";}
+    "missing_producer_completion"
+}
+
+/// Decide whether this runtime's original producer closure is proven, against
+/// the retained owner/audit binding rather than any current selected policy.
+fn producer_closure(root:&Path,session:&Path)->Result<Closure> {
+    let Some(owned)=evidence(session,"owned.json") else {return Ok(Closure::Retained("missing_owner_receipt"))};
+    let (Some(audit),Some(owner))=(owned.get("audit_path").and_then(|value|value.as_str()),owned.get("owner"))
+        else {return Ok(Closure::Retained("missing_owner_receipt"))};
+    if session.join("active.json").exists() {return Ok(Closure::Retained("active_session"));}
+    if session.join("resumed.json").exists() {return Ok(Closure::Retained("resumed_session"));}
+    if let Some(marker)=evidence(session,"retired-owner.json") {
+        if marker.get("audit_path").and_then(|value|value.as_str())!=Some(audit) || marker.get("owner")!=Some(owner) {
+            return Ok(Closure::Retained("owner_audit_mismatch"));
+        }
+        let fenced:RuntimeOwner=serde_json::from_value(owner.clone())?;
+        return Ok(if owner_retired(root,Path::new(audit),&fenced)? {Closure::Verified}
+            else {Closure::Retained("unrecorded_owner_retirement")});
+    }
+    let Some(completion)=evidence(session,"producer-completion.json") else {return Ok(Closure::Retained(observed_blocker(session)))};
+    if completion.get("audit_path").and_then(|value|value.as_str())!=Some(audit) || completion.get("owner")!=Some(owner) {
+        return Ok(Closure::Retained("owner_audit_mismatch"));
+    }
+    if completion.get("writer_fence").and_then(|value|value.as_i64())!=owner.get("lease_generation").and_then(|value|value.as_i64()) {
+        return Ok(Closure::Retained("stale_writer_fence"));
+    }
+    if !session.join("retired.json").exists() {return Ok(Closure::Retained("no_retirement_intent"));}
+    let settled=evidence(session,"settled-result.json").is_some_and(|record|
+        record.get("durable")==Some(&serde_json::Value::Bool(true)) && record.get("owner")==Some(owner));
+    Ok(if settled {Closure::Verified} else {Closure::Retained("unsettled_durable_result")})
+}
+
+/// Unresumable runtime history: scope-retired (retired.json) but interrupted
+/// before completion (no complete.json) and not held by any running launcher.
+/// Resume refuses retired runtimes, so this is forensic state only. It is
+/// charged at its actual stored bytes rather than a live session reservation,
+/// and admission evicts the oldest of it when a new session needs the room.
+struct RetiredHistory { provider:PathBuf, session:PathBuf, bytes:u64, retired_at:std::time::SystemTime }
+/// `running` runtimes hold their session lock and reserve a full session.
+/// Idle resumable runtimes cost their stored bytes; history is evictable.
+struct Inventory { running:usize, idle:usize, idle_bytes:u64, history:Vec<RetiredHistory> }
+impl Inventory {
+    fn history_bytes(&self)->u64 { self.history.iter().fold(0u64,|total,entry|total.saturating_add(entry.bytes)) }
+    fn retained(&self)->usize { self.running.saturating_add(self.idle).saturating_add(self.history.len()) }
+    fn idle(&mut self,session:&Path)->Result<()> {
+        self.idle+=1;
+        self.idle_bytes=self.idle_bytes.saturating_add(tree_bytes(session)?);
+        Ok(())
+    }
+    /// Bytes the budget must hold for `additional` new running sessions.
+    fn reserved(&self,additional:usize)->u64 {
+        (self.running.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES).saturating_add(self.idle_bytes)
+    }
+    fn report(&self,additional:usize,max_sessions:usize,max_state_bytes:u64,stored:u64,free:u64)->state_capacity::Report {
+        state_capacity::observed(self.running,self.idle,self.idle_bytes,self.history.len(),self.history_bytes(),additional,
+            max_sessions,max_state_bytes,stored,free)
+    }
+}
+/// Whether a launcher holds this session's lock, for marker-only observation.
+/// On Linux this reads /proc/locks and never touches the lock, so it cannot
+/// make a concurrent launcher's non-blocking acquisition fail; evidence that
+/// cannot be read counts as running. A missing lock file was never launched.
+fn session_lock_observed(session:&Path)->Result<bool> {
+    let lock=session.join("lock");
+    let info=match lock.symlink_metadata() {
+        Ok(info)=>info,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),
+        Err(error)=>return Err(error.into()),
+    };
+    ensure!(info.is_file(),"native session lock is not a file");
+    #[cfg(target_os="linux")]
+    { Ok(std::fs::read_to_string("/proc/locks").map(|locks|flock_listed(&locks,info.ino())).unwrap_or(true)) }
+    #[cfg(not(target_os="linux"))]
+    {
+        let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&lock)?;
+        let free=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)}==0;
+        if free {unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_UN)};}
+        Ok(!free)
+    }
+}
+/// A /proc/locks FLOCK entry on this inode. The device is deliberately not
+/// matched (procfs and stat disagree on some filesystems): a collision only
+/// over-reserves, never under-reserves.
+#[cfg_attr(not(target_os="linux"),allow(dead_code))]
+fn flock_listed(locks:&str,inode:u64)->bool {
+    let suffix=format!(":{inode}");
+    locks.lines().any(|line|{
+        let fields=line.split_whitespace().collect::<Vec<_>>();
+        let fields=if fields.get(1)==Some(&"->") {&fields[1..]} else {&fields[..]};
+        fields.get(1)==Some(&"FLOCK") && fields.get(5).is_some_and(|id|id.ends_with(&suffix))
+    })
+}
+fn scope_retired_interrupted(session:&Path)->bool {
+    session.join("owned.json").is_file() && session.join("retired.json").is_file()
+        && !session.join("complete.json").exists() && !session.join("retired-owner.json").exists()
+        && private(&session.join("retired.json")).ok()
+            .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value|value["version"]==1 && value["reason"]=="native_scope_retired")
+}
+fn remove_session(provider:&Path,session:&Path)->Result<()> {
+    let aliases=provider.join("aliases");
+    if aliases.is_dir() {
+        for entry in std::fs::read_dir(aliases)? {
+            let alias=entry?.path();
+            let target:String=serde_json::from_slice(&private(&alias)?)?;
+            if session.file_name().is_some_and(|name|name==target.as_str()){std::fs::remove_file(alias)?;}
+        }
+    }
+    std::fs::remove_dir_all(session)?;
+    Ok(())
+}
+/// With `reclaim`, the caller holds the exclusive state lock: only runtimes
+/// whose original producer closure is proved are removed, and liveness is
+/// proven by each session lock. Without it, this is a marker-only observation
+/// that never creates or takes session locks, so it cannot disturb a launcher.
+fn scan(root:&Path,reclaim:bool) -> Result<Inventory> {
+    let mut inventory=Inventory{running:0,idle:0,idle_bytes:0,history:Vec::new()};
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
@@ -150,28 +338,63 @@ fn prune_and_count(root:&Path) -> Result<usize> {
             let session=entry?.path();
             if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
             ensure!(session.is_dir() && !session.is_symlink(),"native session state is not a directory");
-            let reconciled=session.join("retired-owner.json").exists();
-            let retired=session.join("owned.json").exists() && (reconciled
-                || (session.join("retired.json").exists() && session.join("complete.json").exists()));
+            let history=|session:PathBuf|->Result<RetiredHistory> {
+                let retired_at=session.join("retired.json").symlink_metadata()?.modified()?;
+                Ok(RetiredHistory{provider:provider.clone(),bytes:tree_bytes(&session)?,session,retired_at})
+            };
+            if !reclaim {
+                if session_lock_observed(&session)? {inventory.running+=1;}
+                else if scope_retired_interrupted(&session) {inventory.history.push(history(session)?);}
+                else {inventory.idle(&session)?;}
+                continue;
+            }
+            let closed=matches!(producer_closure(root,&session)?,Closure::Verified);
+            // Take the session lock only after closure is proved, and hold it,
+            // with the caller's state lock, until the runtime and its alias are gone.
             let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW).open(session.join("lock"))?;
             let available=unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0;
-            if retired && available {
-                let receipts=if reconciled {vec!["retired-owner.json","owned.json"]} else {vec!["retired.json","owned.json","complete.json"]};
-                for name in receipts { let _:serde_json::Value=serde_json::from_slice(&private(&session.join(name))?)?; }
-                let aliases=provider.join("aliases");
-                if aliases.is_dir() {
-                    for entry in std::fs::read_dir(aliases)? {
-                        let alias=entry?.path();
-                        let target:String=serde_json::from_slice(&private(&alias)?)?;
-                        if session.file_name().is_some_and(|name|name==target.as_str()){std::fs::remove_file(alias)?;}
-                    }
-                }
-                std::fs::remove_dir_all(&session)?;
-            } else {count+=1;}
+            if closed && available {
+                remove_session(&provider,&session)?;
+            } else if !available {
+                inventory.running+=1;
+            } else if scope_retired_interrupted(&session) {
+                inventory.history.push(history(session)?);
+            } else {inventory.idle(&session)?;}
         }
     }
-    Ok(count)
+    inventory.history.sort_by(|a,b|a.retired_at.cmp(&b.retired_at).then_with(||a.session.cmp(&b.session)));
+    Ok(inventory)
+}
+fn prune_and_count(root:&Path) -> Result<usize> { Ok(scan(root,true)?.retained()) }
+
+/// Native admission under the exclusive state lock. Only running (locked)
+/// runtimes and the `additional` sessions about to run hold full session
+/// reservations; idle resumable runtimes cost their stored bytes. When the
+/// budget or disk cannot also hold the retained history, the oldest
+/// unresumable history is evicted (re-proving it is unlocked) until the new
+/// session fits. Locked and resumable runtimes are never evicted.
+fn admit_capacity(root:&Path,additional:usize,max_sessions:usize,max_state_bytes:u64)->Result<state_capacity::Report> {
+    let mut inventory=scan(root,true)?;
+    let mut stored=tree_bytes(root)?;
+    let mut free=available_bytes(root)?;
+    let mut evicted=0usize;
+    while !inventory.history.is_empty() && (inventory.reserved(additional).saturating_add(inventory.history_bytes())>max_state_bytes
+        || stored>max_state_bytes || free<SESSION_BYTES) {
+        let oldest=inventory.history.remove(0);
+        let lock=std::fs::OpenOptions::new().read(true).write(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW).open(oldest.session.join("lock"))?;
+        if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 || !scope_retired_interrupted(&oldest.session) {
+            inventory.running+=1;
+            continue;
+        }
+        remove_session(&oldest.provider,&oldest.session)?;
+        evicted+=1;
+        stored=tree_bytes(root)?;
+        free=available_bytes(root)?;
+    }
+    if evicted>0 {std::fs::File::open(root)?.sync_all()?;}
+    Ok(inventory.report(additional,max_sessions,max_state_bytes,stored,free))
 }
 
 /// Finish already-authorized retirement through the same locked pruning path
@@ -190,9 +413,10 @@ pub fn reconcile_retired_runtimes()->Result<()> {
 /// Called by the workflow controller only after fenced recovery or completion.
 /// It authorizes retirement of owned runtime data, including interrupted exports;
 /// active session locks still prevent reclamation. Approval/audit history is not
-/// stored here and is never removed by this operation.
-pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<usize> {
-    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(0)};
+/// stored here and is never removed by this operation. The returned outcome is
+/// verified only when every runtime of this owner was proved closed and pruned.
+pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<RetirementOutcome> {
+    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(RetirementOutcome::default())};
     let policy:Policy=serde_json::from_slice(&private(Path::new(&policy_path))?)?;
     let root=policy.state_root.canonicalize()?;
     let _lock=StateLock::acquire(&root)?;
@@ -212,10 +436,11 @@ fn owner_retired(root:&Path,audit_path:&Path,owner:&RuntimeOwner)->Result<bool> 
     Ok(retirement_db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE audit_path=?1 AND workflow=?2 AND generation=?3)",
         rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,owner.workflow_id,owner.lease_generation],|row|row.get(0))?)
 }
-fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<usize> {
+fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<RetirementOutcome> {
     retirement_db(root)?.execute("INSERT OR IGNORE INTO retired_owner VALUES(?1,?2,?3)",rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,expected_owner.workflow_id,expected_owner.lease_generation])?;
     std::fs::File::open(root)?.sync_all()?;
-    let mut count=0;
+    let mut authorized=0;
+    let mut owned=Vec::new();
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
@@ -232,11 +457,24 @@ fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) ->
             let marker=session.join("retired-owner.json");
             if !marker.exists(){
                 write(&marker,&serde_json::to_vec(&serde_json::json!({"version":1,"reason":"fenced_workflow_owner_reconciled","audit_path":audit_path,"owner":expected_owner}))?)?;
-                count+=1;
+                authorized+=1;
             }
+            owned.push(session);
         }
     }
-    Ok(count)
+    let total=owned.len();
+    scan(root,true)?;
+    // Whatever survived the locked pass still owes proof: an unreleased lock,
+    // or evidence that never closed. Report the blocker instead of completing.
+    let mut retained=Vec::new();
+    for session in owned {
+        if !session.exists(){continue;}
+        retained.push(match producer_closure(root,&session)? {
+            Closure::Verified=>retained_runtime(&session,"session_lock_held"),
+            Closure::Retained(blocker)=>retained_runtime(&session,blocker),
+        });
+    }
+    Ok(RetirementOutcome{authorized,pruned:total-retained.len(),retained})
 }
 
 fn validate_resume_owner(root:&Path,session:&Path,audit_path:&Path,current:&RuntimeOwner)->Result<()> {
@@ -329,10 +567,10 @@ impl Launch {
         policy_readiness::refresh_grant(&policy, provider, profile)?;
         let state_lock=StateLock::acquire(&root)?;
         ensure!(!owner_retired(&root,owner_logger.path(),&audit_owner)?,"native runtime owner has been retired");
-        let count=prune_and_count(&root)?;
-        let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
-        let capacity=state_capacity::observed(count,additional,policy.max_sessions,policy.max_state_bytes,
-            tree_bytes(&root)?,available_bytes(&root)?);
+        // A resumed runtime is idle (unlocked) until its launcher runs it, so
+        // it reserves a running session exactly like a fresh one.
+        let additional=1;
+        let capacity=admit_capacity(&root,additional,policy.max_sessions,policy.max_state_bytes)?;
         if capacity.exhausted() {
             crate::run_resources::admission_failed_observation(provider,opts.audit_logger.as_ref(),
                 serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,"native_state":capacity}))?;
@@ -382,7 +620,7 @@ impl Launch {
         let mut index = 0;
         while index < arguments.len() {
             if arguments[index].starts_with("mcp_servers.jarvis=") {
-                arguments[index] = "mcp_servers.jarvis={command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}".into();
+                arguments[index] = relayed_jarvis_server(&arguments[index]);
             } else if let Some(raw) = arguments[index].strip_prefix("model_instructions_file=") {
                 let path: String = serde_json::from_str(raw)?;
                 let guest = format!("/native/asset-{}",assets.len());
@@ -520,6 +758,15 @@ impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&self.sess
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relayed_jarvis_server_keeps_the_host_wait_within_bounds() {
+        let host = |secs: &str| format!("mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",\"/x/tool-bridge.py\",\"/p\"],required=true,startup_timeout_sec=120,tool_timeout_sec={secs},default_tools_approval_mode=\"approve\"}}");
+        for (given, kept) in [("900", "900"), ("2070", "2070"), ("99999", "2460"), ("5", "900"), ("x", "900")] {
+            let relayed = relayed_jarvis_server(&host(given));
+            assert!(relayed.contains(&format!("tool_timeout_sec={kept},")), "{given}: {relayed}");
+            assert!(relayed.contains("/native/mcp-relay.py") && !relayed.contains("/x/tool-bridge.py"));
+        }
+    }
     fn session(root:&Path,name:&str,owner:&str,complete:bool)->PathBuf {
         let path=root.join("codex").join(name);
         std::fs::create_dir_all(&path).unwrap();
@@ -677,7 +924,7 @@ mod tests {
             // Exercise release/cancellation with the real host supervisor and a
             // disposable marker-writing command. This is a controller-boundary
             // fixture, not native guest or provider acceptance.
-            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","teardown-proof-missing"] {
+            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","charged-release-unacknowledged","teardown-proof-missing"] {
                 let create=crate::native_session::Launch::Create{requested_id:None};
                 let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
                 let original=vm.session.clone();let effect=root.join(format!("{provider}-{case}-effect"));
@@ -704,6 +951,19 @@ mod tests {
                 if case=="release-ack-error" || case=="foreign-release-before-refusal" {write(&receipt.with_file_name("launch-continue"),b"admitted\n").unwrap();}
                 if case=="owner-refused" || case=="foreign-release-before-refusal" {
                     assert!(group.admit_model(provider,Some(&denied)).await.is_err());
+                }else if case=="charged-release-unacknowledged" {
+                    // The accounting authority commits the charge before its
+                    // acknowledgement can fail. This must preserve the fresh
+                    // runtime even though no dispatch artifact is published.
+                    let accounting=Arc::new(crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit"))));
+                    let charged=Arc::new(AtomicUsize::new(0));let counted=charged.clone();
+                    accounting.set_correlated_model_call_observer(Arc::new(move |_|{
+                        counted.fetch_add(1,Ordering::SeqCst);
+                        anyhow::bail!("charged release acknowledgement failed")
+                    })).unwrap();
+                    assert!(group.admit_model(provider,Some(&accounting)).await.is_err());
+                    assert_eq!(charged.load(Ordering::SeqCst),1,"{provider}/{case}: the model release was never charged");
+                    assert!(!receipt.with_file_name("launch-continue").exists(),"{provider}/{case}: the unacknowledged release still published dispatch");
                 }else if case!="cancel-before-release" && case!="teardown-proof-missing" {
                     let result=group.admit_model(provider,None).await;
                     assert_eq!(result.is_err(),case=="release-ack-error");
@@ -713,7 +973,11 @@ mod tests {
                 drop(group);child.wait().await.unwrap();drop(vm);
                 assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing","{provider}/{case}: supervisor cleanup proof missing");
                 assert_eq!(effect.exists(),released,"{provider}/{case}: release fixture did not exercise expected dispatch");
-                assert_eq!(original.exists(),released || case=="teardown-proof-missing","{provider}/{case}: uncertain/released runtime disposition incorrect");
+                assert_eq!(original.exists(),released || matches!(case,"teardown-proof-missing"|"charged-release-unacknowledged"),
+                    "{provider}/{case}: uncertain/released runtime disposition incorrect");
+                if case=="charged-release-unacknowledged" {
+                    assert!(original.join("owned.json").is_file(),"{provider}/{case}: charged release lost its ownership receipt");
+                }
                 if case=="teardown-proof-missing" {
                     // The fixture provider was never released and the original
                     // supervisor has now been waited/reaped. Remove only this
@@ -733,6 +997,9 @@ mod tests {
         std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.join("state.lock")).unwrap();
         let original=session(&root,"session-retained","/private/credential/path",false);
+        // A running runtime (its launcher holds the session lock) reserves a full session.
+        let running=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(original.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         let policy=temp.path().join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":root,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
         let before=std::fs::read(original.join("owned.json")).unwrap();
@@ -751,6 +1018,13 @@ mod tests {
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
         let missing=serde_json::to_value(state_capacity::inspect_at(None)).unwrap();
         assert_eq!(missing["status"],"policy-unobserved");
+        // Once idle, the same resumable runtime costs only its stored bytes.
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_UN)},0);
+        let idle=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(idle["running_sessions"],0);
+        assert_eq!(idle["idle_resumable_sessions"],1);
+        assert_eq!(idle["required_reserved_bytes"],SESSION_BYTES+idle["idle_resumable_bytes"].as_u64().unwrap());
+        assert!(original.exists());
     }
     /// Real native admission must retain the precise storage observation and
     /// return a resource hold before executable preparation or model dispatch.
@@ -770,6 +1044,8 @@ mod tests {
         let state=root.join("state");
         for path in [&state,&root.join("logs"),&root.join("anchors")] {std::fs::create_dir(path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
         let original=session(&state,"session-retained","/original/audit",false);
+        let running=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(original.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         let before=std::fs::read(original.join("owned.json")).unwrap();
         let policy=root.join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":state,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
@@ -846,8 +1122,14 @@ mod tests {
         let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
         let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(held.join("lock")).unwrap();
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
-        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap(),0);
-        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
+        let unmatched=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap();
+        assert_eq!((unmatched.authorized,unmatched.pruned),(0,0));
+        assert!(unmatched.verified(),"no runtime of this owner exists to retain");
+        let fenced=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        assert_eq!((fenced.authorized,fenced.pruned),(2,1));
+        assert!(!fenced.verified(),"a locked runtime cannot complete durable retirement");
+        let blocker=fenced.blocker().unwrap();
+        assert_eq!((blocker.session.as_str(),blocker.blocker),("session-held","session_lock_held"));
         assert_eq!(prune_and_count(temp.path()).unwrap(),2);
         assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
         // Parallel tests can fork while this fixture lock is open. Explicitly
@@ -876,6 +1158,144 @@ mod tests {
         assert!(!path.join("retired-owner.json").exists());
         assert!(validate_resume_owner(temp.path(),&path,Path::new("/audit/shared"),&later).is_err());
     }
+    /// Production state for #2329 (PR #2378): eight scope-retired, interrupted
+    /// runtimes (retired.json, no complete.json, nothing running) each reserved
+    /// a full GiB, so 8 retained + 1 new = 9 GiB against the 8 GiB budget
+    /// refused every native run although only ~2.6 GB was actually stored.
+    /// Unresumable history may cost its stored bytes, never a live reservation.
+    fn retired_history(root:&Path,count:usize,bytes_each:u64)->Vec<PathBuf> {
+        (0..count).map(|index|{
+            let path=session(root,&format!("session-history-{index}"),"/audit/history",false);
+            retire(&path);
+            let file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path.join("guest-state.img")).unwrap();
+            file.set_len(bytes_each).unwrap();
+            path
+        }).collect()
+    }
+    fn production_policy(temp:&Path,root:&Path)->PathBuf {
+        let policy=temp.join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":root,"memory_mb":512,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
+        policy
+    }
+    fn private_state_root(temp:&Path)->PathBuf {
+        std::fs::set_permissions(temp,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root=temp.join("state");std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.join("state.lock")).unwrap();
+        root
+    }
+    #[test]
+    fn scope_retired_history_does_not_reserve_capacity_for_new_native_work() {
+        let temp=tempfile::tempdir().unwrap();
+        let root=private_state_root(temp.path());
+        let history=retired_history(&root,8,2_619_576_074/8);
+        let policy=production_policy(temp.path(),&root);
+        let report=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(report["status"],"capacity-observed","retained history blocked new native work: {report}");
+        assert_eq!(report["blockers"],serde_json::json!([]));
+        assert_eq!(report["retained_sessions"],0,"unresumable history still holds reservations: {report}");
+        assert_eq!(report["required_reserved_bytes"],SESSION_BYTES);
+        assert!(report["stored_bytes"].as_u64().unwrap()>=2_619_576_074);
+        // Admission keeps forensic history while it fits the budget.
+        assert_eq!(prune_and_count(&root).unwrap(),8);
+        assert!(history.iter().all(|path|path.exists()));
+    }
+    #[test]
+    fn admission_evicts_oldest_unresumable_history_only_when_the_new_session_needs_room() {
+        let temp=tempfile::tempdir().unwrap();
+        let root=private_state_root(temp.path());
+        // Production numbers fit without eviction: history is kept for forensics.
+        let history=retired_history(&root,8,2_619_576_074/8);
+        let report=serde_json::to_value(admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()).unwrap();
+        assert_eq!(report["status"],"capacity-observed","{report}");
+        assert_eq!(report["retained_sessions"],0);
+        assert_eq!(report["retired_history_sessions"],8);
+        assert!(history.iter().all(|path|path.exists()));
+        // History that would push one new reservation past the budget is
+        // evicted oldest-first; a running (locked) retired runtime and a
+        // resumable completed runtime are never touched.
+        for (index,path) in history.iter().enumerate() {
+            let stamp=std::time::SystemTime::UNIX_EPOCH+std::time::Duration::from_secs(1_000+index as u64);
+            std::fs::File::options().write(true).open(path.join("retired.json")).unwrap().set_modified(stamp).unwrap();
+            std::fs::File::options().write(true).open(path.join("guest-state.img")).unwrap().set_len(SESSION_BYTES).unwrap();
+        }
+        let running=history[0].clone();
+        let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(running.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let resumable=session(&root,"session-resumable","/audit/live",true);
+        let report=serde_json::to_value(admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()).unwrap();
+        assert_eq!(report["status"],"capacity-observed","{report}");
+        assert_eq!(report["retained_sessions"],2,"running and resumable runtimes are retained: {report}");
+        assert_eq!(report["running_sessions"],1,"only the locked runtime reserves a full session: {report}");
+        assert_eq!(report["idle_resumable_sessions"],1);
+        assert!(running.exists() && resumable.exists());
+        // 2 reservations plus the idle runtime's bytes leave under 6 GiB for
+        // history: the oldest unlocked history goes first.
+        assert!(!history[1].exists() && !history[2].exists());
+        assert!(history[3..].iter().all(|path|path.exists()));
+        assert_eq!(report["retired_history_sessions"],5);
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
+    }
+    /// Production state after #2523 released 24 scope parks: 8 resumable,
+    /// unlocked runtimes (1 claude, 7 codex) holding 27,560,846 bytes in total
+    /// each reserved a full GiB, so 8 + 1 new = 9 GiB against the 8 GiB budget
+    /// refused every native run although the worker runs one session at a time.
+    /// Only a running (locked) runtime reserves a GiB; an idle one costs its bytes.
+    #[test]
+    fn idle_resumable_sessions_cost_stored_bytes_and_only_running_sessions_reserve() {
+        const STORED:u64=27_560_846;
+        let temp=tempfile::tempdir().unwrap();
+        let root=private_state_root(temp.path());
+        let sessions=(0..8).map(|index|{
+            let provider=if index==0 {"claude"}else{"codex"};
+            let path=root.join(provider).join(format!("session-resumable-{index}"));
+            std::fs::create_dir_all(&path).unwrap();
+            write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":"/audit/live","owner":{"workflow_id":format!("workflow-{index}"),"lease_generation":1}})).unwrap()).unwrap();
+            write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();
+            path
+        }).collect::<Vec<_>>();
+        let metadata=tree_bytes(&root).unwrap();
+        assert!(metadata<STORED);
+        let padding=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(sessions[1].join("guest-state.img")).unwrap();
+        padding.set_len(STORED-metadata).unwrap();
+        assert_eq!(tree_bytes(&root).unwrap(),STORED);
+        let policy=production_policy(temp.path(),&root);
+        let observed=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(observed["status"],"capacity-observed","idle resumable sessions blocked new native work: {observed}");
+        assert_eq!(observed["blockers"],serde_json::json!([]));
+        let admitted=serde_json::to_value(admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()).unwrap();
+        assert_eq!(admitted["status"],"capacity-observed","idle resumable sessions blocked admission: {admitted}");
+        assert_eq!(admitted["blockers"],serde_json::json!([]));
+        assert_eq!(admitted["running_sessions"],0);
+        assert_eq!(admitted["idle_resumable_sessions"],8);
+        assert_eq!(admitted["idle_resumable_bytes"],STORED);
+        assert_eq!(admitted["required_reserved_bytes"],SESSION_BYTES+STORED);
+        assert!(sessions.iter().all(|path|path.exists()),"admission never removes resumable runtimes");
+        // The same eight while running each hold a full reservation and block.
+        let locks=sessions.iter().map(|path|{
+            let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path.join("lock")).unwrap();
+            assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            lock
+        }).collect::<Vec<_>>();
+        for report in [state_capacity::inspect_at(Some(&policy)),admit_capacity(&root,1,16,8*SESSION_BYTES).unwrap()] {
+            let report=serde_json::to_value(report).unwrap();
+            assert_eq!(report["status"],"capacity-exhausted","{report}");
+            assert_eq!(report["blockers"],serde_json::json!(["reserved-bytes"]));
+            assert_eq!(report["running_sessions"],8);
+            assert_eq!(report["required_reserved_bytes"],9*SESSION_BYTES);
+        }
+        assert!(sessions.iter().all(|path|path.exists()),"locked runtimes are never touched");
+        for lock in &locks {assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);}
+    }
+    #[test]
+    fn proc_locks_flock_entries_mark_only_their_inode_running() {
+        let locks="1: FLOCK  ADVISORY  WRITE 4242 103:02:5678 0 EOF\n1: -> FLOCK  ADVISORY  WRITE 4243 103:02:5678 0 EOF\n2: POSIX  ADVISORY  WRITE 99 103:02:9999 0 EOF\n3: OFDLCK ADVISORY  READ  -1 00:1a:7777 0 EOF\n";
+        assert!(flock_listed(locks,5678));
+        assert!(!flock_listed(locks,9999),"POSIX record locks are not session locks");
+        assert!(!flock_listed(locks,7777));
+        assert!(!flock_listed(locks,678),"inode suffix must match whole");
+        assert!(!flock_listed("",5678));
+    }
     #[test]
     fn scope_retirement_does_not_guess_interrupted_session_safe() {
         let temp=tempfile::tempdir().unwrap();
@@ -883,7 +1303,57 @@ mod tests {
         retire(&interrupted);
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(interrupted.exists());
-        retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        let fenced=retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        assert!(fenced.verified() && fenced.pruned==1);
         assert_eq!(prune_and_count(temp.path()).unwrap(),0);
+    }
+    /// Filesystem observations are never closure. Only correlated producer
+    /// completion with durable settlement, or the controller's fenced owner
+    /// retirement, may authorize deleting a runtime.
+    #[test]
+    fn observed_runtime_evidence_never_authorizes_retirement() {
+        let temp=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner=serde_json::json!({"workflow_id":"workflow","lease_generation":1});
+        let completion=serde_json::json!({"version":1,"audit_path":"/audit/one","owner":owner,"writer_fence":1});
+        let settled=serde_json::json!({"version":1,"owner":owner,"durable":true});
+        let cases:&[(&str,&[(&str,serde_json::Value)],&str)]=&[
+            ("session-incomplete",&[],"missing_producer_completion"),
+            ("session-active",&[("producer-completion.json",completion.clone()),("settled-result.json",settled.clone()),("active.json",serde_json::json!({}))],"active_session"),
+            ("session-resumed",&[("producer-completion.json",completion.clone()),("settled-result.json",settled.clone()),("resumed.json",serde_json::json!({}))],"resumed_session"),
+            ("session-mismatch",&[("producer-completion.json",serde_json::json!({"audit_path":"/audit/other","owner":owner,"writer_fence":1})),("settled-result.json",settled.clone())],"owner_audit_mismatch"),
+            ("session-fence",&[("producer-completion.json",serde_json::json!({"audit_path":"/audit/one","owner":owner,"writer_fence":2})),("settled-result.json",settled.clone())],"stale_writer_fence"),
+            ("session-unsettled",&[("producer-completion.json",completion.clone()),("upstream-export.json",serde_json::json!({"authenticated":true}))],"unsettled_durable_result"),
+            ("session-foreign-settlement",&[("producer-completion.json",completion.clone()),("settled-result.json",serde_json::json!({"owner":{"workflow_id":"other","lease_generation":9},"durable":true}))],"unsettled_durable_result"),
+            ("session-legacy",&[("legacy-retirement.json",serde_json::json!({"retired":true}))],"unsupported_legacy_evidence"),
+            ("session-readonly",&[("readonly.json",serde_json::json!({"readonly":true}))],"readonly_label_only"),
+            ("session-stale-lease",&[("lease.json",serde_json::json!({"expired":true}))],"lease_observation_only"),
+            ("session-missing-process",&[("process.json",serde_json::json!({"present":false}))],"process_observation_only"),
+            ("session-unrecorded",&[("retired-owner.json",serde_json::json!({"version":1,"audit_path":"/audit/one","owner":owner}))],"unrecorded_owner_retirement"),
+            ("session-foreign-marker",&[("retired-owner.json",serde_json::json!({"version":1,"audit_path":"/audit/other","owner":owner}))],"owner_audit_mismatch"),
+        ];
+        for (name,extra,blocker) in cases {
+            let path=session(temp.path(),name,"/audit/one",true);
+            write(&path.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}").unwrap();
+            for (file,value) in *extra {write(&path.join(file),&serde_json::to_vec(value).unwrap()).unwrap();}
+            assert!(matches!(producer_closure(temp.path(),&path).unwrap(),Closure::Retained(observed) if observed==*blocker),
+                "{name} was not retained for {blocker}");
+        }
+        let retired_only=session(temp.path(),"session-retired-only","/audit/one",false);
+        write(&retired_only.join("retired.json"),b"{}").unwrap();
+        assert!(matches!(producer_closure(temp.path(),&retired_only).unwrap(),Closure::Retained("retired_marker_only")));
+        let unretired=session(temp.path(),"session-unretired","/audit/one",true);
+        write(&unretired.join("producer-completion.json"),&serde_json::to_vec(&completion).unwrap()).unwrap();
+        write(&unretired.join("settled-result.json"),&serde_json::to_vec(&settled).unwrap()).unwrap();
+        assert!(matches!(producer_closure(temp.path(),&unretired).unwrap(),Closure::Retained("no_retirement_intent")));
+        let before=cases.iter().map(|(name,..)|std::fs::read(temp.path().join("codex").join(name).join("owned.json")).unwrap()).collect::<Vec<_>>();
+        assert_eq!(prune_and_count(temp.path()).unwrap(),cases.len()+2,"observed evidence authorized a deletion");
+        for (index,(name,..)) in cases.iter().enumerate() {
+            let path=temp.path().join("codex").join(name);
+            assert!(path.exists() && std::fs::read(path.join("owned.json")).unwrap()==before[index],"{name} lost original ownership evidence");
+        }
+        write(&unretired.join("retired.json"),b"{}").unwrap();
+        assert_eq!(prune_and_count(temp.path()).unwrap(),cases.len()+1);
+        assert!(!unretired.exists(),"producer-verified settled closure was not reclaimed");
     }
 }

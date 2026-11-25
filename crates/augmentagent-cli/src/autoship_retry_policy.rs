@@ -1,10 +1,11 @@
-//! Never-give-up pacing for autoship retries (#2289).
+//! Pacing for autoship retries (#2289).
 //!
-//! Autoship itself never parks a workflow permanently: an exhausted repair or
-//! validation budget escalates to the next strategy and comes back after a
-//! capped exponential backoff. A per-issue rolling daily model-call budget
-//! keeps that loop from burning spend; only closing the issue or an owner
-//! pause stops it. These are scheduling facts only, never acceptance evidence.
+//! An exhausted repair or validation budget escalates to the next strategy
+//! and comes back after a capped exponential backoff. A per-issue rolling
+//! daily model-call budget paces that loop. #2467: it is bounded. The ladder
+//! does not repeat, and the per-issue attempt and spend caps
+//! (`attempt_cap`) end it with one give-up comment. These are scheduling
+//! facts only, never acceptance evidence.
 use super::*;
 
 /// First retry waits 30 minutes; each further round doubles it.
@@ -60,7 +61,9 @@ pub(crate) fn budget_reopens_at(charges: &[(i64, u64)], now: i64, cap: u64) -> O
 }
 
 /// Escalating acceptance recovery strategies. Each exhausted cycle advances
-/// one rung and the ladder repeats; no rung removes an owner requirement.
+/// one rung; no rung removes an owner requirement. #2467: the ladder does not
+/// wrap around. Past the last rung it stays on the last one, and the
+/// per-issue attempt cap stops it long before that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Strategy {
     /// #2281's first rung: split into independently observable children.
@@ -82,7 +85,7 @@ pub(crate) const LADDER: [Strategy; 5] = [
     Strategy::FreshFromMain,
 ];
 pub(crate) fn strategy(cycle: u32) -> Strategy {
-    LADDER[cycle as usize % LADDER.len()]
+    LADDER[(cycle as usize).min(LADDER.len() - 1)]
 }
 impl Strategy {
     pub(crate) fn name(self) -> &'static str {
@@ -146,7 +149,7 @@ mod tests {
         assert!((0..200).all(|r| backoff_ms(r) > 0 && backoff_ms(r) <= BACKOFF_CAP_MS));
     }
     #[test]
-    fn strategy_ladder_escalates_through_every_rung_then_cycles_again() {
+    fn strategy_ladder_escalates_through_every_rung_and_never_repeats() {
         let names: Vec<_> = (0..10).map(|c| strategy(c).name()).collect();
         assert_eq!(
             &names[..5],
@@ -158,7 +161,8 @@ mod tests {
                 "fresh_from_current_main"
             ]
         );
-        assert_eq!(names[..5], names[5..]);
+        assert!(names[5..].iter().all(|n| *n == "fresh_from_current_main"), "the ladder cycled: {names:?}");
+        assert_eq!(strategy(u32::MAX).name(), "fresh_from_current_main");
     }
     #[test]
     fn daily_budget_is_a_rolling_window_and_reopens_when_the_oldest_call_ages_out() {

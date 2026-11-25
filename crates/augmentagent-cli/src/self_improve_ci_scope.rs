@@ -269,11 +269,21 @@ pub(crate) async fn widen<A: Authority>(
         Ok(Some(_)) => "amendment did not add every requested file".to_owned(),
         Ok(None) => "amendment produced no executable revision".to_owned(),
         Err(error) => {
-            if error.downcast_ref::<CiInfrastructureDeferred>().is_some() || logger.resource_capacity_seen() {
+            // #2510: infrastructure refused the request before the authority
+            // reached a verdict. Hand the round back; the backoff retries it.
+            let capacity = logger.resource_capacity_seen();
+            let infrastructure = super::own_pr_rescope::infrastructure_refusal(&error, capacity);
+            if infrastructure {
+                workflow.release_epoch_attempt(ROUND_PURPOSE, &round_key)?;
+            }
+            if error.downcast_ref::<CiInfrastructureDeferred>().is_some() || capacity {
                 return Err(error);
             }
             if let Some(hold) = persist_enrolled_acceptance_error(workflow, prepared, &error).await? {
                 return Err(hold.into());
+            }
+            if infrastructure {
+                return Err(error);
             }
             format!("{error:#}")
         }
@@ -512,6 +522,57 @@ mod tests {
         assert_eq!(after.checkpoint.next.action, "rescope_remaining_findings");
         assert!(after.checkpoint.evidence.contains(&format!("ci-scope-path:{NOTIFY}")));
         assert_eq!(after.model_calls, 0);
+    }
+
+    /// Native runtime capacity refuses the authority's run, then declines.
+    struct CapacityFirst {
+        left: std::sync::atomic::AtomicU32,
+        bounds: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Authority for CapacityFirst {
+        async fn amend(&self, _: &PreparedAcceptance, workflow: &mut workflow::WorkflowGuard, bound: &str) -> Result<Option<PreparedAcceptance>> {
+            self.bounds.lock().unwrap().push(bound.to_owned());
+            if self.left.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+                workflow.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,
+                    "native_state":{"status":"capacity-exhausted","capacity_fingerprint":"a".repeat(64)}}))?;
+                anyhow::bail!("native runtime capacity exhausted: 8 of 8 GiB reserved");
+            }
+            Err(anyhow::anyhow!("adjudicated amendment conflicts with immutable owner requirements"))
+        }
+    }
+
+    /// #2510: capacity refusals are infrastructure, not the authority's
+    /// answer. Any number of them leave the CI scope rounds unspent; the
+    /// request that finally reaches the authority spends exactly one.
+    #[tokio::test]
+    async fn capacity_refusals_do_not_spend_ci_scope_rounds() {
+        if parent("capacity_refusals_do_not_spend_ci_scope_rounds") { return; }
+        const REFUSALS: u32 = MAX_ROUNDS + 2;
+        let mut lane = lane().await;
+        let authority = CapacityFirst { left: REFUSALS.into(), bounds: Mutex::new(vec![]) };
+        let implicated = vec![NOTIFY.to_string()];
+        let control = lane.control.path().to_owned();
+        let root = lane._root.path().to_owned();
+        let mut now = chrono::Utc::now().timestamp_millis();
+        for refusal in 1..=REFUSALS {
+            let error = widen(&authority, &mut lane.prepared, &control, &implicated, failure(), &mut lane.workflow).await
+                .expect_err("a capacity refusal was treated as the authority's answer");
+            assert!(format!("{error:#}").contains("capacity"), "{error:#}");
+            assert_eq!(snapshot(&lane).checkpoint.next.action, "await_capacity", "refusal {refusal}");
+            now += 2 * 3_600_000;
+            let fresh = workflow::WorkflowGuard::acquire_fixture_at(&control.join("workflow.db"), workflow::Start {
+                repo_root: &root, worktree: &root, repository: "owner/repo", source_issue: Some(2329), pr: Some(2378),
+                branch: "fixture", contract: lane.prepared.baseline.registration.contract_hash(), environment: "environment-a",
+            }, now).await.unwrap().expect("claimable after the capacity backoff");
+            drop(std::mem::replace(&mut lane.workflow, fresh));
+            assert_eq!(rounds(&lane), 0, "capacity refusal {refusal} spent a CI scope round");
+        }
+        let outcome = widen(&authority, &mut lane.prepared, &control, &implicated, failure(), &mut lane.workflow).await.unwrap();
+        assert!(matches!(outcome, Widen::Rescoped(_)), "{outcome:?}");
+        assert_eq!(snapshot(&lane).checkpoint.next.reason, "ci_scope_amendment_refused");
+        assert_eq!(rounds(&lane), 1);
+        assert_eq!(authority.bounds.lock().unwrap().len() as u32, REFUSALS + 1);
     }
 
     #[tokio::test]

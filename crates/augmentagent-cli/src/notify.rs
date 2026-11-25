@@ -252,6 +252,7 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
     act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
     p("owner_alert_layout", "crates/augmentagent-approval-discord/src/owner_alerts.rs", "CreateMessage::new(", 1, TRANSPORT, "owner alert presentation"),
+    p("owner_alert_day_digest", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_digest(", 1, BROKER, "opt-in daily digest of owner alerts handled in Discord but never texted (#2329)"),
     // -- Trusted-contact autonomy (#1833) --------------------------------------
     act(p("autonomy_cards", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 3, BROKER, "autonomy: noted cards, plan notices (Undo / Pause), trusted-contacts notices (Confirm)")),
     p("autonomy_layout", "crates/augmentagent-approval-discord/src/autonomy.rs", "CreateMessage::new(", 2, TRANSPORT, "autonomy notice and trusted-contacts notice builders"),
@@ -313,6 +314,9 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Phone call proposals (#1553) ---------------------------------------
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/proposals.rs", "notify_owner(", 1, Route::PhoneControlChat, "agent-proposed call questions (yes/no) in the owner's private control chat")),
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/router.rs", "notify_owner(", 1, Route::PhoneControlChat, "per-platform routing of call proposal questions")),
+    // nolanmak/tabagent#61: a one-time link that takes over one browser tab.
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "send_message(&", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff link (ID check, passkey, payment step)"),
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "CreateMessage::new(", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff message"),
     p("cli_discord_posts", CLI, "CreateMessage::new(", 4, Route::DiscordOnly("explicit `--post` Discord commands and Discord loop output"), "one-shot Discord posts"),
 ];
 // producer-scan: on

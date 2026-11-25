@@ -86,28 +86,31 @@ fn is_query_thread(kind: ChannelType, parent: Option<ChannelId>, query: ChannelI
         && parent == Some(query)
 }
 
-async fn is_query_conversation(ctx: &Context, msg: &Message, query: Option<ChannelId>) -> bool {
-    is_query_channel(ctx, msg.guild_id, msg.channel_id, query).await
+async fn is_query_conversation(ctx: &Context, msg: &Message, queries: &[ChannelId]) -> bool {
+    is_query_channel(ctx, msg.guild_id, msg.channel_id, queries).await
 }
 
+/// `channel_id` is one of `queries` or a thread directly under one.
 async fn is_query_channel(
     ctx: &Context,
     guild_id: Option<serenity::all::GuildId>,
     channel_id: ChannelId,
-    query: Option<ChannelId>,
+    queries: &[ChannelId],
 ) -> bool {
-    let Some(query) = query else { return false; };
-    if channel_id == query { return true; }
+    if queries.is_empty() { return false; }
+    if queries.contains(&channel_id) { return true; }
     let Some(guild_id) = guild_id else { return false; };
-    if let Some(guild) = ctx.cache.guild(guild_id) {
-        if let Some(thread) = guild.threads.iter().find(|thread| thread.id == channel_id) {
-            return is_query_thread(thread.kind, thread.parent_id, query);
-        }
-    }
-    match channel_id.to_channel(&ctx.http).await {
-        Ok(Channel::Guild(channel)) => is_query_thread(channel.kind, channel.parent_id, query),
-        _ => false,
-    }
+    let cached = ctx.cache.guild(guild_id).and_then(|guild| {
+        guild.threads.iter().find(|thread| thread.id == channel_id).map(|t| (t.kind, t.parent_id))
+    });
+    let (kind, parent) = match cached {
+        Some(found) => found,
+        None => match channel_id.to_channel(&ctx.http).await {
+            Ok(Channel::Guild(channel)) => (channel.kind, channel.parent_id),
+            _ => return false,
+        },
+    };
+    queries.iter().any(|query| is_query_thread(kind, parent, *query))
 }
 
 pub struct Handler {
@@ -125,7 +128,7 @@ impl Handler {
         let Some(guild_id) = command.guild_id else {
             return "Voice requires a server channel; group calls and DMs are unsupported.".into();
         };
-        if !is_query_channel(ctx, Some(guild_id), command.channel_id, self.state.query_channel_id).await {
+        if !is_query_channel(ctx, Some(guild_id), command.channel_id, &self.state.conversation_channels()).await {
             return "Run `/voice` from the configured conversation channel or one of its threads.".into();
         }
         let Some(bridge) = &self.state.voice_bridge else {
@@ -522,7 +525,7 @@ impl EventHandler for Handler {
         }
 
         let is_dm = msg.guild_id.is_none();
-        let in_query_channel = is_query_conversation(&ctx, &msg, self.state.query_channel_id).await;
+        let in_query_channel = is_query_conversation(&ctx, &msg, &self.state.conversation_channels()).await;
         if !is_dm && !in_query_channel {
             return;
         }
@@ -553,7 +556,9 @@ impl EventHandler for Handler {
         let is_query_root = self.state.query_channel_id == Some(msg.channel_id);
         let thread_mark = augmentagent_store::yolo_threads::mark(msg.channel_id.get());
         let yolo_thread = thread_mark == augmentagent_store::yolo_threads::ThreadMark::Yes;
-        if thread_mark == augmentagent_store::yolo_threads::ThreadMark::Unknown && !is_dm && !is_query_root {
+        // Extra conversation channels are roots too: never yolo threads.
+        let is_conversation_root = is_query_root || self.state.extra_query_channel_ids.contains(&msg.channel_id);
+        if thread_mark == augmentagent_store::yolo_threads::ThreadMark::Unknown && !is_dm && !is_conversation_root {
             let builder = CreateMessage::new()
                 .content(format!("Yolo thread registry is unreadable ({}); threads are paused until it is fixed.",
                     augmentagent_store::yolo_threads::config_path().display()))

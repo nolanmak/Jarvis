@@ -291,6 +291,7 @@ impl BridgeLaunch {
             category: Option<String>,
             available_bytes: Option<u64>,
             required_bytes: Option<u64>,
+            detail: Option<String>,
         }
         let script = self
             .native_cwd
@@ -328,6 +329,7 @@ impl BridgeLaunch {
                     report.available_bytes,
                     report.required_bytes,
                 )
+                .map(|refusal| refusal.with_detail(report.detail.as_deref()))
             }) {
                 return refusal.fail(provider, logger);
             }
@@ -516,8 +518,9 @@ impl BridgeLaunch {
             config_overrides.push(format!("features.{feature}=false"));
         }
         config_overrides.push(format!(
-            "mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",{},{}],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}}",
-            serde_json::to_string(&server_path)?, serde_json::to_string(&policy_path)?
+            "mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",{},{}],required=true,startup_timeout_sec=120,tool_timeout_sec={},default_tools_approval_mode=\"approve\"}}",
+            serde_json::to_string(&server_path)?, serde_json::to_string(&policy_path)?,
+            bridge_tool_timeout_secs(&settings)
         ));
         let voice_env = if let Some((command, env)) = voice_launch {
             config_overrides.push(format!(
@@ -535,6 +538,28 @@ impl BridgeLaunch {
         } else { Vec::new() };
         Ok(Self { native_cwd, config_overrides, voice_env, compute_env, policy_path, _policy_dir: policy_dir })
     }
+}
+
+/// Codex's default wait for one call into the tool bridge.
+pub const BRIDGE_TOOL_TIMEOUT_SECS: u64 = 900;
+/// The bridge's ceiling for a server's per-tool `toolTimeouts`
+/// (`MCP_TOOL_TIMEOUT_MAX` in scripts/codex-tool-bridge.py).
+pub const MCP_TOOL_TIMEOUT_MAX_SECS: u64 = 2400;
+
+/// Codex's wait for the bridge: the default, or longer when a configured MCP
+/// server declares a longer per-tool wait (nolanmak/tabagent#61: TabAgent's
+/// auth_handoff waits for the owner), so the bridge answers first.
+pub fn bridge_tool_timeout_secs(settings: &serde_json::Value) -> u64 {
+    let longest = settings.get("mcpServers").and_then(|servers| servers.as_object()).into_iter()
+        .flat_map(|servers| servers.values())
+        .filter_map(|server| server.get("toolTimeouts").and_then(|timeouts| timeouts.as_object()))
+        .flat_map(|timeouts| timeouts.values())
+        .filter_map(|secs| secs.as_f64())
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map(|secs| (secs.ceil() as u64).min(MCP_TOOL_TIMEOUT_MAX_SECS))
+        .max()
+        .unwrap_or(0);
+    BRIDGE_TOOL_TIMEOUT_SECS.max(longest + 60)
 }
 
 /// Native Claude retains provider transport, but every model-visible tool is
@@ -651,6 +676,32 @@ mod tests {
         let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.policy_path).unwrap()).unwrap();
         assert!(policy.pointer("/settings/mcpServers/compute").is_none());
         assert!(!policy["allowed_tools"].as_array().unwrap().contains(&serde_json::json!("mcp__compute__run")));
+    }
+
+    #[test]
+    fn bridge_tool_timeout_outlasts_the_longest_declared_mcp_tool_wait() {
+        // nolanmak/tabagent#61: auth_handoff blocks while the owner finishes an
+        // ID check on their phone; Codex must not abandon the bridge first.
+        let jarvis = |launch: &BridgeLaunch| launch.config_overrides.iter()
+            .find(|line| line.starts_with("mcp_servers.jarvis=")).unwrap().clone();
+        let fixture = tempfile::tempdir().unwrap();
+        let mut opts = crate::reasoner::resume_opts(fixture.path().into());
+        let plain = BridgeLaunch::prepare(&opts, fixture.path()).unwrap();
+        assert!(jarvis(&plain).contains("tool_timeout_sec=900,"), "{}", jarvis(&plain));
+        let mut settings: serde_json::Value = serde_json::from_str(opts.settings_json.as_deref().unwrap_or("{}")).unwrap();
+        settings["mcpServers"]["tabagent"] = serde_json::json!({
+            "command": "/fixture/augmentagent", "args": ["tabagent-tool"], "timeout": 120,
+            "toolTimeouts": {"auth_handoff": 2010, "captcha_solve": 190}});
+        opts.settings_json = Some(settings.to_string());
+        let other = tempfile::tempdir().unwrap();
+        let long = BridgeLaunch::prepare(&opts, other.path()).unwrap();
+        assert!(jarvis(&long).contains("tool_timeout_sec=2070,"), "{}", jarvis(&long));
+        // The bridge caps any declared wait at 2400 s, so Codex never waits longer than that plus slack.
+        settings["mcpServers"]["tabagent"]["toolTimeouts"]["auth_handoff"] = serde_json::json!(1_000_000);
+        opts.settings_json = Some(settings.to_string());
+        let third = tempfile::tempdir().unwrap();
+        let capped = BridgeLaunch::prepare(&opts, third.path()).unwrap();
+        assert!(jarvis(&capped).contains("tool_timeout_sec=2460,"), "{}", jarvis(&capped));
     }
 
     #[test]
@@ -1317,6 +1368,43 @@ mod tests {
 #[cfg(test)]
 mod required_build_preflight_tests {
     use super::*;
+    /// #2532: every autoship build failed `mcp_start` with no reason. The
+    /// readiness refusal must carry the bridge's own denial.
+    #[tokio::test]
+    async fn build_preflight_mcp_start_reports_the_bridge_denial() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["work", "launch", "logs"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let mut opts = ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "");
+        opts.cwd = Some(root.path().join("work"));
+        opts.allowed_tools = vec!["Bash(cargo *)".into()];
+        let bridge = BridgeLaunch::prepare(&opts, &root.path().join("launch")).unwrap();
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bridge.policy_path).unwrap()).unwrap();
+        let agents = root.path().join("work/AGENTS.md").canonicalize().unwrap_or_else(|_| {
+            std::fs::write(root.path().join("work/AGENTS.md"), "x").unwrap();
+            root.path().join("work/AGENTS.md").canonicalize().unwrap()
+        });
+        policy["write_files"] = serde_json::json!([agents]);
+        policy["autoship_in_place_writes"] = true.into();
+        std::fs::write(&bridge.policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let logger = std::sync::Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                root.path().join("logs/audit.jsonl"),
+                root.path().join("anchors/anchor.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        logger.require_run_resources().unwrap();
+        let error = bridge.preflight_builds("codex", Some(&logger)).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("(mcp_start: Denied: credential and control files cannot be admitted)"),
+            "{error:#}"
+        );
+    }
+
     #[tokio::test]
     async fn required_build_preflight_refuses_before_model_admission_and_allocates_nothing() {
         use std::os::unix::fs::PermissionsExt;

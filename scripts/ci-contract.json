@@ -292,7 +292,7 @@
       "shell": "bash"
     },
     "macos/platform-macos/30": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "macos/platform-macos/31": {
@@ -528,7 +528,7 @@
       "shell": "bash"
     },
     "platform/platform/32": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/33": {
