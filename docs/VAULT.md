@@ -64,6 +64,7 @@ The wrapper scripts mount the vault before exec'ing each process, so pm2 restart
 2. Set env vars in `.env`:
    ```
    DISCORD_QUERY_CHANNEL_ID=<channel id where you want to ask questions>
+   DISCORD_EXTRA_QUERY_CHANNEL_IDS=<optional: more channel ids, comma-separated; each is its own parallel conversation>
    DISCORD_ALLOWED_USER_ID=<your Discord user ID>
    ```
 3. Launch the daemon with `--wiki-dir ./wiki` (enables the query handler):
