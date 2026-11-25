@@ -350,20 +350,12 @@ fn external_test_modules_are_excluded_without_hiding_shared_production() {
     );
 }
 
-/// The capability contract, compiled into this target so Cargo rebuilds the
-/// gates whenever it changes.
-const EMBEDDED_MANIFEST: &str = include_str!("../../../docs/reasoner-capabilities.json");
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+/// Every production callsite in the workspace, plus the checked-in manifest.
+fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
-        .unwrap()
-}
-
-/// Every production callsite in the workspace, plus the embedded manifest.
-fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
-    let root = repo_root();
+        .unwrap();
     let mut files = BTreeSet::new();
     for entry in std::fs::read_dir(root.join("crates")).unwrap() {
         let src = entry.unwrap().path().join("src");
@@ -371,7 +363,11 @@ fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
             rust_files(&src, &mut files);
         }
     }
-    (collect_files(&files, &root), serde_json::from_str(EMBEDDED_MANIFEST).unwrap())
+    let manifest = serde_json::from_slice(
+        &std::fs::read(root.join("docs/reasoner-capabilities.json")).unwrap(),
+    )
+    .unwrap();
+    (collect_files(&files, &root), manifest)
 }
 
 #[test]
@@ -395,16 +391,56 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
 }
 
-/// The manifest the gates run against is the one this target compiled in, the
-/// way `channel-slack/tests/app_manifest.rs` guards the Slack app manifest.
-/// `scripts/tests/updater-rebuild-trigger.test.sh` classifies the manifest as a
-/// test-only embed, so the classification stays true only while the embed is
-/// structural here rather than incidental to a single assertion.
+/// `include_str!` resolves against the embedding file, so the capability
+/// manifest embed, copied out of this `tests/` target into an `src/bin/`
+/// autoship adapter, gains a directory level and names nothing. Compiling the
+/// adapter is the only other check on that path, and a focused run of one
+/// crate's tests never builds another crate's binaries, so resolve every
+/// embedded path here.
+fn unresolved_embeds(crates: &Path) -> Vec<String> {
+    let mut files = BTreeSet::new();
+    rust_files(crates, &mut files);
+    let mut unresolved = Vec::new();
+    for file in &files {
+        let source = std::fs::read_to_string(file).unwrap();
+        for opening in ["include_str!(\"", "include_bytes!(\""] {
+            for (at, _) in source.match_indices(opening) {
+                let embedded = source[at + opening.len()..].split('"').next().unwrap();
+                if !file.parent().unwrap().join(embedded).exists() {
+                    unresolved.push(format!("{}: {embedded}", file.display()));
+                }
+            }
+        }
+    }
+    unresolved
+}
+
 #[test]
-fn embedded_manifest_is_the_checked_in_manifest() {
-    let on_disk = std::fs::read_to_string(repo_root().join("docs/reasoner-capabilities.json")).unwrap();
-    assert_eq!(on_disk, EMBEDDED_MANIFEST,
-        "the inventory gates ran against a manifest this target never compiled in");
+fn every_embedded_file_resolves_from_the_target_that_embeds_it() {
+    let unresolved = unresolved_embeds(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+    assert!(unresolved.is_empty(), "embedded paths name no file: {unresolved:#?}");
+}
+
+/// The reported case: the capability manifest embedded in the `autoship_case`
+/// binary target with this target's `tests/` depth, where `src/bin/` needs one
+/// level more.
+#[test]
+fn an_unresolved_manifest_embed_in_a_bin_target_is_reported() {
+    let repo = tempfile::tempdir().unwrap();
+    let crates = repo.path().join("crates");
+    let adapter = crates.join("augmentagent-cli/src/bin/autoship_case.rs");
+    std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    std::fs::write(repo.path().join("docs/reasoner-capabilities.json"), "{}").unwrap();
+    let embed = |levels| format!("const MANIFEST: &str = include_str!(\"{levels}docs/reasoner-capabilities.json\");\n");
+
+    std::fs::write(&adapter, embed("../../../")).unwrap();
+    let reported = unresolved_embeds(&crates);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert!(reported[0].ends_with("bin/autoship_case.rs: ../../../docs/reasoner-capabilities.json"), "{reported:#?}");
+
+    std::fs::write(&adapter, embed("../../../../")).unwrap();
+    assert!(unresolved_embeds(&crates).is_empty(), "a resolvable embed was reported");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
@@ -467,7 +503,7 @@ fn core_presets_match_permission_contracts() {
         ("archetype_pick_opts", archetype_pick_opts(), TextOnly, false),
         ("autonomy_plan_opts", autonomy_plan_opts(), TextOnly, false),
     ];
-    let manifest: serde_json::Value = serde_json::from_str(EMBEDDED_MANIFEST).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
     for (name, opts, class, writable) in presets {
         assert_eq!(classify(&opts), class, "{name}: capability changed");
         let launch_dir = fixture.path().join(name);
@@ -760,7 +796,7 @@ fn query_preset_policy_carries_attachment_read_allowances_not_wider_roots() {
     let discord = json!({"tools": ["Read"], "directory": "/tmp",
         "name_pattern": r"aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+"});
     // C3: the query preset's contract names this evidence.
-    let manifest: Value = serde_json::from_str(EMBEDDED_MANIFEST).unwrap();
+    let manifest: Value = serde_json::from_slice(&std::fs::read(repo.join("docs/reasoner-capabilities.json")).unwrap()).unwrap();
     let entry = manifest["presets"].as_array().unwrap().iter()
         .find(|entry| entry["callsite"] == "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts").unwrap();
     for test in ["capability_inventory::query_preset_policy_carries_attachment_read_allowances_not_wider_roots",
@@ -1004,6 +1040,6 @@ fn imessage_compose_matches_social_card_scope_and_forbids_send_controls() {
     let opts=ask_opts(wiki.clone(),wiki);
     assert!(opts.system_prompt.contains("imessage compose"));
     assert!(opts.system_prompt.contains("--post"));
-    let manifest:serde_json::Value=serde_json::from_str(EMBEDDED_MANIFEST).unwrap();
+    let manifest:serde_json::Value=serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
     assert!(manifest.to_string().contains("imessage compose"));
 }
