@@ -76,6 +76,8 @@ augmentagent-docs = { path = "../augmentagent-docs" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
+# Same version the phone crate uses: the TabAgent handoff webhook listener.
+axum = "0.8"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }
