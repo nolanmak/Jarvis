@@ -396,14 +396,14 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
 /// test target, owns the `include_str!` path being guarded.
 #[test]
 fn autoship_case_embedded_manifest_target_passes_the_inventory_gate() {
-    inventory_accounts_for_every_production_preset_and_wrapper();
-
     let status = std::process::Command::new(env!("CARGO"))
         .args(["check", "--quiet", "--bin", "autoship_case"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
         .expect("cargo check should start for autoship_case");
     assert!(status.success(), "autoship_case must compile its embedded manifest");
+
+    inventory_accounts_for_every_production_preset_and_wrapper();
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
