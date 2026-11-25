@@ -196,10 +196,11 @@ export function initDb(dbPath?: string): Database.Database {
       ON socialapi_webhook_events(processed, received_at_ms);
     -- #2387: durable Gmail compose queue. A compose the in-loop 429 backoff
     -- (#1493) could not push through is parked here and swept again at/after
-    -- retry_after; approval_card_post_receipts authorizes exactly one
-    -- approval-card post per compose idempotency key. Column-for-column
-    -- identical to crates/augmentagent-store/src/store.rs::migrate(), which
-    -- owns this schema.
+    -- retry_after, which doubles as the lease deadline of an in-flight attempt
+    -- so two sweeps cannot run one compose; approval_card_post_receipts
+    -- authorizes exactly one approval-card post per compose idempotency key.
+    -- Column-for-column identical to
+    -- crates/augmentagent-store/src/store.rs::migrate(), which owns this schema.
     CREATE TABLE IF NOT EXISTS gmail_compose_queue (
       entity      TEXT NOT NULL,
       payload     TEXT NOT NULL,

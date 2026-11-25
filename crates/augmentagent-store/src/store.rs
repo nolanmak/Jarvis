@@ -2916,8 +2916,10 @@ impl Store {
         conn.execute_batch(include_str!("linkedin_archive.sql"))?;
 
         // #2387 — durable Gmail compose queue: a compose parked when the
-        // in-loop 429 backoff (#1493) is exhausted, plus the receipt that
-        // authorizes exactly one approval-card post per compose key. Mirrored
+        // in-loop 429 backoff (#1493) is exhausted. `retry_after` is both the
+        // next-attempt boundary and the lease deadline of an attempt in
+        // flight, so one row is never swept twice at once. Plus the receipt
+        // that authorizes exactly one approval-card post per compose key. Mirrored
         // in Node's initDb; additive and idempotent. The CHECK stops a status
         // the sweep would not know whether to retry from reaching the file.
         conn.execute_batch(
@@ -2978,32 +2980,48 @@ impl Store {
         Ok(rows?)
     }
 
-    /// #2387 — compare-and-swap a row into `retrying`, bumping `attempt`.
-    /// Only the caller holding the expected `(status, attempt)` wins, so a
-    /// sweeper reading stale state cannot take a row another one is already
-    /// attempting; `false` leaves the row untouched. A terminal `expected` is
-    /// rejected outright: no claim can revive a settled compose.
+    /// #2387 — compare-and-swap a row into `retrying` for one attempt and
+    /// lease it for `lease_ms` by pushing `retry_after` to `now_ms +
+    /// lease_ms`. Only the caller holding the expected `(status, attempt)` of
+    /// a row that is actually due wins, so a sweeper reading the
+    /// `(retrying, attempt + 1)` state the winner just wrote still cannot take
+    /// a compose that is in flight — the lease holds the row out of
+    /// [`Self::due_gmail_composes`] and out of reach of a competing claim
+    /// until it lapses, and a lapsed lease is what returns an attempt whose
+    /// process died to the rotation. `false` leaves the row untouched. A
+    /// terminal `expected` is rejected outright: no claim can revive a settled
+    /// compose, and a non-positive `lease_ms` is rejected because it would
+    /// leave the claimed row immediately reclaimable.
     pub fn claim_gmail_compose(
         &self,
         idem_key: &str,
         expected: ComposeQueueStatus,
         expected_attempt: i64,
         now_ms: i64,
+        lease_ms: i64,
     ) -> StoreResult<bool> {
         reject_terminal_expectation(idem_key, expected)?;
+        if lease_ms <= 0 {
+            return Err(StoreError::InvalidInput(format!(
+                "compose queue claim of {idem_key} needs a positive lease, got {lease_ms}ms"
+            )));
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let claimed = guard.execute(
             "UPDATE gmail_compose_queue \
-             SET status = 'retrying', attempt = attempt + 1, updated_at = ?4 \
-             WHERE idem_key = ?1 AND status = ?2 AND attempt = ?3",
-            params![idem_key, expected.as_str(), expected_attempt, now_ms],
+             SET status = 'retrying', attempt = attempt + 1, retry_after = ?4 + ?5, updated_at = ?4 \
+             WHERE idem_key = ?1 AND status = ?2 AND attempt = ?3 AND retry_after <= ?4",
+            params![idem_key, expected.as_str(), expected_attempt, now_ms, lease_ms],
         )?;
         Ok(claimed == 1)
     }
 
     /// #2387 — compare-and-swap a row to its outcome under the same
-    /// `(status, attempt)` guard as [`Self::claim_gmail_compose`]. A
-    /// `retry_after_ms` of `None` keeps the stored boundary; `Some` moves it.
+    /// `(status, attempt)` guard as [`Self::claim_gmail_compose`], but with no
+    /// due check: the lease holder settles its own row while that row is held
+    /// out of the rotation. A `retry_after_ms` of `None` keeps the stored
+    /// boundary — for a claimed row that is its lease deadline, so a re-park
+    /// that wants an earlier next attempt passes `Some`.
     /// A terminal `expected` is rejected, so `landed`, `gave_up` and
     /// `unknown` are the last word on a compose whatever `next` asks for.
     pub fn transition_gmail_compose(

@@ -6,6 +6,7 @@ use augmentagent_store::ComposeQueueStatus::{self, GaveUp, Landed, Queued, Retry
 use augmentagent_store::{NewComposeQueueEntry, Store, StoreError};
 
 const T0: i64 = 1_700_000_000_000;
+const LEASE: i64 = 120_000;
 const ALL: [ComposeQueueStatus; 5] = [Queued, Retrying, Landed, GaveUp, Unknown];
 
 fn open(dir: &tempfile::TempDir) -> Store {
@@ -104,8 +105,11 @@ fn due_selection_takes_retryable_rows_and_skips_terminal_and_future_ones() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir);
     assert!(park(&store, "due-queued", T0 - 1));
-    assert!(park(&store, "due-retrying", T0));
-    assert!(store.claim_gmail_compose("due-retrying", Queued, 0, T0).unwrap());
+    assert!(park(&store, "due-retrying", T0 - 1));
+    assert!(store.claim_gmail_compose("due-retrying", Queued, 0, T0 - 1, LEASE).unwrap());
+    // that attempt failed and re-parked itself, releasing its lease.
+    let reparked = store.transition_gmail_compose("due-retrying", Retrying, 1, Retrying, Some(T0), T0);
+    assert!(reparked.unwrap());
     assert!(park(&store, "future", T0 + 1));
     for terminal in [Landed, GaveUp, Unknown] {
         let key = format!("terminal-{}", terminal.as_str());
@@ -125,12 +129,12 @@ fn competing_and_stale_compare_and_swaps_leave_the_row_untouched() {
     let store = open(&dir);
     assert!(park(&store, "cas", T0));
 
-    assert!(store.claim_gmail_compose("cas", Queued, 0, T0 + 1).unwrap());
+    assert!(store.claim_gmail_compose("cas", Queued, 0, T0 + 1, LEASE).unwrap());
     let claimed = store.gmail_compose("cas").unwrap().unwrap();
     assert_eq!((claimed.status, claimed.attempt, claimed.updated_at_ms), (Retrying, 1, T0 + 1));
-    let competing = store.claim_gmail_compose("cas", Queued, 0, T0 + 2);
+    let competing = store.claim_gmail_compose("cas", Queued, 0, T0 + 2, LEASE);
     assert!(!competing.unwrap(), "the second sweeper must lose the claim");
-    assert!(!store.claim_gmail_compose("missing", Queued, 0, T0).unwrap());
+    assert!(!store.claim_gmail_compose("missing", Queued, 0, T0, LEASE).unwrap());
     let stale = store.transition_gmail_compose("cas", Retrying, 0, Landed, None, T0 + 3);
     assert!(!stale.unwrap(), "a stale attempt count must not transition the row");
     assert_eq!(store.gmail_compose("cas").unwrap().unwrap(), claimed);
@@ -148,6 +152,34 @@ fn competing_and_stale_compare_and_swaps_leave_the_row_untouched() {
     assert_eq!(landed.retry_after_ms, T0 + 90_000, "retry_after is kept when none is supplied");
 }
 
+/// A claim is a lease. The row the winner leaves behind carries the state a
+/// second sweep would read, so that state must not be claimable: a compose in
+/// flight may not be attempted twice. The lease lapsing is what puts an
+/// attempt whose process died back in the rotation.
+#[test]
+fn a_second_sweep_cannot_reclaim_a_compose_that_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    assert!(park(&store, "rate-limited", T0));
+    assert!(store.claim_gmail_compose("rate-limited", Queued, 0, T0, LEASE).unwrap());
+    let leased = store.gmail_compose("rate-limited").unwrap().unwrap();
+    assert_eq!((leased.status, leased.attempt, leased.retry_after_ms), (Retrying, 1, T0 + LEASE));
+
+    let mid_lease = T0 + LEASE - 1;
+    assert!(due_keys(&store, mid_lease).is_empty(), "a leased row must not be swept");
+    let second = store.claim_gmail_compose("rate-limited", Retrying, 1, mid_lease, LEASE);
+    assert!(!second.unwrap(), "the state the winner wrote must not be reclaimable");
+    assert_eq!(store.gmail_compose("rate-limited").unwrap().unwrap(), leased);
+
+    assert_eq!(due_keys(&store, T0 + LEASE), ["rate-limited"]);
+    assert!(store.claim_gmail_compose("rate-limited", Retrying, 1, T0 + LEASE, LEASE).unwrap());
+    let retaken = store.gmail_compose("rate-limited").unwrap().unwrap();
+    assert_eq!((retaken.attempt, retaken.retry_after_ms), (2, T0 + 2 * LEASE));
+
+    let unleased = store.claim_gmail_compose("rate-limited", Retrying, 2, T0 + 2 * LEASE, 0);
+    assert!(matches!(unleased, Err(StoreError::InvalidInput(_))), "a lease must be positive");
+}
+
 /// A settled compose is the last word: whatever a caller believes it read,
 /// neither a claim nor a transition may put it back in the retry rotation.
 #[test]
@@ -160,7 +192,7 @@ fn a_terminal_row_can_neither_be_claimed_nor_revived() {
         assert!(store.transition_gmail_compose(&key, Queued, 0, terminal, None, T0 + 1).unwrap());
         let settled = store.gmail_compose(&key).unwrap().unwrap();
 
-        let claimed = store.claim_gmail_compose(&key, terminal, 0, T0 + 2);
+        let claimed = store.claim_gmail_compose(&key, terminal, 0, T0 + 2, LEASE);
         assert!(matches!(claimed, Err(StoreError::InvalidInput(_))), "claimed a {terminal:?} row");
         let revived = store.transition_gmail_compose(&key, terminal, 0, Retrying, Some(T0), T0 + 3);
         assert!(matches!(revived, Err(StoreError::InvalidInput(_))), "revived a {terminal:?} row");
