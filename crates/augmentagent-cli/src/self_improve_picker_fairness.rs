@@ -24,6 +24,14 @@ pub(super) fn finishing_published(snapshot:Option<&Snapshot>)->bool {
         && matches!(s.checkpoint.stage,Stage::Reconcile|Stage::AwaitChecks|Stage::Review|Stage::Merge))
 }
 
+/// #2550: a published PR waiting only for the shared slot is not stalled; it
+/// makes no model call while it waits. Demoting it as a repeated retry handed
+/// that same slot to the next hour-long planned build, so #2545 never got its
+/// review turn even after #2543.
+fn awaiting_capacity(snapshot:Option<&Snapshot>)->bool {
+    snapshot.is_some_and(|s|s.checkpoint.next.reason=="resource_capacity")
+}
+
 /// #2394: a publication retry is stalled only once it has retried this long
 /// without meaningful progress. Claims spent on scope, build and review before
 /// the push are not a stalled publication (#2329 had six).
@@ -68,7 +76,8 @@ const RETRY_STARVATION_MS:i64=2*60*60*1000;
 fn rank(snapshot:Option<&Snapshot>,research_filed:bool,recovered:bool,now:i64)->(bool,bool,bool,bool,bool,i64,bool) {
     let age=retry_age(snapshot);
     let starved=age>0 && now.saturating_sub(age)>=RETRY_STARVATION_MS;
-    (!(publish_retry(snapshot) && age==0),!(finishing_published(snapshot) && age==0),!planned_unbuilt(snapshot),
+    (!(publish_retry(snapshot) && age==0),!(finishing_published(snapshot) && (age==0 || awaiting_capacity(snapshot))),
+        !planned_unbuilt(snapshot),
         !starved,research_filed,age,!recovered)
 }
 
