@@ -1,7 +1,9 @@
 use anyhow::{bail, Result};
 use augmentagent_finance::{
-    access_token, complete, connect, Client, ConnectOptions, FinanceStore, Vault,
+    access_token, complete, connect, poll_session, Client, ConnectOptions, FinanceStore,
+    SessionOutcome, Vault,
 };
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::{cell::RefCell, collections::HashMap};
 use wiremock::{
@@ -28,6 +30,33 @@ async fn response(server: &MockServer, p: &str, v: Value) {
         .respond_with(ResponseTemplate::new(200).set_body_json(v))
         .mount(server)
         .await;
+}
+/// Mount a Hosted Link creation that expires at `expiration`, then connect.
+async fn start(
+    server: &MockServer,
+    client: &Client,
+    store: &FinanceStore,
+    vault: &MemoryVault,
+    expiration: &str,
+) -> String {
+    response(server,"/link/token/create",json!({"link_token":"fixture-link","hosted_link_url":"https://secure.plaid.com/hl/fixture","expiration":expiration,"request_id":"fixture-request"})).await;
+    connect(
+        client,
+        store,
+        vault,
+        "sandbox",
+        ConnectOptions {
+            alias: "Household",
+            countries: &["US".into()],
+            update_item: None,
+            statements: false,
+        },
+    )
+    .await
+    .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 #[tokio::test]
 async fn hosted_link_completion_persists_tokens_outside_db_and_is_idempotent() {
@@ -235,4 +264,163 @@ async fn update_mode_preserves_item_and_requires_successful_consent() {
         access_token(&vault, "sandbox", "item").unwrap(),
         "fixture-access"
     );
+}
+
+#[tokio::test]
+async fn connect_records_expiry_and_pending_state() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    let id = start(
+        &server,
+        &client,
+        &store,
+        &vault,
+        "2099-01-01T00:00:00Z",
+    )
+    .await;
+    let session = store.session("sandbox", &id).unwrap();
+    assert_eq!(session.state, "pending");
+    assert!(!session.complete);
+    assert_eq!(
+        session.expires_at.as_deref(),
+        Some("2099-01-01T00:00:00.000Z")
+    );
+    assert_eq!(session.request_id.as_deref(), Some("fixture-request"));
+    assert!(session.created_at.is_some());
+    assert!(session.last_polled_at.is_none());
+    assert_eq!(store.due_sessions("sandbox", Utc::now()).unwrap().len(), 1);
+}
+#[tokio::test]
+async fn poll_session_reports_pending_for_unopened_link() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    let id = start(&server, &client, &store, &vault, "2099-01-01T00:00:00Z").await;
+    response(
+        &server,
+        "/link/token/get",
+        json!({"expiration":"2099-01-01T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(
+        poll_session(&client, &store, &vault, "sandbox", &id)
+            .await
+            .unwrap(),
+        SessionOutcome::Pending
+    );
+    assert_eq!(store.session("sandbox", &id).unwrap().state, "pending");
+}
+#[tokio::test]
+async fn poll_session_reports_exited_without_success() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    let id = start(&server, &client, &store, &vault, "2099-01-01T00:00:00Z").await;
+    response(
+        &server,
+        "/link/token/get",
+        json!({"link_sessions":[{"finished_at":"2026-09-10T00:00:00Z","on_exit":{}}]}),
+    )
+    .await;
+    assert_eq!(
+        poll_session(&client, &store, &vault, "sandbox", &id)
+            .await
+            .unwrap(),
+        SessionOutcome::Exited
+    );
+    // An exit is not terminal: the Hosted Link URL works until it expires.
+    let session = store.session("sandbox", &id).unwrap();
+    assert_eq!(session.state, "pending");
+    assert!(!session.complete);
+    assert!(store.status("sandbox").unwrap().is_empty());
+}
+#[tokio::test]
+async fn poll_session_expired_never_calls_exchange() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    let id = start(&server, &client, &store, &vault, "2020-01-01T00:00:00Z").await;
+    response(&server,"/link/token/get",json!({"link_sessions":[{"results":{"item_add_results":[{"public_token":"fixture-public"}]}}]})).await;
+    Mock::given(path("/item/public_token/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"item_id":"fixture-item","access_token":"fixture-access"}),
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        poll_session(&client, &store, &vault, "sandbox", &id)
+            .await
+            .unwrap(),
+        SessionOutcome::Expired
+    );
+    assert_eq!(store.session("sandbox", &id).unwrap().state, "expired");
+    assert!(store.status("sandbox").unwrap().is_empty());
+    // Expired sessions are never due again, so nothing re-polls them.
+    assert!(store.due_sessions("sandbox", Utc::now()).unwrap().is_empty());
+}
+#[tokio::test]
+async fn linked_item_records_institution_and_flags_duplicate() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    store.add_item("sandbox", "existing-item", "Household").unwrap();
+    store
+        .set_institution("sandbox", "existing-item", "ins_fixture")
+        .unwrap();
+    let id = start(&server, &client, &store, &vault, "2099-01-01T00:00:00Z").await;
+    response(&server,"/link/token/get",json!({"link_sessions":[{"results":{"item_add_results":[{"public_token":"fixture-public","institution":{"institution_id":"ins_fixture","name":"Fixture Bank"}}]}}]})).await;
+    response(
+        &server,
+        "/item/public_token/exchange",
+        json!({"item_id":"fixture-item","access_token":"fixture-access"}),
+    )
+    .await;
+    assert_eq!(
+        poll_session(&client, &store, &vault, "sandbox", &id)
+            .await
+            .unwrap(),
+        SessionOutcome::Linked {
+            items: vec!["fixture-item".into()]
+        }
+    );
+    assert_eq!(
+        store.duplicates("sandbox").unwrap(),
+        vec![("fixture-item".to_owned(), "existing-item".to_owned())]
+    );
+    // Both connections survive; unlinking is the owner's decision alone.
+    assert_eq!(store.status("sandbox").unwrap().len(), 2);
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() != "/item/remove"));
+}
+#[tokio::test]
+async fn legacy_session_without_expiry_is_not_polled() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("data.db");
+    let store = FinanceStore::open(&db).unwrap();
+    let vault = MemoryVault::default();
+    let id = start(&server, &client, &store, &vault, "2099-01-01T00:00:00Z").await;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE finance_sessions SET expires_at=NULL,created_at=NULL WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let store = FinanceStore::open(&db).unwrap();
+    assert!(store.due_sessions("sandbox", Utc::now()).unwrap().is_empty());
+    assert!(store.expire_sessions("sandbox", Utc::now()).unwrap().is_empty());
+    assert_eq!(store.session("sandbox", &id).unwrap().state, "pending");
 }

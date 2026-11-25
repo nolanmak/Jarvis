@@ -4050,6 +4050,13 @@ async fn main() -> Result<()> {
             // shortly after start and hourly, in small batches.
             tasks.push(tokio::spawn(db_compact::run_loop(Arc::clone(&store), shutdown.clone())));
 
+            // #2188 — finish Hosted Link sessions and import the newly linked
+            // accounts without a CLI step. Each tick skips while a `finance`
+            // command holds the lock, and costs nothing with no live session.
+            tasks.push(tokio::spawn(finance::worker_loop(
+                db_path.clone(), cli.wiki_dir.clone(), shutdown.clone(),
+            )));
+
             // #1434 — task leases recover at startup and at most 30 seconds
             // apart; retained compute artifacts expire after 24 hours.
             tasks.push(tokio::spawn(augmentagent_channel_core::code_mode::compute::retention::run_sweep_loop(shutdown.clone())));

@@ -1,11 +1,16 @@
 use anyhow::{bail, Context, Result};
 use augmentagent_finance::{
-    access_token, complete, connect, export_wiki, refresh_statements, sync_item, sync_statements,
-    Client, ConnectOptions, FinanceStore, KeyringVault,
+    complete, connect, export_wiki, import_items, poll_session, Client, ConnectOptions,
+    FinanceStore, KeyringVault, SessionOutcome,
 };
 use clap::{Args, Subcommand};
-use serde_json::json;
-use std::{fs::OpenOptions, path::Path};
+use serde_json::{json, Value};
+use std::{
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tracing::{info, warn};
 
 #[derive(Subcommand)]
 pub enum FinanceCommand {
@@ -39,6 +44,9 @@ pub enum FinanceCommand {
     Transactions(Query),
     /// Compute exact totals by currency, excluding pending and classified transfers.
     Summary(Query),
+    /// One completion-worker pass; `serve` runs this on a timer.
+    #[command(hide = true)]
+    WorkerTick,
 }
 #[derive(Args)]
 pub struct Query {
@@ -49,10 +57,33 @@ pub struct Query {
     #[arg(long)]
     pub end: Option<String>,
 }
-pub async fn run(op: &FinanceCommand, db: &Path, wiki: Option<&Path>) -> Result<()> {
+fn environment() -> Result<String> {
     let env = std::env::var("PLAID_ENV").unwrap_or_else(|_| "production".into());
     if !matches!(env.as_str(), "production" | "sandbox") {
         bail!("PLAID_ENV must be production or sandbox");
+    }
+    Ok(env)
+}
+fn lock_file(db: &Path) -> Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    Ok(opts.open(db.with_extension("finance.lock"))?)
+}
+pub async fn run(op: &FinanceCommand, db: &Path, wiki: Option<&Path>) -> Result<()> {
+    let env = environment()?;
+    // The worker attempts the same lock itself and skips a busy tick instead
+    // of failing, so it must not go through the blocking acquisition below.
+    if matches!(op, FinanceCommand::WorkerTick) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&worker_tick(db, wiki).await?)?
+        );
+        return Ok(());
     }
     // Local read commands do not load bank credentials or touch the keyring.
     let read = matches!(
@@ -63,14 +94,7 @@ pub async fn run(op: &FinanceCommand, db: &Path, wiki: Option<&Path>) -> Result<
             | FinanceCommand::Check
     );
     let _lock = if !read {
-        let mut opts = OpenOptions::new();
-        opts.create(true).truncate(false).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let f = opts.open(db.with_extension("finance.lock"))?;
+        let f = lock_file(db)?;
         f.try_lock()
             .context("another finance operation is running")?;
         Some(f)
@@ -119,63 +143,154 @@ pub async fn run(op: &FinanceCommand, db: &Path, wiki: Option<&Path>) -> Result<
             .await?
         }
         FinanceCommand::Complete { session } => {
-            complete(
-                &Client::from_env(&env)?,
-                &store,
-                &KeyringVault,
-                &env,
-                session,
-            )
-            .await?
+            let client = Client::from_env(&env)?;
+            let mut result = complete(&client, &store, &KeyringVault, &env, session).await?;
+            // A new connection is worthless until its history is in the
+            // database, so import before reporting success.
+            let linked = items_of(&result);
+            if !linked.is_empty() {
+                let failed = import(&client, &mut store, &env, wiki, Some(&linked)).await?;
+                if failed > 0 {
+                    bail!("{failed} finance connection(s) failed; see finance status");
+                }
+                report_duplicates(&store, &env, &linked)?;
+                result["freshness"] = json!(store.status(&env)?);
+            }
+            result
         }
         FinanceCommand::Sync => {
-            let items = store.status(&env)?;
-            let client = Client::from_env(&env)?;
-            let mut failed = 0;
-            for item in items {
-                let id = item["item_id"].as_str().context("missing item id")?;
-                let result = match access_token(&KeyringVault, &env, id) {
-                    Ok(access) => sync_item(&client, &mut store, &env, id, &access).await,
-                    Err(e) => {
-                        store.error(&env, id, "CREDENTIAL_UNAVAILABLE")?;
-                        Err(e)
-                    }
-                };
-                if let Err(e) = result {
-                    failed += 1;
-                    eprintln!("finance sync failed: {e}");
-                }
-            }
-            if let Some(root) = wiki {
-                for id in store.statement_items(&env)? {
-                    let result = async {
-                        let access = access_token(&KeyringVault, &env, &id)?;
-                        sync_statements(&client, &store, &env, &id, &access, root).await?;
-                        refresh_statements(&client, &store, &env, &id, &access).await?;
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        failed += 1;
-                        store.error(&env, &id, "STATEMENTS_FAILED")?;
-                        eprintln!("finance statements failed: {e}");
-                    }
-                }
-                export(&store, &env, root)?;
-            }
+            let failed = import(&Client::from_env(&env)?, &mut store, &env, wiki, None).await?;
             if failed > 0 {
                 bail!("{failed} finance connection(s) failed; see finance status");
             }
             json!({"environment":env,"items":store.status(&env)?})
         }
+        FinanceCommand::WorkerTick => unreachable!("worker tick runs before the finance lock"),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
+fn reindex(store: &FinanceStore, root: &Path) -> Result<()> {
+    augmentagent_wiki::rebuild_index(root, &|id| store.source_time(id))?;
+    Ok(())
+}
 fn export(store: &FinanceStore, env: &str, root: &Path) -> Result<usize> {
     let pages = export_wiki(store, env, root)?;
-    augmentagent_wiki::rebuild_index(root, &|id| store.source_time(id))?;
+    reindex(store, root)?;
     Ok(pages)
+}
+fn items_of(result: &Value) -> Vec<String> {
+    result["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// The shared sync/export loop, bound to this crate's wiki index rebuild.
+async fn import(
+    client: &Client,
+    store: &mut FinanceStore,
+    env: &str,
+    wiki: Option<&Path>,
+    only: Option<&[String]>,
+) -> Result<usize> {
+    import_items(client, store, &KeyringVault, env, wiki, &reindex, only).await
+}
+/// Second connections to an already linked institution are kept and reported;
+/// nothing is ever unlinked on our own initiative.
+fn report_duplicates(store: &FinanceStore, env: &str, items: &[String]) -> Result<()> {
+    for (item, existing) in store.duplicates(env)? {
+        if items.contains(&item) {
+            warn!("finance item {item} duplicates already linked connection {existing}; kept for owner review");
+        }
+    }
+    Ok(())
+}
+const WORKER_INTERVAL: Duration = Duration::from_secs(15);
+/// One pass of the completion worker: retire expired sessions, poll the due
+/// ones, then import whatever linked (plus any history re-sync now due).
+/// Skipped while a `finance` command holds the lock.
+pub async fn worker_tick(db: &Path, wiki: Option<&Path>) -> Result<Value> {
+    let env = environment()?;
+    let handle = lock_file(db)?;
+    if handle.try_lock().is_err() {
+        return Ok(json!({"status":"skipped","reason":"another finance operation is running"}));
+    }
+    let _lock = handle;
+    let mut store = FinanceStore::open(db)?;
+    let now = chrono::Utc::now();
+    for id in store.expire_sessions(&env, now)? {
+        info!("finance session {id} expired before the bank was authorized");
+    }
+    let due = store.due_sessions(&env, now)?;
+    let mut items = store.history_retries_due(&env, now)?;
+    if due.is_empty() && items.is_empty() {
+        return Ok(json!({"status":"idle"}));
+    }
+    let client = Client::from_env(&env)?;
+    let polled = due.len();
+    for session in due {
+        // Marked before the call so a failing session still waits its turn.
+        store.mark_polled(&env, &session.id, now)?;
+        match poll_session(&client, &store, &KeyringVault, &env, &session.id).await {
+            Ok(SessionOutcome::Linked { items: linked }) => {
+                info!("finance session {} linked {} item(s)", session.id, linked.len());
+                items.extend(linked);
+            }
+            Ok(SessionOutcome::Expired) => {
+                info!("finance session {} expired", session.id)
+            }
+            Ok(SessionOutcome::Exited | SessionOutcome::Pending) => {}
+            Err(e) => warn!("finance session {} could not be polled: {e:#}", session.id),
+        }
+    }
+    items.sort();
+    items.dedup();
+    if items.is_empty() {
+        return Ok(json!({"status":"polled","sessions":polled}));
+    }
+    let failed = import(&client, &mut store, &env, wiki, Some(&items)).await?;
+    if failed > 0 {
+        warn!("{failed} finance connection(s) failed to import; see finance status");
+    }
+    report_duplicates(&store, &env, &items)?;
+    Ok(json!({"status":"imported","sessions":polled,"items":items,"failed":failed}))
+}
+/// The daemon's loop. Every failure only logs: a bank, keyring or network
+/// problem must not end `serve`. A tick runs on the blocking pool with its
+/// own current-thread runtime because the SQLite connection it holds across
+/// awaits is not `Sync`.
+pub async fn worker_loop(
+    db: PathBuf,
+    wiki: Option<PathBuf>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(WORKER_INTERVAL) => {}
+        }
+        let (db, wiki) = (db.clone(), wiki.clone());
+        let tick = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(worker_tick(&db, wiki.as_deref()))
+        })
+        .await;
+        match tick {
+            Ok(Ok(result)) if result["status"] == "imported" => {
+                info!("finance completion worker: {result}")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("finance completion worker tick failed: {e:#}"),
+            Err(e) => warn!("finance completion worker task failed: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

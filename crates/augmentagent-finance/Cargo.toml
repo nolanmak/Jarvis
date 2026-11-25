@@ -23,3 +23,5 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 [dev-dependencies]
 wiremock.workspace = true
 tempfile = "3"
+# Seeds pre-migration session rows that the public API can no longer create.
+rusqlite.workspace = true

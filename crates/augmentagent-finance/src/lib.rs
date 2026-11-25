@@ -4,7 +4,7 @@ mod store;
 use anyhow::{bail, Context, Result};
 pub use client::{ApiError, Client};
 use serde_json::{json, Value};
-pub use store::{date, FinanceStore};
+pub use store::{date, FinanceStore, Session};
 
 pub async fn sync_item(
     client: &Client,
@@ -69,10 +69,16 @@ async fn sync_inner(
 }
 
 mod connect;
-pub use connect::{access_token, complete, connect, ConnectOptions, KeyringVault, Vault};
+pub use connect::{
+    access_token, complete, connect, poll_session, ConnectOptions, KeyringVault, SessionOutcome,
+    Vault,
+};
 
 mod export;
 pub use export::{atomic_write, export_wiki};
+
+mod import;
+pub use import::{import_items, Reindex};
 
 mod statements;
 pub use statements::{refresh_statements, sync_statements};
