@@ -314,6 +314,9 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Phone call proposals (#1553) ---------------------------------------
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/proposals.rs", "notify_owner(", 1, Route::PhoneControlChat, "agent-proposed call questions (yes/no) in the owner's private control chat")),
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/router.rs", "notify_owner(", 1, Route::PhoneControlChat, "per-platform routing of call proposal questions")),
+    // nolanmak/tabagent#61: a one-time link that takes over one browser tab.
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "send_message(&", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff link (ID check, passkey, payment step)"),
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "CreateMessage::new(", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff message"),
     p("cli_discord_posts", CLI, "CreateMessage::new(", 4, Route::DiscordOnly("explicit `--post` Discord commands and Discord loop output"), "one-shot Discord posts"),
 ];
 // producer-scan: on
