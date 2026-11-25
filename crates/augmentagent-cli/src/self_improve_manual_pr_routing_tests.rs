@@ -55,13 +55,13 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 let mut issues:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("issues.json")).unwrap()).unwrap();
                 issues["7"]["state"]="closed".into();issues["7"]["state_reason"]="completed".into();
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
-                let mut closed=candidates.clone();manual_routing::filter(&root,&mut closed).await;
+                let mut closed=candidates.clone();manual_routing::filter(&root,&mut closed,&rows).await;
                 assert_eq!(initial.pending_operations(&id).unwrap().len(),1,"already completed source still replayed its pending Push");
                 assert_eq!(initial.snapshot(&id).unwrap().unwrap().attempts,before.attempts,"closed source admitted another attempt");
                 issues["7"]["state"]="open".into();issues["7"]["state_reason"]=serde_json::Value::Null;
                 std::fs::write(root.join("issues.json"),serde_json::to_vec(&issues).unwrap()).unwrap();
             }
-            manual_routing::filter(&root,&mut candidates).await;
+            manual_routing::filter(&root,&mut candidates,&rows).await;
             assert!(initial.pending_operations(&id).unwrap().is_empty(),"automatic inventory never recovered the failed bound Push");
             let out=std::process::Command::new("/usr/bin/git").args(["ls-remote","--heads","origin","refs/heads/feat/repair-9"])
                 .current_dir(&root).output().unwrap();assert!(out.status.success());
@@ -358,9 +358,12 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
             std::fs::write(root.join("fresh-claim-appeared"),b"owner opened manual PR after earlier absence observation").unwrap();
             if case.starts_with("fresh-uncertain") {
                 guard.transition(crate::autoship_workflow::Stage::Publish,"publishing_revision","push",0).await.unwrap();
-                let id=guard.id().to_owned();let binding=guard.binding().clone();guard.finish().unwrap();
+                let id=guard.id().to_owned();let binding=guard.binding().clone();
                 let now=chrono::Utc::now().timestamp_millis();
-                let lease=initial.claim(&id,"lost-response-controller",now,1000).unwrap().unwrap();
+                // Record the uncertain intent under the original controller's
+                // live authority, before finishing it. A new productive claim
+                // after a completed no-intent turn must respect retry backoff.
+                let lease=guard.merge_lease().unwrap();
                 let missing_peer=if matches!(case.as_str(),"fresh-uncertain-missing-peer"|"fresh-uncertain-access-denied") {
                     let peer="owner/repo#8";
                     initial.register(peer,"feat/missing-8",binding.clone(),now-20).unwrap();
@@ -382,7 +385,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
                 // Network I/O is served by the existing scripted GitHub API;
                 // effective push destination parsing is the actual Git command.
                 git(&["remote","set-url","--push","origin",if matches!(case.as_str(),"fresh-uncertain-unbound"|"fresh-uncertain-destination-changed") {"https://github.com/owner/other.git"}else{"https://github.com/owner/repo.git"}]);
-                initial.release(&lease,now+1).unwrap();
+                guard.finish().unwrap();
                 if case=="fresh-uncertain-branch-changed" {
                     // Isolate retained-effect identity from the mutable workflow
                     // branch in this fixture; production state is never edited.
@@ -538,7 +541,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         let before=ids.map(|id|(initial.snapshot(id).unwrap(),initial.owner_control(id).unwrap(),initial.events(id).unwrap()));
         let prior_adoption=initial.adopted_pr("owner/repo",9).unwrap();drop(initial);
         let selected=if std::env::var("MANUAL_PR_ROUTE").unwrap()=="linked" {
-            find_resumable_draft(&root,None,false).await.map(|p|p.0)
+            find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await.map(|p|p.0)
         }else {
             adopted_execution::next(&root,false).await.unwrap().map(|p|p.pr)
         };
@@ -573,7 +576,7 @@ async fn automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer(
         for case in ["cross-repository-source","push-failed-recovery","create-manual-auto","create-manual-explicit","merge-label-during-policy","ready-pause-during-routing","source-reopened-during-close-routing","fresh-uncertain-branch-changed","push-empty-destination","push-multiple-destination","push-nonbare-destination","fresh-uncertain-access-denied","fresh-uncertain-destination-changed","push-valid-ccat","push-shadowed-ccat","push-push-instead-of","push-missing-ccat","push-before-config-change","push-after-config-change","push-hook-composition","push-rewrite-once","push-separate-remotes","post-rabbit-label","post-rabbit-pause","post-rabbit-unknown","post-rabbit-ordinary","round-pause-during-push","post-control-pause","post-control-followup","fresh-uncertain-missing-peer","fresh-uncertain-other-fetch","round-label-during-push","fresh-uncertain-unbound","paused-unlabelled","pending-pr-unlabelled","fresh-uncertain-unobserved","late-fresh-recheck","post-note-manual","post-note-unknown","post-note-between","changed-owned-source","missing-owned-source","fresh-uncertain","late-fresh-claim","late-adopted-retry","late-mutation","pr-label","source-label","unknown-pr","unknown-source","race","malformed-pr","malformed-source","malformed-reference","saturated-pr-labels","saturated-references","explicit-revoked","paused-pr","paused-issue"] {
             if std::env::var("MANUAL_PR_FOCUS").is_ok_and(|focus|focus!=case) {continue;}
             for draft in [false,true] {
-                let dir=tempfile::tempdir_in("/tmp").unwrap();let root=dir.path().join("repo");
+                let dir=tempfile::tempdir_in("/tmp").unwrap();let base=dir.path().canonicalize().unwrap();let root=base.join("repo");
                 std::fs::create_dir(&root).unwrap();
                 for args in [vec!["init","-q"],vec!["remote","add","origin","https://github.com/owner/repo.git"]] {
                     assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&root)
@@ -625,8 +628,26 @@ elif a[:2]==['pr','list']:
  if case.startswith('create-manual-'):print('[]');sys.exit(0)
  if case=='late-fresh-recheck':
   p=root/'fresh-observations';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n));print(json.dumps([] if n<=2 else prs))
- else: print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
-elif a[:2]==['issue','list']: print(json.dumps(list(issues.values())))
+ else:
+  # #2444: selection routes from this listing, so the PR-row faults that
+  # used to reach selection only through `pr view` are applied here too.
+  for row in prs:
+   if row['number']!=9: continue
+   if case=='race': row['labels']=[dict(name='autoship-manual')]
+   if case in ('malformed-pr','unknown-pr'): row.pop('labels')
+   if case=='saturated-pr-labels': row['labels']=[dict(name=f'ordinary-{n}') for n in range(100)]
+   if case=='saturated-references': row['closingIssuesReferences']=[dict(number=7,url='https://github.com/owner/repo/issues/7') for _ in range(100)]
+  print(json.dumps([] if case in ('late-fresh-claim','fresh-uncertain','fresh-uncertain-unobserved','fresh-uncertain-unbound','fresh-uncertain-other-fetch','fresh-uncertain-destination-changed','fresh-uncertain-branch-changed','fresh-uncertain-access-denied','fresh-uncertain-missing-peer') and not (root/'fresh-claim-appeared').exists() else prs))
+elif a[:2]==['issue','list']:
+ # An unknown source is absent from the routing listing (the one asking for
+ # state); a malformed one is listed malformed there. Both fall back to the
+ # direct issue read. Other issue inventories keep their own observations.
+ routing='--json' in a and 'state' in a[a.index('--json')+1].split(',')
+ rows=[dict(i) for k,i in issues.items() if not (routing and case=='unknown-source' and k=='7')]
+ if routing and case=='malformed-source':
+  for row in rows:
+   if row['number']==7: row.pop('labels',None)
+ print(json.dumps(rows))
 elif a[:2]==['pr','view']:
  if (case=='unknown-pr' or (case=='post-note-unknown' and (root/'manual-after-admission').exists())) and a[2]=='9':sys.exit(1)
  row=next(p for p in prs if p['number']==int(a[2]))
@@ -685,9 +706,9 @@ else:raise AssertionError('Unexpected or mutating GitHub call: '+repr(a))
                 std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
                 let output=tokio::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact","self_improve::manual_pr_routing_tests::automatic_pr_routes_skip_manual_work_before_ownership_and_advance_peer","--nocapture"])
-                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",dir.path())
-                    .env("XDG_STATE_HOME",dir.path().join("state"))
-                    .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",dir.path().join("workflow.db"))
+                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&base)
+                    .env("XDG_STATE_HOME",base.join("state"))
+                    .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",base.join("workflow.db"))
                     .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
                     .env("AUGMENTAGENT_GH_OWNER","owner").env("GH_BIN",gh)
                     .env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")

@@ -410,3 +410,135 @@ async fn issue_preparation_preserves_lost_checkout_identity_before_git_reconstru
     assert!(!candidate.exists(), "failed preparation left an unauthorized replacement");
     assert_eq!(crate::autoship_workflow::WorkflowStore::open(&state).unwrap().snapshot("fixture/repo#7").unwrap(), before);
 }
+
+/// #2349 — enroll a synthetic workflow checkout at `stage`, then lose the path.
+async fn lost_checkout_fixture(root: &Path, state: &Path, number: u64, stage: crate::autoship_workflow::Stage)
+    -> (String, PathBuf, String, crate::autoship_workflow::Snapshot) {
+    use crate::autoship_workflow::{NextAction, RecoveryContext, WorkflowStore};
+    let id = format!("fixture/repo#{number}");
+    let candidate = candidate_parent(root).await.unwrap().join(format!("current-issue-{number}"));
+    let branch = format!("agent-fix/issue-{number}");
+    recovery::prepare_issue_at(state, root, &candidate, &id, "fixture/repo", &branch).await.unwrap();
+    let binding = crate::autoship_workflow::Binding {head: git(&candidate, &["rev-parse", "HEAD"]),
+        contract: "synthetic-contract".into(), evidence_hash: "synthetic-environment".into()};
+    let mut store = WorkflowStore::open(state).unwrap();
+    store.register(&id, &branch, binding.clone(), 1).unwrap();
+    let lease = store.claim(&id, "fixture", 2, 1000).unwrap().unwrap();
+    let identity = checkout_identity::Identity::observe(state, root, &candidate, &id, "fixture/repo", &branch).await.unwrap();
+    identity.enroll(&mut store, &lease, &binding, 3).unwrap();
+    store.record_recovery_context(&lease, &binding, &RecoveryContext {version: 1, workflow: id.clone(),
+        repository: "fixture/repo".into(), worktree: candidate.clone(), source_request: "synthetic-request".into(),
+        source_pr: None, contract: "synthetic-contract".into(), environment: "synthetic-environment".into(),
+        binding: binding.clone()}, 4).unwrap();
+    let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+    cp.stage = stage;
+    cp.next = NextAction {reason: "scope_policy_changed".into(), action: "rescope_executable_acceptance".into(), eligible_at_ms: 0};
+    store.checkpoint(&lease, &cp, 5).unwrap();
+    store.release(&lease, 6).unwrap();
+    git(root, &["worktree", "remove", "--force", candidate.to_str().unwrap()]);
+    let before = store.snapshot(&id).unwrap().unwrap();
+    (id, candidate, branch, before)
+}
+
+fn receipt_files(state: &Path) -> Vec<(String, Vec<u8>)> {
+    let dir = state.parent().unwrap().join("workflow-checkout-identities");
+    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        (entry.file_name().to_string_lossy().into_owned(), std::fs::read(entry.path()).unwrap())
+    }).collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn scope_stage_lost_checkout_reestablishes_continuity_from_current_main() {
+    use crate::autoship_workflow::{Stage, WorkflowStore};
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    let (id, candidate, branch, before) = lost_checkout_fixture(root.path(), &state, 9, Stage::Scope).await;
+    let old_head = before.checkpoint.binding.head.clone();
+    let receipts = receipt_files(&state);
+    assert_eq!(receipts.len(), 1);
+    // Main moves on after the old checkout was lost (repo rename/relocation).
+    std::fs::write(root.path().join("code"), "advanced main").unwrap();
+    git(root.path(), &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "advance"]);
+    let main = git(root.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(main, old_head);
+
+    recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await
+        .expect("scope-stage work must re-establish continuity instead of holding forever");
+
+    // A fresh checkout of the same branch, now at current main.
+    assert_eq!(git(&candidate, &["rev-parse", "HEAD"]), main);
+    assert_eq!(git(&candidate, &["symbolic-ref", "--short", "HEAD"]), branch);
+    let store = WorkflowStore::open(&state).unwrap();
+    assert_eq!(store.snapshot(&id).unwrap().unwrap(), before, "re-establishment rewrote the checkpoint");
+    let events = store.events(&id).unwrap();
+    let audits: Vec<_> = events.iter().filter(|e| e.1 == "checkout_continuity_reestablished").collect();
+    assert_eq!(audits.len(), 1, "missing or duplicate continuity audit");
+    let payload: serde_json::Value = serde_json::from_str(&audits[0].2).unwrap();
+    let old_receipt: serde_json::Value = serde_json::from_slice(&receipts[0].1).unwrap();
+    assert_eq!(payload["previous"]["identity"], old_receipt, "audit lost the old identity");
+    assert_eq!(payload["previous"]["branch_head"], old_head);
+    assert_eq!(payload["current"]["base"], main);
+    assert_eq!(payload["current"]["branch"], branch);
+    assert_eq!(payload["current"]["worktree"], candidate.to_str().unwrap());
+    assert_eq!(payload["checkpoint"]["next"]["action"], "rescope_executable_acceptance");
+    // The old receipt bytes are archived, not deleted or rewritten.
+    let after = receipt_files(&state);
+    assert_eq!(after.len(), 1);
+    assert!(after[0].0.starts_with(&format!("{}.superseded-", receipts[0].0)), "{after:?}");
+    assert_eq!(after[0].1, receipts[0].1);
+
+    // Ordinary selection/preparation now sees continuity; the next lease-fenced
+    // acquisition enrolls the current identity.
+    checkout_identity::check_recorded(&state, &id, &candidate, "fixture/repo", &branch).unwrap();
+    recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await.unwrap();
+    let mut store = WorkflowStore::open(&state).unwrap();
+    let lease = store.claim(&id, "fixture-rescope", 100, 1000).unwrap().unwrap();
+    let identity = checkout_identity::Identity::observe(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await.unwrap();
+    identity.enroll(&mut store, &lease, &before.checkpoint.binding, 101).unwrap();
+    checkout_identity::check_recorded(&state, &id, &candidate, "fixture/repo", &branch).unwrap();
+    assert_eq!(store.events(&id).unwrap().iter().filter(|e| e.1 == "checkout_continuity_reestablished").count(), 1);
+}
+
+#[tokio::test]
+async fn build_stage_lost_checkout_keeps_continuity_hold() {
+    use crate::autoship_workflow::{Stage, WorkflowStore};
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    for (number, stage) in [(11, Stage::Build), (12, Stage::Review)] {
+        let (id, candidate, branch, before) = lost_checkout_fixture(root.path(), &state, number, stage).await;
+        let receipts = receipt_files(&state);
+        let result = recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await;
+        let error = result.expect_err("build/review work recreated a lost checkout");
+        assert!(error.downcast_ref::<checkout_identity::Hold>().is_some_and(|h| h.reason_code == "checkout_identity_changed"), "{error:#}");
+        assert!(!candidate.exists(), "failed preparation left an unauthorized replacement");
+        let store = WorkflowStore::open(&state).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
+        assert!(!store.events(&id).unwrap().iter().any(|e| e.1 == "checkout_continuity_reestablished"));
+        assert_eq!(receipt_files(&state), receipts, "receipt evidence changed");
+    }
+}
+
+#[tokio::test]
+async fn scope_stage_lost_checkout_with_unpublished_commits_keeps_hold() {
+    use crate::autoship_workflow::{Stage, WorkflowStore};
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    let (id, candidate, branch, before) = lost_checkout_fixture(root.path(), &state, 13, Stage::Scope).await;
+    // The branch carries work that is not on main: never reset it.
+    let tree = git(root.path(), &["rev-parse", &format!("{branch}^{{tree}}")]);
+    let work = git(root.path(), &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit-tree", &tree, "-p", &branch, "-m", "unpublished"]);
+    git(root.path(), &["update-ref", &format!("refs/heads/{branch}"), &work]);
+    let result = recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await;
+    assert!(result.is_err(), "branch with unpublished commits was replaced");
+    assert_eq!(git(root.path(), &["rev-parse", &branch]), work);
+    assert!(!candidate.exists());
+    let store = WorkflowStore::open(&state).unwrap();
+    assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
+    assert!(!store.events(&id).unwrap().iter().any(|e| e.1 == "checkout_continuity_reestablished"));
+}

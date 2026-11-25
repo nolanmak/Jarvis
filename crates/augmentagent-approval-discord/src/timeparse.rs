@@ -132,8 +132,56 @@ pub fn resolve_token_in<Tz: TimeZone>(token: &str, now: DateTime<Tz>) -> Result<
                 add_days(today, ahead).and_time(at_hm(9, 0)),
             ))
         }
-        other => Err(format!("unknown schedule option \"{other}\"")),
+        other => {
+            // #2286 — `in30m`, `in8h`: pure offsets.
+            if let Some(delta) = other.strip_prefix("in").and_then(parse_offset) {
+                return Ok(now_ms + delta);
+            }
+            // #2286 — `next-0900`: the next time the owner's clock reads
+            // 09:00 that is at least the minimum lead away. Today when it
+            // still can be, otherwise tomorrow, so the pick never depends
+            // on which calendar day the daemon thinks it is.
+            if let Some(time) = other.strip_prefix("next-").and_then(parse_hhmm_token) {
+                let today_at = resolve_wall_time(&tz, today.and_time(time));
+                if today_at > now_ms + MIN_LEAD_MS {
+                    return Ok(today_at);
+                }
+                return Ok(resolve_wall_time(&tz, add_days(today, 1).and_time(time)));
+            }
+            Err(format!("unknown schedule option \"{other}\""))
+        }
     }
+}
+
+/// `"0900"` → 09:00. Exactly four digits, a valid 24-hour time.
+fn parse_hhmm_token(s: &str) -> Option<NaiveTime> {
+    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    NaiveTime::from_hms_opt(s[..2].parse().ok()?, s[2..].parse().ok()?, 0)
+}
+
+/// #2286 — a trailing zone on free text: `9am est`, `tomorrow 2pm pacific`,
+/// `fri 14:30 America/Chicago`. Returns the text without it and the zone.
+/// Abbreviations name the region, not a fixed offset, so `9am est` in July
+/// is 9:00 Eastern daylight time, resolved under the normal DST policy.
+fn split_zone(raw: &str) -> Option<(&str, Zone)> {
+    let raw = raw.trim();
+    let (rest, word) = raw.rsplit_once(char::is_whitespace)?;
+    let rest = rest.trim_end();
+    if rest.is_empty() {
+        return None;
+    }
+    let zone = match word.to_ascii_lowercase().as_str() {
+        "et" | "est" | "edt" | "eastern" => chrono_tz::America::New_York,
+        "ct" | "cst" | "cdt" | "central" => chrono_tz::America::Chicago,
+        "mt" | "mst" | "mdt" | "mountain" => chrono_tz::America::Denver,
+        "pt" | "pst" | "pdt" | "pacific" => chrono_tz::America::Los_Angeles,
+        "utc" | "gmt" => chrono_tz::UTC,
+        _ if word.contains('/') => zone_named(word)?,
+        _ => return None,
+    };
+    Some((rest, zone))
 }
 
 /// Generic-timezone core of [`parse_send_at`]. Accepted forms:
@@ -167,6 +215,10 @@ fn parse_core<Tz: TimeZone>(
     // before any case-folding.
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
         return Ok((dt.timestamp_millis(), None));
+    }
+    // #2286 — "9am est": read the rest as wall time in that zone.
+    if let Some((rest, zone)) = split_zone(raw) {
+        return parse_core(rest, now.with_timezone(&zone));
     }
 
     let s = raw.to_ascii_lowercase();
@@ -373,7 +425,8 @@ fn add_days(date: NaiveDate, days: u64) -> NaiveDate {
 fn format_error() -> String {
     "couldn't parse that time — accepted formats: \"tomorrow 9am\", \
      \"fri 14:30\", \"in 3h\", \"7pm\", \"2026-09-01 09:00\", or RFC3339 \
-     with offset"
+     with offset. Add a zone to any time: \"9am et\", \"tomorrow 2pm pt\", \
+     \"fri 14:30 America/Chicago\""
         .to_string()
 }
 
@@ -390,14 +443,36 @@ pub use chrono_tz::Tz as Zone;
 /// The preset send times every surface offers, label → the symbolic token
 /// [`resolve_token_in`] resolves at click time (Discord's Schedule select
 /// uses the same tokens).
+///
+/// #2286 — wall-time presets are "next occurrence" (`next-0900`) rather than
+/// "tomorrow", which picked the wrong day whenever the owner and the daemon
+/// were on different sides of midnight. The retired `tonight-1900`,
+/// `tomorrow-0900` and `tomorrow-1400` tokens still resolve for cards
+/// already posted.
 pub const SCHEDULE_PRESETS: &[(&str, &str)] = &[
+    ("In 30 minutes", "in30m"),
     ("In 1 hour", "in1h"),
+    ("In 2 hours", "in2h"),
     ("In 3 hours", "in3h"),
-    ("Tonight 7pm", "tonight-1900"),
-    ("Tomorrow 9am", "tomorrow-0900"),
-    ("Tomorrow 2pm", "tomorrow-1400"),
+    ("In 4 hours", "in4h"),
+    ("In 6 hours", "in6h"),
+    ("In 8 hours", "in8h"),
+    ("In 12 hours", "in12h"),
+    ("Next 7am", "next-0700"),
+    ("Next 8am", "next-0800"),
+    ("Next 9am", "next-0900"),
+    ("Next 10am", "next-1000"),
+    ("Next noon", "next-1200"),
+    ("Next 2pm", "next-1400"),
+    ("Next 5pm", "next-1700"),
     ("Next Monday 9am", "next-monday-0900"),
 ];
+
+/// The owner's zone abbreviation right now (`EST`), for labels that say
+/// which clock the wall-time presets use.
+pub fn zone_abbreviation(zone: &Zone, now_ms: i64) -> String {
+    at_in(now_ms, zone).format("%Z").to_string()
+}
 
 /// Names the owner's zone (`America/New_York`). Wins over the host zone.
 pub const TIMEZONE_ENV: &str = "AUGMENTAGENT_TIMEZONE";
@@ -555,7 +630,8 @@ pub fn resolve_send_at_in<Tz: TimeZone>(
     input: &str,
     now: DateTime<Tz>,
 ) -> Result<ResolvedSendAt, SendAtError> {
-    if let Some((prefix, h)) = bare_hour(input) {
+    let unzoned = split_zone(input).map(|(rest, _)| rest).unwrap_or(input);
+    if let Some((prefix, h)) = bare_hour(unzoned) {
         return Err(SendAtError::Ambiguous(format!(
             "“{}” could be {h}am or {h}pm — say which, e.g. `{prefix}{h}am` or `{prefix}{h}pm` \
              (or 24-hour `{prefix}{h:02}:00`).",
@@ -735,5 +811,84 @@ mod confirm_tests {
             describe_send_time(utc_ms(2026, 1, 15, 14, 0), &New_York),
             "Thu Jan 15, 9:00 AM EST (America/New_York)"
         );
+    }
+
+    // ----- #2286 presets and zones -----
+
+    fn la(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Zone> {
+        chrono_tz::America::Los_Angeles
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("unambiguous fixture")
+    }
+
+    #[test]
+    fn next_nine_is_today_until_it_passes_then_tomorrow() {
+        // 02:20 Eastern: the owner's "tomorrow morning" is today.
+        assert_eq!(resolve_token_in("next-0900", ny(2026, 11, 19, 2, 20)).unwrap(), utc_ms(2026, 11, 19, 14, 0));
+        // 08:59 is inside the two-minute lead, so it rolls to tomorrow.
+        assert_eq!(resolve_token_in("next-0900", ny(2026, 11, 19, 8, 59)).unwrap(), utc_ms(2026, 11, 20, 14, 0));
+        assert_eq!(resolve_token_in("next-0900", ny(2026, 11, 19, 10, 0)).unwrap(), utc_ms(2026, 11, 20, 14, 0));
+        assert_eq!(resolve_token_in("next-1200", ny(2026, 11, 19, 10, 0)).unwrap(), utc_ms(2026, 11, 19, 17, 0));
+    }
+
+    #[test]
+    fn offset_presets_are_instant_math() {
+        let now = ny(2026, 11, 19, 2, 20);
+        let base = now.timestamp_millis();
+        assert_eq!(resolve_token_in("in30m", now).unwrap(), base + 30 * 60_000);
+        assert_eq!(resolve_token_in("in8h", now).unwrap(), base + 8 * 3_600_000);
+        assert_eq!(resolve_token_in("in12h", now).unwrap(), base + 12 * 3_600_000);
+        assert!(resolve_token_in("in0h", now).is_err());
+        assert!(resolve_token_in("next-2500", now).is_err());
+        assert!(resolve_token_in("next-9", now).is_err());
+    }
+
+    #[test]
+    fn every_preset_resolves_at_any_hour_and_old_tokens_still_work() {
+        assert!(SCHEDULE_PRESETS.len() + 1 <= 25, "Discord selects hold at most 25 options");
+        for hour in 0..24 {
+            let now = ny(2026, 11, 19, hour, 30);
+            for (label, token) in SCHEDULE_PRESETS {
+                let at = resolve_token_in(token, now).unwrap_or_else(|e| panic!("{label} at {hour}:30: {e}"));
+                validate_send_at(at, now.timestamp_millis()).unwrap_or_else(|e| panic!("{label} at {hour}:30: {e}"));
+            }
+        }
+        let morning = ny(2026, 11, 19, 8, 0);
+        for retired in ["tonight-1900", "tomorrow-0900", "tomorrow-1400"] {
+            assert!(resolve_token_in(retired, morning).is_ok(), "{retired}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_zone_reads_the_time_in_that_zone() {
+        // 23:19 Pacific, asking for 9am Eastern: 06:00 Pacific next morning.
+        let now = la(2026, 11, 18, 23, 19);
+        let r = resolve_send_at_in("9am est", now).unwrap();
+        assert_eq!(r.at_ms, utc_ms(2026, 11, 19, 14, 0));
+        for text in ["9am ET", "9am eastern", "9am America/New_York", "9:00 et"] {
+            assert_eq!(resolve_send_at_in(text, now).unwrap().at_ms, utc_ms(2026, 11, 19, 14, 0), "{text}");
+        }
+        assert_eq!(resolve_send_at_in("tomorrow 2pm pt", now).unwrap().at_ms, utc_ms(2026, 11, 19, 22, 0));
+        assert_eq!(resolve_send_at_in("fri 14:30 utc", now).unwrap().at_ms, utc_ms(2026, 11, 20, 14, 30));
+        assert_eq!(resolve_send_at_in("2026-12-01 09:00 ct", now).unwrap().at_ms, utc_ms(2026, 12, 1, 15, 0));
+        // "est" names the region, so in July it is daylight time.
+        let july = la(2026, 7, 1, 20, 0);
+        assert_eq!(resolve_send_at_in("9am est", july).unwrap().at_ms, utc_ms(2026, 7, 2, 13, 0));
+    }
+
+    #[test]
+    fn zone_suffix_errors_stay_helpful() {
+        let now = la(2026, 11, 18, 23, 19);
+        assert!(matches!(resolve_send_at_in("9 et", now), Err(SendAtError::Ambiguous(_))));
+        assert!(matches!(resolve_send_at_in("9am mars", now), Err(SendAtError::Invalid(m)) if m.contains("9am et")));
+        assert!(matches!(resolve_send_at_in("est", now), Err(SendAtError::Invalid(_))));
+        assert!(matches!(resolve_send_at_in("9am Not/AZone", now), Err(SendAtError::Invalid(_))));
+    }
+
+    #[test]
+    fn zone_abbreviation_follows_daylight_time() {
+        assert_eq!(zone_abbreviation(&New_York, utc_ms(2026, 1, 15, 12, 0)), "EST");
+        assert_eq!(zone_abbreviation(&New_York, utc_ms(2026, 7, 15, 12, 0)), "EDT");
     }
 }

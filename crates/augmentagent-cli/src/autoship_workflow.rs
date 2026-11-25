@@ -1,10 +1,33 @@
 //! Durable autoship control-plane state. Workers get fenced leases, not authority
 //! from a branch name or model-authored PR body. This store records evidence;
 //! callers still enforce authorization, review and CI policy before side effects.
+#[path="autoship_acceptance_escalation.rs"]
+pub(crate) mod acceptance_escalation;
+#[path="autoship_retry_policy.rs"]
+pub(crate) mod retry_policy;
+#[path="autoship_attempt_cap.rs"]
+pub(crate) mod attempt_cap;
+pub use attempt_cap::GlobalModelBudget;
+#[path="autoship_command_fairness.rs"]
+pub(crate) mod command_fairness;
+#[path="autoship_owner_requalification.rs"]
+pub(crate) mod owner_requalification;
+#[path="autoship_scope_policy.rs"]
+pub(crate) mod scope_policy;
+#[path="autoship_terminal_parks.rs"]
+pub(crate) mod terminal_parks;
+#[path="autoship_scope_proof_gate.rs"]
+pub(crate) mod scope_proof_gate;
+#[path="autoship_witness_regeneration.rs"]
+pub(crate) mod witness_regeneration;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
+#[path = "autoship_checkout_continuity.rs"]
+pub(crate) mod checkout_continuity;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
+#[path="autoship_review_binding_cap.rs"]
+pub(crate) mod review_binding_cap;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -23,6 +46,9 @@ pub(crate) mod family_budget;
 #[cfg(test)]
 #[path = "autoship_family_budget_tests.rs"]
 mod family_budget_tests;
+#[cfg(test)]
+#[path = "autoship_park_guard_tests.rs"]
+mod park_guard_tests;
 #[path = "autoship_activity_observation.rs"]
 mod activity_observation;
 #[path = "autoship_idle_recovery.rs"]
@@ -44,6 +70,8 @@ mod adopted_publication;
 
 #[path = "autoship_push_observation.rs"]
 mod push_observation;
+#[path = "autoship_publish_checkpoint.rs"]
+mod publish_checkpoint;
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
@@ -93,8 +121,14 @@ pub(crate) mod owner_control;
 pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_main_update.rs"]
+pub(crate) mod main_update;
+#[path = "autoship_ci_code_repair.rs"]
+pub(crate) mod ci_code_repair;
 #[path = "autoship_tool_capacity.rs"]
 pub(crate) mod tool_capacity;
+#[path = "autoship_retry_recovery.rs"]
+pub(crate) mod retry_recovery;
 #[path = "autoship_capacity_retry.rs"]
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
@@ -106,7 +140,8 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::VerificationDomain;
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCOPE_STOP_ACTION, RESCOPE_STOP_MAIN_EVIDENCE,
+    RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -226,12 +261,32 @@ pub struct Snapshot {
 /// Shared wait shape for acquisition and dispatch. Recovery evidence still
 /// requires separate authentication and grants no builder or merge approval.
 pub(crate) fn awaits_initial_input(checkpoint:&Checkpoint)->bool {
-    checkpoint.stage==Stage::Scope && matches!(
-        (checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-        ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
-        ("readiness_assessment_invalid","await_readiness_input_change")|
-        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
-        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"))
+    checkpoint.stage==Stage::Scope && INITIAL_INPUT_WAITS.iter().any(|(reason,action)|
+        checkpoint.next.reason==*reason && checkpoint.next.action==*action)
+}
+/// Every reason → await pair an initial verifier hold can produce. #2370's
+/// guard proves each one leaves automatically; none waits on a human.
+pub(crate) const INITIAL_INPUT_WAITS:&[(&str,&str)]=&[
+    ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+    ("acceptance_verifier_amendment_declined","await_acceptance_input_change"),
+    ("acceptance_contract_invalid","await_acceptance_input_change"),
+    ("acceptance_strategies_exhausted","await_new_execution_inputs"),
+    ("readiness_assessment_invalid","await_readiness_input_change"),
+    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+];
+
+/// #2432 — is this workflow resuming work already in flight, rather than
+/// starting fresh? The #851 daily attempt ledger caps fresh starts only; work
+/// past the start is governed by its own lease, `eligible_at` backoff and the
+/// per-review cost cap (#2421). On 2026-11-21 the ledger held three PRs in
+/// verify/reconcile for 8+ hours.
+pub(crate) fn resumes_existing_work(snapshot:&Snapshot)->bool {
+    let stage=snapshot.checkpoint.stage;
+    if matches!(stage,Stage::Merged|Stage::Retired) {return false;}
+    matches!(stage,Stage::Build|Stage::Verify|Stage::Review|Stage::Reconcile|Stage::Publish)
+        || snapshot.pr.is_some()
+        || matches!(snapshot.checkpoint.next.action.as_str(),"resume_preserved_work"|"resume_preserved_pr")
 }
 
 /// Shape only; the unpaid consumer separately authenticates the exact private
@@ -320,7 +375,17 @@ mod acceptance_input_wait_claim_tests {
                 checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
+                let recoverable=matches!(reason,"acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid");
+                let mut planning_claims=0;
                 for now in [6,86_400_001,2*86_400_000] {
+                    if recoverable {
+                        let plan=stale.claim_productive_for_binding(&setup.workflow,"planning",now,1000,&binding).unwrap().unwrap();
+                        assert!(store.claim_productive_for_binding(&setup.workflow,"racer",now+1,1000,&binding).unwrap().is_none());
+                        let current=store.snapshot(&setup.workflow).unwrap().unwrap();
+                        assert_eq!(current.checkpoint,before.checkpoint);
+                        assert_eq!((current.model_calls,current.tokens,current.wall_ms),(3,700,5));
+                        stale.release(&plan,now+2).unwrap();planning_claims+=1;continue;
+                    }
                     assert!(stale.claim_productive_for_binding(&setup.workflow,"stale-reader",now,1000,&binding).unwrap().is_none());
                     assert!(stale.claim_productive(&setup.workflow,"unbound-reader",now,1000).unwrap().is_none());
                     assert_eq!(store.snapshot(&setup.workflow).unwrap().unwrap(),before);
@@ -335,7 +400,7 @@ mod acceptance_input_wait_claim_tests {
                 assert!(store.claim_productive_for_binding(&setup.workflow,"racer",3*86_400_000+4,1000,&changed).unwrap().is_none());
                 let after=store.snapshot(&setup.workflow).unwrap().unwrap();
                 assert_eq!((after.model_calls,after.tokens,after.wall_ms),(3,700,5));
-                assert_eq!(after.attempts,before.attempts+1);
+                assert_eq!(after.attempts,before.attempts+planning_claims+1);
                 stale.release(&next,3*86_400_000+5).unwrap();
             }
         }
@@ -383,6 +448,15 @@ pub(crate) struct NativeScopeAdmissionData {
     pub binding:Binding,
 }
 
+/// An identical content-addressed response produced again after a recovery
+/// cutover is a fresh fact for the new episode; index it past the cutover.
+fn reindex_after_cutover(tx:&Transaction<'_>,lease:&Lease,key:&str,now:i64)->Result<()> {
+    let cutover=owner_checkout_recovery::cutover_seq(tx,&lease.workflow)?;
+    if cutover==0 {return Ok(());}
+    let indexed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq>?2 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?3)",params![lease.workflow,cutover,key],|r|r.get(0))?;
+    if !indexed {event(tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;}
+    Ok(())
+}
 fn baseline_native_custody(tx:&Connection,workflow:&str)->Result<Vec<NativeScopeCustody>> {
     Ok(baseline_native_admissions(tx,workflow)?.into_iter().map(|data|data.custody).collect())
 }
@@ -519,7 +593,7 @@ impl WorkflowStore {
         ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
         let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");} else {
+        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");reindex_after_cutover(&tx,lease,key,now)?;} else {
             tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,response])?;
             event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
         }tx.commit()?;Ok(())
@@ -811,6 +885,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS integration_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS main_update_carry (
+                workflow TEXT NOT NULL REFERENCES workflow(id), reviewed_head TEXT NOT NULL,
+                main TEXT NOT NULL, reviewed_base TEXT NOT NULL, origin_head TEXT NOT NULL,
+                updated_head TEXT, requested_at INTEGER NOT NULL, carried_at INTEGER,
+                PRIMARY KEY(workflow, reviewed_head));
             CREATE TABLE IF NOT EXISTS integration_recovery (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
@@ -864,6 +943,8 @@ impl WorkflowStore {
         activity::initialize(&conn)?;
         runtime_events::initialize(&conn)?;
         conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
+        conn.execute_batch(command_fairness::SCHEMA)?;
+        conn.execute_batch(attempt_cap::SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -1122,7 +1203,15 @@ impl WorkflowStore {
         if purpose==ClaimPurpose::MergeReconciliation && cp.stage==Stage::Scope
             && cp.next.reason=="acceptance_verifier_evidence_unknown" && !qualification_inspection {return Ok(None);}
         let awaiting_input=awaits_initial_input(&cp);
-        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input
+        let escalation=purpose==ClaimPurpose::Productive && acceptance_escalation::eligible(&tx,workflow,&cp)?;
+        if escalation {
+            let observed=baseline_native_custody(&tx,workflow)?;
+            if !observed.is_empty() {
+                let Some((root,validate))=custody else {return Ok(None)};
+                if validate(root,&observed).is_err() {return Ok(None)}
+            }
+        }
+        let requires_recovery=purpose==ClaimPurpose::Productive && awaiting_input && !escalation
             && binding.is_none_or(|binding|binding==&cp.binding);
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
@@ -1130,6 +1219,11 @@ impl WorkflowStore {
             return Ok(None);
         }
         if purpose == ClaimPurpose::Productive && target_fence::fenced(&tx,workflow)? {return Ok(None);}
+        // #2467: no productive claim past the attempt or spend cap, after a
+        // give-up, or while the global daily model budget is spent. Merge
+        // reconciliation and finalize claim with their own purpose.
+        if purpose == ClaimPurpose::Productive && leased <= now_ms
+            && attempt_cap::productive_claim_refused(&tx,workflow,&cp,now_ms,attempt_cap::Caps::configured())? {return Ok(None);}
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
@@ -1173,7 +1267,10 @@ impl WorkflowStore {
             params![workflow, owner, generation, until, now_ms,i64::from(!qualification_inspection)])?;
         if qualification_inspection {event(&tx,workflow,generation,"qualification_recovery_claimed",&serde_json::to_string(&cp)?,now_ms)?;}
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
-        if purpose==ClaimPurpose::Productive {owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;}
+        if purpose==ClaimPurpose::Productive {
+            event(&tx,workflow,generation,"productive_claimed","",now_ms)?;
+            owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;
+        }
         tx.commit()?;
         Ok(Some(Lease {
             workflow: workflow.into(),
@@ -1291,6 +1388,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
         idle_recovery::require_dispatch(&tx,&lease.workflow)?;
+        retry_recovery::finish(&tx,lease,now_ms)?;
         tx.execute(
             "UPDATE workflow SET owner=NULL,lease_until=0 WHERE id=?1",
             [&lease.workflow],
@@ -1946,6 +2044,23 @@ impl WorkflowStore {
         Ok(true)
     }
 
+    /// #2510: hand back one admitted attempt whose work never reached a
+    /// verdict because infrastructure refused it. Never below zero.
+    pub fn release_epoch_attempt(&mut self, lease: &Lease, purpose: &str, epoch: &str, now: i64) -> Result<bool> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len() <= 1024, "bounded epoch purpose required");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let key = format!("epoch:{epoch}");
+        let released = tx.execute("UPDATE bounded_attempt SET attempts=attempts-1 WHERE workflow=?1 AND purpose=?2 AND binding=?3 AND attempts>0",
+            params![lease.workflow, purpose, key])? == 1;
+        if released {
+            event(&tx, &lease.workflow, lease.generation, "epoch_attempt_released",
+                &serde_json::json!({"purpose":purpose,"epoch":epoch}).to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(released)
+    }
+
     /// Check fencing immediately before a remote operation, in addition to
     /// using the remote API's own compare-and-swap head precondition. A local
     /// SQLite lease alone cannot fence a push already accepted by GitHub.
@@ -2342,12 +2457,33 @@ impl WorkflowStore {
             || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
             || !(matches!(snapshot.checkpoint.stage,
                 Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+                // #2279 — built and verified, but the push failed before any
+                // dispatch. Pending Push intents are refused below.
+                || (snapshot.checkpoint.stage==Stage::Publish
+                    && snapshot.checkpoint.next.reason=="publishing_revision"
+                    && snapshot.checkpoint.next.action=="push")
                 || (snapshot.checkpoint.stage==Stage::Held
                     && snapshot.checkpoint.next.reason=="automatic_pr_routing_held"
                     && snapshot.checkpoint.next.action=="retry_automatic_pr_routing"))
             || self.owner_control(&id)?.is_some_and(|control| control.paused)
             || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
             return Ok(None);
+        }
+        Ok(self.published_by_workflow(repository, pr, branch, published)?.then_some(snapshot.checkpoint.binding.head))
+    }
+
+    /// #2475: provenance only. True when this PR's workflow itself published
+    /// `published`: its latest Push carries the `git-head:<published>`
+    /// receipt, or, with no Push at all, the fenced adoption record names it.
+    /// Leases, retry delays and stages say when work may run, never who
+    /// published a head, so none of them are consulted here.
+    pub fn published_by_workflow(&self, repository: &str, pr: u64, branch: &str, published: &str) -> Result<bool> {
+        if published.is_empty() { return Ok(false); }
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        if snapshot.pr != Some(pr) || snapshot.branch != branch
+            || matches!(snapshot.checkpoint.stage, Stage::Merged | Stage::Retired) {
+            return Ok(false);
         }
         let latest: Option<(String, Option<String>)> = self.conn.query_row(
             "SELECT binding,receipt FROM operation WHERE workflow=?1 AND kind=?2 ORDER BY rowid DESC LIMIT 1",
@@ -2358,15 +2494,24 @@ impl WorkflowStore {
             // An imported PR may have been published by its owner, before this
             // workflow existed. Its fenced admission is a different fact from
             // a Push; any actual Push above still takes precedence.
-            return Ok((adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published))
-                .then_some(snapshot.checkpoint.binding.head));
+            return Ok(adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published));
         };
         let binding: Binding = serde_json::from_str(&binding)?;
         binding.validate()?;
-        if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {
-            return Ok(None);
-        }
-        Ok(Some(snapshot.checkpoint.binding.head))
+        Ok(binding.head == published && receipt.as_deref() == Some(&format!("git-head:{published}")))
+    }
+
+    /// #2279 — the PR workflow is idle and authorized to resume: no lease,
+    /// retry delay, owner pause, unresolved operation or terminal stage. Only
+    /// then may an unrecorded retained head be set aside for a rebuild.
+    pub fn retained_candidate_due(&self, repository: &str, pr: u64, branch: &str, now: i64) -> Result<bool> {
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        Ok(snapshot.pr == Some(pr) && snapshot.branch == branch
+            && snapshot.lease_until_ms <= now && snapshot.checkpoint.next.eligible_at_ms <= now
+            && !matches!(snapshot.checkpoint.stage, Stage::Merge | Stage::Merged | Stage::Retired)
+            && !self.owner_control(&id)?.is_some_and(|control| control.paused)
+            && !self.merge_reconciliation_needed(&id)? && self.pending_operations(&id)?.is_empty())
     }
 
     pub fn snapshot(&self, workflow: &str) -> Result<Option<Snapshot>> {
@@ -2451,6 +2596,30 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_work_is_distinguished_from_a_fresh_start() {
+        let snapshot=|stage:Stage,pr:Option<u64>,reason:&str,action:&str|Snapshot {workflow:"owner/repo#7".into(),branch:"agent-fix/issue-7".into(),pr,
+            checkpoint:Checkpoint {stage,binding:Binding {head:"h".into(),contract:"c".into(),evidence_hash:"e".into()},evidence:vec![],
+                next:NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0}},
+            attempts:1,wall_ms:0,model_calls:0,tokens:0,heartbeat_at_ms:0,progress_at_ms:0,lease_until_ms:0,generation:1};
+        for stage in [Stage::Build,Stage::Verify,Stage::Review,Stage::Reconcile,Stage::Publish] {
+            assert!(resumes_existing_work(&snapshot(stage,None,"r","a")),"{stage:?} without a PR is past the start");
+        }
+        // The 2026-11-21 shapes: #2360 and #2350 sat behind the ledger.
+        assert!(resumes_existing_work(&snapshot(Stage::Verify,Some(2372),"integration_checks_required","verify_integrated_head")));
+        assert!(resumes_existing_work(&snapshot(Stage::Reconcile,Some(2358),"verification_infrastructure_retry","retry_verification")));
+        assert!(resumes_existing_work(&snapshot(Stage::Scope,Some(2307),"original_evidence_unrecoverable","rescope_executable_acceptance")),"an open PR is in flight at any stage");
+        for action in ["resume_preserved_work","resume_preserved_pr"] {
+            assert!(resumes_existing_work(&snapshot(Stage::Held,None,"resume_deferred",action)),"preserved unpushed head {action}");
+        }
+        for stage in [Stage::Intake,Stage::Scope,Stage::Held] {
+            assert!(!resumes_existing_work(&snapshot(stage,None,"acceptance_failed","build")),"{stage:?} without a PR is a fresh start");
+        }
+        for stage in [Stage::Merged,Stage::Retired] {
+            assert!(!resumes_existing_work(&snapshot(stage,Some(9),"done","none")),"{stage:?} is finished, not in flight");
+        }
+    }
 
     #[test]
     fn unused_merge_cancellation_preserves_dispatched_legacy_and_stale_lease_intents() {

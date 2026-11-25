@@ -397,10 +397,12 @@ impl CardDrafter<'_> {
             baseline.push_str(&group_policy);
         }
         let triage = triage_opts(self.config.wiki_root.clone());
-        let raw = self
-            .reasoner
-            .call(&triage, &triage_user_message(&email, &baseline, ""))
-            .await?;
+        // #2332 — triage sees the message's images, not just their names.
+        let images = crate::draft_images::fetch(&email).await;
+        let mut triage_prompt = triage_user_message(&email, &baseline, "");
+        triage_prompt.push_str(&images.prompt_lines());
+        let raw = self.reasoner.call(&triage, &triage_prompt).await?;
+        drop(images);
         let decision = parse_decision(&raw)?;
         match decision.decision {
             DecisionKind::Reply => {}
@@ -443,16 +445,20 @@ impl CardDrafter<'_> {
         // #2014 — tell the drafter how this person writes, so the card is
         // mirrored at generation, not only flagged afterwards.
         let samples = recipient_samples(&email);
-        let prompt = augmentagent_approval_discord::register::with_register_guidance(
+        let mut prompt = augmentagent_approval_discord::register::with_register_guidance(
             draft_user_message(&email, &evidence, "", "", "", ""),
             samples.iter().map(|s| s.as_str()),
         );
+        // #2332 — the drafter looks at the images it is replying to.
+        let images = crate::draft_images::fetch(&email).await;
+        prompt.push_str(&images.prompt_lines());
         let drafted = self
             .reasoner
             .call(&draft_opts, &prompt)
             .await?
             .trim()
             .to_string();
+        drop(images);
         if drafted.is_empty() {
             anyhow::bail!("draft came back empty");
         }

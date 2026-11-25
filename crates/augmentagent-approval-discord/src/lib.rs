@@ -15,6 +15,9 @@ pub mod imessage_owner_control;
 pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
+pub mod owner_text;
+#[cfg(test)]
+mod yolo_isolation_tests;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
@@ -35,6 +38,7 @@ mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
 pub mod register;
+pub mod relay;
 mod status_bus;
 mod surface;
 mod presets;
@@ -77,6 +81,11 @@ pub use loops::{
 };
 // #1292 — Slack's loop command reuses the deterministic grammar and checks.
 pub use loops::{parse_create_args, validate_parsed};
+// #2246 — loop findings emailed to allowlisted owner addresses.
+pub use loops::{
+    own_send_addresses, parse_self_send_allowlist, self_send_allowed, self_send_allowlist, validate_prompt_file,
+    LoopMailer, SELF_SEND_ENV,
+};
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};
@@ -123,6 +132,8 @@ pub enum ApprovalActionOutcome {
         organizer_account: String,
         event_id: String,
         html_link: Option<String>,
+        /// #2514 — the Meet join URL (`--meet true`), for follow-up messages.
+        join_url: Option<String>,
         /// A repeated Approve recovered the saved receipt; no new write/nudge.
         already_existed: bool,
     },
@@ -583,6 +594,23 @@ pub trait QueryHandler: Send + Sync {
         text: &str,
     ) -> Option<String> {
         self.model_command(channel_id, text).await
+    }
+
+    /// #2208 — owner text commands other than `/model` (`/search`). Called
+    /// after the owner allowlist check and before attachment download or
+    /// history collection. `Some` for every message whose first token is a
+    /// command this handler owns, valid or not; `None` for anything else.
+    async fn owner_text_command(
+        &self,
+        _cx: owner_text::OwnerCommandCtx,
+        _text: &str,
+    ) -> Option<owner_text::OwnerCommandOutcome> {
+        None
+    }
+
+    /// #2219 — the first line of every message posted for a yolo turn.
+    fn yolo_tag(&self) -> String {
+        "[yolo]".into()
     }
 
     /// Model selected for a new scheduled loop in this conversation.

@@ -165,6 +165,31 @@ pub fn load_from(path: &Path) -> anyhow::Result<Option<RouterConfig>> {
     }
 }
 
+/// Validate a remote OpenAI-compatible endpoint that is not the model
+/// gateway (#2213). Stricter than the router rule below: `https` only, no
+/// loopback exception. `allowed` is a comma-separated list of `host:port`;
+/// the URL's port defaults from its scheme and hosts compare
+/// case-insensitively.
+pub fn validate_remote_v1(raw: &str, allowed: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid endpoint"))?;
+    let host = url.host_str().unwrap_or_default();
+    let listed = url.port_or_known_default().is_some_and(|port| {
+        let authority = format!("{host}:{port}");
+        allowed.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority))
+    });
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && listed
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/v1",
+        "Endpoint must be an explicitly allowed https /v1 endpoint"
+    );
+    Ok(url)
+}
+
 pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
     let config: RouterConfig = serde_json::from_str(raw)
         .map_err(|_| anyhow::anyhow!("Invalid model router configuration"))?;

@@ -51,6 +51,7 @@ mod integration_checks;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 
+use acceptance::escalation as acceptance_escalation;
 #[path = "self_improve_episode.rs"]
 mod episode;
 #[cfg(test)]
@@ -73,11 +74,17 @@ mod paused_selection_tests;
 mod epic_selection_tests;
 #[path = "self_improve_picker_fairness.rs"]
 mod picker_fairness;
+#[path="self_improve_publish_smoke.rs"]
+mod publish_smoke;
+pub(crate) async fn deployment_publish_smoke(repo:&Path)->serde_json::Value {publish_smoke::inspect(repo).await}
 #[cfg(test)]
 #[path = "self_improve_picker_fairness_tests.rs"]
 mod picker_fairness_tests;
 #[path = "self_improve_epics.rs"]
 mod epics;
+#[cfg(test)]
+#[path = "self_improve_recovered_edits_tests.rs"]
+mod recovered_edits_tests;
 #[cfg(test)]
 #[path = "self_improve_review_recovery_tests.rs"]
 mod review_recovery_tests;
@@ -88,6 +95,11 @@ mod review_recovery;
 mod manual_pr_routing_tests;
 #[path = "self_improve_manual_routing.rs"]
 mod manual_routing;
+#[path = "self_improve_gh_budget.rs"]
+mod gh_budget;
+#[cfg(test)]
+#[path = "self_improve_gh_budget_tests.rs"]
+mod gh_budget_tests;
 #[path = "self_improve_integration_merge.rs"]
 mod integration_merge;
 #[path = "self_improve_integration.rs"]
@@ -101,6 +113,12 @@ mod policy_hold;
 mod legacy_readmission;
 #[path = "self_improve_closed_targets.rs"]
 mod closed_targets;
+#[path = "self_improve_attempt_cap.rs"]
+mod attempt_cap;
+#[path="self_improve_scope_policy.rs"]
+mod scope_policy;
+#[path = "self_improve_owner_requalification.rs"]
+mod owner_requalification;
 #[path = "self_improve_owner_checkout_recovery.rs"]
 mod owner_checkout_recovery;
 #[path = "self_improve_readoption.rs"]
@@ -131,6 +149,8 @@ mod workflow;
 mod recovery;
 #[path = "self_improve_checkout_identity.rs"]
 mod checkout_identity;
+#[path = "self_improve_checkout_continuity.rs"]
+mod checkout_continuity;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
 #[path = "self_improve_observation_wake.rs"]
@@ -140,6 +160,8 @@ mod observation_wake;
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
+#[path = "self_improve_plan_proof.rs"]
+mod plan_proof;
 #[path = "self_improve_alignment.rs"]
 mod alignment;
 #[path = "self_improve_push_destination.rs"]
@@ -466,6 +488,8 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
             if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) || has_label(iss,MANUAL_ENGINEERING_LABEL) {
+                // #2373: never drop a candidate silently.
+                tracing::debug!(issue=number,"skip: excluded by gave-up, sliced or manual-engineering label");
                 return None;
             }
             if epics::is_epic(iss) {
@@ -644,12 +668,15 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             return Ok((false, String::new(), error));
         }
     }
+    // #2444: a GitHub write clears this tick's shared reads, before and after.
+    gh_budget::observed(cmd, args);
     let mut command = Command::new(cmd);
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     let child = command.spawn().with_context(|| format!("spawn {cmd}"))?;
     let _group = CommandGroup(child.id().context("command has no process id")?);
     let out = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), child.wait_with_output())
         .await.context("metadata/publication command timed out; reconcile durable intent before retry")??;
+    gh_budget::observed(cmd, args);
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1065,10 +1092,21 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let mut qualification_retries=qualification_reconcile::issue_retries(repo_root).await
         .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
 
-    qualification_retries.extend(owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?);
+    let owner_recoveries=owner_checkout_recovery::issue_retries(&workflow::path(),&repository)?;
+    qualification_retries.extend(owner_recoveries.iter().copied());
+    qualification_retries.extend(scope_policy::retries(&workflow::path(),&repository)?);
+    let due_retries=crate::autoship_workflow::retry_recovery::due_issues(&workflow::path(),&repository,chrono::Utc::now().timestamp_millis())?;
     if let Some(rows)=issues.as_array() {epics::flag_childless_epics(repo_root,rows).await;}
-    let candidates=picker_fairness::candidates(rest_issue_candidates(&issues),
+    let rest_issues=rest_issue_candidates(&issues);
+    qualification_retries.extend(picker_fairness::publish_retries(&rest_issues,&owner_controls,&repository));
+    let candidates=picker_fairness::candidates(rest_issues,
         &qualification_retries,&owner_controls,&repository,chrono::Utc::now().timestamp_millis())?;
+    let candidates=owner_requalification::prioritize(&workflow::path(),candidates,&owner_recoveries,&repository,chrono::Utc::now().timestamp_millis())
+        .map_err(|error|error.context(RecoveryHistoryUnavailable))?;
+    // #2373: the ranked order is the first thing to check when a due row is
+    // never selected; the picker stops at the first viable candidate.
+    info!(order=?candidates.iter().take(12).map(|issue|issue.number).collect::<Vec<_>>(),
+        total=candidates.len(),"picker candidate order");
     let mut unavailable_history=None;
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
@@ -1094,7 +1132,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) {
+        // #2432 — that caps fresh starts only: a workflow already in flight
+        // (build..publish, open PR, preserved head) resumes on its own backoff.
+        let retry_due=qualification_retries.contains(&iss.number) || due_retries.contains(&iss.number);
+        if owner_controls.daily_ledger_holds(&ledger, today, &repository, iss.number, retry_due) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -1135,10 +1176,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None).await.ok();
+            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED, true, None, GaveUpNote::Reason).await.ok();
             continue;
         }
-        if has_open_agent_pr(repo_root, number).await? {
+        if has_foreign_agent_pr(repo_root, number).await? {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
         }
@@ -1153,11 +1194,13 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 continue;
             },
         }
-        if owner_checkout_recovery::readiness_blocked(repo_root,&repository,&candidate).await? {
+        if scope_policy::readiness_blocked(repo_root,&repository,&candidate).await? {
             info!(issue=number,"unchanged material readiness dependency; free reconciliation");
             continue;
         }
         owner_controls.require_current_history()?;
+        if !dry_run && owner_recoveries.contains(&number) && !owner_requalification::reserve(&workflow::path(),&repository,number,chrono::Utc::now().timestamp_millis())
+            .map_err(|error|error.context(RecoveryHistoryUnavailable))? {continue;}
         return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -1182,6 +1225,31 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     let repository=workflow::canonical_repository(repo_root).await
         .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
     Ok(!linked_claims::observe(repo_root,&repository,issue).await?.is_empty())
+}
+
+/// #2396: the fresh-work dedup, except for the PR this issue's own durable
+/// workflow already owns while it continues (publish, reconcile, review…).
+/// A pending publication still belongs to its free reconciler.
+async fn has_foreign_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
+    if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
+    let claims=linked_claims::observe(repo_root,&repository,issue).await?;
+    if claims.is_empty() { return Ok(false); }
+    let own=match crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? {
+        Some(store)=>store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?,
+        None=>None,
+    };
+    Ok(!linked_claims::foreign_claims(claims,own.as_ref()).is_empty())
+}
+
+/// #2408: the PR lane target for an issue whose own workflow is continuing on
+/// a PR it owns. None keeps the fresh issue pipeline.
+async fn own_pr_route(repo_root: &Path, issue: u64) -> Result<Option<(u64, String)>> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else {return Ok(None)};
+    let repository=workflow::canonical_repository(repo_root).await?;
+    let own=store.snapshot(&crate::autoship_workflow::workflow_id(&repository,issue)?)?;
+    Ok(linked_claims::own_pr_continuation(own.as_ref()))
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -1716,7 +1784,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     // locally only after the complete pool is known, then apply fair windows.
     let out = if let Some(target) = selected {
         let read = run(&gh, &["pr","view",&target.pr.to_string(),"--repo",&target.repository,"--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body"],repo_root).await;
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body"],repo_root).await;
         let row = match read {
             Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
             _ => None,
@@ -1727,7 +1795,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         serde_json::json!([row]).to_string()
     } else { match complete_repository_inventory(repo_root, "pr", None,
-        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
+        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body").await {
         Ok(out) => out,
         Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
     }};
@@ -1741,6 +1809,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     };
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
+    // #2444: one open-issue listing serves routing and source state for every
+    // examined PR. Unavailable, the sweep reads each source as before.
+    let open_issues = if selected.is_none() {gh_budget::OpenIssues::read(repo_root, &repository).await} else {None};
     let adopted = if let Some(target)=selected {
         adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()],false).await
     } else { adopted_execution::sweep(repo_root,dry_run).await };
@@ -1770,10 +1841,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         // Routing observations cost network reads even when the PR is excluded.
         examined += 1;
-        if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+        if selected.is_none() && !manual_routing::allowed_listed(repo_root,&repository,Some(row),pr,Some(issue),open_issues.as_ref()).await {
             continue;
         }
-        if source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
+        // A source this tick listed as open needs no further read; any other
+        // source is reconciled (and possibly retired) exactly as before.
+        if !open_issues.as_ref().is_some_and(|issues| issues.is_open(issue))
+            && source_reconcile::reconcile(repo_root, pr, issue, dry_run, selected.is_none()).await
             != source_reconcile::SourceAction::Continue {
             continue;
         }
@@ -1791,7 +1865,16 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // box's own record is the half of provenance GitHub cannot produce, and
         // the half that binds to a specific pull request rather than a shape.
         let record = opened_prs::get(issue);
-        let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
+        // #2458: after GitHub merged main into the approved head, the
+        // approval recorded at that head reaches the merge commit through
+        // the durable update. Resolved before any gate reads approval.
+        let carry = match (record.as_ref(), head_sha.as_deref()) {
+            (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
+                finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
+            _ => None,
+        };
+        let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
+        let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
         if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
                 if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
@@ -1800,6 +1883,21 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
             }
         }
+        // #2444: settle every gate that needs no remote evidence first. The
+        // hosted CI reader alone costs about 30 REST calls per PR, and most
+        // examined PRs are not yet approved.
+        let ours = head_is_ours(row, owner.as_deref());
+        let loop_authored = loop_authored(body, issue, pr, approval_head.as_deref(), record.as_ref())
+            || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue));
+        let mergeable = match row.get("mergeable").and_then(serde_json::Value::as_str) {
+            Some("MERGEABLE") => Some(true),
+            Some("CONFLICTING") => Some(false),
+            _ => None,
+        };
+        if let Some(why) = sweep_local_skip(pr, ours, loop_authored, mergeable, approval.reviewed) {
+            info!("merge sweep skipped {why}");
+            continue;
+        }
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -1807,19 +1905,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         let candidate = SweepCandidate {
             pr,
             issue,
-            ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(
-                body,
-                issue,
-                pr,
-                head_sha.as_deref(),
-                record.as_ref(),
-            ) || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue)),
-            mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
-                Some("MERGEABLE") => Some(true),
-                Some("CONFLICTING") => Some(false),
-                _ => None,
-            },
+            ours,
+            loop_authored,
+            mergeable,
             checks_green: checks_green(repo_root, pr).await,
             review_approved: approval.reviewed,
             policy: MergePolicy {
@@ -1876,11 +1964,39 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 }
                 let head = candidate_head.clone().unwrap_or_default();
                 let recorded = match serde_json::to_string(&record) { Ok(value) => value, Err(_) => continue };
-                let sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, &head, &recorded).await {
+                // #2458: an uncarried update is authorized by the head it merged into.
+                let pending_carry = carry.as_ref().filter(|c| c.pending);
+                let authorized = pending_carry.map_or(head.as_str(), |c| c.reviewed_head.as_str());
+                let mut sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, authorized, &recorded).await {
                     Ok(Some(lease)) => lease,
                     Ok(None) => { info!(pr, "merge sweep: workflow busy or approval evidence changed"); continue; }
                     Err(error) => { warn!(pr, "merge sweep lease unavailable: {error:#}"); continue; }
                 };
+                if pending_carry.is_some() {
+                    if let Err(error) = sweep_lease.carry_main_update(repo_root, &head).await {
+                        warn!(pr, "merge sweep cannot carry the approval to the main update: {error:#}"); continue;
+                    }
+                }
+                // #2458: green but BEHIND main under strict protection. Merge
+                // main in with a merge commit; checks rerun on it and a later
+                // tick merges it once green. No worker slot, no model call.
+                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                    let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
+                        Ok(main) => main,
+                        Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
+                    };
+                    if selected.is_none() && !manual_routing::allowed(repo_root,&repository,pr,Some(issue)).await {
+                        continue;
+                    }
+                    if let Err(error) = sweep_lease.request_main_update(&main) {
+                        warn!(pr, "merge sweep main update unavailable: {error:#}"); continue;
+                    }
+                    match finalize::update_branch(repo_root, &repository, pr, &head).await {
+                        Ok(()) => info!(pr, issue, "merge sweep: merged main into the approved head; merging once checks pass on it"),
+                        Err(error) => warn!(pr, "merge sweep: update-branch refused: {error:#}"),
+                    }
+                    continue;
+                }
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
                 }
@@ -2006,6 +2122,8 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>, before_
 /// determined, which the sweep treats as "do not merge".
 #[path = "self_improve_optional_checks.rs"]
 mod optional_checks;
+#[path = "self_improve_finalize.rs"]
+mod finalize;
 
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
@@ -2532,12 +2650,16 @@ enum SweepVerdict {
 
 /// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
 /// so the whole decision is evidence already on the PR.
-fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
-    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
-    if c.ours != Some(true) {
+/// #2444 — the sweep's gates that need no remote evidence, in the order the
+/// verdict applies them. The sweep checks these before reading CI, the diff
+/// or the issue, so an unapproved PR costs no GitHub reads.
+fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable: Option<bool>,
+    review_approved: bool) -> Option<String> {
+    let skip = |why: &str| Some(format!("PR #{pr}: {why}"));
+    if ours != Some(true) {
         return skip("not ours — the loop only finishes work it opened (#1006)");
     }
-    if !c.loop_authored {
+    if !loop_authored {
         // Same repository is not the same as loop-authored. A human can open
         // `agent-fix/issue-N` here by hand; the sweep merges with nobody
         // watching, so it needs the loop's own signature on the body.
@@ -2545,16 +2667,24 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     }
     // GitHub UNKNOWN is a pending recompute, not proof of conflict.
     // Both states withhold merging; the integration scheduler owns recovery.
-    match c.mergeable {
+    match mergeable {
         None => return skip("mergeability unknown; retry remote metadata computation"),
         Some(false) => return skip("confirmed conflict with main; exact-head integration required"),
         Some(true) => {},
     }
+    if !review_approved {
+        return skip("no approving independent review recorded by the loop for this head");
+    }
+    None
+}
+
+fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
+    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved) {
+        return SweepVerdict::Skip(why);
+    }
     if c.checks_green != Some(true) {
         return skip("checks are not green, or their state is unknown");
-    }
-    if !c.review_approved {
-        return skip("no approving independent review recorded by the loop for this head");
     }
     // Unknown must DENY, and it must do so where nothing can release it.
     // Codex: routing an unreadable diff through the receipt gate as a gated
@@ -2766,6 +2896,14 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
 
 
 struct InitialPreparation {retained:bool,context:String,saved:Option<InitialScopeSnapshot>}
+
+/// #2464 plan mode: reuse a recorded scope for this episode if there is one,
+/// but never require retained qualification or a repair budget preflight.
+fn plan_initial_preparation(root:&Path,workflow:&workflow::WorkflowGuard,base:&str)->Result<InitialPreparation> {
+    let context=acceptance::initial_scope_context(root,workflow,base)?;
+    let saved=read_initial_scope(&context,|key|workflow.recorded_scope_stage_response(key)).ok().flatten();
+    Ok(InitialPreparation {retained:false,context,saved})
+}
 
 /// Choose the existing original episode before any readiness or scoping call.
 fn initial_preparation(root:&Path,workflow:&workflow::WorkflowGuard,source:crate::autoship_contract::AcceptanceSource,
@@ -3255,35 +3393,6 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &wo
 
 /// Finish an over-cap scope decision after its optional plan has been generated.
 /// Keep the real parent mutation fallback behind the typed child-publication hold.
-async fn finish_scope_refusal(repo:&Path,issue:&Issue,reason:&str,scope_body:&str,plan:&[Slice],
-    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting,automatic:bool)->Result<RunReport> {
-    if let Some(report)=accounting.report()? {return Ok(report);}
-    if plan.len()>=MIN_SLICES {
-        match file_slices(repo,issue,plan,guard).await {
-            Ok(children) if !children.is_empty()=> {
-                guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
-                if let Some(report)=accounting.report()? {return Ok(report);}
-                return Ok(RunReport::triage(format!("issue #{}: oversized — sliced into {} child issues ({})",issue.number,children.len(),
-                    children.iter().map(|n|format!("#{n}")).collect::<Vec<_>>().join(", "))));
-            },
-            Ok(_)=>(),
-            Err(error)=> {
-                if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-                warn!(issue=issue.number,"filing slices failed: {error:#}");
-            },
-        }
-    }
-    guard.require_fresh_issue(repo).await?;
-    guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
-    if let Some(report)=accounting.report()? {return Ok(report);}
-    backoff_comment(repo,issue.number,&format!(
-        "Auto-fix triage: refused before building — {reason}.\n\nThe work itself may be sound; it does not fit the unattended pipeline's bounds (focused diff ≤ 600 lines, no deploy/auth/secret/CI paths). Splitting it into smaller issues usually resolves the size case. Remove the `{GAVE_UP_LABEL}` label to re-triage it (for example if the path is only mentioned as background).\n\nScoping spec, for whoever picks this up:\n\n{}",truncate(scope_body,1500))).await.ok();
-    if label_gave_up(repo,issue.number,GIVE_UP_SCOPER_PREDICTS_REFUSAL,automatic,None).await.is_err() {
-        return Ok(RunReport::held(format!("issue #{}: terminal labeling deferred",issue.number)));
-    }
-    Ok(RunReport::triage(format!("issue #{}: refused pre-build ({reason}) — labeled out",issue.number)))
-}
-
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
 /// stronger tier as the scoper. A rejected review means no PR — it counts as
 /// a failed attempt, exactly like a red verification gate.
@@ -4059,9 +4168,10 @@ async fn find_resumable_draft(
     repo_root: &Path,
     only: Option<u64>,
     dry_run: bool,
+    ceiling: adoption::FinishTier,
 ) -> Option<(u64, u64, String)> {
     let stdout = complete_repository_inventory(repo_root, "pr", None,
-        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences")
+        "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,statusCheckRollup")
         .await.ok()?;
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
     // Never treat a capped/malformed issue listing as absence of a hold.
@@ -4077,7 +4187,7 @@ async fn find_resumable_draft(
     let mut allowed = trusted_authors(repo_root).await;
     if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
     let mut adopted = adoption::authorized(&prs, &repository, &allowed);
-    manual_routing::filter(repo_root, &mut adopted).await;
+    manual_routing::filter(repo_root, &mut adopted, &prs).await;
     if !dry_run {
         if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
             warn!("cannot persist adopted PR ownership: {error:#}");
@@ -4109,7 +4219,35 @@ async fn find_resumable_draft(
     retries.extend(integration_retries);
     retries.extend(adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default());
     retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
+    // #2432 — in-flight PRs resume on their own backoff, not the daily ledger.
+    retries.extend(adoption::in_flight_retries(&workflow::path(), &adopted, now).unwrap_or_default());
+    // #2495 — finish before starting: a due PR whose bound head is green, or
+    // one at publish/CI-pending, outranks the rotation, oldest first. Ranked
+    // from the same inventory, so no per-PR GitHub reads.
+    let plan = adoption::finish_plan(&workflow::path(), &adopted, &prs, now).unwrap_or_else(|error| {
+        warn!("finish-first ranking unavailable; using the rotation: {error:#}");
+        Default::default()
+    });
+    if !dry_run && !plan.expedite.is_empty() {
+        match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) {
+            Ok(mut store) => for (id, head) in &plan.expedite {
+                match store.expedite_hosted_ci_pending(id, head, now) {
+                    Ok(true) => info!(workflow=%id, %head, "hosted checks finished green on the bound head; CI poll is due now"),
+                    Ok(false) => {},
+                    Err(error) => warn!(workflow=%id, "cannot end the hosted CI poll early: {error:#}"),
+                }
+            },
+            Err(error) => warn!("cannot end hosted CI polls early: {error:#}"),
+        }
+    }
+    retries.extend(plan.tiers.keys().copied());
     let select = |cursor| {
+        if let Some(finishing) = adoption::select_finishing(&adopted, &ledger, utc_day_now(), only, &retries, &plan.tiers) {
+            return Some(finishing);
+        }
+        if ceiling < adoption::FinishTier::Other {
+            return None;
+        }
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
@@ -5064,6 +5202,16 @@ impl CiGateResult {
                 return Err(CiInfrastructureDeferred{workflow:workflow.id().to_owned(),eligible_at_ms}.into());
             }
         }
+        // #2408: a candidate outside its PR's lineage is provenance, never
+        // infrastructure. Reroute to the PR lane, which checks out the PR
+        // head, instead of retrying a check that can never pass.
+        if let Some(diverged)=error.downcast_ref::<adoption::CandidateProvenanceDiverged>().cloned() {
+            workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+                "kind":"candidate_provenance_diverged","adopted_head":diverged.adopted_head,
+                "candidate_head":diverged.candidate_head,"action":"resume_preserved_pr","shipping_authority":false}))?;
+            workflow.transition(crate::autoship_workflow::Stage::Reconcile,"candidate_provenance_diverged","resume_preserved_pr",0).await?;
+            return Err(error.context("candidate provenance diverged; resuming on the PR lane"));
+        }
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
             return Err(error);
@@ -5708,13 +5856,15 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
             }
         }
     };
-    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
-        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
-    }
+    // #2432 — an open fix PR is work in flight: the daily ledger caps only a
+    // fresh start, so check for the PR first.
     match has_open_agent_pr(repo_root, number).await {
         Ok(true) => return RedMainPlan::Resume(number),
         Ok(false) => (),
         Err(_) => return RedMainPlan::Hold(linked_claims::Hold::Unknown.to_string()),
+    }
+    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
+        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
     }
     // Build the Issue the same way pick_issue does, trust gate included —
     // the daemon files with the owner's gh login, but nothing here assumes it.
@@ -6553,7 +6703,7 @@ async fn hold_unreviewable(
         // branch, so a failed label leaves the draft open and unmarked; the
         // next pass (at most once a UTC day) tries again.
         if !routing_allowed().await {return routing_held();}
-        match label_gave_up(repo_root, issue, &format!("held:{}", why.code()), automatic, Some(pr)).await {
+        match label_gave_up(repo_root, issue, &format!("held:{}", why.code()), automatic, Some(pr), GaveUpNote::Reason).await {
             Ok(()) => {
                 if !routing_allowed().await {return routing_held();}
                 close_gave_up_pr(repo_root, pr, issue, body).await;
@@ -6855,6 +7005,25 @@ async fn recovered_revision_diff(worktree:&Path)->Result<String> {
     // head; newer main changes are checked after normal integration, not charged
     // to the interrupted editor as apparent deletions or reversions here.
     let (ok,diff,error)=run("git",&["diff","--cached","HEAD"],worktree).await?;
+    anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");
+    // #2394 (PR #2358): an interrupted merge with main stages everything main
+    // brings in. A staged path identical to a MERGE_HEAD that origin/main
+    // contains is main's change, not the editor's; every other path, including
+    // conflict resolutions, remains a recovered edit.
+    let (merging,_,_)=run("git",&["rev-parse","-q","--verify","MERGE_HEAD^{commit}"],worktree).await?;
+    if !merging {return Ok(diff);}
+    let (contained,_,_)=run("git",&["merge-base","--is-ancestor","MERGE_HEAD","refs/remotes/origin/main"],worktree).await?;
+    if !contained {return Ok(diff);}
+    let (listed,names,error)=run("git",&["diff","--cached","--name-only","-z","HEAD"],worktree).await?;
+    anyhow::ensure!(listed,"cannot list recovered edits: {error}");
+    let (compared,from_main,error)=run("git",&["diff","--cached","--name-only","-z","MERGE_HEAD"],worktree).await?;
+    anyhow::ensure!(compared,"cannot compare recovered edits with main: {error}");
+    let differs_from_main:std::collections::BTreeSet<&str>=from_main.split('\0').filter(|p|!p.is_empty()).collect();
+    let edited:Vec<&str>=names.split('\0').filter(|p|!p.is_empty() && differs_from_main.contains(p)).collect();
+    if edited.is_empty() {return Ok(String::new());}
+    let mut args=vec!["diff","--cached","HEAD","--"];
+    args.extend(edited.iter().map(|p|*p));
+    let (ok,diff,error)=run("git",&args,worktree).await?;
     anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");Ok(diff)
 }
 
@@ -7055,8 +7224,48 @@ async fn resume_draft_pr(
     let capacity_accounting = workflow.capacity_accounting(true)?;
     let outcome = async {
     workflow.bind_builder(reasoner.as_ref())?;
+    // #2464: with the scope proof gate off the PR repairs from a plan; no
+    // witness, amendment, rescope registration or ladder runs on this path.
+    let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();
+    // #2488: read the checkpoint before this run moves it. A workflow that
+    // stopped for the owner after its bounded rescopes does no more work.
+    // The stop is a bounded wait autoship revisits itself (#2371): daily, or
+    // as soon as main or the issue's request changes.
+    let rescope_entry = workflow.current_checkpoint()?;
+    let (_, rescope_main, _) = run("git", &["rev-parse", "origin/main"], &worktree).await?;
+    let rescope_inputs = acceptance::own_pr_rescope::Inputs {
+        request: acceptance::own_pr_rescope::request_digest(&issue.title, &issue.body),
+        main: rescope_main.trim().to_owned(),
+    };
+    if !plan_mode && acceptance::own_pr_rescope::parked(&rescope_entry, chrono::Utc::now().timestamp_millis(), &rescope_inputs) {
+        return Ok(RunReport::held(format!("PR #{pr}: rescopes exhausted; re-evaluated daily or when main or the issue changes")));
+    }
+    // #2491: a push this workflow checkpointed for the exact head it built
+    // goes first. The push is idempotent and pinned to that head, so a later
+    // acceptance hold can no longer strand finished work unpublished. It also
+    // makes the head the workflow's own published head, which #2477's bounded
+    // witness regeneration requires. A changed contract or source is a
+    // different binding and takes the normal path below.
+    if workflow.unpushed_publish_checkpoint()? {
+        if let Err(error) = workflow.push_fresh(repo_root, branch, expected_head.is_none()).await {
+            if error.downcast_ref::<manual_routing::Hold>().is_some() {
+                return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
+            }
+            if let Some(report) = linked_claims::report(&error) { return Ok(report); }
+            workflow.transition(Stage::Publish, "publishing_revision", "push", chrono::Utc::now().timestamp_millis() + 60_000).await?;
+            return Err(error.context("resume: checkpointed publication push deferred; candidate preserved"));
+        }
+        info!(pr, issue = issue.number, head = %workflow.binding().head, "resume: published the workflow's checkpointed head before acceptance");
+    }
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
-    let mut ci_findings = match ci_repair::prepare(&worktree, pr, &mut workflow, &ci_repair::SharedReplay).await? {
+    // #2329: with a rescope pending (or a failure implicating files outside
+    // the contract), the CI code-repair round is only `due` here. It is
+    // admitted after the scope decision below, so a repair confined to the
+    // old scope spends nothing and its backoff never replaces the rescope.
+    let mut rescope_findings = acceptance::own_pr_rescope::pending(&rescope_entry);
+    let ci_repair::Scoped { preparation: ci_preparation, scope: mut ci_scope, due: mut ci_due } =
+        ci_repair::prepare_scoped(&worktree, pr, &mut workflow, &ci_repair::SharedReplay, rescope_findings.is_some()).await?;
+    let mut ci_findings = match ci_preparation {
         ci_repair::Preparation::Continue => None,
         ci_repair::Preparation::Repair(input) => Some(input),
         ci_repair::Preparation::Deferred(report) => return Ok(report),
@@ -7065,6 +7274,20 @@ async fn resume_draft_pr(
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+    let mut prepared_slot: Option<acceptance::PreparedAcceptance> = None;
+    let mut rescope_notes = None;
+    if plan_mode {
+        // #2464: a pending rescope's upheld findings become this run's repair
+        // notes on the same branch and head; nothing is re-registered.
+        if let Some(findings) = rescope_findings.take() {
+            rescope_notes = workflow.latest_review_receipt("resume-structured-")?
+                .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+                .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+        }
+        if resumed_criteria.is_empty() { resumed_criteria.push(format!("{}\n{}", issue.title, issue.body)); }
+        let resumed_plan = plan_proof::Plan::from_scope(&acceptance_scope, None, &resumed_criteria);
+        workflow.bind_plan(&resumed_plan)?;
+    } else {
     // Leave the legacy parked status before any paid preparation. If that
     // preparation fails, the unchanged old policy cannot buy another wake.
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
@@ -7084,6 +7307,75 @@ async fn resume_draft_pr(
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
+    // #2488: the bounded amendments that could change the contract are spent
+    // and resuming it again only reaches the same refusal. Rescope from the
+    // recorded findings: a new revision on this branch and head, then repair,
+    // verify and review in it; past the bound, stop for the owner.
+    // #2329: a refused CI scope amendment goes straight to the rescope in
+    // this same run (the second pass), instead of waiting for a later tick
+    // whose CI preparation could move the checkpoint first.
+    for _pass in 0..2 {
+        let rescoping = rescope_findings.is_some();
+        if let Some(findings) = rescope_findings.take() {
+            let upheld = workflow.latest_review_receipt("resume-structured-")?
+                .and_then(|receipt| serde_json::from_str::<crate::autoship_review::ReviewEvidence>(&receipt).ok())
+                .and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(&review, &findings.head, &findings.contract));
+            let rescope = acceptance::own_pr_rescope::Controller { repo_root, worktree: &worktree, control: &acceptance_control,
+                pr, issue: issue.number, automatic: expected_head.is_none() };
+            match acceptance::own_pr_rescope::run(&rescope, &mut prepared_acceptance, &acceptance_control, &findings, upheld, &rescope_inputs, &mut workflow).await? {
+                acceptance::own_pr_rescope::Outcome::Rescoped { revision, added, notes } => {
+                    info!(pr, issue = issue.number, revision, added = %added.join(", "), "resume: own PR rescoped from recorded findings");
+                    rescope_notes = notes;
+                }
+                acceptance::own_pr_rescope::Outcome::NeedsOwner(blocker) => {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: rescopes exhausted; owner attention needed ({blocker})")));
+                }
+            }
+        }
+        // #2454: a required check whose failure implicates files outside the
+        // contract asks the amendment authority for exactly those files before
+        // any repair round. A refusal rescopes; repair never retries the old scope.
+        let Some(scope) = ci_scope.take() else { break };
+        let authority = acceptance::ci_scope::Amendment { reasoner, source: crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+            title: &issue.title, worktree: &worktree, control: &acceptance_control };
+        // #2329: `Repair` means the failure reproduced on this head with the
+        // same pinned recipe while green main passes it. #2456: otherwise no
+        // paired replay ran, which is unknown, not "main also fails".
+        let regression = acceptance::ci_scope::Regression::of(ci_findings.is_some(), scope.unreplayed);
+        let failure = acceptance::ci_scope::Failure { tests: &scope.tests, diagnostics: &scope.diagnostics,
+            panic_locations: &scope.panic_locations, regression, main: scope.main.as_ref() };
+        match acceptance::ci_scope::widen(&authority, &mut prepared_acceptance, &acceptance_control, &scope.files, failure, &mut workflow).await? {
+            acceptance::ci_scope::Widen::InScope => break,
+            acceptance::ci_scope::Widen::Amended(paths) => {
+                info!(pr, issue = issue.number, paths = %paths.join(", "), "resume: CI repair scope amended");
+                break;
+            }
+            acceptance::ci_scope::Widen::Rescoped(message) => {
+                let pending = acceptance::own_pr_rescope::pending(&workflow.current_checkpoint()?);
+                if rescoping || pending.is_none() {
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!("PR #{pr}: {message}")));
+                }
+                info!(pr, issue = issue.number, "resume: CI scope refused; rescoping the own PR now");
+                rescope_findings = pending;
+                ci_scope = Some(scope);
+            }
+        }
+    }
+    prepared_slot = Some(prepared_acceptance);
+    }
+    // #2329: the scope now covers the failing check's files (or never needed
+    // them): only now does a due CI code-repair round spend a rung.
+    if let Some(due) = ci_due.take() {
+        match ci_repair::admit_due(&mut workflow, pr, due).await? {
+            ci_repair::Preparation::Continue => {}
+            ci_repair::Preparation::Repair(input) => {
+                if ci_findings.is_none() { ci_findings = Some(input); }
+            }
+            ci_repair::Preparation::Deferred(report) => return Ok(report),
+        }
+    }
 
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
@@ -7182,7 +7474,7 @@ async fn resume_draft_pr(
         Some(note) => format!("Resumed sitting draft PR #{pr}.\n{note}"),
         None => format!("Resumed sitting draft PR #{pr}."),
     };
-    loop {
+    'resume: loop {
         // The PR's actual contribution, freshly computed each round.
         let (_ok, diff, _) =
             run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
@@ -7223,7 +7515,7 @@ async fn resume_draft_pr(
             )
             .await
             .unwrap_or_else(|_| Tally::uncounted());
-            if label_gave_up(repo_root, issue.number, "guard:blast-radius-diff", expected_head.is_none(), Some(pr)).await.is_err() {
+            if label_gave_up(repo_root, issue.number, "guard:blast-radius-diff", expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.is_err() {
                 return Ok(RunReport::held(format!("PR #{pr}: terminal labeling deferred")));
             }
                 // Preserve the draft and committed candidates for episode recovery.
@@ -7383,7 +7675,7 @@ async fn resume_draft_pr(
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
-                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.ok();
                 // Preserve the draft and committed candidates for episode recovery.
             }
             return Ok(RunReport::built(format!(
@@ -7433,16 +7725,71 @@ async fn resume_draft_pr(
             }
         }
 
-        let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
-            &mut prepared_acceptance, &acceptance_control, &mut workflow).await?;
+        let acceptance_receipt = match prepared_slot.as_mut() {
+            Some(prepared_acceptance) => {
+                let receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
+            prepared_acceptance, &acceptance_control, &mut workflow).await?;
         resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                Some(receipt)
+            }
+            None => {
+                // #2464: the PR's own tests are the proof, recorded here.
+                summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, resume_base.trim(), &summary, &workflow).await?.note());
+                None
+            }
+        };
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        // #2451: at most N review attempts per (head, contract). A rejection
+        // already recorded for this exact code is acted on, not re-reviewed:
+        // PR #2378 reviewed one head three times to reach the same verdict.
+        let review_key = crate::autoship_workflow::review_binding_cap::binding_key(
+            &workflow.binding().head, &workflow.binding().contract);
+        // #2488: a rescope's carried findings are repaired once in the new
+        // scope, through the shared revise round, before any re-review.
+        let carried = if rounds_done < revise_rounds() { rescope_notes.take() } else { None };
+        let recorded = carried.clone().or_else(|| previous_review.as_ref().and_then(|review| crate::autoship_workflow::review_binding_cap::recorded_findings(
+            review, &workflow.binding().head, &workflow.binding().contract)));
+        let review_route = if carried.is_some() { crate::autoship_workflow::review_binding_cap::Route::Repair }
+            else { workflow.admit_review_binding(&review_key, aligned_review::attempt_call_bound(),
+                recorded.is_some(), rounds_done < revise_rounds())? };
+        let mut capped_findings = None;
+        {
+            use crate::autoship_workflow::review_binding_cap::{Route, EXHAUSTED_BACKOFF_MS};
+            match (review_route, recorded) {
+                (Route::Review, _) => {}
+                // Repair goes through the one shared revise round below; it
+                // adds no commit or prompt site of its own.
+                (Route::Repair, Some(findings)) => capped_findings = Some(findings),
+                (Route::Rescope, _) | (Route::Repair, None) => {
+                    workflow.transition(Stage::Scope, Route::Rescope.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + 300_000).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted; findings routed to rescoping")));
+                }
+                (Route::Backoff, _) => {
+                    workflow.transition(Stage::Scope, review_route.reason(), "rescope_remaining_findings",
+                        chrono::Utc::now().timestamp_millis() + EXHAUSTED_BACKOFF_MS).await?;
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+                    return Ok(RunReport::triage(format!(
+                        "PR #{pr}: review attempts for this head exhausted without actionable findings; backing off")));
+                }
+            }
+        }
+        let (findings, kind, episode_session) = 'review: {
+        if let Some(findings) = capped_findings {
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, reason = review_route.reason(),
+                "resume: review attempts for this head exhausted; revising against recorded findings");
+            break 'review (findings, "recorded review findings", None);
+        }
+        let review_calls_before = workflow.model_calls()?;
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &plan_proof::harness_files(prepared_slot.as_ref())))
             .await
         {
             Ok(r) => parse_review_output(&r),
@@ -7474,14 +7821,18 @@ async fn resume_draft_pr(
         // reason to skip it and repeat the same repair debate indefinitely.
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
-            0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+            0, Some(&workflow), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await;
+        // #2451: charge what this attempt actually spent to its binding.
+        workflow.charge_review_binding_calls(&review_key, workflow.model_calls()?.saturating_sub(review_calls_before))?;
         if let Some(structured) = &independent.structured {
+            if let Some(prepared_acceptance) = prepared_slot.as_mut() {
             if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
-                &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
+                &issue.title, &worktree, prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                 verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await??;
-                continue;
+                continue 'resume;
+            }
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
@@ -7538,9 +7889,12 @@ async fn resume_draft_pr(
             &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
         workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
             &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
+        // #2464: no episode ladder in plan mode; review rounds and the #2452
+        // cap bound the work.
+        let episode_session = if let Some(prepared_acceptance) = prepared_slot.as_ref() {
         let evaluated = episode::evaluate(&mut workflow,&independent,
             prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
-        let episode_session = match &evaluated.decision {
+        match &evaluated.decision {
             crate::autoship_episode::Decision::FreshSession { .. } => {
                 let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
                 if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
@@ -7561,7 +7915,8 @@ async fn resume_draft_pr(
                 return Ok(RunReport::built(format!("PR #{pr}: review evidence recovery queued; candidate preserved")));
             }
             _ => None,
-        };
+        }
+        } else { None };
         if independent.approved() {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
@@ -7616,7 +7971,9 @@ async fn resume_draft_pr(
                 return Ok(RunReport::held(format!("PR #{pr}: automatic publication routing held")));
             }
             workflow.push(branch).await?;
-            acceptance::assert_receipt_current(&worktree,&prepared_acceptance,&acceptance_receipt).await?;
+            if let (Some(prepared_acceptance), Some(acceptance_receipt)) = (prepared_slot.as_ref(), acceptance_receipt.as_ref()) {
+            acceptance::assert_receipt_current(&worktree,prepared_acceptance,acceptance_receipt).await?;
+            }
             // Preserve approval for a future explicit merge authorization too.
             opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             if workflow.published_pr_ready(pr,&independent).await? {
@@ -7664,7 +8021,9 @@ async fn resume_draft_pr(
             };
             workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
             anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
-            acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
+            if let (Some(prepared_acceptance), Some(acceptance_receipt)) = (prepared_slot.as_ref(), acceptance_receipt.as_ref()) {
+            acceptance::assert_receipt_current(&worktree, prepared_acceptance, acceptance_receipt).await?;
+            }
             if !manual_routing::permit_mutation(repo_root,pr,Some(issue_no),expected_head.is_none(),&mut workflow).await? {
                 manual_routing::restore_draft(repo_root,pr,readied,&workflow).await;
                 return Ok(RunReport::held(format!("PR #{pr}: automatic merge routing held")));
@@ -7732,7 +8091,7 @@ async fn resume_draft_pr(
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
-                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr)).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), expected_head.is_none(), Some(pr), GaveUpNote::Reason).await.ok();
                 // Preserve this PR for the durable adjudication/recovery path.
             }
             notify_review_unless(workflow.legacy_notice_suppressed(), &format!(
@@ -7759,6 +8118,8 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
+        (findings, kind, episode_session)
+        };
         if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
         let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
@@ -8176,7 +8537,7 @@ where F:FnOnce()->Fut,Fut:std::future::Future<Output=Result<Option<RunReport>>> 
 
 async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<RunReport>> {
     if let Some((pr, issue_no, resume_branch)) =
-        find_resumable_draft(repo_root, None, dry_run).await
+        find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other).await
     {
         let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
         return resume_draft_pr(
@@ -8199,6 +8560,18 @@ async fn waiting_issue_fallback(repo_root:&Path,dry_run:bool)->Result<Option<Run
     }
 
     Ok(None)
+}
+
+/// #2467: the held report a run returns while the global budget is spent.
+fn global_budget_hold(path: &Path, now: i64) -> Result<Option<RunReport>> {
+    let Some(store) = crate::autoship_workflow::WorkflowStore::open_read_only(path)? else { return Ok(None) };
+    let budget = store.global_model_budget(now)?;
+    Ok(budget.exhausted().then(|| {
+        let reopens = budget.reopens_at_ms.and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| format!("; reopens at {}", at.format("%Y-%m-%dT%H:%M:%SZ"))).unwrap_or_default();
+        RunReport::held(format!("global daily model-call budget spent ({} of {} in the rolling 24 hours){reopens}; no new paid work",
+            budget.used, budget.cap))
+    }))
 }
 
 async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
@@ -8227,6 +8600,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     };
     note_current_issue(0); // This run has not committed to an issue yet (#954).
+    // #2467: with the global daily model budget spent, start no paid work.
+    // The merge sweep and finalize run on their own tick and keep going.
+    if !dry_run {
+        if let Some(report)=global_budget_hold(&workflow::path(),chrono::Utc::now().timestamp_millis())? {
+            return Ok(report);
+        }
+    }
 
     // Deployment evidence above deliberately uses the real deploy root. All
     // subsequent execution uses a clean controller pinned to fetched main;
@@ -8273,7 +8653,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 RedMainPlan::Resume(n) => {
                     if lane != Lane::Build {
                         if let Some((pr, issue_no, resume_branch)) =
-                            find_resumable_draft(repo_root, Some(n), dry_run).await
+                            find_resumable_draft(repo_root, Some(n), dry_run, adoption::FinishTier::Other).await
                         {
                             info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
                             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
@@ -8328,8 +8708,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         &fair,
         resume_per_build(),
     );
-    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
-        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
+    // #2495 — an owed build turn still yields to finishing: near-done PRs
+    // (green bound head, publish, CI pending) are what that debt protects.
+    let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);
+    if let (None, Some(ceiling)) = (&red_main_issue, ceiling) {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run, ceiling).await {
             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run, None)
                 .await
@@ -8400,13 +8783,23 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // label it out of the selection pool immediately. Without this, the
         // unattended loop re-picks the same issue every tick: it head-of-line
         // blocks every other labeled issue and re-comments daily, forever.
-        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR, automatic_routing, None).await.ok();
+        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR, automatic_routing, None, GaveUpNote::Reason).await.ok();
         return Ok(RunReport::triage(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
         )));
     }
 
+    // #2408: an issue whose own workflow owns an open PR and is continuing
+    // runs on the PR lane. The issue checkout can be stale, and rebuilding
+    // there abandoned verified work and produced a candidate the PR could
+    // never accept.
+    if let Some((pr,pr_branch))=own_pr_route(repo_root,issue.number).await? {
+        info!(issue=issue.number,pr,"selected issue owns a continuing PR; resuming on the PR lane");
+        let reasoner=workflow_builder(repo_root,crate::autoship_workflow::submission::Target::Pr(pr)).await?;
+        return resume_draft_pr(repo_root,&reasoner,pr,issue.number,&pr_branch,dry_run,None).await
+            .map(|mut report|{report.resumed=true;report});
+    }
     match publication::claimed_after_reconcile(repo_root,issue.number,dry_run).await {
         Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
@@ -8434,15 +8827,21 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let outcome = async {
     workflow_guard.require_fresh_issue(repo_root).await?;
     workflow_guard.bind_builder(reasoner.as_ref())?;
+    // #2464: with the scope proof gate off, scope writes a plan and the build
+    // carries the proof; the witness, amendment and ladder never run here.
+    let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();
+    if !plan_mode {
+    if let Some(report)=acceptance_escalation::execute(repo_root,&worktree,&issue,&mut workflow_guard).await? {return Ok(report);}
+    }
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
     let owner_request=acceptance_owner_request(&issue);
-    let initial=match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
+    let initial=if plan_mode {plan_initial_preparation(&worktree,&workflow_guard,candidate_base)?} else {match initial_preparation(&worktree,&workflow_guard,crate::autoship_contract::AcceptanceSource::Issue(issue.number),candidate_base,&owner_request) {
         Ok(initial)=>initial,
-        Err(error)=>{if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
-    };
+        Err(error)=>{if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);}
+    }};
     let retained_preparation=initial.retained;
     let scope_context=initial.context;
     let saved_scope=initial.saved;
@@ -8509,12 +8908,16 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     }
     let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    scope_prompt.push_str(scope_policy::SCOPING_POLICY);
+    if plan_mode {scope_prompt.push_str(plan_proof::SCOPE_PLAN_POLICY);}
+    let mut readiness_decisions=None;
     if !retained_preparation {
         let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
             acceptance::readiness::Decision::Ready(evidence)=>evidence,
-            acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+            acceptance::readiness::Decision::Deferred(retry)=>return Ok(RunReport::held(format!("issue #{}: readiness retry scheduled; {}",issue.number,retry))),
         };
         scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
+        readiness_decisions=Some(readiness);
         // #1515 — what landed on main since the issue was written, so the scoper
         // judges the issue against today's code rather than the code it
         // described. Empty when nothing merged or the date is unknown.
@@ -8543,9 +8946,21 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }};
     workflow_guard.require_fresh_issue(repo_root).await?;
     if saved_scope.is_none() {if let Some(s) = &mut scope {
+        if s.relevance == Relevance::Overtaken && plan_mode {
+            // #2464: no registered observation can prove main satisfies the
+            // request in plan mode; build it and let review judge.
+            s.relevance=Relevance::Current;
+        }
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
-                return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
+            if let Some(base)=acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
+                workflow_guard.validate_before_side_effect()?;
+                return Ok(match close_satisfied_issue(repo_root,issue.number,&base,automatic_routing).await {
+                    Ok(())=>RunReport::triage(format!("issue #{}: current main `{}` satisfies the request (registered observations and independent completeness review); closed as completed",issue.number,truncate(&base,12))),
+                    Err(error)=>{
+                        warn!(issue=issue.number,"satisfied issue left open: {error:#}");
+                        RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; closing held; automatically re-evaluate on request/main change",issue.number))
+                    }
+                });
             }
             // A model's relevance claim or an inadequate green test is never
             // enough to retire useful work. Generate a fresh falsifier below.
@@ -8561,6 +8976,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     }
     }
+    if saved_scope.is_none() {scope=scope_policy::constrain_scope(scope,&owner_request,readiness_decisions.as_deref())?;}
     // #843/#1516 — plan only unguarded parent issues. The post-scope caller
     // owns both child publication and the ordinary refusal fallback.
     if let Some(sc)=&scope {
@@ -8572,9 +8988,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         warn!(issue=issue.number,"slice planning failed: {error:#}");Vec::new()
                     })
             } else {Vec::new()};
-            let result=finish_scope_refusal(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting,automatic_routing).await;
-            cleanup(worktree,branch,repo_root.to_path_buf()).await;
-            return result;
+            match scope_policy::finish_prediction(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting,automatic_routing).await {
+                Ok(None)=>{},
+                Ok(Some(report))=>{
+                    cleanup(worktree,branch,repo_root.to_path_buf()).await;
+                    return Ok(report);
+                },
+                Err(error)=>{
+                    cleanup(worktree,branch,repo_root.to_path_buf()).await;
+                    return Err(error);
+                },
+            }
         }
     }
 
@@ -8586,17 +9010,26 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
     if saved_scope.is_none() {
         if let Err(error)=retain_initial_scope(&scope_context,scope.clone(),|key,raw|workflow_guard.record_scope_stage_response(key,raw)) {
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}return Err(error);
         }
     }
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
+    let mut prepared_slot: Option<acceptance::PreparedAcceptance> = None;
+    if plan_mode {
+        // #2464: one scope call is enough. Bind the plan, criteria and
+        // allowed paths and go straight to the build.
+        if criteria.is_empty() { criteria.push(owner_request.clone()); }
+        let scoped_plan = plan_proof::Plan::from_scope(&owner_request, scope.as_ref(), &criteria);
+        workflow_guard.bind_plan(&scoped_plan)?;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Build, "plan_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+    } else {
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, candidate_base, &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+            if let Some(report)=acceptance_escalation::hold_issue_error(repo_root,&worktree,&issue,&mut workflow_guard,&error).await? {return Ok(report);}
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }
@@ -8610,12 +9043,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
     workflow_guard.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+    prepared_slot = Some(prepared_acceptance);
+    }
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+    let prompt = match &prepared_slot {
+        Some(prepared_acceptance) => format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
-        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
+        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?),
+        None => format!("{}{}", build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria), plan_proof::BUILD_PROOF_POLICY),
+    };
     workflow_guard.require_fresh_issue(repo_root).await?;
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
@@ -8762,7 +9200,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         .await
         .ok();
         if attempts.exhausted() {
-            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: refused — diff hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -8866,7 +9304,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 return Ok(RunReport::built(format!(
                     "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
                     issue.number
@@ -8988,7 +9426,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -8999,8 +9437,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
         }
 
-        acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-            &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+        match prepared_slot.as_mut() {
+            Some(prepared_acceptance) => acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+            prepared_acceptance, &acceptance_control, &mut workflow_guard).await?),
+            // #2464: the build's own tests are the proof, recorded here.
+            None => summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, candidate_base, &summary, &workflow_guard).await?.note()),
+        }
 
         // Stage 3 (#653): QA review of the diff by the stronger tier. Since
         // #1488 a reject is not terminal: its notes drive revision rounds,
@@ -9008,7 +9450,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // before the dry-run exit so dry runs exercise the full pipeline.
         workflow_guard.require_fresh_issue(repo_root).await?;
         match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &plan_proof::harness_files(prepared_slot.as_ref())))
             .await
         {
             Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -9044,7 +9486,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
             workflow_guard.require_fresh_issue(repo_root).await?;
             let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await;
+                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -9078,14 +9520,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // receipt/review. Re-enter all verification and review stages before
             // the episode controller may consume the new revision.
             let adjudicated = independent.as_ref().and_then(|review| review.structured.clone());
-            if let Some(review) = adjudicated {
+            if let (Some(review), Some(prepared_acceptance)) = (adjudicated, prepared_slot.as_mut()) {
                 if acceptance::apply_adjudicated_amendment(reasoner.as_ref(), crate::autoship_contract::AcceptanceSource::Issue(issue.number),
-                    &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
+                    &issue.title, &worktree, prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
                     independent = None; acceptance_receipt = None; qa_ok = false;
                     review_notes.clear(); findings_override = None; pending_guard = None;
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                     acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
-                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                        prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
                     verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await??;
                     let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
@@ -9105,13 +9547,13 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     workflow_guard.require_fresh_issue(repo_root).await?;
                     independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
                         qa_ok, &review_notes, round, None, 0, Some(&workflow_guard),
-                        acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                        acceptance_receipt.as_ref().map(|receipt| (&*prepared_acceptance, receipt))).await);
                     continue;
                 }
             }
             let mut episode_session = None;
             if findings_override.is_none() {
-                if let Some(review) = independent.as_ref() {
+                if let (Some(review), Some(prepared_acceptance)) = (independent.as_ref(), prepared_slot.as_ref()) {
                     let evaluated = episode::evaluate(&mut workflow_guard,review,
                         prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
                     match &evaluated.decision {
@@ -9206,7 +9648,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         .await
                         .ok();
                         if attempts.exhausted() {
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                         }
                         if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -9248,7 +9690,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9293,7 +9735,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )
                             .await
                             .ok();
-                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
@@ -9310,14 +9752,17 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     gated = touches_verify_gated_path(&names2);
                     lines = lines2;
                     summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
-                    acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                    match prepared_slot.as_mut() {
+                        Some(prepared_acceptance) => acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+                        prepared_acceptance, &acceptance_control, &mut workflow_guard).await?),
+                        None => summary = format!("{summary}\n\n{}", plan_proof::record_build_proof(&worktree, candidate_base, &format!("{summary}\n{rev_summary}"), &workflow_guard).await?.note()),
+                    }
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
                     workflow_guard.require_fresh_issue(repo_root).await?;
                     match reasoner
-                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
+                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &plan_proof::harness_files(prepared_slot.as_ref())))
                         .await
                     {
                         Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -9339,7 +9784,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         let previous = independent.as_ref().and_then(|r| r.structured.clone());
                         workflow_guard.require_fresh_issue(repo_root).await?;
                         independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), prepared_slot.as_ref().zip(acceptance_receipt.as_ref())).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -9376,7 +9821,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9428,7 +9873,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -9461,7 +9906,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     )
                     .await
                     .ok();
-                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -9592,7 +10037,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                                 let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
                                 if attempts.exhausted() {
-                                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None).await.ok();
+                                    label_gave_up(repo_root, issue.number, attempts.reason(), automatic_routing, None, GaveUpNote::Reason).await.ok();
                                 }
                             }
                             return Ok(RunReport::built(message));
@@ -9620,33 +10065,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }, automatic_routing).await));
     }
-    // Compare-and-swap publication preserves concurrent remote work and
-    // reconciles successful pushes whose responses were lost.
-    if let Err(error) = workflow_guard.push_fresh(repo_root,&branch,automatic_routing).await {
-        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
-        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
-        let e = format!("{error:#}");
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
-        }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
-            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
-    }
-    // #1037 — the push landed, plainly or by superseding an orphan above, so
-    // the remote branch is now exactly this attempt's work, built from `main`.
-    // Its record becomes this attempt's builders: earlier authors described
-    // content that no longer exists, and keeping them disqualified reviewers
-    // (a stale `[claude, codex]` left nobody) for work they never touched.
-    // Only here — until the push lands the old work may still be on the
-    // remote, so the branch record stays the union. A failure leaves the
-    // union too, which excludes more reviewers, never fewer.
-    if let Err(e) = reasoner.supersede_review_history() {
-        warn!(
-            issue = issue.number,
-            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
-        );
-    }
-
     // Open the PR. Draft + human merge for everyone; owner-authored issues
     // auto-merge when the owner opted in AND the scoper graded the work
     // simple/medium (#653 — hard work always gets human eyes).
@@ -9776,6 +10194,36 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
     }
+    // Compare-and-swap publication preserves concurrent remote work and
+    // reconciles successful pushes whose responses were lost. #2279 — the
+    // complete publication request is retained before the push, so a built
+    // and verified candidate whose push fails is pushed and published by free
+    // reconciliation once the cause is fixed, never rebuilt from scope.
+    if let Err(error) = publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,published_head,issue.number,&args,automatic_routing).await {
+        if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+        if error.downcast_ref::<manual_routing::Hold>().is_some() {return Ok(RunReport::held(format!("issue #{}: fresh publication routing held",issue.number)));}
+        let e = format!("{error:#}");
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines), automatic_routing).await));
+    }
+    // #1037 — the push landed, plainly or by superseding an orphan above, so
+    // the remote branch is now exactly this attempt's work, built from `main`.
+    // Its record becomes this attempt's builders: earlier authors described
+    // content that no longer exists, and keeping them disqualified reviewers
+    // (a stale `[claude, codex]` left nobody) for work they never touched.
+    // Only here — until the push lands the old work may still be on the
+    // remote, so the branch record stays the union. A failure leaves the
+    // union too, which excludes more reviewers, never fewer.
+    if let Err(e) = reasoner.supersede_review_history() {
+        warn!(
+            issue = issue.number,
+            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
+        );
+    }
+
     let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args, automatic_routing).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
@@ -9937,8 +10385,12 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         return Ok(RunReport::held(format!("PR #{}: automatic fresh merge routing held",pr_number.unwrap())));
     }
     workflow_guard.validate_binding(workflow_guard.binding()).await?;
-    acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
+    // #2464: a plan-bound merge rests on the green required checks above and
+    // the independent approval; there is no executable receipt to assert.
+    if let Some(prepared_acceptance) = prepared_slot.as_ref() {
+    acceptance::assert_receipt_current(&worktree, prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
+    }
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
     let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?,publication::MergeRouting {automatic:automatic_routing,source_issue:Some(issue.number)}).await;
     if let Ok(Some(receipt)) = &mutation {
@@ -10042,7 +10494,7 @@ async fn record_hard_failure(
         )
         .await
         .ok();
-        label_gave_up(repo_root, issue, attempts.reason(), automatic, None).await.ok();
+        label_gave_up(repo_root, issue, attempts.reason(), automatic, None, GaveUpNote::Reason).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
@@ -10367,14 +10819,23 @@ where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
         limit=(limit*2).min(max);
     }
 }
+/// #2444 — every PR reader shares one listing per tick, so it asks for the
+/// union of the fields any reader needs (including routing labels and closing
+/// references, which used to cost a `gh pr view` per open PR).
+const PR_INVENTORY_FIELDS: &str = "number,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences,labels,statusCheckRollup";
 async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
     anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
-    complete_labelled_inventory(|limit| async move {
+    let fields=if kind=="pr" {
+        debug_assert!(fields.split(',').all(|f|PR_INVENTORY_FIELDS.split(',').any(|u|u==f)),"PR inventory field {fields} missing from the shared listing");
+        PR_INVENTORY_FIELDS
+    } else {fields};
+    let key=format!("inventory\0{}\0{kind}\0{}\0{fields}",repo_root.display(),repository.unwrap_or(""));
+    gh_budget::tick_read(key,||complete_labelled_inventory(|limit| async move {
         let args=repository_inventory_args(kind,repository,fields,limit);
         let (ok,raw,error)=run(&gh_bin(),&args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
         anyhow::ensure!(ok,"gh repository inventory failed: {}",truncate(&error,300));
         Ok(raw)
-    }).await
+    })).await
 }
 fn filter_inventory_label(raw:&str,label:&str)->Result<Vec<serde_json::Value>> {
     let rows:Vec<serde_json::Value>=serde_json::from_str(raw)?;
@@ -10540,17 +11001,66 @@ async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()>
     Ok(())
 }
 
-async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str, automatic:bool, pr:Option<u64>) -> Result<()> {
-    let gh = gh_bin();
-    // #1214 — the reason first: a labelled issue always says why, and a
-    // reason comment on an issue whose label then failed is harmless.
-    let note = format!(
+/// #2462 (#1644): current main was independently proven to satisfy the issue
+/// (registered verifiers already green on `base`, plus a separate completeness
+/// review). Close it as completed instead of re-proving it on every main
+/// change. Terminal routing and owner controls are re-observed right before
+/// the write; the workflow retires through the closed-target path.
+async fn close_satisfied_issue(repo_root:&Path,issue:u64,base:&str,automatic:bool)->Result<()> {
+    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,None,automatic).await,
+        "terminal controls or routing held before closing a satisfied issue");
+    let comment=format!("Autoship: current main already satisfies this issue. Independently registered \
+        verifiers pass on main `{base}`, and a separate completeness review covered every criterion. \
+        Closing as completed; reopen it to request more work.");
+    let (ok,_,error)=run(&gh_bin(),&["issue","close",&issue.to_string(),"--reason","completed","--comment",&comment],repo_root).await?;
+    anyhow::ensure!(ok,"closing satisfied issue #{issue} failed: {}",truncate(&error,300));
+    Ok(())
+}
+
+/// #2467 — what the reason comment carries. Every give-up goes through
+/// [`label_gave_up`]; the cap close-out adds its detail and, when a lost
+/// reply already put the comment on, labels without commenting again.
+pub(super) enum GaveUpNote<'a> {
+    /// The reason line only; a failed comment does not stop the label.
+    Reason,
+    /// Reason plus detail. The comment must succeed before the label.
+    Detailed(&'a str),
+    /// The comment is already on the issue: label only.
+    AlreadyPosted,
+}
+
+/// #1214 — the durable reason comment `label_gave_up` posts before it labels.
+fn gave_up_note(reason: &str, detail: &str) -> String {
+    let mut note = format!(
         "{GAVE_UP_REASON_MARKER_PREFIX}{reason} -->\nAuto-PR gave up on this issue: `{reason}`. \
          Remove the `{GAVE_UP_LABEL}` label, or run `augmentagent autopr readmit --reason <code>`, \
          to put it back in the pool."
     );
-    anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before reason comment");
-    let _ = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
+    if !detail.is_empty() {
+        note.push_str("\n\n");
+        note.push_str(detail);
+    }
+    note
+}
+
+async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str, automatic:bool, pr:Option<u64>, note: GaveUpNote<'_>) -> Result<()> {
+    let gh = gh_bin();
+    // #1214 — the reason first: a labelled issue always says why, and a
+    // reason comment on an issue whose label then failed is harmless.
+    let (detail, required) = match note {
+        GaveUpNote::Reason => (Some(""), false),
+        GaveUpNote::Detailed(detail) => (Some(detail), true),
+        GaveUpNote::AlreadyPosted => (None, false),
+    };
+    if let Some(detail) = detail {
+        let note = gave_up_note(reason, detail);
+        debug_assert!(note.starts_with(GAVE_UP_REASON_MARKER_PREFIX));
+        anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before reason comment");
+        let posted = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
+        if required && !matches!(posted, Ok((true, _, _))) {
+            bail!("reason comment on #{issue} was not confirmed");
+        }
+    }
     anyhow::ensure!(manual_routing::terminal_allowed(repo_root,issue,pr,automatic).await,"terminal controls or routing held before label");
     // #1037 L1 — the exit status is the answer: a caller that closes a draft
     // only once the label is on has to know when it is not.
@@ -11349,7 +11859,10 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
     command_repository: Option<String>,
-    upgrade: Option<crate::autoship_worker::UpgradeWatch>,
+    upgrade: Option<Arc<crate::autoship_worker::UpgradeWatch>>,
+    /// #2354: cancelled once a deploy has waited past the stale bound; the
+    /// concurrent recovery and sweep lanes stop claiming new work.
+    drain: tokio_util::sync::CancellationToken,
     repo_root: PathBuf,
     dry_run: bool,
     interval: std::time::Duration,
@@ -11648,6 +12161,14 @@ impl FairSched {
         self.resume_reservations_since_build = self.resume_reservations_since_build.saturating_add(1);
     }
 
+    /// #2504 — an issue-lane turn (selected, scoped or parked, billed or not)
+    /// settles the debt. Unbilled scoping used to leave it standing, so the
+    /// issue lane kept the slot while due own PRs starved.
+    fn record_issue_turn(&mut self) {
+        self.resumes_since_build = 0;
+        self.resume_reservations_since_build = 0;
+    }
+
     fn record_billed(&mut self, resumed: bool) {
         if !resumed { self.resume_reservations_since_build = 0; }
         self.resumes_since_build = if resumed {
@@ -11741,6 +12262,16 @@ fn resume_per_build() -> u32 {
 /// #1532 — is this billed slot reserved for a new-issue build? Only the
 /// combined lane interleaves: the explicit lanes keep their single purpose,
 /// and with resume-first off there is nothing to interleave against.
+/// #2495 — the furthest-from-done PR work the PR lane may take this turn.
+/// `None` skips it (build lane, or resume-first off); an owed fresh-issue turn
+/// (#1532) still admits work that only needs finishing.
+fn resume_ceiling(lane: Lane, resume_first: bool, prefer_build: bool) -> Option<adoption::FinishTier> {
+    if lane == Lane::Build || !resume_first {
+        return None;
+    }
+    Some(if prefer_build { adoption::FinishTier::PublishOrCiPending } else { adoption::FinishTier::Other })
+}
+
 fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
     lane == Lane::Combined && resume_first && fair.resumes_since_build.max(fair.resume_reservations_since_build) >= per_build
 }
@@ -12326,6 +12857,7 @@ impl AutoPrLoop {
         Some(Self {
             command_repository: None,
             upgrade: None,
+            drain: tokio_util::sync::CancellationToken::new(),
             repo_root,
             dry_run,
             interval: std::time::Duration::from_secs(interval),
@@ -12352,6 +12884,7 @@ impl AutoPrLoop {
         Self {
             command_repository: None,
             upgrade: None,
+            drain: tokio_util::sync::CancellationToken::new(),
             repo_root,
             dry_run: true,
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
@@ -12369,10 +12902,14 @@ impl AutoPrLoop {
             .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
-        let recovery_stop=tokio_util::sync::CancellationToken::new();
+        // #2354: a deploy pending past the stale bound stops recovery from
+        // claiming new work; its in-flight verifiers drain to completion.
+        let drain = self.drain.clone();
+        let recovery_stop=drain.child_token();
         let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
         tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
+        let canary_root = root.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
         // The protected daily claim prevents restart from multiplying probes.
@@ -12385,6 +12922,7 @@ impl AutoPrLoop {
                     _ = timer.tick() => {}
                 }
                 if dry_run { continue; }
+                if gh_budget::low(&canary_root, "review canary").await { continue; }
                 tokio::select! {
                     _ = canary_stop.cancelled() => return Ok(()),
                     result = review_canary_if_due() => {
@@ -12397,44 +12935,65 @@ impl AutoPrLoop {
         };
         let shipping = self.run_with(shutdown, move || {
             let root = root.clone();
-            async move { run_once(&root, dry_run).await }
+            // #2444: each tick shares its GitHub reads.
+            async move { gh_budget::tick_scope(run_once(&root, dry_run)).await }
         }, move || {
             let root = sweep_root.clone();
-            async move {
+            gh_budget::tick_scope(async move {
                 // Unknown remote mutations must reconcile even when controller
                 // preparation is temporarily unavailable. This path reads Git
                 // identity and remote evidence without editing the owner tree.
                 if let Err(error) = publication::reconcile_merge_dispatches(&root, dry_run).await {
                     warn!("merge dispatch reconciliation unavailable: {error:#}");
                 }
+                if let Err(error)=scope_policy::migrate(&root,dry_run).await {warn!("scope-policy migration deferred: {error:#}");}
                 let controller = match workspace::prepare(&root, "sweep").await {
                     Ok(controller) => controller,
                     Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
                 };
                 let root = controller.root.as_path();
                 let merged=merge_sweep(root,dry_run).await;
+                // #2444: housekeeping polls stand down while the shared REST
+                // budget is low; merges and their reconciliation continue.
+                if gh_budget::low(root, "legacy readmission and closed-target sweeps").await {return merged;}
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 // Waiting workflows never re-check their target, so one whose
                 // issue was fixed by hand stays queued forever (#2040, #2081).
                 if !dry_run {
                     if let Err(error)=closed_targets::sweep(root,&workflow::path()).await {warn!("closed-target sweep deferred: {error:#}");}
+                    // #2467: issues over their attempt or spend cap get one
+                    // comment, the label and retirement. Model-free.
+                    if let Err(error)=attempt_cap::sweep(root,&workflow::path()).await {warn!("give-up sweep deferred: {error:#}");}
                 }
                 merged
-            }
+            })
         });
-        tokio::select! {
-            result = shipping => {
-                recovery_stop.cancel();
-                if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
-                result
-            },
-            result = &mut recovery => result,
-            result = canary => result,
+        tokio::pin!(shipping);
+        tokio::pin!(canary);
+        let mut recovery_drained = false;
+        loop {
+            tokio::select! {
+                result = &mut shipping => {
+                    recovery_stop.cancel();
+                    if !recovery_drained {
+                        if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
+                    }
+                    return result;
+                },
+                result = &mut recovery, if !recovery_drained => {
+                    // Draining toward a restart is not the end of the worker:
+                    // shipping still reaches its safe point and exits 75.
+                    if !drain.is_cancelled() { return result; }
+                    if let Err(error)=result {warn!("qualification recovery ended during drain: {error:#}");}
+                    recovery_drained = true;
+                },
+                result = &mut canary => return result,
+            }
         }
     }
 
     pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
-        self.upgrade = Some(watch);
+        self.upgrade = Some(Arc::new(watch));
         self
     }
 
@@ -12454,6 +13013,7 @@ impl AutoPrLoop {
     {
         let interval = self.interval.min(std::time::Duration::from_secs(300));
         let stop = shutdown.clone();
+        let drain = self.drain.clone();
         let upgrade_stop = tokio_util::sync::CancellationToken::new();
         let reconciliation_stop = upgrade_stop.clone();
         let reconciliation = async move {
@@ -12466,6 +13026,8 @@ impl AutoPrLoop {
                     _ = reconciliation_stop.cancelled() => return Ok(()),
                     _ = timer.tick() => {}
                 }
+                // #2354: a stale deploy is draining; claim no new work.
+                if drain.is_cancelled() { continue; }
                 let swept = tokio::select! {
                     _ = stop.cancelled() => return Ok(()),
                     swept = sweep() => swept,
@@ -12503,6 +13065,9 @@ impl AutoPrLoop {
         let mut queue_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first = true;
+        // #2354: ticks restart at safe points inside them (see SafePoints).
+        let points = self.upgrade.clone()
+            .map(|watch| crate::autoship_worker::SafePoints::new(watch, self.drain.clone()));
         loop {
             // The worker restarts to load every deploy. Waiting a full
             // interval after each start meant deploys arriving every 25-60
@@ -12534,7 +13099,8 @@ impl AutoPrLoop {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
                                         || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                         || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?
-                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?)
+                                        || s.has_due_activity_observation(None,(self.clock)().timestamp_millis())?
+                                        || s.has_due_retry_work(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12555,7 +13121,8 @@ impl AutoPrLoop {
                                 Ok(store.command_queue_due(repository, now)?
                                     || store.has_due_main_reconciliation(Some(repository), now)?
                                     || (lane_from_env()!=Lane::Build && store.has_due_owner_resume(Some(repository),now)?)
-                                    || store.has_due_qualification_recovery(Some(repository),now)?)
+                                    || store.has_due_qualification_recovery(Some(repository),now)?
+                                    || store.has_due_retry_work(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
@@ -12592,13 +13159,38 @@ impl AutoPrLoop {
                 let reservation = DailyCounter::update(&counter_path,
                     |counter| Ok(counter.begin_attempt(started_day)))?;
                 let _ = std::fs::write(&tick_stamp, b"");
-                let outcome = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
-                        return Ok(());
+                let outcome = {
+                    let run = async {
+                        match &points {
+                            Some(points) => points.scope(tick()).await,
+                            None => tick().await,
+                        }
+                    };
+                    tokio::pin!(run);
+                    // Observe a pending deploy while the tick runs, so the
+                    // stale bound is measured even when no safe point is near.
+                    let mut observe = tokio::time::interval(std::time::Duration::from_secs(30));
+                    observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => {
+                                info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
+                                return Ok(());
+                            }
+                            r = &mut run => break r,
+                            // The tick is parked at a safe point: its
+                            // checkpoint is durable and nothing of it is in
+                            // flight. Dropping it here (end of this block)
+                            // is the restart boundary.
+                            _ = async { points.as_ref().unwrap().parked().await }, if points.is_some() => {
+                                break Err(crate::autoship_worker::UpgradeRequested.into());
+                            }
+                            _ = observe.tick(), if points.is_some() => {
+                                points.as_ref().unwrap().restart_pending();
+                            }
+                        }
                     }
-                    r = tick() => r,
                 };
                 let completed_day = utc_day_of((self.clock)());
                 let billed = outcome.as_ref().map(|r| r.billed)
@@ -12615,9 +13207,18 @@ impl AutoPrLoop {
                 if let Ok(report) = &outcome {
                     if report.billed {
                         FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
+                    } else if !report.resumed && report.message != IDLE_MSG {
+                        // #2504: an unbilled issue-lane turn still took the
+                        // slot the debt reserved for it; own-PR work is next.
+                        FairSched::update_persist(&self.fair_path, FairSched::record_issue_turn);
                     }
                 }
                 match outcome {
+                    Ok(r) if r.billed && r.held => {
+                        triaged+=1;
+                        info!(triaged,attempts_today=runs_today,"auto-PR: paid deferred turn yielded to eligible peers: {r}");
+                        if triaged>=Self::MAX_TRIAGE_PER_TICK {break;}
+                    }
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
@@ -12633,6 +13234,11 @@ impl AutoPrLoop {
                             );
                             break;
                         }
+                    }
+                    // #2354: parked at a safe point; the reservation is settled.
+                    Err(e) if e.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some() => {
+                        info!(attempts_today=runs_today, "auto-PR: tick stopped at a safe point to load a deploy");
+                        return Err(e);
                     }
                     // Transient controller or network failures retry next tick.
                     Err(e) => {
@@ -13053,8 +13659,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         let stop = tokio_util::sync::CancellationToken::new();
         let timer_stop = stop.clone();
         let run = worker.run_with(stop, move || {
-            observed.fetch_add(1, Ordering::SeqCst);
+            let turn=observed.fetch_add(1, Ordering::SeqCst);
             async move {
+                if turn>0 {return Ok(RunReport::idle());}
                 Ok(RunReport {
                     message: "durable verification retry; candidate preserved".into(),
                     billed, held, resumed,
@@ -13067,7 +13674,7 @@ else:raise Exception('unexpected fixture call '+repr(args))
         };
         let (result, ()) = tokio::join!(run, timer);
         result.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "fixture must settle exactly one attempt");
+        assert_eq!(calls.load(Ordering::SeqCst), if billed && held {2}else{1}, "paid deferred turns yield once, then the empty picker stops");
         assert_eq!(DailyCounter::load(&counter_path).runs_today(utc_day_of(now)), if billed { 1 } else { 0 },
             "compute spend must remain attributable even when work is held");
         let allowance = crate::autoship_workflow::WorkflowStore::open(&workflow_path).unwrap()
@@ -13075,7 +13682,9 @@ else:raise Exception('unexpected fixture call '+repr(args))
         assert_eq!(allowance.confirmed, 0);
         assert_eq!(allowance.available, 5, "a paid retry is not a merged PR");
         let fair = FairSched::load(&fair_path);
-        let expected = if billed { if resumed { (3, 3) } else { (0, 0) } } else { (2, 3) };
+        // #2504: any issue-lane turn (selected, scoped or parked) settles the
+        // debt, billed or not; an unpaid PR turn leaves it unchanged.
+        let expected = if !resumed { (0, 0) } else if billed { (3, 3) } else { (2, 3) };
         assert_eq!((fair.resumes_since_build, fair.resume_reservations_since_build), expected,
             "held control flow must not erase a paid turn's fairness settlement");
     }
@@ -13104,6 +13713,82 @@ else:raise Exception('unexpected fixture call '+repr(args))
     #[tokio::test(start_paused = true)]
     async fn paid_completed_build_clears_resume_debt() {
         assert_turn_fairness(false, true, false).await;
+    }
+
+    /// #2504 — Legion 2026-11-23 20:20Z-20:40Z: autopr-fair.json read
+    /// {"resume_cursor":2449,"resumes_since_build":1,"resume_reservations_since_build":3}.
+    /// About ten fresh issues were scoped and parked unbilled, so the debt never
+    /// cleared and due own PRs (#2378, #2358, #2449) starved. An unbilled
+    /// issue-lane turn must settle the debt so own-PR work gets the next slot,
+    /// and own-PR work must come back at least every `per_build + 1` turns.
+    #[tokio::test(start_paused = true)]
+    async fn unbilled_issue_turns_cannot_starve_due_own_pr_work() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1);
+        let now = chrono::Utc::now();
+        worker.clock = Arc::new(move || now);
+        FairSched::update_persist(&worker.fair_path, |fair| {
+            fair.resume_cursor = 2449;
+            fair.resumes_since_build = 1;
+            fair.resume_reservations_since_build = 3;
+        });
+        let fair_path = worker.fair_path.clone();
+        assert!(prefer_build_now(Lane::Combined, true, &FairSched::load(&fair_path), 2), "fixture: the owed build turn");
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "fixture: tier (c) own-PR work is shut out while the debt stands");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let timer_stop = stop.clone();
+        let run = worker.run_with(stop, move || {
+            let turn = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if turn > 0 { return Ok(RunReport::idle()); }
+                // A fresh issue scoped and parked: unbilled, held, not a resume.
+                Ok(RunReport { message: "issue #2401: scoping parked awaiting input".into(),
+                    billed: false, held: true, resumed: false })
+            }
+        }, || async { 0 });
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            timer_stop.cancel();
+        };
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        let fair = FairSched::load(&fair_path);
+        assert_eq!((fair.resume_cursor, fair.resumes_since_build, fair.resume_reservations_since_build), (2449, 0, 0),
+            "an unbilled issue-lane turn must settle the resume debt");
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other),
+            "the next slot admits due tier (c) own-PR work");
+
+        // Bounded interleave: issue turns settle, PR reservations accrue; own-PR
+        // work is never more than one issue turn away.
+        let mut fair = FairSched::default();
+        let mut since_pr = 0;
+        for _ in 0..30 {
+            if prefer_build_now(Lane::Combined, true, &fair, 2) {
+                fair.record_issue_turn();
+                since_pr += 1;
+            } else {
+                fair.reserve_resume();
+                since_pr = 0;
+            }
+            assert!(since_pr <= 1, "own-PR work starved for {since_pr} consecutive issue turns");
+        }
+
+        // A stale owner whose lease expired does not keep the workflow.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::autoship_workflow::WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let binding = crate::autoship_workflow::Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        store.register("owner/repo#2439", "agent-fix/issue-2439", binding, 0).unwrap();
+        assert!(store.claim("owner/repo#2439", "stale-worker", 0, 1_000).unwrap().is_some());
+        assert!(store.claim("owner/repo#2439", "worker", 500, 1_000).unwrap().is_none(), "a live lease is exclusive");
+        assert!(store.claim("owner/repo#2439", "worker", 1_001, 1_000).unwrap().is_some(),
+            "an expired lease with a stale owner is claimable");
     }
 
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
@@ -13179,6 +13864,248 @@ else:raise Exception('unexpected fixture call '+repr(args))
         assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some());
         let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
         assert_eq!(counter.runs, 1, "finished work must be recorded before the worker reloads");
+    }
+
+    /// #2303: a deploy that lands while the worker is idle must load within
+    /// minutes, not at the next 30-minute tick or "some clean boundary".
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_stamp_reloads_an_idle_worker_within_five_minutes() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(30 * 60);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(RunReport::idle()) }
+        }, || async { 0 }));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(!task.is_finished(), "an unchanged stamp must not reload");
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("an idle worker must reload within five minutes of a deploy").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(crate::autoship_worker::restart_code(&Err(error)), Some(75));
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 0, "the reload must not wait for a tick");
+    }
+
+    /// #2303: a deploy during a build never interrupts it. The worker reloads
+    /// at the tick boundary after the build settles its reservation.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_stamp_mid_build_waits_for_the_tick_boundary() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (s, f) = (started.clone(), finish.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (s, f) = (s.clone(), f.clone());
+            async move { s.notify_one(); f.notified().await; Ok(RunReport::built("synthetic build".into())) }
+        }, || async { 0 }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert!(!task.is_finished(), "a deploy must never interrupt an in-flight build");
+        finish.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("the worker must reload at the boundary after the build").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "the finished build is recorded before the reload");
+    }
+
+    /// #2303: the stamp a worker started under is not a deploy. Rewriting the
+    /// same commit (the updater's no-op ticks) must never restart it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_deploy_stamp_never_restarts_the_worker() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.path().join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(300);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let rewrites = stamp.clone();
+        let operator = async move {
+            for _ in 0..12 {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                std::fs::write(&rewrites, "aaaa\n").unwrap();
+            }
+            stop.cancel();
+        };
+        let run = worker.run_with(shutdown, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(RunReport::idle()) }
+        }, || async { 0 });
+        let (result, ()) = tokio::join!(run, operator);
+        result.expect("an unchanged stamp must not reload or fail the worker");
+        assert!(ticks.load(Ordering::SeqCst) >= 10, "the worker kept ticking: {}", ticks.load(Ordering::SeqCst));
+    }
+
+    /// A worker following `built-commit`, ticking every second, under `state`.
+    fn stamped_worker(state: &Path) -> (AutoPrLoop, PathBuf) {
+        let binary = state.join("worker");
+        std::fs::write(&binary, "same executable").unwrap();
+        let stamp = state.join("built-commit");
+        std::fs::write(&stamp, "aaaa\n").unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state)
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary).with_deployment_stamp(&stamp));
+        worker.interval = std::time::Duration::from_secs(1);
+        (worker, stamp)
+    }
+
+    /// #2354: production ran one tick for hours (scope, a 61-minute build,
+    /// verify, repair) across three deploys. A deploy landing mid-tick must
+    /// restart the worker at the next durable checkpoint, before the tick
+    /// claims its next workflow or step.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_mid_tick_restarts_after_the_checkpoint_before_the_next_claim() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let claims = Arc::new(AtomicUsize::new(0));
+        let observed = claims.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (claims, stamp) = (observed.clone(), stamp.clone());
+            async move {
+                claims.fetch_add(1, Ordering::SeqCst);
+                // The deploy lands while the first workflow's step runs.
+                std::fs::write(&stamp, "bbbb\n").unwrap();
+                // That step's checkpoint is now durable.
+                crate::autoship_worker::safe_point().await;
+                claims.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await;
+                Ok(RunReport::built("chained verification and repair".into()))
+            }
+        }, || async { 0 }));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10 * 60), task).await
+            .expect("a deploy mid-tick must restart at the next checkpoint, not after the whole tick")
+            .unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(crate::autoship_worker::restart_code(&Err(error)), Some(75));
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "nothing is claimed after the safe point");
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "the parked tick's reservation is settled before the restart");
+    }
+
+    /// #2354: ticks that follow each other with no idle gap still check the
+    /// stamp between them.
+    #[tokio::test(start_paused = true)]
+    async fn back_to_back_ticks_pick_up_a_deploy_stamp() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let n = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 2 { std::fs::write(&stamp, "bbbb\n").unwrap(); }
+            async move { Ok(RunReport::triage(format!("back-to-back tick {n}"))) }
+        }, || async { 0 }));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("back-to-back ticks must pick up the deploy").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert_eq!(ticks.load(Ordering::SeqCst), 2, "no tick starts after the deploy");
+    }
+
+    /// #2354: a deploy never interrupts an in-flight build. The safe point
+    /// inside the build does not park; the one after it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_mid_tick_never_interrupts_an_in_flight_build() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (worker, stamp) = stamped_worker(state.path());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let built = Arc::new(AtomicBool::new(false));
+        let claims = Arc::new(AtomicUsize::new(0));
+        let (s, f, b, c) = (started.clone(), finish.clone(), built.clone(), claims.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let (s, f, b, c) = (s.clone(), f.clone(), b.clone(), c.clone());
+            async move {
+                crate::build_storage::watch_reserve_roots(None, None, async {
+                    s.notify_one();
+                    f.notified().await;
+                    // A checkpoint written by the build itself is not a place
+                    // to stop it.
+                    crate::autoship_worker::safe_point().await;
+                    Ok(())
+                }).await?;
+                b.store(true, Ordering::SeqCst);
+                crate::autoship_worker::safe_point().await;
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(RunReport::built("synthetic build".into()))
+            }
+        }, || async { 0 }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert!(!task.is_finished(), "a deploy must never interrupt an in-flight build");
+        finish.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), task).await
+            .expect("the worker restarts at the safe point after the build").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some(), "{error:#}");
+        assert!(built.load(Ordering::SeqCst), "the build ran to completion");
+        assert_eq!(claims.load(Ordering::SeqCst), 0, "the next step was never claimed");
+    }
+
+    /// #2354: when a deploy has waited past the bound (a single step running
+    /// longer than that), the worker's concurrent lanes stop claiming new work.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_pending_past_the_bound_stops_new_concurrent_claims() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let (mut worker, stamp) = stamped_worker(state.path());
+        worker.interval = std::time::Duration::from_secs(300);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = started.clone();
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let observed = sweeps.clone();
+        let drain = worker.drain.clone();
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+            let s = s.clone();
+            async move {
+                s.notify_one();
+                // One step with no safe point for hours.
+                tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
+                Ok(RunReport::built("long step".into()))
+            }
+        }, move || { observed.fetch_add(1, Ordering::SeqCst); async { 0 } }));
+        started.notified().await;
+        std::fs::write(&stamp, "bbbb\n").unwrap();
+        tokio::time::sleep(crate::autoship_worker::STALE_DEPLOY_BOUND - std::time::Duration::from_secs(120)).await;
+        assert!(!drain.is_cancelled(), "a fresh deploy does not drain");
+        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+        assert!(drain.is_cancelled(), "a deploy pending past the bound drains the worker");
+        let drained = sweeps.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), drained, "no new concurrent sweep starts while draining");
+        assert!(!task.is_finished(), "the in-flight step is never interrupted");
+        task.abort();
     }
 
     #[test]
@@ -15181,9 +16108,22 @@ CODEX-REVIEW: lgtm").0);
         let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
+        // #2495: the resume-first block is gated by `resume_ceiling`. An owed
+        // build slot admits only finishing work (green head, publish, CI
+        // pending); ordinary drafts still yield the slot to a build.
         let resume_first = body
-            .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
+            .find("let ceiling = resume_ceiling(lane, resume_first_enabled(), prefer_build);")
             .expect("the resume-first block yields a reserved slot");
+        assert!(body[resume_first..].starts_with("let ceiling") && body.contains("find_resumable_draft(repo_root, None, dry_run, ceiling)"));
+        assert_eq!(resume_ceiling(Lane::Combined, true, true), Some(adoption::FinishTier::PublishOrCiPending),
+            "an owed build slot must not go to ordinary draft work");
+        assert_eq!(resume_ceiling(Lane::Combined, true, false), Some(adoption::FinishTier::Other));
+        assert_eq!(resume_ceiling(Lane::Build, true, false), None);
+        assert_eq!(resume_ceiling(Lane::Combined, false, false), None);
+        let fallback = &src[src.find("async fn waiting_issue_fallback(").expect("fallback")..];
+        let fallback = &fallback[..fallback.find("\n}\n").expect("fallback end")];
+        assert!(fallback.contains("find_resumable_draft(repo_root, None, dry_run, adoption::FinishTier::Other)"),
+            "with no build to run, the reserved slot falls back to any waiting draft");
         let pick=body.find("match select_issue_with_fallback(repo_root, dry_run, prefer_build, || waiting_issue_fallback(repo_root,dry_run)).await").expect("production picker and guarded waiting-work fallback");
         assert!(resume_first<pick,"resume-first still precedes reserved-slot issue selection");
 
@@ -15763,6 +16703,127 @@ CODEX-REVIEW: lgtm").0);
             publishes, commits + 1,
             "every inline round plus the delegated integration commit must be pushed + commented (#895)"
         );
+    }
+
+    /// #2488: an own PR at `rescope_remaining_findings` is rescoped before
+    /// the resume moves its checkpoint, and before CI scope widening would
+    /// refuse the same files again. A workflow already stopped for the owner
+    /// does no work, and a rescope's carried findings feed the one shared
+    /// revise round rather than a new prompt or commit site.
+    #[test]
+    fn resume_rescopes_an_own_pr_from_its_recorded_findings() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let entry = at("let rescope_entry = workflow.current_checkpoint()?");
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
+        let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
+        let bound = at("workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;");
+        let rescoped = at("own_pr_rescope::run(");
+        let widened = at("acceptance::ci_scope::widen(");
+        let review = at("admit_review_binding(");
+        let carried = at("rescope_notes.take()");
+        assert!(entry < parked && parked < started, "the rescope checkpoint must be read before the resume moves it");
+        assert!(bound < rescoped && rescoped < widened, "rescope after the old contract is bound and before CI scope widening");
+        assert!(carried < review, "carried findings must route the round before a re-review is admitted");
+    }
+
+    /// #2464: both lanes branch on the one switch. With it on they prepare,
+    /// qualify and (for issues) climb the ladder exactly as before; with it
+    /// off, the plan is bound before any of that and none of it runs.
+    #[test]
+    fn the_scope_proof_gate_switch_guards_the_witness_amendment_and_ladder() {
+        let src = include_str!("self_improve.rs");
+        for lane in ["async fn run_selected(", "async fn resume_draft_pr("] {
+            let start = src.find(lane).expect(lane);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{lane} lacks {needle}"));
+            let switch = at("let plan_mode = !crate::autoship_workflow::scope_proof_gate::enabled();");
+            let plan = at(".bind_plan(&");
+            let prepared = at("acceptance::prepare_acceptance(");
+            let qualified = at("acceptance::qualify_or_amend(");
+            assert!(switch < plan && plan < prepared && prepared < qualified, "{lane}: the plan branch must precede the old gate");
+            assert!(body[plan..prepared].contains("} else {"), "{lane}: the old gate must be the gate-on branch");
+            assert!(!body[switch..prepared].contains("verify_with_repair("), "{lane}: no witness verification on the plan path");
+        }
+        let start = src.find("async fn run_selected(").unwrap();
+        let issue = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(issue.contains("if !plan_mode {\n    if let Some(report)=acceptance_escalation::execute("), "the ladder runs only with the gate on");
+        assert!(issue.contains("plan_proof::record_build_proof("), "the build records its test proof");
+    }
+
+    /// #2464 AC (#2329, #2350, #2439): an own PR stopped after its rescopes
+    /// (for example on `baseline_witness_invalid`) is not held for a day with
+    /// the gate off. Its pending findings become repair notes on the same
+    /// branch and head, routed through the one shared revise round.
+    #[test]
+    fn an_own_pr_stopped_on_rescope_registration_repairs_in_plan_mode() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let parked = at("if !plan_mode && acceptance::own_pr_rescope::parked(&rescope_entry");
+        let plan = at("if plan_mode {");
+        let notes = at("rescope_notes = workflow.latest_review_receipt(\"resume-structured-\")?");
+        let bound = at("workflow.bind_plan(&resumed_plan)?;");
+        let rescoped = at("own_pr_rescope::run(");
+        let carried = at("rescope_notes.take()");
+        let review = at("admit_review_binding(");
+        assert!(parked < plan && plan < notes && notes < bound && bound < rescoped, "the plan branch runs before any rescope registration");
+        assert!(carried < review, "the carried findings route the repair before any re-review");
+    }
+
+    /// #2329 (PR #2378, head 856aca6f): the CI code-repair ladder ran before
+    /// the pending own-PR rescope and the CI scope step, so it spent four
+    /// rounds on a repair that could not edit `notify.rs` and its backoff
+    /// returned before the rescope (and overwrote it). The CI preparation is
+    /// told a rescope is pending; the rescope runs; the CI scope step runs; a
+    /// refusal there goes straight to the rescope in the same run; and only
+    /// then is a due CI repair round admitted, before the revise round uses it.
+    #[test]
+    fn resume_admits_a_due_ci_repair_round_only_after_the_scope_decision() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let pending = at("own_pr_rescope::pending(&rescope_entry)");
+        let prepared = at("ci_repair::prepare_scoped(");
+        let told = at("&ci_repair::SharedReplay, rescope_findings.is_some())");
+        let rescoped = at("own_pr_rescope::run(");
+        let widened = at("acceptance::ci_scope::widen(");
+        let straight = at("own_pr_rescope::pending(&workflow.current_checkpoint()?)");
+        let admitted = at("ci_repair::admit_due(");
+        let repaired = at("ci_findings.take()");
+        assert!(pending < prepared && prepared < told, "the CI preparation must know a rescope is pending");
+        assert!(told < rescoped && rescoped < widened, "the rescope runs before the CI scope step");
+        assert!(widened < straight && straight < admitted, "a refused CI scope must rescope before any repair round is admitted");
+        assert!(admitted < repaired, "the admitted round feeds the CI repair revise round");
+    }
+
+    /// #2491 (PR #2449, 14:33Z): the resume ran acceptance preparation before
+    /// the push its own `publish` checkpoint was waiting for, and parked the
+    /// verified head unpublished. The checkpointed push comes first: after the
+    /// rescope gate reads the entry, and before the resume moves the
+    /// checkpoint or prepares acceptance.
+    #[test]
+    fn resume_pushes_its_checkpointed_head_before_acceptance() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("resume_draft_pr lacks {needle}"));
+        let parked = at("own_pr_rescope::parked(&rescope_entry");
+        let pending = at("if workflow.unpushed_publish_checkpoint()? {");
+        let pushed = at("workflow.push_fresh(repo_root, branch, expected_head.is_none())");
+        let started = at(r#"transition(Stage::Reconcile, "resume_started""#);
+        let prepared = at("acceptance::prepare_acceptance(");
+        let qualified = at("acceptance::qualify_or_amend(");
+        assert!(parked < pending && pending < pushed, "the checkpointed push must follow the owner-stop gate");
+        assert!(pushed < started && started < prepared && prepared < qualified,
+            "the checkpointed push must come before the resume re-establishes acceptance");
     }
 
     // --- #931 baseline check: a red `main` is not the builder's failure ----
@@ -18761,11 +19822,76 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert_eq!(t.n, 2, "the infra failure was not counted");
             assert!(t.exhausted());
             assert_eq!(t.reason(), format!("stuck:gate-red:{fp}"));
-            label_gave_up(&repo, 71002, t.reason(), false, None).await.unwrap();
+            label_gave_up(&repo, 71002, t.reason(), false, None, GaveUpNote::Reason).await.unwrap();
             let log = calls();
             assert!(log.contains("--add-label"), "{log}");
             let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
             assert!(comments.contains(&format!("reason=stuck:gate-red:{fp}")), "{comments}");
+        });
+    }
+
+    /// #1644: independent proof that current main already satisfies an issue
+    /// parked it on `await_request_or_main_change`. Main changes many times a
+    /// day, so the same paid scope, verifier and completeness review re-ran
+    /// and re-proved "already done" forever (the owner paused it by hand).
+    /// The proof now closes the issue as completed, once, through the same
+    /// terminal routing and owner controls as every other terminal write.
+    #[test]
+    fn issue_proven_satisfied_on_main_closes_as_completed() {
+        const CHILD: &str = "JARVIS_1644_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("fake-gh.py");
+            augmentagent_test_support::write_executable(&gh, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['JARVIS_1644_ROOT'])
+args = sys.argv[1:]
+with (root/'gh-calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\n')
+labels = json.loads((root/'labels.json').read_text())
+if args[:2]==['repo','view']:
+    print('fixture-owner/repo')
+elif args[:2]==['api','repos/fixture-owner/repo/issues/1644']:
+    print(json.dumps({'number':1644,'state':'open','labels':[{'name':n} for n in labels]}))
+elif args[:2]==['issue','close']:
+    print('closed')
+else:
+    sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n'); sys.exit(1)
+"#).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::issue_proven_satisfied_on_main_closes_as_completed", "--nocapture"])
+                .env(CHILD, "1")
+                .env("JARVIS_1644_ROOT", root.path())
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.path().join("workflow.db"))
+                .env("HOME", root.path().join("home"))
+                .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.path().join("state"))
+                .env("GH_BIN", gh)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("JARVIS_1644_ROOT").unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let calls = || std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap_or_default()
+                .lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+            let base = "4fbb04bf69c9a69f577136ab5009b78aef94a55c";
+            // A manual issue is never closed by automatic routing.
+            std::fs::write(root.join("labels.json"), format!("[\"{MANUAL_ENGINEERING_LABEL}\"]")).unwrap();
+            assert!(close_satisfied_issue(&root, 1644, base, true).await.is_err());
+            assert!(!calls().iter().any(|call| call.starts_with(&["issue".into(), "close".into()])));
+            std::fs::write(root.join("labels.json"), "[]").unwrap();
+            close_satisfied_issue(&root, 1644, base, true).await.unwrap();
+            let closes = calls().into_iter().filter(|call| call.starts_with(&["issue".into(), "close".into()])).collect::<Vec<_>>();
+            assert_eq!(closes.len(), 1, "{closes:?}");
+            let close = &closes[0];
+            assert_eq!(close[2], "1644");
+            assert_eq!(close[close.iter().position(|a| a == "--reason").unwrap() + 1], "completed");
+            let comment = &close[close.iter().position(|a| a == "--comment").unwrap() + 1];
+            assert!(comment.contains(base) && comment.contains("already satisfies"), "{comment}");
         });
     }
 
@@ -20127,10 +21253,14 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find("workflow_guard.push_fresh(repo_root,&branch,automatic_routing)").expect("guarded fresh compare-and-swap push");
+        let force = body.find("publication::push_retained(&mut workflow_guard,repo_root,&worktree,&branch,").expect("guarded fresh compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
-        let create = body.find(r#""pr", "create""#).expect("PR creation");
+        // #2279: the request is built (and retained) before the push; the
+        // remote creation itself still follows the reset.
+        let request = body.find(r#""pr", "create""#).expect("PR request");
+        assert!(request < force, "publication request is retained before the push");
+        let create = body.find("publication::publish(&workflow_guard,").expect("PR creation");
         assert!(force < supersede && failed < supersede, "only after the push has landed");
         assert!(supersede < create, "before anything else can resume the branch");
         assert_eq!(body.matches("supersede_review_history(").count(), 1);
@@ -20357,13 +21487,13 @@ else:
             return;
         };
         let branch=format!("{BRANCH_PREFIX}70994");let repo=fixture_repo_1037(&root,&[&branch]);
-        assert!(label_gave_up(&repo,70994,"held:synthetic",true,None).await.is_err());
+        assert!(label_gave_up(&repo,70994,"held:synthetic",true,None, GaveUpNote::Reason).await.is_err());
         let calls=gh_calls_1037(&root);
         assert_eq!(calls.iter().filter(|c|gh_call_is(c,&["issue","comment"])).count(),1,
             "actual reason comment did not precede the routing change");
         assert!(!calls.iter().any(|c|gh_call_is(c,&["issue","edit"])),"terminal label ignored a late issue routing change");
         let before=calls.len();
-        label_gave_up(&repo,70994,"held:synthetic",false,None).await.unwrap();
+        label_gave_up(&repo,70994,"held:synthetic",false,None, GaveUpNote::Reason).await.unwrap();
         assert!(gh_calls_1037(&root)[before..].iter().any(|c|gh_call_is(c,&["issue","edit"])),
             "automatic routing revoked explicit manual labeling");
     }
@@ -21130,6 +22260,10 @@ mod runtime_readiness_gate_tests {
 mod linked_pr_dedup_regressions {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[tokio::test]
+    async fn predicted_refusal_without_split_keeps_build_eligible() {
+        fixture("prediction-advisory").await;
+    }
 
     // Every override is confined to a disposable child; never read the daemon's
     // workflow database or change process-global configuration in parallel tests.
@@ -21201,6 +22335,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 "remote-selection" => "linked_pr_is_not_returned_by_real_remote_issue_selector",
                 "midflight" => "pr_appearing_after_selection_holds_real_guard_before_further_work",
                 "midflight-slicing" => "pr_appearing_at_child_creation_preserves_plan_and_parent",
+                "prediction-advisory" => "predicted_refusal_without_split_keeps_build_eligible",
                 "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
                 "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
                 _ => unreachable!(),
@@ -21223,7 +22358,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             return;
         }
         let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
-        if matches!(case,"midflight"|"midflight-slicing") {
+        if matches!(case,"midflight"|"midflight-slicing"|"prediction-advisory") {
             let path=PathBuf::from(std::env::var_os("AUGMENTAGENT_AUTOPR_WORKFLOW_DB").unwrap());
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
                 repo_root:&repo,worktree:&repo,repository:"fixture-owner/repo",source_issue:Some(42),pr:None,
@@ -21233,7 +22368,15 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
             if case=="midflight" {
                 guard.require_fresh_issue(&repo).await.unwrap();
-                std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
+                if case=="prediction-advisory" {
+                let issue=Issue {number:42,title:"Correct widget rounding".into(),body:"Round widget values consistently.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
+                let accounting=guard.capacity_accounting(false).unwrap();
+                let _=scope_policy::finish_prediction(&repo,&issue,"predicted guarded or large diff","original owner request",&[],&mut guard,&accounting,false).await.unwrap();
+                let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint,before.checkpoint,"advisory scope prediction parked the real build pipeline");
+                guard.finish().unwrap();return;
+            }
+            std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
                 let error=guard.require_fresh_issue(&repo).await.unwrap_err();
                 assert_eq!(error.downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
                 assert!(linked_claims::report(&error).is_some());
@@ -21242,7 +22385,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 let plan=vec![Slice{title:"Round small values".into(),body:"Cover small widget values.".into()},
                     Slice{title:"Round large values".into(),body:"Cover large widget values.".into()}];
                 let accounting=guard.capacity_accounting(false).unwrap();
-                let report=finish_scope_refusal(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting,false).await.unwrap();
+                let report=scope_policy::finish_prediction(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting,false).await.unwrap().unwrap();
                 assert!(report.is_idle());assert!(!report.billed);
                 assert_eq!(report.message,linked_claims::Hold::Claimed.to_string());
             }
@@ -21620,3 +22763,7 @@ mod observation_wake_tests;
 #[cfg(test)]
 #[path = "self_improve_ci_repair_tests.rs"]
 mod ci_repair_tests;
+
+#[cfg(test)]
+#[path="self_improve_stall_tests.rs"]
+mod stall_tests;

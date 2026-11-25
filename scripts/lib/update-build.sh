@@ -4,6 +4,15 @@
 run_update_build() {
   local cli="$1" target="$2" help="" output="" code=0 legacy=0
   local repair="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secure-release-executables.py"
+  if [ -n "${AUGMENTAGENT_REMOTE_BUILD_HOST:-}" ]; then
+    if python3 "$(dirname "$repair")/remote-builder/client.py" \
+        --host "$AUGMENTAGENT_REMOTE_BUILD_HOST" --sha "${3:-}" \
+        --repo "${REPO_ROOT:-$(pwd)}" --target "$target" >> "$LOG" 2>&1; then
+      return 0
+    fi
+    log "update deferred: remote release builder unavailable or artifacts rejected; retry next tick (no local fallback)"
+    return 75
+  fi
   python3 "$repair" "$target/release" >> "$LOG" 2>&1 || return 1
   local driver=(cargo)
   if help=$("$cli" disk build --help 2>/dev/null); then
