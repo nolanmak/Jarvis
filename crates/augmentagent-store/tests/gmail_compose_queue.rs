@@ -84,6 +84,10 @@ fn a_reopen_keeps_one_row_per_key_and_one_post_receipt() {
     }
 
     let store = open(&dir);
+    let rows: i64 = store
+        .with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM gmail_compose_queue", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(rows, 1, "a repeat 429 under one key must leave exactly one row");
     assert_eq!(due_keys(&store, T0 + 60_000), ["rate-limited"]);
     let row = store.gmail_compose("rate-limited").unwrap().unwrap();
     assert_eq!(row.payload, entry("", "original", 0).payload);
