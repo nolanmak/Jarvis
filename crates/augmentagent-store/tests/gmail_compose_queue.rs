@@ -135,14 +135,36 @@ fn competing_and_stale_compare_and_swaps_leave_the_row_untouched() {
     assert!(!stale.unwrap(), "a stale attempt count must not transition the row");
     assert_eq!(store.gmail_compose("cas").unwrap().unwrap(), claimed);
 
-    assert!(store.transition_gmail_compose("cas", Retrying, 1, Landed, None, T0 + 4).unwrap());
-    let replay = store.transition_gmail_compose("cas", Retrying, 1, Unknown, None, T0 + 5);
+    let next = Some(T0 + 90_000);
+    assert!(store.transition_gmail_compose("cas", Retrying, 1, Queued, next, T0 + 4).unwrap());
+    let reparked = store.gmail_compose("cas").unwrap().unwrap();
+    assert_eq!((reparked.status, reparked.retry_after_ms), (Queued, T0 + 90_000));
+
+    assert!(store.transition_gmail_compose("cas", Queued, 1, Landed, None, T0 + 5).unwrap());
+    let replay = store.transition_gmail_compose("cas", Queued, 1, Unknown, None, T0 + 6);
     assert!(!replay.unwrap(), "the applied transition must not be replayed");
     let landed = store.gmail_compose("cas").unwrap().unwrap();
-    assert_eq!((landed.status, landed.updated_at_ms), (Landed, T0 + 4));
-    assert_eq!(landed.retry_after_ms, T0, "retry_after is kept when none is supplied");
+    assert_eq!((landed.status, landed.updated_at_ms), (Landed, T0 + 5));
+    assert_eq!(landed.retry_after_ms, T0 + 90_000, "retry_after is kept when none is supplied");
+}
 
-    let next = Some(T0 + 90_000);
-    assert!(store.transition_gmail_compose("cas", Landed, 1, Retrying, next, T0 + 6).unwrap());
-    assert_eq!(store.gmail_compose("cas").unwrap().unwrap().retry_after_ms, T0 + 90_000);
+/// A settled compose is the last word: whatever a caller believes it read,
+/// neither a claim nor a transition may put it back in the retry rotation.
+#[test]
+fn a_terminal_row_can_neither_be_claimed_nor_revived() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    for terminal in [Landed, GaveUp, Unknown] {
+        let key = format!("settled-{}", terminal.as_str());
+        assert!(park(&store, &key, T0));
+        assert!(store.transition_gmail_compose(&key, Queued, 0, terminal, None, T0 + 1).unwrap());
+        let settled = store.gmail_compose(&key).unwrap().unwrap();
+
+        let claimed = store.claim_gmail_compose(&key, terminal, 0, T0 + 2);
+        assert!(matches!(claimed, Err(StoreError::InvalidInput(_))), "claimed a {terminal:?} row");
+        let revived = store.transition_gmail_compose(&key, terminal, 0, Retrying, Some(T0), T0 + 3);
+        assert!(matches!(revived, Err(StoreError::InvalidInput(_))), "revived a {terminal:?} row");
+        assert_eq!(store.gmail_compose(&key).unwrap().unwrap(), settled);
+        assert!(!due_keys(&store, T0 + 3).contains(&key));
+    }
 }

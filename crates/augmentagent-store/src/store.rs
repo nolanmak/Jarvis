@@ -202,6 +202,19 @@ fn row_to_compose_queue(r: &rusqlite::Row) -> rusqlite::Result<ComposeQueueRow> 
     })
 }
 
+/// #2387 — a compare-and-swap whose expected status is terminal would have to
+/// reopen a settled compose, which is a caller bug rather than a lost race, so
+/// it is refused instead of reported as a missed swap.
+fn reject_terminal_expectation(idem_key: &str, expected: ComposeQueueStatus) -> StoreResult<()> {
+    if expected.is_retryable() {
+        return Ok(());
+    }
+    Err(StoreError::InvalidInput(format!(
+        "compose queue row {idem_key} is terminal in {}; terminal rows are never reattempted",
+        expected.as_str()
+    )))
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2968,7 +2981,8 @@ impl Store {
     /// #2387 — compare-and-swap a row into `retrying`, bumping `attempt`.
     /// Only the caller holding the expected `(status, attempt)` wins, so a
     /// sweeper reading stale state cannot take a row another one is already
-    /// attempting; `false` leaves the row untouched.
+    /// attempting; `false` leaves the row untouched. A terminal `expected` is
+    /// rejected outright: no claim can revive a settled compose.
     pub fn claim_gmail_compose(
         &self,
         idem_key: &str,
@@ -2976,6 +2990,7 @@ impl Store {
         expected_attempt: i64,
         now_ms: i64,
     ) -> StoreResult<bool> {
+        reject_terminal_expectation(idem_key, expected)?;
         let guard = self.conn.lock().expect("store mutex poisoned");
         let claimed = guard.execute(
             "UPDATE gmail_compose_queue \
@@ -2989,6 +3004,8 @@ impl Store {
     /// #2387 — compare-and-swap a row to its outcome under the same
     /// `(status, attempt)` guard as [`Self::claim_gmail_compose`]. A
     /// `retry_after_ms` of `None` keeps the stored boundary; `Some` moves it.
+    /// A terminal `expected` is rejected, so `landed`, `gave_up` and
+    /// `unknown` are the last word on a compose whatever `next` asks for.
     pub fn transition_gmail_compose(
         &self,
         idem_key: &str,
@@ -2998,6 +3015,7 @@ impl Store {
         retry_after_ms: Option<i64>,
         now_ms: i64,
     ) -> StoreResult<bool> {
+        reject_terminal_expectation(idem_key, expected)?;
         let guard = self.conn.lock().expect("store mutex poisoned");
         let changed = guard.execute(
             "UPDATE gmail_compose_queue \
