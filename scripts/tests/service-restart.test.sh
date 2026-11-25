@@ -261,6 +261,19 @@ export AUGMENTAGENT_RESTART_TURN_DB="$TURN_DB"
 RESTART_TURN_DEFER_STAMP="$TURN_DIR/turn-deferred-since"
 DEFER_LOG="$TURN_DIR/log"
 log() { printf '%s\n' "$*" >> "$DEFER_LOG"; }  # _sr_log routes here
+
+# A PATH in $1 carrying only the externals the deferral path uses, so the
+# sqlite3-missing and sqlite3-failing branches are reachable without relying
+# on this process's filesystem privileges: root reads a chmod 000 DB, so
+# permissions alone cannot produce an unreadable store here.
+turn_stub_bin() {
+  local t p
+  mkdir -p "$1"
+  for t in cat date rm head tr mkdir dirname printf flock; do
+    p=$(command -v "$t") && [ -x "$p" ] && ln -sf "$p" "$1/$t"
+  done
+}
+
 sqlite3 "$TURN_DB" "CREATE TABLE surface_native_turns (platform TEXT, account_id TEXT,
   conversation_id TEXT, thread_id TEXT, turn_id TEXT, status TEXT,
   created_at_ms INTEGER, finished_at_ms INTEGER);
@@ -277,11 +290,17 @@ check "defers while an owner turn is pending" "$?" "0"
 grep -q "restart deferred: owner turn in flight" "$DEFER_LOG" \
   && ok "logs the turn deferral" || bad "logs the turn deferral" "$(cat "$DEFER_LOG")"
 
+TURN_STAMP_FIRST=$(cat "$RESTART_TURN_DEFER_STAMP")
 maybe_defer_restart >/dev/null 2>&1
 check "keeps deferring inside the cap" "$?" "0"
+check "keeps the first timestamp across retries inside the cap" \
+  "$(cat "$RESTART_TURN_DEFER_STAMP")" "$TURN_STAMP_FIRST"
 
 ( AUGMENTAGENT_RESTART_FORCE=1; maybe_defer_restart >/dev/null 2>&1 )
 check "AUGMENTAGENT_RESTART_FORCE=1 bypasses the turn deferral" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "a forced restart clears the turn stamp" "stamp survived" \
+  || ok "a forced restart clears the turn stamp"
 
 printf '%s\n' "$(( $(date +%s) - 601 ))" > "$RESTART_TURN_DEFER_STAMP"
 : > "$DEFER_LOG"
@@ -289,8 +308,13 @@ maybe_defer_restart >/dev/null 2>&1
 check "proceeds once the turn deferral passes the cap" "$?" "1"
 grep -q "restarting anyway" "$DEFER_LOG" \
   && ok "logs the capped deploy" || bad "logs the capped deploy" "$(cat "$DEFER_LOG")"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp on the capped deploy" "stamp survived a proceed" \
+  || ok "clears the turn stamp on the capped deploy"
+# The capped deploy is authorized for this tick, so a turn still pending
+# afterwards opens its own window rather than inheriting the spent one.
 maybe_defer_restart >/dev/null 2>&1
-check "a later tick for the same long turn does not restart the window" "$?" "1"
+check "a turn still pending after the capped deploy re-arms the window" "$?" "0"
 
 sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='complete' WHERE turn_id='t2';"
 printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
@@ -299,23 +323,45 @@ check "proceeds once the turn finishes" "$?" "1"
 [ ! -e "$RESTART_TURN_DEFER_STAMP" ] && ok "clears the turn stamp when nothing is pending" \
   || bad "clears the turn stamp when nothing is pending" "stamp survived"
 
-# Fail open: unreadable DB, missing table, no sqlite3.
+# Fail open: unreadable DB, a query that cannot answer, missing table, no
+# sqlite3. Each permits the deploy, so each must also drop a stale stamp.
 sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='pending' WHERE turn_id='t2';"
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
 chmod 000 "$TURN_DB"
-if [ -r "$TURN_DB" ]; then ok "unreadable DB (skipped: running as root)"; else
-  maybe_defer_restart >/dev/null 2>&1; check "proceeds when the DB is unreadable" "$?" "1"; fi
+if [ -r "$TURN_DB" ]; then
+  ok "unreadable DB (skipped: running as root; the stubbed sqlite3 covers it)"
+else
+  maybe_defer_restart >/dev/null 2>&1
+  check "proceeds when the DB is unreadable" "$?" "1"
+  [ -e "$RESTART_TURN_DEFER_STAMP" ] \
+    && bad "clears the turn stamp when the DB is unreadable" "stamp survived" \
+    || ok "clears the turn stamp when the DB is unreadable"
+fi
 chmod 600 "$TURN_DB"
+
+# A sqlite3 that fails on a readable store with a pending row: only the
+# unanswerable query can let this deploy through.
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
+( FAILSQL="$TURN_DIR/failsql"; turn_stub_bin "$FAILSQL"
+  printf '#!/bin/sh\nexit 1\n' > "$FAILSQL/sqlite3"; chmod +x "$FAILSQL/sqlite3"
+  PATH="$FAILSQL"; maybe_defer_restart >/dev/null 2>&1 )
+check "proceeds when the sqlite3 query fails" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp when the query fails" "stamp survived" \
+  || ok "clears the turn stamp when the query fails"
 ( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/empty.db"; : > "$TURN_DIR/empty.db"
   maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when the table is missing" "$?" "1"
 ( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/absent.db"; maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when the DB does not exist" "$?" "1"
 [ ! -e "$TURN_DIR/absent.db" ] && ok "never creates a missing DB" || bad "never creates a missing DB"
-( NOSQL="$TURN_DIR/nosql"; mkdir -p "$NOSQL"
-  for t in cat date rm head tr mkdir dirname printf flock; do
-    p=$(command -v "$t") && [ -x "$p" ] && ln -sf "$p" "$NOSQL/$t"; done
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
+( NOSQL="$TURN_DIR/nosql"; turn_stub_bin "$NOSQL"
   PATH="$NOSQL"; maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when sqlite3 is not installed" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp when sqlite3 is missing" "stamp survived" \
+  || ok "clears the turn stamp when sqlite3 is missing"
 
 unset -f log
 rm -rf "$TURN_DIR"

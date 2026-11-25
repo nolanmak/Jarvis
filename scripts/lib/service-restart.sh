@@ -380,10 +380,12 @@ owner_turn_defer() {
       ;;
   esac
   if [ $((now - since)) -ge "$RESTART_TURN_DEFER_MAX_SECS" ]; then
-    # Keep the stamp: if another guard holds this tick, the next one must not
-    # start a fresh 600 s window for the same long turn. It clears once
-    # nothing is pending.
+    # Every path that permits a deploy drops the stamp, this one included: a
+    # window the cap already spent must not decide a later tick's deferral.
+    # The deploy is authorized from here, so a turn still pending afterwards
+    # gets its own window rather than inheriting one that is already elapsed.
     _sr_log "owner turn still in flight after $((now - since))s (cap ${RESTART_TURN_DEFER_MAX_SECS}s); restarting anyway — the turn will be reported interrupted"
+    rm -f "$RESTART_TURN_DEFER_STAMP"
     return 1
   fi
   _sr_log "restart deferred: owner turn in flight ($n pending, $((now - since))s; retry next tick)"
