@@ -47,6 +47,9 @@ pub(super) async fn preflight(
                 "index_tree":tree,"main":dependency.main,"shipping_authority":false}))?;
             return Err(dependency.into());
         }
+        if main_outpaces_controller(root).await {
+            return Err(error.context(CONTROLLER_ROLLOUT_PENDING));
+        }
         return Err(error);
     }
     audit.record_controller(
@@ -54,6 +57,19 @@ pub(super) async fn preflight(
         "backend":"github-actions", "shipping_authority":false}),
     )?;
     Err(AwaitingHostedCi.into())
+}
+
+/// #2572: origin/main itself fails this controller's reviewed CI policy, so
+/// no candidate can pass until the controller (the autoship pin) is rolled.
+/// `infra_failure_reason` reads this as a bounded wait, never a repair round.
+pub(super) const CONTROLLER_ROLLOUT_PENDING: &str =
+    "controller rollout pending: origin/main no longer matches this controller's reviewed CI policy; move the autoship pin";
+
+async fn main_outpaces_controller(root: &Path) -> bool {
+    match shared_ci::git(root, &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]).await {
+        Ok(main) => policy_check(root, main.trim()).await.is_err(),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +806,36 @@ mod tests {
         );
     }
 
+    /// #2572: #2566 added `.github/workflows/security.yml` to main while the
+    /// pinned worker still carried the older contract. Every candidate that
+    /// contained main then failed preflight with "workflow inventory changed",
+    /// and the gate spent repair rounds pushing empty commits for a failure
+    /// no candidate can fix. Main failing this controller's own policy is a
+    /// controller-rollout wait: bounded infrastructure, never a code repair,
+    /// and still never a passing gate.
+    #[tokio::test]
+    async fn main_ahead_of_the_controller_policy_is_a_rollout_wait_not_a_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        retained_policy_fixture(&root).await;
+        policy_git(&root, &["checkout", "-q", "-f", "main"]).await;
+        let workflow = root.join(".github/workflows/security-scan-fixture.yml");
+        std::fs::write(&workflow, "name: security\non: [pull_request]\n").unwrap();
+        let main = commit_policy_fixture(&root, "main adds a workflow the controller has not reviewed").await;
+        policy_git(&root, &["update-ref", "refs/remotes/origin/main", &main]).await;
+        policy_git(&root, &["checkout", "-q", "-b", "merged-candidate", &main]).await;
+        std::fs::write(root.join("product"), "fix merged with current main").unwrap();
+        policy_git(&root, &["add", "product"]).await;
+        let audit = test_resource_audit(directory.path());
+        let error = preflight(&root, &audit).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(error.downcast_ref::<AwaitingHostedCi>().is_none(), "stale controller must not grant verification: {text}");
+        assert!(error.downcast_ref::<MainPolicyReconciliation>().is_none(), "merging main cannot cure it: {text}");
+        assert_eq!(super::super::infra_failure_reason(&text), Some("controller CI policy rollout pending"),
+            "a controller behind main is a bounded wait: {text}");
+        assert!(!super::super::gate_repair_wanted(0, 3, &text, false), "no repair round for a controller rollout: {text}");
+    }
+
     #[tokio::test]
     async fn candidate_policy_edits_cannot_masquerade_as_inherited_drift() {
         use sha2::{Digest, Sha256};
@@ -817,6 +863,9 @@ mod tests {
             "candidate edits must not be called inherited policy"
         );
         assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
+        // #2572: main still matches the controller, so the candidate's own
+        // edit is code the builder must answer for, never a rollout wait.
+        assert_eq!(super::super::infra_failure_reason(&format!("{error:#}")), None);
     }
     #[tokio::test]
     async fn unreviewed_main_policy_cannot_supply_reconciliation_authority() {
