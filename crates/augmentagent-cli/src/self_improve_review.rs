@@ -261,6 +261,12 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+/// #2451: #2421's worst-case model calls for one complete review attempt,
+/// the unit the per-binding review call budget is built from.
+pub(super) fn attempt_call_bound() -> u64 {
+    evidence_plan::worst_case_calls(evidence_plan::MAX_EVIDENCE_GROUPS_PER_ROLE)
+        .expect("the per-role evidence group cap is a small positive constant")
+}
 #[path="self_improve_review_source_ranges.rs"]
 mod source_ranges;
 #[path = "self_improve_review_group.rs"]
@@ -552,6 +558,29 @@ async fn caller_discovery_symbols(
     source_items::collect(root,&snapshot.base,&snapshot.head,&implementation).await
 }
 
+/// The reviewed evidence is the exact `base..head` diff. #2554: refs are
+/// shared across worktrees, so a sibling lane's fetch can fast-forward
+/// origin/main mid-review without touching this candidate. Main moving past
+/// the reviewed base is not a candidate change (merge freshness is enforced
+/// at merge time); a moved head, a dirty tree, or a main that no longer
+/// contains the reviewed base still invalidates the evidence.
+async fn ensure_candidate_unchanged(worktree: &Path, head: &str, base: &str) -> Result<()> {
+    let main = git(worktree, &["rev-parse", "origin/main"]).await?;
+    let main = main.trim();
+    let base_kept = main == base
+        || git_output(worktree, &["merge-base", "--is-ancestor", base, main]).await?.0;
+    anyhow::ensure!(
+        git(worktree, &["rev-parse", "HEAD"]).await?.trim() == head
+            && base_kept
+            && git(worktree, &["status", "--porcelain", "--untracked-files=all"])
+                .await?
+                .trim()
+                .is_empty(),
+        "candidate changed while reviews ran"
+    );
+    Ok(())
+}
+
 async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
     let dirty = git(
         &worktree,
@@ -790,8 +819,10 @@ async fn run_impl(
                 .map(|criterion| (criterion.id.clone(), criterion.requirement.clone()))
                 .collect()
         } else {
+            // #2464: a plan-bound workflow reviews against its plan criteria;
+            // hosted CI and this review are its proof.
             anyhow::ensure!(
-                context.workflow.is_none(),
+                context.workflow.is_none_or(|workflow| workflow.plan_mode()),
                 "production review requires executable acceptance evidence"
             );
             criteria
@@ -805,10 +836,14 @@ async fn run_impl(
         "reserved reviewer criterion collides with acceptance contract"
     );
     contract.insert("REGRESSION".into(), REGRESSION_REQUIREMENT.into());
-    let contract_hash = context
-        .acceptance_evidence
-        .map(|(_, receipt)| receipt.binding.contract_hash.clone())
-        .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
+    let plan_contract = context.workflow.filter(|workflow| workflow.plan_mode()).map(|workflow| workflow.binding().contract.clone());
+    let contract_hash = match context.acceptance_evidence {
+        Some((_, receipt)) => receipt.binding.contract_hash.clone(),
+        None => match plan_contract {
+            Some(plan) => plan,
+            None => aligned::digest(&serde_json::to_vec(&contract)?),
+        },
+    };
     let (callers,caller_plan)=complete_or_streamed_callers(&worktree,&head,&caller_symbols).await?;
     let rubric = review_calibration::active()?;
     let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;
@@ -1090,18 +1125,7 @@ async fn run_impl(
     }
     // Check the immutable source again after model calls. A sibling push or
     // local edit invalidates the evidence rather than borrowing its approval.
-    anyhow::ensure!(
-        git(&worktree, &["rev-parse", "HEAD"]).await?.trim() == head
-            && git(&worktree, &["rev-parse", "origin/main"]).await?.trim() == base
-            && git(
-                &worktree,
-                &["status", "--porcelain", "--untracked-files=all"]
-            )
-            .await?
-            .trim()
-            .is_empty(),
-        "candidate changed while reviews ran"
-    );
+    ensure_candidate_unchanged(&worktree, &head, &base).await?;
     if let Some(guard) = context.workflow {
         let mut calibration_context=recovered_files.clone();
         calibration_context.extend(final_recovered_contexts);
@@ -1223,6 +1247,40 @@ mod tests {
         fixture_git(path, &["add", "-A"]);
         fixture_git(path, &["commit", "-qm", "candidate"]);
         dir
+    }
+
+    #[tokio::test]
+    async fn main_fast_forward_during_review_is_not_a_candidate_change() {
+        // #2546: a sibling lane fetched origin/main (refs are shared across
+        // worktrees) while reviews ran. The reviewed base..head diff is
+        // unchanged, so the review must not be stranded.
+        let dir = candidate_fixture();
+        let path = dir.path();
+        let head = fixture_git(path, &["rev-parse", "HEAD"]);
+        let base = fixture_git(path, &["rev-parse", "origin/main"]);
+        ensure_candidate_unchanged(path, &head, &base).await.unwrap();
+        fixture_git(path, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(path.join("sibling.rs"), "fn sibling() {}\n").unwrap();
+        fixture_git(path, &["add", "."]);
+        fixture_git(path, &["commit", "-qm", "sibling merge"]);
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fixture_git(path, &["checkout", "-q", "--detach", &head]);
+        ensure_candidate_unchanged(path, &head, &base).await
+            .expect("main advancing past the reviewed base is not a candidate change");
+        // A rewritten main no longer contains the reviewed base: refuse.
+        fixture_git(path, &["checkout", "-q", "--orphan", "rewrite"]);
+        fixture_git(path, &["commit", "-qm", "rewritten main"]);
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fixture_git(path, &["checkout", "-q", "--detach", &head]);
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", &base]);
+        // A moved head or a dirty tree is still a real change.
+        std::fs::write(path.join("untracked.rs"), "x").unwrap();
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
+        std::fs::remove_file(path.join("untracked.rs")).unwrap();
+        std::fs::write(path.join("source.rs"), "fn pushed() {}\n").unwrap();
+        fixture_git(path, &["commit", "-qam", "new head"]);
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
     }
 
     #[tokio::test]

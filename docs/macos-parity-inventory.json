@@ -959,6 +959,33 @@
     "evidence": null
   },
   {
+    "id": "cli:tabagent-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Hidden MCP server for TabAgent browse and act tools in the owner's Chrome, attached to owner-authorized turns; proxies to the loopback TabAgent REST API with a scoped token read from a private file and never starts a TabAgent daemon.",
+    "macos_target": "Hidden MCP server for TabAgent browse and act tools in the owner's Chrome, attached to owner-authorized turns; proxies to the loopback TabAgent REST API with a scoped token read from a private file and never starts a TabAgent daemon.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic local HTTP responses"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent tabagent_tool on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:tabagent-handoff-url",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Prints the loopback URL for TabAgent's handoff webhook (creating its private secret on first use) so `serve` can post one-time phone handoff links to the owner's Discord; the listener binds 127.0.0.1 only.",
+    "macos_target": "Prints the loopback URL for TabAgent's handoff webhook (creating its private secret on first use) so `serve` can post one-time phone handoff links to the owner's Discord; the listener binds 127.0.0.1 only.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic local HTTP responses"
+    ],
+    "owner_issue": "https://github.com/nolanmak/tabagent/issues/61",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent tabagent_handoff on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified"
+  },
+  {
     "id": "cli:web-tool",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Hidden MCP server for web search, page fetch and the per-conversation provider pin, attached to turns whose model cannot run native web tools; credentials reach the child only through its environment.",

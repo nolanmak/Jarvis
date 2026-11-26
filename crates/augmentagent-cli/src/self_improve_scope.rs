@@ -52,8 +52,18 @@ struct NativeReplyProvenance {
 
 /// The qualification context must include this policy identity. A saved reply
 /// is an observation under its original policy, never approval of a later one.
+/// Versioned on purpose like `baseline_witness::WITNESS_POLICY_VERSION`
+/// (#2493), never derived from this file's bytes. Version 1 is the identity
+/// the retired byte-hash scheme gave this module as deployed from cfa5393b on,
+/// so every retained native reply stays authenticated across the switch.
+pub(super) const SCOPE_WITNESS_POLICY_VERSION:u32=1;
+const SCOPE_WITNESS_POLICY_V1:&str="d404a078a3bb1f5377d365a750126faf76610f0437b9ece9fed0825a834f5512";
 pub(super) fn witness_policy_hash()->String {
-    amendment::digest(include_bytes!("self_improve_scope.rs"))
+    scope_witness_policy(SCOPE_WITNESS_POLICY_VERSION)
+}
+pub(super) fn scope_witness_policy(version:u32)->String {
+    if version==1 {return SCOPE_WITNESS_POLICY_V1.into();}
+    amendment::digest(&serde_json::to_vec(&("scope-witness-policy",version)).unwrap())
 }
 
 struct NativeScopeContext<'a> {
@@ -779,7 +789,7 @@ pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,p
 /// Native admissions with no completed result hold even after input/binding
 /// changes. Such a hold requires original-outcome recovery, not a fresh call.
 /// `epoch` must bind the original requirements/source/observations and
-/// `witness_policy_hash()`. Changed policy is a new qualification input.
+/// `witness_policy_hash()`. A changed policy version is a new qualification input.
 pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::WorkflowGuard,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<(T,NativeReply)> {
     ensure!(epoch.len()==64 && epoch.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid baseline-witness input identity");
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance.canonicalize()?;

@@ -921,6 +921,32 @@ def literal_command_argv(command):
     return argv
 
 
+TABAGENT_READS = frozenset('mcp__tabagent__' + leaf for leaf in (
+    'page_snapshot', 'page_markdown', 'page_text', 'page_find', 'extract_table', 'extract_links'))
+TABAGENT_REPEATABLE = frozenset('mcp__tabagent__' + leaf for leaf in (
+    'act_click', 'act_type', 'act_press', 'act_select', 'act_check', 'act_hover',
+    'act_scroll', 'act_fill', 'form_fill', 'nav_goto', 'tabs', 'dialog_handle',
+    # nolanmak/tabagent#61: a second solve after CAPTCHA_UNSOLVED, or a new
+    # handoff after the owner cancelled one, is a new, intended action.
+    'captcha_solve', 'auth_handoff'))
+# A server's `toolTimeouts` may give named tools a longer wait than the 120 s
+# default cap (TabAgent's auth_handoff waits for a person). Codex's own
+# tool_timeout_sec for this bridge is raised to match (codex_tools.rs).
+MCP_TOOL_TIMEOUT_MAX = 2400
+
+
+def repeatable_operation(name):
+    """Mutations whose identical repeat is a new, intended action (#2519).
+
+    Clicking the same ref after a scroll, scrolling twice or pressing a key
+    again are ordinary browser steps, so a completed or failed receipt must
+    not refuse or replace them. They stay journaled, so an unanswered
+    (`started`) one still requires reconciliation. form_submit is excluded:
+    an identical repeat is most likely a real double submission.
+    """
+    return name in TABAGENT_REPEATABLE
+
+
 def read_only_operation(name, arguments):
     """Known read contracts, not server-supplied advisory annotations.
 
@@ -943,6 +969,16 @@ def read_only_operation(name, arguments):
         return (arguments.get('operation') == 'status'
                 and isinstance(arguments.get('taskId'), str)
                 and set(arguments) == {'operation', 'taskId'})
+    # #2519: TabAgent page reads observe the live page. A second identical
+    # read after the page changes is a new observation, not a replayed
+    # effect. Explicit names; navigation and actions stay mutations.
+    if name in TABAGENT_READS:
+        return True
+    if name == 'mcp__tabagent__nav_wait':
+        # for=fn runs page JavaScript (the Jarvis proxy refuses it too).
+        return isinstance(arguments.get('for'), str) and arguments['for'] != 'fn'
+    if name == 'mcp__tabagent__tabs':
+        return arguments == {'action': 'list'}
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
     if name in ('mcp__memory__memory_search', 'mcp__memory__memory_recent',
@@ -1176,7 +1212,8 @@ class HandoffJournal:
     def execute(self, name, arguments, action):
         with self.locked():
             state = self.load()
-            for row in reversed(state['operations']):
+            # A repeatable action has no earlier receipt to return or retry.
+            for row in ([] if repeatable_operation(name) else reversed(state['operations'])):
                 if same_operation(row, name, arguments):
                     if row['status'] in ('not_applied', 'refused'):
                         break  # proven not run; preserve this row and append a new attempt
@@ -1229,10 +1266,13 @@ class HandoffJournal:
             if phase == 'PreToolUse':
                 if matching or any(row['status'] == 'started' for row in state['operations']):
                     raise ReconciliationRequired('unfinished primary operation requires reconciliation')
-                if any(row['status'] == 'failed' and same_operation(row, name, arguments)
+                # The primary saw its own earlier result; repeating a browser
+                # UI step is intended. Unanswered rows still block above.
+                repeatable = repeatable_operation(name)
+                if not repeatable and any(row['status'] == 'failed' and same_operation(row, name, arguments)
                        for row in state['operations']):
                     raise ReconciliationRequired('failed primary operation requires reconciliation before a retry')
-                if external_operation(name, arguments) and any(
+                if not repeatable and external_operation(name, arguments) and any(
                         same_operation(row, name, arguments)
                         and row['status'] == 'completed' for row in state['operations']):
                     raise CompletedOperation('external operation already completed for this request; use its prior receipt instead of repeating it')
@@ -2693,6 +2733,12 @@ class Remote:
         self.timeout = min(float(config.get('timeout', 30)), 120)
         if self.timeout <= 0:
             raise Denied('invalid MCP timeout')
+        declared = config.get('toolTimeouts', {})
+        if not isinstance(declared, dict) or not all(
+                isinstance(key, str) and type(value) in (int, float) and value > 0
+                for key, value in declared.items()):
+            raise Denied('invalid MCP tool timeouts')
+        self.tool_timeouts = {key: min(float(value), MCP_TOOL_TIMEOUT_MAX) for key, value in declared.items()}
         if config.get('type', 'stdio') == 'http':
             from urllib.parse import urlparse
             parsed = urlparse(config.get('url', ''))
@@ -2718,22 +2764,27 @@ class Remote:
     def notify(self, method, params):
         self.exchange({'jsonrpc': '2.0', 'method': method, 'params': params}, False)
 
+    def tool_timeout(self, leaf):
+        return self.tool_timeouts.get(leaf, self.timeout)
+
     def request(self, method, params):
+        timeout = self.tool_timeout(params.get('name')) if method == 'tools/call' else None
         self.sequence += 1
         message = {'jsonrpc': '2.0', 'id': self.sequence, 'method': method, 'params': params}
-        reply = self.exchange(message, True)
+        reply = self.exchange(message, True, timeout)
         if reply.get('id') != self.sequence or 'error' in reply or not isinstance(reply.get('result'), dict):
             raise Denied('MCP returned an invalid or failed response')
         return reply['result']
 
-    def exchange(self, message, expect_response):
+    def exchange(self, message, expect_response, timeout=None):
         import time
         import select
+        timeout = self.timeout if timeout is None else timeout
         data = (json.dumps(message) + '\n').encode()
         if self.process is None:
             from urllib.error import URLError
             try:
-                return self.http(data, expect_response)
+                return self.http(data, expect_response, timeout)
             except TimeoutError as error:
                 raise Readiness('mcp_timeout') from error
             except URLError as error:
@@ -2745,7 +2796,7 @@ class Remote:
         self.process.stdin.write(data)
         if not expect_response:
             return None
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + timeout
         while True:
             if b'\n' in self.buffer:
                 line, self.buffer = self.buffer.split(b'\n', 1)
@@ -2772,7 +2823,7 @@ class Remote:
             if len(self.buffer) > MAX_FILE_BYTES:
                 raise Denied('MCP response exceeds size limit')
 
-    def http(self, data, expect_response):
+    def http(self, data, expect_response, timeout=None):
         import urllib.request
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -2784,7 +2835,8 @@ class Remote:
         if self.session is not None:
             headers['Mcp-Session-Id'] = self.session
         request = urllib.request.Request(self.config['url'], data=data, headers=headers, method='POST')
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=self.timeout) as response:
+        with urllib.request.build_opener(NoRedirect()).open(
+                request, timeout=self.timeout if timeout is None else timeout) as response:
             session = response.headers.get('Mcp-Session-Id')
             if session:
                 self.session = session
@@ -3214,8 +3266,13 @@ if __name__ == '__main__':
                        if key in ('available_bytes', 'required_bytes')
                        and type(value) is int and 0 <= value <= 2**64-1}
             print(json.dumps({'ready': False, 'category': error.category, **numbers}))
-        except Exception:
-            print(json.dumps({'ready': False, 'category': 'mcp_start'}))
+        except Exception as error:
+            # #2532: name the real failure. Only a Denied carries its fixed
+            # message; any other exception reports its type alone, so no
+            # path or value from the environment leaves the bridge.
+            detail = (f'Denied: {error.args[0]}' if type(error) is Denied and error.args
+                      and isinstance(error.args[0], str) else type(error).__name__)
+            print(json.dumps({'ready': False, 'category': 'mcp_start', 'detail': detail[:200]}))
         finally:
             if policy is not None:
                 policy.close()

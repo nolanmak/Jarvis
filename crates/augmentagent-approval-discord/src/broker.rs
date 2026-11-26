@@ -28,6 +28,10 @@ pub struct DiscordConfig {
     /// Channel where wiki queries are accepted. `None` disables query replies
     /// in server channels (DMs still work if `allowed_user_id` is set).
     pub query_channel_id: Option<u64>,
+    /// More channels answered exactly like the query channel (each, and each
+    /// of its threads, is its own conversation). Owner commands such as
+    /// `/yolo` and webhook relays stay on `query_channel_id` only.
+    pub extra_query_channel_ids: Vec<u64>,
     /// User ID allowed to send wiki queries OR click approval buttons. `None`
     /// = no allowlist (any user in the channel can drive).
     pub allowed_user_id: Option<u64>,
@@ -63,6 +67,7 @@ pub(crate) struct BrokerState {
     ready: Arc<Notify>,
     ready_flag: std::sync::atomic::AtomicBool,
     pub(crate) query_channel_id: Option<ChannelId>,
+    pub(crate) extra_query_channel_ids: Vec<ChannelId>,
     pub(crate) allowed_user_id: Option<UserId>,
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
@@ -87,6 +92,11 @@ pub(crate) struct BrokerState {
 }
 
 impl BrokerState {
+    /// The query channel plus any extra conversation channels.
+    pub(crate) fn conversation_channels(&self) -> Vec<ChannelId> {
+        self.query_channel_id.into_iter().chain(self.extra_query_channel_ids.iter().copied()).collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         approval_channel_id: ChannelId,
@@ -105,6 +115,7 @@ impl BrokerState {
             ready: Arc::new(Notify::new()),
             ready_flag: std::sync::atomic::AtomicBool::new(false),
             query_channel_id,
+            extra_query_channel_ids: Vec::new(),
             allowed_user_id,
             query_handler,
             action_handler,
@@ -170,7 +181,7 @@ impl DiscordApprovalBroker {
                 }
             }
         } else { None };
-        let state = Arc::new(BrokerState::new(
+        let mut state = BrokerState::new(
             approval_channel,
             config.query_channel_id.map(ChannelId::new),
             config.allowed_user_id.map(UserId::new),
@@ -182,7 +193,10 @@ impl DiscordApprovalBroker {
             config.journal_ops.clone(),
             voice_bridge,
             config.voice_socket_path.is_some(),
-        ));
+        );
+        state.extra_query_channel_ids = config.extra_query_channel_ids.iter().copied()
+            .filter(|id| *id != 0).map(ChannelId::new).collect();
+        let state = Arc::new(state);
 
         *state.interrupted_turns.lock().expect("interrupted turns poisoned") =
             config.interrupted_turns.clone();

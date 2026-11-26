@@ -292,7 +292,7 @@
       "shell": "bash"
     },
     "macos/platform-macos/30": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "macos/platform-macos/31": {
@@ -528,7 +528,7 @@
       "shell": "bash"
     },
     "platform/platform/32": {
-      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
+      "body": "set -euo pipefail\nfor t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary updater-autoship-pin; do\n  echo \"::group::$t\"\n  bash \"scripts/tests/$t.test.sh\"\n  echo \"::endgroup::\"\ndone\nbash scripts/tests/updater-rebuild-trigger.test.sh\nbash scripts/tests/updater-sync-scripts.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/33": {
@@ -939,6 +939,22 @@
     },
     "rust/phone/9": {
       "body": "python3 scripts/phone-offline-tests.py",
+      "shell": "bash"
+    },
+    "security/gitleaks/1": {
+      "body": "bash .github/security/install-tools.sh gitleaks",
+      "shell": "bash"
+    },
+    "security/gitleaks/2": {
+      "body": "bash .github/security/ci-security-scan.sh gitleaks",
+      "shell": "bash"
+    },
+    "security/scan/1": {
+      "body": "bash .github/security/install-tools.sh osv shai-hulud semgrep zizmor",
+      "shell": "bash"
+    },
+    "security/scan/2": {
+      "body": "bash .github/security/ci-security-scan.sh osv shai-hulud semgrep zizmor",
       "shell": "bash"
     },
     "targeted/targeted/10": {
@@ -3152,6 +3168,75 @@
       },
       "role": "validation",
       "sha256": "58ab1cf3528735e23a7c6a84999bef2e2b8d1589949d4f822c782dfeadd226f0"
+    },
+    ".github/workflows/security.yml": {
+      "defaults": {},
+      "env": {},
+      "events": {
+        "pull_request": null,
+        "push": {
+          "branches": [
+            "main"
+          ]
+        },
+        "schedule": [
+          {
+            "cron": "23 13 * * 1"
+          }
+        ],
+        "workflow_dispatch": null
+      },
+      "jobs": {
+        "gitleaks": {
+          "name": "gitleaks",
+          "runs-on": "ubuntu-24.04",
+          "steps": [
+            {
+              "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+              "with": {
+                "fetch-depth": 0,
+                "persist-credentials": false
+              }
+            },
+            {
+              "command_id": "security/gitleaks/1",
+              "name": "Install checksum-verified gitleaks"
+            },
+            {
+              "command_id": "security/gitleaks/2",
+              "name": "Scan this branch's full history"
+            }
+          ],
+          "timeout-minutes": 5
+        },
+        "scan": {
+          "name": "Security scan",
+          "runs-on": "ubuntu-24.04",
+          "steps": [
+            {
+              "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+              "with": {
+                "persist-credentials": false
+              }
+            },
+            {
+              "command_id": "security/scan/1",
+              "name": "Install checksum-verified scanners"
+            },
+            {
+              "command_id": "security/scan/2",
+              "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "SCAN_REPORT_ONLY": "osv shai-hulud semgrep zizmor"
+              },
+              "name": "Run the scans"
+            }
+          ],
+          "timeout-minutes": 10
+        }
+      },
+      "role": "validation",
+      "sha256": "fa63bef89bc62f86bd730837ac8d004fedcd996dd93f29166bc430dd0c678e46"
     },
     ".github/workflows/targeted.yml": {
       "defaults": {},

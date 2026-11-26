@@ -92,6 +92,19 @@ fn gate_passed_since(tx: &Transaction<'_>, lease: &Lease, after_seq: i64, after_
     Ok(recovered)
 }
 
+/// #2458: hosted checks still running on the bound head. This is a short
+/// poll, not an infrastructure failure: no failure count, no growing
+/// backoff and no retry-cycle turn (PR #2449 waited an hour behind a
+/// `failures: 5` history because a fresh push had not finished CI).
+pub const HOSTED_CI_PENDING_REASON: &str = "hosted_ci_pending";
+/// #2490's single own-PR rescope stop and the inputs it records (#2512).
+pub const RESCOPE_STOP_REASON: &str = "own_pr_rescope_exhausted";
+pub const RESCOPE_STOP_ACTION: &str = "await_request_or_main_change";
+pub const RESCOPE_STOP_REQUEST_EVIDENCE: &str = "request:";
+pub const RESCOPE_STOP_MAIN_EVIDENCE: &str = "main:";
+const RESCOPE_STOP_WOKEN: &str = "rescope_stop_inputs_changed";
+pub const HOSTED_CI_PENDING_POLL_MS: i64 = 300_000;
+
 fn retryable_stage(stage: Stage) -> bool {
     matches!(
         stage,
@@ -116,6 +129,109 @@ impl WorkflowStore {
             &serde_json::to_string(&GatePassed {version:1,domain,binding:binding.clone()})?,now)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Wait a fixed short poll for checks still running on the bound head.
+    /// Candidate, evidence, progress clock, charges, the infrastructure
+    /// failure history and the merge allowance are all left untouched.
+    pub fn defer_hosted_ci_pending(&mut self, lease: &Lease, binding: &Binding, now: i64) -> Result<i64> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx, lease, binding, now)?;
+        owner_control::require_dispatch(&tx, &lease.workflow)?;
+        let raw: String = tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1", [&lease.workflow], |r| r.get(0))?;
+        let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
+        ensure!(retryable_stage(checkpoint.stage), "only an active pre-merge CI stage can wait for checks");
+        let eligible = now.saturating_add(HOSTED_CI_PENDING_POLL_MS);
+        checkpoint.next = NextAction {
+            reason: HOSTED_CI_PENDING_REASON.into(),
+            action: "retry_verification".into(),
+            eligible_at_ms: eligible,
+        };
+        let checkpoint = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1", params![lease.workflow, checkpoint])?;
+        event(&tx, &lease.workflow, lease.generation, "checkpoint", &checkpoint, now)?;
+        event(&tx, &lease.workflow, lease.generation, "hosted_ci_pending_wait",
+            &serde_json::json!({"version":1,"binding":binding,"eligible_at_ms":eligible}).to_string(), now)?;
+        tx.commit()?;
+        Ok(eligible)
+    }
+
+    /// #2495: the bound head's checks finished green before the poll expired.
+    /// Make the waiting poll due now. Only the eligibility time changes; an
+    /// active lease, an owner pause, another head or another wait is a no-op.
+    pub fn expedite_hosted_ci_pending(&mut self, workflow: &str, head: &str, now: i64) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, i64)> = tx.query_row(
+            "SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1", [workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let Some((raw, lease_until, generation)) = row else { return Ok(false) };
+        let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
+        if lease_until > now
+            || checkpoint.binding.head != head
+            || checkpoint.next.reason != HOSTED_CI_PENDING_REASON
+            || checkpoint.next.action != "retry_verification"
+            || checkpoint.next.eligible_at_ms <= now
+            || !retryable_stage(checkpoint.stage)
+            || owner_control::read(&tx, workflow)?.is_some_and(|control| control.paused)
+        {
+            return Ok(false);
+        }
+        checkpoint.next.eligible_at_ms = now;
+        let checkpoint = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1", params![workflow, checkpoint])?;
+        event(&tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+        event(&tx, workflow, generation, "hosted_ci_green_observed",
+            &serde_json::json!({"version":1,"head":head,"eligible_at_ms":now}).to_string(), now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// #2512: an own-PR rescope stop (#2490) waits a day only while the
+    /// issue's request and main are what it recorded. When either observed
+    /// input differs, make the stop due now so the resume re-checks it; the
+    /// resume still decides the budget (an edit is a fresh budget, a main
+    /// change only re-checks). Only the eligibility time changes. A lease, an
+    /// owner pause, another checkpoint, unknown or unchanged inputs, and an
+    /// observation this stop was already woken for are all no-ops, so a hash
+    /// the resume records differently can wake it at most once.
+    pub fn expedite_changed_rescope_stop(&mut self, workflow: &str, request: Option<&str>, main: Option<&str>, now: i64) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, i64)> = tx.query_row(
+            "SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1", [workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let Some((raw, lease_until, generation)) = row else { return Ok(false) };
+        let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
+        let request = request.filter(|value| !value.is_empty());
+        let main = main.filter(|value| !value.is_empty());
+        let recorded = |prefix: &str, value: &str| checkpoint.evidence.iter().any(|item| item.strip_prefix(prefix) == Some(value));
+        let request_changed = request.is_some_and(|value| !recorded(RESCOPE_STOP_REQUEST_EVIDENCE, value));
+        let main_changed = main.is_some_and(|value| !recorded(RESCOPE_STOP_MAIN_EVIDENCE, value));
+        if lease_until > now
+            || checkpoint.stage != Stage::Scope
+            || checkpoint.next.reason != RESCOPE_STOP_REASON
+            || checkpoint.next.action != RESCOPE_STOP_ACTION
+            || checkpoint.next.eligible_at_ms <= now
+            || !(request_changed || main_changed)
+            || owner_control::read(&tx, workflow)?.is_some_and(|control| control.paused)
+        {
+            return Ok(false);
+        }
+        let observed = serde_json::json!({"request":request,"main":main});
+        let last: Option<String> = tx.query_row(
+            "SELECT payload FROM workflow_event WHERE workflow=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1",
+            params![workflow, RESCOPE_STOP_WOKEN], |r| r.get(0)).optional()?;
+        if last.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()).is_some_and(|prior| prior["observed"] == observed) {
+            return Ok(false);
+        }
+        checkpoint.next.eligible_at_ms = now;
+        let checkpoint = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1", params![workflow, checkpoint])?;
+        event(&tx, workflow, generation, "checkpoint", &checkpoint, now)?;
+        event(&tx, workflow, generation, RESCOPE_STOP_WOKEN,
+            &serde_json::json!({"version":1,"observed":observed,"request_changed":request_changed,
+                "main_changed":main_changed,"eligible_at_ms":now}).to_string(), now)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn defer_verification_infrastructure(
@@ -292,6 +408,43 @@ mod tests {
             assert_eq!(store.merge_allowance(due+4,5).unwrap(),allowance);
             store.release(&lease,due+4).unwrap();due=next;
         }
+    }
+
+    /// #2458 (PR #2449): every poll of still-running checks waits five
+    /// minutes. None is an infrastructure failure, so a real outage later
+    /// keeps the failure count it had, and none is a retry-cycle turn, so
+    /// slow CI can never exhaust the cycle and push the PR back to scope.
+    #[test]
+    fn pending_checks_poll_shortly_and_never_count_as_failures_or_retry_turns() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("workflow.db");
+        let (mut store,lease,binding)=setup(&path);
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Reconcile;store.checkpoint(&lease,&checkpoint,22).unwrap();
+        let mut due=store.defer_verification_infrastructure(&lease,&binding,
+            "shared CI environment prerequisite",&"a".repeat(64),30).unwrap();
+        store.record_retry_completion(&lease,31).unwrap();store.release(&lease,31).unwrap();
+        for poll in 0..12 {
+            let lease=store.claim_productive(&lease.workflow,&format!("worker-{poll}"),due,60_000).unwrap()
+                .unwrap_or_else(||panic!("poll {poll}: due pending wait was not claimable"));
+            let now=due+1;
+            let next=store.defer_hosted_ci_pending(&lease,&binding,now).unwrap();
+            assert_eq!(next,now+HOSTED_CI_PENDING_POLL_MS,"poll {poll}: pending checks wait a fixed five minutes");
+            store.record_retry_completion(&lease,now+1).unwrap();
+            let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage,Stage::Reconcile,"poll {poll}: slow CI exhausted the retry cycle");
+            assert_eq!((after.checkpoint.next.reason.as_str(),after.checkpoint.next.action.as_str(),after.checkpoint.next.eligible_at_ms),
+                (HOSTED_CI_PENDING_REASON,"retry_verification",next),"poll {poll}");
+            assert_eq!(after.checkpoint.evidence,vec!["protected-receipt".to_string()]);
+            assert!(store.has_due_retry_work(None,next).unwrap(),"poll {poll}: the wait wakes the worker when due");
+            store.release(&lease,now+2).unwrap();due=next;
+        }
+        let failures=store.events(&lease.workflow).unwrap().iter()
+            .filter(|event|event.1=="verification_infrastructure_retry").count();
+        assert_eq!(failures,1,"pending polls were recorded as infrastructure failures");
+        // A real outage afterwards continues the original count (1 -> 2).
+        let lease=store.claim_productive(&lease.workflow,"worker-outage",due,60_000).unwrap().unwrap();
+        assert_eq!(store.defer_verification_infrastructure(&lease,&binding,
+            "shared CI environment prerequisite",&"a".repeat(64),due+1).unwrap(),due+1+600_000);
     }
 
     #[test]

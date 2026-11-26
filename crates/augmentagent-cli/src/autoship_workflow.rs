@@ -5,6 +5,9 @@
 pub(crate) mod acceptance_escalation;
 #[path="autoship_retry_policy.rs"]
 pub(crate) mod retry_policy;
+#[path="autoship_attempt_cap.rs"]
+pub(crate) mod attempt_cap;
+pub use attempt_cap::GlobalModelBudget;
 #[path="autoship_command_fairness.rs"]
 pub(crate) mod command_fairness;
 #[path="autoship_owner_requalification.rs"]
@@ -13,12 +16,18 @@ pub(crate) mod owner_requalification;
 pub(crate) mod scope_policy;
 #[path="autoship_terminal_parks.rs"]
 pub(crate) mod terminal_parks;
+#[path="autoship_scope_proof_gate.rs"]
+pub(crate) mod scope_proof_gate;
+#[path="autoship_witness_regeneration.rs"]
+pub(crate) mod witness_regeneration;
 #[path = "autoship_owner_checkout_recovery.rs"]
 pub(crate) mod owner_checkout_recovery;
 #[path = "autoship_checkout_continuity.rs"]
 pub(crate) mod checkout_continuity;
 #[path="autoship_review_custody.rs"]
 mod review_custody;
+#[path="autoship_review_binding_cap.rs"]
+pub(crate) mod review_binding_cap;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -61,6 +70,8 @@ mod adopted_publication;
 
 #[path = "autoship_push_observation.rs"]
 mod push_observation;
+#[path = "autoship_publish_checkpoint.rs"]
+mod publish_checkpoint;
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
@@ -110,6 +121,8 @@ pub(crate) mod owner_control;
 pub(crate) mod target_fence;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_main_update.rs"]
+pub(crate) mod main_update;
 #[path = "autoship_ci_code_repair.rs"]
 pub(crate) mod ci_code_repair;
 #[path = "autoship_tool_capacity.rs"]
@@ -127,7 +140,8 @@ pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
-pub use verification_retry::VerificationDomain;
+pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCOPE_STOP_ACTION, RESCOPE_STOP_MAIN_EVIDENCE,
+    RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -871,6 +885,11 @@ impl WorkflowStore {
                 ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS integration_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), after_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS main_update_carry (
+                workflow TEXT NOT NULL REFERENCES workflow(id), reviewed_head TEXT NOT NULL,
+                main TEXT NOT NULL, reviewed_base TEXT NOT NULL, origin_head TEXT NOT NULL,
+                updated_head TEXT, requested_at INTEGER NOT NULL, carried_at INTEGER,
+                PRIMARY KEY(workflow, reviewed_head));
             CREATE TABLE IF NOT EXISTS integration_recovery (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),binding TEXT NOT NULL,base TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,kind TEXT NOT NULL,attempts INTEGER NOT NULL,next_at INTEGER NOT NULL,original TEXT NOT NULL);
@@ -925,6 +944,7 @@ impl WorkflowStore {
         runtime_events::initialize(&conn)?;
         conn.execute_batch(owner_checkout_recovery::SCHEMA)?;
         conn.execute_batch(command_fairness::SCHEMA)?;
+        conn.execute_batch(attempt_cap::SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -1199,6 +1219,11 @@ impl WorkflowStore {
             return Ok(None);
         }
         if purpose == ClaimPurpose::Productive && target_fence::fenced(&tx,workflow)? {return Ok(None);}
+        // #2467: no productive claim past the attempt or spend cap, after a
+        // give-up, or while the global daily model budget is spent. Merge
+        // reconciliation and finalize claim with their own purpose.
+        if purpose == ClaimPurpose::Productive && leased <= now_ms
+            && attempt_cap::productive_claim_refused(&tx,workflow,&cp,now_ms,attempt_cap::Caps::configured())? {return Ok(None);}
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
@@ -1213,8 +1238,13 @@ impl WorkflowStore {
                 }
             }
         }
+        // #2574: with review moved to the nightly pass, a review park's
+        // backoff no longer gates the free merge sweep (it still checks green).
+        let review_park_released = purpose == ClaimPurpose::MergeReconciliation
+            && crate::autoship_review::ReviewMode::nightly()
+            && crate::autoship_review::review_park(cp.stage == Stage::Review, &cp.next.reason);
         if leased > now_ms
-            || cp.next.eligible_at_ms > now_ms
+            || (cp.next.eligible_at_ms > now_ms && !review_park_released)
             || matches!(cp.stage, Stage::Merged | Stage::Retired)
         {
             return Ok(None);
@@ -2019,6 +2049,23 @@ impl WorkflowStore {
         Ok(true)
     }
 
+    /// #2510: hand back one admitted attempt whose work never reached a
+    /// verdict because infrastructure refused it. Never below zero.
+    pub fn release_epoch_attempt(&mut self, lease: &Lease, purpose: &str, epoch: &str, now: i64) -> Result<bool> {
+        ensure!(!purpose.is_empty() && !epoch.is_empty() && epoch.len() <= 1024, "bounded epoch purpose required");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let key = format!("epoch:{epoch}");
+        let released = tx.execute("UPDATE bounded_attempt SET attempts=attempts-1 WHERE workflow=?1 AND purpose=?2 AND binding=?3 AND attempts>0",
+            params![lease.workflow, purpose, key])? == 1;
+        if released {
+            event(&tx, &lease.workflow, lease.generation, "epoch_attempt_released",
+                &serde_json::json!({"purpose":purpose,"epoch":epoch}).to_string(), now)?;
+        }
+        tx.commit()?;
+        Ok(released)
+    }
+
     /// Check fencing immediately before a remote operation, in addition to
     /// using the remote API's own compare-and-swap head precondition. A local
     /// SQLite lease alone cannot fence a push already accepted by GitHub.
@@ -2427,6 +2474,22 @@ impl WorkflowStore {
             || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
             return Ok(None);
         }
+        Ok(self.published_by_workflow(repository, pr, branch, published)?.then_some(snapshot.checkpoint.binding.head))
+    }
+
+    /// #2475: provenance only. True when this PR's workflow itself published
+    /// `published`: its latest Push carries the `git-head:<published>`
+    /// receipt, or, with no Push at all, the fenced adoption record names it.
+    /// Leases, retry delays and stages say when work may run, never who
+    /// published a head, so none of them are consulted here.
+    pub fn published_by_workflow(&self, repository: &str, pr: u64, branch: &str, published: &str) -> Result<bool> {
+        if published.is_empty() { return Ok(false); }
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(false); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(false); };
+        if snapshot.pr != Some(pr) || snapshot.branch != branch
+            || matches!(snapshot.checkpoint.stage, Stage::Merged | Stage::Retired) {
+            return Ok(false);
+        }
         let latest: Option<(String, Option<String>)> = self.conn.query_row(
             "SELECT binding,receipt FROM operation WHERE workflow=?1 AND kind=?2 ORDER BY rowid DESC LIMIT 1",
             params![id, serde_json::to_string(&OperationKind::Push)?],
@@ -2436,15 +2499,11 @@ impl WorkflowStore {
             // An imported PR may have been published by its owner, before this
             // workflow existed. Its fenced admission is a different fact from
             // a Push; any actual Push above still takes precedence.
-            return Ok((adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published))
-                .then_some(snapshot.checkpoint.binding.head));
+            return Ok(adopted_publication::published_head(&self.conn,&id,repository,pr,branch)?.as_deref()==Some(published));
         };
         let binding: Binding = serde_json::from_str(&binding)?;
         binding.validate()?;
-        if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {
-            return Ok(None);
-        }
-        Ok(Some(snapshot.checkpoint.binding.head))
+        Ok(binding.head == published && receipt.as_deref() == Some(&format!("git-head:{published}")))
     }
 
     /// #2279 — the PR workflow is idle and authorized to resume: no lease,
@@ -2739,6 +2798,34 @@ mod tests {
         assert!(store.pending_operations(&lease.workflow).unwrap().is_empty());
         assert!(store.claim_productive(&lease.workflow,"command",30,1000).unwrap().is_none(),"completed operation hid uncertain merge dispatch");
         assert!(store.claim_reconciliation(&lease.workflow,"sweep",30,1000).unwrap().is_none(),"free claim bypassed uncertain dispatch");
+    }
+
+    /// #2574 — nightly mode releases a review park's backoff to the free
+    /// merge sweep, but never an owner hold, a retired workflow, a non-review
+    /// backoff, or pre-merge mode.
+    #[test]
+    fn nightly_releases_review_parks_to_the_sweep_but_not_holds() {
+        use crate::autoship_review::{ReviewMode, ReviewModeGuard};
+        let case = |mode: ReviewMode, stage: Stage, reason: &str, pause: bool| {
+            let _mode = ReviewModeGuard::set(mode);
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, lease) = setup(&dir.path().join("state.db"));
+            let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage = stage;
+            checkpoint.next = NextAction { reason: reason.into(), action: "x".into(), eligible_at_ms: 1_000_000 };
+            store.checkpoint(&lease, &checkpoint, 30).unwrap();
+            store.release(&lease, 31).unwrap();
+            if pause { store.set_owner_pause(&lease.workflow, "github:owner", 0, true, 32).unwrap(); }
+            store.claim_reconciliation(&lease.workflow, "sweep", 40, 1000).unwrap().is_some()
+        };
+        use ReviewMode::{Nightly, PreMerge};
+        assert!(case(Nightly, Stage::Review, "review-recovery-required", false));
+        assert!(case(Nightly, Stage::Scope, "review_attempts_exhausted_backoff", false));
+        assert!(case(Nightly, Stage::Review, "resource_capacity", false));
+        assert!(!case(Nightly, Stage::Build, "resource_capacity", false), "non-review capacity wait");
+        assert!(!case(Nightly, Stage::Review, "review-recovery-required", true), "owner hold");
+        assert!(!case(Nightly, Stage::Retired, "review-recovery-required", false), "retired");
+        assert!(!case(PreMerge, Stage::Review, "review-recovery-required", false), "pre-merge unchanged");
     }
 
     #[test]

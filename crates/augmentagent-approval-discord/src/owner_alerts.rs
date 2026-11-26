@@ -2,6 +2,7 @@
 use crate::ApprovalBroker;
 use augmentagent_store::{
     alert_schedule::AlertNotice,
+    owner_alert_digest::AlertDayDigest,
     owner_alerts::{AlertState, OwnerAlert, Urgency},
     Store,
 };
@@ -192,11 +193,13 @@ pub fn control(store: &Store, custom_id: &str, now: i64) -> anyhow::Result<Strin
     match verb {
         "ack" => {
             store.set_owner_alert_state(id, AlertState::Acknowledged, now)?;
+            store.record_owner_alert_discord_action(id, now)?;
             store.reconcile_owner_alert_texts(now)?;
             Ok("Marked as seen — still open. Ordinary follow-ups and queued text escalation are stopped; preparation reminders remain. To stop all reminders, click Mark done / stop reminders. No reply was sent.".into())
         }
         "resolve" => {
             store.set_owner_alert_state(id, AlertState::Resolved, now)?;
+            store.record_owner_alert_discord_action(id, now)?;
             store.reconcile_owner_alert_texts(now)?;
             Ok("Marked done. Future reminders and queued text escalation are cancelled.".into())
         }
@@ -206,6 +209,51 @@ pub fn control(store: &Store, custom_id: &str, now: i64) -> anyhow::Result<Strin
         }
         _ => anyhow::bail!("unknown owner alert control"),
     }
+}
+
+/// Opt-in: the daily digest explains a quiet phone, so it is never on by default.
+const DIGEST_FLAG: &str = "AUGMENTAGENT_ALERT_DIGEST";
+
+fn digest_enabled() -> bool {
+    matches!(std::env::var(DIGEST_FLAG).as_deref(), Ok("1" | "true"))
+}
+
+/// Counts and eligible subjects only — no bodies, senders or handles.
+fn digest_text(digest: &AlertDayDigest) -> String {
+    let mut text = format!(
+        "{} alert{} · {} high · {} texted you.",
+        digest.alerts,
+        if digest.alerts == 1 { "" } else { "s" },
+        digest.high,
+        digest.texted
+    );
+    if digest.subjects.is_empty() {
+        text.push_str("\nNo high alert was handled here before its text went out.");
+    } else {
+        text.push_str("\nHigh alerts handled here, never texted:");
+        for subject in &digest.subjects {
+            text.push_str(&format!("\n• {}", clipped(subject, 120)));
+        }
+    }
+    text
+}
+
+/// The local-date key is claimed inside the store transaction before the post,
+/// so a failed post is not retried: one digest per local date stays strict.
+async fn post_day_digest(
+    store: &Store,
+    broker: &dyn ApprovalBroker,
+    now: i64,
+) -> anyhow::Result<bool> {
+    let Some(digest) = store.claim_owner_alert_day_digest(now)? else {
+        return Ok(false);
+    };
+    let title = format!("Owner alerts · {} ({})", digest.local_date, digest.zone);
+    if let Err(error) = broker.post_digest(&title, &digest_text(&digest)).await {
+        tracing::warn!(local_date=%digest.local_date,"owner alert digest delivery failed: {error}");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub async fn tick(store: &Store, broker: &dyn ApprovalBroker, now: i64) -> anyhow::Result<usize> {
@@ -239,6 +287,9 @@ pub async fn tick(store: &Store, broker: &dyn ApprovalBroker, now: i64) -> anyho
         }
     }
     store.enqueue_owner_alert_texts(now + started.elapsed().as_millis() as i64)?;
+    if digest_enabled() {
+        post_day_digest(store, broker, now + started.elapsed().as_millis() as i64).await?;
+    }
     Ok(count)
 }
 
@@ -520,6 +571,295 @@ mod tests {
             AlertState::Resolved
         );
     }
+    /// The opt-in is process-global, so digest tests take this lock and leave
+    /// the flag unset.
+    struct DigestOptIn {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl DigestOptIn {
+        fn disabled() -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var(DIGEST_FLAG);
+            Self { _lock: lock }
+        }
+        fn enable(&self) {
+            std::env::set_var(DIGEST_FLAG, "1");
+        }
+    }
+    impl Drop for DigestOptIn {
+        fn drop(&mut self) {
+            std::env::remove_var(DIGEST_FLAG);
+        }
+    }
+
+    struct DigestBroker {
+        fail: bool,
+        digests: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl DigestBroker {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                digests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn posts(&self) -> Vec<(String, String)> {
+            self.digests.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApprovalBroker for DigestBroker {
+        async fn post_approval(
+            &self,
+            _: &str,
+            _: &augmentagent_store::Email,
+            _: &str,
+        ) -> Result<(), crate::ApprovalError> {
+            panic!("the digest must bypass the approval carousel")
+        }
+        async fn post_flag_notice(
+            &self,
+            _: &augmentagent_store::Email,
+            _: &str,
+        ) -> Result<(), crate::ApprovalError> {
+            panic!("the digest posts through post_digest")
+        }
+        async fn post_digest(&self, title: &str, body: &str) -> Result<(), crate::ApprovalError> {
+            self.digests
+                .lock()
+                .unwrap()
+                .push((title.into(), body.into()));
+            if self.fail {
+                Err(crate::ApprovalError::NotReady)
+            } else {
+                Ok(())
+            }
+        }
+        async fn post_owner_alert(&self, _: &AlertNotice) -> Result<String, crate::ApprovalError> {
+            panic!("handled alerts must not produce ordinary owner-alert posts")
+        }
+    }
+
+    fn ms(at: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn seed_alert(
+        store: &Store,
+        id: &str,
+        urgency: Urgency,
+        created: i64,
+        text_after: i64,
+        meeting: Option<&str>,
+    ) {
+        store
+            .insert_owner_alert(
+                &augmentagent_store::owner_alerts::NewOwnerAlert {
+                    id,
+                    source_url: "https://example.test/alert",
+                    sender: "sender-handle",
+                    action: "private-action-marker",
+                    reason: "private-reason-marker",
+                    urgency,
+                    due_at_ms: None,
+                    timezone: "America/New_York",
+                    meeting_id: meeting,
+                    expires_at_ms: ms("2026-12-01T00:00:00Z"),
+                    text_after_ms: text_after,
+                },
+                created,
+            )
+            .unwrap();
+        store
+            .attach_owner_alert_details(
+                id,
+                &augmentagent_store::alert_schedule::AlertDetails {
+                    message_id: format!("{id}-message"),
+                    thread_id: None,
+                    account_id: None,
+                    subject: format!("{id} subject"),
+                    evidence: "private-body-marker".into(),
+                    deadline_kind: "explicit".into(),
+                    meeting_start_ms: None,
+                    meeting_url: None,
+                    reply_resolves: false,
+                },
+                created,
+            )
+            .unwrap();
+    }
+
+    /// An alert becomes digest-eligible by being posted on Discord and
+    /// acknowledged there, without ever reaching the phone.
+    fn post_on_discord(store: &Store, id: &str, at: i64) {
+        let notice = store.claim_owner_alert_notice(at).unwrap().unwrap();
+        assert_eq!(notice.alert.id, id);
+        store
+            .complete_owner_alert_notice(notice.id, Some("https://example.test/posted"), None, at)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn digest_posts_once_per_local_date_across_a_reopened_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let opt_in = DigestOptIn::disabled();
+        opt_in.enable();
+        let yesterday = ms("2026-11-18T15:00:00Z"); // 10:00 America/New_York
+        let morning = ms("2026-11-19T14:00:00Z"); // 09:00 America/New_York
+        let store = Store::open(&path).unwrap();
+        seed_alert(&store, "handled", Urgency::High, yesterday, morning, None);
+        post_on_discord(&store, "handled", yesterday + 10);
+        control(&store, "oa:ack:handled", yesterday + 11).unwrap();
+        seed_alert(&store, "texted", Urgency::High, yesterday + 20, yesterday + 21, None);
+        post_on_discord(&store, "texted", yesterday + 30);
+        store
+            .configure_owner_alert_texts(Some("+15555550123"), true)
+            .unwrap();
+        store.enqueue_owner_alert_texts(yesterday + 40).unwrap();
+        store.claim_owner_alert_text(yesterday + 50).unwrap().unwrap();
+        control(&store, "oa:ack:texted", yesterday + 60).unwrap();
+        seed_alert(
+            &store,
+            "older",
+            Urgency::Routine,
+            ms("2026-11-17T15:00:00Z"),
+            morning,
+            None,
+        );
+        seed_alert(&store, "today", Urgency::Routine, morning, morning, None);
+
+        let broker = DigestBroker::new(false);
+        tick(&store, &broker, morning).await.unwrap();
+        let posts = broker.posts();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        let (title, body) = &posts[0];
+        assert!(
+            title.contains("2026-11-18") && title.contains("America/New_York"),
+            "{title}"
+        );
+        assert!(
+            body.contains("2 alerts · 2 high · 1 texted"),
+            "only the preceding local date counts: {body}"
+        );
+        assert!(body.contains("• handled subject"), "{body}");
+        for leaked in [
+            "texted subject",
+            "older subject",
+            "today subject",
+            "private-action-marker",
+            "private-body-marker",
+            "private-reason-marker",
+            "sender-handle",
+            "+1555",
+        ] {
+            assert!(!body.contains(leaked), "digest leaked {leaked}: {body}");
+        }
+
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        tick(&reopened, &broker, morning + 60_000).await.unwrap();
+        assert_eq!(
+            broker.posts().len(),
+            1,
+            "a claimed local date must not post again after a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_needs_the_opt_in_and_claims_the_date_before_posting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let yesterday = ms("2026-11-18T15:00:00Z");
+        let morning = ms("2026-11-19T14:00:00Z");
+        seed_alert(&store, "handled", Urgency::High, yesterday, morning, None);
+        post_on_discord(&store, "handled", yesterday + 10);
+        control(&store, "oa:ack:handled", yesterday + 11).unwrap();
+
+        let opt_in = DigestOptIn::disabled();
+        let broker = DigestBroker::new(false);
+        tick(&store, &broker, morning).await.unwrap();
+        assert!(broker.posts().is_empty(), "the opt-in is off");
+
+        opt_in.enable();
+        let failing = DigestBroker::new(true);
+        tick(&store, &failing, morning + 1_000).await.unwrap();
+        assert_eq!(failing.posts().len(), 1, "the disabled tick claimed nothing");
+        tick(&store, &broker, morning + 60_000).await.unwrap();
+        assert!(
+            broker.posts().is_empty(),
+            "the key is claimed before the post, so a failed post is not retried"
+        );
+    }
+
+    /// Reconciliation resolves an alert on its own, after the Discord post and
+    /// without the owner touching it there: that is not "handled here".
+    #[tokio::test]
+    async fn digest_lists_only_alerts_the_owner_handled_on_discord() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let opt_in = DigestOptIn::disabled();
+        opt_in.enable();
+        let yesterday = ms("2026-11-18T15:00:00Z");
+        let morning = ms("2026-11-19T14:00:00Z");
+        seed_alert(&store, "reconciled", Urgency::High, yesterday, morning, Some("m1"));
+        seed_alert(&store, "pressed", Urgency::High, yesterday + 1, morning, None);
+        post_on_discord(&store, "reconciled", yesterday + 10);
+        post_on_discord(&store, "pressed", yesterday + 20);
+        store.cancel_owner_alert_meeting("m1", yesterday + 30).unwrap();
+        control(&store, "oa:ack:pressed", yesterday + 40).unwrap();
+
+        let broker = DigestBroker::new(false);
+        tick(&store, &broker, morning).await.unwrap();
+        let body = broker.posts().remove(0).1;
+        assert!(body.contains("• pressed subject"), "{body}");
+        assert!(
+            !body.contains("reconciled subject"),
+            "an alert resolved away from Discord was not handled here: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_derives_the_prior_date_from_local_time_not_a_fixed_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let opt_in = DigestOptIn::disabled();
+        opt_in.enable();
+        // America/New_York fell back on 2026-11-01: that local date is 25 hours long.
+        seed_alert(
+            &store,
+            "edt",
+            Urgency::Routine,
+            ms("2026-11-01T05:30:00Z"),
+            ms("2026-12-01T00:00:00Z"),
+            None,
+        );
+        seed_alert(
+            &store,
+            "est",
+            Urgency::Routine,
+            ms("2026-11-02T04:30:00Z"),
+            ms("2026-12-01T00:00:00Z"),
+            None,
+        );
+
+        let broker = DigestBroker::new(false);
+        tick(&store, &broker, ms("2026-11-02T20:00:00Z")).await.unwrap();
+        assert!(broker.posts().is_empty(), "15:00 local is not the morning");
+        tick(&store, &broker, ms("2026-11-02T14:00:00Z")).await.unwrap();
+        let posts = broker.posts();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert!(posts[0].0.contains("2026-11-01"), "{}", posts[0].0);
+        assert!(
+            posts[0].1.contains("2 alerts · 0 high · 0 texted"),
+            "both ends of a 25-hour local date count: {}",
+            posts[0].1
+        );
+    }
+
     struct AlertBroker {
         fail: bool,
         posts: std::sync::atomic::AtomicUsize,

@@ -1,7 +1,38 @@
-use augmentagent_approval_discord::{approval_edit_message, approval_message};
-use augmentagent_store::Email;
+use async_trait::async_trait;
+use augmentagent_approval_discord::{
+    approval_edit_message, approval_message, ApprovalBroker, ApprovalError,
+};
+use augmentagent_store::{
+    alert_schedule::AlertDetails,
+    owner_alerts::{AlertState, NewOwnerAlert, Urgency},
+    Email, Store,
+};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Broker {
+    posts: AtomicUsize,
+}
+
+#[async_trait]
+impl ApprovalBroker for Broker {
+    async fn post_approval(&self, _: &str, _: &Email, _: &str) -> Result<(), ApprovalError> {
+        panic!("digest must bypass the approval carousel")
+    }
+
+    async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
+        self.posts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn post_owner_alert(
+        &self,
+        _: &augmentagent_store::alert_schedule::AlertNotice,
+    ) -> Result<String, ApprovalError> {
+        panic!("seeded alerts must not produce ordinary owner-alert posts")
+    }
+}
 
 fn email(body: &str) -> Email {
     Email {
@@ -43,7 +74,8 @@ fn descriptions<T: Serialize>(message: &T) -> String {
     output.join("\n")
 }
 
-fn main() {
+/// #2426 — the Discord renderers' projection of a stored inbound body.
+fn renderer_observation() -> Value {
     let html = r#"<!doctype html><html><head><title>HEAD_SENTINEL</title><style>STYLE_SENTINEL</style><script>DROP_SCRIPT()</script></head><body><p>Hello &amp; welcome <a href="https://example.test/destination">portal</a>.</p></body></html>"#;
     let multipart = "Content-Type: multipart/alternative; boundary=renderer-boundary\r\n\r\n--renderer-boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPLAIN_ALTERNATIVE_SENTINEL\r\n--renderer-boundary\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML_FALLBACK_SENTINEL</p>\r\n--renderer-boundary--\r\n";
     let draft = "Draft response";
@@ -84,24 +116,99 @@ fn main() {
         text.contains("PLAIN_ALTERNATIVE_SENTINEL") && !text.contains("HTML_FALLBACK_SENTINEL")
     };
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "approval_html": readable_html(&approval_html),
-            "edit_html": readable_html(&edit_html),
-            "approval_multipart": plain_alternative(&approval_multipart),
-            "edit_multipart": plain_alternative(&edit_multipart),
-            "html_entities_decoded": html_previews.contains("Hello & welcome"),
-            "html_suppressed_content_absent": !html_previews.contains("HEAD_SENTINEL")
-                && !html_previews.contains("DROP_SCRIPT")
-                && !html_previews.contains("STYLE_SENTINEL"),
-            "html_tags_absent": !html_previews.contains('<') && !html_previews.contains('>'),
-            "differing_link_destination_visible": html_previews.contains("portal")
-                && html_previews.contains("https://example.test/destination"),
-            "plain_format_preserved": plain.contains("PLAIN_ORIGINAL\n\n— DRAFT —\n\nDraft response"),
-            "truncation_preserved": long.len() <= 3_800,
-            "persisted_email_json_unchanged": serde_json::to_string(&html_email)
-                .expect("email serializes") == stored_before
-        })
-    );
+    serde_json::json!({
+        "approval_html": readable_html(&approval_html),
+        "edit_html": readable_html(&edit_html),
+        "approval_multipart": plain_alternative(&approval_multipart),
+        "edit_multipart": plain_alternative(&edit_multipart),
+        "html_entities_decoded": html_previews.contains("Hello & welcome"),
+        "html_suppressed_content_absent": !html_previews.contains("HEAD_SENTINEL")
+            && !html_previews.contains("DROP_SCRIPT")
+            && !html_previews.contains("STYLE_SENTINEL"),
+        "html_tags_absent": !html_previews.contains('<') && !html_previews.contains('>'),
+        "differing_link_destination_visible": html_previews.contains("portal")
+            && html_previews.contains("https://example.test/destination"),
+        "plain_format_preserved": plain.contains("PLAIN_ORIGINAL\n\n— DRAFT —\n\nDraft response"),
+        "truncation_preserved": long.len() <= 3_800,
+        "persisted_email_json_unchanged": serde_json::to_string(&html_email)
+            .expect("email serializes") == stored_before
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    println!("{}", renderer_observation());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("digest.db");
+    let seeded_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T15:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let morning = chrono::DateTime::parse_from_rfc3339("2026-11-19T14:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let store = Store::open(&path).unwrap();
+    store
+        .insert_owner_alert(
+            &NewOwnerAlert {
+                id: "digest-subject",
+                source_url: "https://example.test/alert",
+                sender: "sender-handle",
+                action: "private-body-marker",
+                reason: "private-reason-marker",
+                urgency: Urgency::High,
+                due_at_ms: None,
+                timezone: "America/New_York",
+                meeting_id: None,
+                expires_at_ms: morning + 86_400_000,
+                text_after_ms: morning + 86_400_000,
+            },
+            seeded_at,
+        )
+        .unwrap();
+    store
+        .attach_owner_alert_details(
+            "digest-subject",
+            &AlertDetails {
+                message_id: "message".into(),
+                thread_id: None,
+                account_id: None,
+                subject: "Eligible subject".into(),
+                evidence: "private-body-marker".into(),
+                deadline_kind: "explicit".into(),
+                meeting_start_ms: None,
+                meeting_url: None,
+                reply_resolves: false,
+            },
+            seeded_at,
+        )
+        .unwrap();
+    let notice = store.claim_owner_alert_notice(seeded_at).unwrap().unwrap();
+    store
+        .complete_owner_alert_notice(notice.id, Some("https://example.test"), None, seeded_at)
+        .unwrap();
+    store
+        .set_owner_alert_state("digest-subject", AlertState::Acknowledged, seeded_at + 1)
+        .unwrap();
+
+    let broker = Broker { posts: AtomicUsize::new(0) };
+    std::env::remove_var("AUGMENTAGENT_ALERT_DIGEST");
+    augmentagent_approval_discord::owner_alerts::tick(&store, &broker, morning)
+        .await
+        .unwrap();
+    let disabled = broker.posts.load(Ordering::SeqCst);
+
+    std::env::set_var("AUGMENTAGENT_ALERT_DIGEST", "1");
+    augmentagent_approval_discord::owner_alerts::tick(&store, &broker, morning)
+        .await
+        .unwrap();
+    let first = broker.posts.load(Ordering::SeqCst);
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    augmentagent_approval_discord::owner_alerts::tick(&reopened, &broker, morning + 60_000)
+        .await
+        .unwrap();
+    let after_restart = broker.posts.load(Ordering::SeqCst);
+    println!("{}", serde_json::json!([disabled, first, after_restart]));
 }

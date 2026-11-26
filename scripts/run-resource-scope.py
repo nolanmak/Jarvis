@@ -102,8 +102,67 @@ def read_host_memory():
         return parse_host_memory(source.read(65537))
 
 
+PROC_ROOT = Path('/proc')
+BLOCK_ROOT = Path('/sys/block')
+
+
+def _zram_storable(device, free):
+    """RAM a zram device's free space would net once filled, or 0 if unknown.
+
+    A swapped page still costs `mem_used_total / orig_data_size` of itself in
+    the compressed pool. Without an observed ratio, count nothing. A pool
+    memory limit caps how much more the device can still store.
+    """
+    try:
+        fields = (BLOCK_ROOT/device/'mm_stat').read_text().split()
+        orig, used, limit = int(fields[0]), int(fields[2]), int(fields[3])
+    except (OSError, ValueError, IndexError):
+        return 0
+    if orig <= 0 or used <= 0 or used >= orig or limit < 0:
+        return 0
+    if limit:
+        free = min(free, max(0, limit - used) * orig // used)
+    return free - free * used // orig
+
+
+def swap_relief():
+    """RAM the kernel can free for an unswappable run by swapping others out.
+
+    Run groups inherit the service's MemorySwapMax=0, so their pages need
+    RAM. MemAvailable ignores that the kernel makes that RAM by moving other
+    processes' cold anonymous pages to swap. On a desktop host with Chrome
+    beside the worker this left 5.4 GiB "available" with 1.9 GB of free swap
+    and 2.6 GiB of cold anonymous memory, and refused every 6 GiB build (#2528,
+    2026-11-24). Count free swap at what it frees (zram at its observed
+    compression), bounded by inactive anonymous memory. Malformed or
+    missing evidence adds nothing; it never removes MemAvailable.
+    """
+    try:
+        inactive = None
+        for line in (PROC_ROOT/'meminfo').read_text().splitlines():
+            fields = line.split()
+            if fields[:1] == ['Inactive(anon):'] and len(fields) == 3 and fields[2] == 'kB' and fields[1].isdigit():
+                inactive = int(fields[1]) * 1024
+        if inactive is None:
+            return 0
+        relief = 0
+        for line in (PROC_ROOT/'swaps').read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) != 5 or not fields[2].isdigit() or not fields[3].isdigit():
+                return 0
+            free = max(0, int(fields[2]) - int(fields[3])) * 1024
+            name = fields[0]
+            if name.startswith('/dev/zram'):
+                relief += _zram_storable(name.removeprefix('/dev/'), free)
+            else:
+                relief += free
+        return min(relief, inactive)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return 0
+
+
 def available_memory():
-    return read_host_memory()['available_bytes']
+    return read_host_memory()['available_bytes'] + swap_relief()
 
 
 def memory_defaults(total_bytes, external_maxima=(), reserve_bytes=None):

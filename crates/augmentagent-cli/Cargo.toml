@@ -10,6 +10,17 @@ repository.workspace = true
 name = "augmentagent"
 path = "src/main.rs"
 
+# Auto-ship acceptance harness. It includes socialapi_compose_identity.rs via
+# #[path] with a stub social_card_row, so that module's unit tests must run
+# only in the main binary. CI selects bins with `--bins`, which ignores
+# `test = false`, so `harness = false` also builds it without cfg(test):
+# `cargo test --bins` then just runs the observation's main().
+[[bin]]
+name = "autoship_case"
+path = "src/bin/autoship_case.rs"
+test = false
+harness = false
+
 [dependencies]
 futures = { workspace = true }
 tempfile = "3"
@@ -65,6 +76,8 @@ augmentagent-docs = { path = "../augmentagent-docs" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
+# Same version the phone crate uses: the TabAgent handoff webhook listener.
+axum = "0.8"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

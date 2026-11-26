@@ -58,6 +58,10 @@ trait Backend: Sync {
         key: &str,
         body: &str,
     ) -> Result<()>;
+    /// #2467: why the ladder stops instead of starting another cycle.
+    fn ladder_stop(&self, guard: &workflow::WorkflowGuard) -> Result<Option<&'static str>> {
+        guard.ladder_stop()
+    }
 }
 struct Production;
 #[async_trait::async_trait]
@@ -250,11 +254,22 @@ async fn execute_with(
         }
     }
     let detail = serde_json::to_string(&material)?;
-    // #2289: strategies never run out. Each exhausted cycle advances one rung
-    // of the ladder and schedules the next after a capped backoff.
+    // #2289: each exhausted cycle advances one rung of the ladder and
+    // schedules the next after a capped backoff. #2467: the ladder no longer
+    // repeats. It stops at the per-issue attempt cap, and it decomposes into
+    // observable children at most once; the stop is closed out by the
+    // give-up sweep (one comment, `agent-gave-up`, retirement).
     let mut cycle = 0u32;
     while cycle < 100_000 && guard.recorded_scope_stage_response(&cycle_key(guard.id(), &material, cycle)?)?.is_some() {
         cycle += 1;
+    }
+    if let Some(stop) = backend.ladder_stop(guard)? {
+        guard
+            .transition(crate::autoship_workflow::Stage::Scope, stop, crate::autoship_workflow::attempt_cap::GIVE_UP_ACTION, 0)
+            .await?;
+        return Ok(Some(RunReport::held(format!(
+            "Acceptance strategy ladder stopped ({stop}) after {cycle} cycle(s); autoship gives up on this issue"
+        ))));
     }
     let rung = retry_policy::strategy(cycle);
     let mut order = providers.to_vec();
@@ -773,6 +788,11 @@ mod tests {
         .is_some());
         assert_eq!(*fake.calls.lock().unwrap(), PROVIDERS);
         assert!(fake.posts.lock().unwrap().is_empty());
+        // #2467: decomposition into children happens once per issue.
+        assert_eq!(
+            g.ladder_stop().unwrap(),
+            Some(crate::autoship_workflow::attempt_cap::DECOMPOSITION_SPENT_REASON)
+        );
         let id = g.id().to_owned();
         g.finish().unwrap();
         let s = crate::autoship_workflow::WorkflowStore::open(
@@ -891,49 +911,63 @@ mod tests {
         .unwrap()
         .unwrap()
     }
+    /// #2467: the ladder no longer repeats with fresh keys. Each cycle is one
+    /// try; after the attempt cap the issue is not claimed for another cycle,
+    /// and the stop is a give-up the sweep closes out, not a wait.
     #[tokio::test]
-    async fn repair_exhaustion_escalates_strategy_with_capped_backoff_and_never_parks() {
+    async fn the_ladder_stops_at_the_attempt_cap() {
+        use crate::autoship_workflow::attempt_cap;
         let f = Fixture::new().await;
         let mut g = f.held().await;
         let id = g.id().to_owned();
-        let cycles = 7u32;
-        let fake = Fake::new(vec![ResultKind::Invalid; 2 * cycles as usize]);
-        for cycle in 0..cycles {
+        let cap = attempt_cap::max_tries();
+        let fake = Fake::new(vec![ResultKind::Invalid; 2 * cap as usize + 2]);
+        let mut wait = 0;
+        for cycle in 0..cap {
+            assert_eq!(g.ladder_stop().unwrap(), None, "cycle {cycle}");
             let before = chrono::Utc::now().timestamp_millis();
             execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
                 .await
                 .unwrap()
                 .expect("an exhausted cycle must report its scheduled retry");
             let after = chrono::Utc::now().timestamp_millis();
-            g.finish().unwrap();
             let s = snapshot(&f, &id);
             assert_eq!(s.checkpoint.next.reason, "acceptance_strategy_backoff", "cycle {cycle}");
-            assert_eq!(s.checkpoint.next.action, ACTION);
-            assert!(!crate::autoship_workflow::awaits_initial_input(&s.checkpoint));
-            let wait = s.checkpoint.next.eligible_at_ms;
+            wait = s.checkpoint.next.eligible_at_ms;
             assert!(
-                wait >= before + retry_policy::backoff_ms(cycle)
-                    && wait <= after + retry_policy::backoff_ms(cycle),
+                wait >= before + retry_policy::backoff_ms(cycle) && wait <= after + retry_policy::backoff_ms(cycle),
                 "cycle {cycle} backoff is not capped exponential"
             );
-            assert!(wait - after <= retry_policy::BACKOFF_CAP_MS);
-            // Not claimable early; claimable once the backoff elapses.
-            g = f.acquire_at(wait).await;
-        }
-        g.finish().unwrap();
-        let seen = fake.strategies.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2 * cycles as usize, "every cycle made new attempts");
-        for cycle in 0..cycles {
-            let rungs: Vec<_> = seen.iter().filter(|(c, _, _)| *c == cycle).collect();
-            assert_eq!(rungs.len(), 2);
-            assert!(rungs.iter().all(|(_, name, _)| *name == retry_policy::strategy(cycle).name()));
-            let order: Vec<_> = rungs.iter().map(|(_, _, p)| *p).collect();
-            if retry_policy::strategy(cycle) == Strategy::SwitchProvider {
-                assert_eq!(order, vec![ProviderKind::Codex, ProviderKind::Claude]);
-            } else {
-                assert_eq!(order, PROVIDERS.to_vec());
+            if cycle + 1 < cap {
+                g.finish().unwrap();
+                g = f.acquire_at(wait).await;
             }
         }
+        // The guard still held reports the stop; running the ladder again
+        // checkpoints it as a give-up without any model call.
+        assert_eq!(g.ladder_stop().unwrap(), Some(attempt_cap::ATTEMPTS_REASON));
+        let report = execute_with(f.repo.path(), f.repo.path(), &f.issue, &mut g, &PROVIDERS, &fake)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.message.contains(attempt_cap::ATTEMPTS_REASON), "{}", report.message);
+        g.finish().unwrap();
+        let s = snapshot(&f, &id);
+        assert_eq!(
+            (s.checkpoint.next.reason.as_str(), s.checkpoint.next.action.as_str()),
+            (attempt_cap::ATTEMPTS_REASON, attempt_cap::GIVE_UP_ACTION)
+        );
+        assert_eq!(fake.strategies.lock().unwrap().len(), 2 * cap as usize, "no model call after the cap");
+        let seen: Vec<_> = fake.strategies.lock().unwrap().iter().map(|(_, name, _)| *name).collect();
+        assert_eq!(seen.iter().collect::<std::collections::BTreeSet<_>>().len(), cap as usize, "no rung repeated: {seen:?}");
+        // No further cycle is ever claimed.
+        let database = f.control.path().canonicalize().unwrap().join("workflow.db");
+        let request = serde_json::to_string(&(f.issue.number, &f.issue.title, &f.issue.body)).unwrap();
+        let again = workflow::WorkflowGuard::acquire_fixture_at(&database, workflow::Start {
+            repo_root: f.repo.path(), worktree: f.repo.path(), repository: "owner/repo",
+            source_issue: Some(f.issue.number), pr: None, branch: "candidate", contract: &request, environment: "fixture",
+        }, wait + retry_policy::DAY_MS).await.unwrap();
+        assert!(again.is_none(), "a capped issue was claimed for another cycle");
         assert_eq!(fake.posts.lock().unwrap().len(), 1, "one public summary, not one per cycle");
     }
     #[tokio::test]

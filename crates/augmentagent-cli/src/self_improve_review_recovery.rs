@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 
 pub(super) fn readiness() -> ReviewRecoveryReadiness {
     use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    // #2574: a nightly-mode resume defers review, so needs no reviewer.
+    if crate::autoship_review::ReviewMode::nightly() {
+        return ReviewRecoveryReadiness::Ready;
+    }
     let reviewer = reviewer_pool()
         .into_iter()
         .filter(|p| matches!(p, Claude | Codex))
@@ -36,7 +40,11 @@ pub(super) fn observe(
     // publication record (PR #2372: recorded 424b…, pushed dd17…). That exact
     // head is still the protected workflow binding, which is the custody the
     // reconciler below requires anyway. Any other head stays unproven.
-    if record.head != head && !controller_bound_head(path, repository, pr, head)? {
+    // #2448: a workflow that carries a retained local candidate (a scope-stage
+    // amendment retry kept in the PR checkout) is bound past the PR head. The
+    // head its own latest confirmed Push published is equally its custody,
+    // whether or not the workflow is due to run right now (#2475).
+    if record.head != head && !controller_bound_head(path, repository, pr, branch, head)? {
         info!(
             pr,
             outcome = "dependency_wait",
@@ -65,14 +73,24 @@ pub(super) fn observe(
     store.reconcile_review_recovery(repository, pr, branch, head, readiness(), now)
 }
 
-fn controller_bound_head(path: &Path, repository: &str, pr: u64, head: &str) -> Result<bool> {
+fn controller_bound_head(path: &Path, repository: &str, pr: u64, branch: &str, head: &str) -> Result<bool> {
     let store = WorkflowStore::open(path)?;
     let Some(id) = store.resolve_pr(repository, pr)? else {
         return Ok(false);
     };
-    Ok(store
-        .snapshot(&id)?
-        .is_some_and(|snapshot| !head.is_empty() && snapshot.checkpoint.binding.head == head))
+    let Some(snapshot) = store.snapshot(&id)? else {
+        return Ok(false);
+    };
+    if head.is_empty() {
+        return Ok(false);
+    }
+    if snapshot.checkpoint.binding.head == head {
+        return Ok(true);
+    }
+    // #2475: the provenance half of the resume executor's retained-candidate
+    // proof. Whether the workflow may resume now (lease, retry delay, stage)
+    // is scheduling; reconcile_review_recovery applies those gates itself.
+    store.published_by_workflow(repository, pr, branch, head)
 }
 
 pub(super) fn filter(
