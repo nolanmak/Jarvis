@@ -10,20 +10,6 @@ const RUNNER: &[u8] = include_bytes!("../../../scripts/ci-contract.py");
 const APT_INSTALLER: &[u8] = include_bytes!("../../../scripts/ci-apt-install.py");
 const PINNED_TOOLS: &[u8] = include_bytes!("../../../scripts/ci-pinned-tools.py");
 
-/// The hosted CI policy the controller pins, as `policy_check` reads it.
-const POLICY_PATHS: &[&str] = &[
-    ".github/workflows",
-    "scripts/ci-contract.py",
-    "scripts/ci-contract.json",
-    "scripts/ci-apt-install.py",
-    "scripts/ci-pinned-tools.py",
-];
-
-/// Marks a policy refusal no candidate diff can act on, so the loop charges
-/// it to infrastructure (`infra_failure_reason`) instead of handing it back
-/// as a code failure to repair.
-const POLICY_ROLLOUT_PENDING: &str = "hosted CI policy rollout pending";
-
 #[derive(Debug)]
 pub(super) struct AwaitingHostedCi;
 impl std::fmt::Display for AwaitingHostedCi {
@@ -61,11 +47,6 @@ pub(super) async fn preflight(
                 "index_tree":tree,"main":dependency.main,"shipping_authority":false}))?;
             return Err(dependency.into());
         }
-        if !candidate_touched_policy(root, tree).await.unwrap_or(true) {
-            audit.record_controller(serde_json::json!({"kind":"hosted_ci_policy_rollout_pending",
-                "index_tree":tree,"shipping_authority":false}))?;
-            return Err(error.context(POLICY_ROLLOUT_PENDING));
-        }
         return Err(error);
     }
     audit.record_controller(
@@ -73,19 +54,6 @@ pub(super) async fn preflight(
         "backend":"github-actions", "shipping_authority":false}),
     )?;
     Err(AwaitingHostedCi.into())
-}
-
-/// Did the candidate itself change a pinned policy file? When it did not, a
-/// failing `policy_check` means the controller's pins and the repository's
-/// reviewed policy have diverged, which only a rollout clears — #1431 spent a
-/// revision round being told it had changed a workflow step its change set
-/// never opened. An unreadable history reports "touched", keeping the refusal.
-async fn candidate_touched_policy(root: &Path, tree: &str) -> Result<bool> {
-    let base = shared_ci::git(root, &["merge-base", "refs/remotes/origin/main", "HEAD"]).await?;
-    let base = base.trim();
-    let mut args = vec!["diff-tree", "-r", "--name-only", base, tree, "--"];
-    args.extend_from_slice(POLICY_PATHS);
-    Ok(!shared_ci::git(root, &args).await?.trim().is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -167,9 +135,17 @@ pub(super) async fn inherited_policy_drift(
         Err(_) => return Ok(None),
     };
     let entries = |revision: &str| {
-        let mut args = vec!["ls-tree".to_owned(), "-r".into(), revision.to_owned(), "--".into()];
-        args.extend(POLICY_PATHS.iter().map(|path| (*path).to_owned()));
-        args
+        vec![
+            "ls-tree".to_owned(),
+            "-r".into(),
+            revision.to_owned(),
+            "--".into(),
+            ".github/workflows".into(),
+            "scripts/ci-contract.py".into(),
+            "scripts/ci-contract.json".into(),
+            "scripts/ci-apt-install.py".into(),
+            "scripts/ci-pinned-tools.py".into(),
+        ]
     };
     let candidate = entries(tree);
     let baseline = entries(&base);
@@ -841,11 +817,6 @@ mod tests {
             "candidate edits must not be called inherited policy"
         );
         assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
-        assert_eq!(
-            infra_failure_reason(&format!("{error:#}")),
-            None,
-            "a candidate that did edit policy must still be told to revert it"
-        );
     }
     #[tokio::test]
     async fn unreviewed_main_policy_cannot_supply_reconciliation_authority() {
@@ -882,10 +853,6 @@ mod tests {
         let error = preflight(&root, &audit).await.unwrap_err();
         assert!(error.downcast_ref::<MainPolicyReconciliation>().is_none());
         assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
-        // #1431 — merging this main would not satisfy the controller either, so
-        // there is no candidate-side remedy: charge the refusal to
-        // infrastructure instead of returning it for code repair.
-        assert_eq!(infra_failure_reason(&format!("{error:#}")), Some("hosted CI policy rollout"));
     }
 
     #[tokio::test]

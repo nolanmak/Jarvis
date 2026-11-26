@@ -12406,8 +12406,6 @@ fn infra_failure_reason(text: &str) -> Option<&'static str> {
         ("no space left on device", "disk full"),
         // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
         ("gate refused: low disk", "disk low"),
-        // #1431 — controller pins vs reviewed policy, no candidate policy edit.
-        ("hosted ci policy rollout pending", "hosted CI policy rollout"),
         ("storage admission:", "storage unavailable"),
         ("out of memory", "out of memory"),
         ("memory allocation of", "out of memory"),
