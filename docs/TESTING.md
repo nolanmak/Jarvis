@@ -189,7 +189,7 @@ Other readers of this state, and what cannot follow the rule:
 
 | Reader | Follows `XDG_STATE_HOME`? |
 |---|---|
-| `scripts/lib/service-restart.sh` (updater): self-improve lane locks, restart stamps | Yes, the identical rule (`augmentagent_state_dir`). Pinned by `service-restart.test.sh` and `updater-restart-hygiene.test.sh` |
+| `scripts/lib/service-restart.sh` (updater): self-improve lane locks (gate-cache trim), restart history | Yes, the identical rule (`augmentagent_state_dir`). Pinned by `service-restart.test.sh` and `updater-restart-hygiene.test.sh` |
 | `check-for-updates.sh` `built-commit` and `update.log`, `install-*.sh` log dirs | Yes, as `${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent`. Same result unless the value is relative, which Rust ignores and these would use. Set it only to an absolute path |
 | systemd `StandardOutput`/`StandardError` (`stdout.log`, `stderr.log`, the timer logs) | **No.** Fixed when the unit is written: `install-autostart.sh` expands `XDG_STATE_HOME` at install time, and `scripts/systemd/*.service` hardcode `%h/.local/state` or an absolute home. `autopr-health` reads `stderr.log` from the resolved state dir, so if `XDG_STATE_HOME` changes after install it looks in the wrong place |
 | Legacy Node dashboard, `src/dashboard.ts` (`/api/audit`) | **No.** Reads `$HOME/.local/state/augmentagent/tool-audit.log` unless `AUGMENTAGENT_TOOL_AUDIT_LOG` is set |
@@ -227,9 +227,28 @@ Tests pin this behaviour:
   crate builds a `.local/state/augmentagent` path by hand.
 - `memory_nudge::tests::default_cycles_root_honors_xdg` checks the rule through
   the pure `state_dir::resolve()`.
-- `scripts/tests/service-restart.test.sh` and
-  `scripts/tests/updater-restart-hygiene.test.sh` check that the updater finds a
-  lane lock held under `$XDG_STATE_HOME/augmentagent`.
+- `scripts/tests/service-restart.test.sh` checks that the updater resolves the
+  lane locks under `$XDG_STATE_HOME/augmentagent`, and
+  `scripts/tests/updater-restart-hygiene.test.sh` checks that a lock held there
+  does not defer the daemon restart (#2271).
+
+## Auto-ship worker installation
+
+Auto-ship has one execution path: the `augmentagent auto-pr-worker` process
+(#2275). The daemon never hosts the loop. These tests pin that, without touching
+the host's service manager:
+
+- `autoship_worker::tests::the_daemon_never_hosts_the_autoship_loop` fails if
+  `serve` constructs the auto-ship loop or branches on the old mode flag.
+- `autoship_worker::tests::the_external_flag_is_accepted_but_ignored_with_a_deprecation_warning`
+  checks that `AUGMENTAGENT_AUTOPR_EXTERNAL` only warns.
+- `scripts/tests/autopr_worker_install_test.py` renders the systemd unit with a
+  faked `uname` of Linux, and the launchd LaunchAgent
+  (`com.nolanmak.augmentagent.autopr`) with `Darwin`, using stub `systemctl`
+  and `launchctl`.
+- `scripts/tests/launchd_installers_test.py` checks that
+  `install-autostart.sh` registers the worker agent on macOS and that
+  `uninstall-autostart.sh` removes it.
 
 For a manual live run, add your own fence as well. It costs nothing:
 

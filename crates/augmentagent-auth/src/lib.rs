@@ -225,10 +225,14 @@ fn platform_store() -> Arc<dyn CredentialStore> {
             // call, and a keyring that timed out once stays off (#1325).
             static LEGACY_OFF: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
                 std::sync::OnceLock::new();
+            // #2433 — misses are remembered for the whole process too.
+            static LEGACY_MISSES: std::sync::OnceLock<Arc<Mutex<LegacyMisses>>> =
+                std::sync::OnceLock::new();
             Arc::new(
                 PrivateFileCredentialStore::new(dir)
                     .with_legacy(Arc::new(KeychainCredentialStore))
-                    .with_legacy_switch(Arc::clone(LEGACY_OFF.get_or_init(Default::default))),
+                    .with_legacy_switch(Arc::clone(LEGACY_OFF.get_or_init(Default::default)))
+                    .with_legacy_misses(Arc::clone(LEGACY_MISSES.get_or_init(Default::default))),
             )
         }
         None => Arc::new(UnavailableCredentialStore),
@@ -643,6 +647,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
 /// unlock prompt and wait for a user who is not there. The first timeout or
 /// failure turns the legacy store off for this store and its clones (for
 /// the default store, the whole process), so later slots never wait again.
+///
+/// #2433 — a slot the legacy store does not have is remembered for
+/// [`LEGACY_MISS_TTL`]: in memory (shared by clones, and by the whole process
+/// for the default store) and as an empty owner-only marker under
+/// [`LEGACY_MISS_DIR`], so the short-lived timer processes share it. Each
+/// Secret Service lookup opens a D-Bus connection and a session on
+/// gnome-keyring-daemon, which keeps memory per session; asking again on
+/// every poll for a key that lives only in `.env` grew it to gigabytes.
+/// Nothing writes to the legacy store any more, so the answer only goes
+/// stale if an older binary is rolled back to; the TTL bounds that.
 #[derive(Clone)]
 pub struct PrivateFileCredentialStore {
     dir: PathBuf,
@@ -650,7 +664,21 @@ pub struct PrivateFileCredentialStore {
     legacy_timeout: std::time::Duration,
     /// Set once the legacy store timed out or failed.
     legacy_off: Arc<std::sync::atomic::AtomicBool>,
+    /// Slots the legacy store lacked, and when that was learned.
+    legacy_misses: Arc<Mutex<LegacyMisses>>,
+    legacy_miss_ttl: std::time::Duration,
 }
+
+type LegacyMisses = std::collections::HashMap<(String, String), std::time::SystemTime>;
+
+/// How long "the legacy store does not have this slot" is trusted before
+/// the Secret Service is asked again (#2433).
+pub const LEGACY_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Directory under the credential directory holding one empty marker per
+/// slot the legacy store lacked (#2433). `%` is always percent-encoded in
+/// platform names, so this can never be a platform directory.
+pub const LEGACY_MISS_DIR: &str = "%legacy-misses";
 
 /// How long one legacy (Secret Service) lookup may take before it is
 /// treated as unavailable.
@@ -678,6 +706,86 @@ impl PrivateFileCredentialStore {
             legacy: None,
             legacy_timeout: LEGACY_TIMEOUT,
             legacy_off: Default::default(),
+            legacy_misses: Default::default(),
+            legacy_miss_ttl: LEGACY_MISS_TTL,
+        }
+    }
+
+    /// Test hook: trust a recorded legacy miss for `ttl` instead of
+    /// [`LEGACY_MISS_TTL`].
+    #[doc(hidden)]
+    pub fn with_legacy_miss_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.legacy_miss_ttl = ttl;
+        self
+    }
+
+    /// Share the remembered legacy misses (the default store uses one set
+    /// per process, since `default_store` builds a store per call).
+    #[cfg(target_os = "linux")]
+    fn with_legacy_misses(mut self, misses: Arc<Mutex<LegacyMisses>>) -> Self {
+        self.legacy_misses = misses;
+        self
+    }
+
+    fn miss_marker(&self, platform: &str, account: &str) -> Result<PathBuf, AuthError> {
+        Ok(self
+            .dir
+            .join(LEGACY_MISS_DIR)
+            .join(encode_component("platform", platform)?)
+            .join(encode_component("account", account)?))
+    }
+
+    /// True while a recorded "legacy store lacks this slot" is fresh. A
+    /// marker from an earlier process is pulled into memory.
+    fn legacy_miss_known(&self, platform: &str, account: &str) -> bool {
+        let fresh = |at: std::time::SystemTime| {
+            std::time::SystemTime::now()
+                .duration_since(at)
+                .is_ok_and(|age| age < self.legacy_miss_ttl)
+        };
+        let key = (platform.to_string(), account.to_string());
+        if let Some(at) = self.legacy_misses.lock().unwrap().get(&key).copied() {
+            if fresh(at) {
+                return true;
+            }
+        }
+        let Some(at) = self
+            .miss_marker(platform, account)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+        else {
+            return false;
+        };
+        if !fresh(at) {
+            return false;
+        }
+        self.legacy_misses.lock().unwrap().insert(key, at);
+        true
+    }
+
+    /// Remember that the legacy store lacks the slot. The marker is best
+    /// effort: without it only this process remembers.
+    fn remember_legacy_miss(&self, platform: &str, account: &str) {
+        self.legacy_misses.lock().unwrap().insert(
+            (platform.to_string(), account.to_string()),
+            std::time::SystemTime::now(),
+        );
+        let written = self.miss_marker(platform, account).and_then(|path| {
+            let parent = path.parent().expect("marker has a platform directory");
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+            for d in [
+                &self.dir,
+                &self.dir.join(LEGACY_MISS_DIR),
+                &parent.to_path_buf(),
+            ] {
+                set_mode(d, 0o700).map_err(io_err)?;
+            }
+            write_atomic(&path, b"")
+        });
+        if let Err(e) = written {
+            debug!(platform, account, error = %e, "legacy miss not recorded on disk");
         }
     }
 
@@ -760,6 +868,9 @@ impl PrivateFileCredentialStore {
     fn migrate(&self, platform: &str, account: &str) -> Option<Vec<u8>> {
         let (p, a) = (platform.to_string(), account.to_string());
         let from = self.legacy.as_ref()?.backend();
+        if self.legacy_miss_known(platform, account) {
+            return None;
+        }
         match self.legacy_call(platform, account, move |l| l.get(&p, &a))? {
             Ok(bytes) => {
                 match self.put(platform, account, &bytes) {
@@ -778,7 +889,10 @@ impl PrivateFileCredentialStore {
                 }
                 Some(bytes)
             }
-            Err(_) => None,
+            Err(_) => {
+                self.remember_legacy_miss(platform, account);
+                None
+            }
         }
     }
 

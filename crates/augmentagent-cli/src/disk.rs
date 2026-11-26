@@ -1987,18 +1987,43 @@ mod tests {
         assert!(stranger.exists(), "a sibling of the link target is not ours to prune");
     }
 
+    /// Takes the exclusive flock on `argv[1]`, says so, then holds it until
+    /// its stdin closes.
+    const FLOCK_HOLDER: &str = "\
+import fcntl,sys
+handle=open(sys.argv[1])
+fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+print('held',flush=True)
+sys.stdin.readline()
+";
+
     #[test]
     fn a_held_flock_reads_as_held_and_a_missing_file_does_not() {
-        use std::os::unix::io::AsRawFd;
+        use std::io::BufRead;
         let tmp = tempfile::tempdir().unwrap();
         let lock = tmp.path().join("lane.lock");
         assert!(!lock_is_held(&lock), "missing file");
-        let holder = std::fs::File::create(&lock).unwrap();
+        std::fs::File::create(&lock).unwrap();
         assert!(!lock_is_held(&lock), "exists but nobody holds it");
-        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-        assert!(lock_is_held(&lock));
-        drop(holder);
-        assert!(!lock_is_held(&lock));
+        // The holder is its own process, like the lane this detects: an flock
+        // taken on our own descriptor still reads as held after we close it
+        // whenever a sibling test's fork carries a copy of that descriptor
+        // into the window before its exec.
+        let mut holder = std::process::Command::new("/usr/bin/python3")
+            .args(["-I", "-c", FLOCK_HOLDER])
+            .arg(&lock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "held", "the holder took the lock");
+        let while_held = lock_is_held(&lock);
+        drop(holder.stdin.take()); // The holder returns on end-of-input.
+        assert!(holder.wait().unwrap().success());
+        assert!(while_held, "another process holds it");
+        assert!(!lock_is_held(&lock), "the holder has exited");
     }
     #[test]
     fn failed_profile_removal_does_not_claim_freed_space() {

@@ -62,7 +62,7 @@ async fn exercise(case: &str, name: &str) {
         }
         let before = git(&root, &["rev-parse", "HEAD"]);
         if case == "resolved" {
-            assert!(find_resumable_draft(&root, None, false).await.is_some());
+            assert!(find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await.is_some());
             let mut rows = rows.clone();
             rows[0]["mergeable"] = "MERGEABLE".into();
             std::fs::write(
@@ -73,7 +73,7 @@ async fn exercise(case: &str, name: &str) {
         }
 
         if matches!(case, "capacity" | "provenance") {
-            assert!(find_resumable_draft(&root, None, false).await.is_some());
+            assert!(find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await.is_some());
             let why = if case == "capacity" {
                 ReviewUnavailable::NoCapacity {
                     reviewers: vec![augmentagent_channel_core::ProviderKind::Codex],
@@ -94,7 +94,7 @@ async fn exercise(case: &str, name: &str) {
         }
 
         for _ in 0..3 {
-            let selected = find_resumable_draft(&root, None, false).await;
+            let selected = find_resumable_draft(&root, None, false, adoption::FinishTier::Other).await;
             if matches!(case, "conflict" | "parent" | "resolved") {
                 assert_eq!(
                     selected,

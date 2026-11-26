@@ -199,59 +199,48 @@ teardown_stub
 export AUGMENTAGENT_RESTART_TURN_DB=/nonexistent/data.db
 RESTART_TURN_DEFER_STAMP=$(mktemp -u)
 
-echo "maybe_defer_restart (#844):"
+echo "maybe_defer_restart ignores auto-ship lane locks (#2271):"
+# #844 used to hold the daemon restart while a self-improve run held its lane
+# lock. Auto-ship now runs in augmentagent-autopr.service, which survives a
+# daemon restart and reloads itself between runs, so a held lane lock must not
+# delay a deploy. The only deferral left is the owner turn (#1779), below.
 
 DEFER_DIR=$(mktemp -d)
 export AUGMENTAGENT_SELFIMPROVE_LOCK="$DEFER_DIR/self-improve.lock"
-export AUGMENTAGENT_RESTART_DEFER_STAMP="$DEFER_DIR/deferred-since"
-# Re-read the config now that the overrides exist.
 SELF_IMPROVE_LOCK="$AUGMENTAGENT_SELFIMPROVE_LOCK"
-RESTART_DEFER_STAMP="$AUGMENTAGENT_RESTART_DEFER_STAMP"
+DEFER_LOG="$DEFER_DIR/log"
+log() { printf '%s\n' "$*" >> "$DEFER_LOG"; }  # _sr_log routes here
 
-# No lock file at all -> proceed.
 maybe_defer_restart >/dev/null 2>&1
 check "proceeds when no run has ever taken the lock" "$?" "1"
 
-# Lock file present but NOT held -> proceed (a finished run leaves the file).
-touch "$AUGMENTAGENT_SELFIMPROVE_LOCK"
-maybe_defer_restart >/dev/null 2>&1
-check "proceeds when the lock file exists but nothing holds it" "$?" "1"
-
-# Held lock -> defer, and record when the deferral started.
+touch "$AUGMENTAGENT_SELFIMPROVE_LOCK" "$DEFER_DIR/self-improve-resume.lock"
 hold_lock "$AUGMENTAGENT_SELFIMPROVE_LOCK" 30 &
 HOLDER=$!
 wait_until_held "$AUGMENTAGENT_SELFIMPROVE_LOCK"
 maybe_defer_restart >/dev/null 2>&1
-check "defers while a run holds the lock" "$?" "0"
-[ -s "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
-  && ok "records when the deferral began" \
-  || bad "records when the deferral began" "stamp file empty/absent"
-
-# Process/cgroup/lock evidence is tested by auto_pr_worker_status_test.py.
-# At this boundary an attested worker permits deployment immediately.
-( external_autopr_isolated() { return 0; }; maybe_defer_restart >/dev/null 2>&1 )
-check "independent attested worker does not defer daemon update" "$?" "1"
-[ ! -e "$RESTART_DEFER_STAMP" ] && ok 'worker handoff clears old restart deferral' || bad 'worker handoff clears old restart deferral'
-
-# Elapsed wall time is not permission to kill a live owner, even past six hours.
-printf '%s\n' "$(( $(date +%s) - 21601 ))" > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
-maybe_defer_restart >/dev/null 2>&1
-check "keeps a live run past six hours" "$?" "0"
-[ -e "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
-  && ok "retains active deferral evidence" \
-  || bad "retains active deferral evidence" "stamp disappeared"
-
+check "proceeds while a run holds the self-improve lock" "$?" "1"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
-# Lock released -> proceed and clear any leftover stamp.
-printf '9\n' > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
+hold_lock "$DEFER_DIR/self-improve-resume.lock" 30 &
+HOLDER=$!
+wait_until_held "$DEFER_DIR/self-improve-resume.lock"
 maybe_defer_restart >/dev/null 2>&1
-check "proceeds again once the run has finished" "$?" "1"
-[ -e "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
-  && bad "clears stale deferral state when the lock is free" "stamp survived" \
-  || ok "clears stale deferral state when the lock is free"
+check "proceeds while a run holds the resume lock" "$?" "1"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+grep -q "self-improve run" "$DEFER_LOG" 2>/dev/null \
+  && bad "never logs a self-improve deferral" "$(cat "$DEFER_LOG")" \
+  || ok "never logs a self-improve deferral"
+[ ! -e "$DEFER_DIR/deferred-since" ] && [ ! -e "$DEFER_DIR/restart-deferred-since" ] \
+  && ok "writes no self-improve deferral stamp" || bad "writes no self-improve deferral stamp"
+for fn in self_improve_run_in_flight external_autopr_isolated; do
+  declare -F "$fn" >/dev/null \
+    && bad "removed: $fn" "still defined by service-restart.sh" || ok "removed: $fn"
+done
+unset -f log
 rm -rf "$DEFER_DIR"
-unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
+unset AUGMENTAGENT_SELFIMPROVE_LOCK
 
 echo "owner_turn_defer (#1779):"
 
@@ -261,6 +250,19 @@ export AUGMENTAGENT_RESTART_TURN_DB="$TURN_DB"
 RESTART_TURN_DEFER_STAMP="$TURN_DIR/turn-deferred-since"
 DEFER_LOG="$TURN_DIR/log"
 log() { printf '%s\n' "$*" >> "$DEFER_LOG"; }  # _sr_log routes here
+
+# A PATH in $1 carrying only the externals the deferral path uses, so the
+# sqlite3-missing and sqlite3-failing branches are reachable without relying
+# on this process's filesystem privileges: root reads a chmod 000 DB, so
+# permissions alone cannot produce an unreadable store here.
+turn_stub_bin() {
+  local t p
+  mkdir -p "$1"
+  for t in cat date rm head tr mkdir dirname printf flock; do
+    p=$(command -v "$t") && [ -x "$p" ] && ln -sf "$p" "$1/$t"
+  done
+}
+
 sqlite3 "$TURN_DB" "CREATE TABLE surface_native_turns (platform TEXT, account_id TEXT,
   conversation_id TEXT, thread_id TEXT, turn_id TEXT, status TEXT,
   created_at_ms INTEGER, finished_at_ms INTEGER);
@@ -277,11 +279,17 @@ check "defers while an owner turn is pending" "$?" "0"
 grep -q "restart deferred: owner turn in flight" "$DEFER_LOG" \
   && ok "logs the turn deferral" || bad "logs the turn deferral" "$(cat "$DEFER_LOG")"
 
+TURN_STAMP_FIRST=$(cat "$RESTART_TURN_DEFER_STAMP")
 maybe_defer_restart >/dev/null 2>&1
 check "keeps deferring inside the cap" "$?" "0"
+check "keeps the first timestamp across retries inside the cap" \
+  "$(cat "$RESTART_TURN_DEFER_STAMP")" "$TURN_STAMP_FIRST"
 
 ( AUGMENTAGENT_RESTART_FORCE=1; maybe_defer_restart >/dev/null 2>&1 )
 check "AUGMENTAGENT_RESTART_FORCE=1 bypasses the turn deferral" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "a forced restart clears the turn stamp" "stamp survived" \
+  || ok "a forced restart clears the turn stamp"
 
 printf '%s\n' "$(( $(date +%s) - 601 ))" > "$RESTART_TURN_DEFER_STAMP"
 : > "$DEFER_LOG"
@@ -289,8 +297,13 @@ maybe_defer_restart >/dev/null 2>&1
 check "proceeds once the turn deferral passes the cap" "$?" "1"
 grep -q "restarting anyway" "$DEFER_LOG" \
   && ok "logs the capped deploy" || bad "logs the capped deploy" "$(cat "$DEFER_LOG")"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp on the capped deploy" "stamp survived a proceed" \
+  || ok "clears the turn stamp on the capped deploy"
+# The capped deploy is authorized for this tick, so a turn still pending
+# afterwards opens its own window rather than inheriting the spent one.
 maybe_defer_restart >/dev/null 2>&1
-check "a later tick for the same long turn does not restart the window" "$?" "1"
+check "a turn still pending after the capped deploy re-arms the window" "$?" "0"
 
 sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='complete' WHERE turn_id='t2';"
 printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
@@ -299,23 +312,45 @@ check "proceeds once the turn finishes" "$?" "1"
 [ ! -e "$RESTART_TURN_DEFER_STAMP" ] && ok "clears the turn stamp when nothing is pending" \
   || bad "clears the turn stamp when nothing is pending" "stamp survived"
 
-# Fail open: unreadable DB, missing table, no sqlite3.
+# Fail open: unreadable DB, a query that cannot answer, missing table, no
+# sqlite3. Each permits the deploy, so each must also drop a stale stamp.
 sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='pending' WHERE turn_id='t2';"
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
 chmod 000 "$TURN_DB"
-if [ -r "$TURN_DB" ]; then ok "unreadable DB (skipped: running as root)"; else
-  maybe_defer_restart >/dev/null 2>&1; check "proceeds when the DB is unreadable" "$?" "1"; fi
+if [ -r "$TURN_DB" ]; then
+  ok "unreadable DB (skipped: running as root; the stubbed sqlite3 covers it)"
+else
+  maybe_defer_restart >/dev/null 2>&1
+  check "proceeds when the DB is unreadable" "$?" "1"
+  [ -e "$RESTART_TURN_DEFER_STAMP" ] \
+    && bad "clears the turn stamp when the DB is unreadable" "stamp survived" \
+    || ok "clears the turn stamp when the DB is unreadable"
+fi
 chmod 600 "$TURN_DB"
+
+# A sqlite3 that fails on a readable store with a pending row: only the
+# unanswerable query can let this deploy through.
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
+( FAILSQL="$TURN_DIR/failsql"; turn_stub_bin "$FAILSQL"
+  printf '#!/bin/sh\nexit 1\n' > "$FAILSQL/sqlite3"; chmod +x "$FAILSQL/sqlite3"
+  PATH="$FAILSQL"; maybe_defer_restart >/dev/null 2>&1 )
+check "proceeds when the sqlite3 query fails" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp when the query fails" "stamp survived" \
+  || ok "clears the turn stamp when the query fails"
 ( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/empty.db"; : > "$TURN_DIR/empty.db"
   maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when the table is missing" "$?" "1"
 ( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/absent.db"; maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when the DB does not exist" "$?" "1"
 [ ! -e "$TURN_DIR/absent.db" ] && ok "never creates a missing DB" || bad "never creates a missing DB"
-( NOSQL="$TURN_DIR/nosql"; mkdir -p "$NOSQL"
-  for t in cat date rm head tr mkdir dirname printf flock; do
-    p=$(command -v "$t") && [ -x "$p" ] && ln -sf "$p" "$NOSQL/$t"; done
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
+( NOSQL="$TURN_DIR/nosql"; turn_stub_bin "$NOSQL"
   PATH="$NOSQL"; maybe_defer_restart >/dev/null 2>&1 )
 check "proceeds when sqlite3 is not installed" "$?" "1"
+[ -e "$RESTART_TURN_DEFER_STAMP" ] \
+  && bad "clears the turn stamp when sqlite3 is missing" "stamp survived" \
+  || ok "clears the turn stamp when sqlite3 is missing"
 
 unset -f log
 rm -rf "$TURN_DIR"
@@ -421,7 +456,6 @@ HYG_DIR=$(mktemp -d)
 MEMINFO_PATH="$HYG_DIR/meminfo"
 RESTART_MIN_AVAIL_MB=3072
 RESTART_HISTORY="$HYG_DIR/restart-history"
-RESTARTS_PER_HOUR=3
 unset AUGMENTAGENT_RESTART_FORCE
 
 printf 'MemTotal:       16000000 kB\nMemAvailable:    8000000 kB\n' > "$MEMINFO_PATH"
@@ -444,13 +478,29 @@ printf 'MemAvailable:    1048576 kB\n' > "$MEMINFO_PATH"
 AUGMENTAGENT_RESTART_FORCE=1 memory_pressure_ok >/dev/null 2>&1
 check "memory: AUGMENTAGENT_RESTART_FORCE=1 overrides" "$?" "0"
 
+# #2271 — production lifted the 3/h cap to 60/h (18 deferrals, each a
+# withheld deploy). The default now matches, so a fresh install does not
+# reintroduce the bottleneck; the knob still works when set.
+check "budget: defaults to 60 restarts per hour" \
+  "$(env -u AUGMENTAGENT_RESTARTS_PER_HOUR bash -c '. "$1" 2>/dev/null; printf %s "$RESTARTS_PER_HOUR"' _ "$REPO_ROOT/scripts/lib/service-restart.sh")" "60"
+check "budget: AUGMENTAGENT_RESTARTS_PER_HOUR still overrides" \
+  "$(AUGMENTAGENT_RESTARTS_PER_HOUR=3 bash -c '. "$1" 2>/dev/null; printf %s "$RESTARTS_PER_HOUR"' _ "$REPO_ROOT/scripts/lib/service-restart.sh")" "3"
+RESTARTS_PER_HOUR=$(env -u AUGMENTAGENT_RESTARTS_PER_HOUR bash -c '. "$1" 2>/dev/null; printf %s "$RESTARTS_PER_HOUR"' _ "$REPO_ROOT/scripts/lib/service-restart.sh")
+
 restart_budget_ok >/dev/null 2>&1
 check "budget: proceeds with no history" "$?" "0"
 
 HYG_NOW=$(date +%s)
+HYG_TWELVE=""; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do HYG_TWELVE="$HYG_TWELVE$((HYG_NOW - i * 290))
+"; done
+printf '%s' "$HYG_TWELVE" > "$RESTART_HISTORY"
+restart_budget_ok >/dev/null 2>&1
+check "budget: default never defers a 5-minute updater (12 restarts/hour)" "$?" "0"
+
+RESTARTS_PER_HOUR=3
 printf '%s\n%s\n%s\n' "$((HYG_NOW-600))" "$((HYG_NOW-1200))" "$((HYG_NOW-1800))" > "$RESTART_HISTORY"
 HYG_LOG=$(restart_budget_ok 2>&1); rc=$?
-check "budget: defers after 3 restarts inside the hour" "$rc" "1"
+check "budget: an explicit 3/h cap defers after 3 restarts inside the hour" "$rc" "1"
 case "$HYG_LOG" in
   *"restart deferred"*) ok "budget: says why (restart deferred: …)" ;;
   *) bad "budget: says why (restart deferred: …)" "log was: $HYG_LOG" ;;
@@ -479,28 +529,28 @@ echo "state dir follows XDG_STATE_HOME like the Rust daemon (#1048):"
 # The auto-PR loop (Rust state_dir::resolve) holds its lane locks in
 # $XDG_STATE_HOME/augmentagent when XDG_STATE_HOME is absolute, else
 # $HOME/.local/state/augmentagent. The updater must look in the same place or
-# it restarts the daemon under a live build. Sourced in a clean subshell per
+# it trims the shared gate cache under a live build (#891). Sourced in a clean subshell per
 # case so the config lines re-evaluate against that environment.
-state_paths() { # <XDG_STATE_HOME or "-unset-"> [extra env...] -> "lock|resume|stamp|history"
+state_paths() { # <XDG_STATE_HOME or "-unset-"> [extra env...] -> "lock|resume|history"
   local xdg="$1"; shift
   env -u XDG_STATE_HOME -u LOG_DIR -u AUGMENTAGENT_SELFIMPROVE_LOCK \
-      -u AUGMENTAGENT_RESTART_DEFER_STAMP -u AUGMENTAGENT_RESTART_HISTORY \
+      -u AUGMENTAGENT_RESTART_HISTORY \
       HOME=/synthetic/home "$@" \
       bash -c '[ "$1" = -unset- ] || export XDG_STATE_HOME="$1"
                . "$2" 2>/dev/null
-               printf "%s|%s|%s|%s" "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK" \
-                 "$RESTART_DEFER_STAMP" "$RESTART_HISTORY"' \
+               printf "%s|%s|%s" "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK" \
+                 "$RESTART_HISTORY"' \
       _ "$xdg" "$REPO_ROOT/scripts/lib/service-restart.sh"
 }
 HOME_STATE=/synthetic/home/.local/state/augmentagent
 check "unset XDG_STATE_HOME: locks and stamps under HOME" "$(state_paths -unset-)" \
-  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-history"
 check "absolute XDG_STATE_HOME: locks and stamps under it" "$(state_paths /synthetic/xdg)" \
-  "/synthetic/xdg/augmentagent/self-improve.lock|/synthetic/xdg/augmentagent/self-improve-resume.lock|/synthetic/xdg/augmentagent/restart-deferred-since|/synthetic/xdg/augmentagent/restart-history"
+  "/synthetic/xdg/augmentagent/self-improve.lock|/synthetic/xdg/augmentagent/self-improve-resume.lock|/synthetic/xdg/augmentagent/restart-history"
 check "empty XDG_STATE_HOME counts as unset" "$(state_paths '')" \
-  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-history"
 check "relative XDG_STATE_HOME is ignored, as in Rust" "$(state_paths relative/state)" \
-  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-history"
 check "AUGMENTAGENT_SELFIMPROVE_LOCK still wins over XDG_STATE_HOME" \
   "$(state_paths /synthetic/xdg AUGMENTAGENT_SELFIMPROVE_LOCK=/synthetic/lock/self-improve.lock | cut -d'|' -f1,2)" \
   "/synthetic/lock/self-improve.lock|/synthetic/lock/self-improve-resume.lock"

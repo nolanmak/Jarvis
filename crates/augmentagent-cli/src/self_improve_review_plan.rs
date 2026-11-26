@@ -145,6 +145,15 @@ fn split_evidence_key(path:&str,body:&str,middle:usize)->Result<(String,String)>
     }
     Ok((format!("{path}/split0"),format!("{path}/split1")))
 }
+/// #2420: hard cap on evidence groups per role in one review attempt. Caller
+/// streaming produced 100 partial QA groups (202 model calls) on PR #2378.
+/// Past the cap the role concludes from the evidence already observed; the
+/// changed sources are packed first, so the cap trims caller context only.
+pub(super) const MAX_EVIDENCE_GROUPS_PER_ROLE: usize = 12;
+pub(super) fn evidence_group_allowed(group_index: usize) -> bool {
+    group_index < MAX_EVIDENCE_GROUPS_PER_ROLE
+}
+
 pub(super) fn worst_case_calls(groups: usize) -> Result<u64> {
     anyhow::ensure!(groups > 0, "cannot reserve zero review groups");
     (groups as u64)
@@ -184,17 +193,36 @@ pub(super) async fn recover_sources(
 )->Result<Request> {
     anyhow::ensure!(git(root,&["rev-parse","HEAD"]).await?.trim()==head,"candidate changed before source recovery");
     let mut files=original.files.clone();
+    // #2420: a source missing at this head or over the prompt budget is
+    // unavailable to the reviewer, not a failed review. A protected or
+    // non-admitted path still refuses.
+    let mut unavailable=Vec::new();
     for source in missing {
-        let additions=source_ranges::resolve_review_source_request(root,head,source).await?;
+        let additions=match source_ranges::resolve_review_source_request(root,head,source).await {
+            Ok(additions)=>additions,
+            Err(error) if !requested_evidence::admitted_path(&source.path)=>return Err(error),
+            Err(error)=>{
+                unavailable.push(serde_json::json!({"path":source.path,"selector":source.selector,
+                    "reason":if is_evidence_budget(&error) {"exceeds_review_budget"} else {"not_available_at_head"}}));
+                continue;
+            }
+        };
+        let before=files.clone();
         for (key,body) in additions {
             if let Some(old)=files.insert(key,body.clone()) {anyhow::ensure!(old==body,"immutable source labels collide");}
         }
         // Early serialized bound, before reading further dependencies. Final
         // construction also accounts for every question and recovery field.
-        inputs.request(files.clone(),false,None)?;
+        if let Err(error)=inputs.request(files.clone(),false,None) {
+            if !is_evidence_budget(&error) {return Err(error);}
+            files=before;
+            unavailable.push(serde_json::json!({"path":source.path,"selector":source.selector,"reason":"exceeds_review_budget"}));
+        }
     }
     let index:Vec<_>=all.iter().map(|(path,body)|serde_json::json!({"path":path,"bytes":body.len(),"sha256":aligned::digest(body.as_bytes())})).collect();
     let recovery=serde_json::json!({"attempt":1,"maximum_attempts":1,"missing_sources":missing,"previous_findings":findings,
+        "unavailable_sources":unavailable,
+        "unavailable_note":"Sources in unavailable_sources cannot be supplied. Judge from the supplied evidence; do not request them again.",
         "candidate_evidence_index_not_source":index,
         "instruction":"Sole evidence-recovery observation. All requested exact source is together with the original assigned evidence. Preserve concrete earlier findings. Metadata/indexes are not source coverage. Judge the requested cross-source relationships; return incomplete if a concrete dependency remains. Never infer approval from partial coverage or fabricate a finding from missing context."});
     let mut coherent=all.clone();coherent.extend(files.clone());
@@ -247,6 +275,16 @@ impl GroupReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// #2420: PR #2378's QA role ran 100 groups and 202 model calls in one
+    /// attempt. Every role is capped, so one attempt is bounded.
+    #[test]
+    fn one_review_attempt_has_a_hard_call_bound() {
+        assert!(evidence_group_allowed(MAX_EVIDENCE_GROUPS_PER_ROLE - 1));
+        assert!(!evidence_group_allowed(MAX_EVIDENCE_GROUPS_PER_ROLE), "group 13 of a role is never observed");
+        assert!(!evidence_group_allowed(99));
+        let bound = worst_case_calls(MAX_EVIDENCE_GROUPS_PER_ROLE).unwrap();
+        assert!(bound <= 74, "worst case per attempt is {bound} calls (was 202 for one role)");
+    }
     fn binding() -> aligned::ReviewBinding {
         aligned::ReviewBinding {
             head: "a".repeat(40),

@@ -1,4 +1,5 @@
-//! Owner signature assets and revision-bound PDF signing. No unattended CLI entrypoint.
+//! Owner signature assets and revision-bound PDF and Word (.docx) signing.
+//! No unattended CLI entrypoint.
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -12,11 +13,39 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 const WORKER: &str = include_str!("../python/sign_pdf.py");
+const DOCX_WORKER: &str = include_str!("../python/sign_docx.py");
 const RUNTIME_PINS: &str = include_str!("../python/requirements.txt");
 /// Identifies the code that turns a placement into bytes: the worker and the
 /// pinned runtime. A proposal's output hash is only reproducible under it.
 pub fn worker_fingerprint() -> String {
-    digest(format!("{WORKER}\0{RUNTIME_PINS}").as_bytes())
+    worker_fingerprint_for(DocFormat::Pdf)
+}
+pub fn worker_fingerprint_for(format: DocFormat) -> String {
+    digest(format!("{}\0{RUNTIME_PINS}", format.worker()).as_bytes())
+}
+/// What can be signed. A Word document is signed as Word: the signature is
+/// inserted at a paragraph and every other part of the file is kept as-is,
+/// since converting it to PDF would need a renderer this host may not have
+/// and would not be the document the owner was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocFormat {
+    Pdf,
+    Docx,
+}
+impl DocFormat {
+    pub fn of(path: &Path) -> Result<Self> {
+        match path.extension().and_then(|s| s.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("pdf") => Ok(Self::Pdf),
+            Some("docx") => Ok(Self::Docx),
+            _ => bail!("only .pdf and .docx documents can be signed"),
+        }
+    }
+    fn worker(self) -> &'static str {
+        match self {
+            Self::Pdf => WORKER,
+            Self::Docx => DOCX_WORKER,
+        }
+    }
 }
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -120,15 +149,25 @@ pub fn register_owner_upload_at(state: &Path, pdf: &[u8]) -> Result<()> {
 /// signable. Returns the wiki-relative path `doc sign` takes. The staged bytes
 /// are re-read and hash-checked, so what is signed is exactly what was sent.
 pub fn stage_owner_upload(root: &Path, state: &Path, filename: &str, pdf: &[u8]) -> Result<PathBuf> {
-    if !pdf.starts_with(b"%PDF-") {
-        bail!("attachment is not a PDF");
-    }
+    let docx = DocFormat::of(Path::new(filename)).ok() == Some(DocFormat::Docx);
+    let ext = if docx {
+        // A .docx is a zip package; the worker checks its contents on use.
+        if !pdf.starts_with(b"PK\x03\x04") {
+            bail!("attachment is not a Word .docx");
+        }
+        "docx"
+    } else {
+        if !pdf.starts_with(b"%PDF-") {
+            bail!("attachment is not a PDF");
+        }
+        "pdf"
+    };
     let stem = Path::new(filename)
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("document");
-    let path = crate::delivery::stage(root, &format!("{stem}.pdf"), pdf)?;
+    let path = crate::delivery::stage(root, &format!("{stem}.{ext}"), pdf)?;
     if digest(&read(&path, crate::pdf::MAX_PDF_BYTES)?) != digest(pdf) {
         bail!("staged upload does not match the attached bytes");
     }
@@ -179,6 +218,10 @@ pub struct Placement {
     pub date_x: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_y: Option<f64>,
+    /// Word documents: the paragraph (0-based, document order) the signature
+    /// is inserted into. `page`, `x` and `y` are unused (0) for these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paragraph: Option<u32>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InkBox {
@@ -263,8 +306,9 @@ fn scoped(root: &Path, path: &Path, exists: bool) -> Result<PathBuf> {
             .canonicalize()?
             .join(path.file_name().context("missing filename")?)
     };
-    if !p.starts_with(&root) || p.extension().and_then(|s| s.to_str()) != Some("pdf") {
-        bail!("PDF must be inside WIKI_ROOT and have a .pdf extension");
+    let ext = p.extension().and_then(|s| s.to_str());
+    if !p.starts_with(&root) || !matches!(ext, Some("pdf") | Some("docx")) {
+        bail!("document must be inside WIKI_ROOT and have a .pdf or .docx extension");
     }
     let relative = p
         .strip_prefix(&root)?
@@ -359,9 +403,12 @@ async fn layout(pdf: &[u8], page: u32) -> Result<serde_json::Value> {
     }))
 }
 async fn worker(request: serde_json::Value) -> Result<Vec<u8>> {
+    worker_with(DocFormat::Pdf, request).await
+}
+async fn worker_with(format: DocFormat, request: serde_json::Value) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(&request)?;
     let mut child = tokio::process::Command::new(crate::pdf::renderer_python()?)
-        .args(["-I", "-c", WORKER])
+        .args(["-I", "-c", format.worker()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -399,8 +446,27 @@ async fn sign_bytes(pdf: &[u8], png: &[u8], placement: &Placement) -> Result<Vec
 }
 /// Horizontal rules (signature lines) a reader sees on each page, with the
 /// text directly beneath them. Read-only; any PDF inside WIKI_ROOT.
+async fn sign_docx_bytes(docx: &[u8], png: &[u8], placement: &Placement) -> Result<Vec<u8>> {
+    let paragraph = placement.paragraph.context("Word placement has no paragraph")?;
+    worker_with(DocFormat::Docx, serde_json::json!({
+        "op": "sign",
+        "docx": STANDARD.encode(docx),
+        "png": STANDARD.encode(png),
+        "placement": {"paragraph": paragraph, "width": placement.width},
+        "date": placement.date,
+    }))
+    .await
+}
 pub async fn sign_lines(root: &Path, source: &Path, page: Option<u32>) -> Result<Vec<serde_json::Value>> {
     let source = scoped(&root.canonicalize()?, source, true)?;
+    if DocFormat::of(&source)? == DocFormat::Docx {
+        // Word documents have no fixed pages without a renderer: the lines are
+        // the paragraphs a signature can go into, numbered for `--line`.
+        let docx = read(&source, crate::pdf::MAX_PDF_BYTES)?;
+        let out = worker_with(DocFormat::Docx, serde_json::json!({"op": "lines", "docx": STANDARD.encode(&docx)})).await?;
+        let result: serde_json::Value = serde_json::from_slice(&out)?;
+        return Ok(result["lines"].as_array().cloned().unwrap_or_default());
+    }
     let pdf = read(&source, crate::pdf::MAX_PDF_BYTES)?;
     let pages = page_count_checked(&pdf, page).await?;
     let mut all = Vec::new();
@@ -448,6 +514,13 @@ pub async fn propose_with_preview(
     if output.symlink_metadata().is_ok() {
         bail!("output already exists; choose a new filename");
     }
+    let format = DocFormat::of(&source)?;
+    if DocFormat::of(&output)? != format {
+        bail!("the signed output must keep the document's extension");
+    }
+    if format == DocFormat::Docx {
+        return propose_docx(&root, state, &source, &output, signature, request).await;
+    }
     let pdf = read(&source, crate::pdf::MAX_PDF_BYTES)?;
     let document_sha256 = digest(&pdf);
     if !is_trusted(state, &document_sha256) {
@@ -486,6 +559,77 @@ pub async fn propose_with_preview(
         preview_png,
     })
 }
+/// A Word signing proposal: the line is resolved by anchor text or `--line`,
+/// the signed bytes are produced now (and their hash pinned), and the preview
+/// shows the signed line in context.
+async fn propose_docx(
+    root: &Path,
+    state: &Path,
+    source: &Path,
+    output: &Path,
+    signature: &str,
+    request: PlacementRequest,
+) -> Result<Proposed> {
+    let docx = read(source, crate::pdf::MAX_PDF_BYTES)?;
+    let document_sha256 = digest(&docx);
+    if !is_trusted(state, &document_sha256) {
+        bail!("document is neither rendered by Jarvis nor uploaded by the owner; have the owner attach it in Discord");
+    }
+    let png =
+        read(&asset_path(state, signature)?, 1024 * 1024).context("signature is not installed")?;
+    let target = match &request.target {
+        Target::AnchorText(text) => serde_json::json!({"anchor_text": text}),
+        Target::Line(line) => serde_json::json!({"line": line}),
+        Target::Ink { .. } => bail!("Word documents are signed on a line: give --anchor-text or --line (see doc sign-lines)"),
+    };
+    let encoded = STANDARD.encode(&docx);
+    let resolved: serde_json::Value = serde_json::from_slice(
+        &worker_with(DocFormat::Docx, serde_json::json!({
+            "op": "resolve", "docx": encoded, "target": target, "width": request.width,
+        }))
+        .await?,
+    )?;
+    let placement = Placement {
+        page: 0,
+        x: 0.0,
+        y: 0.0,
+        width: resolved["width"].as_f64().context("resolved width")?,
+        date: request.date.clone(),
+        ink: None,
+        anchor: Some(Anchor {
+            line: resolved["line"].as_u64().context("resolved line")? as u32,
+            x0: 0.0,
+            x1: 0.0,
+            top: 0.0,
+            text: resolved["text"].as_str().map(str::to_string),
+        }),
+        date_x: None,
+        date_y: None,
+        paragraph: Some(resolved["paragraph"].as_u64().context("resolved paragraph")? as u32),
+    };
+    let signed = sign_docx_bytes(&docx, &png, &placement).await?;
+    let preview_png = worker_with(DocFormat::Docx, serde_json::json!({
+        "op": "preview", "docx": encoded, "png": STANDARD.encode(&png),
+        "placement": {"paragraph": placement.paragraph, "width": placement.width},
+        "date": placement.date,
+    }))
+    .await?;
+    Ok(Proposed {
+        proposal: Proposal {
+            source: source.strip_prefix(root)?.to_str().context("path")?.into(),
+            output: output.strip_prefix(root)?.to_str().context("path")?.into(),
+            document_sha256,
+            signature: signature.into(),
+            signature_sha256: digest(&png),
+            placement,
+            pages: 0,
+            expected_output_sha256: Some(digest(&signed)),
+            preview_sha256: Some(digest(&preview_png)),
+            worker_sha256: Some(worker_fingerprint_for(DocFormat::Docx)),
+        },
+        preview_png,
+    })
+}
 /// Called only by the approved action handler, behind its durable execution fence.
 pub async fn execute(root: &Path, state: &Path, proposal: &Proposal) -> Result<Receipt> {
     let source = scoped(root, Path::new(&proposal.source), true)?;
@@ -501,9 +645,19 @@ pub async fn execute(root: &Path, state: &Path, proposal: &Proposal) -> Result<R
     if !is_trusted(state, &proposal.document_sha256) {
         bail!("PDF provenance registration is missing");
     }
-    let signed = sign_bytes(&pdf, &png, &proposal.placement).await?;
+    let format = DocFormat::of(&source)?;
+    let signed = match format {
+        DocFormat::Pdf => sign_bytes(&pdf, &png, &proposal.placement).await?,
+        DocFormat::Docx => {
+            // Only proposals that pinned the exact signed bytes are executable.
+            if proposal.expected_output_sha256.is_none() {
+                bail!("Word signing proposal has no pinned output; propose again");
+            }
+            sign_docx_bytes(&pdf, &png, &proposal.placement).await?
+        }
+    };
     if let Some(expected) = &proposal.expected_output_sha256 {
-        if proposal.worker_sha256.as_deref() != Some(worker_fingerprint().as_str()) {
+        if proposal.worker_sha256.as_deref() != Some(worker_fingerprint_for(format).as_str()) {
             bail!("Jarvis's signer was updated after this card was proposed, so the preview may not match; nothing was published. Propose the signature again");
         }
         if &digest(&signed) != expected {
@@ -512,7 +666,10 @@ pub async fn execute(root: &Path, state: &Path, proposal: &Proposal) -> Result<R
     }
     // One-for-one: the signed file must be the original bytes plus an appended
     // incremental update. Anything else is a re-encoding and is never published.
-    if signed.len() <= pdf.len() || !signed.starts_with(&pdf) {
+    // A PDF is signed by incremental update, so its original bytes are a
+    // prefix of the signed file. A Word package is rewritten; its worker
+    // checked that every part but the signed paragraph is unchanged.
+    if format == DocFormat::Pdf && (signed.len() <= pdf.len() || !signed.starts_with(&pdf)) {
         bail!("worker output does not preserve the original document bytes; nothing was published");
     }
     // Re-resolve after the worker: fail if a directory was moved/replaced meanwhile.

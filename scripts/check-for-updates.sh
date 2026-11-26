@@ -19,6 +19,12 @@
 #   target/release/augmentagent. A systemd drop-in that overrides ExecStart
 #   (never do that to pin a rollout) is reported as DEPLOY PINNED, alerted
 #   once, and the restart is skipped until the override is retired.
+# - #2468: the auto-ship worker does not follow main. It runs a build of the
+#   commit pinned in ~/.config/augmentagent/autoship-pin (lib/autoship-pin.sh),
+#   rebuilt and reloaded only when that pin moves (scripts/autoship-pin.sh).
+#
+# Optional remote release builder: AUGMENTAGENT_REMOTE_BUILD_HOST opts in.
+# Setup, restricted SSH protocol and failure behavior: scripts/remote-builder/setup.sh.
 #
 # Build stamp (idempotency fix):
 #   Idempotency used to be keyed purely on `HEAD == origin/main`. If the
@@ -93,6 +99,16 @@ notify_owner() {
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
 . "$REPO_ROOT/scripts/lib/update-build.sh"
+# #2468 — the auto-ship worker runs a pinned build that main deploys never
+# move. Absent library (partial fixtures, older checkouts): no pinning.
+if [ -f "$REPO_ROOT/scripts/lib/autoship-pin.sh" ]; then
+  # shellcheck source=lib/autoship-pin.sh
+  . "$REPO_ROOT/scripts/lib/autoship-pin.sh"
+else
+  AUTOSHIP_PIN_CHANGED=0
+  reconcile_autoship_pin() { AUTOSHIP_PIN_CHANGED=0; }
+  autoship_pin_after_provision() { :; }
+fi
 
 # Artifact repair is independent of the executable's capability or health.
 secure_release_artifacts() {
@@ -110,7 +126,8 @@ reconcile_worker_provisioning() {
       if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
         log "AUTO-SHIP WORKER PROVISIONING FAILED — retry pending independently of build stamp"
         return 1
-      fi ;;
+      fi
+      autoship_pin_after_provision || return 1 ;;
     *) log "auto-ship worker capability unavailable; skipping provisioning" ;;
   esac
   rm -f "$PROVISION_PENDING"
@@ -121,8 +138,10 @@ reconcile_worker_recovery() {
   # This is runtime reconciliation, independent of provisioning/build stamps.
   # The helper proves the live daemon's external mode and process birth before
   # starting only a managed worker that exhausted systemd's restart allowance.
+  local pinned=()
+  if declare -F autoship_pin_binary >/dev/null; then pinned=(--worker-binary "$(autoship_pin_binary)"); fi
   if ! python3 "$REPO_ROOT/scripts/recover-autopr-worker.py" \
-      --repository "$REPO_ROOT" --state "$AUGMENTAGENT_STATE_DIR" >> "$LOG" 2>&1; then
+      --repository "$REPO_ROOT" --state "$AUGMENTAGENT_STATE_DIR" ${pinned[@]+"${pinned[@]}"} >> "$LOG" 2>&1; then
     log "AUTO-SHIP WORKER RECOVERY FAILED — retry on the next normal update tick"
     return 1
   fi
@@ -212,9 +231,10 @@ apply_update() {
 
   if [ "$NEEDS_REBUILD" -eq 1 ]; then
     # #903 — a release build is the second-largest memory user on the box;
-    # under pressure it would tip a host that is already struggling. Not a
+    # under pressure it would tip a host that is already struggling. Remote
+    # mode does no local compilation; keep the later restart guards. Not a
     # build failure: withhold the stamp so the next tick retries (#826).
-    if ! memory_pressure_ok; then
+    if [ -z "${AUGMENTAGENT_REMOTE_BUILD_HOST:-}" ] && ! memory_pressure_ok; then
       log "skipping rebuild + restart under memory pressure; stamp withheld, retry next tick"
       return 1
     fi
@@ -233,7 +253,7 @@ apply_update() {
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
     local build_status=0
-    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target"; then
+    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target" "$TARGET"; then
       :
     else
       build_status=$?
@@ -246,6 +266,14 @@ apply_update() {
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # #2468 — the worker's pinned build is reconciled against the pin, never
+  # against this deploy: an unchanged pin leaves its binary and stamp alone,
+  # so merging to main does not reload the worker. target/release now holds
+  # $TARGET's build, which bootstraps the first pin without a second compile.
+  # A failed pinned build never blocks the rest of the deploy.
+  reconcile_autoship_pin "$TARGET" "$TARGET" ||
+    log "pinned auto-ship worker unchanged this tick; retrying next tick"
 
   # Installer/template fixes need provisioning even when Cargo output is
   # cached or only scripts changed. This reloads configuration without
@@ -341,8 +369,8 @@ apply_update() {
     Darwin)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
         # #1079 — the Linux guarantees, on launchd: defer under an in-flight
-        # auto-PR build (#844) or the restart budget (#903), and only count a
-        # restart that verifiably bounced the agent (#826).
+        # owner turn (#1779), memory pressure or the restart budget (#903),
+        # and only count a restart that verifiably bounced the agent (#826).
         if maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
@@ -370,17 +398,18 @@ apply_update() {
       ;;
     Linux)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
-        # #844 — an in-flight auto-PR build is ~20 min of agentic Opus; a
-        # restart kills it unrecorded. Deferring counts as a restart failure,
-        # so the stamp is withheld (#826) and the next tick retries — the
-        # binary is already built, so the retry is cheap.
+        # #1779 — an owner turn in flight defers the restart. Deferring
+        # counts as a restart failure, so the stamp is withheld (#826) and the
+        # next tick retries — the binary is already built, so the retry is
+        # cheap. Auto-ship runs never defer it (#2271): they live in
+        # augmentagent-autopr.service, which survives this restart.
         if deploy_pinned_elsewhere; then
           # #1571 — reported above; a restart would relaunch the frozen binary.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
-          # #903 — same deferral semantics as #844: counts as a restart
+          # #903 — same deferral semantics as #1779: counts as a restart
           # failure so the stamp is withheld and the next tick retries.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else
@@ -494,7 +523,11 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
-    if [ -e "$PROVISION_PENDING" ]; then
+    # #2468 — a moved pin is applied here: target/release is LOCAL's
+    # verified build, so pinning LOCAL itself needs no compile.
+    reconcile_autoship_pin "$LOCAL" "$LOCAL" ||
+      log "pinned auto-ship worker unchanged this tick; retrying next tick"
+    if [ -e "$PROVISION_PENDING" ] || [ "$AUTOSHIP_PIN_CHANGED" = 1 ]; then
       reconcile_worker_provisioning || exit 1
     fi
     reconcile_native_selection

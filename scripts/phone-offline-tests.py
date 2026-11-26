@@ -73,6 +73,14 @@ SUITES = [
     ("augmentagent-channel-whatsapp-history", "--test", "history", 10),
 ]
 SUMMARY = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;")
+# These suites are offline and must never receive provider, forge or messaging
+# credentials, even when the surrounding job exports them for other work.
+CREDENTIAL = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|ACCOUNT_SID|SID$|_KEY|KEY_|^KEY$", re.IGNORECASE)
+
+def suite_environment(environ):
+    env = {name: value for name, value in environ.items() if not CREDENTIAL.search(name)}
+    env.update(AUGMENTAGENT_GH_DISABLE="1", AUGMENTAGENT_PHONE_ENABLED="0", CARGO_TERM_COLOR="never")
+    return env
 
 def validate_output(output, returncode, minimum, *, allow_filtered=False):
     summaries = SUMMARY.findall(output)
@@ -89,7 +97,7 @@ def main():
     parser.add_argument("--managed", action="store_true", help="Use the repository build-storage wrapper for local acceptance runs")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, AUGMENTAGENT_GH_DISABLE="1", AUGMENTAGENT_PHONE_ENABLED="0", CARGO_TERM_COLOR="never")
+    env = suite_environment(os.environ)
     receipt = {"kind":"offline-only", "commit":subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip(), "worktree_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True).strip()), "os":platform.system(), "architecture":platform.machine(), "suites":[], "passed":False}
     jobs = []
     for package, selector, target, minimum in SUITES:
@@ -120,7 +128,13 @@ def main():
             if args.managed:
                 command = [str(ROOT / "scripts/cargo-managed.sh"), *command[1:]]
             print("Running " + label, flush=True)
-            run = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                run = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            except OSError as error:
+                # An unrunnable toolchain is a failed required target, not a
+                # crash: record it so the receipt still names what is missing.
+                receipt["suites"].append({"suite":label,"command":command,"exit_status":None,"passed":False,"error":str(error)})
+                raise ValueError(label + ": required target could not complete: " + str(error)) from error
             (args.output / (label + ".log")).write_text(run.stdout)
             item = {"suite":label,"command":command,"exit_status":run.returncode,"passed":False}
             receipt["suites"].append(item)

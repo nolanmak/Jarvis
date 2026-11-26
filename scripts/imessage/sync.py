@@ -12,7 +12,7 @@ import subprocess
 import time
 import sys
 
-from imessage_sync import load_contacts, source_staleness, sync
+from imessage_sync import heic_to_jpeg, load_contacts, source_staleness, sync
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = Path.home() / "Library/Messages/chat.db"
@@ -122,7 +122,15 @@ def run(args):
                     # writes to stderr and the queue silently re-grows each run.
                     failed(upload_cause(done.returncode, done.stderr, path, key))
                 return done.returncode == 0
-            s3 = {"bucket": args.s3_bucket, "uploader": upload}
+            # The cache directory is configured whether or not a converter is:
+            # a copy queued by an earlier run must still be cleaned up once it
+            # uploads, even on a machine that has since lost `sips`.
+            s3 = {"bucket": args.s3_bucket, "uploader": upload,
+                  "convert_dir": Path.home() / "Library/Caches/augmentagent/imessage-converted"}
+            # HEIC photos are uploaded as JPEG so the drafting models can
+            # open them. `sips` ships with macOS; without it nothing changes.
+            if shutil.which("sips"):
+                s3["converter"] = heic_to_jpeg
         result = sync(args.db, args.out, args.out / ".sync_state.json", contacts=contacts, s3=s3)
         print(f"synced {result['messages']} messages across {result['conversations']} conversations")
         stale = source_staleness(args.db)

@@ -220,6 +220,13 @@ impl WorkflowStore {
             WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
             params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1;
         if changed {
+            // #2317: an owner job that keeps ending at the same checkpoint
+            // yields its alternate turns with backoff, like automatic work.
+            let progressed=outcome.as_str()==Some("progress");
+            if let Some(due)=super::command_fairness::record(&tx,workflow,progressed,now)? {
+                tx.execute("UPDATE command_schedule SET eligible_at=MAX(eligible_at,?2) WHERE workflow=?1",params![workflow,due])?;
+                tx.execute("UPDATE command_attempt SET eligible_at=MAX(eligible_at,?2) WHERE workflow=?1",params![workflow,due])?;
+            }
             tx.execute("DELETE FROM command_resource_refusal WHERE workflow=?1", [workflow])?;
             if let Some(observation) = observation {
                 tx.execute("INSERT INTO command_resource_refusal(workflow,selected_at,payload) VALUES(?1,?2,?3)",
@@ -341,6 +348,14 @@ impl WorkflowStore {
         let id: Option<String> = tx.query_row(
             &due_command_sql(&tx)?,
             params![repository,now], |row| row.get(0)).optional()?;
+        // Finishing beats starting: a starting command job gives its turn to
+        // due finishing work on the automatic lane, for a bounded wait.
+        if let Some(id) = &id {
+            if super::command_fairness::yields_to_finishing(&tx, &repository, id, now)? {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
         if let Some(id) = &id {
             tx.execute("DELETE FROM command_resource_refusal WHERE workflow=?1", [id])?;
             tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)
@@ -542,6 +557,12 @@ pub(super) fn submit_in_transaction(tx:&Transaction<'_>,request_id:&str,principa
                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(workflow) DO NOTHING",
                 params![workflow,request.repository,serde_json::to_string(&request.target)?,serde_json::to_string(&until)?,serde_json::to_string(&provider)?,now])?;
             if inserted==1 {super::progress::project(tx,&workflow,"command_queued",now)?;}
+            // An explicit owner request restores ordinary turns for a job
+            // that had been yielding without progress (#2317).
+            else if super::command_fairness::reset(tx,&workflow)? {
+                tx.execute("UPDATE command_schedule SET eligible_at=MIN(eligible_at,attempted_at+?2) WHERE workflow=?1",
+                    params![workflow,super::command_fairness::RETRY_MS])?;
+            }
         }
         tx.execute("INSERT INTO command_request(request_id,principal,payload,admission,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![request_id,principal,payload,serde_json::to_string(&admission)?,now])?;

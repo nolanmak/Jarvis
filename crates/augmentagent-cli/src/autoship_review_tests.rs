@@ -1024,3 +1024,123 @@ fn review_response_accepts_exact_byte_limit_and_refuses_one_more() {
     raw.push(' ');
     assert!(parse_review_pass_with_sources(&raw,&binding(),actor("codex","actual-review"),ReviewRole::Diff,coverage(),&criteria()).is_err());
 }
+
+/// #2385: the requested binding of PR #2378's 2026-11-21 review (head 18019c3f,
+/// group 24, "review response changed binding" twice). The binding is the
+/// controller's own: the reviewer's echo carries no authority, so a copy that
+/// still names the same head is normalized. A different head is a response to
+/// another candidate and stays refused.
+fn production_binding() -> ReviewBinding {
+    ReviewBinding {
+        head: "18019c3fa308d43da7bd437dca2321a8a1f39021".into(),
+        base: "b00aa78d7707b48337df61aa6612dd7f843d7959".into(),
+        environment_id: "37c61c99de971d677e8f83b625aed562deee59f67f06a3abd6bab25218c1d7b0".into(),
+        contract_hash: "e32b4a6af25e72be52ee9e666d2d508d4207f2f4d319d354cef659ba7fb8c63b".into(),
+        evidence_hash: "2415c40a395d3f727f6fafa187a463938f4c3c691cec2533ea762709c06b90bb".into(),
+    }
+}
+
+#[test]
+fn echoed_binding_naming_the_same_head_is_normalized_not_rejected() {
+    let requested = production_binding();
+    let coverage = CoverageReceipt { binding: requested.clone(), ..coverage() };
+    let parse = |echo: serde_json::Value| {
+        let raw = serde_json::json!({"binding": echo, "decision": "approve", "findings": []}).to_string();
+        parse_review_pass(&raw, &requested, actor("codex", "r"), ReviewRole::Qa, coverage.clone(), &criteria())
+    };
+    let mut miscopied = serde_json::to_value(&requested).unwrap();
+    // The shapes a copied 40/64-hex echo takes: a transcription slip in a
+    // controller-owned hash, the pre-integration base, an uppercase head.
+    miscopied["evidence_hash"] = "2415c40a395d3f727f6fafa187a463938f4c3c691cec2533ea762709c06b90b".into();
+    miscopied["base"] = "6f1a56aa1e3c3ace38b64b99eb824695113917fb".into();
+    miscopied["head"] = requested.head.to_uppercase().into();
+    let pass = parse(miscopied).expect("same-head echo must be normalized");
+    assert!(pass.completed);
+    assert_eq!(pass.binding, requested, "the controller's binding, never the echo, is recorded");
+    let mut abbreviated = serde_json::to_value(&requested).unwrap();
+    abbreviated["head"] = "18019c3fa308".into();
+    assert_eq!(parse(abbreviated).unwrap().binding, requested);
+    let mut stale = serde_json::to_value(&requested).unwrap();
+    stale["head"] = "6f1a56aa1e3c3ace38b64b99eb824695113917fb".into();
+    let error = parse(stale).unwrap_err();
+    assert!(format!("{error:#}").contains("changed binding"), "{error:#}");
+    let mut too_short = serde_json::to_value(&requested).unwrap();
+    too_short["head"] = "1801".into();
+    assert!(parse(too_short).is_err(), "an ambiguous abbreviation names no candidate");
+}
+
+
+// Reviewer/adjudicator wire shapes Codex actually returned overnight
+// (#2545, #2546, #2553). Each was valid in substance but strict parsing
+// exhausted the bounded correction and stranded the review.
+fn echo_without_evidence_hash(head: &str) -> String {
+    let b = binding();
+    format!(r#"{{"head": "{head}", "base": "{}", "environment_id": "{}", "contract_hash": "{}"}}"#,
+        b.base, b.environment_id, b.contract_hash)
+}
+
+#[test]
+fn review_echo_missing_evidence_hash_binds_to_controller_head() {
+    let raw = format!(r#"{{"binding": {}, "decision": "approve", "findings": []}}"#, echo_without_evidence_hash("head-a"));
+    let pass = parse_review_pass(&raw, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria())
+        .expect("a binding echo that omits evidence_hash still names the requested head");
+    assert!(pass.completed);
+    assert_eq!(pass.binding, binding(), "the pass records the controller binding, never the echo");
+    let other = format!(r#"{{"binding": {}, "decision": "approve", "findings": []}}"#, echo_without_evidence_hash("head-b"));
+    assert!(parse_review_pass(&other, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria()).is_err(),
+        "an echo naming another head is still refused");
+    let headless = r#"{"binding": {}, "decision": "approve", "findings": []}"#;
+    assert!(parse_review_pass(headless, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria()).is_err(),
+        "an echo naming no head binds to nothing");
+}
+
+#[test]
+fn review_finding_missing_evidence_hash_defaults_to_reviewed_evidence() {
+    let mut finding = serde_json::to_value(finding("F1")).unwrap();
+    finding.as_object_mut().unwrap().remove("evidence_hash");
+    let raw = serde_json::json!({"binding": binding(), "decision": "changes_requested", "findings": [finding]}).to_string();
+    let pass = parse_review_pass(&raw, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria()).unwrap();
+    assert_eq!(pass.findings[0].evidence_hash, binding().evidence_hash);
+    // A review with no real verdict still fails.
+    let raw = serde_json::json!({"binding": binding(), "findings": []}).to_string();
+    assert!(parse_review_pass(&raw, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria()).is_err());
+    let raw = serde_json::json!({"binding": binding(), "decision": "lgtm", "findings": []}).to_string();
+    assert!(parse_review_pass(&raw, &binding(), actor("codex", "r"), ReviewRole::Diff, coverage(), &criteria()).is_err());
+}
+
+#[test]
+fn adjudication_uphold_with_extra_rationale_is_accepted() {
+    let raw = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "uphold",
+        "evidence": "source.rs line 4", "rationale": "the claim matches the diff", "repair_criterion": "restore the old branch"}}}).to_string();
+    let response = validate_adjudicator_response(&raw, &binding(), &[finding("F1")]).expect("extra rationale is a note, not a schema break");
+    assert_eq!(response.rulings["F1"], Ruling::Uphold { evidence: "source.rs line 4".into(), repair_criterion: "restore the old branch".into() });
+    let raw = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "uphold",
+        "evidence": "source.rs line 4", "rationale": "no repair given"}}}).to_string();
+    assert!(validate_adjudicator_response(&raw, &binding(), &[finding("F1")]).is_err(), "an uphold without a repair criterion is still no verdict");
+}
+
+#[test]
+fn adjudication_amend_named_rerun_checks_is_an_alias() {
+    let raw = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "amend", "evidence": "contract",
+        "replacement_criterion": "docs may be in README", "named_rerun_checks": ["cargo test -p x"]}}}).to_string();
+    let response = validate_adjudicator_response(&raw, &binding(), &[finding("F1")]).unwrap();
+    assert_eq!(response.rulings["F1"], Ruling::Amend { evidence: "contract".into(),
+        replacement_criterion: "docs may be in README".into(), rerun_checks: vec!["cargo test -p x".into()] });
+    let conflicting = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "amend", "evidence": "contract",
+        "replacement_criterion": "r", "rerun_checks": ["a"], "named_rerun_checks": ["b"]}}}).to_string();
+    assert!(validate_adjudicator_response(&conflicting, &binding(), &[finding("F1")]).is_err(), "two different check lists are ambiguous");
+    let empty = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "amend", "evidence": "contract",
+        "replacement_criterion": "r", "named_rerun_checks": []}}}).to_string();
+    assert!(validate_adjudicator_response(&empty, &binding(), &[finding("F1")]).is_err());
+    let approve = serde_json::json!({"binding": binding(), "rulings": {"F1": {"decision": "approve", "evidence": "e"}}}).to_string();
+    assert!(validate_adjudicator_response(&approve, &binding(), &[finding("F1")]).is_err());
+}
+
+#[test]
+fn adjudication_echo_missing_evidence_hash_still_binds_head() {
+    let ruling = r#"{"F1": {"decision": "uphold", "evidence": "e", "repair_criterion": "r"}}"#;
+    let raw = format!(r#"{{"binding": {}, "rulings": {ruling}}}"#, echo_without_evidence_hash("head-a"));
+    assert!(validate_adjudicator_response(&raw, &binding(), &[finding("F1")]).is_ok());
+    let raw = format!(r#"{{"binding": {}, "rulings": {ruling}}}"#, echo_without_evidence_hash("head-b"));
+    assert!(validate_adjudicator_response(&raw, &binding(), &[finding("F1")]).is_err());
+}

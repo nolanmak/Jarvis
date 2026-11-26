@@ -95,6 +95,13 @@ def ns(unix_seconds):
     return (unix_seconds - APPLE_EPOCH) * 1_000_000_000
 
 
+def jpeg_converter(src, dest):
+    """Stand-in for `sips`, writing a recognisable payload."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"jpeg from " + Path(src).read_bytes())
+    return True
+
+
 def make_contacts_db(path):
     """Minimal replica of the macOS AddressBook (.abcddb) schema."""
     con = sqlite3.connect(path)
@@ -324,6 +331,105 @@ class TestSync(unittest.TestCase):
             " s3://test-bucket/conversations/+15551234567/attachments/1-IMG_001.jpeg]",
             self.read_md("+15551234567"),
         )
+
+    def test_heic_photo_is_uploaded_as_jpeg_when_a_converter_is_configured(self):
+        local = self.root / "IMG_002.HEIC"
+        local.write_bytes(b"heicdata")
+        add_message(self.con, 1, 1, None, ns(1782475200), 1,
+                    cache_has_attachments=1)
+        self.con.execute(
+            "INSERT INTO attachment VALUES (1, 'image/heic', 'IMG_002.HEIC', ?)", (str(local),))
+        self.con.execute("INSERT INTO message_attachment_join VALUES (1, 1)")
+        self.con.commit()
+        uploads, convert_dir = [], self.root / "converted"
+
+        def upload(path, bucket, key):
+            uploads.append((Path(path).read_bytes(), key))
+            return True
+
+        s3 = {"bucket": "test-bucket", "uploader": upload,
+              "converter": jpeg_converter, "convert_dir": convert_dir}
+        sync(self.db_path, self.out, self.state, s3=s3)
+        key = "conversations/+15551234567/attachments/1-IMG_002.jpg"
+        self.assertEqual(uploads, [(b"jpeg from heicdata", key)])
+        self.assertIn(f"[attachment: image/jpeg IMG_002.jpg s3://test-bucket/{key}]",
+                      self.read_md("+15551234567"))
+        # The converted copy is removed once uploaded.
+        self.assertEqual([p for p in convert_dir.rglob("*") if p.is_file()], [])
+
+    def add_heic_attachment(self, rowid, msg_rowid, name="IMG_002.HEIC"):
+        local = self.root / name
+        local.write_bytes(b"heicdata")
+        self.con.execute(
+            "INSERT INTO attachment VALUES (?, 'image/heic', ?, ?)",
+            (rowid, name, str(local)),
+        )
+        self.con.execute(
+            "INSERT INTO message_attachment_join VALUES (?, ?)", (msg_rowid, rowid)
+        )
+        self.con.commit()
+        return local
+
+    def _queue_converted_upload(self, convert_dir):
+        """Export once with a failing uploader; return the queued JPEG copy."""
+        add_message(self.con, 1, 1, None, ns(1782475200), 1,
+                    cache_has_attachments=1)
+        self.add_heic_attachment(1, 1)
+        s3 = {"bucket": "test-bucket", "uploader": lambda p, b, k: False,
+              "converter": jpeg_converter, "convert_dir": convert_dir}
+        sync(self.db_path, self.out, self.state, s3=s3)
+        queued, = json.loads(self.state.read_text())["pending_uploads"]
+        self.assertTrue(Path(queued["path"]).exists())
+        return s3, queued
+
+    def test_queued_converted_copy_survives_another_bundle_sharing_the_cache(self):
+        convert_dir = self.root / "converted"
+        s3, queued = self._queue_converted_upload(convert_dir)
+
+        other = self.root / "other bundle"
+        s3["uploader"] = lambda p, b, k: True
+        sync(self.db_path, other, other / ".sync_state.json", s3=s3)
+        self.assertTrue(Path(queued["path"]).exists())
+
+        uploads = []
+        s3["uploader"] = lambda p, b, k: uploads.append(Path(p).read_bytes()) or True
+        sync(self.db_path, self.out, self.state, s3=s3)
+        self.assertEqual(uploads, [b"jpeg from heicdata"])
+        self.assertEqual(json.loads(self.state.read_text())["pending_uploads"], [])
+        self.assertFalse(Path(queued["path"]).exists())
+
+    def test_queued_converted_copy_is_removed_when_conversion_is_unavailable(self):
+        convert_dir = self.root / "converted"
+        s3, queued = self._queue_converted_upload(convert_dir)
+
+        # `sips` has gone missing by the time the retry runs.
+        uploads = []
+        del s3["converter"]
+        s3["uploader"] = lambda p, b, k: uploads.append(k) or True
+        sync(self.db_path, self.out, self.state, s3=s3)
+        self.assertEqual(uploads, [queued["key"]])
+        self.assertFalse(Path(queued["path"]).exists())
+
+    def test_heic_photo_is_uploaded_unchanged_when_conversion_fails_or_is_off(self):
+        for row, s3_extra in ((1, {}), (2, {"converter": lambda src, dest: False,
+                                             "convert_dir": self.root / "converted"})):
+            local = self.root / f"IMG_00{row}.heic"
+            local.write_bytes(b"heicdata")
+            add_message(self.con, row, 1, None, ns(1782475200 + row), 1,
+                        cache_has_attachments=1)
+            self.con.execute(
+                "INSERT INTO attachment VALUES (?, 'image/heic', ?, ?)",
+                (row, local.name, str(local)))
+            self.con.execute("INSERT INTO message_attachment_join VALUES (?, ?)", (row, row))
+            self.con.commit()
+            uploads = []
+            s3 = {"bucket": "test-bucket",
+                  "uploader": lambda p, b, k: uploads.append((p, k)) or True, **s3_extra}
+            sync(self.db_path, self.out, self.state, s3=s3)
+            key = f"conversations/+15551234567/attachments/{row}-IMG_00{row}.heic"
+            self.assertEqual(uploads, [(str(local), key)])
+            self.assertIn(f"[attachment: image/heic IMG_00{row}.heic s3://test-bucket/{key}]",
+                          self.read_md("+15551234567"))
 
     def test_failed_upload_retried_next_sync(self):
         local = self.root / "IMG_001.jpeg"

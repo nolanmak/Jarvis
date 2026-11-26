@@ -348,3 +348,13 @@ and generation rates and include startup/idle time. Claude/Codex cached
 input tokens cannot be assumed to retain their cache savings after moving
 to Runpod. Per-call usage records can aggregate several tool turns and are
 not measurements of the largest individual context window.
+
+## Yolo is not a selectable profile
+
+The yolo profile ([YOLO.md](YOLO.md)) runs on the same Codex bridge as Qwen
+and GLM, but it is not part of model switching. `/model set yolo`, the
+model-switch tool and `loop create --model yolo` all refuse it, and a
+`AUGMENTAGENT_REASONER_CHAIN` that names it reports it as an unknown entry.
+It is dispatched only for turns in a yolo thread, never as a fallback for
+another profile, and a yolo turn never falls back to another profile.
+

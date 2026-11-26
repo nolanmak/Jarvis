@@ -96,7 +96,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     // identity. Readiness, source selection and specification use real models.
     let grounded_readiness = match acceptance::readiness::assess(&root, &issue, &mut guard).await? {
         acceptance::readiness::Decision::Ready(evidence) => evidence,
-        acceptance::readiness::Decision::Dependency(reason) => anyhow::bail!("routine arithmetic fixture incorrectly requires an external decision: {reason}"),
+        acceptance::readiness::Decision::Deferred(reason) => anyhow::bail!("routine arithmetic fixture readiness was deferred: {reason}"),
     };
     // Production scoper selects actual immutable source, then independently
     // authors the contract and verifier. No scripted reviewer stands in here.

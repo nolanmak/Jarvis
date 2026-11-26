@@ -47,6 +47,7 @@ class LaunchdInstallerTests(unittest.TestCase):
             shutil.copy2(SOURCE / "scripts" / f"install-{name}.sh", self.repo / "scripts")
         shutil.copy2(SOURCE / "scripts/uninstall-autostart.sh", self.repo / "scripts")
         shutil.copy2(SOURCE / "scripts/secure-release-executables.py", self.repo / "scripts")
+        shutil.copy2(SOURCE / "scripts/ensure-autopr-worker.sh", self.repo / "scripts")
         for name in ("run-rs.sh", "run-dashboard.sh", "check-for-updates.sh", "calendar-poll.sh",
                      "daily-digest.sh", "daily-research.sh", "wix-events-sync.mjs"):
             (self.repo / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
@@ -169,6 +170,29 @@ class LaunchdInstallerTests(unittest.TestCase):
         self.assertFalse((self.root / "launchctl.loaded").exists())
         for line in (self.root / "launchctl.log").read_text().splitlines():
             self.assertNotIn("augmentagent-dashboard", line)
+
+    def test_autostart_installs_the_autoship_worker_agent_and_uninstall_removes_it(self):
+        # #2275: auto-ship runs only in `auto-pr-worker`, so a macOS install
+        # registers that worker as its own LaunchAgent next to the daemon.
+        binary = self.repo / "target/release/augmentagent"
+        binary.write_text('#!/bin/sh\n[ "$1 $2" = "auto-pr-worker --help" ] && '
+                          'echo "Usage: augmentagent auto-pr-worker"\nexit 0\n')
+        binary.chmod(0o755)
+        daemon = self.install("autostart")
+        worker_path = self.home / "Library/LaunchAgents/com.nolanmak.augmentagent.autopr.plist"
+        worker = plistlib.loads(worker_path.read_bytes())
+        self.assertEqual(worker["ProgramArguments"],
+                         [str(self.repo / "scripts/run-rs.sh"), "auto-pr-worker", "--dry-run", "true"])
+        self.assertEqual(worker["EnvironmentVariables"]["PATH"], daemon["EnvironmentVariables"]["PATH"])
+        self.assertEqual(worker["StandardErrorPath"], daemon["StandardErrorPath"])
+        calls = (self.root / "launchctl.log").read_text()
+        self.assertLess(calls.index("com.nolanmak.augmentagent.plist"),
+                        calls.index("com.nolanmak.augmentagent.autopr.plist"),
+                        "the daemon restarts on the new build before the worker starts")
+        result = subprocess.run([str(self.repo / "scripts/uninstall-autostart.sh")],
+                                cwd=self.repo, env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(worker_path.exists())
 
 
 if __name__ == "__main__":
