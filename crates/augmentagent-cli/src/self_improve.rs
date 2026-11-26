@@ -1952,7 +1952,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             },
         };
         let candidate_head = head_sha.clone();
-        match sweep_verdict(&candidate) {
+        // #2583: a red draft behind main gets judged as if green, but only so
+        // it can take the main-update step below; it is never merged red.
+        let heal = finalize::heal_by_main_update(
+            review_mode == crate::autoship_review::ReviewMode::Nightly,
+            candidate.checks_green, finalize::merge_state(row));
+        let judged = if heal { SweepCandidate { checks_green: Some(true), ..candidate.clone() } } else { candidate.clone() };
+        match sweep_verdict(&judged) {
             SweepVerdict::Skip(why) => {
                 // Said, not swallowed: a silent skip is indistinguishable from
                 // the sweep being broken.
@@ -1989,7 +1995,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 // #2458: green but BEHIND main under strict protection. Merge
                 // main in with a merge commit; checks rerun on it and a later
                 // tick merges it once green. No worker slot, no model call.
-                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                if heal || finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
                     let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
                         Ok(main) => main,
                         Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
