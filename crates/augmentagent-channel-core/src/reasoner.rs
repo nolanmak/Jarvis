@@ -602,6 +602,13 @@ const HOST_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 /// `128 + n` exit code (#1779) while reporting our stop as `128 + SIGTERM`.
 fn stopped_through_cleanup(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
+    // The supervisor dying of a signal is read as our own, because cleanup
+    // escalates its SIGTERM to a SIGKILL of the supervisor itself when the
+    // receipt does not land in time. A host stop of the whole group reaches
+    // us the same way, so the two are indistinguishable here; attributing the
+    // ambiguous status to the stop we know we just sent keeps cleanup from
+    // reporting itself as a host stop. A stop that preceded cleanup is
+    // already classified from the un-reaped status, before the group drops.
     if status.signal().is_some() {
         return None;
     }
