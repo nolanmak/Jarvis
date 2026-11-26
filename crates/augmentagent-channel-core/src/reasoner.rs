@@ -629,8 +629,12 @@ async fn pipe_io_failure(
     error: std::io::Error,
 ) -> anyhow::Error {
     let waited = tokio::time::timeout(HOST_STOP_WAIT, child.wait()).await.ok().and_then(Result::ok);
-    let stopped = match waited.as_ref().and_then(interrupted_by_signal) {
-        Some(signal) => Some(signal),
+    let stopped = match waited.as_ref() {
+        // Already reaped: this status is the whole story. A reaped status is
+        // cached, so stopping the group and waiting again cannot name a
+        // different stop than the one that is already in hand.
+        Some(status) => interrupted_by_signal(status),
+        // Still running past the wait, so no status names anything yet.
         None => {
             drop(group);
             tokio::time::timeout(HOST_STOP_WAIT, child.wait())
@@ -6127,6 +6131,22 @@ exit 1
             let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
             assert_host_stop(&err);
         }
+    }
+
+    /// #1788 — the other half of the stream rule: a pipe failure the host did
+    /// not cause keeps the IO error it had. Classifying every stream fault as
+    /// a host stop would hide real provider trouble from the chain, which has
+    /// to keep treating a broken CLI as a provider outage.
+    #[tokio::test]
+    async fn a_stream_fault_without_a_host_stop_stays_a_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-bad-byte", "cat >/dev/null\nprintf '\\377\\n'\nexit 1\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(
+            matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+            "{err:#}"
+        );
     }
 
     /// #1788 — a readiness refusal and a host stop land together: the CLI is
