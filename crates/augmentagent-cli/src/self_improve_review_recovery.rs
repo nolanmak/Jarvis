@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 
 pub(super) fn readiness() -> ReviewRecoveryReadiness {
     use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    // #2574: a nightly-mode resume defers review, so needs no reviewer.
+    if crate::autoship_review::ReviewMode::nightly() {
+        return ReviewRecoveryReadiness::Ready;
+    }
     let reviewer = reviewer_pool()
         .into_iter()
         .filter(|p| matches!(p, Claude | Codex))
