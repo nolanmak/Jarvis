@@ -708,6 +708,33 @@ mod tests {
         }
     }
 
+    /// #1431 — `scripts/ci-targeted.py` runs `cargo test -p augmentagent-cli
+    /// --bins`, which builds every bin in this crate with the test harness. A
+    /// harness bin runs the tests it can see instead of its own `main`, so an
+    /// acceptance observation that pulls a production module in by `#[path]`
+    /// reports *this* module's results and never prints its observation.
+    /// Declaring it `harness = false` is what keeps `main` the entry point.
+    #[test]
+    fn an_observation_that_includes_this_module_is_declared_without_a_test_harness() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let bins: Vec<&str> =
+            manifest.split("\n[").filter(|section| section.starts_with("[bin]]")).collect();
+        for entry in std::fs::read_dir(root.join("src/bin")).unwrap() {
+            let path = entry.unwrap().path();
+            if !std::fs::read_to_string(&path).unwrap().contains("#[path = \"../") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let declared = bins.iter().find(|section| section.contains(&format!("name = \"{name}\"")));
+            assert!(
+                declared.is_some_and(|section| section.contains("harness = false")),
+                "{name} includes a production module by #[path], so `cargo test --bins` \
+                 would run that module's tests in place of the observation's main()"
+            );
+        }
+    }
+
     #[test]
     fn a_tail_reaches_into_the_newest_rotation_only_when_the_live_file_is_short() {
         let tmp = tempfile::tempdir().unwrap();

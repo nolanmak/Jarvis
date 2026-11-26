@@ -21,6 +21,15 @@ path = "src/bin/autoship_case.rs"
 test = false
 harness = false
 
+# Scheduled-sync log rotation (#1431). Same shape: it includes log_rotate.rs
+# via #[path], so a harness build would report that module's unit tests and
+# never print the observation.
+[[bin]]
+name = "autoship_sync_log_rotation"
+path = "src/bin/autoship_sync_log_rotation.rs"
+test = false
+harness = false
+
 [dependencies]
 futures = { workspace = true }
 tempfile = "3"
