@@ -6158,6 +6158,37 @@ exit 1
         assert_host_stop(&reasoner.call(&opts, "x").await.unwrap_err());
     }
 
+    /// #1788 — the reported case through the chain the daemon actually calls:
+    /// a SIGKILLed CLI must neither latch claude (the cooldown file outlives
+    /// this daemon process) nor fail over into the dying unit.
+    #[tokio::test]
+    async fn a_sigkilled_claude_neither_latches_nor_fails_over() {
+        struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Reasoner for Counted {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("must not run inside a dying unit".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-sigkilled-chain", "cat >/dev/null\nkill -KILL $$\n");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let latch = crate::cooldown::CooldownLatch::at(dir.path().join("cooldowns.json"));
+        let chain = crate::fallback::FallbackReasoner::for_tests(
+            vec![
+                (crate::providers::ProviderKind::Claude,
+                    Arc::new(ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) }) as Arc<dyn Reasoner>),
+                (crate::providers::ProviderKind::Codex,
+                    Arc::new(Counted(calls.clone())) as Arc<dyn Reasoner>),
+            ],
+            latch.clone(),
+        );
+        assert_host_stop(&chain.call(&dummy_opts(), "triage this").await.unwrap_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "a host stop must not fail over");
+        assert!(latch.latched_until("claude").is_none(), "a host stop must not latch claude");
+    }
+
     /// A permit must go back on every exit path: non-zero exit, and the
     /// caller's future being dropped (the #656 watchdog / a shutdown), so a
     /// capacity-1 gate never starves the next call.
