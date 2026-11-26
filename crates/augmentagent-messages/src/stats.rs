@@ -500,25 +500,36 @@ mod tests {
 
     #[test]
     fn unresolved_marks_unclaimed_person_handles_and_never_a_grouping_key() {
-        let (_d, _w, s) = fixture();
-        // A WhatsApp conversation id carries colons; that is key formatting,
-        // not a handle, and must not be read as unresolved (#1427).
-        s.upsert_email(&Email {
-            message_id: "w1".into(),
-            thread_id: Some("whatsapp-history:15555550199@lid".into()),
-            from: "15555550199@lid".into(),
-            to: String::new(),
-            cc: String::new(),
-            attachments: vec![],
-            subject: "WhatsApp: Jordan Vale".into(),
-            body: "text".into(),
-            date: "2026-09-30T10:00:00Z".into(),
-            account_entity_id: Some("discord:900".into()),
-            platform: "whatsapp".into(),
-            kind: "dm".into(),
-        })
+        let (_d, w, s) = fixture();
+        // Two WhatsApp history DMs, one sender claimed by a person page and one
+        // not. Their conversation ids carry colons; that is key formatting, not
+        // a handle, and must never be read as unresolved (#1427).
+        let whatsapp = |id: &str, jid: &str, title: &str| {
+            s.upsert_email(&Email {
+                message_id: id.into(),
+                thread_id: Some(format!("whatsapp-history:{jid}")),
+                from: jid.into(),
+                to: String::new(),
+                cc: String::new(),
+                attachments: vec![],
+                subject: format!("WhatsApp: {title}"),
+                body: "text".into(),
+                date: "2026-09-30T10:00:00Z".into(),
+                account_entity_id: Some("discord:900".into()),
+                platform: "whatsapp".into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        };
+        whatsapp("w1", "15555550199@lid", "Jordan Vale");
+        whatsapp("w2", "15555550144@lid", "Robin Ash");
+        std::fs::write(
+            w.path().join("people/robin-ash.md"),
+            "---\nkind: person\nidentities:\n  whatsapp: [\"15555550144@lid\"]\n---\n",
+        )
         .unwrap();
         drain(&s, 100, Duration::ZERO).unwrap();
+        people::resolve_people(&s, w.path()).unwrap();
 
         let by_person = run(
             &s,
@@ -542,6 +553,10 @@ mod tests {
         assert!(
             flag(&by_person, "whatsapp:15555550199@lid"),
             "unclaimed WhatsApp sender"
+        );
+        assert!(
+            !flag(&by_person, "robin-ash"),
+            "a person page claims this WhatsApp handle"
         );
 
         for group_by in [
@@ -577,6 +592,25 @@ mod tests {
                 );
             }
         }
+
+        // The reported recall: WhatsApp history from the day ingest stalled.
+        // Those conversations are real hits, not unbacked references (#1427).
+        let recent = run(
+            &s,
+            StatsRequest {
+                group_by: GroupBy::Conversation,
+                platforms: vec!["whatsapp".into()],
+                since_ms: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-09-30T00:00:00Z")
+                        .unwrap()
+                        .timestamp_millis(),
+                ),
+                limit: MAX_LIMIT,
+                ..Default::default()
+            },
+        );
+        assert_eq!(recent.rows.len(), 2, "both WhatsApp conversations are hits");
+        assert!(recent.rows.iter().all(|row| !row.unresolved));
     }
 
     #[test]
