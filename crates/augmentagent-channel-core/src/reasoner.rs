@@ -590,13 +590,13 @@ pub fn interrupted_error(provider: &str, signal: i32) -> anyhow::Error {
 }
 
 /// #1788 — a host stop breaks the CLI's pipes, so the first thing to fail can
-/// be our own prompt write, long before any exit status is read. The broken
-/// pipe has already ended the call, and the supervisor that owns the CLI's
-/// descriptors outlives the CLI it reaps by a moment: wait that moment out
-/// before reporting a provider outage for a stopped host. Must run before
-/// cleanup — the supervisor signals the group itself, so afterwards no status
-/// can tell a host stop from our own kill. Any other pipe failure keeps the
-/// IO error it had.
+/// be our own prompt write or a stdout read, long before any exit status is
+/// read. The broken pipe has already ended the call, and the supervisor that
+/// owns the CLI's descriptors outlives the CLI it reaps by a moment: wait
+/// that moment out before reporting a provider outage for a stopped host.
+/// Must run before cleanup — the supervisor signals the group itself, so
+/// afterwards no status can tell a host stop from our own kill. Any other
+/// pipe failure keeps the IO error it had.
 async fn pipe_io_failure(
     provider: &str,
     child: &mut tokio::process::Child,
@@ -615,6 +615,15 @@ async fn pipe_io_failure(
         }
         None => anyhow::Error::new(error),
     }
+}
+
+/// #1788 — the signal of a host stop that has already ended the CLI, if there
+/// is one. Readable only before cleanup: the supervisor reports its own
+/// SIGTERM once asked to stop the group, so no later status can tell a host
+/// stop from our own kill. A CLI still running was not stopped by the host —
+/// that closes its stdout, which ends the stream instead.
+fn already_stopped(child: &mut tokio::process::Child) -> Option<i32> {
+    child.try_wait().ok().flatten().as_ref().and_then(interrupted_by_signal)
 }
 
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
@@ -1574,7 +1583,20 @@ impl ClaudeCliReasoner {
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            // #1788 — a host stop breaks the CLI's stdout mid line, so the
+            // read can fail before any exit status is waited for. The stop is
+            // what ended the call; only a stream that fails with the CLI
+            // still running is a stream fault.
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(CallError::Other(
+                        pipe_io_failure("claude", &mut child, error).await,
+                    ))
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -1612,10 +1634,17 @@ impl ClaudeCliReasoner {
                 // The supervisor owns detached descendants and publishes the
                 // same checked cleanup receipt used by watchdog/caller aborts.
                 // Do not turn a capacity refusal into another provider retry.
-                // #1788 — the refusal reached us over a live pipe, so stop the
-                // group here and now; never wait on the CLI for a host-stop
-                // status first. A stop that already ended the CLI closes the
-                // stream instead, and is classified from its exit status below.
+                // #1788 — a host stop may have ended the CLI already, in
+                // which case the stop is what happened, not our refusal. Read
+                // that status before the cleanup below replaces it with the
+                // supervisor's own stop. Only an exited child is inspected,
+                // so a live refused CLI is still stopped at once, with no
+                // grace period to start another tool call in.
+                if let Some(signal) = already_stopped(&mut child) {
+                    warn!("claude stopped by signal {signal}");
+                    let _ = process_group.resource_outcome("claude", audit_logger.as_ref());
+                    return Err(CallError::Other(interrupted_error("claude", signal)));
+                }
                 drop(process_group);
                 let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
                 pending_tool_uses.clear();
@@ -6024,6 +6053,43 @@ exit 1
             "{err:#}"
         );
         assert!(!typed.is_provider_side(), "a host stop never latches claude");
+    }
+
+    /// #1788 — the CLI is SIGKILLed mid line, so the stream read fails before
+    /// any exit status is waited for. The host stop still ended the call: it
+    /// must not reach the chain as a bare IO error, which the classifier
+    /// reads as a provider outage.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_when_the_stream_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invalid UTF-8 fails the line reader where a truncated stream would
+        // merely end it.
+        let bin = stub_cli(&dir, "fake-claude-killed-mid-line",
+            "cat >/dev/null\nprintf '\\377\\n'\nkill -KILL $$\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        let typed = ReasonerError::find_in(&err).expect("typed for the fallback chain");
+        assert!(
+            matches!(typed, ReasonerError::Interrupted { provider, signal: 9 } if provider == "claude"),
+            "{err:#}"
+        );
+        assert!(!typed.is_provider_side(), "a host stop never latches claude");
+    }
+
+    /// #1788 — a readiness refusal and a host stop can land together, and the
+    /// refusal path's own cleanup is the moment after which the two are
+    /// indistinguishable. Before it, a CLI the host already stopped reports
+    /// that signal, while a live CLI reports nothing and keeps the refusal's
+    /// immediate stop (`a_readiness_refusal_stops_the_cli_at_once`).
+    #[tokio::test]
+    async fn an_already_stopped_cli_is_read_as_a_host_stop_before_cleanup() {
+        let mut stopped =
+            tokio::process::Command::new("bash").arg("-c").arg("kill -KILL $$").spawn().unwrap();
+        stopped.wait().await.unwrap();
+        assert_eq!(already_stopped(&mut stopped), Some(9));
+        let mut live = tokio::process::Command::new("bash")
+            .arg("-c").arg("sleep 30").kill_on_drop(true).spawn().unwrap();
+        assert_eq!(already_stopped(&mut live), None);
     }
 
     /// #1788 — classifying host stops must never cost the readiness refusal
