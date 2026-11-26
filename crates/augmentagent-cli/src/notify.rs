@@ -252,6 +252,7 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
     act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
     p("owner_alert_layout", "crates/augmentagent-approval-discord/src/owner_alerts.rs", "CreateMessage::new(", 1, TRANSPORT, "owner alert presentation"),
+    p("owner_alert_day_digest", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_digest(", 1, BROKER, "opt-in daily digest of owner alerts handled in Discord but never texted (#2329)"),
     // -- Trusted-contact autonomy (#1833) --------------------------------------
     act(p("autonomy_cards", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 3, BROKER, "autonomy: noted cards, plan notices (Undo / Pause), trusted-contacts notices (Confirm)")),
     p("autonomy_layout", "crates/augmentagent-approval-discord/src/autonomy.rs", "CreateMessage::new(", 2, TRANSPORT, "autonomy notice and trusted-contacts notice builders"),
@@ -289,14 +290,20 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("pr_awaiting_approval", "crates/augmentagent-cli/src/self_improve.rs", ".post_flag_notice(", 1, BROKER, "agent-coding PR awaiting approval")),
     p("heartbeat", "crates/augmentagent-heartbeat/src/runner.rs", ".post_flag_notice(", 2, BROKER, "heartbeat check-ins"),
     p("proactive", "crates/augmentagent-proactive/src/runner.rs", ".post_flag_notice(", 1, BROKER, "proactive notices"),
+    // #2255: the owner has to log in again, so this one is actionable.
+    act(p("linkedin_session", "crates/augmentagent-channel-linkedin/src/session_guard.rs", ".post_flag_notice(", 1, BROKER, "LinkedIn session stopped reading, daily reminder, and reading again")),
     // -- Loops (#1292) --------------------------------------------------------
     act(p("loop_output_slack", "crates/augmentagent-channel-slack/src/commands/loops.rs", "impl LoopPoster for", 2, LOOP, "loop results and reminders on Slack")),
     act(p("loop_output_discord", CLI, "impl LoopPoster for", 1, LOOP, "loop results and reminders on Discord")),
     // -- Replies, interaction responses and Discord-only posts ---------------
     // #1396's interrupted-turn notice stays `REPLY`: it posts in the owner
     // channel the dead turn came from, referencing the owner's own message.
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 10, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 8, REPLY, "query answers, command replies, interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 11, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 9, REPLY, "query answers, command replies, interrupted-turn notices"),
+    p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 2, REPLY, "yolo thread gate: unreadable-registry notice and the reply to an owner command that does not run in a yolo thread (#2219)"),
+    p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 4, REPLY, "yolo thread gate notices, and the intro and could-not-register messages posted in a new yolo thread (#2219)"),
+    p("relay_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 1, REPLY, "refusal of a command relayed through a trusted webhook"),
+    p("relay_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 1, REPLY, "refusal of a command relayed through a trusted webhook"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "send_message(&", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
@@ -307,6 +314,9 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Phone call proposals (#1553) ---------------------------------------
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/proposals.rs", "notify_owner(", 1, Route::PhoneControlChat, "agent-proposed call questions (yes/no) in the owner's private control chat")),
     act(p("phone_call_proposal", "crates/augmentagent-phone/src/router.rs", "notify_owner(", 1, Route::PhoneControlChat, "per-platform routing of call proposal questions")),
+    // nolanmak/tabagent#61: a one-time link that takes over one browser tab.
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "send_message(&", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff link (ID check, passkey, payment step)"),
+    p("tabagent_handoff_link", "crates/augmentagent-cli/src/tabagent_handoff.rs", "CreateMessage::new(", 1, Route::DiscordOnly("one-time tab takeover link: the owner's private Discord channel only, never Slack or a webhook"), "TabAgent remote-handoff message"),
     p("cli_discord_posts", CLI, "CreateMessage::new(", 4, Route::DiscordOnly("explicit `--post` Discord commands and Discord loop output"), "one-shot Discord posts"),
 ];
 // producer-scan: on

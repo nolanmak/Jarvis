@@ -157,12 +157,16 @@ fn code(value:&str,fallback:&str)->String {
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|"target_closed"|
         "acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_verifier_evidence_unknown"|
         "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
-        "readiness_assessment_invalid"|"await_readiness_input_change"|
+        "acceptance_strategy_escalation"|"acceptance_strategy_reviewer_capacity"|"acceptance_strategy_retry"|"acceptance_summary_retry"|
+        "acceptance_strategy_backoff"|"acceptance_strategy_budget_wait"|"readiness_assessment_retry"|"readiness_budget_wait"|
+        "acceptance_strategies_exhausted"|"acceptance_decomposed_into_observable_children"|"escalate_acceptance"|"await_new_execution_inputs"|"await_child_completion"|
+        "readiness_assessment_invalid"|"await_readiness_input_change"|"original_evidence_unrecoverable"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
-        "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
+        "review_main_changed"|"reconcile_main"|"hosted_ci_pending"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
         "owner_execution_retry_pending"|"reconcile_runtime_retirement"|"owner_execution_retry_requested"|"resume_started"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker"|
+        "attempt_cap_reached"|"model_call_cap_reached"|"observable_decomposition_spent"|"give_up"|"give_up_cleared"|
         "linked_pr_claim_exists"|"linked_pr_inventory_unknown"|"reconcile_existing_pr"|"retry_github_inventory") {value.into()} else {fallback.into()}
 }
 
@@ -187,6 +191,8 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
         (c.next.reason.as_str(),c.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_verifier_amendment_declined"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("acceptance_strategies_exhausted","await_new_execution_inputs")|
+        ("acceptance_strategy_reviewer_capacity"|"acceptance_strategy_retry"|"acceptance_summary_retry","escalate_acceptance")|
         ("readiness_assessment_invalid","await_readiness_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));
@@ -398,7 +404,11 @@ mod tests {
             ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
             ("acceptance_contract_invalid","await_acceptance_input_change"),
-            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")] {
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+            ("acceptance_strategy_reviewer_capacity","escalate_acceptance"),
+            ("acceptance_strategy_retry","escalate_acceptance"),
+            ("acceptance_summary_retry","escalate_acceptance"),
+            ("acceptance_strategies_exhausted","await_new_execution_inputs")] {
             let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
             let mut store=WorkflowStore::open(&path).unwrap();
             let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),

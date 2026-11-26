@@ -70,7 +70,7 @@ pub fn health_message(id: i64, status: &str) -> serenity::all::CreateMessage {
         .allowed_mentions(serenity::all::CreateAllowedMentions::new())
 }
 
-pub const HELP:&str="Reply to a draft with approve, 👍, skip, or revise: your changes. Or use approve <ref>, skip <ref>, revise <ref>: changes. A native 👍 reaction approves only that exact pending draft. Revised drafts need fresh approval. Other card controls: fill <ref>: missing values; refine <ref>: preset-id; schedule <ref>: time; reschedule <ref>: time; send-now <ref>; cancel-schedule <ref>; back-to-queue <ref>; recompose <ref>; decline <ref> (calendar auto-RSVP). Send presets to list refinements. For ordinary questions, just text me.";
+pub const HELP:&str="Reply to a draft with approve, 👍, skip, or revise: your changes. Or use approve <ref>, skip <ref>, revise <ref>: changes. A native 👍 reaction approves only that exact pending draft. Revised drafts need fresh approval. Other card controls: fill <ref>: missing values; refine <ref>: preset-id; schedule <ref>: time; reschedule <ref>: time; send-now <ref>; cancel-schedule <ref>; back-to-queue <ref>; recompose <ref>; decline <ref> (calendar auto-RSVP). Send presets to list refinements. Conversation controls: status; cancel, or cancel all to drop what is queued behind it; reset; help. For ordinary questions, just text me.";
 
 /// Only owner-visible fields; transport metadata and component IDs stay private.
 pub fn visible_discord_message(value: &serde_json::Value) -> String {
@@ -335,6 +335,15 @@ impl OwnerSurface {
         anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
         Ok(())
     }
+    /// #2218 — is this message from a yolo thread (or, with an unreadable
+    /// registry, from any guild channel)? A message fetched over REST carries
+    /// no guild id, so "not a verified DM" also counts as a guild message.
+    pub(crate) fn in_yolo_thread(message: &serenity::all::Message, dm_peer: Option<u64>) -> bool {
+        augmentagent_store::yolo_threads::closed_to_normal_turns(
+            augmentagent_store::yolo_threads::mark(message.channel_id.get()),
+            message.guild_id.is_some() || dm_peer.is_none(),
+        )
+    }
     /// Called only with native Discord channel/parent metadata, never a target
     /// supplied in a user's message. DMs require their verified peer ID too.
     pub fn mirror_discord(
@@ -344,6 +353,13 @@ impl OwnerSurface {
         dm_peer: Option<u64>,
     ) -> Result<(), ApprovalError> {
         if !self.active() {
+            return Ok(());
+        }
+        // #2218 — nothing posted in a yolo thread is mirrored: mirrored text
+        // is readable by later normal turns through the owner chat history.
+        // Checked here, the one function every mirror path calls (new
+        // message, edit, catch-up).
+        if Self::in_yolo_thread(message, dm_peer) {
             return Ok(());
         }
         let Some(origin) = self

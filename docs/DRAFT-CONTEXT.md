@@ -173,3 +173,27 @@ Receipts cover the shared context step. Existing channel-specific draft tools
 receipt is not a complete audit of every subsequent model tool call. Public
 feed/comment drafting and new transport support remain outside this DM
 migration, tracked explicitly under #1693/#1695 rather than claimed as parity.
+
+## Linked pages (#2332)
+
+Off by default. With `AUGMENTAGENT_DRAFT_LINKS=1`, the shared draft step also
+reads the pages the message links to and adds a short excerpt of each to the
+draft prompt, marked as untrusted third-party content. It runs for every
+channel that uses this workflow, at the draft stage only.
+
+Opening a link is not free of consequences: the sender can learn the message
+was processed and from which address, and a link can be an action. So:
+
+- at most three links per message, `https` only, text pages only, 512 KB and
+  8 seconds per page, 1,500 characters of text kept;
+- hosts must resolve only to public addresses, and the connection is pinned to
+  that resolution, with no proxy and no cookies;
+- a link whose path, host or query looks like an action or carries a
+  credential (unsubscribe, confirm, accept, sign-in, pay, a `token=` or
+  `code=` parameter, a long opaque value) is never opened, and a redirect to
+  one is abandoned before it is requested;
+- files (PDF, images, archives) are not opened.
+
+A page that cannot be read adds nothing; a link never stops a draft. The
+excerpt is not stored in the evidence receipt.
+

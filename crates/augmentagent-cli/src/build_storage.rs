@@ -586,6 +586,8 @@ pub async fn watch_reserve_roots<T>(
     temp: Option<&Path>,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
+    // #2354: a deploy never stops a tick inside a build or verifier.
+    let _in_flight = crate::autoship_worker::in_flight();
     watch_with(future, || {
         let mut paths = target.map(monitored_paths).unwrap_or_default();
         if let Some(temp) = temp {

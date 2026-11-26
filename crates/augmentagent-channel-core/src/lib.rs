@@ -33,11 +33,13 @@ mod handoff_outcome;
 mod review_history;
 mod process_tree;
 pub mod images;
+pub mod link_context;
 pub mod ingest;
 pub mod mcp;
 pub mod memory_nudge;
 pub mod outbound_scrub;
 pub mod prompt;
+pub mod public_net;
 pub mod providers;
 pub mod public_report;
 pub mod reasoner;
@@ -113,6 +115,8 @@ pub use trigger::{
 
 pub mod model_router;
 pub mod model_selection;
+pub mod yolo;
+pub mod yolo_preset;
 pub mod native_session;
 pub mod native_vm;
 // #1288 — the transport-neutral conversation turn (native sessions, turn

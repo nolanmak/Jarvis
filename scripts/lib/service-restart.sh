@@ -251,26 +251,22 @@ should_write_stamp() {
   [ "${1:-0}" -eq 0 ]
 }
 
-# --- #844: don't kill an in-flight self-improve run -------------------------
+# --- auto-ship lane locks ----------------------------------------------------
 #
-# The auto-PR loop's build stage is ~20 minutes of agentic Opus on the owner's
-# Claude subscription. The updater restarting augmentagent.service kills it
-# mid-flight, silently: the process dies before `record_attempt`, so the spend
-# is not even recorded, and the issue is re-picked to burn another build.
-# Observed live 2026-08-28: a run selected #667 at 01:45:31 and the 01:49:12
-# deploy restart destroyed it. Worse, an auto-merged PR *triggers* a rebuild +
-# restart by design — the loop's own success can kill its next run.
-#
-# run_once holds an exclusive flock on the self-improve lock for the whole run
-# (#816), which makes "a run is in flight" observable from outside the
-# process. Defer while that owner holds the lock. Elapsed time alone cannot
-# authorize interrupting a live run; resume deployment when ownership ends.
+# The auto-PR loop holds an exclusive flock on its lane locks for a whole run
+# (#816). The updater reads them only to keep the gate-cache trim (#891) off a
+# live build. They no longer gate the daemon restart: #844 deferred it while a
+# run held the lock, but auto-ship now runs only in its own worker
+# (augmentagent-autopr.service on Linux, the com.nolanmak.augmentagent.autopr
+# LaunchAgent on macOS, #2275), which survives a daemon restart and reloads
+# itself between runs, so a deploy never waits on auto-ship (#2271).
 
 # #1048: the daemon's state dir, by the rule in the Rust
 # augmentagent_channel_core::state_dir::resolve: $XDG_STATE_HOME/augmentagent
 # when XDG_STATE_HOME is an absolute path, else $HOME/.local/state/augmentagent
 # (empty or relative values are ignored). The Rust auto-PR loop takes its lane
-# locks there, so a different rule here would restart under a live build.
+# locks there, so a different rule here would trim the gate cache under a live
+# build.
 augmentagent_state_dir() {
   case "${XDG_STATE_HOME:-}" in
     /*) printf '%s/augmentagent\n' "$XDG_STATE_HOME" ;;
@@ -280,7 +276,6 @@ augmentagent_state_dir() {
 AUGMENTAGENT_STATE_DIR="$(augmentagent_state_dir)"
 
 SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self-improve.lock}"
-RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-deferred-since}"
 
 # Is `$1` flock(2)-held by another process? 0 = held. Uses flock(1) where it
 # exists (Linux); macOS ships no flock(1), so fall back to python3's
@@ -297,26 +292,6 @@ import fcntl, sys
 with open(sys.argv[1], "rb") as f:
     fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
 PY
-}
-
-# Is a self-improve run holding the lock right now?
-self_improve_run_in_flight() {
-  local lane
-  for lane in "$SELF_IMPROVE_LOCK" "${SELF_IMPROVE_LOCK%.lock}-resume.lock"; do
-    if [ -e "$lane" ] && lock_is_held "$lane"; then return 0; fi
-  done
-  return 1
-}
-
-external_autopr_isolated() {
-  [ "$(uname -s)" = Linux ] || return 1
-  systemctl --user is-active --quiet augmentagent-autopr.service 2>/dev/null || return 1
-  local checker="${REPO_ROOT:-.}/scripts/auto-pr-worker-status.py"
-  [ -f "$checker" ] || return 1
-  python3 "$checker" --state "$AUGMENTAGENT_STATE_DIR" \
-    --daemon "$(unit_main_pid augmentagent.service)" \
-    --worker "$(unit_main_pid augmentagent-autopr.service)" \
-    --lock "$SELF_IMPROVE_LOCK" --lock "${SELF_IMPROVE_LOCK%.lock}-resume.lock" 2>/dev/null
 }
 
 # --- #1779: don't kill an owner's in-flight surface turn ---------------------
@@ -392,34 +367,11 @@ owner_turn_defer() {
   return 0
 }
 
-# Should this restart be deferred? 0 = defer (an owner turn is in flight, or
-# a run owns the lock); 1 = proceed. Clears its own state on
-# every proceed so one long-past deferral cannot poison a later deploy.
+# Should this restart be deferred? 0 = defer (an owner turn is in flight);
+# 1 = proceed. The single entry point the updater calls before a daemon
+# restart; auto-ship runs never defer it (#2271).
 maybe_defer_restart() {
-  if owner_turn_defer; then
-    return 0
-  fi
-  if ! self_improve_run_in_flight; then
-    rm -f "$RESTART_DEFER_STAMP"
-    return 1
-  fi
-  if external_autopr_isolated; then
-    rm -f "$RESTART_DEFER_STAMP"
-    _sr_log "auto-ship is running in its independent worker; daemon deployment can proceed"
-    return 1
-  fi
-  local now since
-  now=$(date +%s)
-  since=$(cat "$RESTART_DEFER_STAMP" 2>/dev/null || true)
-  case "$since" in
-    ''|*[!0-9]*)
-      printf '%s\n' "$now" > "$RESTART_DEFER_STAMP"
-      _sr_log "self-improve run in flight; deferring restart (retry next tick)"
-      return 0
-      ;;
-  esac
-  _sr_log "self-improve run still in flight ($((now - since))s); deferring restart until owner releases lock"
-  return 0
+  owner_turn_defer
 }
 
 # --- #903: restart hygiene — host memory pressure + restart-rate budget ------
@@ -432,15 +384,22 @@ maybe_defer_restart() {
 # struggling, and a busy auto-ship day should not turn the daemon's life into
 # a chain of start-up bursts.
 #
-# Both checks defer exactly like maybe_defer_restart (#844): the caller logs
+# Both checks defer exactly like maybe_defer_restart: the caller logs
 # `restart deferred: …`, withholds the build stamp (#826), and the next tick
 # retries through the stamp-mismatch path. AUGMENTAGENT_RESTART_FORCE=1
 # bypasses both for a manual deploy.
+#
+# #2271 — the restart budget defaults to 60/h, which a 5-minute updater
+# (at most 12 restarts an hour) never reaches. The original 3/h default
+# withheld 18 deploys on a busy auto-ship day and production lifted it with a
+# drop-in; the default now matches, so a fresh install does not reintroduce
+# it. Set AUGMENTAGENT_RESTARTS_PER_HOUR lower to opt back in. The memory
+# floor is unchanged.
 
 MEMINFO_PATH="${AUGMENTAGENT_MEMINFO_PATH:-/proc/meminfo}"
 RESTART_MIN_AVAIL_MB="${AUGMENTAGENT_RESTART_MIN_AVAIL_MB:-3072}"
 RESTART_HISTORY="${AUGMENTAGENT_RESTART_HISTORY:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-history}"
-RESTARTS_PER_HOUR="${AUGMENTAGENT_RESTARTS_PER_HOUR:-3}"
+RESTARTS_PER_HOUR="${AUGMENTAGENT_RESTARTS_PER_HOUR:-60}"
 RESTART_WINDOW_SECS=3600
 
 # MemAvailable in MB, or -1 when it cannot be read (macOS, some containers).

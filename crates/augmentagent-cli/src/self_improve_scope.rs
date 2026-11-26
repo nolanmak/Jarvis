@@ -52,8 +52,18 @@ struct NativeReplyProvenance {
 
 /// The qualification context must include this policy identity. A saved reply
 /// is an observation under its original policy, never approval of a later one.
+/// Versioned on purpose like `baseline_witness::WITNESS_POLICY_VERSION`
+/// (#2493), never derived from this file's bytes. Version 1 is the identity
+/// the retired byte-hash scheme gave this module as deployed from cfa5393b on,
+/// so every retained native reply stays authenticated across the switch.
+pub(super) const SCOPE_WITNESS_POLICY_VERSION:u32=1;
+const SCOPE_WITNESS_POLICY_V1:&str="d404a078a3bb1f5377d365a750126faf76610f0437b9ece9fed0825a834f5512";
 pub(super) fn witness_policy_hash()->String {
-    amendment::digest(include_bytes!("self_improve_scope.rs"))
+    scope_witness_policy(SCOPE_WITNESS_POLICY_VERSION)
+}
+pub(super) fn scope_witness_policy(version:u32)->String {
+    if version==1 {return SCOPE_WITNESS_POLICY_V1.into();}
+    amendment::digest(&serde_json::to_vec(&("scope-witness-policy",version)).unwrap())
 }
 
 struct NativeScopeContext<'a> {
@@ -572,9 +582,15 @@ pub(super) async fn assess(root:&Path,repository:&str,workflow:&workflow::Workfl
 async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,format:ResponseFormat)->Result<String> {
     Ok(run_inner_native(root, repository, workflow, prompt, format,None).await?.text)
 }
+tokio::task_local! {static STRATEGY_PROVIDER:augmentagent_channel_core::ProviderKind;}
+fn strategy_provider_allowed(provider:augmentagent_channel_core::ProviderKind)->bool {STRATEGY_PROVIDER.try_with(|p|*p==provider).unwrap_or(true)}
+pub(super) async fn persistent_on_provider<T>(provider:augmentagent_channel_core::ProviderKind,root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<T> {
+    STRATEGY_PROVIDER.scope(provider,persistent(root,workflow,purpose,epoch,prompt,false,validate)).await
+}
 async fn run_inner_native(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,format:ResponseFormat,witness_context:Option<&str>)->Result<NativeReply> {
     let control = control_directories(repository, workflow.id())?.workflow_acceptance;
     let providers = reviewer_pool().into_iter().filter(|provider| {
+        strategy_provider_allowed(*provider) &&
         matches!(provider,augmentagent_channel_core::ProviderKind::Claude|augmentagent_channel_core::ProviderKind::Codex)
             && matches!(reviewer_status(*provider),ReviewerStatus::Ready)
     }).collect::<Vec<_>>();
@@ -682,7 +698,7 @@ pub(super) fn completed_exhaustion(error:&anyhow::Error)->bool {
 
 fn cached_completed_generation<T>(read:impl Fn(bool,u32)->Result<Option<String>>,validate:impl Fn(&str)->Result<T>)->Result<Option<T>> {
     for correction in [false,true] {
-        for attempt in 0..2 {
+        for attempt in 0..if correction {5}else{2} {
             if let Some(raw)=read(correction,attempt)? {
                 if let Ok(valid)=validate(&raw) {return Ok(Some(valid));}
             }
@@ -692,7 +708,8 @@ fn cached_completed_generation<T>(read:impl Fn(bool,u32)->Result<Option<String>>
 }
 fn response_key(purpose:&str,epoch:&str,contract:&str,correction:bool,attempt:u32)->String {
     let original=serde_json::to_string(&(purpose,epoch,contract,attempt)).unwrap();
-    if correction {amendment::digest(serde_json::to_string(&("completed-contract-correction-v1",original)).unwrap().as_bytes())}
+    if correction && attempt>=2 {amendment::digest(serde_json::to_string(&("bounded-validator-repair-v1",crate::autoship_workflow::scope_policy::POLICY,original)).unwrap().as_bytes())}
+    else if correction {amendment::digest(serde_json::to_string(&("completed-contract-correction-v1",original)).unwrap().as_bytes())}
     else {amendment::digest(original.as_bytes())}
 }
 #[derive(Debug)]
@@ -772,7 +789,7 @@ pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,p
 /// Native admissions with no completed result hold even after input/binding
 /// changes. Such a hold requires original-outcome recovery, not a fresh call.
 /// `epoch` must bind the original requirements/source/observations and
-/// `witness_policy_hash()`. Changed policy is a new qualification input.
+/// `witness_policy_hash()`. A changed policy version is a new qualification input.
 pub(super) async fn persistent_witness<T>(root:&Path,workflow:&workflow::WorkflowGuard,epoch:&str,prompt:&str,validate:impl Fn(&str)->Result<T>)->Result<(T,NativeReply)> {
     ensure!(epoch.len()==64 && epoch.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid baseline-witness input identity");
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance.canonicalize()?;
@@ -863,9 +880,10 @@ async fn recoverable_generation_requests<T,R,W,G,F>(prompt:&str,read:R,write:W,m
 where R:Fn(u32,&str)->Result<Option<String>>,W:Fn(u32,&str,&str)->Result<()>,G:FnMut(String)->F,F:std::future::Future<Output=Result<String>> {
     let mut error=String::new();
     let mut previous=String::new();
-    for attempt in 0..2 {
+    for attempt in 0..3 {
         let request=if attempt==0 {prompt.to_owned()}else{correction_prompt(prompt,&error,&previous)};
         let raw=if let Some(raw)=read(attempt,&request)? {raw} else {
+            if attempt>0 {tokio::time::sleep(std::time::Duration::from_millis(100*attempt as u64)).await;}
             let raw=generate(request.clone()).await?;write(attempt,&request,&raw)?;raw
         };
         match validate(&raw) {
@@ -877,21 +895,33 @@ where R:Fn(u32,&str)->Result<Option<String>>,W:Fn(u32,&str,&str)->Result<()>,G:F
     Err(CompletedInvalid(error).into())
 }
 
-/// Preserve valid legacy output. Once both legacy slots contain rejected
-/// completed replies, permit one separately keyed two-response correction
-/// strategy. Its completed replies are also immutable and bounded across
-/// restarts. Provider failures propagate; every actual admission still passes
-/// through the workflow audit/resource observer in `persistent`.
+/// Preserve valid legacy output, then repair invalid contracts in three
+/// separately keyed policy slots. Completed replies remain immutable and
+/// bounded across restarts; provider/custody refusals never become validator
+/// retries or owner decisions.
 async fn recoverable_contract_generation<T,R,W,G,F>(prompt:&str,read:R,write:W,mut generate:G,validate:impl Fn(&str)->Result<T>)->Result<T>
 where R:Fn(bool,u32)->Result<Option<String>>,W:Fn(bool,u32,&str)->Result<()>,G:FnMut(String)->F,F:std::future::Future<Output=Result<String>> {
-    let failure=match recoverable_generation(prompt,|attempt|read(false,attempt),|attempt,raw|write(false,attempt,raw),&mut generate,&validate).await {
-        Ok(value)=>return Ok(value),
-        Err(error) if error.downcast_ref::<CompletedInvalid>().is_some()=>error,
-        Err(error)=>return Err(error),
-    };
-    let previous=read(false,1)?.context("exhausted contract strategy has no persisted final response")?;
-    let correction=correction_prompt(prompt,&failure.to_string(),&previous);
-    recoverable_generation(&correction,|attempt|read(true,attempt),|attempt,raw|write(true,attempt,raw),generate,validate).await
+    // Reuse valid historical observations, but never create more calls in an
+    // exhausted legacy strategy. The policy upgrade has three distinct slots.
+    let mut previous=String::new();let mut error=String::new();
+    for correction in [false,true] {for attempt in 0..2 {
+        if let Some(raw)=read(correction,attempt)? {
+            match validate(&raw) {Ok(value)=>return Ok(value),Err(problem) if problem.downcast_ref::<initial_repair::Hold>().is_some()=>return Err(problem),Err(problem)=>{error=format!("{problem:#}");previous=raw;}}
+        }
+    }}
+    for attempt in 0..3 {
+        let request=if previous.is_empty() {prompt.to_owned()} else {correction_prompt(prompt,&error,&previous)};
+        let raw=if let Some(raw)=read(true,attempt+2)? {raw} else {
+            if attempt>0 {tokio::time::sleep(std::time::Duration::from_millis(100*attempt as u64)).await;}
+            let raw=generate(request).await?;write(true,attempt+2,&raw)?;raw
+        };
+        match validate(&raw) {
+            Ok(value)=>return Ok(value),
+            Err(problem) if problem.downcast_ref::<initial_repair::Hold>().is_some()=>return Err(problem),
+            Err(problem)=>{error=format!("{problem:#}");previous=raw;}
+        }
+    }
+    Err(CompletedInvalid(error).into())
 }
 
 #[cfg(test)]
@@ -1657,8 +1687,8 @@ mod tests {
         let error=recoverable_contract_generation("original requirements",read,write,|_| {
             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);async{Ok("{}".into())}
         },validate).await.unwrap_err();
-        assert!(error.downcast_ref::<CompletedInvalid>().is_some());assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),2);
-        assert_eq!(saved.lock().unwrap().len(),4);
+        assert!(error.downcast_ref::<CompletedInvalid>().is_some());assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),3);
+        assert_eq!(saved.lock().unwrap().len(),5);
         let error=recoverable_contract_generation("original requirements",read,write,|_|async{panic!("exhausted correction must not redispatch")},validate).await.unwrap_err();
         assert!(error.downcast_ref::<CompletedInvalid>().is_some());
     }
@@ -1667,7 +1697,7 @@ mod tests {
         let valid=recoverable_contract_generation("original requirements",|correction,attempt|{assert!(!correction);Ok((attempt==0).then(||"valid".into()))},|_,_,_|panic!("valid reply must remain immutable"),|_|async{panic!("valid legacy reply must not regenerate")},|raw|{ensure!(raw=="valid","invalid");Ok(())}).await;
         assert!(valid.is_ok());
         let writes=std::sync::atomic::AtomicUsize::new(0);
-        let error=recoverable_contract_generation("original requirements",|correction,_|{assert!(!correction);Ok(None)},|_,_,_|{writes.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())},|_|async{anyhow::bail!("provider unavailable")},|_|Ok(())).await.unwrap_err();
+        let error=recoverable_contract_generation("original requirements",|_,_|Ok(None),|_,_,_|{writes.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())},|_|async{anyhow::bail!("provider unavailable")},|_|Ok(())).await.unwrap_err();
         assert!(error.to_string().contains("provider unavailable"));assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst),0);
     }
     #[tokio::test]
@@ -1780,13 +1810,46 @@ mod tests {
             async move { Ok(raw) }
         },validate).await.unwrap_err();
         assert!(error.downcast_ref::<CompletedInvalid>().is_some());
-        assert_eq!(requests.lock().unwrap().len(),2);
+        assert_eq!(requests.lock().unwrap().len(),3);
         assert!(requests.lock().unwrap()[1].contains("contract.verifiers[0].failure_witness"));
-        assert_eq!(saved.lock().unwrap().len(),2);
+        assert_eq!(saved.lock().unwrap().len(),3);
         let error = recoverable_generation("original requirements",read,write,
             |_| async { panic!("restart must not redispatch exhausted completed responses") },validate)
             .await.unwrap_err();
         assert!(error.downcast_ref::<CompletedInvalid>().is_some());
     }
 
+}
+
+#[cfg(test)]
+mod bounded_validator_repair_tests {
+ use super::*;
+ #[tokio::test]
+ async fn invalid_contract_parks_after_three_with_final_validator_errors() {
+  let rows=std::sync::Mutex::new(BTreeMap::new());let calls=std::sync::atomic::AtomicUsize::new(0);
+  let read=|c,a|Ok(rows.lock().unwrap().get(&(c,a)).cloned());
+  let write=|c,a,raw:&str|{rows.lock().unwrap().insert((c,a),raw.to_owned());Ok(())};
+  let error=recoverable_contract_generation("complete contract",read,write,|prompt|{
+   let n=calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);async move {
+    if n>0 {assert!(prompt.contains("missing verifier observation"),"validator errors were not fed back");}
+    Ok("synthetic invalid contract".into())
+   }
+  },|_|->Result<()> {bail!("missing verifier observation")}).await.unwrap_err();
+  assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),3,"invalid model output must have one bounded three-attempt strategy");
+  assert!(format!("{error:#}").contains("missing verifier observation"));
+  assert!(recoverable_contract_generation("complete contract",read,write,|_|async{panic!("exhausted responses must replay without more admissions")},|_|->Result<()> {bail!("missing verifier observation")}).await.is_err());
+ }
+}
+
+#[cfg(test)]
+mod strategy_provider_tests {
+    use super::*;
+    use augmentagent_channel_core::ProviderKind::{Claude,Codex};
+    #[tokio::test]
+    async fn provider_switch_is_explicit_and_isolated_between_concurrent_workflows() {
+        let first=STRATEGY_PROVIDER.scope(Claude,async {tokio::task::yield_now().await;assert!(strategy_provider_allowed(Claude));assert!(!strategy_provider_allowed(Codex));});
+        let second=STRATEGY_PROVIDER.scope(Codex,async {tokio::task::yield_now().await;assert!(strategy_provider_allowed(Codex));assert!(!strategy_provider_allowed(Claude));});
+        tokio::join!(first,second);
+        assert!(strategy_provider_allowed(Claude));assert!(strategy_provider_allowed(Codex));
+    }
 }

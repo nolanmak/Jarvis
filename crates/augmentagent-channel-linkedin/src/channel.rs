@@ -150,7 +150,9 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
         let mut outcome = PollOutcome::default();
         if let Some(reader)=self.api.archive_reader()? {
             anyhow::ensure!(reader.mailbox()==self.member_urn,"LinkedIn reader account mismatch");
-            let emails=crate::archive_live::poll(&reader,&self.store,100,&CancellationToken::new()).await?;
+            let polled=crate::archive_live::poll(&reader,&self.store,100,&CancellationToken::new()).await;
+            crate::session_guard::notify_after_poll(&self.store,self.approvals.as_ref(),&self.member_urn).await;
+            let emails=polled?;
             outcome.dms_checked=emails.len();
             for email in emails {
                 match self.process_email(email).await {
@@ -801,7 +803,8 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> LinkedInChannel<L, R> {
         let source = Arc::new(crate::inbound::LinkedInInbound::new(
             Arc::clone(&self.api),
             self.member_urn.clone(),
-        ).with_store(Arc::clone(&self.store)));
+        ).with_store(Arc::clone(&self.store))
+            .with_session_notices(Arc::clone(&self.approvals)));
         let trigger = Arc::new(InboundMessageTrigger::new(source));
         let handler = Arc::new(LinkedInWorkHandler {
             channel: Arc::clone(&self),

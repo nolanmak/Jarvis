@@ -20,6 +20,9 @@ regex = "1"
 once_cell = "1"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+# #2215 — the yolo thread registry opens its file with O_NOFOLLOW and takes
+# an advisory lock, like the model-selection file in channel-core.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

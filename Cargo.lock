@@ -645,6 +645,7 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-channel-core",
+ "augmentagent-channel-journal",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -1071,6 +1072,7 @@ dependencies = [
  "augmentagent-store",
  "augmentagent-test-support",
  "augmentagent-wiki",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -1323,6 +1325,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "libc",
  "once_cell",
  "regex",
  "rusqlite",

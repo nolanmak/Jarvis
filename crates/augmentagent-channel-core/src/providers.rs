@@ -40,6 +40,10 @@ pub enum ProviderKind {
     /// while keeping their real model identity in audit and review history.
     Qwen,
     Glm,
+    /// Hosted unfiltered model on the same Codex bridge (#2213). Dispatched
+    /// only for turns in a yolo thread: never selectable, never in a chain,
+    /// never a fallback for another provider.
+    Yolo,
 }
 
 impl ProviderKind {
@@ -51,6 +55,7 @@ impl ProviderKind {
             ProviderKind::Cerebras => "cerebras",
             ProviderKind::Qwen => "qwen",
             ProviderKind::Glm => "glm",
+            ProviderKind::Yolo => "yolo",
         }
     }
 
@@ -62,6 +67,7 @@ impl ProviderKind {
             "cerebras" => Some(ProviderKind::Cerebras),
             "qwen" => Some(ProviderKind::Qwen),
             "glm" => Some(ProviderKind::Glm),
+            "yolo" => Some(ProviderKind::Yolo),
             _ => None,
         }
     }
@@ -147,7 +153,7 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
             class,
             CapabilityClass::TextOnly | CapabilityClass::ReadTools
         ),
-        ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm => true,
+        ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Yolo => true,
         ProviderKind::Cerebras => matches!(class, CapabilityClass::TextOnly),
     }
 }
@@ -173,6 +179,7 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     // must not silently route "qwen" or "glm" to another backend.
     if kind == ProviderKind::Qwen { return "runpod/qwen38-27b".into(); }
     if kind == ProviderKind::Glm { return "runpod/glm-5.3-flash".into(); }
+    if kind == ProviderKind::Yolo { return crate::yolo::model_id(); }
     let tier_name = match tier {
         ModelTier::Quality => "QUALITY",
         ModelTier::Fast => "FAST",
@@ -209,6 +216,7 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
         (ProviderKind::Cerebras, ModelTier::Fast) => "gemma-4-31b".into(),
         (ProviderKind::Qwen, _) => "runpod/qwen38-27b".into(),
         (ProviderKind::Glm, _) => "runpod/glm-5.3-flash".into(),
+        (ProviderKind::Yolo, _) => crate::yolo::model_id(),
     }
 }
 
@@ -233,6 +241,9 @@ pub fn parse_chain(raw: &str) -> ParsedChain {
             continue;
         }
         match ProviderKind::parse(tok) {
+            // Yolo runs only in yolo threads; in a chain it is reported like
+            // any other token that names no chain provider.
+            Some(ProviderKind::Yolo) => unknown.push(tok.trim().to_string()),
             Some(k) if !providers.contains(&k) => providers.push(k),
             Some(_) => {}
             None => unknown.push(tok.trim().to_string()),
@@ -388,6 +399,18 @@ mod tests {
 
         std::env::remove_var("AUGMENTAGENT_REASONER_CHAIN");
         assert_eq!(chain_from_env(), vec![ProviderKind::Claude]);
+    }
+
+    #[test]
+    fn yolo_round_trips_by_name_but_never_joins_a_chain() {
+        assert_eq!(ProviderKind::parse("yolo"), Some(ProviderKind::Yolo));
+        assert_eq!(ProviderKind::Yolo.name(), "yolo");
+        assert!(allowed_for(ProviderKind::Yolo, CapabilityClass::FullAgentic));
+        // In a chain it is reported like an unknown token, so doctor flags it.
+        let parsed = parse_chain("claude, yolo ,codex");
+        assert_eq!(parsed.providers, vec![ProviderKind::Claude, ProviderKind::Codex]);
+        assert_eq!(parsed.unknown, vec!["yolo".to_string()]);
+        assert_eq!(parse_chain("yolo").providers, vec![ProviderKind::Claude]);
     }
 
     #[test]
