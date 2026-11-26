@@ -300,6 +300,9 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
         OrderBy::FirstContact => "first_ts ASC",
     };
     let limit = req.limit.clamp(1, MAX_LIMIT);
+    // `unres` is functionally determined by `k`: a row keys on a person only
+    // when `mp.person_key` is non-null, so every row of a group carries the
+    // same flag and `MAX` reproduces it instead of biasing the group.
     let grouped = format!(
         "SELECT k, MIN(lbl), COUNT(*) AS messages, SUM(mine) AS from_me, \
                 SUM(1 - mine) AS from_them, MIN(ts) AS first_ts, MAX(ts) AS last_ts, \
@@ -504,11 +507,11 @@ mod tests {
         // Two WhatsApp history DMs, one sender claimed by a person page and one
         // not. Their conversation ids carry colons; that is key formatting, not
         // a handle, and must never be read as unresolved (#1427).
-        let whatsapp = |id: &str, jid: &str, title: &str| {
+        let whatsapp = |id: &str, jid: &str, from: &str, title: &str| {
             s.upsert_email(&Email {
                 message_id: id.into(),
                 thread_id: Some(format!("whatsapp-history:{jid}")),
-                from: jid.into(),
+                from: from.into(),
                 to: String::new(),
                 cc: String::new(),
                 attachments: vec![],
@@ -521,8 +524,11 @@ mod tests {
             })
             .unwrap();
         };
-        whatsapp("w1", "15555550199@lid", "Jordan Vale");
-        whatsapp("w2", "15555550144@lid", "Robin Ash");
+        whatsapp("w1", "15555550199@lid", "15555550199@lid", "Jordan Vale");
+        whatsapp("w2", "15555550144@lid", "15555550144@lid", "Robin Ash");
+        // An owner reply in the unclaimed DM feeds the second person arm, so
+        // that handle's group spans both arms of the union.
+        whatsapp("w3", "15555550199@lid", "me", "Jordan Vale");
         std::fs::write(
             w.path().join("people/robin-ash.md"),
             "---\nkind: person\nidentities:\n  whatsapp: [\"15555550144@lid\"]\n---\n",
@@ -550,9 +556,15 @@ mod tests {
             flag(&by_person, "discord:600"),
             "no person page claims this handle"
         );
+        let jordan = by_person
+            .rows
+            .iter()
+            .find(|row| row.key == "whatsapp:15555550199@lid")
+            .expect("unclaimed WhatsApp sender row");
+        assert_eq!((jordan.from_them, jordan.from_me), (1, 1));
         assert!(
-            flag(&by_person, "whatsapp:15555550199@lid"),
-            "unclaimed WhatsApp sender"
+            jordan.unresolved,
+            "no person page claims this handle, in either direction"
         );
         assert!(
             !flag(&by_person, "robin-ash"),
