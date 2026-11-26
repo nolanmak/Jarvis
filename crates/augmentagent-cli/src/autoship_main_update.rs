@@ -41,13 +41,36 @@ fn table_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='main_update_carry')", [], |r| r.get(0))?)
 }
 
-/// Every review recorded for `binding`, which must all approve.
-fn approving_reviews(tx: &Transaction<'_>, workflow: &str, binding: &Binding) -> Result<Vec<(String, String)>> {
+/// May the main update run from this stage? Pre-merge: only an approved PR
+/// awaiting checks. #2578 — nightly merges any green draft the sweep found
+/// eligible, and those park in `Held` (resume or review-evidence waits) or a
+/// review stage, so only a finished workflow is refused. Owner holds are still
+/// enforced by `owner_control::require_dispatch`.
+fn update_stage_ok(stage: Stage, mode: crate::autoship_review::ReviewMode) -> bool {
+    match mode {
+        crate::autoship_review::ReviewMode::PreMerge => stage == Stage::AwaitChecks,
+        crate::autoship_review::ReviewMode::Nightly => !matches!(stage, Stage::Merged | Stage::Retired),
+    }
+}
+
+/// The approving reviews recorded for `binding`. Pre-merge: every review must
+/// approve. #2578 — nightly: the deferred verdict (or any approval) suffices;
+/// an earlier pre-merge rejection no longer withholds a green draft, and only
+/// approving rows are carried.
+fn approving_reviews(tx: &Transaction<'_>, workflow: &str, binding: &Binding,
+    mode: crate::autoship_review::ReviewMode) -> Result<Vec<(String, String)>> {
     let mut statement = tx.prepare("SELECT reviewer,approved,evidence FROM review WHERE workflow=?1 AND binding=?2 ORDER BY reviewer")?;
     let rows = statement.query_map(params![workflow, serde_json::to_string(binding)?],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, String>(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    ensure!(!rows.is_empty() && rows.iter().all(|row| row.1), "main update requires an approving review of the bound head");
+    let rows: Vec<_> = match mode {
+        crate::autoship_review::ReviewMode::PreMerge => {
+            ensure!(!rows.is_empty() && rows.iter().all(|row| row.1), "main update requires an approving review of the bound head");
+            rows
+        }
+        crate::autoship_review::ReviewMode::Nightly => rows.into_iter().filter(|row| row.1).collect(),
+    };
+    ensure!(!rows.is_empty(), "main update requires an approving review of the bound head");
     Ok(rows.into_iter().map(|(reviewer, _, evidence)| (reviewer, evidence)).collect())
 }
 
@@ -60,8 +83,9 @@ impl WorkflowStore {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now)?;
         owner_control::require_dispatch(&tx, &lease.workflow)?;
-        ensure!(stage(&tx, &lease.workflow)? == Stage::AwaitChecks, "only an approved PR awaiting checks is updated");
-        approving_reviews(&tx, &lease.workflow, binding)?;
+        let mode = crate::autoship_review::ReviewMode::current();
+        ensure!(update_stage_ok(stage(&tx, &lease.workflow)?, mode), "only an approved PR awaiting checks is updated");
+        approving_reviews(&tx, &lease.workflow, binding, mode)?;
         // A head that is itself a carried update keeps the original verdict's head.
         let origin: Option<String> = tx.query_row("SELECT origin_head FROM main_update_carry WHERE workflow=?1 AND updated_head=?2",
             params![lease.workflow, binding.head], |r| r.get(0)).optional()?;
@@ -109,8 +133,9 @@ impl WorkflowStore {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
         let (requested, reviewed_base, origin) = request.context("no main update was requested for the approved head")?;
         ensure!(requested.eq_ignore_ascii_case(main), "the merge commit merged another main than the one requested");
-        ensure!(stage(&tx, &lease.workflow)? == Stage::AwaitChecks, "only an approved PR awaiting checks is carried");
-        let reviews = approving_reviews(&tx, &lease.workflow, reviewed)?;
+        let mode = crate::autoship_review::ReviewMode::current();
+        ensure!(update_stage_ok(stage(&tx, &lease.workflow)?, mode), "only an approved PR awaiting checks is carried");
+        let reviews = approving_reviews(&tx, &lease.workflow, reviewed, mode)?;
         let carried = Binding { head: updated_head.into(), ..reviewed.clone() };
         for (reviewer, evidence) in reviews {
             let review = Review { reviewer, binding: carried.clone(), approved: true, evidence: serde_json::json!({
@@ -225,5 +250,58 @@ mod tests {
         store.record_review(&lease, &Review { reviewer: "sweep-invalidation-x".into(), binding: binding(H),
             approved: false, evidence: "{}".into() }, 11).unwrap();
         assert!(store.record_main_update_request(&lease, &binding(H), M, B, 12).is_err());
+    }
+
+    /// #2578 — nightly: a green draft the sweep found merge-eligible parks in
+    /// `Held` (resume or review-evidence waits) carrying only the deferred
+    /// verdict, possibly beside an earlier pre-merge rejection. The main
+    /// update runs and carries the approving rows; pre-merge still refuses it.
+    #[test]
+    fn nightly_updates_a_held_green_draft_and_pre_merge_does_not() {
+        use crate::autoship_review::{ReviewMode, ReviewModeGuard, NIGHTLY_DEFERRED};
+        let held = |path: &Path| {
+            let mut store = WorkflowStore::open(path).unwrap();
+            store.register("owner/repo#1", "agent-fix/issue-1", binding(H), 1).unwrap();
+            let lease = store.claim("owner/repo#1", "publisher", 2, 1_000).unwrap().unwrap();
+            store.record_review(&lease, &Review { reviewer: "codex-review".into(), binding: binding(H),
+                approved: false, evidence: "{}".into() }, 3).unwrap();
+            store.record_review(&lease, &Review { reviewer: NIGHTLY_DEFERRED.into(), binding: binding(H),
+                approved: true, evidence: "{}".into() }, 3).unwrap();
+            let mut cp = store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint;
+            cp.stage = Stage::Held;
+            cp.next = NextAction { reason: "resume_deferred".into(), action: "resume".into(), eligible_at_ms: 0 };
+            store.checkpoint(&lease, &cp, 4).unwrap();
+            store.release(&lease, 5).unwrap();
+            store
+        };
+        {
+            let _mode = ReviewModeGuard::set(ReviewMode::PreMerge);
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = held(&dir.path().join("workflow.db"));
+            let lease = store.claim_reconciliation("owner/repo#1", "sweep:finalize", 10, 60_000).unwrap().unwrap();
+            let error = store.record_main_update_request(&lease, &binding(H), M, B, 11).unwrap_err();
+            assert!(format!("{error:#}").contains("only an approved PR awaiting checks is updated"), "{error:#}");
+        }
+        let _mode = ReviewModeGuard::set(ReviewMode::Nightly);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = held(&dir.path().join("workflow.db"));
+        let lease = store.claim_reconciliation("owner/repo#1", "sweep:finalize", 10, 60_000).unwrap().unwrap();
+        store.record_main_update_request(&lease, &binding(H), M, B, 11).unwrap();
+        let carried = store.carry_main_update(&lease, &binding(H), U, M, 12).unwrap();
+        assert_eq!(carried, Binding { head: U.into(), ..binding(H) });
+        let after = store.snapshot("owner/repo#1").unwrap().unwrap();
+        assert_eq!(after.checkpoint.binding, carried);
+        assert_eq!(after.checkpoint.stage, Stage::Held, "the carry does not move the stage");
+        let reviews = store.current_reviews("owner/repo#1").unwrap();
+        assert!(!reviews.is_empty() && reviews.iter().all(|review| review.approved), "only approving rows carry");
+        assert!(reviews.iter().any(|review| review.reviewer == NIGHTLY_DEFERRED));
+        // A finished workflow is never updated, nightly or not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = held(&dir.path().join("workflow.db"));
+        let lease = store.claim("owner/repo#1", "publisher", 6, 1_000).unwrap().unwrap();
+        let mut cp = store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Retired;
+        store.checkpoint(&lease, &cp, 7).unwrap();
+        assert!(store.record_main_update_request(&lease, &binding(H), M, B, 8).is_err(), "retired");
     }
 }
