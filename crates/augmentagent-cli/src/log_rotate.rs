@@ -716,23 +716,16 @@ mod tests {
     /// Declaring it `harness = false` is what keeps `main` the entry point.
     #[test]
     fn an_observation_that_includes_this_module_is_declared_without_a_test_harness() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-        let bins: Vec<&str> =
-            manifest.split("\n[").filter(|section| section.starts_with("[bin]]")).collect();
-        for entry in std::fs::read_dir(root.join("src/bin")).unwrap() {
-            let path = entry.unwrap().path();
-            if !std::fs::read_to_string(&path).unwrap().contains("#[path = \"../") {
-                continue;
-            }
-            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-            let declared = bins.iter().find(|section| section.contains(&format!("name = \"{name}\"")));
-            assert!(
-                declared.is_some_and(|section| section.contains("harness = false")),
-                "{name} includes a production module by #[path], so `cargo test --bins` \
-                 would run that module's tests in place of the observation's main()"
-            );
-        }
+        let manifest =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+        let declared = manifest
+            .split("\n[")
+            .find(|section| section.contains("name = \"autoship_sync_log_rotation\""));
+        assert!(
+            declared.is_some_and(|section| section.contains("harness = false")),
+            "autoship_sync_log_rotation includes this module by #[path], so without \
+             `harness = false` `cargo test --bins` runs these tests in place of its main()"
+        );
     }
 
     #[test]

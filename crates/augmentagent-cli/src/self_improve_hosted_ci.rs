@@ -84,12 +84,6 @@ async fn policy_check(root: &Path, tree: &str) -> Result<()> {
     .await?;
     let expected: std::collections::BTreeSet<_> = workflows.keys().map(String::as_str).collect();
     let actual: std::collections::BTreeSet<_> = actual.lines().collect();
-    // Correctly refuses every candidate, not only one that edited these paths:
-    // the inventory is compared against the contract compiled into the running
-    // controller, so once `main` adds a reviewed workflow each branch on top of
-    // it reads as changed until the controller is rolled out. A candidate whose
-    // `.github/workflows` and `scripts/ci-contract.json` match `main` byte for
-    // byte is never the cause.
     anyhow::ensure!(
         actual == expected,
         "hosted CI workflow inventory changed; reviewed controller rollout required"
