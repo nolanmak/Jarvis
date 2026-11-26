@@ -333,6 +333,7 @@ fn sweep_candidate(mergeable: Option<bool>) -> SweepCandidate {
         mergeable,
         checks_green: Some(true),
         review_approved: true,
+        review_mode: crate::autoship_review::ReviewMode::PreMerge,
         policy: MergePolicy {
             automerge_enabled: true,
             complexity: Complexity::Medium,

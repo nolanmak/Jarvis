@@ -120,6 +120,19 @@ esac
 exit 0
 STUB
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/curl"
+  # GitHub, stubbed: `gh api PATH` answers from $STUB_DIR/gh/<PATH with / and
+  # ? turned into _>, and fails (as a network or auth error does) when there
+  # is no such fixture or $STUB_DIR/gh.fail exists.
+  cat > "$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+path="${!#}"
+echo "$path" >> "$STUB_DIR/gh.calls"
+[ -e "$STUB_DIR/gh.fail" ] && { echo "gh: network down" >&2; exit 1; }
+f="$STUB_DIR/gh/$(printf '%s' "$path" | tr '/?=&' '____')"
+[ -f "$f" ] || { echo "gh: HTTP 404" >&2; exit 1; }
+cat "$f"
+STUB
+  mkdir -p "$TMP/gh"; : > "$TMP/gh.calls"
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname"
   chmod +x "$TMP/bin/"*
   STUB_DIR="$TMP"; export STUB_DIR
@@ -146,13 +159,14 @@ merge_to_main() {
 }
 
 run_env() {
-  env PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" HOME="$TMP" \
+  env -u GH_TOKEN -u GITHUB_TOKEN -u AUTOSHIP_PIN_AUTO \
+    PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" HOME="$TMP" \
     AUGMENTAGENT_AUTOSHIP_PIN=on AUGMENTAGENT_AUTOSHIP_PIN_ROOT="$PIN_ROOT" \
     AUGMENTAGENT_MEMINFO_PATH="$MEMINFO" AUGMENTAGENT_PROC_ROOT="$TMP/proc" \
     AUGMENTAGENT_EXE_SETTLE_SECS=0 AUGMENTAGENT_RESTART_POLL_SECS=0.1 \
     AUGMENTAGENT_RESTART_FORCE=1 "$@"
 }
-run_updater() { ( cd "$TMP/work" && run_env ./scripts/check-for-updates.sh >/dev/null 2>&1 ); }
+run_updater() { ( cd "$TMP/work" && run_env "$@" ./scripts/check-for-updates.sh >/dev/null 2>&1 ); }
 pin_cli() { ( cd "$TMP/work" && run_env ./scripts/autoship-pin.sh "$@" >/dev/null 2>&1 ); }
 
 count() { local n; n=$(grep -c -- "$1" "$2" 2>/dev/null); printf '%s' "${n:-0}"; }
@@ -248,6 +262,155 @@ FIRST=$(merge_to_main first)
     AUGMENTAGENT_AUTOSHIP_PIN_ROOT="$PIN_ROOT" AUGMENTAGENT_MEMINFO_PATH="$MEMINFO" \
     ./scripts/check-for-updates.sh >/dev/null 2>&1 )
 [ -e "$PIN_FILE" ] && bad "non-Linux: no pin is bootstrapped" "$(cat "$PIN_FILE")" || ok "non-Linux: no pin is bootstrapped"
+rm -rf "$TMP"
+
+# --- auto-advance: the updater moves the pin to green main commits ---------
+echo "auto-advance of the pin to green main commits:"
+REPO_SLUG=nolanmak/Jarvis
+gh_file() { printf '%s/gh/%s' "$TMP" "$(printf '%s' "$1" | tr '/?=&' '____')"; }
+# checks SHA name:state ...   state = success | failure | pending | skipped
+checks() {
+  local sha="$1" id=1 entry name state runs=""; shift
+  for entry in "$@"; do
+    name="${entry%%:*}"; state="${entry#*:}"; id=$((id + 1))
+    if [ "$state" = pending ]; then
+      runs="$runs{\"id\":$id,\"name\":\"$name\",\"status\":\"in_progress\",\"conclusion\":null},"
+    else
+      runs="$runs{\"id\":$id,\"name\":\"$name\",\"status\":\"completed\",\"conclusion\":\"$state\"},"
+    fi
+  done
+  runs="$runs{\"id\":1,\"name\":\"unrelated\",\"status\":\"queued\",\"conclusion\":null}"
+  printf '{"total_count":0,"check_runs":[%s]}' "$runs" > "$(gh_file "repos/$REPO_SLUG/commits/$sha/check-runs?per_page=100")"
+}
+green() { checks "$1" privacy:success node-release:success targeted:success gitleaks:success; }
+pulls() { printf '[{"number":7,"merged_at":"2026-11-26T00:00:00Z","merge_commit_sha":"%s","head":{"sha":"%s"}}]' "$1" "$2" \
+            > "$(gh_file "repos/$REPO_SLUG/commits/$1/pulls")"; }
+pin_now() { tr -d '[:space:]' < "$PIN_FILE" 2>/dev/null; }
+advanced() { count "AUTOSHIP PIN AUTO-ADVANCED: $1 -> $2 (required checks green)" "$LOG_FILE"; }
+
+# Each case starts from a deployed main whose worker is pinned to FIRST.
+auto_case() {
+  make_case
+  FIRST=$(merge_to_main first)
+  run_updater
+  : > "$TMP/gh.calls"
+}
+
+auto_case
+SECOND=$(merge_to_main second); green "$SECOND"
+run_updater
+check "green HEAD: pin advances to it"                     "$(pin_now)" "$SECOND"
+check "green HEAD: logged"                                 "$(advanced "$FIRST" "$SECOND")" 1
+check "green HEAD: the new pin is installed"               "$(tr -d '[:space:]' < "$PIN_STAMP")" "$SECOND"
+check "green HEAD: installed by copy from the deploy build" "$(pinned_builds)" 0
+check "green HEAD: never restarts the worker unit"         "$(worker_restarts)" 0
+: > "$TMP/gh.calls"
+run_updater
+check "pin at HEAD: a further tick asks GitHub nothing"    "$(count . "$TMP/gh.calls")" 0
+rm -rf "$TMP"
+
+auto_case
+SECOND=$(merge_to_main second)
+checks "$SECOND" privacy:pending node-release:success targeted:success gitleaks:success
+run_updater
+check "pending HEAD: pin does not move"                    "$(pin_now)" "$FIRST"
+check "pending HEAD: logged why"                           "$(count "AUTOSHIP PIN AUTO: no green main commit after $FIRST" "$LOG_FILE")" 1
+checks "$SECOND" privacy:failure node-release:success targeted:success gitleaks:success
+run_updater
+check "red HEAD: pin does not move"                        "$(pin_now)" "$FIRST"
+check "red HEAD: never logs an advance"                    "$(count "AUTO-ADVANCED" "$LOG_FILE")" 0
+check "red HEAD: installed build unchanged"                "$(tr -d '[:space:]' < "$PIN_STAMP")" "$FIRST"
+rm -rf "$TMP"
+
+auto_case
+SECOND=$(merge_to_main second); green "$SECOND"
+THIRD=$(merge_to_main third)
+checks "$THIRD" privacy:pending node-release:pending
+run_updater
+check "older green descendant: pin advances to it, not HEAD" "$(pin_now)" "$SECOND"
+check "older green descendant: logged"                     "$(advanced "$FIRST" "$SECOND")" 1
+check "older green descendant: builds that commit once"    "$(pinned_builds)" 1
+check "older green descendant: installs it"                "$(sed -n 2p "$PINNED_BIN" 2>/dev/null)" "# pinned build of second"
+check "older green descendant: main deploy is HEAD"        "$(cat "$BUILT_STAMP")" "$THIRD"
+rm -rf "$TMP"
+
+# Main pushes do not run targeted (PR-only) and often skip gitleaks: those
+# come from the PR head; a check that ran on main itself still counts.
+auto_case
+SECOND=$(merge_to_main second)
+checks "$SECOND" privacy:success node-release:success gitleaks:skipped
+printf '[]' > "$(gh_file "repos/$REPO_SLUG/commits/$SECOND/pulls")"
+run_updater
+check "required check missing everywhere: no move"         "$(pin_now)" "$FIRST"
+check "required check missing everywhere: says which"      "$(count "$(printf '%.12s' "$SECOND"):incomplete" "$LOG_FILE")" 1
+PR_HEAD=$(printf 'c%.0s' {1..40}); pulls "$SECOND" "$PR_HEAD"
+checks "$PR_HEAD" privacy:success node-release:success targeted:failure gitleaks:success
+run_updater
+check "red on the PR head: no move"                        "$(pin_now)" "$FIRST"
+checks "$PR_HEAD" privacy:failure node-release:success targeted:success gitleaks:success
+run_updater
+check "PR head supplies targeted + gitleaks: advances"     "$(pin_now)" "$SECOND"
+# A merge commit's PR head is its second parent; no pull-request lookup.
+CLONE="$TMP/other"
+git -C "$CLONE" checkout -q -b feature
+echo feature > "$CLONE/crates/x.rs"
+git -C "$CLONE" -c user.email=t@e -c user.name=t commit -qam feature
+FEATURE=$(git -C "$CLONE" rev-parse HEAD)
+git -C "$CLONE" checkout -q main
+git -C "$CLONE" -c user.email=t@e -c user.name=t merge -q --no-ff -m "Merge feature" feature
+git -C "$CLONE" push -q origin HEAD:main
+MERGE=$(git -C "$CLONE" rev-parse HEAD)
+checks "$MERGE" privacy:success node-release:success
+green "$FEATURE"
+: > "$TMP/gh.calls"
+run_updater
+check "merge commit: second parent's checks count; advances" "$(pin_now)" "$MERGE"
+check "merge commit: no pull-request lookup"               "$(count pulls "$TMP/gh.calls")" 0
+rm -rf "$TMP"
+
+auto_case
+git -C "$TMP/work" checkout -q -b side "$FIRST"
+git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -q --allow-empty -m side
+SIDE=$(git -C "$TMP/work" rev-parse HEAD)
+git -C "$TMP/work" checkout -q main
+printf '%s\n' "$SIDE" > "$PIN_FILE"
+SECOND=$(merge_to_main second); green "$SECOND"
+run_updater
+check "pin not an ancestor of main: refused"               "$(pin_now)" "$SIDE"
+check "pin not an ancestor of main: logged"                "$(count "is not an ancestor of origin/main" "$LOG_FILE")" 1
+check "pin not an ancestor of main: never asks GitHub"     "$(count check-runs "$TMP/gh.calls")" 0
+rm -rf "$TMP"
+
+auto_case
+SECOND=$(merge_to_main second); green "$SECOND"
+touch "$TMP/gh.fail"
+run_updater
+check "lookup failure: pin unchanged"                      "$(pin_now)" "$FIRST"
+check "lookup failure: logged"                             "$(count "AUTOSHIP PIN AUTO: GitHub lookup failed" "$LOG_FILE")" 1
+check "lookup failure: the main deploy still happens"      "$(cat "$BUILT_STAMP")" "$SECOND"
+rm -f "$TMP/gh.fail"
+printf 'not json' > "$(gh_file "repos/$REPO_SLUG/commits/$SECOND/check-runs?per_page=100")"
+run_updater
+check "unreadable response: pin unchanged"                 "$(pin_now)" "$FIRST"
+check "unreadable response: logged"                        "$(count "unknown check state for $SECOND" "$LOG_FILE")" 1
+rm -rf "$TMP"
+
+auto_case
+SECOND=$(merge_to_main second); green "$SECOND"
+run_updater AUTOSHIP_PIN_AUTO=off
+check "AUTOSHIP_PIN_AUTO=off: pin unchanged"               "$(pin_now)" "$FIRST"
+check "AUTOSHIP_PIN_AUTO=off: never asks GitHub"           "$(count . "$TMP/gh.calls")" 0
+printf 'off\n' > "$TMP/config/augmentagent/autoship-pin-auto"
+run_updater
+check "auto file off: pin unchanged"                       "$(pin_now)" "$FIRST"
+pin_cli auto on
+run_updater
+check "auto on again: advances"                            "$(pin_now)" "$SECOND"
+# Pinning backwards is a rollback: auto turns off so the next tick keeps it.
+pin_cli "$FIRST" --no-apply
+check "pin CLI backwards: auto-advance turned off"         "$(tr -d '[:space:]' < "$TMP/config/augmentagent/autoship-pin-auto")" off
+run_updater
+check "pin CLI backwards: the next tick keeps the rollback" "$(pin_now)" "$FIRST"
 rm -rf "$TMP"
 
 echo

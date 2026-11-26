@@ -731,10 +731,15 @@ impl SweepGuard {
         } else {
             structured_review_base(recorded, head)
         };
+        let nightly = crate::autoship_review::ReviewMode::nightly();
         let authorized = if existing.is_some() {
+            // #2574: nightly keeps head custody and drops the review verdict.
             binding.head == head
-                && reviews.first().is_some_and(|review| review.approved)
-                && structured.as_ref().is_none_or(|(approved, _)| *approved)
+                && (nightly || (reviews.first().is_some_and(|review| review.approved)
+                && structured.as_ref().is_none_or(|(approved, _)| *approved)))
+        } else if nightly {
+            serde_json::from_str::<serde_json::Value>(recorded).ok()
+                .is_some_and(|record| record["head"].as_str() == Some(head))
         } else {
             true
         };
@@ -743,6 +748,16 @@ impl SweepGuard {
             return Ok(None);
         }
         store.attach_pr_in_repo(&lease, repository, pr, now)?;
+        if existing.is_some() && nightly && !reviews.first().is_some_and(|review| review.approved) {
+            // #2574: durable record that this head merges on green with its
+            // review deferred to the nightly pass.
+            store.record_review(&lease, &Review {
+                reviewer: crate::autoship_review::NIGHTLY_DEFERRED.into(),
+                binding: binding.clone(),
+                approved: true,
+                evidence: serde_json::to_string(&super::deferred_verdict())?,
+            }, now)?;
+        }
         if existing.is_none() {
             store.record_review(
                 &lease,
@@ -821,15 +836,19 @@ impl SweepGuard {
             inner.binding.head == expected,
             "sweep approval binding changed"
         );
+        let main = remote_main_head(repo, &inner.repository).await?;
+        // #2574: with no pre-merge review there is no reviewed base; green
+        // checks on this exact head plus branch protection gate staleness.
+        if !crate::autoship_review::ReviewMode::nightly() {
         let reviewed_base = self
             .reviewed_base
             .as_deref()
             .context("recorded approval lacks a structured integration base; refresh review")?;
-        let main = remote_main_head(repo, &inner.repository).await?;
         anyhow::ensure!(
             !reviewed_main || main == reviewed_base,
             "main changed since review; integrate and verify the candidate again"
         );
+        }
         let (ok, head, _) = run(
             &gh_bin(),
             &[
@@ -931,7 +950,9 @@ impl SweepGuard {
     pub(super) fn request_main_update(&self, main: &str) -> Result<()> {
         let inner = self.inner.as_ref().context("released sweep lease")?;
         inner.validate_before_side_effect()?;
-        let base = self.reviewed_base.as_deref().context("recorded approval lacks a structured integration base")?;
+        let base = self.reviewed_base.as_deref()
+            .or_else(|| crate::autoship_review::ReviewMode::nightly().then_some(main))
+            .context("recorded approval lacks a structured integration base")?;
         inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
             .record_main_update_request(&inner.lease, &inner.binding, main, base, millis())?;
         inner.audit_event("main_update_requested", serde_json::json!({"main":main,"reviewed_base":base}))
@@ -1972,9 +1993,12 @@ impl WorkflowGuard {
     /// and independent approval have both been published under this binding.
     pub(super) async fn published_pr_ready(&mut self, pr: u64, review: &IndependentReview) -> Result<bool> {
         anyhow::ensure!(review.approved(), "PR milestone requires independent approval");
+        // #2574: a deferred (nightly) verdict carries no structured passes.
+        if !review.is_deferred() {
         let structured=review.structured.as_ref().context("PR milestone requires structured review evidence")?;
         anyhow::ensure!(structured.binding.head==self.binding.head && structured.binding.contract_hash==self.binding.contract,
             "PR milestone review differs from current candidate or contract");
+        }
         let verdict=review.recorded_verdict().context("PR milestone review evidence missing")?;
         let encoded=serde_json::to_string(&verdict)?;
         self.record_review(&format!("pr-ready-{}",uuid::Uuid::new_v4()),true,&encoded)?;

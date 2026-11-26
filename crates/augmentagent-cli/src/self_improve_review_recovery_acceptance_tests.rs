@@ -34,6 +34,7 @@ pub(crate) fn binding_ruling_finishes_without_unanimity(
         mergeable: Some(true),
         checks_green: Some(false),
         review_approved: approval.reviewed,
+        review_mode: crate::autoship_review::ReviewMode::PreMerge,
         policy: MergePolicy {
             automerge_enabled: true,
             complexity: Complexity::Medium,
