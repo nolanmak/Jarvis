@@ -217,6 +217,38 @@ async fn linkedin_thread_cross_page_copies_are_consistent_and_chronological() {
     }
 }
 
+/// Thread-URL resolution is parsed like any other read command, but stays off
+/// until the owner opts in (#2503). No credential exists in the test
+/// environment, so a default-off run that still reports the opt-in is also
+/// proof that nothing was loaded and nothing was requested.
+#[test]
+fn parsed_resolve_thread_url_is_default_off_and_names_the_opt_in() {
+    let url = "https://www.linkedin.com/messaging/thread/synthetic-thread-id/";
+    let parse = |args: Vec<&str>| {
+        let Cmd::Linkedin {
+            op: LinkedinOp::ResolveThreadUrl { url, json, enable_archive_resolution },
+        } = Cli::try_parse_from(args).unwrap().cmd
+        else {
+            panic!("wrong CLI route");
+        };
+        (url, json, enable_archive_resolution)
+    };
+    let base = vec!["augmentagent", "linkedin", "resolve-thread-url", url];
+    let mut opted_in = base.clone();
+    opted_in.push(augmentagent_channel_linkedin::OPT_IN_FLAG);
+
+    let (parsed, json, enabled) = parse(base);
+    assert_eq!(parsed, url);
+    assert!(!enabled);
+    assert!(parse(opted_in).2);
+
+    let store = Store::open(":memory:").unwrap();
+    let output = linkedin_archive::thread_url_output(&store, &parsed, json, enabled).unwrap();
+    assert!(output.contains("state: resolution_disabled"), "{output}");
+    assert!(output.contains(augmentagent_channel_linkedin::OPT_IN_FLAG), "{output}");
+    assert!(output.contains("network_requests=0"), "{output}");
+}
+
 #[tokio::test]
 async fn linkedin_backfill_indexing_is_bounded_and_cancellable() {
     for (budget, cancelled, expected_remaining) in

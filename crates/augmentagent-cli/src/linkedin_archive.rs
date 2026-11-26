@@ -125,6 +125,22 @@ pub async fn thread_output(
     Ok(output)
 }
 
+/// Name the archived participant behind a `/messaging/thread/<id>/` URL
+/// (#2503). Offline and read-only; no request is issued and nothing is written.
+///
+/// Off unless `enabled`, and the credential is read only once it is: a
+/// default-off run must explain the opt-in even on a host that never logged in.
+pub fn thread_url_output(store: &Store, url: &str, json: bool, enabled: bool) -> Result<String> {
+    let account = if enabled {
+        // The member urn only names the archive scope to search, so it is read
+        // without promoting or repairing the session it came from.
+        LinkedInAuth::load_read_only(&std::env::current_dir()?)?.member_urn
+    } else {
+        String::new()
+    };
+    augmentagent_channel_linkedin::resolve_thread_url_report(store, &account, url, json, enabled)
+}
+
 /// Command-line pacing. Jitter spans one more delay, so requests land
 /// between one and two delays apart.
 pub fn pacing(page_delay_secs: u32, hourly_requests: u32, daily_requests: u32) -> Pacing {

@@ -64,7 +64,7 @@ pub use posting::{
 };
 pub use thread_url_resolution::{
     parse_thread_url, resolve_thread_url, resolve_thread_url_report, session_advice, SessionAdvice,
-    ThreadUrlError, ThreadUrlResolution, PROFILE_URL_UNAVAILABLE, RECONNECT_NOTE,
+    ThreadUrlError, ThreadUrlResolution, OPT_IN_FLAG, PROFILE_URL_UNAVAILABLE, RECONNECT_NOTE,
 };
 pub use types::{
     is_linkedin_email, Dm, FeedPost, Invitation, MemberUrn, PostComment,

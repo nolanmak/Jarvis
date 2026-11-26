@@ -2807,6 +2807,10 @@ enum LinkedinOp {
         url: String,
         #[arg(long)]
         json: bool,
+        /// Opt in to naming the person behind the link. Off by default: without
+        /// it the command reads neither the credential nor the archive.
+        #[arg(long)]
+        enable_archive_resolution: bool,
     },
     /// Archive-only, resumable import. No drafts, cards or sends.
     Backfill {
@@ -5023,12 +5027,9 @@ async fn main() -> Result<()> {
                 linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh,
                     linkedin_archive::pacing(*page_delay_secs,*hourly_requests,*daily_requests)).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
-            LinkedinOp::ResolveThreadUrl { url, json } => {
-                // Read-only: the member urn only names the archive scope, and
-                // no credential is promoted or repaired for an offline lookup.
-                let auth = augmentagent_channel_linkedin::LinkedInAuth::load_read_only(&std::env::current_dir()?)?;
-                print!("{}", augmentagent_channel_linkedin::resolve_thread_url_report(
-                    &store, &auth.member_urn, url, *json)?);
+            LinkedinOp::ResolveThreadUrl { url, json, enable_archive_resolution } => {
+                print!("{}", linkedin_archive::thread_url_output(
+                    &store, url, *json, *enable_archive_resolution)?);
                 Ok(())
             },
             LinkedinOp::Dm {

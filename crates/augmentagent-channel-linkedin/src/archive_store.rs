@@ -163,12 +163,19 @@ pub enum PeerLookup {
 /// account: the same remote id in a second mailbox is a different conversation.
 /// The owner is the account identifier itself, because sync records the mailbox
 /// member urn both as `account` and among the conversation participants.
+///
+/// A messaging-thread link carries only the trailing element of the key sync
+/// stored, so `urn:li:msgConversation:(<mailbox>,<id>)` is matched on that
+/// element as well as whole. Compared as a literal suffix rather than with
+/// LIKE, because an opaque id may contain `_`.
 pub fn direct_peer(store: &Store, account: &str, conversation: &str) -> anyhow::Result<PeerLookup> {
+    const SCOPE: &str =
+        "c.account=?1 AND (c.urn=?2 OR substr(c.urn,-(length(?2)+2))=','||?2||')')";
     Ok(store.with_conn(|c| {
-        let Some(group)=c.query_row("SELECT group_chat FROM linkedin_archive_conversations WHERE account=?1 AND urn=?2",params![account,conversation],|r|r.get::<_,bool>(0)).optional()? else {
+        let Some(group)=c.query_row(&format!("SELECT MAX(c.group_chat) FROM linkedin_archive_conversations c WHERE {SCOPE}"),params![account,conversation],|r|r.get::<_,Option<bool>>(0))? else {
             return Ok(PeerLookup::Unknown);
         };
-        let mut q=c.prepare("SELECT urn,name FROM linkedin_archive_participants WHERE account=?1 AND conversation=?2 AND urn<>?1 ORDER BY urn")?;
+        let mut q=c.prepare(&format!("SELECT DISTINCT p.urn,p.name FROM linkedin_archive_participants p JOIN linkedin_archive_conversations c ON c.account=p.account AND c.urn=p.conversation WHERE {SCOPE} AND p.urn<>?1 ORDER BY p.urn"))?;
         let peers=q.query_map(params![account,conversation],|r|Ok(Participant{urn:r.get(0)?,name:r.get(1)?}))?.collect::<Result<Vec<_>,_>>()?;
         Ok(match peers.as_slice() {
             [peer] if !group => PeerLookup::Peer(peer.clone()),

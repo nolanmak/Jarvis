@@ -6,7 +6,7 @@ use augmentagent_channel_linkedin::{
     session_guard,
     thread_url_resolution::{
         parse_thread_url, resolve_thread_url, resolve_thread_url_report, session_advice,
-        ThreadUrlError, ThreadUrlResolution, RECONNECT_NOTE,
+        ThreadUrlError, ThreadUrlResolution, OPT_IN_FLAG, RECONNECT_NOTE,
     },
 };
 use augmentagent_store::Store;
@@ -23,15 +23,21 @@ fn participant(urn: &str, name: &str) -> Participant {
     }
 }
 
+fn dana() -> Vec<Participant> {
+    vec![participant("person:1", "Dana Example")]
+}
+
 fn url() -> String {
     format!("https://www.linkedin.com/messaging/thread/{THREAD}/")
 }
 
-/// Sync records the mailbox member urn as the account and as a participant.
-fn sync(store: &Store, account: &str, group: bool, peers: Vec<Participant>) {
+/// Sync under an explicit conversation key, because a mailbox may have
+/// recorded the composite urn rather than the bare thread id. The mailbox
+/// member urn lands as the account and as a participant, as sync records it.
+fn sync(store: &Store, account: &str, urn: &str, group: bool, peers: Vec<Participant>) {
     let cp = checkpoint(store, account, "PRIMARY_INBOX").unwrap();
     let items = vec![Conversation {
-        urn: THREAD.into(),
+        urn: urn.into(),
         title: "Thread".into(),
         group,
         last_activity_ms: 100,
@@ -39,21 +45,13 @@ fn sync(store: &Store, account: &str, group: bool, peers: Vec<Participant>) {
             .chain(peers)
             .collect(),
     }];
-    assert!(
-        commit_conversations(
-            store,
-            account,
-            "PRIMARY_INBOX",
-            &cp,
-            &Page { items, next: None },
-            10_000,
-        )
-        .unwrap()
-    );
+    let page = Page { items, next: None };
+    assert!(commit_conversations(store, account, "PRIMARY_INBOX", &cp, &page, 10_000).unwrap());
 }
 
+/// Every case but the opt-in test resolves with the surface switched on.
 fn resolve(store: &Store, account: &str, url: &str) -> ThreadUrlResolution {
-    resolve_thread_url(store, account, url).unwrap()
+    resolve_thread_url(store, account, url, true).unwrap()
 }
 
 /// The reported case: the live session is rejected, yet the pasted thread URL
@@ -63,12 +61,7 @@ fn a_stale_session_still_resolves_an_archived_thread_url_to_its_participant() {
     let store = Store::open(":memory:").unwrap();
     let redirect = ArchiveError::Redirect.to_string();
     session_guard::record_failure(&store, OWNER, &redirect, 1_700_000_000_000).unwrap();
-    sync(
-        &store,
-        OWNER,
-        false,
-        vec![participant("person:1", "Dana Example")],
-    );
+    sync(&store, OWNER, THREAD, false, dana());
 
     let resolved = resolve(
         &store,
@@ -95,15 +88,16 @@ fn a_stale_session_still_resolves_an_archived_thread_url_to_its_participant() {
     assert_eq!(advice.since_ms, 1_700_000_000_000);
     assert_eq!(advice.note, None);
 
-    let receipt: serde_json::Value =
-        serde_json::from_str(&resolve_thread_url_report(&store, OWNER, &url(), true).unwrap())
-            .unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(
+        &resolve_thread_url_report(&store, OWNER, &url(), true, true).unwrap(),
+    )
+    .unwrap();
     assert_eq!(receipt["state"], "resolved");
     assert_eq!(receipt["conversation_id"], THREAD);
     assert_eq!(receipt["account_id"], format!("linkedin:{OWNER}"));
     assert_eq!(receipt["participant"]["name"], "Dana Example");
     assert_eq!(receipt["participant"]["member_urn"], "person:1");
-    assert!(receipt["participant"]["profile_url"].is_null());
+    assert!(receipt["participant"]["profile_url"].is_null(), "{receipt}");
     assert_eq!(receipt["network_requests"], 0);
     assert_eq!(receipt["live_lookup_enabled"], false);
     assert_eq!(
@@ -138,36 +132,80 @@ fn only_https_linkedin_messaging_thread_urls_are_accepted() {
     }
 }
 
+/// The surface is opt-in, so a thread the archive could name stays unnamed
+/// until the owner asks for it, and says which flag to pass.
 #[test]
-fn resolution_is_scoped_to_the_selected_account() {
+fn resolution_is_off_until_it_is_explicitly_enabled() {
     let store = Store::open(":memory:").unwrap();
-    sync(
-        &store,
-        OTHER,
-        false,
-        vec![participant("person:1", "Dana Example")],
-    );
-    assert!(matches!(
-        resolve(&store, OWNER, &url()),
-        ThreadUrlResolution::MappingMissing { .. }
-    ));
-    assert!(matches!(
-        resolve(&store, OTHER, &url()),
-        ThreadUrlResolution::Resolved { .. }
-    ));
+    session_guard::record_failure(&store, OWNER, "redirected", 1_700_000_000_000).unwrap();
+    sync(&store, OWNER, THREAD, false, dana());
+
+    let disabled = resolve_thread_url(&store, OWNER, &url(), false).unwrap();
+    assert_eq!(disabled.state(), "resolution_disabled");
+    assert!(disabled.detail().contains(OPT_IN_FLAG), "{disabled:?}");
+    // An opt-out is not an identification: the archived name is withheld.
+    assert!(!disabled.detail().contains("Dana Example"), "{disabled:?}");
+    assert_eq!(disabled.conversation_id(), None);
+    // An opt-out is not an archive gap, so no reconnect note is attached.
+    let advice = session_advice(&store, OWNER, &disabled).unwrap();
+    assert_eq!(advice.and_then(|advice| advice.note), None);
+
+    let receipt: serde_json::Value = serde_json::from_str(
+        &resolve_thread_url_report(&store, OWNER, &url(), true, false).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["state"], "resolution_disabled");
+    assert!(receipt["participant"].is_null(), "{receipt}");
+    assert!(receipt["conversation_id"].is_null(), "{receipt}");
+    assert_eq!(receipt["network_requests"], 0);
+}
+
+/// A link carries only the trailing thread id, while sync stores whatever
+/// `entityUrn` the mailbox returned. The composite form must still resolve, or
+/// every archived thread reads as missing.
+#[test]
+fn a_composite_conversation_urn_resolves_from_the_thread_id_in_the_link() {
+    let store = Store::open(":memory:").unwrap();
+    let urn = format!("urn:li:msgConversation:({OWNER},{THREAD})");
+    sync(&store, OWNER, &urn, false, dana());
+
+    let resolved = resolve(&store, OWNER, &url());
+    let ThreadUrlResolution::Resolved {
+        conversation_id,
+        participant,
+    } = &resolved
+    else {
+        panic!("{resolved:?}");
+    };
+    assert_eq!(conversation_id, THREAD);
+    assert_eq!(participant.urn, "person:1");
+
+    // Matching the trailing element widens the key, never the account scope,
+    // and never reaches a thread id the mailbox does not hold.
+    for (account, link) in [
+        (OTHER, url()),
+        (
+            OWNER,
+            "https://www.linkedin.com/messaging/thread/2-other-thread-id==/".into(),
+        ),
+    ] {
+        assert_eq!(
+            resolve(&store, account, &link).state(),
+            "archive_mapping_missing"
+        );
+    }
 }
 
 #[test]
 fn group_and_peerless_threads_cannot_name_one_person() {
-    let dana = participant("person:1", "Dana Example");
     let rae = participant("person:2", "Rae Example");
     for (group, peers, expected) in [
-        (true, vec![dana.clone()], (1_usize, true)),
-        (false, vec![dana, rae], (2, false)),
+        (true, dana(), (1_usize, true)),
+        (false, [dana(), vec![rae]].concat(), (2, false)),
         (false, Vec::new(), (0, false)),
     ] {
         let store = Store::open(":memory:").unwrap();
-        sync(&store, OWNER, group, peers);
+        sync(&store, OWNER, THREAD, group, peers);
         let resolved = resolve(&store, OWNER, &url());
         let ThreadUrlResolution::Ambiguous {
             peers, group: flag, ..
@@ -187,20 +225,19 @@ fn an_unsynced_thread_explains_itself_and_offers_the_reconnect_command() {
 
     let missing = resolve(&store, OWNER, &url());
     assert_eq!(missing.state(), "archive_mapping_missing");
-    assert!(missing.detail().contains("stored LinkedIn archive"), "{missing:?}");
-    // A stale session must never surface to the owner as a redirect or
-    // request-compatibility error.
-    assert!(!missing.detail().contains(&redirect), "{missing:?}");
     let advice = session_advice(&store, OWNER, &missing).unwrap().unwrap();
     assert_eq!(advice.note, Some(RECONNECT_NOTE));
     // A healthy account is told nothing about reconnecting.
     assert!(session_advice(&store, OTHER, &missing).unwrap().is_none());
 
-    let text = resolve_thread_url_report(&store, OWNER, &url(), false).unwrap();
+    let text = resolve_thread_url_report(&store, OWNER, &url(), false, true).unwrap();
     assert!(text.contains("state: archive_mapping_missing"), "{text}");
+    assert!(text.contains("stored LinkedIn archive"), "{text}");
     assert!(text.contains(session_guard::LOGIN_COMMAND), "{text}");
     assert!(text.contains(RECONNECT_NOTE), "{text}");
     assert!(text.contains("network_requests=0"), "{text}");
+    // A stale session must never surface to the owner as a redirect or
+    // request-compatibility error.
     assert!(!text.contains(&redirect), "{text}");
 
     let unsupported = resolve(&store, OWNER, "https://www.linkedin.com/feed/");
