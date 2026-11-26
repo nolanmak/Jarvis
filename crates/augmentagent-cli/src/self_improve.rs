@@ -2712,6 +2712,27 @@ fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable:
     None
 }
 
+/// #2574/#2578 — the merge policy under `AUTOSHIP_REVIEW_MODE=nightly`.
+///
+/// The owner moved independent review after the merge, so green required
+/// checks stand in for it. The gates that only an independent (Codex)
+/// approval could release go with it: the review requirement itself, the
+/// complexity band, and the receipt gate. The receipt gate guards
+/// live-behaviour paths (prompts/skills, the reasoner, email send paths, the
+/// governor, Discord approval loops), not credentials; secret, auth, keyring,
+/// `.env` and lockfile diffs are refused earlier by `is_blast_radius` and never
+/// reach a PR. Everything else stays: the automerge switch, research-filed
+/// issues, and author eligibility. An unreadable diff is still refused by the
+/// caller before this runs.
+fn nightly_merge_policy(p: &MergePolicy) -> MergePolicy {
+    MergePolicy {
+        reviews_approved: true,
+        complexity: Complexity::Simple,
+        receipt_gated_file: None,
+        ..p.clone()
+    }
+}
+
 fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
     if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved, c.review_mode) {
@@ -2734,12 +2755,10 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
              path is unknown; no override applies to an unknown",
         );
     }
-    let mut policy = c.policy.clone();
-    if c.review_mode == crate::autoship_review::ReviewMode::Nightly {
-        // #2574: the review requirement moved to the nightly pass; every other
-        // policy gate (automerge switch, complexity, receipt, author) stays.
-        policy.reviews_approved = true;
-    }
+    let policy = match c.review_mode {
+        crate::autoship_review::ReviewMode::PreMerge => c.policy.clone(),
+        crate::autoship_review::ReviewMode::Nightly => nightly_merge_policy(&c.policy),
+    };
     if !may_automerge(&policy) {
         return skip("the merge policy withholds it (complexity, receipt gate, or author)");
     }
@@ -17389,13 +17408,51 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 |c| c.ours = Some(false),
                 |c| c.loop_authored = false,
                 |c| c.policy.automerge_enabled = false,
-                |c| c.policy.complexity = Complexity::Hard,
+                |c| c.policy.research_filed = true,
+                |c| c.policy.issue_author = "a-stranger".into(),
+                |c| c.policy.receipt_gated_file = Some(UNREADABLE_DIFF.into()),
             ] {
                 let mut c = SweepCandidate { review_mode: mode, review_approved: true, ..draft.clone() };
                 c.policy.reviews_approved = true;
                 mutate(&mut c);
                 assert!(matches!(sweep_verdict(&c), SweepVerdict::Skip(_)), "{mode:?}");
             }
+        }
+    }
+
+    /// #2578 — nightly: green required checks stand in for the Codex approval
+    /// that complexity and receipt-gated paths needed, so a hard or
+    /// receipt-gated green loop draft merges. Pre-merge still withholds both.
+    #[test]
+    fn nightly_merges_complex_and_receipt_gated_green_drafts_pre_merge_does_not() {
+        use crate::autoship_review::ReviewMode::{Nightly, PreMerge};
+        let mut unreviewed = policy(Complexity::Simple);
+        unreviewed.reviews_approved = false;
+        unreviewed.codex_approved = false;
+        let draft = SweepCandidate {
+            pr: 2564, issue: 1788, ours: Some(true), loop_authored: true,
+            mergeable: Some(true), checks_green: Some(true), review_approved: false,
+            review_mode: Nightly, policy: unreviewed,
+        };
+        let mut hard = draft.clone();
+        hard.policy.complexity = Complexity::Hard;
+        let mut gated = draft.clone();
+        gated.policy.receipt_gated_file = Some("crates/augmentagent-channel-core/src/reasoner.rs".into());
+        let mut both = hard.clone();
+        both.policy.receipt_gated_file = gated.policy.receipt_gated_file.clone();
+        for c in [&hard, &gated, &both] {
+            assert_eq!(sweep_verdict(c), SweepVerdict::Merge, "nightly merges on green: {:?}", c.policy);
+            // Pre-merge, even with a recorded non-Codex approval, still withholds.
+            let mut pre = SweepCandidate { review_mode: PreMerge, review_approved: true, ..c.clone() };
+            pre.policy.reviews_approved = true;
+            assert!(matches!(sweep_verdict(&pre), SweepVerdict::Skip(why) if why.contains("merge policy withholds")),
+                "pre-merge unchanged: {:?}", pre.policy);
+            // Nightly still needs green checks and the loop's own authorship.
+            let red = SweepCandidate { checks_green: Some(false), ..c.clone() };
+            assert!(matches!(sweep_verdict(&red), SweepVerdict::Skip(_)));
+            let mut foreign = c.clone();
+            foreign.policy.issue_author = "a-stranger".into();
+            assert!(matches!(sweep_verdict(&foreign), SweepVerdict::Skip(why) if why.contains("merge policy withholds")));
         }
     }
 
