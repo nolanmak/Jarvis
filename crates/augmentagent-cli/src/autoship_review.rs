@@ -12,6 +12,77 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_ADJUDICATION_ATTEMPTS: u32 = 2;
+
+/// #2574 — when the independent cross-provider review runs.
+pub const REVIEW_MODE_ENV: &str = "AUTOSHIP_REVIEW_MODE";
+/// Provider/backend/model of the verdict recorded when review is deferred to
+/// the nightly pass. It approves only while the mode is `nightly`.
+pub const NIGHTLY_DEFERRED: &str = "nightly-deferred";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMode {
+    /// Pre-#2574 behaviour: an approving independent review before merge.
+    PreMerge,
+    /// Merge on green; one nightly pass reviews what merged.
+    Nightly,
+}
+
+impl ReviewMode {
+    /// Unset or empty means `nightly` (owner decision, #2574). An unknown
+    /// value fails closed to `pre-merge`.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+            "" | "nightly" => Self::Nightly,
+            _ => Self::PreMerge,
+        }
+    }
+
+    pub fn current() -> Self {
+        #[cfg(test)]
+        if let Some(mode) = TEST_MODE.with(|m| m.get()) {
+            return mode;
+        }
+        // Tests that do not choose run the pre-#2574 contract they encode.
+        #[cfg(test)]
+        if std::env::var_os(REVIEW_MODE_ENV).is_none() {
+            return Self::PreMerge;
+        }
+        Self::parse(std::env::var(REVIEW_MODE_ENV).ok().as_deref())
+    }
+
+    pub fn nightly() -> bool {
+        Self::current() == Self::Nightly
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MODE: std::cell::Cell<Option<ReviewMode>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pin this thread's review mode until the guard drops.
+#[cfg(test)]
+pub struct ReviewModeGuard(Option<ReviewMode>);
+#[cfg(test)]
+impl ReviewModeGuard {
+    pub fn set(mode: ReviewMode) -> Self {
+        Self(TEST_MODE.with(|m| m.replace(Some(mode))))
+    }
+}
+#[cfg(test)]
+impl Drop for ReviewModeGuard {
+    fn drop(&mut self) {
+        TEST_MODE.with(|m| m.set(self.0));
+    }
+}
+
+/// #2574 — a workflow parked only because the pre-merge review did not
+/// approve, could not run, or waits for review capacity.
+pub fn review_park(review_stage: bool, reason: &str) -> bool {
+    matches!(reason, "review-recovery-required" | "review-evidence-budget"
+        | "review_attempts_exhausted_backoff" | "review_evidence_recovery" | "review_main_changed")
+        || (review_stage && reason == "resource_capacity")
+}
 #[path="autoship_review_sources.rs"]
 mod source_requests;
 pub use source_requests::{ReviewSourceRequest,ReviewSourceSelector};
