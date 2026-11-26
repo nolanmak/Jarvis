@@ -6033,9 +6033,11 @@ exit 1
         assert!(!typed.is_provider_side(), "a host stop never latches claude");
     }
 
-    /// #1788 — the reported case: the CLI is SIGKILLed (a deploy restart's
-    /// cgroup kill, the OOM killer) and the call reaches the chain as a host
-    /// stop, not as a provider outage.
+    /// #1788 — the reported case verbatim: the CLI is SIGKILLed (a deploy
+    /// restart's cgroup kill, the OOM killer) and the call reaches the chain
+    /// as a host stop, not as a provider outage. #1779 already pinned the
+    /// classification for this stub; what is asserted here on top of it is
+    /// the half the title names — the stop must not latch claude.
     #[tokio::test]
     async fn a_sigkilled_claude_is_interrupted_not_unavailable() {
         let dir = tempfile::tempdir().unwrap();
