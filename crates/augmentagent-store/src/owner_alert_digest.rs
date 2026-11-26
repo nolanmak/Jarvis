@@ -13,7 +13,12 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
         slot TEXT PRIMARY KEY, outbox_id INTEGER NOT NULL UNIQUE,
         expires_at_ms INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS owner_alert_digest_items (
-        slot TEXT NOT NULL, alert_id TEXT NOT NULL, PRIMARY KEY(slot,alert_id));",
+        slot TEXT NOT NULL, alert_id TEXT NOT NULL, PRIMARY KEY(slot,alert_id));
+        CREATE TABLE IF NOT EXISTS owner_alert_day_digests (
+        zone TEXT NOT NULL, local_date TEXT NOT NULL, claimed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(zone,local_date));
+        CREATE TABLE IF NOT EXISTS owner_alert_discord_actions (
+        alert_id TEXT PRIMARY KEY, acted_at_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -125,5 +130,136 @@ impl Store {
             )
             .optional()
         })
+    }
+}
+
+/// One preceding local date, summarised for the opt-in Discord digest (#2329):
+/// counts plus the subjects of the high-urgency alerts handled on Discord that
+/// never texted. Message content — bodies, senders, handles — is absent by
+/// construction, because a quiet phone is the thing being explained.
+#[derive(Debug, Clone)]
+pub struct AlertDayDigest {
+    pub zone: String,
+    pub local_date: String,
+    pub alerts: i64,
+    pub high: i64,
+    pub texted: i64,
+    pub subjects: Vec<String>,
+}
+
+/// Local hours in which the digest for the preceding date may be delivered.
+const MORNING: std::ops::Range<u32> = 8..12;
+/// A digest is a glance, not an inbox.
+const MAX_SUBJECTS: usize = 10;
+/// An individual text was claimed, sent, or left unknown.
+const TEXTED: &str = "EXISTS(SELECT 1 FROM owner_alert_texts t JOIN imessage_outbox o ON o.id=t.outbox_id
+    WHERE t.alert_id=a.id AND o.status IN ('sent','claimed','unknown'))";
+
+fn local_midnight(tz: chrono_tz::Tz, date: chrono::NaiveDate) -> StoreResult<i64> {
+    use chrono::TimeZone;
+    let naive = date.and_hms_opt(0, 0, 0).expect("midnight exists on every date");
+    // A spring-forward midnight does not exist locally; the hour after it does.
+    tz.from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| {
+            tz.from_local_datetime(&(naive + chrono::Duration::hours(1)))
+                .earliest()
+        })
+        .map(|t| t.timestamp_millis())
+        .ok_or_else(|| StoreError::InvalidInput("unresolvable local digest date".into()))
+}
+
+impl Store {
+    /// Claim the delivery key for the preceding local date and return its
+    /// summary in the same immediate transaction, so a restart after the claim
+    /// cannot post the date twice. `None` means there is nothing to deliver:
+    /// outside the morning window, already claimed, or a date without alerts.
+    /// The zone is the one persisted with the most recent alert — alert data is
+    /// the only configured source of the owner's local day.
+    pub fn claim_owner_alert_day_digest(&self, now: i64) -> StoreResult<Option<AlertDayDigest>> {
+        let zone: Option<String> = self.with_conn(|c| {
+            c.query_row(
+                "SELECT timezone FROM owner_alerts ORDER BY created_at_ms DESC,id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        let Some(zone) = zone else { return Ok(None) };
+        let tz: chrono_tz::Tz = zone
+            .parse()
+            .map_err(|_| StoreError::InvalidInput("invalid owner alert timezone".into()))?;
+        let local = chrono::DateTime::from_timestamp_millis(now)
+            .ok_or_else(|| StoreError::InvalidInput("invalid digest timestamp".into()))?
+            .with_timezone(&tz);
+        if !MORNING.contains(&local.hour()) {
+            return Ok(None);
+        }
+        let date = local
+            .date_naive()
+            .pred_opt()
+            .ok_or_else(|| StoreError::InvalidInput("invalid digest date".into()))?;
+        // Timezone-aware bounds: a DST date is 23 or 25 hours long, never 24.
+        let start = local_midnight(tz, date)?;
+        let end = local_midnight(
+            tz,
+            date.succ_opt()
+                .ok_or_else(|| StoreError::InvalidInput("invalid digest date".into()))?,
+        )?;
+        let key = date.to_string();
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            let (alerts, high, texted): (i64, i64, i64) = tx.query_row(
+                &format!("SELECT COUNT(*),COALESCE(SUM(a.urgency='high'),0),COALESCE(SUM({TEXTED}),0)
+                    FROM owner_alerts a WHERE a.created_at_ms>=?1 AND a.created_at_ms<?2"),
+                params![start, end],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if alerts == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            if tx.execute("INSERT OR IGNORE INTO owner_alert_day_digests(zone,local_date,claimed_at_ms)
+                VALUES(?1,?2,?3)",params![zone,key,now])? == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let subjects = {
+                let mut q = tx.prepare(&format!(
+                    "SELECT json_extract(d.payload,'$.subject') FROM owner_alerts a
+                    JOIN owner_alert_details d ON d.alert_id=a.id
+                    WHERE a.created_at_ms>=?1 AND a.created_at_ms<?2 AND a.urgency='high'
+                    AND a.state IN ('acknowledged','resolved')
+                    AND EXISTS(SELECT 1 FROM owner_alert_discord_actions x WHERE x.alert_id=a.id)
+                    AND NOT {TEXTED} ORDER BY a.created_at_ms,a.id LIMIT ?3"
+                ))?;
+                let rows = q.query_map(params![start, end, MAX_SUBJECTS], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<Option<String>>>>()?
+            };
+            tx.commit()?;
+            Ok(Some(AlertDayDigest {
+                zone,
+                local_date: key,
+                alerts,
+                high,
+                texted,
+                subjects: subjects.into_iter().flatten().collect(),
+            }))
+        })
+    }
+
+    /// Record that the owner acted on `id` from its Discord post. Only an
+    /// action taken there, after the alert was posted there, makes the alert
+    /// eligible for the digest: reply and meeting reconciliation resolve
+    /// alerts on their own, and that is not handling them here.
+    pub fn record_owner_alert_discord_action(&self, id: &str, now: i64) -> StoreResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO owner_alert_discord_actions(alert_id,acted_at_ms)
+                SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM owner_alert_notices
+                WHERE alert_id=?1 AND status='posted' AND posted_at_ms<=?2)",
+                params![id, now],
+            )
+        })? == 1)
     }
 }

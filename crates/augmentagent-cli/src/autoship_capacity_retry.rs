@@ -300,6 +300,10 @@ mod tests {
         std::fs::create_dir(&state).unwrap();std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
         let _lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(state.join("state.lock")).unwrap();
         let session=state.join("codex/session-fixture");std::fs::create_dir_all(&session).unwrap();
+        // A running fixture runtime: its held session lock reserves the only GiB.
+        let running=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(session.join("lock")).unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe{libc::flock(running.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         let policy=root.path().join("policy.json");
         let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":1073741824u64,"max_sessions":2,"providers":{}})).unwrap();
         std::fs::write(&policy,bytes).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -309,6 +313,7 @@ mod tests {
         let due=store.defer_run_capacity(&lease,Some(&fingerprint),30).unwrap();
         assert!(!store.wake_native_capacity(&lease.workflow,&full,31).unwrap());
         // This is an empty test directory created above, never a live session.
+        drop(running);std::fs::remove_file(session.join("lock")).unwrap();
         std::fs::remove_dir(&session).unwrap();
         let available=state_capacity::inspect_at(Some(&policy));assert!(available.available_fingerprint().is_some());
         assert!(!store.wake_native_capacity(&lease.workflow,&available,31).unwrap(),"live lease cannot be preempted");

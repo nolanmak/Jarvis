@@ -2,13 +2,23 @@
 
 mod approval_context;
 mod team_coverage;
+// #2284 — cross-channel owner-reply rule of the stale-approval sweep.
+mod owner_reply_sweep;
 mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
+mod loop_mailer;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod yolo_command;
+mod yolo_turn;
+mod web;
+#[cfg(test)]
+mod yolo_isolation_tests;
+#[cfg(test)]
+mod yolo_acceptance_tests;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod calendar_reschedule;
@@ -21,6 +31,8 @@ mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
 mod computer_tool;
+mod tabagent_handoff;
+mod tabagent_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
@@ -99,6 +111,8 @@ use async_trait::async_trait;
 mod whatsapp_history;
 mod whatsapp_phone;
 mod socialapi_compose_identity;
+#[cfg(test)]
+mod socialapi_compose_identity_approver_tests;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -785,6 +799,28 @@ enum Cmd {
         #[arg(long)]
         readiness: String,
     },
+    /// Internal MCP server for web search and page fetch (non-native-web models).
+    #[command(hide = true)]
+    WebTool {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        tools: String,
+        #[arg(long)]
+        unfiltered: String,
+    },
+    /// Internal owner-authorized MCP server for TabAgent browser tools.
+    #[command(hide = true)]
+    TabagentTool {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        tools: String,
+    },
+    /// Print the loopback URL for TabAgent's `handoff.webhook`: Jarvis posts
+    /// each remote-handoff link it receives there to the owner in Discord.
+    /// Run `tabagent config handoff.webhook "$(augmentagent tabagent-handoff-url)"`.
+    TabagentHandoffUrl,
     /// Internal owner-authorized MCP server for Composio hosted consent links.
     #[command(hide = true)]
     ComposioAuthTool,
@@ -821,8 +857,10 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
-        /// Pin one Discord model profile for this probe, without persisting a selection.
-        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
+        /// Pin one model profile for this probe, without persisting a selection.
+        /// `yolo` is accepted here and nowhere else outside a yolo thread; it
+        /// still requires the enable flag and a configured key.
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex", "yolo"])]
         profile: Option<String>,
         /// Ask the selected model to read a synthetic file through the Jarvis
         /// bridge and require a matching tool audit receipt. Performs inference.
@@ -890,9 +928,10 @@ enum Cmd {
         #[command(subcommand)]
         op: loop_cmd::LoopOp,
     },
-    /// #1317 — the heartbeat: a periodic open-ended check-in that reads
-    /// `<wiki>/HEARTBEAT.md` and stays silent unless something needs the
-    /// operator. `run-once` wakes it now; `status --check` is a liveness
+    /// #1317/#2285 — the heartbeat: a daily safety net that surfaces things
+    /// that slipped through the cracks days ago, judged against
+    /// `<wiki>/HEARTBEAT.md`. `run-once` sweeps now; `items`, `done` and
+    /// `snooze` manage what it surfaced; `status --check` is a liveness
     /// probe for cron or an external healthcheck.
     Heartbeat {
         #[command(subcommand)]
@@ -2356,12 +2395,14 @@ enum DiscordOp {
 
 #[derive(Subcommand)]
 enum DocOp {
-    /// Propose a signature on a generated PDF. Only approval publishes the signed output.
+    /// Propose a signature on a PDF or Word (.docx) document. Only approval
+    /// publishes the signed output.
     Sign {
         file: PathBuf,
         #[arg(long)] out: PathBuf,
         #[arg(long, default_value = "default")] signature: String,
-        #[arg(long)] page: u32,
+        /// PDF page (1-based). Required for PDFs; Word documents have none.
+        #[arg(long)] page: Option<u32>,
         /// Text directly under the signature line, e.g. the signer's printed
         /// name. The signature's ink is placed on that line.
         #[arg(long, conflicts_with_all = ["line", "x", "y"])] anchor_text: Option<String>,
@@ -2376,7 +2417,8 @@ enum DocOp {
         /// Optional ISO date printed beside the signature.
         #[arg(long)] date: Option<String>,
     },
-    /// List the signature lines on a PDF's pages (JSON), with the text under each.
+    /// List the signature lines (JSON): on a PDF's pages with the text under
+    /// each, or a Word document's signature paragraphs and cells.
     SignLines {
         file: PathBuf,
         #[arg(long)] page: Option<u32>,
@@ -2784,6 +2826,17 @@ enum LinkedinOp {
         /// Read into memory only; do not open the production database.
         #[arg(long)]
         dry_run: bool,
+        /// Seconds between two page requests. Up to as much again is added
+        /// at random, so the default reads one page every 5 to 10 seconds.
+        #[arg(long, default_value_t = 5)]
+        page_delay_secs: u32,
+        /// Backfill requests allowed for the account in any hour. A spent
+        /// budget stops the run; live poll reads are not charged to it.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..))]
+        hourly_requests: u32,
+        /// Backfill requests allowed for the account in any 24 hours.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..))]
+        daily_requests: u32,
     },
     /// Persisted coverage, not a credentials-present indicator.
     ArchiveStatus {
@@ -3188,11 +3241,21 @@ async fn main() -> Result<()> {
         .init();
 
     // Dry-run must precede Store::open and all persistent bootstrap hooks.
-    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
-        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh).await;
+    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true, page_delay_secs, hourly_requests, daily_requests } } = cli.cmd {
+        let pacing = linkedin_archive::pacing(page_delay_secs, hourly_requests, daily_requests);
+        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh, pacing).await;
     }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::WebTool { ref conversation, ref tools, ref unfiltered } = cli.cmd {
+        return web::tool::serve(conversation, tools, unfiltered == "1").await;
+    }
+    if let Cmd::TabagentTool { ref session, ref tools } = cli.cmd {
+        return tabagent_tool::serve(session, tools).await;
+    }
+    if let Cmd::TabagentHandoffUrl = cli.cmd {
+        return tabagent_handoff::print_url();
     }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
         let result=async {
@@ -3678,13 +3741,17 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
-            let external_autopr = autoship_worker::external_enabled();
-            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+            // #2275 — auto-ship has one execution path, the separately
+            // supervised `auto-pr-worker` (systemd on Linux, launchd on
+            // macOS). The daemon never hosts the loop; the old mode flag
+            // only earns a deprecation warning.
+            autoship_worker::warn_if_external_flag_set();
+            match autoship_deployment::record("daemon", dry_run, true).await {
                 Ok(()) => {
                     // A second serve must preserve both live configuration
                     // evidence and the updater's matching isolation receipt.
-                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
-                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                    if let Err(error) = autoship_worker::record_host_mode() {
+                        warn!(%error, "could not publish auto-ship host mode; worker recovery will not attest this daemon");
                     }
                 }
                 Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
@@ -4001,6 +4068,13 @@ async fn main() -> Result<()> {
                 }
             } else { None };
 
+
+            // nolanmak/tabagent#61: TabAgent's remote-handoff link → the owner's Discord.
+            if !dry_run {
+                if let Some(webhook) = tabagent_handoff::start(shutdown.clone()).await {
+                    tasks.push(webhook);
+                }
+            }
 
             if phone.is_none() {
                 if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
@@ -4402,24 +4476,9 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
-            // #630 — auto-PR loop: poll for open `agent-fixable` issues and
-            // run the #103 self-improve pipeline (draft PR, never merge)
-            // unattended. Opt-in via AUGMENTAGENT_AUTOPR=1 — every engaged
-            // run spawns the claude CLI on the owner's subscription (#448),
-            // so it must never start billing as a side effect of a deploy.
-            // Serve's --dry-run flows through: the gate runs but no PR opens.
-            if external_autopr {
-                info!("auto-PR loop hosted by augmentagent-autopr.service");
-            } else { match self_improve::AutoPrLoop::from_env(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                dry_run,
-            ) {
-                Some(ap) => {
-                    let sd = shutdown.clone();
-                    tasks.push(tokio::spawn(async move { ap.run(sd).await }));
-                }
-                None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            } }
+            // #630 — the auto-PR loop runs only in `augmentagent
+            // auto-pr-worker` (#2275), so daemon restarts never interrupt it.
+            info!("auto-PR loop hosted by the auto-pr-worker service, not the daemon");
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same
@@ -4600,6 +4659,7 @@ async fn main() -> Result<()> {
                         use augmentagent_channel_slack::commands::{
                             SlackLoopPoster, SurfaceGatedRunner, SurfaceLoopPoster,
                         };
+                        let loop_wiki_root = wiki_root.clone();
                         let repo_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
                         let inner: Arc<dyn LoopRunner> = match slack_serve::test_loop_runner(
@@ -4632,11 +4692,15 @@ async fn main() -> Result<()> {
                                 }) as Arc<dyn LoopPoster>
                             }),
                         });
-                        let loops = Arc::new(LoopScheduler::new(
-                            Arc::clone(&store),
-                            runner,
-                            poster,
-                        ));
+                        // #2246 — loops may read their instructions from the
+                        // wiki and email findings to allowlisted owner addresses.
+                        let loops = Arc::new(
+                            LoopScheduler::new(Arc::clone(&store), runner, poster)
+                                .with_wiki_root(loop_wiki_root)
+                                .with_mailer(Arc::new(loop_mailer::GmailLoopMailer {
+                                    store: Arc::clone(&store),
+                                })),
+                        );
                         let sd = shutdown.clone();
                         tasks.push(tokio::spawn(async move { loops.run(sd).await }));
                     }
@@ -4709,9 +4773,10 @@ async fn main() -> Result<()> {
                 // Runs once at startup (to clear whatever accumulated while the
                 // observer was off) and then on a slow tick.
                 let reconcile_store = Arc::clone(&store);
+                let reconcile_surfaces = card_surfaces.clone();
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
-                    run_stale_approval_reconcile(reconcile_store, sd).await
+                    run_stale_approval_reconcile(reconcile_store, reconcile_surfaces, sd).await
                 }));
             }
 
@@ -4932,8 +4997,16 @@ async fn main() -> Result<()> {
                     _ => anyhow::bail!("give --anchor-text (preferred), --line, or --x/--y; run doc sign-lines to see the page's lines"),
                 };
                 let width = if matches!(target, Target::Ink { .. }) { None } else { *width };
+                // Word documents are placed by line, not page.
+                let docx = augmentagent_docs::signing::DocFormat::of(file).ok()
+                    == Some(augmentagent_docs::signing::DocFormat::Docx);
+                let page = match (page, docx) {
+                    (Some(page), _) => *page,
+                    (None, true) => 0,
+                    (None, false) => anyhow::bail!("--page is required for a PDF; run doc sign-lines to see its pages"),
+                };
                 document_signing::propose(store.clone(), file, out, signature,
-                    PlacementRequest { page: *page, target, width, date: date.clone() }).await
+                    PlacementRequest { page, target, width, date: date.clone() }).await
             }
             DocOp::SignLines { .. } => unreachable!("sign-lines dispatched before store initialization"),
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
@@ -4946,7 +5019,7 @@ async fn main() -> Result<()> {
             ResumeOp::Ingest { file } => run_resume_ingest(&cli, file.clone()).await,
         },
         Cmd::Linkedin { ref op } => match op {
-            LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone()).await,
+            LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone(), &store).await,
             LinkedinOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_linkedin_channel(&cli, store, broker, *dry_run)?;
@@ -4964,8 +5037,9 @@ async fn main() -> Result<()> {
                 print!("{}", dispatch_linkedin_read(op, &reader).await?);
                 Ok(())
             },
-            LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
-                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
+            LinkedinOp::Backfill { category, max_pages, refresh, page_delay_secs, hourly_requests, daily_requests, .. } =>
+                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh,
+                    linkedin_archive::pacing(*page_delay_secs,*hourly_requests,*daily_requests)).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {
                 conversation_urn,
@@ -5916,6 +5990,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
+        Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
+        Cmd::TabagentHandoffUrl => tabagent_handoff::print_url(),
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
@@ -8326,6 +8403,8 @@ async fn run_socialapi_dm(
     // message, so there is no platform message id to key on. `compose:`
     // mirrors the gmail convention and can never collide with a real one.
     let message_id = format!("compose:socialapi:dm:{conversation_id}");
+    // #2331 — read before posting, so the new card is never in this list.
+    let prior = socialapi_compose_identity::pending_compose_cards(&store, &conversation_id)?;
     let action_id = post_social_approval_card(
         &store,
         augmentagent_channel_socialapi::PLATFORM,
@@ -8339,6 +8418,9 @@ async fn run_socialapi_dm(
         &draft,
     )
     .await?;
+    // Only once the replacement card is up, as `gmail compose` does: a failed
+    // post leaves the earlier card live.
+    let superseded = socialapi_compose_identity::supersede_prior_compose_cards(&store, &prior);
     if json {
         println!(
             "{}",
@@ -8347,10 +8429,17 @@ async fn run_socialapi_dm(
                 "conversation_id": conversation_id,
                 "subject": subject,
                 "approval_card_posted": true,
+                "superseded": superseded,
             })
         );
     } else {
         println!("approval card posted to Discord (action {action_id})");
+        if !superseded.is_empty() {
+            println!(
+                "replaced {} earlier pending DM card(s) for this conversation",
+                superseded.len()
+            );
+        }
     }
     Ok(())
 }
@@ -9155,6 +9244,7 @@ fn scheduled_send_interval_secs_from_env() -> u64 {
 /// reason in `errorMessage`, and simply stops being served by the carousel.
 async fn run_stale_approval_reconcile(
     store: Arc<Store>,
+    surfaces: augmentagent_approval_discord::CardSurfaces,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(STALE_RECONCILE_INTERVAL_SECS));
@@ -9187,12 +9277,23 @@ async fn run_stale_approval_reconcile(
             // Fires immediately on the first tick, which is what clears the
             // backlog left behind by the observer having been off.
             _ = ticker.tick() => {
-                match reconcile_stale_approvals_tick(&store) {
-                    Ok(0) => {}
-                    Ok(n) => info!(
-                        retired = n,
-                        "stale approval reconciliation: retired stale cards"
-                    ),
+                match reconcile_stale_approvals_pass(
+                    &store,
+                    &team_coverage::Config::from_env(&store),
+                    owner_reply_sweep::REPLY_CHECKS_PER_TICK,
+                ) {
+                    Ok(pass) => {
+                        if pass.retired > 0 {
+                            info!(
+                                retired = pass.retired,
+                                "stale approval reconciliation: retired stale cards"
+                            );
+                        }
+                        // #2284 — redraw every surface's card, as the other
+                        // supersede paths do, instead of leaving it to each
+                        // surface's own resolved-card poll.
+                        owner_reply_sweep::redraw(&surfaces, &pass.touched).await;
+                    }
                     Err(e) => warn!("stale approval reconciliation failed: {e:#}"),
                 }
             }
@@ -9318,19 +9419,31 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
 /// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
 /// config (#1700), so tests don't depend on the process environment.
 fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    Ok(reconcile_stale_approvals_pass(store, team, owner_reply_sweep::REPLY_CHECKS_PER_TICK)?.retired)
+}
+
+/// One reconciliation pass with at most `reply_checks` owner-reply lookups
+/// (#2284). Returns how many cards were retired and every card it tried to
+/// retire, so the caller can redraw their surfaces.
+fn reconcile_stale_approvals_pass(
+    store: &Store,
+    team: &team_coverage::Config,
+    reply_checks: usize,
+) -> Result<owner_reply_sweep::Pass> {
     let team_active = team.active();
     let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
-        return Ok(0);
+        return Ok(owner_reply_sweep::Pass::default());
     }
+    let mut budget = owner_reply_sweep::Budget::new(reply_checks, pending.len());
 
     let mut bulk_ids: Vec<String> = Vec::new();
     let mut empty_ids: Vec<String> = Vec::new();
     let mut answered_ids: Vec<String> = Vec::new();
 
-    for row in &pending {
+    for (pos, row) in budget.order(&pending).into_iter().enumerate() {
         // Rule 3 (#484) — the card has no draft to approve. This happens when a
         // draft was published with an empty body (historically the retry path
         // did this on a triage failure, fixed in #454; kept as a rule because
@@ -9396,14 +9509,19 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         // inbounds too, and the OutboundObserver deliberately never logs our
         // own sends as manual replies, so without this every older sibling
         // card stayed in the queue after the owner had answered.
+        //
+        // #2284 — "replied" is now cross-channel: any owner message in the
+        // card's conversation (iMessage, WhatsApp, Instagram, LinkedIn, …),
+        // not only Gmail's ledgers. An owner-started compose is never retired
+        // by the owner's own messages, and lookups are bounded per tick.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
-            Some(ms) if ms > 0 => ms,
-            _ => row.created_at_ms,
-        };
-        match store.thread_has_owner_send_after(tid, after_ms) {
+        if owner_reply_sweep::is_compose(row) || !budget.take(pos) {
+            continue;
+        }
+        let after_ms = owner_reply_sweep::inbound_bound_ms(store, row);
+        match store.owner_replied_since(&row.platform, tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
@@ -9431,10 +9549,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
             Err(e) => warn!(
                 action_id = %row.id,
                 thread = %tid,
-                "stale approval: thread_has_owner_send_after failed: {e:#}"
+                "stale approval: owner_replied_since failed: {e:#}"
             ),
         }
     }
+    budget.finish();
 
     // #500 — scheduled sends get Rule 1 ONLY (user replied on the thread),
     // bounded to replies AFTER the schedule was ARMED (its own cutoff, distinct
@@ -9455,6 +9574,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
     // cancellation — only the owner's Approve (arm) or the 7-day expiry
     // retires it. Both guards live in the store so every caller inherits them.
     let mut scheduled_retired = 0usize;
+    let mut scheduled_ids_retired: Vec<String> = Vec::new();
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
             Ok(true) => {
@@ -9473,6 +9593,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
                          replied after arming"
                     );
                     scheduled_retired += 1;
+                    scheduled_ids_retired.push(action_id.clone());
                 }
             }
             Ok(false) => {}
@@ -9506,6 +9627,11 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let mut touched: Vec<String> = Vec::new();
+    touched.extend(scheduled_ids_retired);
+    touched.extend(bulk_ids);
+    touched.extend(empty_ids);
+    touched.extend(answered_ids);
     let now = chrono::Utc::now().timestamp_millis();
     for (action_id, thread_id, c) in covered {
         let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
@@ -9530,12 +9656,13 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         }
         if team.mode == team_coverage::Mode::On {
             retired += store.mark_pending_heuristic_superseded_by_ids(
-                &[action_id],
+                &[action_id.clone()],
                 &format!("superseded: covered by teammate {}", c.teammate),
             )?;
+            touched.push(action_id);
         }
     }
-    Ok(retired)
+    Ok(owner_reply_sweep::Pass { retired, touched })
 }
 
 async fn run_stale_draft_sweep(
@@ -9755,7 +9882,14 @@ async fn run_digest(
     let reasoner = build_reasoner();
     let opts = digest_opts(cli.wiki_dir.clone());
     info!(window_hours = since_hours, post_discord, "composing digest");
-    let digest = reasoner.call(&opts, &ctx).await?;
+    let mut digest = reasoner.call(&opts, &ctx).await?;
+    // #2255: appended after composition so a dead LinkedIn session is in every
+    // digest while it lasts, whatever the model chose to summarise.
+    match augmentagent_channel_linkedin::session_guard::digest_line(&store) {
+        Ok(Some(line)) => digest = format!("{}\n\n{line}", digest.trim_end()),
+        Ok(None) => {}
+        Err(error) => warn!("LinkedIn session state unavailable for the digest: {error:#}"),
+    }
 
     println!("{digest}");
 
@@ -9950,6 +10084,7 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     computer_ctx.channel_id = Some(serenity::model::id::ChannelId::new(1));
     computer_ctx.session_id = format!("local:{}", uuid::Uuid::new_v4());
     computer_tool::configure(&mut opts, &computer_ctx, &repo_root);
+    tabagent_tool::configure(&mut opts, &computer_ctx, &std::env::current_exe().context("current_exe")?);
     info!(wiki = %wiki_root.display(), "wiki ask");
     // #389 — same owner-rules preamble the Discord query path injects, so
     // CLI asks behave identically (and the injection is testable headless).
@@ -11490,6 +11625,20 @@ fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
     assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
 }
 
+/// #2218 — an isolation check, not routing. A turn that is not a yolo turn
+/// never runs in a yolo thread, whatever entry point produced it (voice
+/// start, voice bridge, phone, iMessage owner). An unreadable registry closes
+/// guild channels and leaves DMs alone. No inference is started.
+pub(crate) const YOLO_THREAD_REFUSAL: &str = "Not available in a yolo thread.";
+fn yolo_thread_refusal(ctx: &augmentagent_approval_discord::AuditCtx) -> Option<String> {
+    use augmentagent_store::yolo_threads::{closed_to_normal_turns, mark};
+    let channel = ctx.channel_id?;
+    if augmentagent_approval_discord::interaction::is_yolo_turn() {
+        return None;
+    }
+    closed_to_normal_turns(mark(channel.get()), ctx.guild_id.is_some()).then(|| YOLO_THREAD_REFUSAL.to_string())
+}
+
 async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
@@ -11549,8 +11698,8 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
     let probe = if tool_probe {
         let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
         anyhow::ensure!(
-            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
-            "--tool-probe requires claude, codex, qwen, or glm"
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex | ProviderKind::Yolo),
+            "--tool-probe requires claude, codex, qwen, glm, or yolo"
         );
         let directory = tempfile::tempdir()?;
         let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
@@ -11882,6 +12031,10 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            return self.answer_yolo(ctx, question).await;
+        }
         let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
             std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
                 .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
@@ -11919,6 +12072,7 @@ impl QueryHandler for WikiQuerier {
         let auth_bin = self.repo_root.join("target/release/augmentagent");
         #[cfg(not(test))]
         let auth_bin = std::env::current_exe()?;
+        tabagent_tool::configure(&mut opts, ctx, &auth_bin);
         composio_auth_tool::configure(
             &mut opts,
             ctx,
@@ -11985,29 +12139,35 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        let answer = async {
-            let store = augmentagent_channel_core::model_selection::SelectionStore::new(
-                augmentagent_channel_core::model_selection::config_path());
-            let selected = match augmentagent_channel_core::native_session::CURRENT
-                .try_with(|session| session.provider()) {
-                Ok(provider) => Some(provider),
-                // #1292 — a surface turn (Slack) resolved its own
-                // conversation's selection; Discord keeps the channel lookup.
-                Err(_) => {
-                    match augmentagent_channel_core::model_selection::conversation_selection() {
-                        Some(selected) => selected,
-                        None => store.selected(
-                            ctx.channel_id
-                                .as_ref()
-                                .map(|channel| channel.get().to_string())
-                                .as_deref(),
-                        )?,
-                    }
+        // The dispatch override is resolved once, before the option set is
+        // final, so tools that depend on the model can be attached (#2202).
+        let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+            augmentagent_channel_core::model_selection::config_path());
+        let (selected, from_selection_store) = match augmentagent_channel_core::native_session::CURRENT
+            .try_with(|session| session.provider()) {
+            Ok(provider) => (Some(provider), false),
+            // #1292 — a surface turn (Slack) resolved its own
+            // conversation's selection; Discord keeps the channel lookup.
+            Err(_) => {
+                match augmentagent_channel_core::model_selection::conversation_selection() {
+                    Some(selected) => (selected, false),
+                    None => (store.selected(
+                        ctx.channel_id
+                            .as_ref()
+                            .map(|channel| channel.get().to_string())
+                            .as_deref(),
+                    )?, true),
                 }
-            };
-            augmentagent_channel_core::model_selection::SELECTED_PROFILE
-                .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
-        }.await;
+            }
+        };
+        // Qwen and GLM cannot run the native web tools. Only a Discord turn
+        // whose profile came from the model selection store gets the Jarvis
+        // web tools; unselected, Slack and native-session turns are unchanged.
+        if from_selection_store && matches!(selected, Some(augmentagent_channel_core::ProviderKind::Qwen | augmentagent_channel_core::ProviderKind::Glm)) {
+            web::tool::configure(&mut opts, ctx, false, true, &auth_bin);
+        }
+        let answer = augmentagent_channel_core::model_selection::SELECTED_PROFILE
+            .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await;
         if answer.is_ok() &&
             voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
             self.final_spoken_turns.insert(ctx.session_id.clone(), ());
@@ -12025,6 +12185,14 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        if let Some(refusal) = yolo_thread_refusal(ctx) { return Ok(refusal); }
+        // #2219 — a yolo turn: its own thread's history plus the message, no
+        // native session, no iMessage owner history, no other route.
+        if augmentagent_approval_discord::interaction::is_yolo_turn() {
+            let prompt = if history.is_empty() { current.to_string() }
+                else { format!("{history}\n\nuser's current message:\n{current}") };
+            return self.answer(ctx, &prompt).await;
+        }
         let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
         let mut combined_history=history.to_owned();
         if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {
@@ -12128,6 +12296,41 @@ impl QueryHandler for WikiQuerier {
         let origin = context.origin().ok()?;
         let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
         Some(origin)
+    }
+
+    async fn owner_text_command(
+        &self,
+        cx: augmentagent_approval_discord::owner_text::OwnerCommandCtx,
+        text: &str,
+    ) -> Option<augmentagent_approval_discord::owner_text::OwnerCommandOutcome> {
+        // #2208 — `/search`: configuration only, never a vendor call.
+        let (availability, _) = web::availability(&augmentagent_channel_core::secret_loader::load_provider_key);
+        if let Some(reply) = web::command::run(
+            text,
+            &cx.channel_id.to_string(),
+            &web::pins::PinStore::new(web::pins::config_path()),
+            &availability,
+        ) {
+            return Some(augmentagent_approval_discord::owner_text::OwnerCommandOutcome::Reply(reply));
+        }
+        // #2219 — `/yolo`: decided here, performed by the Discord handler.
+        if text.split_whitespace().next() != Some("/yolo") {
+            return None;
+        }
+        yolo_command::run(
+            text,
+            &cx,
+            augmentagent_store::yolo_threads::mark(cx.channel_id),
+            &yolo_turn::facts(),
+        )
+    }
+
+    fn yolo_tag(&self) -> String {
+        // The id is validated by readiness; an invalid one is never printed.
+        match augmentagent_channel_core::yolo::readiness() {
+            Err(augmentagent_channel_core::yolo::NotReady::InvalidModel) => "[yolo]".into(),
+            _ => format!("[yolo · {}]", augmentagent_channel_core::yolo::model_id()),
+        }
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
@@ -14552,13 +14755,17 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        // #2538 — only while still pending: a follow-up compose that retired
+        // this card mid-redraft must not be undone into a second live card.
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("revise: persist failed: {e}"),
+                }
+            }
+        }
         tracing::info!(action_id, "socialapi revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -14935,6 +15142,16 @@ impl ReplyApprover {
         }
     }
 
+    /// #2538 — before Send / Revise runs (and is audited), give a card a
+    /// follow-up social DM compose replaced a live action where that is safe.
+    fn reopen_replaced_social_card(&self, action_id: &str, take_over: bool) {
+        match socialapi_compose_identity::reopen_replaced_card(&self.store, action_id, take_over) {
+            Ok(true) => info!(action_id, take_over, "socialapi dm: reopened replaced card"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "socialapi dm: reopen replaced card failed: {e:#}"),
+        }
+    }
+
     fn skip_github(
         &self,
         action_id: &str,
@@ -14959,6 +15176,7 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.reopen_replaced_social_card(action_id, false);
         let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
@@ -14988,6 +15206,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
+        self.reopen_replaced_social_card(action_id, true);
         self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
@@ -15354,13 +15573,18 @@ impl ReplyApprover {
     }
 
     fn recover_calendar_receipt(action: &augmentagent_store::ActionWithEmail) -> ApprovalActionOutcome {
-        // #1436 appends these two terminal lines only after confirmed creation.
-        // Use the last suffix so proposal text cannot shadow the saved receipt.
+        // #1436 appends these terminal lines only after confirmed creation
+        // (#2514 adds an optional trailing `meet:` line). Use the last suffix
+        // so proposal text cannot shadow the saved receipt.
         let receipt = action.action.draft_body.as_deref()
             .and_then(|body| body.rsplit_once("\ncreated: "))
             .and_then(|(_, suffix)| suffix.split_once("\nevent ID: "))
-            .filter(|(_, id)| !id.is_empty() && !id.chars().any(char::is_whitespace));
-        let Some((link, event_id)) = receipt else {
+            .map(|(link, rest)| match rest.split_once("\nmeet: ") {
+                Some((id, url)) => (link, id, augmentagent_channel_calendar::join_url(Some(url), None)),
+                None => (link, rest, None),
+            })
+            .filter(|(_, id, _)| !id.is_empty() && !id.chars().any(char::is_whitespace));
+        let Some((link, event_id, join_url)) = receipt else {
             // Historical false-success rows have no ID. Never create on a sent
             // row or rewrite history based on the old empty-link placeholder.
             return ApprovalActionOutcome::Failed {
@@ -15370,6 +15594,7 @@ impl ReplyApprover {
         ApprovalActionOutcome::CalendarCreated {
             event_id: event_id.into(),
             html_link: Self::calendar_account_link(Some(link), &action.email.from),
+            join_url,
             organizer_account: action.email.from.clone(),
             already_existed: true,
         }
@@ -15411,8 +15636,23 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
+                // #2514 — surface the Meet join URL so a follow-up email can
+                // carry it. Google normally echoes it on insert; if a Meet was
+                // requested and the echo lacks it, read the event back once.
+                let join_url = match created.join_url() {
+                    Some(url) => Some(url),
+                    None if draft.create_meeting_room => self
+                        .calendar
+                        .get_event(entity_id, "primary", &event_id)
+                        .await
+                        .map_err(|e| tracing::warn!(action_id, event_id, "Meet link read-back failed: {e}"))
+                        .ok()
+                        .and_then(|ev| ev.join_url()),
+                    None => None,
+                };
+                let meet_line = join_url.as_deref().map(|u| format!("\nmeet: {u}")).unwrap_or_default();
                 let base_body = action.action.draft_body.clone().unwrap_or_default();
-                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}");
+                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}{meet_line}");
                 if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
@@ -15448,7 +15688,7 @@ impl ReplyApprover {
                     }
                 };
                 if !organizer_note.is_empty() {
-                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}");
+                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}{meet_line}");
                     let _ = self.store.update_action_status(action_id, ActionStatus::Sent, Some(&noted), None);
                 }
                 let _ = self
@@ -15463,6 +15703,7 @@ impl ReplyApprover {
                 ApprovalActionOutcome::CalendarCreated {
                     event_id,
                     html_link,
+                    join_url,
                     organizer_account: action.email.from.clone(),
                     already_existed: false,
                 }
@@ -16793,6 +17034,10 @@ async fn start_discord_broker(
             .and_then(|s| s.parse().ok())
             .unwrap_or(channel_id),
     );
+    let extra_query_channel_ids = parse_channel_id_list(
+        std::env::var("DISCORD_EXTRA_CHANNEL_IDS").ok().as_deref(),
+    )
+    .context("DISCORD_EXTRA_CHANNEL_IDS must be comma-separated numeric channel ids")?;
     let allowed_user_id: Option<u64> = std::env::var("DISCORD_ALLOWED_USER_ID")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -16815,6 +17060,7 @@ async fn start_discord_broker(
         bot_token: token,
         channel_id,
         query_channel_id,
+        extra_query_channel_ids,
         allowed_user_id,
         query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
@@ -17386,7 +17632,7 @@ fn load_linkedin_client(repo_root: &std::path::Path) -> Option<Arc<VoyagerClient
     }
 }
 
-async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
+async fn run_linkedin_login(cookies_json: PathBuf, store: &Store) -> Result<()> {
     let raw = std::fs::read_to_string(&cookies_json)
         .with_context(|| format!("read cookies file at {}", cookies_json.display()))?;
     let mut auth: LinkedInAuth = serde_json::from_str(&raw)
@@ -17422,6 +17668,11 @@ async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
         .context("save auth to keychain (augmentagent/linkedin/default)")?;
     println!("linkedin auth saved to {} + keychain (augmentagent/linkedin/default)", out.display());
     println!("member: {}", auth.member_urn);
+    // #2255: a dead session is paused for up to hours. The new cookies were
+    // just probed, so let the next read go out now instead of waiting it out.
+    if augmentagent_channel_linkedin::session_guard::clear_pause_after_login(store, &auth.member_urn)? {
+        println!("cleared the read pause left by the previous session; the next poll reads again");
+    }
     Ok(())
 }
 
@@ -21308,6 +21559,33 @@ fn build_calendar_alert_sink(
     Some(Arc::new(notify::RoutedAlertSink::new(router)))
 }
 
+/// Comma/whitespace-separated Discord channel ids; empty or unset = none.
+fn parse_channel_id_list(raw: Option<&str>) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for part in raw.unwrap_or("").split([',', ' ', '\n', '\t']).map(str::trim).filter(|p| !p.is_empty()) {
+        let id: u64 = part.parse().with_context(|| format!("not a channel id: {part:?}"))?;
+        anyhow::ensure!(id != 0, "channel id 0 is invalid");
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod channel_id_list_tests {
+    use super::parse_channel_id_list;
+
+    #[test]
+    fn parses_dedupes_and_rejects_garbage() {
+        assert!(parse_channel_id_list(None).unwrap().is_empty());
+        assert!(parse_channel_id_list(Some(" , ")).unwrap().is_empty());
+        assert_eq!(parse_channel_id_list(Some("11, 22 11,33")).unwrap(), vec![11, 22, 33]);
+        assert!(parse_channel_id_list(Some("11,abc")).is_err());
+        assert!(parse_channel_id_list(Some("0")).is_err());
+    }
+}
+
 /// #399 — read-only schedule lookup for query mode ("what's on my calendar
 /// this week?"). Unlike the ingest poll this applies NO engagement filter:
 /// solo events, focus blocks, and all-day entries all show. Output carries
@@ -21357,7 +21635,8 @@ async fn run_calendar_list_events(
 
     struct AccountEvents {
         email: String,
-        result: std::result::Result<Vec<(MeetingPayload, bool)>, String>,
+        // (payload, all_day, #2514 conference join URL)
+        result: std::result::Result<Vec<(MeetingPayload, bool, Option<String>)>, String>,
     }
 
     let mut per_account: Vec<AccountEvents> = Vec::new();
@@ -21367,7 +21646,7 @@ async fn run_calendar_list_events(
             .await
         {
             Ok(events) => {
-                let mut items: Vec<(MeetingPayload, bool)> = events
+                let mut items: Vec<(MeetingPayload, bool, Option<String>)> = events
                     .iter()
                     .filter(|ev| {
                         !ev.status
@@ -21386,10 +21665,10 @@ async fn run_calendar_list_events(
                             .as_ref()
                             .map(|s| s.date_time.is_none())
                             .unwrap_or(false);
-                        Some((p, all_day))
+                        Some((p, all_day, ev.join_url()))
                     })
                     .collect();
-                items.sort_by_key(|(p, _)| p.start);
+                items.sort_by_key(|(p, _, _)| p.start);
                 per_account.push(AccountEvents {
                     email: account.email.clone(),
                     result: Ok(items),
@@ -21446,7 +21725,7 @@ async fn run_calendar_list_events(
                 Ok(items) => serde_json::json!({
                     "email": a.email,
                     "error": serde_json::Value::Null,
-                    "events": items.iter().map(|(p, all_day)| serde_json::json!({
+                    "events": items.iter().map(|(p, all_day, conference_url)| serde_json::json!({
                         "event_id": p.event_id,
                         "summary": p.summary,
                         "start": p.start.to_rfc3339(),
@@ -21465,6 +21744,8 @@ async fn run_calendar_list_events(
                         // unanswered invite (`calendar rsvp` answers it).
                         "my_response": my_response(p),
                         "conference_kind": p.conference_kind,
+                        // #2514 — the join URL, so a follow-up can include it.
+                        "conference_url": conference_url,
                         "virtual_meeting": p.virtual_meeting,
                         "recurring_event_id": p.recurring_event_id,
                     })).collect::<Vec<_>>(),
@@ -21505,7 +21786,7 @@ async fn run_calendar_list_events(
                     items.len(),
                     if items.len() == 1 { "" } else { "s" }
                 );
-                for (p, all_day) in items {
+                for (p, all_day, conference_url) in items {
                     let local_start = p.start.with_timezone(&Local);
                     if *all_day {
                         println!(
@@ -21518,7 +21799,10 @@ async fn run_calendar_list_events(
                     let conf = p
                         .conference_kind
                         .as_deref()
-                        .map(|k| format!(" [{k}]"))
+                        .map(|k| match conference_url {
+                            Some(url) => format!(" [{k}: {url}]"),
+                            None => format!(" [{k}]"),
+                        })
                         .unwrap_or_default();
                     let reply = match my_response(p).as_deref() {
                         Some("needsAction") => " [invite: not answered]",

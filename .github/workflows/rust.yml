@@ -169,6 +169,12 @@ jobs:
       - name: WhatsApp Rust channel lint
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/26"
 
+      # Yolo threads (#2220): the canary test that nothing from a yolo thread
+      # reaches a normal turn, plus the per-entry-point isolation tests.
+      - name: Yolo isolation acceptance
+        if: runner.os == 'Linux'
+        shell: bash
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/27"
   phone:
     # Split from channels for wall clock; macos.yml runs these steps on macOS.
     runs-on: ubuntu-latest

@@ -14,7 +14,9 @@ StartLimitBurst=10
 [Service]
 Type=simple
 WorkingDirectory=@WORKING_DIR@
-ExecStart="@REPO_ROOT@/scripts/run-rs.sh" auto-pr-worker --dry-run @DRY_RUN@
+# The launcher is run-autoship-pinned.sh once a pinned build is installed
+# (#2468): the worker then runs that build, not main's target/release.
+ExecStart="@REPO_ROOT@/scripts/@LAUNCHER@" auto-pr-worker --dry-run @DRY_RUN@
 Environment="PATH=@SERVICE_PATH@"
 Environment=RUST_LOG=info
 @EXTRA_ENV@

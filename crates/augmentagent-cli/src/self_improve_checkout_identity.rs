@@ -118,7 +118,10 @@ pub(super) struct Identity {
     ownership: Ownership,
 }
 
-fn read_receipt(path: &Path) -> Result<Option<Ownership>> {
+fn read_receipt(path:&Path)->Result<Option<Ownership>> {
+    read_receipt_bytes(path)?.map(|bytes|Ok(serde_json::from_slice(&bytes)?)).transpose()
+}
+fn read_receipt_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -137,7 +140,10 @@ fn read_receipt(path: &Path) -> Result<Option<Ownership>> {
             && metadata.len() <= 65536,
         hold("checkout_receipt_invalid")
     );
-    Ok(Some(serde_json::from_reader(file)?))
+    use std::io::Read;
+    let mut bytes=Vec::new();file.take(65537).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len()<=65536,hold("checkout_receipt_invalid"));
+    Ok(Some(bytes))
 }
 async fn git(root: &Path, args: &[&str]) -> Result<String> {
     let mut options = vec!["-c", "core.hooksPath=/dev/null"];
@@ -183,6 +189,73 @@ pub(super) fn check_recorded(state: &Path, workflow: &str, worktree: &Path,
         .map_err(|error| error.context(hold("checkout_identity_changed")))?;
     anyhow::ensure!(current == recorded.fingerprint, hold("checkout_identity_changed"));
     Ok(())
+}
+
+/// #2349 — a recorded checkout whose path no longer exists. Nothing physical
+/// remains to preserve, so a scope-stage workflow may re-establish continuity.
+/// Read-only: callers archive `receipt` before superseding it.
+pub(super) struct LostCheckout {
+    pub receipt_path: PathBuf,
+    pub receipt: Vec<u8>,
+    pub common: PathBuf,
+    pub worktree: PathBuf,
+}
+
+/// Return the recorded identity only when its exact checkout path is absent and
+/// the record belongs to this workflow and branch. Present-but-replaced
+/// checkouts, missing or malformed records keep the #2224 hold.
+pub(super) fn lost_recorded(state:&Path,workflow:&str,worktree:&Path,branch:&str)->Result<Option<LostCheckout>> {
+    if !state.try_exists()? {return Ok(None);}
+    let root=canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    let receipt_path=receipt_path(state,workflow,&root)?;
+    let Some(receipt)=read_receipt_bytes(&receipt_path)? else {return Ok(None)};
+    let recorded:Ownership=serde_json::from_slice(&receipt)?;
+    if !(recorded.version==1 && recorded.workflow==workflow && recorded.source_branch==branch && recorded.worktree==root) {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>(),
+        Err(error)=>return Err(error.into()),
+        Ok(_)=>return Ok(None),
+    }
+    Ok(Some(LostCheckout {receipt_path,receipt,common:recorded.common,worktree:root}))
+}
+
+/// Where a superseded receipt is archived beside its original name.
+pub(super) fn superseded_path(lost:&LostCheckout,now:i64)->Result<PathBuf> {
+    let mut name=lost.receipt_path.file_name().context("checkout receipt name unavailable")?.to_os_string();
+    name.push(format!(".superseded-{now}"));
+    Ok(lost.receipt_path.with_file_name(name))
+}
+
+/// Move an archived receipt aside so the next lease-fenced acquisition enrolls
+/// the replacement checkout. The bytes stay on disk beside the audit event.
+pub(super) fn supersede_lost(lost:&LostCheckout,archive:&Path)->Result<()> {
+    anyhow::ensure!(read_receipt_bytes(&lost.receipt_path)?.as_deref()==Some(lost.receipt.as_slice()),
+        hold("checkout_receipt_changed"));
+    anyhow::ensure!(matches!(std::fs::symlink_metadata(&lost.worktree),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+        hold("checkout_restore_requires_absence"));
+    anyhow::ensure!(archive.parent()==lost.receipt_path.parent() && !archive.try_exists()?,hold("checkout_receipt_changed"));
+    std::fs::rename(&lost.receipt_path,archive)?;
+    std::fs::File::open(lost.receipt_path.parent().context("checkout receipt parent unavailable")?)?.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn has_recorded(state:&Path,workflow:&str,worktree:&Path)->Result<bool> {
+    let root=canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    Ok(read_receipt(&receipt_path(state,workflow,&root)?)?.is_some())
+}
+
+/// Read validated original bytes for an owner archive; never change the receipt.
+pub(super) fn archive_recorded(state:&Path,workflow:&str,worktree:&Path)->Result<(PathBuf,Vec<u8>)> {
+    let root=canonicalize_lexically(worktree.parent().context("checkout parent unavailable")?)?
+        .join(worktree.file_name().context("checkout name unavailable")?);
+    let path=receipt_path(state,workflow,&root)?;
+    let bytes=read_receipt_bytes(&path)?.context(hold("checkout_receipt_invalid"))?;
+    let _:Ownership=serde_json::from_slice(&bytes)?;
+    Ok((path,bytes))
 }
 
 /// An in-process handoff from the existing lease-fenced reconstruction path.

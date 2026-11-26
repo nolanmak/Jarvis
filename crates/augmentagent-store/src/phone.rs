@@ -12,18 +12,23 @@ pub use inbound::ReserveInboundCall;
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
-    // #1555 speculation fields, added in place to existing metrics tables.
-    for (column, definition) in [
-        ("speculated", "INTEGER NOT NULL DEFAULT 0 CHECK(speculated IN (0,1))"),
+    // #1555 speculation fields and #2169 turn boundaries, added in place to
+    // existing metrics tables; existing rows keep their values and read NULL.
+    let speculation = [
+        ("speculated", "INTEGER NOT NULL DEFAULT 0 CHECK(speculated IN (0,1))".to_owned()),
         (
             "speculation_committed",
-            "INTEGER NOT NULL DEFAULT 0 CHECK(speculation_committed IN (0,1))",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(speculation_committed IN (0,1))".to_owned(),
         ),
         (
             "speculation_saved_ms",
-            "INTEGER CHECK(speculation_saved_ms IS NULL OR speculation_saved_ms >= 0)",
+            "INTEGER CHECK(speculation_saved_ms IS NULL OR speculation_saved_ms >= 0)".to_owned(),
         ),
-    ] {
+    ];
+    let boundaries = METRIC_BOUNDARY_COLUMNS.map(|column| {
+        (column, format!("INTEGER CHECK({column} IS NULL OR {column} >= 0)"))
+    });
+    for (column, definition) in speculation.into_iter().chain(boundaries) {
         let present: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info('phone_turn_metrics') WHERE name = ?1",
             [column],
@@ -1024,6 +1029,16 @@ pub struct PhoneTurnMetrics {
     pub outcome: TurnOutcome,
     pub queue_wait_ms: Option<i64>,
     pub t_first_token_ms: Option<i64>,
+    /// #2169: the turn reached the native agent.
+    pub t_native_start_ms: Option<i64>,
+    /// #2169: the voice provider acknowledged the turn.
+    pub t_provider_start_ms: Option<i64>,
+    /// #2169: a source began executing for the turn.
+    pub t_source_execution_ms: Option<i64>,
+    /// #2169: the first owner-usable fact, which is never the first token.
+    pub t_first_useful_fact_ms: Option<i64>,
+    /// #2169: the turn's work finished; `None` when it stayed blocked.
+    pub t_completion_ms: Option<i64>,
     pub t_first_speech_ms: Option<i64>,
     pub t_last_speech_ms: Option<i64>,
     pub tool_ms: Option<i64>,
@@ -1039,9 +1054,14 @@ pub struct PhoneTurnMetrics {
     pub speculation_saved_ms: Option<i64>,
 }
 /// Percentile columns, in CLI display order.
-pub const PHONE_TURN_METRIC_FIELDS: [&str; 9] = [
+pub const PHONE_TURN_METRIC_FIELDS: [&str; 14] = [
     "queue_wait_ms",
     "t_first_token_ms",
+    "t_native_start_ms",
+    "t_provider_start_ms",
+    "t_source_execution_ms",
+    "t_first_useful_fact_ms",
+    "t_completion_ms",
     "t_first_speech_ms",
     "t_last_speech_ms",
     "tool_ms",
@@ -1055,6 +1075,11 @@ impl PhoneTurnMetrics {
         Some(match name {
             "queue_wait_ms" => self.queue_wait_ms,
             "t_first_token_ms" => self.t_first_token_ms,
+            "t_native_start_ms" => self.t_native_start_ms,
+            "t_provider_start_ms" => self.t_provider_start_ms,
+            "t_source_execution_ms" => self.t_source_execution_ms,
+            "t_first_useful_fact_ms" => self.t_first_useful_fact_ms,
+            "t_completion_ms" => self.t_completion_ms,
             "t_first_speech_ms" => self.t_first_speech_ms,
             "t_last_speech_ms" => self.t_last_speech_ms,
             "tool_ms" => self.tool_ms,
@@ -1087,7 +1112,15 @@ pub fn nearest_rank_percentile(sorted: &[i64], percent: u32) -> Option<i64> {
     let rank = (sorted.len() as u64 * u64::from(percent)).div_ceil(100).max(1) as usize;
     sorted.get(rank.min(sorted.len()) - 1).copied()
 }
-const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha,speculated,speculation_committed,speculation_saved_ms";
+/// #2169 per-turn boundaries, nullable because a turn may not reach them.
+const METRIC_BOUNDARY_COLUMNS: [&str; 5] = [
+    "t_native_start_ms",
+    "t_provider_start_ms",
+    "t_source_execution_ms",
+    "t_first_useful_fact_ms",
+    "t_completion_ms",
+];
+const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_native_start_ms,t_provider_start_ms,t_source_execution_ms,t_first_useful_fact_ms,t_completion_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha,speculated,speculation_committed,speculation_saved_ms";
 fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
     Ok(PhoneTurnMetrics {
         call_id: row.get(0)?,
@@ -1097,16 +1130,21 @@ fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
         outcome: TurnOutcome::parse(&row.get::<_, String>(4)?)?,
         queue_wait_ms: row.get(5)?,
         t_first_token_ms: row.get(6)?,
-        t_first_speech_ms: row.get(7)?,
-        t_last_speech_ms: row.get(8)?,
-        tool_ms: row.get(9)?,
-        t_first_played_ms: row.get(10)?,
-        t_last_played_ms: row.get(11)?,
-        audible_delta_ms: row.get(12)?,
-        commit_sha: row.get(13)?,
-        speculated: row.get(14)?,
-        speculation_committed: row.get(15)?,
-        speculation_saved_ms: row.get(16)?,
+        t_native_start_ms: row.get(7)?,
+        t_provider_start_ms: row.get(8)?,
+        t_source_execution_ms: row.get(9)?,
+        t_first_useful_fact_ms: row.get(10)?,
+        t_completion_ms: row.get(11)?,
+        t_first_speech_ms: row.get(12)?,
+        t_last_speech_ms: row.get(13)?,
+        tool_ms: row.get(14)?,
+        t_first_played_ms: row.get(15)?,
+        t_last_played_ms: row.get(16)?,
+        audible_delta_ms: row.get(17)?,
+        commit_sha: row.get(18)?,
+        speculated: row.get(19)?,
+        speculation_committed: row.get(20)?,
+        speculation_saved_ms: row.get(21)?,
     })
 }
 impl Store {
@@ -1121,8 +1159,10 @@ impl Store {
         {
             return Err(PhoneError::InvalidInput);
         }
+        // Every offset is a forward latency, including the audible delta: the
+        // provider cannot play a frame before it was written.
         for name in PHONE_TURN_METRIC_FIELDS {
-            if name != "audible_delta_ms" && m.field(name).flatten().is_some_and(|v| v < 0) {
+            if m.field(name).flatten().is_some_and(|v| v < 0) {
                 return Err(PhoneError::InvalidInput);
             }
         }
@@ -1138,8 +1178,8 @@ impl Store {
             }
         }
         Ok(self.with_conn(|c| c.execute(
-            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(call_id,turn_id) DO NOTHING"),
-            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha, m.speculated, m.speculation_committed, m.speculation_saved_ms]))? == 1)
+            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22) ON CONFLICT(call_id,turn_id) DO NOTHING"),
+            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_native_start_ms, m.t_provider_start_ms, m.t_source_execution_ms, m.t_first_useful_fact_ms, m.t_completion_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha, m.speculated, m.speculation_committed, m.speculation_saved_ms]))? == 1)
     }
     pub fn phone_turn_metrics(&self, call_id: &str) -> PhoneResult<Vec<PhoneTurnMetrics>> {
         Ok(self.with_conn(|conn| {

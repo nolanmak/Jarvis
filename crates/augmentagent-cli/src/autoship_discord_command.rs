@@ -70,7 +70,17 @@ async fn readopt(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,repositor
     let (kind,number)=match target {Target::Issue(n)=>("issue",n),Target::Pr(n)=>("pr",n)};
     let label=format!("{repository}#{number}");
     let (refusal,content)=match target {
-        Target::Pr(_)=>(Some("pr-readoption-unsupported"),format!("Autoship readopt {label}: pr-readoption-unsupported. PR readoption ships with explicit PR adoption (#1537); no hold was changed.")),
+        Target::Pr(number)=>{
+            let request=crate::self_improve::readoption::pr::Request {repository:repository.into(),number,
+                reason:reason.into(),request_id:origin.request_id(),origin:"discord".into()};
+            match crate::self_improve::readoption::pr::apply(repo,path,&request).await {
+                Ok(_)=>(None,format!("Autoship readopted PR {label}: joined the shared workflow for fresh review and CI; owner and security holds are preserved, nothing was dispatched.")),
+                Err(error)=>{
+                    let code=error.downcast_ref::<crate::self_improve::readoption::Refusal>().map_or("workflow-state-unavailable",|r|r.reason());
+                    (Some(code),format!("Autoship readopt PR {label}: {code}. No hold was changed."))
+                }
+            }
+        },
         Target::Issue(issue)=>{
             let request=crate::self_improve::readoption::Request {repository:repository.into(),issue,reason:reason.into(),request_id:origin.request_id()};
             match crate::self_improve::readoption::apply(repo,&request).await {

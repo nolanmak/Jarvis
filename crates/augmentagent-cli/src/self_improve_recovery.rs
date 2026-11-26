@@ -131,7 +131,12 @@ pub(super) async fn prepare(root: &Path, worktree: &Path, branch: &str) -> Resul
 /// Prepare an issue checkout without manufacturing a new physical generation.
 pub(super) async fn prepare_issue_at(state: &Path, root: &Path, worktree: &Path,
     workflow: &str, repository: &str, branch: &str) -> Result<()> {
-    checkout_identity::check_recorded(state, workflow, worktree, repository, branch)?;
+    if owner_checkout_recovery::prepare(state,root,worktree,workflow,repository,branch).await? {return Ok(());}
+    if let Err(error) = checkout_identity::check_recorded(state, workflow, worktree, repository, branch) {
+        // #2349 — scope-stage work with an absent recorded checkout starts
+        // again from current main; every other case keeps the original hold.
+        checkout_continuity::reestablish(state, root, worktree, workflow, repository, branch, error).await?;
+    }
     prepare(root, worktree, branch).await
 }
 

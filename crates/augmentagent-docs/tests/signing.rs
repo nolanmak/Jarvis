@@ -717,3 +717,126 @@ async fn live_owner_document_signs_on_its_line() {
         std::fs::write(out, &proposed.preview_png).unwrap();
     }
 }
+
+
+// ---- Word (.docx) signing ----
+
+/// A real two-party agreement written by tests/fixtures (stdlib zip/XML): a
+/// "Signature: ____" line for the owner and a two-column table whose
+/// "Signature:" label sits beside an empty cell for the client.
+const AGREEMENT_DOCX: &[u8] = include_bytes!("fixtures/agreement.docx");
+
+fn docx_rig() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wiki");
+    let state = dir.path().join("private");
+    std::fs::create_dir(&root).unwrap();
+    let png = dir.path().join("test.png");
+    std::fs::write(&png, include_bytes!("fixtures/signature-test.png")).unwrap();
+    signing::install(&state, "default", &png).unwrap();
+    (dir, root, state)
+}
+
+/// One part of a Word package, read with the signing runtime's Python (the
+/// workspace has no zip crate). `None` when the part is absent.
+fn zip_part(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let python = std::env::var_os("AUGMENTAGENT_PDF_PYTHON").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share/augmentagent/pdf-runtime/bin/python3")
+    });
+    let script = "import io,sys,zipfile\nz=zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()))\n\
+                  n=sys.argv[1]\nsys.exit(3) if n not in z.namelist() else sys.stdout.buffer.write(z.read(n))\n";
+    let mut child = std::process::Command::new(python)
+        .args(["-I", "-c", script, name])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    match out.status.code() {
+        Some(0) => Some(out.stdout),
+        Some(3) => None,
+        other => panic!("reading {name} failed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_owner_uploaded_word_document_is_signed_as_word_after_approval() {
+    let (_dir, root, state) = docx_rig();
+    // Only an owner upload (or a Jarvis render) is signable.
+    std::fs::write(root.join("planted.docx"), AGREEMENT_DOCX).unwrap();
+    let refused = signing::propose(&root, &state, "planted.docx".as_ref(), "planted-signed.docx".as_ref(),
+        "default", PlacementRequest { page: 0, target: signing::Target::Line(1), width: None, date: None }).await;
+    assert!(refused.unwrap_err().to_string().contains("neither rendered by Jarvis nor uploaded by the owner"));
+
+    assert!(signing::stage_owner_upload(&root, &state, "notes.docx", b"not a zip").is_err());
+    let rel = signing::stage_owner_upload(&root, &state, "Services Agreement.DOCX", AGREEMENT_DOCX).unwrap();
+    assert_eq!(rel.extension().unwrap(), "docx", "{rel:?}");
+    assert_eq!(std::fs::read(root.join(&rel)).unwrap(), AGREEMENT_DOCX);
+
+    // The two signature lines a reader would sign, not prose that mentions one.
+    let lines = signing::sign_lines(&root, &rel, None).await.unwrap();
+    let found: Vec<(u64, &str, &str)> = lines.iter()
+        .map(|l| (l["line"].as_u64().unwrap(), l["kind"].as_str().unwrap(), l["text"].as_str().unwrap()))
+        .collect();
+    assert_eq!(found, [(1, "line", "Signature: ______________________________"), (2, "cell", "Signature:")]);
+
+    let out = rel.with_file_name("Services Agreement-signed.docx");
+    let request = PlacementRequest { page: 0, target: signing::Target::Line(1), width: None, date: Some("2026-11-18".into()) };
+    let proposed = signing::propose_with_preview(&root, &state, &rel, &out, "default", request.clone()).await.unwrap();
+    let p = proposed.proposal;
+    assert!(proposed.preview_png.starts_with(b"\x89PNG"), "the card shows the signed line");
+    assert!(p.placement.paragraph.is_some());
+    assert_eq!(p.placement.anchor.as_ref().unwrap().text.as_deref(), Some("Signature: ______________________________"));
+    assert!(!root.join(&out).exists(), "nothing is published before approval");
+
+    // Approval publishes exactly the pinned bytes, once.
+    let receipt = signing::execute(&root, &state, &p).await.unwrap();
+    signing::verify_receipt(&root, &receipt).unwrap();
+    let signed = std::fs::read(root.join(&out)).unwrap();
+    assert_eq!(Some(signing::digest(&signed)), p.expected_output_sha256);
+    assert!(signing::execute(&root, &state, &p).await.is_err(), "never overwritten");
+    assert_eq!(std::fs::read(root.join(&rel)).unwrap(), AGREEMENT_DOCX, "the original is untouched");
+
+    // Word document: the signature image is in, the blank is replaced, the
+    // date follows it, and every other part of the package is unchanged.
+    let doc = String::from_utf8(zip_part(&signed, "word/document.xml").unwrap()).unwrap();
+    assert_eq!(doc.matches("<w:drawing>").count(), 1);
+    assert!(!doc.contains("Signature: ______"), "the blank is replaced by the signature");
+    assert!(doc.contains("2026-11-18"));
+    assert!(zip_part(&signed, "word/media/jarvis-signature-1.png").unwrap().starts_with(b"\x89PNG"));
+    assert_eq!(zip_part(&signed, "_rels/.rels"), zip_part(AGREEMENT_DOCX, "_rels/.rels"));
+    let types = String::from_utf8(zip_part(&signed, "[Content_Types].xml").unwrap()).unwrap();
+    assert!(types.contains(r#"Extension="png""#));
+}
+
+#[tokio::test]
+async fn word_signing_refuses_what_it_cannot_sign_faithfully() {
+    let (_dir, root, state) = docx_rig();
+    let rel = signing::stage_owner_upload(&root, &state, "agreement.docx", AGREEMENT_DOCX).unwrap();
+    let propose = |out: &'static str, target: signing::Target| {
+        let (root, state, rel) = (root.clone(), state.clone(), rel.clone());
+        async move {
+            signing::propose(&root, &state, &rel, out.as_ref(), "default",
+                PlacementRequest { page: 0, target, width: None, date: None }).await
+        }
+    };
+    // Same format out as in: never silently converted.
+    let err = propose("signed.pdf", signing::Target::Line(1)).await.unwrap_err().to_string();
+    assert!(err.contains("keep the document's extension"), "{err}");
+    // Coordinates mean nothing in a Word document.
+    let err = propose("a.docx", signing::Target::Ink { x: 72., y: 72., width: 144. }).await.unwrap_err().to_string();
+    assert!(err.contains("--anchor-text or --line"), "{err}");
+    // An anchor on two lines is ambiguous; an unknown line is named.
+    let err = propose("b.docx", signing::Target::AnchorText("Signature:".into())).await.unwrap_err().to_string();
+    assert!(err.contains("matches 2 lines"), "{err}");
+    let err = propose("c.docx", signing::Target::Line(9)).await.unwrap_err().to_string();
+    assert!(err.contains("no line 9"), "{err}");
+
+    // A document changed after the proposal is never signed.
+    let p = propose("d.docx", signing::Target::Line(2)).await.unwrap();
+    std::fs::write(root.join(&rel), b"PK\x03\x04changed").unwrap();
+    assert!(signing::execute(&root, &state, &p).await.unwrap_err().to_string().contains("changed"));
+    assert!(!root.join("d.docx").exists());
+}

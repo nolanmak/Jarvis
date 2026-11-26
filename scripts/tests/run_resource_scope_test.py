@@ -28,7 +28,8 @@ class HostMemoryFactsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             fixture = Path(name) / 'meminfo'
             fixture.write_bytes(data)
-            with patch.object(resources, 'Path', return_value=fixture):
+            with patch.object(resources, 'Path', return_value=fixture), \
+                 patch.object(resources, 'swap_relief', return_value=0):
                 return resources.available_memory()
 
     def test_available_memory_reads_kibibytes_and_accepts_known_zero(self):
@@ -131,6 +132,7 @@ class HostMemoryFactsTests(unittest.TestCase):
                 resources.memory_defaults(physical, caps, reserve)
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'requires Linux child subreaper')
 class AdmissionPublicationTests(unittest.TestCase):
     """Exercise the real supervisor without delegated cgroups or a provider."""
     def start_supervisor(self):
@@ -195,6 +197,7 @@ class AdmissionPublicationTests(unittest.TestCase):
         self.assertEqual(receipt.read_bytes(), b'all-descendants-reaped\n')
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'requires Linux delegated cgroups')
 class ResourceTests(unittest.TestCase):
     def setUp(self):
         if resources.current_group().name != 'daemon':
@@ -347,6 +350,7 @@ class AdmissionDiagnosticTests(unittest.TestCase):
             self.assertNotIn('secret',json.dumps(receipt));self.assertNotIn('private',json.dumps(receipt))
         self.assertEqual(resources.refusal_receipt(PermissionError(13,'secret'))['errno'],13)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux child subreaper')
     def test_real_supervisor_refuses_before_dispatch_and_retains_safe_reason(self):
         import shutil
         with tempfile.TemporaryDirectory() as temporary:
@@ -521,6 +525,262 @@ class TransientAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'ceiling'):
                 self.run_reserve(parent,[never])
             self.assertFalse((parent/'memory.reclaim').exists())
+
+
+class AncestorCacheRecoveryTests(unittest.TestCase):
+    """Real hierarchical counters, fake kernel reclaim; no Linux writes."""
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.ancestor = self.root/'runtime.slice'; self.ancestor.mkdir()
+        self.parent = self.ancestor/'worker.service'; self.parent.mkdir()
+        self.leaf = self.parent/'daemon'; self.leaf.mkdir()
+        self.gib = 1024**3
+        for path, data in {
+            self.ancestor/'memory.max': str(10*self.gib),
+            self.ancestor/'memory.current': str(8*self.gib),
+            self.ancestor/'memory.stat': f'inactive_file {3*self.gib}\nactive_file {4*self.gib}\nfile_dirty 0\nfile_writeback 0\n',
+            self.parent/'memory.max': str(10*self.gib),
+            self.parent/'memory.current': str(128*1024**2),
+            self.parent/'cgroup.procs': '',
+            self.parent/'cgroup.controllers': 'cpu memory pids',
+            self.parent/'cgroup.subtree_control': 'cpu memory pids',
+            self.parent/'pids.max': '512', self.parent/'cpu.max': '200000 100000',
+            self.leaf/'memory.current': str(128*1024**2),
+        }.items(): path.write_text(data)
+        self.enterContext(patch.object(resources, 'CGROUP_ROOT', self.root, create=True))
+        self.enterContext(patch.object(resources, 'current_group', return_value=self.leaf))
+        self.enterContext(patch.object(resources, 'available_memory', return_value=12*self.gib))
+        self.enterContext(patch.object(resources, 'reclaim_stamp', return_value=self.root/'stamp', create=True))
+        self.writes = []
+        self.kernel_frees = True
+        self.reclaim_error = None
+        original = Path.write_text
+        def kernel(path, value, *args, **kwargs):
+            if path.name == 'cgroup.subtree_control': value = 'cpu memory pids'
+            if path.name == 'memory.reclaim':
+                self.writes.append((path, value))
+                self.assertEqual(path.parent, self.ancestor)
+                amount, option = value.split()
+                self.assertEqual(option, 'swappiness=0')
+                self.assertLessEqual(int(amount), 4*self.gib)
+                if self.kernel_frees:
+                    stats = resources.counters(self.ancestor/'memory.stat')
+                    inactive_freed = min(int(amount), stats.get('inactive_file', 0))
+                    stats['inactive_file'] -= inactive_freed
+                    stats['active_file'] -= int(amount) - inactive_freed
+                    current = int((self.ancestor/'memory.current').read_text())
+                    original(self.ancestor/'memory.current', str(current-int(amount)))
+                    original(self.ancestor/'memory.stat', ''.join(f'{k} {v}\n' for k,v in stats.items()))
+                if self.reclaim_error is not None:
+                    raise OSError(self.reclaim_error, 'synthetic')
+            return original(path, value, *args, **kwargs)
+        self.enterContext(patch.object(Path, 'write_text', kernel))
+        self.policy = {'memory_bytes': 6*self.gib, 'pids': 512, 'cpu_percent': 200}
+
+    def refuse(self):
+        with self.assertRaises(resources.AdmissionRefused) as caught:
+            resources.headroom(self.parent, 6*self.gib, 12*self.gib)
+        self.assertEqual(caught.exception.code, 'ancestor_headroom')
+        return caught.exception
+
+    def test_reserve_reclaims_limiting_ancestor_then_admits(self):
+        self.refuse()
+        with resources.reserve(self.parent, 6*self.gib, sleep=lambda _: self.fail('must retry immediately')) as proof:
+            self.assertEqual(proof['requested_bytes'], 6*self.gib)
+        self.assertEqual(self.writes, [(self.ancestor/'memory.reclaim', f'{4*self.gib} swappiness=0')])
+        self.assertEqual((self.ancestor/'memory.max').read_text(), str(10*self.gib))
+
+    def test_readonly_inspect_stays_readonly_but_preparation_recovers(self):
+        self.assertEqual(resources.inspect(self.policy)['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [])
+        self.assertFalse((self.root/'stamp').exists())
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'available', report)
+        self.assertEqual(report['reclaim']['before_current_bytes'], 8*self.gib)
+        self.assertEqual(report['reclaim']['after_current_bytes'], 4*self.gib)
+        self.assertEqual(report['reclaim']['status'], 'attempted')
+
+    def test_nonreclaimable_shortfall_never_writes(self):
+        (self.ancestor/'memory.stat').write_text('inactive_file 0\nactive_file 0\n')
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [])
+
+    def test_dirty_or_writeback_cache_does_not_justify_reclaim(self):
+        for key in ['file_dirty', 'file_writeback']:
+            with self.subTest(key=key):
+                (self.ancestor/'memory.stat').write_text(f'inactive_file {3*self.gib}\nactive_file {4*self.gib}\n{key} {4*self.gib}\n')
+                report = resources.inspect(self.policy, prepare=True)
+                self.assertEqual(report['status'], 'capacity-exhausted')
+                self.assertEqual(self.writes, [])
+
+    def test_no_progress_remains_refused_and_stamp_limits_fresh_observers(self):
+        self.kernel_frees = False
+        for _ in range(3):
+            report = resources.inspect(self.policy, prepare=True)
+            self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(report['reclaim']['status'], 'rate-limited')
+
+    def test_fresh_helper_processes_share_rate_limit(self):
+        helper = str(Path(__file__).parents[1]/'run-resource-scope.py')
+        code = f"""import importlib.util,json
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('resources',{helper!r})
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+m.CGROUP_ROOT=Path({str(self.root)!r})
+m.current_group=lambda:Path({str(self.leaf)!r})
+m.available_memory=lambda:12*1024**3
+m.reclaim_stamp=lambda group:Path({str(self.root/'stamp')!r})
+print(json.dumps(m.inspect({self.policy!r},prepare=True)))
+"""
+        statuses = []
+        for _ in range(2):
+            report = json.loads(subprocess.check_output([sys.executable, '-I', '-c', code], text=True))
+            self.assertEqual(report['status'], 'capacity-exhausted', 'fake kernel never frees pages')
+            statuses.append(report['reclaim']['status'])
+        self.assertEqual(statuses, ['attempted', 'rate-limited'])
+
+    def test_partial_or_denied_kernel_reclaim_does_not_authorize_admission(self):
+        import errno
+        self.kernel_frees = False
+        self.reclaim_error = errno.EAGAIN
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(report['reclaim']['errno'], errno.EAGAIN)
+        self.assertEqual(report['reclaim']['after_current_bytes'], 8*self.gib)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_rate_limit_expires_after_ten_minutes(self):
+        self.kernel_frees = False
+        for now in [1000, 1599, 1600]:
+            with patch.object(resources.time, 'monotonic', return_value=now):
+                resources.inspect(self.policy, prepare=True)
+        self.assertEqual(len(self.writes), 2)
+
+    def test_large_inactive_cache_can_recover_over_rate_limited_attempts(self):
+        (self.ancestor/'memory.current').write_text(str(10*self.gib))
+        (self.ancestor/'memory.stat').write_text(f'inactive_file {5*self.gib}\nactive_file {4*self.gib}\n')
+        for now, expected in [(1000, 'capacity-exhausted'), (1599, 'capacity-exhausted'), (1600, 'available')]:
+            with patch.object(resources.time, 'monotonic', return_value=now):
+                report = resources.inspect(self.policy, prepare=True)
+            self.assertEqual(report['status'], expected)
+        self.assertEqual([v for _,v in self.writes], [f'{4*self.gib} swappiness=0', f'{2*self.gib} swappiness=0'])
+
+    def test_reclaim_request_cannot_exceed_four_gib(self):
+        (self.ancestor/'memory.current').write_text(str(9*self.gib))
+        (self.ancestor/'memory.stat').write_text(f'inactive_file {self.gib}\nactive_file {6*self.gib}\n')
+        report = resources.inspect(self.policy, prepare=True)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(self.writes, [(self.ancestor/'memory.reclaim', f'{4*self.gib} swappiness=0')])
+        self.assertEqual(report['reclaim']['after_current_bytes'], 5*self.gib)
+
+
+
+class LegionSwapBackedHostHeadroomTests(unittest.TestCase):
+    """#2528: every build tick on the Legion refused with host_headroom.
+
+    Numbers are the 2026-11-24 observation of augmentagent-autopr.service:
+    no run-* group existed (no leaked reservation) and the service held
+    ~166 MB of charged memory, so a 6 GiB composed native+build run fit the
+    10 GiB service with room to spare. The refusal was the host check:
+    6 GiB + 256 MiB margin against MemAvailable alone (5.4 GiB), although
+    1.9 GB more could be made available for an unswappable run by moving
+    other processes' cold anonymous pages to free disk swap and zram.
+    """
+    GIB = 1024**3
+    MEM_AVAILABLE = 5662708*1024
+    POLICY = {'memory_bytes': 6442450944, 'pids': 512, 'cpu_percent': 200}
+    SWAPS = ('Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n'
+             '/swap.img                               file\t\t4194300\t\t3701260\t\t-1\n'
+             '/dev/zram0                              partition\t8137792\t\t6307832\t\t100\n')
+    MM_STAT = '5855690752 1375456956 1414017024        0 1989283840    43689  2919299    22006    48660\n'
+    MEMINFO = ('MemTotal:       16275588 kB\nMemAvailable:    5662708 kB\n'
+               'Active(anon):    4397296 kB\nInactive(anon):  2725604 kB\n'
+               'SwapTotal:      12332092 kB\nSwapFree:        2443204 kB\n')
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        cgroups = self.root/'cgroup'; cgroups.mkdir()
+        ancestor = cgroups/'augmentagent-runtime.slice'; ancestor.mkdir()
+        parent = ancestor/'augmentagent-autopr.service'; parent.mkdir()
+        leaf = parent/'daemon'; leaf.mkdir()
+        proc = self.root/'proc'; proc.mkdir()
+        zram = self.root/'block'/'zram0'; zram.mkdir(parents=True)
+        for path, data in {
+            ancestor/'memory.max': '10737418240', ancestor/'memory.current': '3881861120',
+            ancestor/'memory.stat': 'anon 408555520\ninactive_file 3263610880\nactive_file 95711232\n',
+            parent/'memory.max': '10737418240', parent/'memory.current': '1061519360',
+            parent/'memory.stat': 'anon 72839168\ninactive_file 895569920\nactive_file 72712192\n',
+            parent/'cgroup.procs': '', parent/'cgroup.controllers': 'cpu memory pids',
+            parent/'cgroup.subtree_control': 'cpu memory pids',
+            parent/'pids.max': '4096', parent/'cpu.max': '400000 100000',
+            leaf/'memory.current': '1031667712',
+            leaf/'memory.stat': 'anon 47579136\ninactive_file 894676992\nactive_file 72245248\n',
+            proc/'meminfo': self.MEMINFO, proc/'swaps': self.SWAPS, zram/'mm_stat': self.MM_STAT,
+        }.items(): path.write_text(data)
+        self.enterContext(patch.object(resources, 'CGROUP_ROOT', cgroups))
+        self.enterContext(patch.object(resources, 'current_group', return_value=leaf))
+        self.enterContext(patch.object(resources, 'read_host_memory',
+            return_value={'total_bytes': 16275588*1024, 'available_bytes': self.MEM_AVAILABLE}))
+        self.enterContext(patch.object(resources, 'PROC_ROOT', proc, create=True))
+        self.enterContext(patch.object(resources, 'BLOCK_ROOT', self.root/'block', create=True))
+        self.proc, self.zram = proc, zram
+
+    def test_memavailable_alone_reproduces_the_legion_refusal(self):
+        parent = resources.current_group().parent
+        with self.assertRaises(resources.AdmissionRefused) as caught:
+            resources.headroom(parent, self.POLICY['memory_bytes'], self.MEM_AVAILABLE)
+        receipt = resources.refusal_receipt(caught.exception)
+        self.assertEqual(receipt['refusal_code'], 'host_headroom')
+        self.assertEqual(receipt['facts'], {
+            'requested_bytes': 6442450944, 'reservation_slack_bytes': 0,
+            'margin_bytes': 268435456, 'required_bytes': 6710886400,
+            'available_bytes': 5798612992})
+
+    def test_swap_backed_headroom_admits_one_composed_build(self):
+        report = resources.inspect(self.POLICY)
+        self.assertEqual(report['status'], 'available', report)
+        self.assertTrue(report['permits_attempt'])
+        self.assertEqual(report['capacity']['host_available_bytes'], 7724865539)
+        self.assertEqual(report['capacity']['reserved_before_bytes'], 165949440)
+        # Disk swap frees a page per page; zram costs mem_used/orig of it.
+        self.assertEqual(resources.swap_relief(), 504872960 + 1421379587)
+        self.assertEqual(resources.available_memory(), 7724865539)
+
+    def test_relief_is_bounded_by_cold_anonymous_memory(self):
+        (self.proc/'meminfo').write_text(self.MEMINFO.replace('Inactive(anon):  2725604', 'Inactive(anon):     1024'))
+        self.assertEqual(resources.swap_relief(), 1024*1024)
+        report = resources.inspect(self.POLICY)
+        self.assertEqual(report['status'], 'capacity-exhausted')
+        self.assertEqual(report['refusal']['refusal_code'], 'host_headroom')
+
+    def test_full_swap_and_unknown_zram_ratio_add_nothing(self):
+        (self.proc/'swaps').write_text('Filename Type Size Used Priority\n/swap.img file 4194300 4194300 -1\n'
+                                       '/dev/zram0 partition 8137792 0 100\n')
+        (self.zram/'mm_stat').write_text('0 0 0 0 0 0 0 0 0\n')
+        self.assertEqual(resources.swap_relief(), 0)
+        self.assertEqual(resources.inspect(self.POLICY)['refusal']['refusal_code'], 'host_headroom')
+
+    def test_zram_memory_limit_caps_what_it_can_still_store(self):
+        # Limit leaves 100 MiB of pool; at the observed ~4.1:1 ratio that
+        # stores ~414 MiB of pages, which free ~314 MiB of RAM.
+        used = 1414017024
+        (self.zram/'mm_stat').write_text(f'5855690752 1375456956 {used} {used+100*1024**2} 0 0 0 0 0\n')
+        stored = 100*1024**2*5855690752//used
+        self.assertEqual(resources.swap_relief(), 504872960 + stored - stored*used//5855690752)
+
+    def test_unreadable_or_malformed_swap_facts_never_add_capacity(self):
+        for name, data in {'swaps': 'garbage\n/dev/zram0 partition x y 100\n', 'meminfo': 'MemTotal: 1 kB\n'}.items():
+            with self.subTest(name=name):
+                original = (self.proc/name).read_text()
+                (self.proc/name).write_text(data)
+                self.assertEqual(resources.swap_relief(), 0)
+                (self.proc/name).write_text(original)
+        (self.zram/'mm_stat').unlink()
+        self.assertEqual(resources.swap_relief(), 504872960)
+        (self.proc/'swaps').unlink()
+        self.assertEqual(resources.swap_relief(), 0)
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

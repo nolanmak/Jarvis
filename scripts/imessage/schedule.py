@@ -15,6 +15,7 @@ JOBS = {
     "sync": (LABEL, "sync.py", "imessage-sync.log"),
     "send": ("org.augmentagent.imessage-send", "send.py", "imessage-send.log"),
     "owner": ("org.augmentagent.imessage-owner", "owner_capture.py", "imessage-owner.log"),
+    "update": ("org.augmentagent.mac-update", "update.py", "mac-update.log"),
 }
 
 
@@ -41,7 +42,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, epilog="Pass exporter options after --. See docs/IMESSAGE.md.")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--job", choices=sorted(JOBS), default="sync",
-                    help="sync exports history; send delivers approved replies (#1305)")
+                    help="sync exports history; send delivers approved replies (#1305); "
+                         "update keeps this checkout on origin/main (#2417)")
     ap.add_argument("--interval", type=int, default=30, metavar="MINUTES")
     ap.add_argument("--every-seconds", type=int, default=15,
                     help="send job only: how often to check the agent outbox")

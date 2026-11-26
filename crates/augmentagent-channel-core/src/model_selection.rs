@@ -65,6 +65,7 @@ pub fn runtime_profile_enabled(kind: ProviderKind) -> bool {
     let flag = match kind {
         ProviderKind::Qwen => "AUGMENTAGENT_MODEL_QWEN_ENABLED",
         ProviderKind::Glm => "AUGMENTAGENT_MODEL_GLM_ENABLED",
+        ProviderKind::Yolo => crate::yolo::ENABLED_ENV,
         _ => return true,
     };
     std::env::var(flag).ok().as_deref() == Some("1")
@@ -263,6 +264,7 @@ pub fn run_command(
         [name] | ["set", name] | ["set", name, "scope:default"] => {
             let scope = if args.len() == 3 { None } else { Some(channel_id) };
             match profile(name) {
+                None if name.eq_ignore_ascii_case("yolo") => "Use /yolo to start a yolo thread.".into(),
                 None => "Unknown model. Choose claude, codex, qwen, or glm.".into(),
                 Some(kind) => match available(kind) {
                     Err(reason) => format!("Model selection unchanged: {reason}"),
@@ -497,6 +499,20 @@ mod tests {
             );
         }
         assert_eq!(store.selected(Some("9999")).unwrap(), None);
+    }
+
+    #[test]
+    fn yolo_is_not_selectable_and_points_at_its_own_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("selection.json");
+        let store = SelectionStore::new(&path);
+        for command in ["/model yolo", "model set yolo", "/model set YOLO scope:default"] {
+            let reply = run_command(&store, "123", command, |_| Ok(())).unwrap();
+            assert_eq!(reply, "Use /yolo to start a yolo thread.", "{command}");
+        }
+        assert!(!path.exists(), "nothing is written");
+        assert!(store.set(Some("123"), Some(ProviderKind::Yolo)).is_err());
+        assert_eq!(store.selected(Some("123")).unwrap(), None);
     }
 
     #[test]

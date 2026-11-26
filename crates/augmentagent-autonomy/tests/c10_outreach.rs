@@ -474,6 +474,21 @@ fn heartbeat_for(fx: &Fx, reply: &str) -> (HeartbeatRunner<Scripted>, Arc<Script
         "- nudge people about the deck\n",
     )
     .unwrap();
+    // The v2 sweep only calls the model when something is on the table, so
+    // give it one triage-skipped automated mail to judge.
+    let ten_days_ago = now_ms() - 10 * 24 * 60 * 60 * 1000;
+    fx.store
+        .with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO emails (messageId, threadId, fromEmail, subject, body, \
+                 firstSeenAt, triageResult, platform, kind) VALUES ('m-credits', 'm-credits', \
+                 'Example Cloud <no-reply@startups.example.com>', \
+                 'Your Example Cloud credits application was approved', 'Body text here.', \
+                 ?1, 'skip', 'gmail', 'dm')",
+                [ten_days_ago],
+            )
+        })
+        .unwrap();
     let reasoner = Arc::new(Scripted {
         reply: reply.into(),
         prompts: Mutex::new(Vec::new()),
