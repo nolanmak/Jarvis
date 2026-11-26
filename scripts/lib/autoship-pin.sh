@@ -172,6 +172,7 @@ reconcile_autoship_pin() {
   local bootstrap="${1:-}" prebuilt="${2:-}" pin installed present=0 decision
   AUTOSHIP_PIN_CHANGED=0
   autoship_pin_enabled || return 0
+  autoship_pin_auto_advance || true
   if ! pin=$(autoship_pin_read); then
     log "AUTOSHIP PIN INVALID: $(autoship_pin_file) must hold a full commit SHA or 'main'; worker binary left unchanged"
     return 1
@@ -203,4 +204,217 @@ autoship_pin_after_provision() {
   [[ "$(autoship_pin_installed)" =~ ^[0-9a-f]{40}$ ]] || return 0
   autoship_pin_write "$(autoship_pin_stamp)" main || return 1
   log "AUTOSHIP UNPINNED: the worker reloads onto the main deploy build at its next safe point"
+}
+
+# ---------------------------------------------------------------------------
+# Auto-advance: move the pin forward to the newest origin/main commit whose
+# required checks are green, so a human no longer has to.
+#
+# Kill switch: AUTOSHIP_PIN_AUTO=off in the updater's environment, or "off"
+# in ${XDG_CONFIG_HOME:-~/.config}/augmentagent/autoship-pin-auto (the
+# environment wins). Default on. `scripts/autoship-pin.sh auto on|off` writes
+# the file, and pinning backwards with that script turns it off, so a
+# rollback is not undone on the next tick.
+#
+# "Green" for a main commit C: every required check (branch protection's
+# contexts, else privacy node-release targeted gitleaks) is SUCCESS. Main
+# pushes do not run every required check (targeted is PR-only, gitleaks is
+# path-filtered), so a required check that has no run on C itself is taken
+# from the head of the pull request that produced C: C's second parent for a
+# merge commit, else the PR whose merge commit is C. Branch protection is
+# strict, so that head was up to date with main and its tree is C's. A run on
+# C itself that is pending or failed always counts against C.
+#
+# Only forward: the candidate must be a first-parent commit of origin/main
+# that descends from the current pin. Any lookup failure or unexpected answer
+# leaves the pin where it is and says why in update.log.
+
+AUTOSHIP_PIN_REQUIRED_CHECKS_DEFAULT="privacy node-release targeted gitleaks"
+
+autoship_pin_auto_file() { printf '%s/augmentagent/autoship-pin-auto\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+autoship_pin_repo() { printf '%s\n' "${AUGMENTAGENT_AUTOSHIP_PIN_REPO:-nolanmak/Jarvis}"; }
+
+autoship_pin_auto_mode() {
+  local value="${AUTOSHIP_PIN_AUTO:-}"
+  if [ -z "$value" ] && [ -r "$(autoship_pin_auto_file)" ]; then
+    value=$(tr -d '[:space:]' < "$(autoship_pin_auto_file)" 2>/dev/null || true)
+  fi
+  case "$value" in
+    off|OFF|0|false|no) echo off ;;
+    *) echo on ;;
+  esac
+}
+
+# GET a GitHub REST path and print the body. gh first (the deploy host has it
+# authed in the updater's environment); otherwise curl with GH_TOKEN or
+# GITHUB_TOKEN, passed on stdin so it never appears in argv or the log.
+autoship_pin_gh_api() {
+  local path="$1" out token limit=()
+  command -v timeout >/dev/null 2>&1 && limit=(timeout 30)
+  if command -v gh >/dev/null 2>&1 &&
+     out=$(${limit[@]+"${limit[@]}"} gh api -H 'Accept: application/vnd.github+json' "$path" 2>/dev/null); then
+    printf '%s' "$out"
+    return 0
+  fi
+  token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -n "$token" ] || return 1
+  printf 'Authorization: Bearer %s\n' "$token" |
+    curl -fsS -m 30 -H @- -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/$path" 2>/dev/null
+}
+
+autoship_pin_required_checks() {
+  local repo="$1" contexts
+  if contexts=$(autoship_pin_gh_api "repos/$repo/branches/main/protection/required_status_checks" |
+       python3 -c 'import json,sys; c=json.load(sys.stdin).get("contexts") or []; assert c and all(isinstance(x,str) and x and " " not in x for x in c); print(" ".join(c))' 2>/dev/null) &&
+     [ -n "$contexts" ]; then
+    printf '%s\n' "$contexts"
+  else
+    printf '%s\n' "$AUTOSHIP_PIN_REQUIRED_CHECKS_DEFAULT"
+  fi
+}
+
+# autoship_pin_checks_verdict REQUIRED MAIN_JSON [HEAD_JSON]
+# Prints green | pending | red | incomplete | unknown, a space, then a reason.
+# incomplete: nothing pending or failed on the main commit, but some required
+# check has no usable run there (look at the PR head next).
+autoship_pin_checks_verdict() {
+  python3 -c '
+import json, sys
+required = sys.argv[1].split()
+def runs(path):
+    if not path:
+        return None
+    with open(path) as fh:
+        data = json.load(fh)
+    latest = {}
+    for run in data["check_runs"]:
+        name = run["name"]
+        if name in required and (name not in latest or run["id"] > latest[name]["id"]):
+            latest[name] = run
+    return latest
+try:
+    main, head = runs(sys.argv[2]), runs(sys.argv[3] if len(sys.argv) > 3 else "")
+except Exception as exc:
+    print("unknown unreadable check-runs response (%s)" % type(exc).__name__)
+    sys.exit(0)
+red, pending, missing = [], [], []
+for name in required:
+    found = False
+    for source, latest in (("main", main), ("pr-head", head)):
+        run = (latest or {}).get(name)
+        if not run:
+            continue
+        if run.get("status") != "completed":
+            pending.append("%s(%s)" % (name, source)); found = True; break
+        conclusion = run.get("conclusion")
+        if conclusion == "success":
+            found = True; break
+        if conclusion in ("skipped", "neutral"):
+            continue  # did not really run here; look at the PR head
+        red.append("%s=%s(%s)" % (name, conclusion, source)); found = True; break
+    if not found:
+        missing.append(name)
+if red:
+    print("red " + " ".join(red))
+elif pending:
+    print("pending " + " ".join(pending))
+elif missing:
+    print("incomplete no successful run for " + " ".join(missing))
+else:
+    print("green all of %s succeeded" % " ".join(required))
+' "$@" 2>/dev/null || echo "unknown could not evaluate check runs"
+}
+
+# The head commit of the pull request that produced main commit SHA, or
+# nothing (a direct push). Fails only when the lookup itself fails.
+autoship_pin_pr_head() {
+  local repo="$1" sha="$2" parents body line
+  line=$(git -C "$REPO_ROOT" rev-list --parents -n 1 "$sha" 2>/dev/null) || return 1
+  read -r -a parents <<< "$line"
+  if [ "${#parents[@]}" -ge 3 ]; then printf '%s\n' "${parents[2]}"; return 0; fi
+  body=$(autoship_pin_gh_api "repos/$repo/commits/$sha/pulls") || return 1
+  printf '%s' "$body" | python3 -c '
+import json, sys
+sha = sys.argv[1]
+for pr in json.load(sys.stdin):
+    if pr.get("merge_commit_sha") == sha and pr.get("merged_at"):
+        print(pr["head"]["sha"]); break
+' "$sha" 2>/dev/null
+}
+
+# Whether main commit SHA is green. Prints the verdict line; fails only when
+# GitHub could not be asked.
+autoship_pin_commit_verdict() {
+  local repo="$1" sha="$2" required="$3" tmp verdict head status=0
+  tmp=$(mktemp -d) || return 1
+  if ! autoship_pin_gh_api "repos/$repo/commits/$sha/check-runs?per_page=100" > "$tmp/main.json"; then
+    rm -rf "$tmp"; echo "lookup of check runs for $sha failed"; return 1
+  fi
+  verdict=$(autoship_pin_checks_verdict "$required" "$tmp/main.json")
+  if [ "${verdict%% *}" = incomplete ]; then
+    if ! head=$(autoship_pin_pr_head "$repo" "$sha"); then
+      rm -rf "$tmp"; echo "lookup of the pull request for $sha failed"; return 1
+    fi
+    if [ -n "$head" ]; then
+      if autoship_pin_gh_api "repos/$repo/commits/$head/check-runs?per_page=100" > "$tmp/head.json"; then
+        verdict=$(autoship_pin_checks_verdict "$required" "$tmp/main.json" "$tmp/head.json")
+      else
+        verdict="lookup of check runs for PR head $head failed"; status=1
+      fi
+    else
+      verdict="incomplete ${verdict#* } (no pull request; a direct push)"
+    fi
+  fi
+  rm -rf "$tmp"
+  echo "$verdict"
+  return "$status"
+}
+
+# Move the pin to the newest green first-parent commit of origin/main that
+# descends from it. Called by reconcile_autoship_pin after the updater's
+# fetch; the normal install path then builds and installs the new pin.
+autoship_pin_auto_advance() {
+  local pin head repo required scan sha verdict checked=0 skipped=()
+  [ "$(autoship_pin_auto_mode)" = on ] || return 0
+  pin=$(autoship_pin_read 2>/dev/null) || return 0
+  [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || return 0   # none yet (bootstrap) or unpinned
+  head=$(git -C "$REPO_ROOT" rev-parse --verify --quiet 'origin/main^{commit}') || {
+    log "AUTOSHIP PIN AUTO: origin/main unreadable; pin stays at $pin"; return 0; }
+  [ "$head" != "$pin" ] || return 0
+  if ! git -C "$REPO_ROOT" cat-file -e "$pin^{commit}" 2>/dev/null ||
+     ! git -C "$REPO_ROOT" merge-base --is-ancestor "$pin" "$head" 2>/dev/null; then
+    log "AUTOSHIP PIN AUTO: pin $pin is not an ancestor of origin/main $head; refusing to move it (only forward moves are automatic)"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "AUTOSHIP PIN AUTO: python3 missing; cannot read check runs; pin stays at $pin"; return 0
+  fi
+  repo=$(autoship_pin_repo)
+  required=$(autoship_pin_required_checks "$repo")
+  scan="${AUGMENTAGENT_AUTOSHIP_PIN_AUTO_SCAN:-10}"
+  for sha in $(git -C "$REPO_ROOT" rev-list --first-parent --max-count="$scan" "$pin..$head"); do
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$pin" "$sha" 2>/dev/null || continue
+    checked=$((checked + 1))
+    if ! verdict=$(autoship_pin_commit_verdict "$repo" "$sha" "$required"); then
+      log "AUTOSHIP PIN AUTO: GitHub lookup failed ($verdict); pin stays at $pin; retry next tick"
+      return 0
+    fi
+    case "${verdict%% *}" in
+      green)
+        autoship_pin_write "$(autoship_pin_file)" "$sha" || {
+          log "AUTOSHIP PIN AUTO: could not write $(autoship_pin_file); pin stays at $pin"; return 0; }
+        log "AUTOSHIP PIN AUTO-ADVANCED: $pin -> $sha (required checks green)"
+        if [ "${#skipped[@]}" -gt 0 ]; then
+          log "AUTOSHIP PIN AUTO: newer main commits not yet green: ${skipped[*]}"
+        fi
+        return 0 ;;
+      pending|red|incomplete)
+        skipped+=("${sha:0:12}:${verdict%% *}") ;;
+      *)
+        log "AUTOSHIP PIN AUTO: unknown check state for $sha ($verdict); pin stays at $pin"
+        return 0 ;;
+    esac
+  done
+  log "AUTOSHIP PIN AUTO: no green main commit after $pin among the newest $checked candidate(s) (${skipped[*]:-none}); pin unchanged"
 }
