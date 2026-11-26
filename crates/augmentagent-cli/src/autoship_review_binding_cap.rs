@@ -14,6 +14,10 @@ use super::*;
 pub(crate) const MAX_REVIEW_ATTEMPTS_PER_BINDING: u32 = 2;
 /// Adjudicated amendment rounds (dispute → amend → re-review) per acceptance
 /// source and original base before the remaining findings go to rescoping.
+/// #2572: attempts that ended without findings (aborted, budget, capacity)
+/// leave nothing to repair. They may continue up to this many per binding while
+/// the binding's call budget remains, instead of backing off forever.
+pub(crate) const MAX_UNPRODUCTIVE_REVIEW_ATTEMPTS: u32 = 4;
 pub(crate) const MAX_ADJUDICATION_ROUNDS: u32 = 2;
 pub(crate) const ADJUDICATION_ROUND_PURPOSE: &str = "adjudicated-amendment-round";
 const ATTEMPT_PURPOSE: &str = "review-binding-attempt";
@@ -63,13 +67,22 @@ pub(crate) fn call_cap(per_attempt_bound: u64) -> u64 {
 
 /// Pure routing. A new attempt is admitted only while the attempt count is
 /// under the cap and its worst case still fits the binding's call budget, so
-/// one over-spent attempt (fallback reviewer, adjudication) cannot buy another.
+/// one over-spent attempt (fallback reviewer, adjudication) cannot buy another
+/// re-review of findings already recorded. With no findings recorded, the
+/// unproductive-attempt bound and the call budget decide (#2572).
 pub(crate) fn route(usage: Usage, per_attempt_bound: u64, has_findings: bool, repair_round_left: bool) -> Route {
     let fits = usage.calls.saturating_add(per_attempt_bound) <= call_cap(per_attempt_bound);
     if usage.attempts < MAX_REVIEW_ATTEMPTS_PER_BINDING && fits {
         Route::Review
     } else if !has_findings {
-        Route::Backoff
+        // #2572: nothing recorded to repair or rescope. An attempt that never
+        // reached a verdict is not a rejection, so it may not strand unchanged
+        // code; another attempt runs while the binding's budget remains.
+        if usage.attempts < MAX_UNPRODUCTIVE_REVIEW_ATTEMPTS && usage.calls < call_cap(per_attempt_bound) {
+            Route::Review
+        } else {
+            Route::Backoff
+        }
     } else if repair_round_left {
         Route::Repair
     } else {
@@ -270,8 +283,11 @@ mod tests {
         let spent = Usage { attempts: MAX_REVIEW_ATTEMPTS_PER_BINDING, calls: 100 };
         assert_eq!(route(spent, BOUND, true, true), Route::Repair);
         assert_eq!(route(spent, BOUND, true, false), Route::Rescope);
-        assert_eq!(route(spent, BOUND, false, true), Route::Backoff);
-        assert_eq!(route(spent, BOUND, false, false), Route::Backoff);
+        // #2572: no findings and budget left is another attempt, not a dead end.
+        assert_eq!(route(spent, BOUND, false, true), Route::Review);
+        let unproductive = Usage { attempts: MAX_UNPRODUCTIVE_REVIEW_ATTEMPTS, calls: 100 };
+        assert_eq!(route(unproductive, BOUND, false, true), Route::Backoff);
+        assert_eq!(route(unproductive, BOUND, false, false), Route::Backoff);
         assert_eq!(route(Usage::default(), BOUND, true, true), Route::Review);
         // One attempt that spent more than its share (e.g. a fallback
         // reviewer re-ran every group) cannot buy a second full attempt.
@@ -279,6 +295,45 @@ mod tests {
         assert_eq!(route(Usage { attempts: 1, calls: 74 }, BOUND, true, true), Route::Review);
         assert_eq!(route(Usage { attempts: 1, calls: 75 }, BOUND, true, true), Route::Repair);
         assert_eq!(route(Usage { attempts: 1, calls: 150 }, BOUND, false, true), Route::Backoff);
+    }
+
+    /// #2572 (PR #2553 / #2387, PR #2545 / #2424): review attempts that never
+    /// produced a verdict (evidence budget, recovery, capacity interrupts)
+    /// left nothing to repair, yet counted as exhausted rejections. The binding
+    /// then backed off forever on unchanged code until the workflow retired
+    /// with a green, never-reviewed draft. Without recorded findings, another
+    /// attempt is admitted while the binding's call budget remains.
+    #[test]
+    fn unproductive_attempts_do_not_strand_a_binding_in_backoff() {
+        // #2387: two aborted attempts, 26 calls, no findings.
+        assert_eq!(route(Usage { attempts: 2, calls: 26 }, BOUND, false, true), Route::Review);
+        // #2424: one aborted attempt that overspent its share (77 calls).
+        assert_eq!(route(Usage { attempts: 1, calls: 77 }, BOUND, false, true), Route::Review);
+        // Still bounded: the call budget and an attempt ceiling both stop it.
+        assert_eq!(route(Usage { attempts: 1, calls: call_cap(BOUND) }, BOUND, false, true), Route::Backoff);
+        assert_eq!(route(Usage { attempts: MAX_UNPRODUCTIVE_REVIEW_ATTEMPTS, calls: 10 }, BOUND, false, true), Route::Backoff);
+        // A recorded rejection keeps #2451's cap: repair, never re-review.
+        assert_eq!(route(Usage { attempts: 2, calls: 26 }, BOUND, true, true), Route::Repair);
+        assert_eq!(route(Usage { attempts: 1, calls: 77 }, BOUND, true, true), Route::Repair);
+    }
+
+    /// The durable store applies the same rule across ticks: the #2387 shape
+    /// reaches a third review instead of a permanent backoff.
+    #[test]
+    fn store_admits_a_review_after_aborted_attempts_without_findings() {
+        let (_dir, mut store, lease) = fixture();
+        let key = binding_key("21b7c7acac54a8112888692ed547da5b4fefe92d", "41a29214");
+        for tick in 0..MAX_REVIEW_ATTEMPTS_PER_BINDING {
+            assert_eq!(store.admit_review_binding(&lease, &key, BOUND, false, true, 10 + i64::from(tick)).unwrap(), Route::Review);
+            store.charge_review_binding_calls(&lease, &key, 13, 10 + i64::from(tick)).unwrap();
+        }
+        assert_eq!(store.admit_review_binding(&lease, &key, BOUND, false, true, 20).unwrap(), Route::Review);
+        let mut routes = vec![];
+        for tick in 0..6 {
+            routes.push(store.admit_review_binding(&lease, &key, BOUND, false, true, 30 + tick).unwrap());
+        }
+        assert!(routes.contains(&Route::Backoff), "unproductive attempts stay bounded: {routes:?}");
+        assert!(store.review_binding_usage(&lease, &key, 40).unwrap().attempts <= MAX_UNPRODUCTIVE_REVIEW_ATTEMPTS);
     }
 
     #[test]
