@@ -80,7 +80,9 @@ impl Policy {
 
 /// Where the macOS scheduled-sync jobs write (`scripts/*/schedule.py`); nothing
 /// rotated these until #1431, and one reached 112 MB. On Linux the same jobs
-/// log into the state dir, which this command already covers.
+/// log into the state dir, which this command already covers. Giving launchd
+/// its own equivalent of the housekeeping timer that calls this command is the
+/// separate parity gap #1406; this pass covers the dir whenever it runs.
 pub fn sync_log_dir() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -177,13 +179,20 @@ fn gzip_into(src: &Path, dst: &Path) -> Result<u64> {
     Ok(n)
 }
 
-/// A name for today's rotation of `name` that does not exist yet.
+/// A name for today's rotation of `name` that does not exist yet, and that
+/// sorts after every rotation already taken today. Reusing a name the archive
+/// cap has freed would label the newest rotation as the oldest, and the next
+/// pass would delete it instead of the stale one (#1431).
 fn free_rotated_path(dir: &Path, name: &str, today: NaiveDate) -> PathBuf {
-    let first = dir.join(rotated_name(name, today));
-    if !first.exists() {
-        return first;
-    }
-    (2..)
+    let taken = rotated_files(dir, name)
+        .iter()
+        .filter(|(_, date)| *date == today)
+        .map(|(path, _)| generation(path))
+        .max();
+    let Some(highest) = taken else {
+        return dir.join(rotated_name(name, today));
+    };
+    (highest + 1..)
         .map(|n| dir.join(format!("{name}.{}-{n}.gz", today.format("%Y%m%d"))))
         .find(|p| !p.exists())
         .expect("an unbounded range always yields a free name")
@@ -603,11 +612,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let log = dir.join("imessage-sync.log");
-        let policy = Policy { max_bytes: 1024 * 1024, keep_months: 5 };
+        let policy = Policy { max_bytes: SYNC_DEFAULT_MAX_MB * 1024 * 1024, keep_months: SYNC_DEFAULT_KEEP };
         let today = d(2026, 11, 20);
-        // Between runs nothing holds the log, but the job's redirect opens it
-        // for the whole of the next run: the inode has to survive regardless.
-        std::fs::write(&log, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        // The size the issue reported, sparse here. Between runs nothing holds
+        // the log, but the job's redirect opens it for the whole of the next
+        // run: the inode has to survive regardless.
+        std::fs::File::create(&log).unwrap().set_len(112 * 1024 * 1024).unwrap();
         let inode = log.metadata().unwrap().ino();
 
         run(dir, &policy, today, false, false);
@@ -644,6 +654,35 @@ mod tests {
         assert_eq!(kept.len(), 5, "{kept:?}");
         assert!(!kept.contains(&"whatsapp-sync.log.20261120.gz".to_string()), "the oldest went: {kept:?}");
         assert!(decoy.exists(), "pruning only touches archives rotation named");
+    }
+
+    /// #1431 — the cap must drop the oldest rotation, every pass. Today's
+    /// plain name sorts first, so a rotation written back into the slot the
+    /// cap just freed is labelled the oldest and the next pass deletes it:
+    /// the history freezes at the first `keep` rotations and every later one
+    /// is thrown away.
+    #[test]
+    fn the_newest_sync_rotation_survives_once_the_cap_is_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let log = dir.join("imessage-sync.log");
+        let policy = Policy { max_bytes: 1024, keep_months: 5 };
+        let today = d(2026, 11, 20);
+
+        // Seven size rotations inside one day: one more than the cap keeps.
+        for pass in 1..=7 {
+            std::fs::write(&log, format!("pass {pass}\n").repeat(200)).unwrap();
+            run(dir, &policy, today, false, false);
+        }
+        let kept: Vec<String> =
+            rotated_files(dir, "imessage-sync.log").iter().map(|(p, _)| read_gz(p)).collect();
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        for pass in 3..=7 {
+            assert!(
+                kept.iter().any(|body| body.starts_with(&format!("pass {pass}\n"))),
+                "the five newest rotations are the ones kept, missing pass {pass}"
+            );
+        }
     }
 
     #[test]
