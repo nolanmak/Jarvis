@@ -1575,10 +1575,22 @@ impl ClaudeCliReasoner {
                 );
             }
             if let Some(refused)=tool_readiness {
+                // #1788 — a host stop (OOM kill, deploy restart) can land
+                // while the refusal is still in the stdout buffer, and it is
+                // what ended the call. Reap the CLI first, briefly: cleanup
+                // below signals the group itself, so afterwards no status can
+                // tell a host stop from our own kill.
+                let stopped=tokio::time::timeout(std::time::Duration::from_millis(500),child.wait())
+                    .await.ok().and_then(Result::ok)
+                    .as_ref().and_then(interrupted_by_signal);
                 // The supervisor owns detached descendants and publishes the
                 // same checked cleanup receipt used by watchdog/caller aborts.
                 // Do not turn a capacity refusal into another provider retry.
                 drop(process_group);
+                if let Some(signal)=stopped {
+                    warn!("claude stopped by signal {signal}");
+                    return Err(CallError::Other(interrupted_error("claude",signal)));
+                }
                 let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
                 pending_tool_uses.clear();
                 if let Some(logger)=&audit_logger {logger.drain_checked().await?;}
@@ -5965,6 +5977,37 @@ exit 1
         );
         assert!(!typed.is_provider_side(), "a host stop never latches claude");
         assert!(logger.protected_health().is_err(), "the dropped intent ticket must stay evidence");
+    }
+
+    /// #1788 — a readiness refusal and a host SIGKILL in the same turn. The
+    /// stop ended the call, so the (now moot) capacity verdict must not be
+    /// reported in its place.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_even_after_a_readiness_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let use_event = serde_json::json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","id":"blocked-build","name":"mcp__jarvis__Bash","input":{"command":"cargo test"}}]}});
+        let result_event = serde_json::json!({"type":"user","message":{"content":[{
+            "type":"tool_result","tool_use_id":"blocked-build","is_error":true,
+            "content":"JARVIS_READINESS:build_scratch_space SYNTHETIC_DIAGNOSTIC"}]}});
+        let bin = stub_cli(&dir, "fake-claude-refused-then-killed",
+            &format!("cat >/dev/null\nprintf '%s\\n' '{use_event}' '{result_event}'\nkill -KILL $$\n"));
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = Arc::new(AuditLogger::protected(
+            dir.path().join("logs/audit.jsonl"),
+            dir.path().join("anchors/anchor.json"),
+            &[],
+        ).unwrap());
+        let mut opts = dummy_opts();
+        opts.audit_logger = Some(logger);
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&opts, "x").await.unwrap_err();
+        let typed = ReasonerError::find_in(&err).expect("typed for the fallback chain");
+        assert!(
+            matches!(typed, ReasonerError::Interrupted { provider, signal: 9 } if provider == "claude"),
+            "{err:#}"
+        );
+        assert!(!typed.is_provider_side(), "a host stop never latches claude");
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the
