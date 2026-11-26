@@ -972,6 +972,11 @@ pub fn revise_modal(action_id: &str, previous_feedback: Option<&str>) -> CreateM
 /// at this rendering boundary: `Email.body` and every non-Discord consumer
 /// keep the stored bytes, and plain text passes through unchanged so existing
 /// cards render byte-identically.
+///
+/// The argument is the inbound body alone. A renderer that puts its own notice
+/// above the quoted body — the reminder header in [`crate::nudge`] — projects
+/// the body first and prefixes afterwards, so nothing here has to tell a
+/// renderer's prose apart from a sender's MIME headers.
 pub(crate) fn discord_body(email_body: &str) -> String {
     if let Some(part) = mime_display_part(email_body) {
         return part;
@@ -2428,5 +2433,17 @@ mod tests {
         e.body = format!("<p>{}</p>", "overlong html paragraph ".repeat(500));
         let d = description(&approval_message("act-h5", &e, &draft, 0));
         assert!(d.len() <= MAX_EMBED_DESCRIPTION, "{} bytes", d.len());
+    }
+
+    /// A MIME container is projected whether the sender transmitted it with
+    /// CRLF or LF line endings.
+    #[test]
+    fn multipart_inbound_is_projected_for_either_line_ending() {
+        let mut e = email();
+        e.body = MULTIPART_INBOUND.replace("\r\n", "\n");
+        let d = description(&approval_message("act-h6", &e, "Noted.", 0));
+        assert!(d.contains("The plain alternative the sender wrote."), "{d}");
+        assert!(!d.contains("Content-Type"), "MIME headers never render: {d}");
+        assert!(!d.contains("ab-1"), "MIME boundaries never render: {d}");
     }
 }
