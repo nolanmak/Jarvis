@@ -98,6 +98,34 @@ after its slot; restart never resends a claimed/sent/unknown batch. A missed slo
 is not replayed hours later. DST's repeated local minute produces one batch.
 The existing sender's five-second dispatch deadline also applies to digests.
 
+## New-DM alerts
+
+Off for every platform until you opt one in with
+`AUGMENTAGENT_ALERT_DM_POLICY=imessage=first-contact`. Each entry
+is exactly `<platform>=<off|priority|first-contact|all>`, comma separated and
+matched verbatim — no surrounding spaces, no other spelling or case. An unknown
+mode, a missing `=`, or a platform named twice leaves *that* platform off and
+never affects another one; an absent variable alerts on nothing anywhere.
+
+Only an inbound 1:1 direct message can qualify — never a group, channel, bot,
+service or short-code sender, or the owner's own message. Two classes qualify: a
+**first contact** (no prior stored inbound message in the conversation) and a
+**priority contact** (the handle resolves, through the wiki identity index on
+the exact handle only, to a person on the `imessage alerts priority` list, muted
+`routine` selectors excluded). `first-contact` and `priority` enable only their
+own class, `all` both. A conversation first seen with only messages at or
+before the newest iMessage already stored is a backfill, not a DM.
+
+Only the iMessage poll evaluates this policy today; the other messaging
+channels are wired in follow-up slices of #1643, so naming another platform has
+no effect until its channel calls the shared evaluator.
+
+A qualifying message creates one **High** owner alert per platform conversation
+per rolling hour; the claim lives in SQLite, so restarting mid-hour does not
+produce a second one. From there it follows the owner-alert paths above — the
+Discord schedule, and text escalation only behind the existing `imessage alerts
+configure --enabled` opt-in. Nothing reaches the DM's sender.
+
 ## Offline calibration
 
 No provider calls, database mutations, or sends are needed. On the machine that
