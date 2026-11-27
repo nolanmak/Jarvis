@@ -566,7 +566,7 @@ fn approval_embed_and_rows(
     let description = if composed {
         truncate_within(&human_draft, MAX_EMBED_DESCRIPTION)
     } else {
-        format_body(&email.body, &human_draft)
+        format_body(&discord_body(&email.body), &human_draft)
     };
     let mut embed = CreateEmbed::new()
         .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
@@ -960,6 +960,235 @@ pub fn revise_modal(action_id: &str, previous_feedback: Option<&str>) -> CreateM
         "Revise draft",
     )
     .components(vec![CreateActionRow::InputText(input)])
+}
+
+/// Discord-only projection of a stored inbound body (#2426).
+///
+/// Mail is persisted as the sender transmitted it: a MIME `multipart/*`
+/// container, a whole HTML document, or plain text. Discord renders none of
+/// the first two — the card shows `<head>`/`<style>` noise or raw markup
+/// where the message should be — so every Discord renderer that quotes an
+/// inbound body passes it through here first. The projection is applied ONLY
+/// at this rendering boundary: `Email.body` and every non-Discord consumer
+/// keep the stored bytes, and plain text passes through unchanged so existing
+/// cards render byte-identically.
+///
+/// The argument is the inbound body alone. A renderer that puts its own notice
+/// above the quoted body — the reminder header in [`crate::nudge`] — projects
+/// the body first and prefixes afterwards, so nothing here has to tell a
+/// renderer's prose apart from a sender's MIME headers.
+pub(crate) fn discord_body(email_body: &str) -> String {
+    if let Some(part) = mime_display_part(email_body) {
+        return part;
+    }
+    if looks_like_html(email_body) {
+        return html_display_text(email_body);
+    }
+    email_body.to_string()
+}
+
+/// The displayable part of a MIME `multipart/*` container: the sender's
+/// plain-text alternative when there is one, else its HTML part as text.
+/// `None` for anything that is not a container, which is the passthrough.
+fn mime_display_part(body: &str) -> Option<String> {
+    let (headers, _) = split_mime_headers(body)?;
+    let lowered = headers.to_ascii_lowercase();
+    if !lowered.contains("multipart/") {
+        return None;
+    }
+    let delimiter = format!("--{}", mime_boundary(headers, &lowered)?);
+    let mut html = None;
+    for part in body.split(&delimiter).skip(1) {
+        let Some((part_headers, part_body)) = split_mime_headers(part) else {
+            continue;
+        };
+        let part_type = part_headers.to_ascii_lowercase();
+        if part_type.contains("multipart/") {
+            if let Some(nested) = mime_display_part(part) {
+                return Some(nested);
+            }
+        } else if part_type.contains("text/plain") {
+            return Some(part_body.trim_end_matches(['\r', '\n']).to_string());
+        } else if html.is_none() && part_type.contains("text/html") {
+            html = Some(html_display_text(part_body));
+        }
+    }
+    html
+}
+
+/// Split a MIME entity into its header block and its body at the first blank
+/// line. `None` when there is no blank line, i.e. nothing to split.
+fn split_mime_headers(part: &str) -> Option<(&str, &str)> {
+    let part = part.trim_start_matches(['\r', '\n']);
+    part.find("\r\n\r\n")
+        .map(|at| (&part[..at], &part[at + 4..]))
+        .or_else(|| part.find("\n\n").map(|at| (&part[..at], &part[at + 2..])))
+}
+
+/// The `boundary=` parameter, read out of `headers` (case preserved — the
+/// delimiter is matched literally) using `lowered` only to locate it.
+fn mime_boundary(headers: &str, lowered: &str) -> Option<String> {
+    let at = lowered.find("boundary=")? + "boundary=".len();
+    let value = headers[at..].trim_start();
+    let boundary = match value.strip_prefix(['"', '\'']) {
+        Some(quoted) => quoted.split(['"', '\'']).next()?,
+        None => value.split([';', '\r', '\n']).next()?.trim(),
+    };
+    (!boundary.is_empty()).then(|| boundary.to_string())
+}
+
+/// Does this body look like an HTML document rather than plain text?
+fn looks_like_html(body: &str) -> bool {
+    let head = body.chars().take(4000).collect::<String>().to_ascii_lowercase();
+    ["<html", "<body", "<div", "<table", "<p>", "<p ", "<br", "<span", "</a>"]
+        .iter()
+        .any(|tag| head.contains(tag))
+}
+
+/// Block-level tags whose boundary is a line break in the rendered text.
+const HTML_BLOCK_TAGS: [&str; 11] = [
+    "br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "table", "blockquote",
+];
+
+/// Visible text of an HTML document: tags removed, `<head>`/`<title>`/
+/// `<script>`/`<style>` contents dropped, block tags as line breaks, entities
+/// decoded. A hyperlink whose destination differs from its label keeps that
+/// destination in parentheses, so the owner can still see where a link in the
+/// mail actually goes. Tag names and attribute values never reach the output.
+fn html_display_text(html: &str) -> String {
+    let lowered = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len() / 3);
+    let mut link: Option<(usize, String)> = None;
+    let mut i = 0;
+    while i < html.len() {
+        if !html[i..].starts_with('<') {
+            let next = html[i..].find('<').map_or(html.len(), |at| i + at);
+            out.push_str(&html[i..next]);
+            i = next;
+            continue;
+        }
+        let Some(rel) = html[i..].find('>') else { break };
+        let tag = &html[i + 1..i + rel];
+        let closing = tag.starts_with('/');
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .flat_map(char::to_lowercase)
+            .collect();
+        i += rel + 1;
+        if !closing && matches!(name.as_str(), "head" | "title" | "script" | "style") {
+            // Skip the whole element: its text is never shown to a reader.
+            let Some(end) = lowered[i..].find(&format!("</{name}")) else {
+                break;
+            };
+            i += end;
+            if let Some(gt) = html[i..].find('>') {
+                i += gt + 1;
+            }
+            continue;
+        }
+        match (name.as_str(), closing) {
+            ("a", false) => link = tag_href(tag).map(|href| (out.len(), href)),
+            ("a", true) => {
+                if let Some((label_at, href)) = link.take() {
+                    push_link_destination(&mut out, label_at, &href);
+                }
+            }
+            _ => {}
+        }
+        out.push(if HTML_BLOCK_TAGS.contains(&name.as_str()) { '\n' } else { ' ' });
+    }
+    collapse_lines(&decode_entities(&out))
+}
+
+/// `href` of an `<a …>` tag, with its case preserved. Only a whole attribute
+/// name matches, so `data-href=` is not mistaken for the destination.
+fn tag_href(tag: &str) -> Option<String> {
+    let lowered = tag.to_ascii_lowercase();
+    for (at, _) in lowered.match_indices("href") {
+        if at > 0 && !lowered.as_bytes()[at - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let Some(value) = tag[at + 4..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        let href = match value.strip_prefix(['"', '\'']) {
+            Some(quoted) => quoted.split(['"', '\'']).next().unwrap_or_default(),
+            None => value.split_whitespace().next().unwrap_or_default(),
+        };
+        return Some(href.to_string());
+    }
+    None
+}
+
+/// Append ` (destination)` after a link's label when the two differ — the
+/// label alone ("click here") tells the owner nothing about where it goes.
+fn push_link_destination(out: &mut String, label_at: usize, href: &str) {
+    let label = out[label_at..].trim();
+    let destination = href.trim();
+    if destination.is_empty() || destination.starts_with('#') || label.contains(destination) {
+        return;
+    }
+    out.push_str(&format!(" ({destination})"));
+}
+
+/// Decode the HTML entities that appear in mail bodies; anything unrecognised
+/// is left as the literal `&…` the sender wrote.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let Some(semi) = rest.as_bytes().iter().take(12).position(|b| *b == b';') else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "nbsp" | "#160" => Some(' '),
+            _ => entity
+                .strip_prefix("#x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|dec| dec.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Collapse runs of whitespace within each line and drop the empty lines the
+/// tag stripping leaves behind, so an HTML preview spends its embed budget on
+/// text rather than on the sender's layout.
+fn collapse_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            out.push_str(&collapsed);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn format_body(email_body: &str, draft: &str) -> String {
@@ -2103,5 +2332,118 @@ mod tests {
             serde_json::from_str(&json(&approval_message("act-r1", &email(), "ok", 0))).unwrap();
         assert_eq!(reply["embeds"][0]["fields"][0]["name"], "From");
         assert!(reply["embeds"][0]["description"].as_str().unwrap().contains("— DRAFT —"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #2426: every Discord renderer that quotes an inbound body renders the
+    // Discord-only projection, so HTML mail and MIME containers read as text.
+    // ---------------------------------------------------------------------
+
+    /// An HTML-only newsletter-shaped body: suppressed document sections, an
+    /// entity, and a link whose destination differs from its label.
+    const HTML_INBOUND: &str = concat!(
+        "<!doctype html><html><head><title>Title noise</title>",
+        "<style>.brand { color: #fff }</style>",
+        "<script>track('open')</script></head><body><p>Terms &amp; pricing ",
+        r#"are <a href="https://billing.example.test/q4-plan">on the plan page</a>.</p>"#,
+        "</body></html>",
+    );
+
+    /// A `multipart/alternative` body carrying both alternatives.
+    const MULTIPART_INBOUND: &str = concat!(
+        "Content-Type: multipart/alternative; boundary=\"ab-1\"\r\n\r\n",
+        "--ab-1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
+        "The plain alternative the sender wrote.\r\n",
+        "--ab-1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
+        "<p>The derived HTML alternative.</p>\r\n--ab-1--\r\n",
+    );
+
+    /// The edited card's embed description as Discord would receive it.
+    fn edit_description(m: &EditMessage) -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(m).expect("EditMessage serializes"))
+                .expect("edit json parses");
+        v["embeds"][0]["description"]
+            .as_str()
+            .expect("embed has a description")
+            .to_string()
+    }
+
+    #[test]
+    fn html_only_inbound_reads_as_text_on_the_posted_and_edited_card() {
+        let mut e = email();
+        e.body = HTML_INBOUND.into();
+        let posted = description(&approval_message("act-h1", &e, "Confirmed, thanks.", 0));
+        let edited = edit_description(&approval_edit_message("act-h1", &e, "Confirmed, thanks.", 0));
+        for d in [&posted, &edited] {
+            assert!(d.contains("Terms & pricing"), "entities stay decoded: {d}");
+            assert!(!d.contains('<') && !d.contains('>'), "no markup reaches Discord: {d}");
+            assert!(!d.contains("Title noise"), "<head> content is dropped: {d}");
+            assert!(!d.contains("color:"), "<style> content is dropped: {d}");
+            assert!(!d.contains("track("), "<script> content is dropped: {d}");
+            assert!(
+                d.contains("on the plan page") && d.contains("https://billing.example.test/q4-plan"),
+                "a differing link destination stays readable: {d}"
+            );
+            assert!(d.contains(SEPARATOR), "the draft separator is unchanged: {d}");
+            assert!(d.contains("Confirmed, thanks."));
+            assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+        }
+        assert_eq!(posted, edited, "a redrawn card still matches a fresh one");
+        assert_eq!(e.body, HTML_INBOUND, "the stored body is never rewritten");
+    }
+
+    #[test]
+    fn multipart_inbound_shows_the_plain_text_alternative() {
+        let mut e = email();
+        e.body = MULTIPART_INBOUND.into();
+        let posted = description(&approval_message("act-h2", &e, "Noted.", 0));
+        let edited = edit_description(&approval_edit_message("act-h2", &e, "Noted.", 0));
+        for d in [&posted, &edited] {
+            assert!(
+                d.contains("The plain alternative the sender wrote."),
+                "the sender's plain part is what Discord shows: {d}"
+            );
+            assert!(
+                !d.contains("derived HTML alternative"),
+                "the HTML alternative is not used when plain text exists: {d}"
+            );
+            assert!(!d.contains("Content-Type"), "MIME headers never render: {d}");
+            assert!(!d.contains("ab-1"), "MIME boundaries never render: {d}");
+        }
+        assert_eq!(e.body, MULTIPART_INBOUND, "the stored body is never rewritten");
+    }
+
+    #[test]
+    fn plain_text_inbound_and_truncation_are_untouched_by_the_projection() {
+        // The projection is a no-op for plain text, so the pre-#2426 card is
+        // byte-identical — including the long-chain truncation budget.
+        let mut e = email();
+        assert_eq!(
+            description(&approval_message("act-h3", &e, "ok", 0)),
+            format!("the inbound message{SEPARATOR}ok")
+        );
+        e.body = long_inbound();
+        let draft = long_draft();
+        assert_eq!(
+            description(&approval_message("act-h4", &e, &draft, 0)),
+            format_body(&long_inbound(), &draft)
+        );
+        // An HTML body long enough to overflow still fits the embed.
+        e.body = format!("<p>{}</p>", "overlong html paragraph ".repeat(500));
+        let d = description(&approval_message("act-h5", &e, &draft, 0));
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION, "{} bytes", d.len());
+    }
+
+    /// A MIME container is projected whether the sender transmitted it with
+    /// CRLF or LF line endings.
+    #[test]
+    fn multipart_inbound_is_projected_for_either_line_ending() {
+        let mut e = email();
+        e.body = MULTIPART_INBOUND.replace("\r\n", "\n");
+        let d = description(&approval_message("act-h6", &e, "Noted.", 0));
+        assert!(d.contains("The plain alternative the sender wrote."), "{d}");
+        assert!(!d.contains("Content-Type"), "MIME headers never render: {d}");
+        assert!(!d.contains("ab-1"), "MIME boundaries never render: {d}");
     }
 }

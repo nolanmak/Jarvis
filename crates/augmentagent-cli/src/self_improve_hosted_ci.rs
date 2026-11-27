@@ -30,6 +30,47 @@ pub(super) struct Evidence {
     pub reason: String,
     #[serde(default)]
     pub receipts: Vec<Value>,
+    /// Ratebudget: immutable reads the reader made (see `Cache` in the
+    /// reader). Kept in [`IMMUTABLE`] for later observations.
+    #[serde(default)]
+    pub cache_updates: serde_json::Map<String, Value>,
+}
+
+impl Evidence {
+    /// Evidence that was not read: deferred, never a verdict.
+    pub(super) fn deferred(reason: &str) -> Self {
+        Self { state: "unknown".into(), head: String::new(), failures: Vec::new(),
+            reason: reason.into(), receipts: Vec::new(), cache_updates: Default::default() }
+    }
+}
+
+/// Ratebudget: answers to reads that cannot change, handed back to the
+/// reader on every observation. Keys bind the repository and an exact commit
+/// SHA (or a completed run attempt), so a stale entry is impossible; the
+/// bound only limits memory. The reader still compares every policy hash.
+static IMMUTABLE: std::sync::Mutex<Option<serde_json::Map<String, Value>>> = std::sync::Mutex::new(None);
+const IMMUTABLE_BOUND: usize = 8_192;
+
+fn immutable_snapshot() -> serde_json::Map<String, Value> {
+    IMMUTABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().unwrap_or_default()
+}
+
+fn remember_immutable(updates: &serde_json::Map<String, Value>) {
+    if updates.is_empty() { return; }
+    let mut cache = IMMUTABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = cache.get_or_insert_with(Default::default);
+    if cache.len() + updates.len() > IMMUTABLE_BOUND { cache.clear(); }
+    cache.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+}
+
+/// An optional observation (CI repair diagnosis, integration wait): stands
+/// down inside the merge reserve and reports deferred evidence instead.
+pub(super) async fn observe_optional(root: &Path, pr: u64) -> Result<Evidence> {
+    let remaining = gh_budget::remaining(root).await;
+    match gh_budget::unless_reserved(remaining, "hosted CI diagnosis", || observe(root, Some(pr), None)).await {
+        Some(evidence) => evidence,
+        None => Ok(Evidence::deferred(gh_budget::RESERVED)),
+    }
 }
 
 /// This is a publication preflight, never a passing CI receipt. No candidate
@@ -203,6 +244,7 @@ async fn observe_with(
     use tokio::io::AsyncWriteExt;
     let private = tempfile::tempdir()?;
     let request = serde_json::json!({"gh":gh,"repository":repository,"pr":pr,"head":head,
+        "cache":immutable_snapshot(),
         "contract":serde_json::from_str::<Value>(CONTRACT)?,
         "policy_files":{"scripts/ci-contract.py":format!("{:x}",Sha256::digest(RUNNER)),
             "scripts/ci-apt-install.py":format!("{:x}",Sha256::digest(APT_INSTALLER)),
@@ -229,7 +271,9 @@ async fn observe_with(
         output.status.success(),
         "GitHub CI evidence reader unavailable"
     );
-    serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")
+    let evidence: Evidence = serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")?;
+    remember_immutable(&evidence.cache_updates);
+    Ok(evidence)
 }
 
 pub(super) fn job_diagnostics(log: &str) -> String {
@@ -660,6 +704,52 @@ mod tests {
         let wrong=serde_json::json!([{"number":2054,"title":"main is red at abc1234: workspace does not build","body":format!("{RED_MAIN_MARKER}\n`abc1234different`"),"labels":[]}]);
         assert_eq!(red_main_repair_lookup(&wrong,&changed),None);
     }
+    /// Ratebudget regression: the second observation of an unchanged PR head
+    /// makes no policy-content or changed-path reads; the cache hit avoids
+    /// them. Mutable identity (PR, run inventory) is still read fresh.
+    #[tokio::test]
+    async fn second_observation_reuses_immutable_policy_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        let gh = dir.path().join("gh");
+        let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let head = "e".repeat(40);
+        let base = "f".repeat(40);
+        let script = format!(r#"#!/usr/bin/env python3
+import base64, json, sys
+args = sys.argv[1:]
+open({log:?}, 'a').write(' '.join(args) + '\n')
+if args[0] == 'pr':
+    print(json.dumps([{{'name': 'rust', 'state': 'PENDING'}}])); sys.exit(8)
+endpoint = args[1]
+if '/contents/' in endpoint:
+    path = endpoint.split('/contents/', 1)[1].split('?', 1)[0]
+    print(json.dumps({{'type': 'file', 'encoding': 'base64', 'content': base64.b64encode(open({repo:?} + '/' + path, 'rb').read()).decode()}}))
+elif '/files' in endpoint:
+    print(json.dumps([{{'filename': 'src/a.rs'}}]))
+elif '/actions/runs?' in endpoint:
+    print(json.dumps({{'total_count': 0, 'workflow_runs': []}}))
+elif '/pulls/' in endpoint:
+    print(json.dumps({{'head': {{'sha': {head:?}}}, 'base': {{'sha': {base:?}, 'ref': 'main', 'repo': {{'full_name': 'ratebudget/fixture'}}}}, 'state': 'open', 'changed_files': 1}}))
+else:
+    sys.exit(1)
+"#, log = log.to_str().unwrap());
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let observe = || observe_with(dir.path(), gh.to_str().unwrap(), "ratebudget/fixture", Some(7), None);
+        let first = observe().await.unwrap();
+        assert_eq!(first.state, "pending", "{}", first.reason);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("/contents/"), "{calls}");
+        std::fs::write(&log, "").unwrap();
+        let second = observe().await.unwrap();
+        assert_eq!(second.state, "pending", "{}", second.reason);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("/contents/") && !calls.contains("/files"), "cache hit still read: {calls}");
+        assert!(calls.contains("/actions/runs?") && calls.contains("pulls/7"), "{calls}");
+    }
+
     #[test]
     fn hosted_policy_covers_linux_missing_checks_reruns_and_exact_identity() {
         let result = std::process::Command::new("/usr/bin/python3")

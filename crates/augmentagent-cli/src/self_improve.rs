@@ -1015,6 +1015,34 @@ impl std::error::Error for RecoveryHistoryUnavailable {}
 /// Completes on an empty page. Malformed responses and bound exhaustion fail
 /// closed; partial inventories cannot prove absence. Deduplicate rows shifted
 /// between pages by concurrent issue creation.
+/// Ratebudget: the paginated REST open-issue listing (seven-plus pages) is
+/// shared by issue selection, red-main lookup and legacy readmission within
+/// one tick, instead of each paging it again. A write clears it.
+async fn open_issue_rest_inventory(repo_root: &Path) -> Result<serde_json::Value> {
+    let gh = gh_bin();
+    let key = format!("rest-open-issues\0{}\0{gh}", repo_root.display());
+    let raw = gh_budget::tick_read(key, || async {
+        let json = fetch_issue_pages(|page| {
+            let gh = gh.clone();
+            async move {
+                let path = format!(
+                    "repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}\
+                     &sort=created&direction=desc&page={page}"
+                );
+                let (ok, stdout, stderr) = run(&gh, &["api", &path], repo_root).await?;
+                if !ok {
+                    bail!("gh api issues failed: {stderr}");
+                }
+                serde_json::from_str(&stdout).context("parse gh api issues")
+            }
+        })
+        .await?;
+        Ok(json.to_string())
+    })
+    .await?;
+    serde_json::from_str(&raw).context("parse shared open-issue inventory")
+}
+
 async fn fetch_issue_pages<F, Fut>(mut fetch: F) -> Result<serde_json::Value>
 where
     F: FnMut(u32) -> Fut,
@@ -1049,7 +1077,6 @@ where
 /// other ingress paths; untrusted sources require explicit owner approval.
 async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let allowlist = trusted_authors(repo_root).await;
-    let gh = gh_bin();
     // #653 — no label gate: every open issue is considered (newest first, up
     // to MAX_ISSUE_PAGES pages) and the stage-1 scoping pass decides
     // fixability itself. Issues it judges not-fixable get the gave-up label
@@ -1066,21 +1093,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // #1517 — paginated: one page of 50 made every issue older than the
     // newest 50 invisible to the loop forever, including everything `autopr
     // readmit` hands back.
-    let issues = fetch_issue_pages(|page| {
-        let gh = gh.clone();
-        async move {
-            let path = format!(
-                "repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}\
-                 &sort=created&direction=desc&page={page}"
-            );
-            let (ok, stdout, stderr) = run(&gh, &["api", &path], repo_root).await?;
-            if !ok {
-                bail!("gh api issues failed: {stderr}");
-            }
-            serde_json::from_str(&stdout).context("parse gh api issues")
-        }
-    })
-    .await?;
+    let issues = open_issue_rest_inventory(repo_root).await?;
 
     // #787 — human-filed issues first, newest-first within each group. The
     // research pipeline files 3/day and the daily cap is 3, so strict
@@ -1870,14 +1883,20 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // #2458: after GitHub merged main into the approved head, the
         // approval recorded at that head reaches the merge commit through
         // the durable update. Resolved before any gate reads approval.
+        let review_mode = crate::autoship_review::ReviewMode::current();
         let carry = match (record.as_ref(), head_sha.as_deref()) {
             (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
                 finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
             _ => None,
-        };
+        // #2588: a nightly review park leaves the record behind the bound head;
+        // the workflow's own pending update then anchors the carry.
+        }.or_else(|| match head_sha.as_deref() {
+            Some(head) if review_mode == crate::autoship_review::ReviewMode::Nightly =>
+                finalize::pending_for_binding(&workflow::path(), &repository, pr, branch, head),
+            _ => None,
+        });
         let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
         let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
-        let review_mode = crate::autoship_review::ReviewMode::current();
         if review_mode == crate::autoship_review::ReviewMode::PreMerge
             && !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
@@ -1916,7 +1935,10 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             ours,
             loop_authored,
             mergeable,
-            checks_green: checks_green(repo_root, pr).await,
+            // Ratebudget: an unchanged not-green PR is not re-read.
+            checks_green: gh_budget::sweep_checks(pr, gh_budget::ci_fingerprint(row),
+                gh_budget::below_floor(gh_budget::remaining(repo_root).await, gh_budget::floor()),
+                || checks_green(repo_root, pr)).await,
             review_approved: approval.reviewed,
             review_mode,
             policy: MergePolicy {
@@ -1952,7 +1974,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             },
         };
         let candidate_head = head_sha.clone();
-        match sweep_verdict(&candidate) {
+        // #2583: a red draft behind main gets judged as if green, but only so
+        // it can take the main-update step below; it is never merged red.
+        let heal = finalize::heal_by_main_update(
+            review_mode == crate::autoship_review::ReviewMode::Nightly,
+            candidate.checks_green, finalize::merge_state(row));
+        let judged = if heal { SweepCandidate { checks_green: Some(true), ..candidate.clone() } } else { candidate.clone() };
+        match sweep_verdict(&judged) {
             SweepVerdict::Skip(why) => {
                 // Said, not swallowed: a silent skip is indistinguishable from
                 // the sweep being broken.
@@ -1989,7 +2017,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 // #2458: green but BEHIND main under strict protection. Merge
                 // main in with a merge commit; checks rerun on it and a later
                 // tick merges it once green. No worker slot, no model call.
-                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                if heal || finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
                     let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
                         Ok(main) => main,
                         Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
@@ -5913,15 +5941,7 @@ enum RedMainPlan {
 async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
     let title = red_main_title(red);
     let gh = gh_bin();
-    let listing = fetch_issue_pages(|page| {
-        let gh=gh.clone();
-        async move {
-            let path=format!("repos/{{owner}}/{{repo}}/issues?state=open&per_page=100&sort=created&direction=desc&page={page}");
-            let (ok,out,error)=run(&gh,&["api",&path],repo_root).await?;
-            anyhow::ensure!(ok,"red-main issue lookup failed: {error}");
-            serde_json::from_str(&out).context("red-main issue inventory malformed")
-        }
-    }).await;
+    let listing = open_issue_rest_inventory(repo_root).await.context("red-main issue lookup failed");
     let json=match listing {
         Ok(json)=>json,
         Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
@@ -19788,8 +19808,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn pick_issue(repo_root: &Path").expect("pick_issue");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        assert!(body.contains("fetch_issue_pages("), "paginated (#1519)");
-        assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
+        // The paginated listing is now shared per tick (#2584).
+        assert!(body.contains("open_issue_rest_inventory("), "shared inventory");
+        let start = src.find("async fn open_issue_rest_inventory(").expect("inventory");
+        let inventory = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        assert!(inventory.contains("fetch_issue_pages("), "paginated (#1519)");
+        assert!(!body.contains("per_page=50") && !inventory.contains("per_page=50"),
+            "the newest-50 window is gone");
     }
 
     #[test]

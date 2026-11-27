@@ -24,6 +24,9 @@ elif a[:2] == ['api', 'rate_limit']:
     print('4999' if '--jq' in a else json.dumps({'resources': {'core': {'remaining': 4999}}}))
 elif a[:2] == ['pr', 'view']:
     print(json.dumps(next(p for p in prs if p['number'] == int(a[2]))))
+elif a[:1] == ['api'] and '/pulls/' in a[1] and a[1].split('?', 1)[0].rsplit('/', 1)[-1].isdigit():
+    n = int(a[1].split('?', 1)[0].rsplit('/', 1)[-1])
+    print(json.dumps(next(p for p in prs if p['number'] == n)))
 elif a[:2] == ['issue', 'view']:
     print(json.dumps({'title': 'Fixture', 'body': 'Fixture request', 'author': {'login': 'owner'}}))
 elif a[:2] == ['pr', 'diff']:

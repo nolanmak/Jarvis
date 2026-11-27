@@ -247,7 +247,8 @@ async fn api(root: &Path, repository: &str, suffix: &str) -> Result<serde_json::
 /// The embedded hosted reader establishes policy, repository, workflow and head
 /// identity. Failed job metadata is correlated to its run before reading logs.
 pub(super) async fn observe(root: &Path, pr: u64) -> Result<Observation> {
-    let evidence = hosted_ci::observe(root, Some(pr), None).await?;
+    // Ratebudget: diagnosis is optional; inside the merge reserve it defers.
+    let evidence = hosted_ci::observe_optional(root, pr).await?;
     let mut result = Observation {
         head: evidence.head,
         action: match evidence.state.as_str() {

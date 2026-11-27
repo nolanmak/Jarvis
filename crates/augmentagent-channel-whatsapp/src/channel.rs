@@ -353,6 +353,10 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             return Ok(());
         }
 
+        // Shared DM-alert policy (#1643) — every admission guard above has
+        // already run, and nothing durable has happened to this message yet.
+        self.evaluate_dm_alert(&msg);
+
         let email = msg.into_email(&self.config.phone);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
@@ -781,6 +785,44 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
         }
     }
 
+    /// Hand an admitted inbound 1:1 message to the shared DM-alert policy
+    /// (#2424). The bare chat JID is the dedupe key, the stored thread ID and
+    /// the handle the wiki's `whatsapp` identities are matched against. The
+    /// wiki index is built only once the policy names WhatsApp; a configured
+    /// wiki that cannot be read suppresses alerts rather than calling a known
+    /// person a stranger.
+    fn evaluate_dm_alert(&self, msg: &WaMessage) {
+        use augmentagent_channel_core::dm_alert::{self, DmAlertMode, DmAlertPolicy, DmEvent};
+        if DmAlertPolicy::from_env().mode(PLATFORM) == DmAlertMode::Off {
+            return;
+        }
+        let index = match &self.config.wiki_root {
+            None => None,
+            Some(root) => {
+                let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+                match augmentagent_wiki::IdentityIndex::build(&layout) {
+                    Ok(index) => Some(index),
+                    Err(e) => {
+                        warn!(error = %e, "wiki index unavailable; skipping DM alert");
+                        return;
+                    }
+                }
+            }
+        };
+        let chat = msg.chat.bare();
+        let user = msg.chat.user();
+        let source = if !user.is_empty() && user.bytes().all(|b| b.is_ascii_digit()) {
+            format!("https://wa.me/{user}")
+        } else {
+            "https://web.whatsapp.com/".to_string()
+        };
+        let mut event = DmEvent::inbound_dm(PLATFORM, &chat, &chat, &source);
+        event.display_name = &msg.push_name;
+        event.direct_message = msg.chat.is_personal();
+        event.from_self = msg.is_outbound();
+        dm_alert::evaluate_inbound(&self.store, event, Some(&chat), index.as_ref());
+    }
+
     fn maybe_ingest(
         &self,
         email: &Email,
@@ -1015,6 +1057,85 @@ mod tests {
             from_me: false,
             metadata: Default::default(),
         }
+    }
+
+    fn owner_alerts(store: &Store) -> i64 {
+        store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM owner_alerts", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// #2424 — the shared DM-alert policy runs before any downstream work:
+    /// with persistence broken the alert still lands. Off until the policy
+    /// names WhatsApp; an established chat is not a first contact; group,
+    /// broadcast and outbound traffic never alert.
+    #[tokio::test]
+    async fn dm_alerts_precede_durable_work_and_skip_groups_broadcasts_and_outbound() {
+        use augmentagent_channel_core::dm_alert::POLICY_ENV;
+        use augmentagent_store::owner_alerts::Urgency;
+        const KNOWN: &str = "15551234567@s.whatsapp.net";
+        const FRESH: &str = "15557654321@s.whatsapp.net";
+        const PRIORITY: &str = "15550001111@s.whatsapp.net";
+        const QUIET: &str = "15559990000@s.whatsapp.net";
+        let (store, _f) = tmp_store();
+        for chat in [KNOWN, FRESH, PRIORITY, QUIET] {
+            store.allow_whatsapp_inbound(chat).unwrap();
+        }
+        store
+            .set_owner_alert_priority("person:priority-contact", Urgency::High)
+            .unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::create_dir(wiki.path().join("people")).unwrap();
+        std::fs::write(
+            wiki.path().join("people/priority-contact.md"),
+            format!("---\nidentities:\n  whatsapp: [\"{PRIORITY}\"]\n---\n"),
+        )
+        .unwrap();
+        let mut ch = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        // The sender's wiki identity resolves through the configured wiki.
+        ch.config.wiki_root = Some(wiki.path().to_path_buf());
+        let in_chat = |id: &str, chat: &str| {
+            let mut m = msg(id, "are we still on for tomorrow?");
+            m.chat = Jid::new(chat);
+            m.sender = Jid::new(chat);
+            m
+        };
+
+        // Disabled: triage is exactly what it was, and nothing alerts.
+        std::env::remove_var(POLICY_ENV);
+        ch.inbox.lock().await.push(in_chat("known-1", KNOWN));
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!((out.errors, out.skipped), (0, 1), "triage is unchanged");
+        assert_eq!(owner_alerts(&store), 0, "no policy means no DM alert");
+
+        std::env::set_var(POLICY_ENV, "whatsapp=all");
+        let mut group = msg("group", "team chatter");
+        group.chat = Jid::new("120363001234567890@g.us");
+        let mut broadcast = msg("broadcast", "status update");
+        broadcast.chat = Jid::new("1234567890@broadcast");
+        let mut outbound = in_chat("outbound", QUIET);
+        outbound.from_me = true;
+        for m in [in_chat("known-2", KNOWN), in_chat("fresh-1", FRESH), group, broadcast, outbound] {
+            ch.inbox.lock().await.push(m);
+        }
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.errors, 0);
+        assert_eq!(out.skipped, 2, "only the two DMs are triaged");
+        assert_eq!(out.groups_dropped, 2, "group and broadcast stay dropped");
+        assert_eq!(owner_alerts(&store), 1, "only the fresh chat's first contact alerts");
+
+        store
+            .with_conn(|c| c.execute("DROP TABLE emails", []))
+            .unwrap();
+        ch.inbox.lock().await.push(in_chat("priority-1", PRIORITY));
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.errors, 1, "persistence is broken");
+        assert_eq!(owner_alerts(&store), 2, "the priority alert precedes persistence");
+        std::env::remove_var(POLICY_ENV);
     }
 
     #[tokio::test]

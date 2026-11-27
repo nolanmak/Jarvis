@@ -43,6 +43,16 @@ pub(super) fn step(checks_green: Option<bool>, state: MergeState) -> Step {
     }
 }
 
+/// #2583: nightly review mode only. A draft whose required checks went red
+/// while it sat BEHIND main may be red only because the main it merged was
+/// red; main may since have been fixed. Merging current main in is the one
+/// step that can heal it, and it never merges the PR itself: checks rerun on
+/// the update and a later tick merges only if they come up green. Without
+/// this, a red-main episode stranded every draft that pulled it in.
+pub(super) fn heal_by_main_update(nightly: bool, checks_green: Option<bool>, state: MergeState) -> bool {
+    nightly && checks_green == Some(false) && state == MergeState::Behind
+}
+
 /// A main update the sweep may finish for this PR: the approval recorded for
 /// `origin_head` reaches the current PR head through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +73,31 @@ pub(super) fn carried(path: &Path, repository: &str, pr: u64, origin_head: &str,
     if update.origin_head != origin_head {
         return None;
     }
+    carry_to(update, pr_head)
+}
+
+/// #2588: nightly only. A review park can leave the opened-PR record behind
+/// the head the workflow is bound to (#2574), so the record cannot anchor the
+/// carry. The workflow's own binding does: its pending main update, on this
+/// PR and this branch, is the request the sweep made under its own lease.
+/// Only a pending update is returned, so the sweep authorizes the bound head
+/// and `carry_main_update` still verifies, under that lease, that the PR head
+/// is exactly GitHub's clean merge of the recorded main into it.
+pub(super) fn pending_for_binding(path: &Path, repository: &str, pr: u64, branch: &str, pr_head: &str) -> Option<Carry> {
+    let store = crate::autoship_workflow::WorkflowStore::open_read_only(path).ok()??;
+    let id = store.resolve_pr(repository, pr).ok()??;
+    let snapshot = store.snapshot(&id).ok()??;
+    if snapshot.branch != branch || snapshot.pr != Some(pr) {
+        return None;
+    }
+    let update = store.main_update(&id).ok()??;
+    if update.updated_head.is_some() || update.reviewed_head != snapshot.checkpoint.binding.head {
+        return None;
+    }
+    carry_to(update, pr_head).filter(|carry| carry.pending)
+}
+
+fn carry_to(update: crate::autoship_workflow::main_update::MainUpdate, pr_head: &str) -> Option<Carry> {
     let pending = match update.updated_head.as_deref() {
         // Carried already: only the verified merge commit is reached.
         Some(updated) if updated == pr_head => false,
@@ -158,6 +193,12 @@ mod tests {
         let row = |state: &str| serde_json::json!({"number": 2449, "mergeStateStatus": state});
         // PR #2449 at 07:45Z: approved head, every required check green, BEHIND.
         assert_eq!(step(Some(true), merge_state(&row("BEHIND"))), Step::UpdateBranch);
+        // #2583: only a red, behind draft in nightly mode is healed by an update.
+        assert!(heal_by_main_update(true, Some(false), merge_state(&row("BEHIND"))));
+        assert!(!heal_by_main_update(false, Some(false), merge_state(&row("BEHIND"))), "pre-merge keeps waiting");
+        assert!(!heal_by_main_update(true, None, merge_state(&row("BEHIND"))), "pending checks are not red");
+        assert!(!heal_by_main_update(true, Some(false), merge_state(&row("CLEAN"))), "current with main: red is the PR's own");
+        assert!(!heal_by_main_update(true, Some(true), merge_state(&row("BEHIND"))), "green already updates");
         // After update-branch, checks rerun on GitHub's merge commit.
         assert_eq!(step(Some(false), merge_state(&row("BLOCKED"))), Step::AwaitChecks);
         assert_eq!(step(None, merge_state(&row("BEHIND"))), Step::AwaitChecks, "unknown checks never update or merge");
@@ -274,6 +315,60 @@ mod tests {
         store.release(&sweep, 24).unwrap();
     }
 
+    /// #2588 (PR #2564 at 2026-11-27T02:36Z): nightly. The sweep requested a
+    /// main update at the bound head 829e4a8 and GitHub merged main in
+    /// (c27ac72), but the opened-PR record still names an earlier head
+    /// (6710cc5) a review park pushed past. Anchored on that record the carry
+    /// never resolved, the sweep authorized the merge commit, and the lease
+    /// refused it every tick. The binding-anchored pending update resolves it.
+    #[tokio::test]
+    async fn a_nightly_pending_update_carries_past_a_stale_opened_record() {
+        use crate::autoship_workflow::{Binding, NextAction, OperationKind, Review, Stage, WorkflowStore};
+        let _mode = crate::autoship_review::ReviewModeGuard::set(crate::autoship_review::ReviewMode::Nightly);
+        let (dir, base, reviewed, main) = repository();
+        let root = dir.path();
+        let path = root.join("workflow.db");
+        let id = "owner/repo#1788";
+        let branch = "agent-fix/issue-1788";
+        // The record's head: an earlier commit on the branch.
+        let stale = base.clone();
+        let bound = Binding { head: reviewed.clone(), contract: "plan:contract".into(), evidence_hash: "evidence".into() };
+        let mut store = WorkflowStore::open(&path).unwrap();
+        store.register(id, branch, bound.clone(), 1).unwrap();
+        let lease = store.claim(id, "worker", 2, 1_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 2564, 3).unwrap();
+        store.record_review(&lease, &Review { reviewer: crate::autoship_review::NIGHTLY_DEFERRED.into(), binding: bound.clone(), approved: true,
+            evidence: "{}".into() }, 4).unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Held;
+        cp.next = NextAction { reason: "resume_deferred".into(), action: "resume_preserved_work".into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, 5).unwrap();
+        store.release(&lease, 6).unwrap();
+        // 21:16Z: the sweep records the request and GitHub merges main in.
+        let sweep = store.claim_reconciliation(id, "sweep:1", 10, 60_000).unwrap().unwrap();
+        store.record_main_update_request(&sweep, &bound, &main, &main, 11).unwrap();
+        store.release(&sweep, 12).unwrap();
+        let updated = github_update(root, &reviewed, &main);
+
+        assert_eq!(carried(&path, "owner/repo", 2564, &stale, &updated), None, "the stale record anchors nothing");
+        let carry = pending_for_binding(&path, "owner/repo", 2564, branch, &updated).expect("the binding anchors the update");
+        assert_eq!(carry, Carry { origin_head: reviewed.clone(), reviewed_head: reviewed.clone(), main: main.clone(), pending: true });
+        assert_eq!(pending_for_binding(&path, "owner/repo", 2564, "someone/else", &updated), None, "only our branch");
+        assert_eq!(pending_for_binding(&path, "owner/repo", 7, branch, &updated), None, "only our PR");
+        assert_eq!(pending_for_binding(&path, "owner/repo", 2564, branch, &reviewed), None, "nothing merged in yet");
+
+        // The sweep now authorizes the bound head, verifies GitHub's merge and carries.
+        verify_main_merge(root, &carry.reviewed_head, &updated, &carry.main).await.unwrap();
+        let sweep = store.claim_reconciliation(id, "sweep:2", 20, 60_000).unwrap().unwrap();
+        let carried_binding = store.carry_main_update(&sweep, &bound, &updated, &main, 21).unwrap();
+        assert_eq!(carried_binding.head, updated);
+        let intent = store.begin_operation(&sweep, OperationKind::MergePr, &carried_binding, 22).unwrap();
+        assert_eq!(intent.binding.head, updated, "the merge is pinned to GitHub's merge commit");
+        store.release(&sweep, 23).unwrap();
+        assert_eq!(pending_for_binding(&path, "owner/repo", 2564, branch, &updated), None,
+            "once carried the binding is the PR head and no fallback is needed");
+    }
+
     /// #2458 (PR #2449 at 08:14Z): re-integration of an approved PR drops its
     /// approval and re-enters acceptance preparation, which parked #2449 in
     /// scope. A clean, approved PR that is only BEHIND stays with the sweep.
@@ -301,6 +396,7 @@ mod tests {
         let sweep = &src[start..start + src[start..].find("\n}\n").expect("end")];
         let at = |needle: &str| sweep.find(needle).unwrap_or_else(|| panic!("the sweep lacks {needle}"));
         assert!(at("finalize::carried(") < at("sweep_local_skip("), "carried approval feeds the local gates");
+        assert!(at("finalize::pending_for_binding(") < at("sweep_local_skip("), "#2588: so does the binding-anchored carry");
         let update = at("finalize::update_branch(");
         assert!(at("SweepGuard::acquire(") < at("validate_for_main_update("));
         assert!(at("validate_for_main_update(") < at("request_main_update(") && at("request_main_update(") < update,
