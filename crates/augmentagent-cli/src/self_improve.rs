@@ -19802,8 +19802,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn pick_issue(repo_root: &Path").expect("pick_issue");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        assert!(body.contains("fetch_issue_pages("), "paginated (#1519)");
-        assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
+        // The paginated listing lives in the per-tick shared inventory, which
+        // pick_issue reads instead of paging the open set itself.
+        assert!(body.contains("open_issue_rest_inventory("), "shared inventory");
+        let inv_start = src.find("async fn open_issue_rest_inventory(").expect("inventory");
+        let inventory = &src[inv_start..inv_start + src[inv_start..].find("\n}\n").expect("end")];
+        assert!(inventory.contains("fetch_issue_pages("), "paginated (#1519)");
+        assert!(!body.contains("per_page=50") && !inventory.contains("per_page=50"), "the newest-50 window is gone");
     }
 
     #[test]
