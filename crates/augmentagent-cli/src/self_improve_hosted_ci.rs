@@ -141,6 +141,12 @@ async fn policy_check(root: &Path, tree: &str) -> Result<()> {
     .await?;
     let expected: std::collections::BTreeSet<_> = workflows.keys().map(String::as_str).collect();
     let actual: std::collections::BTreeSet<_> = actual.lines().collect();
+    // The inventory is compared against the contract compiled into the running
+    // controller, so once `main`'s set of workflows and the deployed binary
+    // disagree every candidate on top of `main` is refused here, whatever it
+    // changed. A branch whose `.github/workflows` and `scripts/ci-contract.json`
+    // match `main` byte for byte is never the cause: the remedy is rolling out
+    // a controller built from the reviewed `main`, not editing the candidate.
     anyhow::ensure!(
         actual == expected,
         "hosted CI workflow inventory changed; reviewed controller rollout required"
