@@ -720,9 +720,33 @@ impl SweepGuard {
         else {
             return Ok(None);
         };
+        // #2592: everything between the claim and the guard that owns it must
+        // hand the lease back on failure. An early `?` leaked a 10-minute sweep
+        // lease that answered "workflow busy" and starved the worker.
+        match Self::authorize_claim(&mut store, &lease, existing.as_ref(), &id, repository, pr, head, recorded, &binding, now) {
+            Ok(Some(reviewed_base)) => Self::finish_acquire(path, store, lease, existing.is_some(), reviewed_base,
+                repository, issue, pr, branch, head, binding, id, now),
+            Ok(None) => { store.release(&lease, now)?; Ok(None) }
+            Err(error) => { let _ = store.release(&lease, now); Err(error) }
+        }
+    }
+
+    /// The approval checks a claimed sweep lease must pass. `Ok(None)` declines
+    /// the workflow; `Ok(Some(base))` carries the reviewed integration base.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_claim(
+        store: &mut WorkflowStore, lease: &Lease, existing: Option<&crate::autoship_workflow::Snapshot>, id: &str,
+        repository: &str, pr: u64, head: &str, recorded: &str, binding: &Binding, now: i64,
+    ) -> Result<Option<Option<String>>> {
+        // #2592: a sweep-invalidated approval queued one reverification for the
+        // worker. Re-claiming it every tick only re-invalidated it and kept the
+        // worker from running that verification; the worker's result decides.
+        if existing.is_some_and(|s| s.checkpoint.next.action == "reverify_candidate") {
+            return Ok(None);
+        }
         // Bind merge metadata to the protected review that granted authority,
         // not a different cached OpenedPr supplied by a reconciliation caller.
-        let reviews=store.current_review_history(&id)?;
+        let reviews=store.current_review_history(id)?;
         let structured = reviews.iter().find_map(|review| {
             structured_review_base(&review.evidence, head).map(|base| (review.approved, base))
         });
@@ -744,14 +768,17 @@ impl SweepGuard {
             true
         };
         if !authorized {
-            store.release(&lease, now)?;
             return Ok(None);
         }
-        store.attach_pr_in_repo(&lease, repository, pr, now)?;
-        if existing.is_some() && nightly && !reviews.first().is_some_and(|review| review.approved) {
+        store.attach_pr_in_repo(lease, repository, pr, now)?;
+        // #2592: a carried update already recorded this binding's deferral;
+        // re-recording it with other evidence is an immutable-review conflict.
+        let deferred = reviews.iter().any(|review| review.approved
+            && review.reviewer == crate::autoship_review::NIGHTLY_DEFERRED);
+        if existing.is_some() && nightly && !deferred && !reviews.first().is_some_and(|review| review.approved) {
             // #2574: durable record that this head merges on green with its
             // review deferred to the nightly pass.
-            store.record_review(&lease, &Review {
+            store.record_review(lease, &Review {
                 reviewer: crate::autoship_review::NIGHTLY_DEFERRED.into(),
                 binding: binding.clone(),
                 approved: true,
@@ -760,7 +787,7 @@ impl SweepGuard {
         }
         if existing.is_none() {
             store.record_review(
-                &lease,
+                lease,
                 &Review {
                     reviewer: "legacy-recorded-approval".into(),
                     binding: binding.clone(),
@@ -770,7 +797,18 @@ impl SweepGuard {
                 now,
             )?;
         }
-        let audit = workflow_audit(path, &id, None)?;
+        Ok(Some(reviewed_base))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_acquire(
+        path: &Path, mut store: WorkflowStore, lease: Lease, existing: bool, reviewed_base: Option<String>,
+        repository: &str, issue: Option<u64>, pr: u64, branch: &str, head: &str, binding: Binding, id: String, now: i64,
+    ) -> Result<Option<Self>> {
+        let audit = match workflow_audit(path, &id, None) {
+            Ok(audit) => audit,
+            Err(error) => { let _ = store.release(&lease, now); return Err(error); }
+        };
         let inner = WorkflowGuard {
             state: path.into(), checkout_identity: Arc::new(Mutex::new(None)),
             audit,
@@ -794,28 +832,31 @@ impl SweepGuard {
             family_wait_released: Arc::new(AtomicBool::new(false)),
             released: false,
         };
-        // A head produced by a carried main update was reviewed at its origin.
-        let carried = if existing.is_some() {
-            inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
-                .filter(|update| update.updated_head.as_deref() == Some(head))
-        } else { None };
-        let (reviewed_base, acceptance_head) = match carried {
-            Some(update) => (Some(update.main), Some(update.origin_head)),
-            None => (reviewed_base, None),
-        };
-        inner.install_model_accounting()?;
-        inner.audit_event("sweep_claimed", serde_json::json!({}))?;
-        inner.spawn_renewal();
-        Ok(Some(Self {
+        // From here the guard owns the lease: dropping it on an error releases.
+        let mut guard = Self {
             inner: Some(inner),
             reviewed_base,
-            acceptance_head,
+            acceptance_head: None,
             source: issue
                 .map(crate::autoship_contract::AcceptanceSource::Issue)
                 .unwrap_or(crate::autoship_contract::AcceptanceSource::PullRequest(pr)),
             branch: branch.into(),
             worktree_lock: Mutex::new(None),
-        }))
+        };
+        let inner = guard.inner.as_ref().context("released sweep lease")?;
+        // A head produced by a carried main update was reviewed at its origin.
+        let carried = if existing {
+            inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?.main_update(inner.id())?
+                .filter(|update| update.updated_head.as_deref() == Some(head))
+        } else { None };
+        inner.install_model_accounting()?;
+        inner.audit_event("sweep_claimed", serde_json::json!({}))?;
+        inner.spawn_renewal();
+        if let Some(update) = carried {
+            guard.reviewed_base = Some(update.main);
+            guard.acceptance_head = Some(update.origin_head);
+        }
+        Ok(Some(guard))
     }
 
     pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
@@ -867,19 +908,7 @@ impl SweepGuard {
             ok && head.trim() == expected,
             "remote PR head changed since review"
         );
-        {
-            let mut held = self
-                .worktree_lock
-                .lock()
-                .map_err(|_| anyhow::anyhow!("sweep worktree lock poisoned"))?;
-            if held.is_none() {
-                let path = run_lock_path().with_file_name(format!("self-improve-pr-{pr}.lock"));
-                *held = Some(
-                    RunLock::try_acquire(&path)?
-                        .context("PR checkout is currently being prepared by another worker")?,
-                );
-            }
-        }
+        self.hold_worktree_lock(pr)?;
         let worktree = prepare_resume_worktree_at_head(repo, pr, &self.branch,Some(&expected)).await?;
         let identity=checkout_identity::Identity::observe(&inner.state,repo,&worktree,inner.id(),&inner.repository,&self.branch).await?;
         identity.enroll(&mut *inner.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?,&inner.lease,&inner.binding,millis())?;
@@ -945,6 +974,22 @@ impl SweepGuard {
         Ok(main)
     }
 
+    /// Exclusive use of the PR's resume checkout for the rest of this lease.
+    fn hold_worktree_lock(&self, pr: u64) -> Result<()> {
+        let mut held = self
+            .worktree_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sweep worktree lock poisoned"))?;
+        if held.is_none() {
+            let path = run_lock_path().with_file_name(format!("self-improve-pr-{pr}.lock"));
+            *held = Some(
+                RunLock::try_acquire(&path)?
+                    .context("PR checkout is currently being prepared by another worker")?,
+            );
+        }
+        Ok(())
+    }
+
     /// #2458: durably record the main GitHub is about to merge into the
     /// approved head, before asking it to.
     pub(super) fn request_main_update(&self, main: &str) -> Result<()> {
@@ -975,7 +1020,10 @@ impl SweepGuard {
         super::finalize::verify_main_merge(repo, &update.reviewed_head, updated, &update.main).await?;
         let pr = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
             .snapshot(inner.id())?.context("sweep workflow missing")?.pr.context("main update needs its PR")?;
+        // #2592: the carry may reset the checkout, so no worker may be using it.
+        self.hold_worktree_lock(pr)?;
         advance_resume_checkout(repo, pr, &update.reviewed_head, updated).await?;
+        let inner = self.inner.as_mut().context("released sweep lease")?;
         inner.validate_before_side_effect()?;
         let carried = inner.store.lock().map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
             .carry_main_update(&inner.lease, &inner.binding, updated, &update.main, millis())?;
@@ -2958,10 +3006,42 @@ async fn advance_resume_checkout(repo_root: &Path, pr: u64, from: &str, to: &str
     }
     anyhow::ensure!(head.eq_ignore_ascii_case(from), "resume checkout holds another candidate");
     let (ok, status, _) = run("git", &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], &path).await?;
-    anyhow::ensure!(ok && status.trim().is_empty(), "resume checkout has unpublished changes");
+    anyhow::ensure!(ok, "cannot read resume checkout status");
+    if !status.trim().is_empty() {
+        // #2592: uncommitted edits on the approved head are an interrupted
+        // turn's leftovers: never reviewed, never published, and not part of
+        // what the approval covers. Refusing kept the carry failing every
+        // sweep forever. Keep them under a durable ref, never publish them,
+        // and follow the update from the approved head.
+        let preserved = preserve_uncommitted(&path, pr, from).await?;
+        warn!(pr, preserved = %preserved, "resume checkout had uncommitted edits outside the approved head; preserved and following the main update");
+    }
     let (ok, _, error) = run("git", &["merge", "--ff-only", "-q", to], &path).await?;
     anyhow::ensure!(ok, "resume checkout cannot follow the main update: {}", error.trim());
     Ok(())
+}
+
+/// #2592: snapshot every uncommitted change (tracked and untracked, never
+/// ignored build output) into a commit on top of `head`, keep it under
+/// `refs/autoship/preserved/pr-N/uncommitted/<sha>`, then reset the checkout
+/// to `head`. Nothing is pushed; the edits stay recoverable.
+async fn preserve_uncommitted(path: &Path, pr: u64, head: &str) -> Result<String> {
+    let (ok, _, error) = run("git", &["add", "-A"], path).await?;
+    anyhow::ensure!(ok, "cannot stage resume checkout edits for preservation: {}", error.trim());
+    let tree = git_evidence(path, &["write-tree"]).await?;
+    let (ok, commit, error) = run("git", &["-c", "user.name=autoship", "-c", "user.email=autoship@localhost",
+        "-c", "commit.gpgsign=false", "commit-tree", &tree, "-p", head,
+        "-m", "autoship: uncommitted resume checkout edits preserved before a main update"], path).await?;
+    anyhow::ensure!(ok, "cannot preserve resume checkout edits: {}", error.trim());
+    let commit = commit.trim().to_string();
+    let preserved = format!("refs/autoship/preserved/pr-{pr}/uncommitted/{commit}");
+    let (saved, _, error) = run("git", &["update-ref", &preserved, &commit], path).await?;
+    anyhow::ensure!(saved, "cannot keep preserved resume checkout edits: {}", error.trim());
+    let (reset, _, error) = run("git", &["reset", "--hard", "-q", head], path).await?;
+    anyhow::ensure!(reset, "cannot reset resume checkout after preservation (edits kept at {preserved}): {}", error.trim());
+    let (ok, status, _) = run("git", &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], path).await?;
+    anyhow::ensure!(ok && status.trim().is_empty(), "resume checkout still dirty after preservation (edits kept at {preserved})");
+    Ok(preserved)
 }
 
 pub(super) async fn prepare_resume_worktree_at_head(
@@ -4177,6 +4257,124 @@ mod tests {
         let sweep = SweepGuard::acquire_at(&path, "owner/repo", 1788, 2564, branch, &carry.reviewed_head, &record, now + 3)
             .unwrap().expect("the sweep takes the lease to carry and update");
         assert_eq!(sweep.inner.as_ref().unwrap().binding.head, reviewed);
+    }
+
+    /// #2592 fixture: a nightly workflow bound to `head` whose last recorded
+    /// review is the sweep's own invalidation, after a carried deferral.
+    fn invalidated_nightly_workflow(path: &Path, head: &str, deferral_approved: bool, next: &str) -> Binding {
+        let id = "owner/repo#2426";
+        let bound = Binding { head: head.into(), contract: "d39d024a".into(), evidence_hash: "7e15ae2a".into() };
+        let mut store = WorkflowStore::open(path).unwrap();
+        store.register(id, "agent-fix/issue-2426", bound.clone(), 1).unwrap();
+        let lease = store.claim(id, "worker", 2, 1_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 2571, 3).unwrap();
+        // The carry's deferral, with the carried base as its evidence.
+        store.record_review(&lease, &Review { reviewer: crate::autoship_review::NIGHTLY_DEFERRED.into(), binding: bound.clone(),
+            approved: deferral_approved, evidence: r#"{"binding":{"base":"41f746de"}}"#.into() }, 4).unwrap();
+        store.record_review(&lease, &Review { reviewer: "sweep-invalidation-1".into(), binding: bound.clone(),
+            approved: false, evidence: r#"{"reason":"protected acceptance checkpoint missing"}"#.into() }, 5).unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = if next == "reverify_candidate" { Stage::Verify } else { Stage::Held };
+        cp.next = NextAction { reason: "protected_acceptance_stale".into(), action: next.into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, 6).unwrap();
+        store.release(&lease, 7).unwrap();
+        bound
+    }
+
+    /// #2592 (#2571 at 02:57Z): once the sweep invalidated the approval and
+    /// queued a reverification, every later tick re-claimed the workflow and
+    /// kept the worker off it. The queued reverification belongs to the worker.
+    #[tokio::test]
+    async fn sweep_leaves_a_reverify_queued_workflow_to_the_worker() {
+        let _mode = crate::autoship_review::ReviewModeGuard::set(crate::autoship_review::ReviewMode::Nightly);
+        let state = control_dir();
+        let path = std::fs::canonicalize(state.path()).unwrap().join("workflow.db");
+        let head = "0acd109ac1c2a433ef6e780dc77878a417c326aa";
+        invalidated_nightly_workflow(&path, head, true, "reverify_candidate");
+        let record = serde_json::json!({"pr": 2571, "head": head, "verdict": null}).to_string();
+        let now = millis();
+        assert!(SweepGuard::acquire_at(&path, "owner/repo", 2426, 2571, "agent-fix/issue-2426", head, &record, now)
+            .unwrap().is_none(), "the sweep must not re-claim a reverification it queued");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        assert!(store.claim("owner/repo#2426", "worker", now + 1, LEASE_MS).unwrap().is_some(),
+            "no sweep lease may remain on the workflow");
+        assert_eq!(store.snapshot("owner/repo#2426").unwrap().unwrap().checkpoint.next.action, "reverify_candidate");
+    }
+
+    /// #2592 (#2571 at 02:57Z–03:52Z): a carried update had already recorded
+    /// this binding's nightly deferral, so re-recording it with other evidence
+    /// was an immutable-review conflict on every tick.
+    #[tokio::test]
+    async fn nightly_sweep_does_not_rerecord_a_carried_deferral() {
+        let _mode = crate::autoship_review::ReviewModeGuard::set(crate::autoship_review::ReviewMode::Nightly);
+        let state = control_dir();
+        let path = std::fs::canonicalize(state.path()).unwrap().join("workflow.db");
+        let head = "0acd109ac1c2a433ef6e780dc77878a417c326aa";
+        invalidated_nightly_workflow(&path, head, true, "resume_preserved_work");
+        let record = serde_json::json!({"pr": 2571, "head": head, "verdict": null}).to_string();
+        let sweep = SweepGuard::acquire_at(&path, "owner/repo", 2426, 2571, "agent-fix/issue-2426", head, &record, millis())
+            .expect("an existing deferral is not a conflict").expect("the sweep takes the idle workflow");
+        assert_eq!(sweep.inner.as_ref().unwrap().binding.head, head);
+    }
+
+    /// #2592: an error after the claim returned through `?` and leaked the
+    /// sweep's 10-minute lease ("workflow busy" on the next ticks).
+    #[tokio::test]
+    async fn failed_sweep_acquire_releases_its_claim() {
+        let _mode = crate::autoship_review::ReviewModeGuard::set(crate::autoship_review::ReviewMode::Nightly);
+        let state = control_dir();
+        let path = std::fs::canonicalize(state.path()).unwrap().join("workflow.db");
+        let head = "0acd109ac1c2a433ef6e780dc77878a417c326aa";
+        // An unapproved deferral row for the binding forces the conflict.
+        invalidated_nightly_workflow(&path, head, false, "resume_preserved_work");
+        let record = serde_json::json!({"pr": 2571, "head": head, "verdict": null}).to_string();
+        let now = millis();
+        let error = SweepGuard::acquire_at(&path, "owner/repo", 2426, 2571, "agent-fix/issue-2426", head, &record, now)
+            .err().expect("the conflicting deferral still refuses");
+        assert!(format!("{error:#}").contains("immutable review conflict"), "{error:#}");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        assert!(store.claim("owner/repo#2426", "worker", now + 1, LEASE_MS).unwrap().is_some(),
+            "a failed acquire must hand the lease back");
+    }
+
+    /// #2592 (#2567): the resume checkout sat on the approved head with an
+    /// interrupted turn's uncommitted edits, so carrying the main update
+    /// refused every sweep. The edits are preserved under a durable ref, never
+    /// published, and the checkout follows the update.
+    #[tokio::test]
+    async fn main_update_carry_preserves_uncommitted_resume_edits_and_advances() {
+        let dir = repo();
+        let state = control_dir();
+        let remote = state.path().join("remote.git");
+        assert!(run("git", &["init", "--bare", "-q", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["remote", "add", "origin", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["push", "-q", "origin", "HEAD:fixture"], dir.path()).await.unwrap().0);
+        let reviewed = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let checkout = prepare_resume_worktree_at_head(dir.path(), 2567, "fixture", Some(&reviewed)).await.unwrap();
+        // GitHub's merge of main into the approved head.
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-qm", "merge main"], dir.path()).await.unwrap().0);
+        let updated = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        std::fs::write(checkout.join("code.txt"), "interrupted repair\n").unwrap();
+        std::fs::write(checkout.join("new.rs"), "fn new() {}\n").unwrap();
+
+        advance_resume_checkout(dir.path(), 2567, &reviewed, &updated).await
+            .expect("leftover edits must not block the carry");
+        assert_eq!(git_evidence(&checkout, &["rev-parse", "HEAD"]).await.unwrap(), updated);
+        assert!(git_evidence(&checkout, &["status", "--porcelain", "--untracked-files=all"]).await.unwrap().is_empty());
+        let refs = git_evidence(dir.path(), &["for-each-ref", "--format=%(refname)", "refs/autoship/preserved/pr-2567/uncommitted/"]).await.unwrap();
+        assert_eq!(refs.lines().count(), 1, "exactly one preserved snapshot: {refs}");
+        assert_eq!(git_evidence(dir.path(), &["rev-parse", &format!("{refs}^")]).await.unwrap(), reviewed);
+        assert_eq!(git_evidence(dir.path(), &["show", &format!("{refs}:code.txt")]).await.unwrap(), "interrupted repair");
+        assert_eq!(git_evidence(dir.path(), &["show", &format!("{refs}:new.rs")]).await.unwrap(), "fn new() {}");
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{reviewed}\trefs/heads/fixture"), "preserved edits are never published");
+
+        // A checkout on some other head is still refused, untouched.
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-qm", "local"], &checkout).await.unwrap().0);
+        let error = advance_resume_checkout(dir.path(), 2567, &reviewed, &"e".repeat(40)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("another candidate"), "{error:#}");
     }
 
     #[tokio::test]
