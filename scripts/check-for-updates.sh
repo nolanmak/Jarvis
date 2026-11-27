@@ -22,6 +22,8 @@
 # - #2468: the auto-ship worker does not follow main. It runs a build of the
 #   commit pinned in ~/.config/augmentagent/autoship-pin (lib/autoship-pin.sh),
 #   rebuilt and reloaded only when that pin moves (scripts/autoship-pin.sh).
+#   #2576: each tick also advances the pin to the newest main commit whose
+#   required checks are green (AUTOSHIP_PIN_AUTO=off keeps it manual).
 #
 # Optional remote release builder: AUGMENTAGENT_REMOTE_BUILD_HOST opts in.
 # Setup, restricted SSH protocol and failure behavior: scripts/remote-builder/setup.sh.
