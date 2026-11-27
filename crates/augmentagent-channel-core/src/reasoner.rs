@@ -602,14 +602,14 @@ const HOST_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 /// `128 + n` exit code (#1779) while reporting our stop as `128 + SIGTERM`.
 fn stopped_through_cleanup(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
-    // The supervisor dying of a signal is read as our own, because cleanup
-    // escalates its SIGTERM to a SIGKILL of the supervisor itself when the
-    // receipt does not land in time. A host stop of the whole group reaches
-    // us the same way, so the two are indistinguishable here; attributing the
-    // ambiguous status to the stop we know we just sent keeps cleanup from
-    // reporting itself as a host stop. A stop that preceded cleanup is
-    // already classified from the un-reaped status, before the group drops.
-    if status.signal().is_some() {
+    // The supervisor dying of SIGTERM or SIGKILL is read as our own, because
+    // cleanup escalates its SIGTERM to a SIGKILL of the supervisor itself
+    // when the receipt does not land in time. A host stop of the whole group
+    // reaches us the same way, so those two are indistinguishable here;
+    // attributing the ambiguous status to the stop we know we just sent keeps
+    // cleanup from reporting itself as a host stop. Cleanup sends nothing
+    // else, so a supervisor that died of another host stop still names it.
+    if matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)) {
         return None;
     }
     interrupted_by_signal(status).filter(|signal| *signal != libc::SIGTERM)
@@ -6070,6 +6070,14 @@ exit 1
         assert_eq!(stopped_through_cleanup(&status("exit 143").await), None);
         assert_eq!(stopped_through_cleanup(&status("kill -KILL $$").await), None);
         assert_eq!(stopped_through_cleanup(&status("exit 1").await), None);
+        // Cleanup sends SIGTERM and escalates to SIGKILL; it never sends
+        // SIGHUP or SIGINT, so a supervisor that died of one names a host
+        // stop as surely as a forwarded `128 + n` exit code does.
+        assert_eq!(stopped_through_cleanup(&status("exit 129").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("exit 130").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -HUP $$").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("kill -INT $$").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -SEGV $$").await), None);
     }
 
     /// #1788 — the CLI is SIGKILLed mid tool call, so its unmatched intent
