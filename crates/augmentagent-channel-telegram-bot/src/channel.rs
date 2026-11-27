@@ -559,37 +559,27 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
         }
     }
 
-    /// Hand an eligible inbound 1:1 DM to the shared DM-alert policy. Group
-    /// and channel posts, this bot's own echoes, other bots and the owner's
-    /// control DM never alert, whatever subscription routed them to triage.
-    /// The chat id is the dedupe subject; the sender's wiki slug (when the
-    /// identity index resolves one) lets an owner `person:` priority match.
+    /// Hand an admitted message to the shared DM-alert policy (#2424). The
+    /// evaluator rejects group and channel posts, bots and this bot's own
+    /// echoes; the owner's control DM is excluded here. The chat id is both
+    /// the dedupe key and the stored thread ID; the sender's Telegram user id
+    /// is resolved through the wiki identity index only.
     fn evaluate_dm_alert(&self, handle: &BotHandle, msg: &Message) {
-        if !msg.chat.is_private() || msg.chat.id == handle.owner_chat_id {
+        use augmentagent_channel_core::dm_alert::{self, DmEvent};
+        if msg.chat.id == handle.owner_chat_id {
             return;
         }
-        let Some(from) = msg.from.as_ref().filter(|u| !u.is_bot && u.id != handle.bot_id) else {
-            return;
-        };
+        let Some(from) = msg.from.as_ref() else { return };
+        let chat = msg.chat.id.to_string();
+        let sender = from.id.to_string();
         let label = from.display_label();
-        let slugs: Vec<String> = self
-            .identity_index
-            .as_ref()
-            .and_then(|index| index.lookup(PLATFORM, &from.id.to_string()))
-            .map(|page| vec![page.slug.clone()])
-            .unwrap_or_default();
-        augmentagent_channel_core::dm_alerts::evaluate(
-            &self.store,
-            &augmentagent_channel_core::dm_alerts::InboundDm {
-                platform: PLATFORM,
-                conversation: &msg.chat.id.to_string(),
-                handles: &[],
-                person_slugs: &slugs,
-                sender_label: &label,
-                source_url: &format!("https://web.telegram.org/a/#{}", msg.chat.id),
-            },
-            now_millis(),
-        );
+        let source = format!("https://web.telegram.org/a/#{}", msg.chat.id);
+        let mut event = DmEvent::inbound_dm(PLATFORM, &chat, &sender, &source);
+        event.display_name = &label;
+        event.direct_message = msg.chat.is_private();
+        event.from_bot = from.is_bot;
+        event.from_self = from.id == handle.bot_id;
+        dm_alert::evaluate_inbound(&self.store, event, Some(&chat), self.identity_index.as_deref());
     }
 
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
@@ -1073,13 +1063,13 @@ mod tests {
             .unwrap()
     }
 
-    /// The DM-alert policy (#1643) runs before any downstream work: with
-    /// persistence broken the alert still lands. Only an eligible inbound
-    /// 1:1 DM may produce one.
+    /// #2424 — the shared DM-alert policy runs before any downstream work:
+    /// with persistence broken the alert still lands. Off until the policy
+    /// names Telegram, and only an eligible inbound 1:1 DM may alert.
     #[tokio::test]
     async fn dm_alerts_precede_persistence_and_skip_groups_bots_and_the_owner_chat() {
+        use augmentagent_channel_core::dm_alert::POLICY_ENV;
         use augmentagent_store::owner_alerts::Urgency;
-        std::env::set_var(augmentagent_channel_core::dm_alerts::ENABLED, "1");
         let (store, _f) = tmp_store();
         store
             .set_owner_alert_priority("person:priority-contact", Urgency::High)
@@ -1106,37 +1096,55 @@ mod tests {
         let subs = vec![
             sub(SubscriptionMode::Priority, "55501"),
             sub(SubscriptionMode::Priority, "55502"),
+            sub(SubscriptionMode::Priority, "55503"),
             sub(SubscriptionMode::Priority, "-100"),
         ];
         let by_chat = index_subs_by_chat(&subs);
         let mut out = PollOutcome::default();
+
+        // Disabled: triage is exactly what it was, and nothing alerts.
+        std::env::remove_var(POLICY_ENV);
         let dm = sample_msg(1, 55_501, "are we still on for tomorrow?");
-        ch.dispatch_message(&h, &dm, &by_chat, &mut out)
-            .await
-            .unwrap();
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
         assert_eq!(out.priority_skipped, 1, "triage is unchanged");
-        assert_eq!(owner_alerts(&store), 1, "the eligible 1:1 DM alerts");
+        assert_eq!(owner_alerts(&store), 0, "no policy means no DM alert");
+
+        std::env::set_var(POLICY_ENV, "telegram=priority");
+        let dm = sample_msg(2, 55_501, "hello again");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
+        assert_eq!(out.priority_skipped, 2, "triage is unchanged");
+        assert_eq!(owner_alerts(&store), 1, "the priority contact's 1:1 DM alerts");
+        let dm = sample_msg(3, 55_501, "and again");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
+        assert_eq!(owner_alerts(&store), 1, "one alert per conversation per hour");
 
         store
             .with_conn(|c| c.execute("DROP TABLE emails", []))
             .unwrap();
-        let second = sample_msg(2, 55_502, "ping");
+        let second = sample_msg(4, 55_502, "ping");
         let result = ch.dispatch_message(&h, &second, &by_chat, &mut out).await;
         assert!(result.is_err(), "persistence is broken");
         assert_eq!(owner_alerts(&store), 2, "the alert precedes persistence");
 
-        let mut group = sample_msg(3, -100, "team chatter");
+        let mut group = sample_msg(5, -100, "team chatter");
         group.chat.chat_type = "supergroup".into();
-        let mut bot = sample_msg(4, 55_501, "automated notice");
+        group.from.as_mut().unwrap().id = 55_501;
+        // Each rejected message uses a conversation that has not alerted, so
+        // only its own shape — never the hourly dedupe — can keep it quiet.
+        let mut bot = sample_msg(6, 55_503, "automated notice");
+        bot.from.as_mut().unwrap().id = 55_502;
         bot.from.as_mut().unwrap().is_bot = true;
-        for msg in [group, bot, sample_msg(5, 12_345, "note to self")] {
+        let mut owner = sample_msg(7, 12_345, "note to self");
+        owner.from.as_mut().unwrap().id = 55_501;
+        for msg in [group, bot, owner] {
             let _ = ch.dispatch_message(&h, &msg, &by_chat, &mut out).await;
         }
         assert_eq!(
             owner_alerts(&store),
             2,
-            "groups, other bots and the owner's own chat never alert"
+            "groups, bots and the owner's own chat never alert"
         );
+        std::env::remove_var(POLICY_ENV);
     }
 
     #[tokio::test]

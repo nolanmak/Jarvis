@@ -880,9 +880,35 @@ mod tests {
 
         // A conversation surfacing with only messages older than the previous
         // poll's newest entry is history being imported, not a new DM.
-        poll(&[("+14155550777", "Known", known), ("+14155550888", "Fresh", fresh),
-            ("+14155550999", "Old", page(&[old]))]);
+        poll(&[("+14155550777", "Known", known.clone()), ("+14155550888", "Fresh", fresh.clone()),
+            ("+14155550999", "Old", page(std::slice::from_ref(&old)))]);
         assert_eq!(high(), 1, "a backfilled conversation never alerts");
+
+        // #2424 — a group and the owner's own control transcript never alert,
+        // however new their inbound messages are.
+        let control_guid = "iMessage;-;+14155550555";
+        store.with_conn(|c| {
+            c.execute("INSERT INTO imessage_owner_control_chats VALUES(?1)", [control_guid])
+        }).unwrap();
+        let convs = [
+            ("+14155550777", "Known", "Known", known.as_str()),
+            ("+14155550888", "Fresh", "Fresh", fresh.as_str()),
+            ("+14155550999", "Old", "Old", &page(&[old])),
+            ("+14155550555", "Control", "Control",
+                &page(&[entry("2026-08-26T13:00:00-04:00", "+14155550555")])),
+            ("chat777", "Group", "Group",
+                &page(&[entry("2026-08-26T13:00:00-04:00", "+14155550666")])),
+        ];
+        let bundle = fixture_bundle(dir.path(), &convs);
+        let index_path = dir.path().join("conversations/index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        index["+14155550555"]["chat_guid"] = serde_json::json!(control_guid);
+        std::fs::write(&index_path, index.to_string()).unwrap();
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(high(), 1, "groups and owner control chats never alert");
+        assert!(store.email_first_seen_at("imessage:chat777:0").unwrap().is_some(),
+            "the group itself is still stored");
         std::env::remove_var(dm_alert::POLICY_ENV);
     }
 
