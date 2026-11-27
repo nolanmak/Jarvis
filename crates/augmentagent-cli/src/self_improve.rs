@@ -1799,7 +1799,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
     // locally only after the complete pool is known, then apply fair windows.
     let out = if let Some(target) = selected {
         let read = run(&gh, &["pr","view",&target.pr.to_string(),"--repo",&target.repository,"--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body"],repo_root).await;
+            "number,headRefName,headRefOid,baseRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,statusCheckRollup,body"],repo_root).await;
         let row = match read {
             Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
             _ => None,
@@ -1810,7 +1810,9 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         };
         serde_json::json!([row]).to_string()
     } else { match complete_repository_inventory(repo_root, "pr", None,
-        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,body").await {
+        // #2585: the head/base/check rollup is what `gh_budget::ci_fingerprint`
+        // reads to prove CI cannot have changed. One connection, no extra call.
+        "number,headRefName,headRefOid,baseRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,mergeStateStatus,statusCheckRollup,body").await {
         Ok(out) => out,
         Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
     }};

@@ -317,6 +317,30 @@ mod tests {
             "statusCheckRollup": [{"name": "rust", "status": check, "conclusion": null}]})
     }
 
+    /// The verdict reuse is only worth what the row it fingerprints carries.
+    /// The sweep asked GitHub for an inventory without `baseRefOid` or
+    /// `statusCheckRollup`, so `ci_fingerprint` was always `None`, every
+    /// examined PR paid its full hosted CI read again, and the sweep kept
+    /// draining the shared REST core budget it is meant to preserve.
+    #[test]
+    fn the_sweep_asks_github_for_every_field_the_fingerprint_reads() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep_selected(").expect("the sweep");
+        let sweep = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        let lists: Vec<&str> = sweep.match_indices("\"number,")
+            .map(|(at, _)| sweep[at + 1..].split('"').next().expect("a field list"))
+            .collect();
+        assert_eq!(lists.len(), 2, "the selected PR read and the repository inventory");
+        for list in lists {
+            let fields: Vec<&str> = list.split(',').collect();
+            for field in ["headRefOid", "baseRefOid", "statusCheckRollup"] {
+                assert!(fields.contains(&field), "the fingerprint reads {field}, absent from {list}");
+            }
+        }
+        assert!(ci_fingerprint(&serde_json::json!({"headRefOid": "a", "baseRefOid": "b",
+            "statusCheckRollup": []})).is_some(), "and those are the fields it reads");
+    }
+
     #[tokio::test]
     async fn unchanged_not_green_pr_skips_the_hosted_read() {
         use std::sync::atomic::{AtomicUsize, Ordering};
