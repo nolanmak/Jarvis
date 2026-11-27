@@ -149,3 +149,45 @@ pub fn dashboard_history_url() -> String {
     format!("http://localhost:{}/history",
         std::env::var("DASHBOARD_PORT").unwrap_or_else(|_| "3000".into()))
 }
+
+/// Channel-adapter entry point (#2424): evaluate `event` under the policy in
+/// the environment before the channel persists, triages or drafts the
+/// message. A disabled platform touches nothing. `history_thread` is the
+/// channel's stored thread ID for this conversation, so a chat with earlier
+/// stored messages is not a first contact the day the policy is enabled.
+/// Without a wiki `index` no sender resolves, so only first contacts qualify.
+/// A failure is logged, never returned: a missed notification must not drop
+/// or delay the message itself.
+pub fn evaluate_inbound(
+    store: &Store, mut event: DmEvent<'_>, history_thread: Option<&str>, index: Option<&IdentityIndex>,
+) -> Option<String> {
+    let policy = DmAlertPolicy::from_env();
+    if policy.mode(event.platform) == DmAlertMode::Off {
+        return None;
+    }
+    if event.display_name.trim().is_empty() {
+        event.display_name = event.handle;
+    }
+    if let Some(thread) = history_thread {
+        event.prior_inbound |= thread_has_history(store, event.platform, thread);
+    }
+    let empty = IdentityIndex::default();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match evaluate(store, &policy, &event, index.unwrap_or(&empty), now_ms) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(platform = event.platform, error = %e, "new-DM alert evaluation failed");
+            None
+        }
+    }
+}
+
+/// Whether the channel already stored a message in `thread_id`. A failed
+/// lookup counts as history: it can cost a first-contact alert, never invent one.
+fn thread_has_history(store: &Store, platform: &str, thread_id: &str) -> bool {
+    let sql = "SELECT EXISTS(SELECT 1 FROM emails WHERE platform=?1 AND threadId=?2)";
+    store
+        .with_conn(|c| c.query_row(sql, [platform, thread_id], |r| r.get(0)))
+        .inspect_err(|e| tracing::warn!(platform, error = %e, "DM history lookup failed"))
+        .unwrap_or(true)
+}
