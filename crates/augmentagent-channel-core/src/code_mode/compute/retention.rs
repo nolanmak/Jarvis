@@ -287,12 +287,37 @@ impl Drop for Lease {
         }
     }
 }
+/// Bytes the store's filesystem can still hand out, as the kernel reports them.
+fn available_bytes(root: &Directory) -> Result<u64> {
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    anyhow::ensure!(
+        unsafe { libc::fstatvfs(root.0.as_raw_fd(), vfs.as_mut_ptr()) } == 0,
+        "compute storage capacity unavailable"
+    );
+    let vfs = unsafe { vfs.assume_init() };
+    Ok((vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64))
+}
+
 impl Lease {
     pub fn reserve(
         path: &Path,
         account: &str,
         at: u64,
         limits: BuildScratchLimits,
+    ) -> Result<Self> {
+        Self::reserve_with(path, account, at, limits, available_bytes)
+    }
+
+    /// `available` reports the store filesystem's free bytes. Production passes
+    /// [`available_bytes`]; the reservation-accounting tests pin it, so what
+    /// the store charges itself is asserted without also demanding gigabytes
+    /// of real free space from whatever host happens to run them.
+    fn reserve_with(
+        path: &Path,
+        account: &str,
+        at: u64,
+        limits: BuildScratchLimits,
+        available: impl FnOnce(&Directory) -> Result<u64>,
     ) -> Result<Self> {
         anyhow::ensure!(
             cfg!(target_os = "linux"),
@@ -350,14 +375,8 @@ impl Lease {
                 <= limits.budget_bytes,
             AdmissionDenied
         );
-        let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         anyhow::ensure!(
-            unsafe { libc::fstatvfs(root.0.as_raw_fd(), vfs.as_mut_ptr()) } == 0,
-            "compute storage capacity unavailable"
-        );
-        let vfs = unsafe { vfs.assume_init() };
-        anyhow::ensure!(
-            (vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64)
+            available(&root)?
                 >= limits
                     .headroom_bytes
                     .saturating_add(outstanding)
@@ -541,22 +560,30 @@ mod tests {
         );
     }
 
+    /// What the store charges itself, with the filesystem's free space pinned
+    /// well above anything the reservations need: three live 640 MiB
+    /// reservations would otherwise ask a CI runner for ~2 GiB of real free
+    /// space, which a disk-tight job cannot promise.
+    fn reserve_roomy(path: &Path, account: &str, at: u64) -> Result<Lease> {
+        Lease::reserve_with(path, account, at, limits(), |_| Ok(4 * STORE_LIMIT))
+    }
+
     #[test]
     fn reservation_refuses_storage_overcommit_and_retention_releases_unused_capacity() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.path().join("store");
-        let first = Lease::reserve(&path, "account-a", 10, limits()).unwrap();
-        let second = Lease::reserve(&path, "account-b", 10, limits()).unwrap();
-        let third = Lease::reserve(&path, "account-c", 10, limits()).unwrap();
+        let first = reserve_roomy(&path, "account-a", 10).unwrap();
+        let second = reserve_roomy(&path, "account-b", 10).unwrap();
+        let third = reserve_roomy(&path, "account-c", 10).unwrap();
         assert!(
-            Lease::reserve(&path, "account-d", 10, limits()).is_err(),
+            reserve_roomy(&path, "account-d", 10).is_err(),
             "active reservations must count before bytes are written"
         );
         first
             .retain(&json!({"cleanupVerified":true,"records":[]}), 20)
             .unwrap();
-        let fourth = Lease::reserve(&path, "account-d", 20, limits()).unwrap();
+        let fourth = reserve_roomy(&path, "account-d", 20).unwrap();
         let value = child(&first.root, &first.name)
             .unwrap()
             .read_private_json("retention.json")
@@ -568,6 +595,26 @@ mod tests {
         assert_eq!(report.retained, 1);
         assert_eq!(report.removed, 3);
         assert_eq!(sweep_at(&path, 20 + TTL_SECS).unwrap().removed, 1);
+    }
+
+    /// The store never admits a task the filesystem cannot hold: the operator
+    /// headroom plus the new task's reservation must still fit in free space.
+    #[test]
+    fn reservation_refuses_a_filesystem_that_cannot_hold_the_task() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("store");
+        let headroom = BuildScratchLimits {
+            headroom_bytes: 8 * 1024 * 1024 * 1024,
+            ..limits()
+        };
+        let need = headroom.headroom_bytes + TASK_RESERVATION;
+        assert!(
+            Lease::reserve_with(&path, "account-a", 10, headroom, |_| Ok(need - 1)).is_err(),
+            "one byte short of the headroom plus the reservation must be refused"
+        );
+        let admitted = Lease::reserve_with(&path, "account-a", 10, headroom, |_| Ok(need)).unwrap();
+        assert!(admitted.path.exists());
     }
 
     #[test]
