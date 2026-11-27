@@ -166,7 +166,11 @@ impl NudgeScheduler {
         // draft makes the card's revision differ from the stored draft and
         // causes every approval from a reminder to fail the stale-card check.
         let mut email = card.action.email.clone();
-        email.body = format!("{header}\n\n{}", email.body);
+        // #2426: project the inbound body before the header goes above it. A
+        // reminder quotes the same body as the original card, so it has to
+        // read the same way — and a prefixed body is no longer recognisable
+        // as the MIME container or HTML document it started as.
+        email.body = format!("{header}\n\n{}", crate::layout::discord_body(&email.body));
 
         match self
             .approvals
@@ -345,5 +349,80 @@ mod tests {
         for email in broker.emails.lock().unwrap().iter() {
             assert!(email.body.starts_with("🔔 reminder"));
         }
+    }
+
+    /// #2426 — a reminder quotes the stored body under its own header, so the
+    /// re-posted card must read like the original one: a MIME container shows
+    /// the sender's plain-text alternative, never raw headers and boundaries.
+    #[tokio::test]
+    async fn a_reminder_card_renders_the_projected_body_not_the_raw_container() {
+        use augmentagent_store::ActionStatus;
+
+        const CONTAINER: &str = concat!(
+            "Content-Type: multipart/alternative; boundary=\"nudge-1\"\n\n",
+            "--nudge-1\nContent-Type: text/plain; charset=utf-8\n\n",
+            "The plain alternative the sender wrote.\n",
+            "--nudge-1\nContent-Type: text/html; charset=utf-8\n\n",
+            "<p>The derived HTML alternative.</p>\n--nudge-1--\n",
+        );
+        const DRAFT: &str = "Thursday works.";
+
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(f.path()).unwrap());
+        let email = Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "mime:r1".into(),
+            thread_id: None,
+            from: "peer@example.invalid".into(),
+            subject: "Re: the plan".into(),
+            body: CONTAINER.into(),
+            date: String::new(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        store.upsert_email(&email).unwrap();
+        let id = store
+            .log_action(
+                "mime:r1",
+                None,
+                "peer@example.invalid",
+                "Re: the plan",
+                Some(CONTAINER),
+                Some(DRAFT),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let broker = Arc::new(CountingBroker::default());
+        let sched = NudgeScheduler::new(store.clone(), broker.clone());
+        assert!(sched.post_next_if_idle().await.unwrap());
+
+        // Exactly what the Discord broker renders from what it was handed.
+        let (email, draft) = {
+            let emails = broker.emails.lock().unwrap();
+            let posts = broker.posts.lock().unwrap();
+            let email = emails.first().cloned().expect("the reminder posted a card");
+            (email, posts.first().expect("the reminder posted a card").1.clone())
+        };
+        let card = serde_json::to_value(crate::approval_message(&id, &email, &draft, 0))
+            .expect("CreateMessage serializes");
+        let shown = card["embeds"][0]["description"]
+            .as_str()
+            .expect("the card has a description");
+        assert!(shown.contains("🔔 reminder"), "the reminder header is lost: {shown}");
+        assert!(
+            shown.contains("The plain alternative the sender wrote."),
+            "the plain alternative is what the card shows: {shown}"
+        );
+        assert!(!shown.contains("Content-Type"), "raw MIME headers on the card: {shown}");
+        assert!(!shown.contains("nudge-1"), "raw MIME boundaries on the card: {shown}");
+        assert_eq!(
+            store.get_action_with_email(&id).unwrap().unwrap().email.body,
+            CONTAINER,
+            "the stored body is never rewritten"
+        );
     }
 }

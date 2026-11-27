@@ -1883,14 +1883,20 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // #2458: after GitHub merged main into the approved head, the
         // approval recorded at that head reaches the merge commit through
         // the durable update. Resolved before any gate reads approval.
+        let review_mode = crate::autoship_review::ReviewMode::current();
         let carry = match (record.as_ref(), head_sha.as_deref()) {
             (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
                 finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
             _ => None,
-        };
+        // #2588: a nightly review park leaves the record behind the bound head;
+        // the workflow's own pending update then anchors the carry.
+        }.or_else(|| match head_sha.as_deref() {
+            Some(head) if review_mode == crate::autoship_review::ReviewMode::Nightly =>
+                finalize::pending_for_binding(&workflow::path(), &repository, pr, branch, head),
+            _ => None,
+        });
         let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
         let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
-        let review_mode = crate::autoship_review::ReviewMode::current();
         if review_mode == crate::autoship_review::ReviewMode::PreMerge
             && !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
@@ -19802,8 +19808,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn pick_issue(repo_root: &Path").expect("pick_issue");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        assert!(body.contains("fetch_issue_pages("), "paginated (#1519)");
-        assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
+        // The paginated listing is now shared per tick (#2584).
+        assert!(body.contains("open_issue_rest_inventory("), "shared inventory");
+        let start = src.find("async fn open_issue_rest_inventory(").expect("inventory");
+        let inventory = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        assert!(inventory.contains("fetch_issue_pages("), "paginated (#1519)");
+        assert!(!body.contains("per_page=50") && !inventory.contains("per_page=50"),
+            "the newest-50 window is gone");
     }
 
     #[test]

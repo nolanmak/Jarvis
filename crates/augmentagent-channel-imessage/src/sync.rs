@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use augmentagent_channel_core::dm_alert::{self, DmAlertPolicy, DmEvent};
 use augmentagent_store::{PhoneIdentity, Store};
 use augmentagent_wiki::{
     merge_person_page, slug_from_email, IdentityIndex, PersonPatch, WikiLayout,
@@ -320,12 +321,71 @@ pub struct PollDelta {
     pub first_run: bool,
 }
 
+/// Wiki root the DM-alert evaluator resolves senders against. The poll loop
+/// never receives `--wiki-dir`, so the CLI exports it here instead (#2422).
+pub const WIKI_DIR_ENV: &str = "AUGMENTAGENT_WIKI_DIR";
+
+/// Everything one poll pass needs to evaluate new DMs, resolved once.
+struct DmAlertPass {
+    policy: DmAlertPolicy,
+    /// `None` when the configured wiki is unreadable, suppressing DM alerts
+    /// rather than calling a known person a stranger; an empty index (no wiki
+    /// configured) still allows first contacts.
+    index: Option<IdentityIndex>,
+    source_url: String,
+}
+
+impl DmAlertPass {
+    fn open() -> Self {
+        let index = match std::env::var_os(WIKI_DIR_ENV).filter(|root| !root.is_empty()) {
+            None => Some(IdentityIndex::default()),
+            Some(root) => IdentityIndex::build(&WikiLayout::new(PathBuf::from(root)))
+                .inspect_err(|e| warn!(error = %e, "wiki index unavailable; skipping DM alerts"))
+                .ok(),
+        };
+        Self {
+            policy: DmAlertPolicy::from_env(), index,
+            source_url: dm_alert::dashboard_history_url(),
+        }
+    }
+
+    /// Evaluate one newly observed entry against the shared policy, before
+    /// `poll_once` stores it. An evaluation failure is logged and swallowed:
+    /// a missed notification must never drop a message.
+    fn evaluate(&self, store: &Store, conv: &Conversation, entry: &MessageEntry, prior: bool) {
+        let Some(index) = self.index.as_ref() else { return };
+        let title = clean_title(&conv.title);
+        let mut event =
+            DmEvent::inbound_dm("imessage", &conv.identifier, &entry.sender, &self.source_url);
+        event.display_name = if title.is_empty() { &entry.sender } else { &title };
+        event.direct_message = !conv.is_group();
+        event.from_self = entry.sender == "me";
+        // A handle that is neither E.164 nor an Apple-ID address is a short
+        // code or service sender — the signal the page backfill refuses to page.
+        event.from_bot = !entry.sender.starts_with('+') && !entry.sender.contains('@');
+        event.prior_inbound = prior;
+        // Read the clock at the claim, not when the poll opened, so the
+        // rolling hour is measured from when the alert was actually made.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = dm_alert::evaluate(store, &self.policy, &event, index, now_ms) {
+            warn!(conversation = %conv.identifier, error = %e, "new-DM alert evaluation failed");
+        }
+    }
+}
+
 /// Read every conversation's tail past the cursor, persist the messages as
 /// `emails` rows (historical `firstSeenAt`), advance the cursor.
 pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollDelta>)> {
     let mut stats = PollStats::default();
     let mut deltas = Vec::new();
+    let dm_alerts = DmAlertPass::open();
 
+    // The newest iMessage already stored before this poll: a conversation
+    // seen for the first time whose entries are all at or before it is
+    // history being imported, not a new DM. An empty store imports only.
+    let backfill_cutoff_ms: Option<i64> = store.with_conn(|c| {
+        c.query_row("SELECT MAX(firstSeenAt) FROM emails WHERE platform='imessage'", [], |r| r.get(0))
+    })?;
     let conversations = bundle.conversations()?;
     store.set_archive_newest_entry(
         "imessage",
@@ -353,15 +413,28 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
             continue;
         }
 
+        let mut prior_inbound = entries[..seen].iter().any(|e| e.sender != "me");
         let mut new_entries = Vec::new();
         for (idx, entry) in entries.iter().enumerate().skip(seen) {
             let email = synthetic_imessage_email(&conv, idx, entry);
             let ts_ms = DateTime::parse_from_rfc3339(&entry.timestamp)
                 .map(|t| t.timestamp_millis())
                 .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+            // A backfilled entry is still stored and still counts as prior
+            // history below; it just never alerts. Entries of a conversation
+            // already being followed are new by construction.
+            let live = seen > 0
+                || backfill_cutoff_ms.is_some_and(|cutoff| {
+                    DateTime::parse_from_rfc3339(&entry.timestamp)
+                        .is_ok_and(|ts| ts.timestamp_millis() > cutoff)
+                });
+            if live {
+                dm_alerts.evaluate(store, &conv, entry, prior_inbound);
+            }
             if store.upsert_email_backfill(&email, ts_ms)? {
                 stats.emails_inserted += 1;
             }
+            prior_inbound |= entry.sender != "me";
             new_entries.push((idx, entry.clone()));
         }
         store.set_imessage_entries_seen(&conv.identifier, entries.len() as i64)?;
@@ -759,6 +832,84 @@ mod tests {
         assert_eq!(report.pages_updated, 1);
         let page = std::fs::read_to_string(layout.people_dir().join("jane.md")).unwrap();
         assert!(page.contains("iMessage group 'Ski Trip'"), "page:\n{page}");
+    }
+
+    /// #2422 — every new DM is evaluated against the policy before it is
+    /// stored: nothing until the owner opts the platform in, then one alert
+    /// for a conversation's first inbound contact and nothing after it. A
+    /// conversation that first shows up with several live messages still
+    /// alerts; one whose messages predate the previous poll is a backfill.
+    #[test]
+    fn poll_alerts_once_on_a_new_dm_only_once_the_policy_opts_imessage_in() {
+        let (dir, _layout, store) = fresh_env();
+        let entry = |ts: &str, handle: &str| format!("\n### [{ts}] {handle}\nyo\n");
+        let page = |entries: &[String]| format!("---\n---\n{}", entries.concat());
+        let known_1 = entry("2026-08-26T11:00:00-04:00", "+14155550777");
+        let known_2 = entry("2026-08-26T11:05:00-04:00", "+14155550777");
+        let fresh_1 = entry("2026-08-26T12:00:00-04:00", "+14155550888");
+        let fresh_2 = entry("2026-08-26T12:01:00-04:00", "+14155550888");
+        let fresh_3 = entry("2026-08-26T12:30:00-04:00", "+14155550888");
+        let old = entry("2026-08-01T09:00:00-04:00", "+14155550999");
+        let poll = |convs: &[(&str, &str, String)]| {
+            let convs: Vec<(&str, &str, &str, &str)> =
+                convs.iter().map(|(h, name, md)| (*h, *name, *name, md.as_str())).collect();
+            poll_once(&fixture_bundle(dir.path(), &convs), &store).unwrap();
+        };
+        let sql = "SELECT COUNT(*) FROM owner_alerts WHERE urgency='high'";
+        let high = || store.with_conn(|c| c.query_row(sql, [], |r| r.get::<_, i64>(0))).unwrap();
+
+        std::env::remove_var(dm_alert::POLICY_ENV);
+        poll(&[("+14155550777", "Known", page(std::slice::from_ref(&known_1)))]);
+        assert_eq!(high(), 0, "no policy means no DM alert");
+        assert!(store.email_first_seen_at("imessage:+14155550777:0").unwrap().is_some());
+
+        // Opting in mid-conversation: the conversation already has stored
+        // inbound history, so its next message is not a first contact.
+        std::env::set_var(dm_alert::POLICY_ENV, "imessage=first-contact");
+        let known = page(&[known_1, known_2]);
+        poll(&[("+14155550777", "Known", known.clone())]);
+        assert_eq!(high(), 0, "an established conversation is not a new DM");
+
+        // Two live messages land in a brand-new conversation between polls.
+        let fresh = page(&[fresh_1.clone(), fresh_2.clone()]);
+        poll(&[("+14155550777", "Known", known.clone()), ("+14155550888", "Fresh", fresh)]);
+        assert_eq!(high(), 1, "a burst in a new conversation is still a first contact");
+        let fresh = page(&[fresh_1, fresh_2, fresh_3]);
+        poll(&[("+14155550777", "Known", known.clone()), ("+14155550888", "Fresh", fresh.clone())]);
+        assert_eq!(high(), 1, "at most one alert per conversation");
+
+        // A conversation surfacing with only messages older than the previous
+        // poll's newest entry is history being imported, not a new DM.
+        poll(&[("+14155550777", "Known", known.clone()), ("+14155550888", "Fresh", fresh.clone()),
+            ("+14155550999", "Old", page(std::slice::from_ref(&old)))]);
+        assert_eq!(high(), 1, "a backfilled conversation never alerts");
+
+        // #2424 — a group and the owner's own control transcript never alert,
+        // however new their inbound messages are.
+        let control_guid = "iMessage;-;+14155550555";
+        store.with_conn(|c| {
+            c.execute("INSERT INTO imessage_owner_control_chats VALUES(?1)", [control_guid])
+        }).unwrap();
+        let convs = [
+            ("+14155550777", "Known", "Known", known.as_str()),
+            ("+14155550888", "Fresh", "Fresh", fresh.as_str()),
+            ("+14155550999", "Old", "Old", &page(&[old])),
+            ("+14155550555", "Control", "Control",
+                &page(&[entry("2026-08-26T13:00:00-04:00", "+14155550555")])),
+            ("chat777", "Group", "Group",
+                &page(&[entry("2026-08-26T13:00:00-04:00", "+14155550666")])),
+        ];
+        let bundle = fixture_bundle(dir.path(), &convs);
+        let index_path = dir.path().join("conversations/index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        index["+14155550555"]["chat_guid"] = serde_json::json!(control_guid);
+        std::fs::write(&index_path, index.to_string()).unwrap();
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(high(), 1, "groups and owner control chats never alert");
+        assert!(store.email_first_seen_at("imessage:chat777:0").unwrap().is_some(),
+            "the group itself is still stored");
+        std::env::remove_var(dm_alert::POLICY_ENV);
     }
 
     #[test]
