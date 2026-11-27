@@ -116,8 +116,13 @@ the exact handle only, to a person on the `imessage alerts priority` list, muted
 own class, `all` both. A conversation first seen with only messages at or
 before the newest iMessage already stored is a backfill, not a DM.
 
-Only the iMessage poll evaluates this policy today; the other messaging
-channels are wired in follow-up slices of #1643, so naming another platform has
+The iMessage poll, Telegram bot direct chats and WhatsApp personal chats
+evaluate this policy (`imessage`, `telegram`, `whatsapp`), each after its own
+allowlist, owner/control-chat and outbound checks and before triage or drafting,
+so alerts never widen who a channel reads. Telegram senders resolve through the
+wiki `telegram` user-id identities and WhatsApp senders through the `whatsapp`
+JIDs; a chat with earlier stored messages is not a first contact. The remaining
+channels are wired in a follow-up slice of #1643, so naming another platform has
 no effect until its channel calls the shared evaluator.
 
 A qualifying message creates one **High** owner alert per platform conversation

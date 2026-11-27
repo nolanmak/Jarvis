@@ -352,6 +352,10 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
             return Ok(());
         }
 
+        // Shared DM-alert policy (#1643) — every admission check above has
+        // already run, and nothing durable has happened to this message yet.
+        self.evaluate_dm_alert(handle, msg);
+
         let email = message_to_email(handle, msg, sub);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
@@ -553,6 +557,29 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
                 Ok(())
             }
         }
+    }
+
+    /// Hand an admitted message to the shared DM-alert policy (#2424). The
+    /// evaluator rejects group and channel posts, bots and this bot's own
+    /// echoes; the owner's control DM is excluded here. The chat id is both
+    /// the dedupe key and the stored thread ID; the sender's Telegram user id
+    /// is resolved through the wiki identity index only.
+    fn evaluate_dm_alert(&self, handle: &BotHandle, msg: &Message) {
+        use augmentagent_channel_core::dm_alert::{self, DmEvent};
+        if msg.chat.id == handle.owner_chat_id {
+            return;
+        }
+        let Some(from) = msg.from.as_ref() else { return };
+        let chat = msg.chat.id.to_string();
+        let sender = from.id.to_string();
+        let label = from.display_label();
+        let source = format!("https://web.telegram.org/a/#{}", msg.chat.id);
+        let mut event = DmEvent::inbound_dm(PLATFORM, &chat, &sender, &source);
+        event.display_name = &label;
+        event.direct_message = msg.chat.is_private();
+        event.from_bot = from.is_bot;
+        event.from_self = from.id == handle.bot_id;
+        dm_alert::evaluate_inbound(&self.store, event, Some(&chat), self.identity_index.as_deref());
     }
 
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
@@ -1028,6 +1055,96 @@ mod tests {
             },
             None,
         )
+    }
+
+    fn owner_alerts(store: &Store) -> i64 {
+        store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM owner_alerts", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// #2424 — the shared DM-alert policy runs before any downstream work:
+    /// with persistence broken the alert still lands. Off until the policy
+    /// names Telegram, and only an eligible inbound 1:1 DM may alert.
+    #[tokio::test]
+    async fn dm_alerts_precede_persistence_and_skip_groups_bots_and_the_owner_chat() {
+        use augmentagent_channel_core::dm_alert::POLICY_ENV;
+        use augmentagent_store::owner_alerts::Urgency;
+        let (store, _f) = tmp_store();
+        store
+            .set_owner_alert_priority("person:priority-contact", Urgency::High)
+            .unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::create_dir(wiki.path().join("people")).unwrap();
+        std::fs::write(
+            wiki.path().join("people/priority-contact.md"),
+            "---\nidentities:\n  telegram: [\"55501\", \"55502\"]\n---\n",
+        )
+        .unwrap();
+        let index = IdentityIndex::build(&augmentagent_wiki::WikiLayout::new(
+            wiki.path().to_path_buf(),
+        ))
+        .unwrap();
+        let mut ch = build_channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        ch.identity_index = Some(Arc::new(index));
+
+        let h = handle();
+        let subs = vec![
+            sub(SubscriptionMode::Priority, "55501"),
+            sub(SubscriptionMode::Priority, "55502"),
+            sub(SubscriptionMode::Priority, "55503"),
+            sub(SubscriptionMode::Priority, "-100"),
+        ];
+        let by_chat = index_subs_by_chat(&subs);
+        let mut out = PollOutcome::default();
+
+        // Disabled: triage is exactly what it was, and nothing alerts.
+        std::env::remove_var(POLICY_ENV);
+        let dm = sample_msg(1, 55_501, "are we still on for tomorrow?");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
+        assert_eq!(out.priority_skipped, 1, "triage is unchanged");
+        assert_eq!(owner_alerts(&store), 0, "no policy means no DM alert");
+
+        std::env::set_var(POLICY_ENV, "telegram=priority");
+        let dm = sample_msg(2, 55_501, "hello again");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
+        assert_eq!(out.priority_skipped, 2, "triage is unchanged");
+        assert_eq!(owner_alerts(&store), 1, "the priority contact's 1:1 DM alerts");
+        let dm = sample_msg(3, 55_501, "and again");
+        ch.dispatch_message(&h, &dm, &by_chat, &mut out).await.unwrap();
+        assert_eq!(owner_alerts(&store), 1, "one alert per conversation per hour");
+
+        store
+            .with_conn(|c| c.execute("DROP TABLE emails", []))
+            .unwrap();
+        let second = sample_msg(4, 55_502, "ping");
+        let result = ch.dispatch_message(&h, &second, &by_chat, &mut out).await;
+        assert!(result.is_err(), "persistence is broken");
+        assert_eq!(owner_alerts(&store), 2, "the alert precedes persistence");
+
+        let mut group = sample_msg(5, -100, "team chatter");
+        group.chat.chat_type = "supergroup".into();
+        group.from.as_mut().unwrap().id = 55_501;
+        // Each rejected message uses a conversation that has not alerted, so
+        // only its own shape — never the hourly dedupe — can keep it quiet.
+        let mut bot = sample_msg(6, 55_503, "automated notice");
+        bot.from.as_mut().unwrap().id = 55_502;
+        bot.from.as_mut().unwrap().is_bot = true;
+        let mut owner = sample_msg(7, 12_345, "note to self");
+        owner.from.as_mut().unwrap().id = 55_501;
+        for msg in [group, bot, owner] {
+            let _ = ch.dispatch_message(&h, &msg, &by_chat, &mut out).await;
+        }
+        assert_eq!(
+            owner_alerts(&store),
+            2,
+            "groups, bots and the owner's own chat never alert"
+        );
+        std::env::remove_var(POLICY_ENV);
     }
 
     #[tokio::test]
