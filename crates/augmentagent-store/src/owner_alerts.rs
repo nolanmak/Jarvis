@@ -128,6 +128,76 @@ impl OwnerAlert {
     }
 }
 
+/// Everything [`Store::insert_owner_alert`] rejects, checked before any write
+/// so a caller can validate an alert ahead of the transaction that inserts it.
+fn validate_owner_alert(a: &NewOwnerAlert<'_>) -> StoreResult<()> {
+    if a.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(StoreError::InvalidInput(
+            "invalid owner alert timezone".into(),
+        ));
+    }
+    if a.id.len() > 80
+        || a.sender.chars().count() > 120
+        || a.action.chars().count() > 400
+        || a.reason.chars().count() > 400
+        || a.source_url.len() > 1500
+    {
+        return Err(StoreError::InvalidInput(
+            "owner alert fields exceed concise notification limits".into(),
+        ));
+    }
+    for (name, value) in [
+        ("id", a.id),
+        ("source URL", a.source_url),
+        ("sender", a.sender),
+        ("action", a.action),
+        ("reason", a.reason),
+        ("timezone", a.timezone),
+    ] {
+        if value.trim().is_empty() || value.contains('\0') {
+            return Err(StoreError::InvalidInput(format!(
+                "owner alert requires {name}"
+            )));
+        }
+    }
+    if !(a.source_url.starts_with("https://") || a.source_url.starts_with("http://")) {
+        return Err(StoreError::InvalidInput(
+            "owner alert source must be an HTTP(S) link".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Insert a validated alert on `c`, which may be an open transaction. Returns
+/// the number of rows written: `0` when the ID already exists.
+fn insert_owner_alert_row(c: &Connection, a: &NewOwnerAlert<'_>, now: i64) -> rusqlite::Result<usize> {
+    c.execute(
+        "INSERT INTO owner_alerts
+    (id,source_url,sender,action,reason,urgency,due_at_ms,timezone,meeting_id,
+     expires_at_ms,text_after_ms,created_at_ms,updated_at_ms)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+    ON CONFLICT(id) DO NOTHING",
+        params![
+            a.id,
+            a.source_url,
+            a.sender,
+            a.action,
+            a.reason,
+            a.urgency.as_str(),
+            a.due_at_ms,
+            a.timezone,
+            a.meeting_id,
+            a.expires_at_ms,
+            if a.urgency == Urgency::Critical {
+                now
+            } else {
+                a.text_after_ms
+            },
+            now
+        ],
+    )
+}
+
 pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS owner_alerts (
@@ -374,84 +444,39 @@ impl Store {
     }
 
     pub fn insert_owner_alert(&self, a: &NewOwnerAlert<'_>, now: i64) -> StoreResult<bool> {
-        if a.timezone.parse::<chrono_tz::Tz>().is_err() {
-            return Err(StoreError::InvalidInput(
-                "invalid owner alert timezone".into(),
-            ));
-        }
-        if a.id.len() > 80
-            || a.sender.chars().count() > 120
-            || a.action.chars().count() > 400
-            || a.reason.chars().count() > 400
-            || a.source_url.len() > 1500
-        {
-            return Err(StoreError::InvalidInput(
-                "owner alert fields exceed concise notification limits".into(),
-            ));
-        }
-        for (name, value) in [
-            ("id", a.id),
-            ("source URL", a.source_url),
-            ("sender", a.sender),
-            ("action", a.action),
-            ("reason", a.reason),
-            ("timezone", a.timezone),
-        ] {
-            if value.trim().is_empty() || value.contains('\0') {
-                return Err(StoreError::InvalidInput(format!(
-                    "owner alert requires {name}"
-                )));
-            }
-        }
-        if !(a.source_url.starts_with("https://") || a.source_url.starts_with("http://")) {
-            return Err(StoreError::InvalidInput(
-                "owner alert source must be an HTTP(S) link".into(),
-            ));
-        }
-        Ok(self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO owner_alerts
-            (id,source_url,sender,action,reason,urgency,due_at_ms,timezone,meeting_id,
-             expires_at_ms,text_after_ms,created_at_ms,updated_at_ms)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-            ON CONFLICT(id) DO NOTHING",
-                params![
-                    a.id,
-                    a.source_url,
-                    a.sender,
-                    a.action,
-                    a.reason,
-                    a.urgency.as_str(),
-                    a.due_at_ms,
-                    a.timezone,
-                    a.meeting_id,
-                    a.expires_at_ms,
-                    if a.urgency == Urgency::Critical {
-                        now
-                    } else {
-                        a.text_after_ms
-                    },
-                    now
-                ],
-            )
-        })? == 1)
+        validate_owner_alert(a)?;
+        Ok(self.with_conn(|c| insert_owner_alert_row(c, a, now))? == 1)
     }
 
     /// Record the inbound DM and, when the policy, the conversation's prior
     /// history and this hour's claim all permit it, create the High owner
     /// alert. Returns the new alert's ID, `None` when nothing qualified. The
-    /// claim is committed before the alert row, so the worst a failure between
-    /// them can do is cost this hour's alert — never a duplicate — and all the
-    /// alert insert would reject is checked up front, before any write (#2422).
+    /// alert is validated before any write and inserted in the same
+    /// transaction as the history and the claim, so a rejected or interrupted
+    /// alert leaves the conversation's first contact unconsumed (#2422).
     pub fn create_dm_owner_alert(&self, dm: &NewDmAlert<'_>, now: i64) -> StoreResult<Option<String>> {
         let blank = [dm.platform, dm.conversation_id, dm.sender]
             .iter().any(|v| v.trim().is_empty() || v.contains('\0'));
-        let linked = dm.source_url.starts_with("https://") || dm.source_url.starts_with("http://");
-        if blank || !linked || dm.timezone.parse::<chrono_tz::Tz>().is_err() {
+        if blank {
             return Err(StoreError::InvalidInput(
                 "DM alert requires a platform, conversation, sender, timezone and link".into()));
         }
-        let claim = self.with_conn(|c| {
+        let (action, reason) = if dm.allow_priority {
+            ("Read the new direct message from a priority contact", "Owner-priority contact")
+        } else {
+            ("Read the first direct message from this sender", "First stored inbound contact")
+        };
+        let sender: String = dm.sender.chars().take(120).collect();
+        let reason = format!("{reason} on {}", dm.platform);
+        let alert = NewOwnerAlert {
+            // The real ID needs the conversation row; this is its longest form.
+            id: &format!("dm-alert:{}:{}", i64::MAX, i64::MIN),
+            source_url: dm.source_url, action, sender: &sender, reason: &reason,
+            urgency: Urgency::High, due_at_ms: None, timezone: dm.timezone, meeting_id: None,
+            expires_at_ms: now + DM_ALERT_WINDOW_MS, text_after_ms: now,
+        };
+        validate_owner_alert(&alert)?;
+        self.with_conn(|c| {
             let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             // Counting the message is what answers "was there inbound history
             // before this one?", and happens even when nothing may alert.
@@ -467,30 +492,15 @@ impl Store {
             // what stops concurrent pollers and restarts from both alerting.
             let claimed = (dm.allow_priority || (dm.allow_first_contact && !prior))
                 && !matches!(claimed_at, Some(at) if at > now - DM_ALERT_WINDOW_MS);
+            let id = format!("dm-alert:{conversation}:{now}");
             if claimed {
                 let sql = "UPDATE owner_dm_conversations SET alert_claimed_at_ms=?2 WHERE id=?1";
                 tx.execute(sql, params![conversation, now])?;
+                insert_owner_alert_row(&tx, &NewOwnerAlert { id: &id, ..alert }, now)?;
             }
             tx.commit()?;
-            Ok(claimed.then(|| format!("dm-alert:{conversation}:{now}")))
-        })?;
-        let Some(id) = claim else { return Ok(None) };
-        let (action, reason) = if dm.allow_priority {
-            ("Read the new direct message from a priority contact", "Owner-priority contact")
-        } else {
-            ("Read the first direct message from this sender", "First stored inbound contact")
-        };
-        self.insert_owner_alert(
-            &NewOwnerAlert {
-                id: &id, source_url: dm.source_url, action,
-                sender: &dm.sender.chars().take(120).collect::<String>(),
-                reason: &format!("{reason} on {}", dm.platform),
-                urgency: Urgency::High, due_at_ms: None, timezone: dm.timezone, meeting_id: None,
-                expires_at_ms: now + DM_ALERT_WINDOW_MS, text_after_ms: now,
-            },
-            now,
-        )?;
-        Ok(Some(id))
+            Ok(claimed.then_some(id))
+        })
     }
 
     pub fn owner_alert(&self, id: &str) -> StoreResult<Option<OwnerAlert>> {

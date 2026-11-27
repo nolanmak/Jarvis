@@ -39,7 +39,8 @@ fn policy_parses_exact_entries_and_otherwise_stays_off() {
     for raw in [
         "", "imessage=off", "imessage=everything", "imessage = all", "imessage=ALL",
         "IMESSAGE=all", "imessage=all,imessage=all", "imessage=all,imessage=off",
-        "imessage=bogus,imessage=all", "imessage", "=all", "imessages=all", "slack=all",
+        "imessage=bogus,imessage=all", "imessage", "imessage=all,imessage",
+        "imessage=all,imessage=", "=all", "imessages=all", "slack=all",
     ] {
         assert_eq!(mode(raw), DmAlertMode::Off, "policy {raw:?}");
     }

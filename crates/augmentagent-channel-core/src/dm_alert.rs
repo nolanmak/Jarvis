@@ -49,7 +49,9 @@ impl DmAlertPolicy {
         let mut modes = BTreeMap::new();
         let mut rejected = BTreeSet::new();
         for entry in raw.split(',').filter(|entry| !entry.is_empty()) {
-            let Some((platform, mode)) = entry.split_once('=') else { continue };
+            // A bare `imessage` names its platform but no mode: reject that
+            // platform rather than keep an earlier entry's mode for it.
+            let (platform, mode) = entry.split_once('=').unwrap_or((entry, ""));
             let Ok(platform) = SurfacePlatform::new(platform) else { continue };
             let platform = platform.as_str().to_string();
             let first = !rejected.contains(&platform) && !modes.contains_key(&platform);

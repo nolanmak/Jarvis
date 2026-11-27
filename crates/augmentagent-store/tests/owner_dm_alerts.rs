@@ -80,3 +80,15 @@ fn a_rejected_dm_leaves_no_history_behind() {
     assert!(store.create_dm_owner_alert(&good, 1_000).unwrap().is_some());
     assert_eq!(high_alerts(&store), 1);
 }
+
+#[test]
+fn an_alert_the_store_cannot_insert_consumes_neither_history_nor_the_claim() {
+    let dir=tempfile::tempdir().unwrap();let store=Store::open(dir.path().join("test.db")).unwrap();
+    let long = format!("https://dashboard.example.test/{}", "x".repeat(1_500));
+    let good = dm("c1", true, false);
+    assert!(store.create_dm_owner_alert(&NewDmAlert { source_url: &long, ..good }, 1_000).is_err());
+    // The rejected attempt must not have recorded inbound history, or the
+    // corrected retry would no longer count as a first contact.
+    assert!(store.create_dm_owner_alert(&good, 1_000).unwrap().is_some());
+    assert_eq!(high_alerts(&store), 1);
+}
