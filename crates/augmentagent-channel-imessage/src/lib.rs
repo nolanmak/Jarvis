@@ -26,6 +26,7 @@ pub use config::{
 pub use page::bump_updated;
 pub use sync::{
     batched_delta_email, poll_once, ImessageReport, ImessageSyncer, PollDelta, PollStats,
+    WIKI_DIR_ENV,
 };
 pub use target::{conversation_identifier, resolve_target, ImessageTarget, TargetError};
 pub use reply::{
