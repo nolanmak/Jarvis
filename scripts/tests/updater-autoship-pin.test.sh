@@ -16,7 +16,9 @@
 #   - scripts/autoship-pin.sh <ref> makes the next tick build that commit on
 #     the pin root's own target dir, install it and re-provision the worker;
 #   - a second tick with the same pin does nothing; an invalid pin changes
-#     nothing; "main" unpins after re-provisioning.
+#     nothing; "main" unpins after re-provisioning;
+#   - the GitHub lookup's curl fallback keeps GH_TOKEN ahead of GITHUB_TOKEN
+#     and the library passes the tracked-file privacy gate (#2580).
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -36,6 +38,28 @@ check "no pin, a deploy to bootstrap from: bootstrap"        "$(autoship_pin_dec
 check "no pin, nothing to bootstrap from: nothing"           "$(autoship_pin_decision "" "" 0 "")" none
 check "unpinned while a pinned build is installed: unpin"    "$(autoship_pin_decision main "$A" 1 "$B")" unpin
 check "unpinned and already following main: nothing"         "$(autoship_pin_decision main main 1 "$B")" none
+
+# --- the GitHub lookup's curl fallback (#2580) ------------------------------
+# gh is preferred, so a stub that fails sends every case down the fallback,
+# where the credential is handed to curl on stdin: the curl stub prints the
+# header pipeline it was given. The library must also pass the tracked-file
+# privacy gate; the credential's local once matched the scanner's
+# secret-assignment shape and turned main red.
+echo "GitHub lookup fallback (#2580):"
+FALLBACK=$(mktemp -d)
+printf '#!/bin/sh\nexit 1\n' > "$FALLBACK/gh"
+printf '#!/bin/sh\ncat\n' > "$FALLBACK/curl"
+chmod +x "$FALLBACK/gh" "$FALLBACK/curl"
+gh_api() {
+  env -u GH_TOKEN -u GITHUB_TOKEN PATH="$FALLBACK:$PATH" "$@" \
+    bash -c '. "$0"; autoship_pin_gh_api repos/owner/repo/commits' "$REPO_ROOT/scripts/lib/autoship-pin.sh"
+}
+scan() { bash "$REPO_ROOT/scripts/check-no-personal-data.sh" "$REPO_ROOT/scripts/lib/autoship-pin.sh" 2>&1; }
+check "GH_TOKEN comes before GITHUB_TOKEN" "$(gh_api GH_TOKEN=gh-cred GITHUB_TOKEN=actions-cred)" "Authorization: Bearer gh-cred"
+check "GITHUB_TOKEN is the fallback"       "$(gh_api GITHUB_TOKEN=actions-cred)" "Authorization: Bearer actions-cred"
+if gh_api >/dev/null; then bad "neither credential set: the lookup fails"; else ok "neither credential set: the lookup fails"; fi
+if scan >/dev/null; then ok "the pin library passes the privacy gate"; else bad "the pin library passes the privacy gate" "$(scan | head -3)"; fi
+rm -rf "$FALLBACK"
 
 make_case() {
   TMP=$(cd "$(mktemp -d)" && pwd -P); export TMP
