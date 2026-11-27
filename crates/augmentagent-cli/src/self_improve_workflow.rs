@@ -4126,6 +4126,59 @@ mod tests {
         .is_none());
     }
 
+    /// #2588 (PR #2564, 2026-11-27T02:36Z): no worker held the lease and the
+    /// stage allowed the claim, but the workflow is bound to the pre-update
+    /// head while the PR head is GitHub's merge of main into it. Authorizing
+    /// that merge commit was refused every sweep; the pending update's
+    /// reviewed head is what the sweep must authorize. A live worker lease
+    /// still refuses the sweep.
+    #[tokio::test]
+    async fn nightly_sweep_takes_the_lease_for_a_pending_main_update_behind_a_stale_record() {
+        let _mode = crate::autoship_review::ReviewModeGuard::set(crate::autoship_review::ReviewMode::Nightly);
+        let state = control_dir();
+        let path = std::fs::canonicalize(state.path()).unwrap().join("workflow.db");
+        let (reviewed, main, updated, stale) = ("829e4a8d744737d6d049e2d7f8dadd4270380a46",
+            "41f746de345fb573d806298b015c1b8bfece3767", "c27ac721fdaf563772ae13622874d28a10957647",
+            "6710cc51057951f54dbb7647e46ca3843dd841c4");
+        let id = "owner/repo#1788";
+        let branch = "agent-fix/issue-1788";
+        let bound = Binding { head: reviewed.into(), contract: "plan:contract".into(), evidence_hash: "evidence".into() };
+        let mut store = WorkflowStore::open(&path).unwrap();
+        store.register(id, branch, bound.clone(), 1).unwrap();
+        let lease = store.claim(id, "worker", 2, 1_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 2564, 3).unwrap();
+        store.record_review(&lease, &Review { reviewer: crate::autoship_review::NIGHTLY_DEFERRED.into(),
+            binding: bound.clone(), approved: true, evidence: "{}".into() }, 4).unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Held;
+        cp.next = NextAction { reason: "resume_deferred".into(), action: "resume_preserved_work".into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, 5).unwrap();
+        store.release(&lease, 6).unwrap();
+        let sweep = store.claim_reconciliation(id, "sweep:1", 10, 60_000).unwrap().unwrap();
+        store.record_main_update_request(&sweep, &bound, main, main, 11).unwrap();
+        store.release(&sweep, 12).unwrap();
+        drop(store);
+        let record = serde_json::json!({"pr": 2564, "head": stale, "verdict": null}).to_string();
+        let now = millis();
+
+        assert!(SweepGuard::acquire_at(&path, "owner/repo", 1788, 2564, branch, updated, &record, now)
+            .unwrap().is_none(), "the merge commit is not the bound head (the 02:36Z refusal)");
+        let carry = super::super::finalize::pending_for_binding(&path, "owner/repo", 2564, branch, updated)
+            .expect("the workflow's own pending update");
+        assert_eq!(carry.reviewed_head, reviewed);
+
+        // A worker actually holding the workflow still wins.
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let worker = store.claim(id, "worker", now, LEASE_MS).unwrap().unwrap();
+        assert!(SweepGuard::acquire_at(&path, "owner/repo", 1788, 2564, branch, &carry.reviewed_head, &record, now + 1)
+            .unwrap().is_none(), "never act under a live worker lease");
+        store.release(&worker, now + 2).unwrap();
+
+        let sweep = SweepGuard::acquire_at(&path, "owner/repo", 1788, 2564, branch, &carry.reviewed_head, &record, now + 3)
+            .unwrap().expect("the sweep takes the lease to carry and update");
+        assert_eq!(sweep.inner.as_ref().unwrap().binding.head, reviewed);
+    }
+
     #[tokio::test]
     async fn published_pr_milestone_stops_pr_only_work_after_real_push_and_bound_review() {
         let dir=repo();let remote=tempfile::tempdir().unwrap();
