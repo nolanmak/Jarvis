@@ -19818,6 +19818,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(inventory.contains("fetch_issue_pages("), "paginated (#1519)");
         assert!(!body.contains("per_page=50") && !inventory.contains("per_page=50"),
             "the newest-50 window is gone");
+        // Every reader of the open set decides absence from that same listing,
+        // so none of them may keep a window of its own: a private listing is
+        // how #1517 returned once already.
+        let red_main = src.find("async fn red_main_plan(").expect("the red-main lookup");
+        let red_main = &src[red_main..red_main + src[red_main..].find("\n}\n").expect("end")];
+        assert!(red_main.contains("open_issue_rest_inventory("), "the red-main lookup shares the listing");
+        assert!(include_str!("self_improve_legacy_readmission.rs").contains("open_issue_rest_inventory("),
+            "legacy readmission shares the listing");
     }
 
     #[test]
