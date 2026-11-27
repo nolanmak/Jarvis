@@ -11,6 +11,16 @@ class DownloadTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d, patch.object(tools.urllib.request,'urlopen',side_effect=[urllib.error.HTTPError('first',504,'gateway',{},None),io.BytesIO(payload)]) as request:
    target=Path(d)/'artifact';tools.download(['https://first','https://second'],digest,target)
    self.assertEqual(target.read_bytes(),payload);self.assertEqual(request.call_count,2)
+ def test_expired_deadline_stops_requesting_the_pinned_artifact(self):
+  # The script is pinned CI policy, so the bound it already enforces is
+  # guarded here: once the overall deadline passes, no further transport is
+  # attempted and provisioning fails closed.
+  _,digest,urls=tools.PINS['deno']
+  with tempfile.TemporaryDirectory() as d, patch.object(tools.time,'monotonic',side_effect=[0,200,200,200,200]),patch.object(tools.urllib.request,'urlopen') as request:
+   target=Path(d)/'artifact'
+   with self.assertRaisesRegex(RuntimeError,'deadline'):tools.download(urls,digest,target)
+   request.assert_not_called()
+   self.assertFalse(target.exists());self.assertFalse(target.with_suffix('.partial').exists())
  def test_wrong_digest_never_becomes_installed_artifact(self):
   with tempfile.TemporaryDirectory() as d, patch.object(tools.urllib.request,'urlopen',side_effect=lambda *a,**k:io.BytesIO(b'wrong')):
    target=Path(d)/'artifact'

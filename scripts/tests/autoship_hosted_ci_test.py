@@ -80,9 +80,38 @@ class EvidenceTests(unittest.TestCase):
     if '/jobs?' in endpoint:return fixture.jobs
     raise AssertionError(endpoint)
   self.api=API()
- def evaluate(self):
+ def evaluate(self,cache=None):
   with patch.object(hosted.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(self.required),'')):
-   return hosted.evaluate(self.request,self.api)
+   return hosted.evaluate(self.request,self.api,cache)
+ def test_immutable_reads_are_cached_by_commit_and_completed_attempt(self):
+  # Ratebudget: policy bytes at a commit SHA, a PR's diff at an exact
+  # head/base pair, and the jobs of a completed run attempt never change.
+  self.runs[0]['status']='completed'
+  cache=hosted.Cache({})
+  self.assertEqual(self.evaluate(cache)['state'],'passed')
+  self.assertTrue(any('/contents/' in c for c in self.calls))
+  self.calls=[]
+  again=hosted.Cache(dict(cache.updates))
+  self.assertEqual(self.evaluate(again)['state'],'passed')
+  self.assertFalse([c for c in self.calls if '/contents/' in c or c.endswith('/files') or '/jobs?' in c],self.calls)
+  # Fresh identity reads remain: PR, run inventory, and the re-check.
+  self.assertTrue(any('/actions/runs?' in c for c in self.calls))
+  self.assertEqual(sum('/pulls/7' in c for c in self.calls),2)
+  self.assertEqual(again.updates,{})
+ def test_cached_policy_hash_still_refuses_a_changed_policy(self):
+  cache=hosted.Cache({})
+  self.evaluate(cache)
+  self.contract['workflows'][self.path]['sha256']=hashlib.sha256(b'other').hexdigest()
+  with self.assertRaisesRegex(ValueError,'policy changed'):self.evaluate(hosted.Cache(dict(cache.updates)))
+ def test_incomplete_run_jobs_are_never_cached(self):
+  for status,job_status in [('in_progress','completed'),('completed','in_progress')]:
+   self.setUp();self.runs[0]['status']=status;self.jobs[0]['status']=job_status
+   cache=hosted.Cache({});self.evaluate(cache)
+   self.assertFalse([k for k in cache.updates if k.startswith('jobs:')],(status,job_status))
+ def test_non_commit_ref_is_never_cached(self):
+  cache=hosted.Cache({})
+  self.assertIsNone(cache.key('contents','o/r','main','x'))
+  self.assertIsNotNone(cache.key('contents','o/r',self.head,'x'))
  def test_multiple_workflows_share_one_fresh_run_inventory(self):
   other='.github/workflows/other.yml'
   self.contract['workflows'][other]=copy.deepcopy(self.contract['workflows'][self.path])
@@ -182,6 +211,21 @@ class EvidenceTests(unittest.TestCase):
  def test_mismatched_job_run_holds(self):
   self.jobs[0]['run_id']=99
   with self.assertRaisesRegex(ValueError,'identity'):self.evaluate()
+
+class RateLimitTests(unittest.TestCase):
+ def test_rate_limit_is_deferred_evidence_never_a_failure(self):
+  limited=subprocess.CompletedProcess([],1,'','gh: API rate limit exceeded for user ID 1. (HTTP 403)')
+  with patch.object(hosted.subprocess,'run',return_value=limited):
+   with self.assertRaisesRegex(ValueError,'rate limit.*deferred'):
+    hosted.GitHub('fake-gh').api('repos/o/r/pulls/7')
+  request={'gh':'fake-gh','repository':'o/r','pr':7,'contract':{},'policy_files':{}}
+  import io,contextlib
+  out=io.StringIO()
+  with patch.object(hosted.subprocess,'run',return_value=limited),patch.object(hosted.sys,'stdin',io.StringIO(json.dumps(request))),contextlib.redirect_stdout(out):
+   hosted.main()
+  result=json.loads(out.getvalue())
+  self.assertEqual(result['state'],'unknown')
+  self.assertIn('deferred',result['reason'])
 
 class RunInventoryPaginationTests(unittest.TestCase):
  def test_filtered_search_limit_and_incomplete_inventory_hold(self):

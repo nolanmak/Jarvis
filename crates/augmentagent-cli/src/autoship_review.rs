@@ -12,6 +12,77 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_ADJUDICATION_ATTEMPTS: u32 = 2;
+
+/// #2574 — when the independent cross-provider review runs.
+pub const REVIEW_MODE_ENV: &str = "AUTOSHIP_REVIEW_MODE";
+/// Provider/backend/model of the verdict recorded when review is deferred to
+/// the nightly pass. It approves only while the mode is `nightly`.
+pub const NIGHTLY_DEFERRED: &str = "nightly-deferred";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMode {
+    /// Pre-#2574 behaviour: an approving independent review before merge.
+    PreMerge,
+    /// Merge on green; one nightly pass reviews what merged.
+    Nightly,
+}
+
+impl ReviewMode {
+    /// Unset or empty means `nightly` (owner decision, #2574). An unknown
+    /// value fails closed to `pre-merge`.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+            "" | "nightly" => Self::Nightly,
+            _ => Self::PreMerge,
+        }
+    }
+
+    pub fn current() -> Self {
+        #[cfg(test)]
+        if let Some(mode) = TEST_MODE.with(|m| m.get()) {
+            return mode;
+        }
+        // Tests that do not choose run the pre-#2574 contract they encode.
+        #[cfg(test)]
+        if std::env::var_os(REVIEW_MODE_ENV).is_none() {
+            return Self::PreMerge;
+        }
+        Self::parse(std::env::var(REVIEW_MODE_ENV).ok().as_deref())
+    }
+
+    pub fn nightly() -> bool {
+        Self::current() == Self::Nightly
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MODE: std::cell::Cell<Option<ReviewMode>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pin this thread's review mode until the guard drops.
+#[cfg(test)]
+pub struct ReviewModeGuard(Option<ReviewMode>);
+#[cfg(test)]
+impl ReviewModeGuard {
+    pub fn set(mode: ReviewMode) -> Self {
+        Self(TEST_MODE.with(|m| m.replace(Some(mode))))
+    }
+}
+#[cfg(test)]
+impl Drop for ReviewModeGuard {
+    fn drop(&mut self) {
+        TEST_MODE.with(|m| m.set(self.0));
+    }
+}
+
+/// #2574 — a workflow parked only because the pre-merge review did not
+/// approve, could not run, or waits for review capacity.
+pub fn review_park(review_stage: bool, reason: &str) -> bool {
+    matches!(reason, "review-recovery-required" | "review-evidence-budget"
+        | "review_attempts_exhausted_backoff" | "review_evidence_recovery" | "review_main_changed")
+        || (review_stage && reason == "resource_capacity")
+}
 #[path="autoship_review_sources.rs"]
 mod source_requests;
 pub use source_requests::{ReviewSourceRequest,ReviewSourceSelector};
@@ -431,7 +502,7 @@ pub fn parse_review_pass_with_sources(
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Response {
-        binding: ReviewBinding,
+        binding: BindingEcho,
         decision: Decision,
         findings: Vec<Finding>,
         #[serde(default)]
@@ -443,7 +514,8 @@ pub fn parse_review_pass_with_sources(
         raw.len() <= MAX_RESPONSE_BYTES,
         "review response exceeds limit"
     );
-    let envelope:serde_json::Value=serde_json::from_str(raw).context("invalid review envelope")?;
+    let mut envelope:serde_json::Value=serde_json::from_str(raw).context("invalid review envelope")?;
+    default_finding_evidence_hash(&mut envelope, binding);
     if let Some(paths)=envelope.get("missing_paths") {
         ensure!(paths.is_array() && envelope["decision"].as_str()==Some("incomplete"), "missing paths require an incomplete decision and an array");
     }
@@ -454,9 +526,9 @@ pub fn parse_review_pass_with_sources(
         for source in sources.as_array().unwrap() {source_requests::validate_selector_wire(source)?;}
     }
     let response: Response =
-        serde_json::from_str(raw).context("invalid structured review response")?;
+        serde_json::from_value(envelope).context("invalid structured review response")?;
     ensure!(
-        echo_names_head(&response.binding, binding),
+        echo_names_head(&response.binding.clone().into(), binding),
         "review response changed binding"
     );
     actor.validate()?;
@@ -508,6 +580,66 @@ pub fn parse_review_pass_with_sources(
         coverage,
         findings: response.findings,
     }, sources))
+}
+
+/// #2554: the reviewer's binding echo is evidence of which head it judged,
+/// never the recorded binding. Codex sometimes drops long hash fields from the
+/// echo; absent fields stay empty so only `echo_names_head` decides, and an
+/// echo without a head names no candidate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct BindingEcho {
+    head: String,
+    base: String,
+    environment_id: String,
+    contract_hash: String,
+    evidence_hash: String,
+}
+
+impl From<BindingEcho> for ReviewBinding {
+    fn from(echo: BindingEcho) -> Self {
+        let BindingEcho { head, base, environment_id, contract_hash, evidence_hash } = echo;
+        Self { head, base, environment_id, contract_hash, evidence_hash }
+    }
+}
+
+/// #2554: a finding's `evidence_hash` names the reproducible evidence it was
+/// judged against. When a reviewer omits it, that evidence is exactly the
+/// controller-bound evidence of this review, so default to that hash.
+fn default_finding_evidence_hash(envelope: &mut serde_json::Value, binding: &ReviewBinding) {
+    let Some(findings) = envelope.get_mut("findings").and_then(serde_json::Value::as_array_mut) else { return };
+    for finding in findings.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+        if finding.get("evidence_hash").is_none_or(serde_json::Value::is_null) {
+            finding.insert("evidence_hash".into(), binding.evidence_hash.clone().into());
+        }
+    }
+}
+
+/// #2554: normalize one adjudicator ruling's wire shape before strict
+/// parsing. Fields the chosen decision does not define (Codex adds
+/// `rationale` to upholds) carry no authority and are dropped, and
+/// `named_rerun_checks` (from the prompt's own wording) aliases
+/// `rerun_checks`. Required fields are never invented, so a ruling without
+/// its real verdict fields still fails.
+fn normalize_ruling(ruling: &mut serde_json::Value) -> Result<()> {
+    let Some(object) = ruling.as_object_mut() else { return Ok(()) };
+    let allowed: &[&str] = match object.get("decision").and_then(serde_json::Value::as_str) {
+        Some("need_evidence") => &["source_paths", "question"],
+        Some("dismiss") => &["evidence", "rationale"],
+        Some("uphold") => &["evidence", "repair_criterion"],
+        Some("amend") => &["evidence", "replacement_criterion", "rerun_checks"],
+        _ => return Ok(()),
+    };
+    if allowed.contains(&"rerun_checks") {
+        if let Some(alias) = object.remove("named_rerun_checks") {
+            match object.get("rerun_checks") {
+                Some(checks) => ensure!(checks == &alias, "rerun_checks and named_rerun_checks disagree"),
+                None => { object.insert("rerun_checks".into(), alias); }
+            }
+        }
+    }
+    object.retain(|key, _| key == "decision" || allowed.contains(&key.as_str()));
+    Ok(())
 }
 
 /// #2385: the binding is the controller's own and every pass records it, never
@@ -636,7 +768,7 @@ pub struct AdjudicationReceipt {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdjudicatorResponse {
-    binding: ReviewBinding,
+    binding: BindingEcho,
     rulings: BTreeMap<String, Ruling>,
 }
 
@@ -742,10 +874,19 @@ fn validate_adjudicator_response(
         raw.len() <= MAX_RESPONSE_BYTES,
         "adjudication response exceeds limit"
     );
-    let response: AdjudicatorResponse =
+    let mut value: serde_json::Value =
         serde_json::from_str(raw).context("invalid adjudication JSON")?;
+    if let Some(rulings) = value.get_mut("rulings").and_then(serde_json::Value::as_object_mut) {
+        for ruling in rulings.values_mut() {
+            normalize_ruling(ruling).context("invalid adjudication JSON")?;
+        }
+    }
+    let response: AdjudicatorResponse =
+        serde_json::from_value(value).context("invalid adjudication JSON")?;
+    // The receipt records the controller binding; the echo only has to name
+    // the exact head under adjudication (same rule as review passes, #2385).
     ensure!(
-        &response.binding == binding,
+        echo_names_head(&response.binding.clone().into(), binding),
         "adjudicator changed reviewed binding"
     );
     let expected: BTreeSet<_> = findings.iter().map(|f| f.id.clone()).collect();

@@ -558,6 +558,29 @@ async fn caller_discovery_symbols(
     source_items::collect(root,&snapshot.base,&snapshot.head,&implementation).await
 }
 
+/// The reviewed evidence is the exact `base..head` diff. #2554: refs are
+/// shared across worktrees, so a sibling lane's fetch can fast-forward
+/// origin/main mid-review without touching this candidate. Main moving past
+/// the reviewed base is not a candidate change (merge freshness is enforced
+/// at merge time); a moved head, a dirty tree, or a main that no longer
+/// contains the reviewed base still invalidates the evidence.
+async fn ensure_candidate_unchanged(worktree: &Path, head: &str, base: &str) -> Result<()> {
+    let main = git(worktree, &["rev-parse", "origin/main"]).await?;
+    let main = main.trim();
+    let base_kept = main == base
+        || git_output(worktree, &["merge-base", "--is-ancestor", base, main]).await?.0;
+    anyhow::ensure!(
+        git(worktree, &["rev-parse", "HEAD"]).await?.trim() == head
+            && base_kept
+            && git(worktree, &["status", "--porcelain", "--untracked-files=all"])
+                .await?
+                .trim()
+                .is_empty(),
+        "candidate changed while reviews ran"
+    );
+    Ok(())
+}
+
 async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
     let dirty = git(
         &worktree,
@@ -1102,18 +1125,7 @@ async fn run_impl(
     }
     // Check the immutable source again after model calls. A sibling push or
     // local edit invalidates the evidence rather than borrowing its approval.
-    anyhow::ensure!(
-        git(&worktree, &["rev-parse", "HEAD"]).await?.trim() == head
-            && git(&worktree, &["rev-parse", "origin/main"]).await?.trim() == base
-            && git(
-                &worktree,
-                &["status", "--porcelain", "--untracked-files=all"]
-            )
-            .await?
-            .trim()
-            .is_empty(),
-        "candidate changed while reviews ran"
-    );
+    ensure_candidate_unchanged(&worktree, &head, &base).await?;
     if let Some(guard) = context.workflow {
         let mut calibration_context=recovered_files.clone();
         calibration_context.extend(final_recovered_contexts);
@@ -1235,6 +1247,40 @@ mod tests {
         fixture_git(path, &["add", "-A"]);
         fixture_git(path, &["commit", "-qm", "candidate"]);
         dir
+    }
+
+    #[tokio::test]
+    async fn main_fast_forward_during_review_is_not_a_candidate_change() {
+        // #2546: a sibling lane fetched origin/main (refs are shared across
+        // worktrees) while reviews ran. The reviewed base..head diff is
+        // unchanged, so the review must not be stranded.
+        let dir = candidate_fixture();
+        let path = dir.path();
+        let head = fixture_git(path, &["rev-parse", "HEAD"]);
+        let base = fixture_git(path, &["rev-parse", "origin/main"]);
+        ensure_candidate_unchanged(path, &head, &base).await.unwrap();
+        fixture_git(path, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(path.join("sibling.rs"), "fn sibling() {}\n").unwrap();
+        fixture_git(path, &["add", "."]);
+        fixture_git(path, &["commit", "-qm", "sibling merge"]);
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fixture_git(path, &["checkout", "-q", "--detach", &head]);
+        ensure_candidate_unchanged(path, &head, &base).await
+            .expect("main advancing past the reviewed base is not a candidate change");
+        // A rewritten main no longer contains the reviewed base: refuse.
+        fixture_git(path, &["checkout", "-q", "--orphan", "rewrite"]);
+        fixture_git(path, &["commit", "-qm", "rewritten main"]);
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fixture_git(path, &["checkout", "-q", "--detach", &head]);
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", &base]);
+        // A moved head or a dirty tree is still a real change.
+        std::fs::write(path.join("untracked.rs"), "x").unwrap();
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
+        std::fs::remove_file(path.join("untracked.rs")).unwrap();
+        std::fs::write(path.join("source.rs"), "fn pushed() {}\n").unwrap();
+        fixture_git(path, &["commit", "-qam", "new head"]);
+        assert!(ensure_candidate_unchanged(path, &head, &base).await.is_err());
     }
 
     #[tokio::test]

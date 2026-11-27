@@ -43,6 +43,16 @@ pub(super) fn step(checks_green: Option<bool>, state: MergeState) -> Step {
     }
 }
 
+/// #2583: nightly review mode only. A draft whose required checks went red
+/// while it sat BEHIND main may be red only because the main it merged was
+/// red; main may since have been fixed. Merging current main in is the one
+/// step that can heal it, and it never merges the PR itself: checks rerun on
+/// the update and a later tick merges only if they come up green. Without
+/// this, a red-main episode stranded every draft that pulled it in.
+pub(super) fn heal_by_main_update(nightly: bool, checks_green: Option<bool>, state: MergeState) -> bool {
+    nightly && checks_green == Some(false) && state == MergeState::Behind
+}
+
 /// A main update the sweep may finish for this PR: the approval recorded for
 /// `origin_head` reaches the current PR head through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +168,12 @@ mod tests {
         let row = |state: &str| serde_json::json!({"number": 2449, "mergeStateStatus": state});
         // PR #2449 at 07:45Z: approved head, every required check green, BEHIND.
         assert_eq!(step(Some(true), merge_state(&row("BEHIND"))), Step::UpdateBranch);
+        // #2583: only a red, behind draft in nightly mode is healed by an update.
+        assert!(heal_by_main_update(true, Some(false), merge_state(&row("BEHIND"))));
+        assert!(!heal_by_main_update(false, Some(false), merge_state(&row("BEHIND"))), "pre-merge keeps waiting");
+        assert!(!heal_by_main_update(true, None, merge_state(&row("BEHIND"))), "pending checks are not red");
+        assert!(!heal_by_main_update(true, Some(false), merge_state(&row("CLEAN"))), "current with main: red is the PR's own");
+        assert!(!heal_by_main_update(true, Some(true), merge_state(&row("BEHIND"))), "green already updates");
         // After update-branch, checks rerun on GitHub's merge commit.
         assert_eq!(step(Some(false), merge_state(&row("BLOCKED"))), Step::AwaitChecks);
         assert_eq!(step(None, merge_state(&row("BEHIND"))), Step::AwaitChecks, "unknown checks never update or merge");

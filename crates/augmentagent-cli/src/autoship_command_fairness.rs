@@ -77,6 +77,64 @@ pub(super) fn record(
     Ok(backoff_ms(streak).map(|delay| now.saturating_add(delay)))
 }
 
+/// Longest a starting command job waits behind due finishing work, measured
+/// from its last turn (or submission). Matches the picker's #2373 bound.
+pub(crate) const FINISH_FIRST_MAX_WAIT_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// SQL for a workflow `w` at a finishing step: a due publication retry, or a
+/// published PR that needs only its post-publish step. The picker ranks the
+/// same rows first (#2279, #2543).
+const FINISHING: &str = "((json_extract(w.checkpoint,'$.stage')='publish'
+        AND json_extract(w.checkpoint,'$.next.reason')='publishing_revision'
+        AND json_extract(w.checkpoint,'$.next.action')='push')
+    OR (w.pr IS NOT NULL AND json_extract(w.checkpoint,'$.stage') IN ('reconcile','await_checks','review','merge')))";
+
+/// Whether the command job `workflow` gives this turn to the automatic lane
+/// because finishing work there is due (#1725 starved #2553 and #2556). A
+/// command job that is itself finishing never yields, and a starting one
+/// (plan, build, rescope) yields for at most `FINISH_FIRST_MAX_WAIT_MS` after
+/// its last turn, so finishing goes first without starving owner commands.
+/// Scheduling only: no lease, checkpoint or grant changes.
+pub(super) fn yields_to_finishing(tx: &Connection, repository: &str, workflow: &str, now: i64) -> Result<bool> {
+    let own: bool = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM workflow w WHERE w.id=?1 AND {FINISHING})"),
+        [workflow],
+        |r| r.get(0),
+    )?;
+    if own {
+        return Ok(false);
+    }
+    let last_turn: i64 = tx.query_row(
+        "SELECT COALESCE(s.attempted_at,j.created_at) FROM command_job j
+         LEFT JOIN command_schedule s ON s.workflow=j.workflow WHERE j.workflow=?1",
+        [workflow],
+        |r| r.get(0),
+    )?;
+    if now.saturating_sub(last_turn) >= FINISH_FIRST_MAX_WAIT_MS {
+        return Ok(false);
+    }
+    let controls: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",
+        [],
+        |r| r.get(0),
+    )?;
+    let paused = if controls {
+        " AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)"
+    } else {
+        ""
+    };
+    Ok(tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM workflow w WHERE (instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)
+               AND NOT EXISTS(SELECT 1 FROM command_job j WHERE j.workflow=w.id)
+               AND w.lease_until<=?2 AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
+               AND {FINISHING}{paused})"
+        ),
+        params![repository, now],
+        |r| r.get(0),
+    )?)
+}
+
 /// An explicit owner resubmission is a new request for turns.
 pub(super) fn reset(tx: &Connection, workflow: &str) -> Result<bool> {
     Ok(tx.execute("DELETE FROM command_no_progress WHERE workflow=?1", [workflow])? > 0)
@@ -252,6 +310,95 @@ mod tests {
             .optional()
             .unwrap();
         assert_eq!(cleared, None, "an explicit owner request must restore ordinary turns");
+    }
+
+    /// Leave the automatic workflow `owner/repo#number` at `stage/reason/action`,
+    /// unleased and due, optionally with a published PR.
+    fn automatic(store: &mut WorkflowStore, number: u64, stage: Stage, reason: &str, action: &str, pr: Option<u64>, at: i64) {
+        let id = format!("owner/repo#{number}");
+        let binding = Binding { head: "b".repeat(40), contract: "contract".into(), evidence_hash: "env".into() };
+        store.register(&id, "agent-fix/branch", binding, at).unwrap();
+        let lease = store.claim(&id, "worker", at, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.stage = stage;
+        cp.next = NextAction { reason: reason.into(), action: action.into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, at + 1).unwrap();
+        if let Some(pr) = pr {
+            store.attach_pr(&lease, pr, at + 1).unwrap();
+        }
+        store.release(&lease, at + 2).unwrap();
+    }
+
+    /// Leave the command job `id` at build / plan_registered, unleased.
+    fn planned(store: &mut WorkflowStore, id: &str, at: i64) {
+        let binding = Binding { head: "a".repeat(40), contract: "synthetic request".into(), evidence_hash: "env".into() };
+        store.register(id, "agent-fix/issue-1725", binding, at).unwrap();
+        let lease = store.claim(id, "worker", at, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Build;
+        cp.next = NextAction { reason: "plan_registered".into(), action: "build".into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, at + 1).unwrap();
+        store.release(&lease, at + 2).unwrap();
+    }
+
+    /// 2026-11-25 Legion: owner command job #1725 looped at build /
+    /// plan_registered, rebuilding an oversized diff on every command turn,
+    /// while autoship's draft PR #2553 (workflow #2387) sat due at publish /
+    /// publishing_revision / push and #2556 at reconcile / review_main_changed.
+    /// Command turns are served before the picker, so ranking never helped.
+    /// Finishing must go first; the command job keeps a bounded wait.
+    #[test]
+    fn due_publish_retry_outranks_a_looping_command_job_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("queue.db")).unwrap();
+        let looping = job(&mut store, 1725, 1);
+        planned(&mut store, &looping, 2);
+        let now = 3_600_000;
+        assert_eq!(store.next_command_job("owner/repo", now).unwrap().as_deref(), Some(looping.as_str()),
+            "with nothing to finish the command job keeps its turn");
+        store.finish_command_attempt(&looping, now, AttemptOutcome::Progress, "workflow-progressed", now + 1).unwrap();
+        assert!(store.next_command_job("owner/repo", now + 2).unwrap().is_none(), "normal lane's alternate turn");
+
+        automatic(&mut store, 2387, Stage::Publish, "publishing_revision", "push", Some(2553), now + 10);
+        let later = now + RETRY_MS + 100;
+        assert!(store.command_queue_due("owner/repo", later).unwrap(), "the command job is otherwise due");
+        assert_eq!(store.next_command_job("owner/repo", later).unwrap(), None,
+            "a due publish retry must not be pre-empted by a looping command build");
+        assert_eq!(store.next_command_job("owner/repo", later + 1).unwrap(), None, "and not on the next tick either");
+
+        // A published PR's next step holds the turn the same way (#2556).
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut other = WorkflowStore::open(&dir2.path().join("queue.db")).unwrap();
+        let second = job(&mut other, 1725, 1);
+        planned(&mut other, &second, 2);
+        other.next_command_job("owner/repo", now).unwrap().unwrap();
+        other.finish_command_attempt(&second, now, AttemptOutcome::Progress, "workflow-progressed", now + 1).unwrap();
+        other.next_command_job("owner/repo", now + 2).unwrap();
+        automatic(&mut other, 2343, Stage::Reconcile, "review_main_changed", "reconcile_main", Some(2556), now + 10);
+        assert_eq!(other.next_command_job("owner/repo", later).unwrap(), None);
+
+        // Bounded: past the wait the command job is served even if the
+        // finishing row was never picked up.
+        let starved = now + FINISH_FIRST_MAX_WAIT_MS;
+        assert_eq!(store.next_command_job("owner/repo", starved).unwrap().as_deref(), Some(looping.as_str()),
+            "a command job must not wait behind finishing work forever");
+    }
+
+    #[test]
+    fn a_finishing_command_job_does_not_yield_to_other_finishing_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("queue.db")).unwrap();
+        let id = job(&mut store, 1800, 1);
+        let binding = Binding { head: "a".repeat(40), contract: "synthetic request".into(), evidence_hash: "env".into() };
+        store.register(&id, "agent-fix/issue-1800", binding, 2).unwrap();
+        let lease = store.claim(&id, "worker", 2, 100).unwrap().unwrap();
+        let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Publish;
+        cp.next = NextAction { reason: "publishing_revision".into(), action: "push".into(), eligible_at_ms: 0 };
+        store.checkpoint(&lease, &cp, 3).unwrap();
+        store.release(&lease, 4).unwrap();
+        automatic(&mut store, 2387, Stage::Publish, "publishing_revision", "push", Some(2553), 10);
+        assert_eq!(store.next_command_job("owner/repo", 100).unwrap().as_deref(), Some(id.as_str()));
     }
 
     #[test]
