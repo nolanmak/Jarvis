@@ -153,7 +153,7 @@ impl OpenIssues {
     }
 }
 
-fn floor() -> u64 {
+pub(super) fn floor() -> u64 {
     std::env::var(FLOOR_ENV).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_FLOOR)
 }
 
@@ -173,6 +173,95 @@ async fn core_remaining(root: &Path) -> Option<u64> {
     };
     *REMAINING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), remaining));
     remaining
+}
+
+/// Ratebudget: requests kept back for the merge path (the sweep's hosted CI
+/// read, its pre-merge re-read, and the merge itself). Below this, optional
+/// hosted CI reads (CI repair diagnosis) defer instead of spending them.
+const DEFAULT_MERGE_RESERVE: u64 = 400;
+const MERGE_RESERVE_ENV: &str = "AUGMENTAGENT_AUTOPR_GH_MERGE_RESERVE";
+
+fn merge_reserve() -> u64 {
+    std::env::var(MERGE_RESERVE_ENV).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_MERGE_RESERVE)
+}
+
+/// Reason an optional read gives when it stands down for the merge reserve.
+/// Callers treat it like any unavailable evidence: deferred, never red.
+pub(super) const RESERVED: &str = "GitHub REST budget reserved for merges; evidence deferred";
+
+/// Remaining REST core requests (cached for a minute), `None` when unknown.
+pub(super) async fn remaining(root: &Path) -> Option<u64> {
+    core_remaining(root).await
+}
+
+/// Run an optional GitHub read unless the known budget is inside the merge
+/// reserve. `None` means deferred; the caller must not treat it as a fact.
+pub(super) async fn unless_reserved<T, F, Fut>(remaining: Option<u64>, what: &str, read: F) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let reserve = merge_reserve();
+    if below_floor(remaining, reserve) {
+        warn!(remaining = remaining.unwrap_or_default(), reserve, what,
+            "GitHub REST budget inside the merge reserve; deferring optional read");
+        return None;
+    }
+    Some(read().await)
+}
+
+/// How long a not-green sweep verdict may stand without a fresh read, while
+/// the PR's head, base and check rollup are unchanged. Doubled-up on a low
+/// budget: the fingerprint still forces a re-read the moment anything moves.
+const VERDICT_TTL: Duration = Duration::from_secs(15 * 60);
+const LOW_BUDGET_VERDICT_TTL: Duration = Duration::from_secs(60 * 60);
+
+static SWEEP_VERDICTS: Mutex<Option<HashMap<u64, (String, Instant)>>> = Mutex::new(None);
+
+/// The CI-relevant state of a PR row from the shared inventory: head, base
+/// and every check's status and conclusion. `None` when any is missing, in
+/// which case nothing is reused.
+pub(super) fn ci_fingerprint(row: &serde_json::Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let head = row.get("headRefOid")?.as_str().filter(|s| !s.is_empty())?;
+    let base = row.get("baseRefOid")?.as_str().filter(|s| !s.is_empty())?;
+    let rollup = row.get("statusCheckRollup")?;
+    rollup.as_array()?;
+    Some(format!("{:x}", Sha256::digest(format!("{head}\0{base}\0{rollup}").as_bytes())))
+}
+
+/// Ratebudget: the merge sweep re-reads hosted CI (dozens of REST calls) for
+/// every approved PR every pass. A PR that was not green and whose head,
+/// base and checks have not changed since cannot have turned green, so its
+/// verdict stands without a read. Only `Some(false)` is ever kept: a green
+/// verdict is always read fresh (and re-read before merge), and an unknown
+/// or deferred read (`None`, e.g. a spent quota) is never recorded as a fact.
+pub(super) async fn sweep_checks<F, Fut>(pr: u64, fingerprint: Option<String>, low: bool, read: F) -> Option<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    let ttl = if low { LOW_BUDGET_VERDICT_TTL } else { VERDICT_TTL };
+    if let Some(fingerprint) = &fingerprint {
+        let verdicts = SWEEP_VERDICTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((seen, at)) = verdicts.as_ref().and_then(|v| v.get(&pr)) {
+            if seen == fingerprint && at.elapsed() < ttl {
+                info!(pr, "merge sweep: CI unchanged since a not-green read; skipping hosted CI read");
+                return Some(false);
+            }
+        }
+    }
+    let verdict = read().await;
+    let mut verdicts = SWEEP_VERDICTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let verdicts = verdicts.get_or_insert_with(HashMap::new);
+    match (verdict, fingerprint) {
+        (Some(false), Some(fingerprint)) => {
+            if verdicts.len() >= 1_024 { verdicts.clear(); }
+            verdicts.insert(pr, (fingerprint, Instant::now()));
+        }
+        _ => { verdicts.remove(&pr); }
+    }
+    verdict
 }
 
 pub(super) fn below_floor(remaining: Option<u64>, floor: u64) -> bool {
@@ -221,6 +310,51 @@ mod tests {
         assert!(below_floor(Some(712), 1_500));
         assert!(!below_floor(Some(1_500), 1_500));
         assert!(!below_floor(None, 1_500), "an unreadable budget never stops polling");
+    }
+
+    fn row(head: &str, check: &str) -> serde_json::Value {
+        serde_json::json!({"headRefOid": head, "baseRefOid": "b".repeat(40),
+            "statusCheckRollup": [{"name": "rust", "status": check, "conclusion": null}]})
+    }
+
+    #[tokio::test]
+    async fn unchanged_not_green_pr_skips_the_hosted_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = AtomicUsize::new(0);
+        let read = |verdict: Option<bool>| { let reads = &reads; move || async move { reads.fetch_add(1, Ordering::SeqCst); verdict } };
+        let pending = ci_fingerprint(&row(&"a".repeat(40), "IN_PROGRESS"));
+        assert_eq!(sweep_checks(990_001, pending.clone(), false, read(Some(false))).await, Some(false));
+        assert_eq!(sweep_checks(990_001, pending.clone(), false, read(Some(true))).await, Some(false), "cache hit");
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "an unchanged pending PR costs no hosted read");
+        // Any change in checks or head forces a fresh read.
+        let done = ci_fingerprint(&row(&"a".repeat(40), "COMPLETED"));
+        assert_eq!(sweep_checks(990_001, done.clone(), false, read(Some(true))).await, Some(true));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        // Green is never reused.
+        assert_eq!(sweep_checks(990_001, done.clone(), false, read(Some(true))).await, Some(true));
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "a green verdict is always read fresh");
+        // A deferred (rate-limited) read is never recorded as a fact.
+        let other = ci_fingerprint(&row(&"c".repeat(40), "IN_PROGRESS"));
+        assert_eq!(sweep_checks(990_002, other.clone(), false, read(None)).await, None);
+        assert_eq!(sweep_checks(990_002, other.clone(), false, read(None)).await, None);
+        assert_eq!(reads.load(Ordering::SeqCst), 5, "unknown is re-read, not cached as red");
+        // Without a fingerprint nothing is reused.
+        sweep_checks(990_003, None, false, read(Some(false))).await;
+        sweep_checks(990_003, None, false, read(Some(false))).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 7);
+        assert_eq!(ci_fingerprint(&serde_json::json!({"headRefOid": "a"})), None);
+    }
+
+    #[tokio::test]
+    async fn merge_reserve_defers_optional_reads_only_on_a_known_low_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = AtomicUsize::new(0);
+        let read = || async { reads.fetch_add(1, Ordering::SeqCst); "evidence" };
+        assert_eq!(unless_reserved(Some(DEFAULT_MERGE_RESERVE - 1), "ci repair", read).await, None);
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "inside the reserve the read is never made");
+        assert_eq!(unless_reserved(Some(DEFAULT_MERGE_RESERVE), "ci repair", read).await, Some("evidence"));
+        assert_eq!(unless_reserved(None, "ci repair", read).await, Some("evidence"), "an unknown budget never blocks");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

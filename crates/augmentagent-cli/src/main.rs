@@ -3228,6 +3228,12 @@ async fn main() -> Result<()> {
     }
     if let Cmd::ComputeTool = cli.cmd { return compute_tool::serve(); }
     let _ = dotenvy::dotenv();
+    // #2422 — the iMessage poll loop resolves DM senders through the wiki
+    // identity index. Export `--wiki-dir` here, before anything spawns,
+    // instead of threading it through every poll signature.
+    if let Some(dir) = &cli.wiki_dir {
+        std::env::set_var(augmentagent_channel_imessage::WIKI_DIR_ENV, dir);
+    }
     // Send tracing to stderr so JSON-mode subcommands (consumed by the
     // dashboard via shell-out) don't get their stdout polluted with log
     // lines. Production systemd captures both streams to log files; in dev
