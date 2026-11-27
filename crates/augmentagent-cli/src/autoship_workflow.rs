@@ -144,7 +144,7 @@ pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCO
     RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
-pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
+pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed, merge_response_refused};
 pub use merge_escalation::UnresolvedMergeHold;
 pub use deployment_progress::{DeploymentOutcome, DeploymentReceipt};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
