@@ -325,6 +325,10 @@ const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "";
 
 const pwa = Router();
 
+// #2706: the queue page and push endpoints need the same auth as the rest of
+// the dashboard. Path-scoped so routes after this router are unaffected.
+pwa.use(["/queue", "/api/push"], requireAuth);
+
 // Installable PWA queue view. Deep-linkable via ?action=<id> (the service
 // worker focuses here on notification click).
 pwa.get("/queue", (_req, res) => {
