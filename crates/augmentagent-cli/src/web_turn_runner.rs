@@ -39,10 +39,30 @@ pub fn web_audit_ctx(thread_id: &str, turn_id: &str) -> AuditCtx {
     }
 }
 
-/// Run `f` as part of web turn `thread_id`, so channel-scoped tools bind to
-/// the web thread (#2777).
-pub async fn in_web_turn<F: std::future::Future>(_thread_id: &str, f: F) -> F::Output {
-    f.await
+tokio::task_local! {
+    /// The web thread whose turn is running (#2777). Set only by the runner.
+    static WEB_THREAD: String;
+}
+
+/// Run `f` as part of a turn on web thread `thread_id`, so channel-scoped
+/// tools bind to the thread (#2777).
+pub async fn in_web_turn<F: std::future::Future>(thread_id: &str, f: F) -> F::Output {
+    WEB_THREAD.scope(thread_id.to_string(), f).await
+}
+
+/// The conversation key channel-scoped tools (computer use, browser,
+/// compute, newsletter, model switch) bind to: the Discord channel, or
+/// `web:<thread_id>` inside a web turn. `None` for any other turn.
+pub fn tool_scope(ctx: &AuditCtx) -> Option<String> {
+    match ctx.channel_id {
+        Some(channel) => Some(channel.get().to_string()),
+        None => web_thread_scope(),
+    }
+}
+
+/// `web:<thread_id>` inside a web turn.
+pub fn web_thread_scope() -> Option<String> {
+    WEB_THREAD.try_with(|thread| format!("web:{thread}")).ok()
 }
 
 pub struct WebTurnRunner {
@@ -116,7 +136,12 @@ impl WebTurnRunner {
         let result = run_surface_turn_with_history(
             store,
             request,
-            || Ok(None),
+            || {
+                augmentagent_channel_core::model_selection::SelectionStore::new(
+                    augmentagent_channel_core::model_selection::config_path(),
+                )
+                .selected(Some(&format!("web:{thread_id}")))
+            },
             Some(&token),
             |prompt: String| async move {
                 let _permit = self.permits.acquire().await?;
@@ -124,9 +149,12 @@ impl WebTurnRunner {
                     anyhow::bail!("web turn was cancelled before it started");
                 }
                 let ctx = web_audit_ctx(thread_id, turn_id);
-                let answer = augmentagent_approval_discord::interaction::owner_history(
-                    true,
-                    self.handler.answer(&ctx, &prompt),
+                let answer = in_web_turn(
+                    thread_id,
+                    augmentagent_approval_discord::interaction::owner_history(
+                        true,
+                        self.handler.answer(&ctx, &prompt),
+                    ),
                 )
                 .await;
                 answer_failed.store(answer.is_err(), Ordering::SeqCst);

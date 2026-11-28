@@ -805,7 +805,7 @@ enum Cmd {
     #[command(hide = true)]
     ModelTool {
         #[arg(long)]
-        channel: u64,
+        channel: String,
         #[arg(long)]
         readiness: String,
     },
@@ -3261,7 +3261,7 @@ async fn main() -> Result<()> {
         let pacing = linkedin_archive::pacing(page_delay_secs, hourly_requests, daily_requests);
         return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh, pacing).await;
     }
-    if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
+    if let Cmd::ModelTool { ref channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
     if let Cmd::WebTool { ref conversation, ref tools, ref unfiltered } = cli.cmd {
@@ -6026,7 +6026,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
-        Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::ModelTool { ref channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::WebTool { ref conversation, ref tools, ref unfiltered } => web::tool::serve(conversation, tools, unfiltered == "1").await,
         Cmd::TabagentTool { ref session, ref tools } => tabagent_tool::serve(session, tools).await,
         Cmd::TabagentHandoffUrl => tabagent_handoff::print_url(),
@@ -12467,6 +12467,8 @@ fn configure_newsletter_tools(
     let Some(url) = url else { return; };
     if newsletter::validated_url_for_agent(url).is_err() { return; }
     if !newsletter::trusted_request_id(&ctx.session_id) { return; }
+    // #2777 — a web request id is trusted only inside the web turn it names.
+    if ctx.session_id.starts_with("web:") && web_turn_runner::web_thread_scope().is_none() { return; }
     opts.env.push(("NEWSLETTERBUDDY_URL".into(), url.to_string()));
     opts.env.push(("NEWSLETTERBUDDY_REQUEST_ID".into(), ctx.session_id.clone()));
     let bin = std::env::current_exe().ok();

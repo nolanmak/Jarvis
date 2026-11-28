@@ -25,7 +25,11 @@ use tokio::{
 const FRAME_LIMIT: u64 = 2 * 1024 * 1024;
 
 fn authorized(ctx: &AuditCtx, policy: &ComputePolicy) -> bool {
-    policy.enabled && ctx.owner_authorized && ctx.guild_id.is_none() && ctx.channel_id.is_some()
+    // A Discord DM, or a Jarvis Dashboard turn (owner-private, #2777).
+    policy.enabled
+        && ctx.owner_authorized
+        && ctx.guild_id.is_none()
+        && crate::web_turn_runner::tool_scope(ctx).is_some()
 }
 
 #[derive(Deserialize)]
@@ -170,7 +174,10 @@ pub async fn attach(
     ctx: &AuditCtx,
     bin: &Path,
 ) -> Result<Option<ComputeTurn>> {
-    if !ctx.owner_authorized || ctx.guild_id.is_some() || ctx.channel_id.is_none() {
+    if !ctx.owner_authorized
+        || ctx.guild_id.is_some()
+        || crate::web_turn_runner::tool_scope(ctx).is_none()
+    {
         return Ok(None);
     }
     let policy = ComputePolicy::from_env().map_err(anyhow::Error::msg)?;
@@ -182,10 +189,11 @@ pub async fn attach(
         augmentagent_approval_discord::compute_inputs::selected(),
     )?;
     let retained = config.scratch_root.join("compute-artifacts");
-    let account = format!(
-        "discord-dm:{}",
-        ctx.channel_id.context("missing authorized channel")?.get()
-    );
+    let account = match ctx.channel_id {
+        Some(channel) => format!("discord-dm:{}", channel.get()),
+        None => crate::web_turn_runner::web_thread_scope()
+            .context("missing authorized scope")?,
+    };
     let lease = retention::Lease::reserve(
         &retained,
         &account,
