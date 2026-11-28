@@ -9,6 +9,7 @@
 //! The digest scheduler (crate::digest) consumes digest-mode rows on its own
 //! daily tick.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use augmentagent_channel_core::prompt::{
 };
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
+use augmentagent_channel_email::owner_alerts;
 use augmentagent_store::{
     ActionStatus, ChannelSubscription, Email, Store, SubscriptionMode, TriageResult,
     NUDGE_INTERVAL_MS,
@@ -191,8 +193,13 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
             return Ok(outcome);
         }
 
+        let dm_channels = self.one_to_one_dm_channels(&subs).await;
         for sub in subs {
-            if let Err(e) = self.poll_subscription(&sub, &mut outcome).await {
+            let direct_message = dm_channels.contains(&sub.channel_id);
+            if let Err(e) = self
+                .poll_subscription(&sub, direct_message, &mut outcome)
+                .await
+            {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, channel_id = %sub.channel_id, "subscription poll failed: {e:#}");
             }
@@ -200,9 +207,33 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
         Ok(outcome)
     }
 
+    /// IDs of the account's 1:1 DM channels, read once per poll. Owner-alert
+    /// enrichment (#1648) admits only a confirmed type-1 DM, so a group DM, a
+    /// guild channel or a failed lookup simply leaves triage unenriched.
+    async fn one_to_one_dm_channels(&self, subs: &[ChannelSubscription]) -> HashSet<String> {
+        if !subs
+            .iter()
+            .any(|sub| matches!(sub.mode, SubscriptionMode::Priority))
+        {
+            return HashSet::new();
+        }
+        match self.client.list_dm_channels().await {
+            Ok(channels) => channels
+                .into_iter()
+                .filter(|c| c.is_one_to_one())
+                .map(|c| c.id)
+                .collect(),
+            Err(e) => {
+                warn!("discord DM channel lookup failed; owner alerts stay off this poll: {e}");
+                HashSet::new()
+            }
+        }
+    }
+
     async fn poll_subscription(
         &self,
         sub: &ChannelSubscription,
+        direct_message: bool,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
         let messages = match self
@@ -248,7 +279,7 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
             }
             let mut msg = msg;
             self.inline_text_attachments(&mut msg).await;
-            if let Err(e) = self.handle_message(sub, msg, outcome).await {
+            if let Err(e) = self.handle_message(sub, msg, direct_message, outcome).await {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, "handle_message failed: {e:#}");
                 // Don't halt the whole subscription; stash progress below.
@@ -265,6 +296,7 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
         &self,
         sub: &ChannelSubscription,
         msg: Message,
+        direct_message: bool,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
         if augmentagent_approval_discord::phone::is_private_control(&msg.content) {
@@ -277,7 +309,9 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
         }
 
         match sub.mode {
-            SubscriptionMode::Priority => self.handle_priority(email, outcome).await,
+            SubscriptionMode::Priority => {
+                self.handle_priority(email, direct_message, outcome).await
+            }
             SubscriptionMode::Digest => {
                 outcome.digest_stored += 1;
                 // Leave triageResult NULL — the digest scheduler aggregates
@@ -419,13 +453,27 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
     async fn handle_priority(
         &self,
         email: Email,
+        direct_message: bool,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
         let wiki_hint = self.wiki_hint_for_sender(&email);
 
         // Triage
         let triage = triage_opts(self.config.wiki_root.clone());
-        let triage_prompt = triage_user_message(&email, &wiki_hint, "");
+        let mut triage_prompt = triage_user_message(&email, &wiki_hint, "");
+        if direct_message {
+            match owner_alerts::prompt_context_with_wiki(
+                &self.store,
+                &email,
+                self.config.wiki_root.as_deref(),
+                now_millis(),
+            ) {
+                Ok(context) => triage_prompt.push_str(&context),
+                Err(e) => {
+                    warn!(message_id = %email.message_id, "owner alert context failed: {e:#}")
+                }
+            }
+        }
         let raw = self.reasoner.call(&triage, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
@@ -443,6 +491,21 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 return Err(e.into());
             }
         };
+
+        // The assessment is owner-side bookkeeping: a failure here is logged
+        // and the reply/skip/flag outcome below proceeds untouched.
+        if direct_message {
+            if let Err(e) = owner_alerts::persist_assessment_with_source(
+                &self.store,
+                &email,
+                &raw,
+                &alert_source(&email),
+                self.config.wiki_root.as_deref(),
+                now_millis(),
+            ) {
+                warn!(message_id = %email.message_id, "owner alert assessment failed: {e:#}");
+            }
+        }
 
         match decision.decision {
             DecisionKind::Skip => {
@@ -920,6 +983,20 @@ pub(crate) fn message_to_email(
     }
 }
 
+/// Owner-alert identity for a 1:1 DM: `discord:<message id>` plus the jump
+/// link the owner opens. `thread_id` is the DM's channel id (see
+/// [`message_to_email`]).
+fn alert_source(email: &Email) -> owner_alerts::AlertSource {
+    owner_alerts::AlertSource::Direct {
+        id: format!("{PLATFORM}:{}", email.message_id),
+        url: format!(
+            "https://discord.com/channels/@me/{}/{}",
+            email.thread_id.as_deref().unwrap_or_default(),
+            email.message_id
+        ),
+    }
+}
+
 /// Parse a Discord user id out of the `from` field shape
 /// `"<display> <discord:<user_id>>"`. Returns `None` if the tag isn't present.
 fn extract_discord_id(from: &str) -> Option<String> {
@@ -1190,13 +1267,13 @@ mod tests {
         for mode in [SubscriptionMode::StoreOnly, SubscriptionMode::Digest, SubscriptionMode::Priority] {
             let private_sub = sub_with_mode(mode);
             for text in ["phone number verify 123456", "/PHONE NUMBER set +12025550123", "phone number verify"] {
-                ch.handle_message(&private_sub, sample_msg("private-phone", text), &mut outcome).await.unwrap();
+                ch.handle_message(&private_sub, sample_msg("private-phone", text), true, &mut outcome).await.unwrap();
             }
         }
         assert_eq!(outcome.store_only_stored, 0);
         let count: i64 = store.with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))).unwrap();
         assert_eq!(count, 0);
-        ch.handle_message(&sub, sample_msg("ordinary", "hello"), &mut outcome).await.unwrap();
+        ch.handle_message(&sub, sample_msg("ordinary", "hello"), true, &mut outcome).await.unwrap();
         assert_eq!(outcome.store_only_stored, 1);
     }
 
@@ -1215,7 +1292,7 @@ mod tests {
         store.upsert_email(&email).unwrap();
 
         let mut outcome = PollOutcome::default();
-        ch.handle_priority(email, &mut outcome).await.unwrap();
+        ch.handle_priority(email, true, &mut outcome).await.unwrap();
 
         assert_eq!(outcome.priority_skipped, 1);
         assert_eq!(outcome.priority_awaiting_approval, 0);
@@ -1238,7 +1315,7 @@ mod tests {
         store.upsert_email(&email).unwrap();
 
         let mut outcome = PollOutcome::default();
-        ch.handle_priority(email, &mut outcome).await.unwrap();
+        ch.handle_priority(email, true, &mut outcome).await.unwrap();
 
         assert_eq!(outcome.priority_awaiting_approval, 1);
         assert_eq!(*counting.approvals.lock().unwrap(), 1);
@@ -1260,9 +1337,110 @@ mod tests {
         store.upsert_email(&email).unwrap();
 
         let mut outcome = PollOutcome::default();
-        ch.handle_priority(email, &mut outcome).await.unwrap();
+        ch.handle_priority(email, true, &mut outcome).await.unwrap();
 
         assert_eq!(outcome.priority_flagged, 1);
         assert_eq!(*counting.flags.lock().unwrap(), 1);
+    }
+
+    /// A 1:1 DM whose text carries both a concrete request and a clock-time
+    /// deadline, plus the triage response the reasoner returns for it.
+    const ALERT_DM_BODY: &str =
+        "can you send the signed vendor form back by 5:00 pm on March 4? legal needs it filed.";
+    const TRIAGE_WITH_ALERT: &str = r#"{"decision":"skip","reason":"owner answers this one",
+        "alert":{"action":"Send the signed vendor form back","urgency":"high",
+        "request_evidence":"can you send the signed vendor form back",
+        "reason":"Concrete request with a hard deadline",
+        "due":"2099-03-04T17:00:00+00:00","deadline_evidence":"by 5:00 pm on March 4"}}"#;
+
+    fn stored_owner_alerts(store: &Store) -> Vec<(String, String)> {
+        store
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT id,source_url FROM owner_alerts ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            })
+            .unwrap()
+    }
+
+    fn assessed_count(store: &Store) -> i64 {
+        store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM owner_alert_assessments", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn priority_dm_alert_evidence_creates_discord_owner_alert() {
+        let (store, _file) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([TRIAGE_WITH_ALERT]));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = build_channel(store.clone(), reasoner, broker);
+
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let msg = sample_msg("m-alert", ALERT_DM_BODY);
+        let email = message_to_email(&msg, &sub, &ch.my_user_id);
+        store.upsert_email(&email).unwrap();
+
+        let mut outcome = PollOutcome::default();
+        ch.handle_priority(email, true, &mut outcome).await.unwrap();
+
+        assert_eq!(outcome.priority_skipped, 1);
+        assert_eq!(assessed_count(&store), 1);
+        assert_eq!(
+            stored_owner_alerts(&store),
+            vec![(
+                "discord:m-alert".to_string(),
+                "https://discord.com/channels/@me/ch1/m-alert".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_group_message_alert_evidence_creates_nothing() {
+        let (store, _file) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([TRIAGE_WITH_ALERT]));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = build_channel(store.clone(), reasoner, broker);
+
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let msg = sample_msg("m-group", ALERT_DM_BODY);
+        let email = message_to_email(&msg, &sub, &ch.my_user_id);
+        store.upsert_email(&email).unwrap();
+
+        let mut outcome = PollOutcome::default();
+        ch.handle_priority(email, false, &mut outcome).await.unwrap();
+
+        assert_eq!(outcome.priority_skipped, 1);
+        assert_eq!(assessed_count(&store), 0);
+        assert!(stored_owner_alerts(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn priority_dm_without_alert_field_is_assessed_without_an_alert() {
+        let (store, _file) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"flag","reason":"unclear ask","alert":null}"#,
+        ]));
+        let counting = Arc::new(CountingBroker::default());
+        let broker: Arc<dyn ApprovalBroker> = counting.clone();
+        let ch = build_channel(store.clone(), reasoner, broker);
+
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let msg = sample_msg("m-null", ALERT_DM_BODY);
+        let email = message_to_email(&msg, &sub, &ch.my_user_id);
+        store.upsert_email(&email).unwrap();
+
+        let mut outcome = PollOutcome::default();
+        ch.handle_priority(email, true, &mut outcome).await.unwrap();
+
+        assert_eq!(outcome.priority_flagged, 1);
+        assert_eq!(*counting.flags.lock().unwrap(), 1);
+        assert_eq!(assessed_count(&store), 1);
+        assert!(stored_owner_alerts(&store).is_empty());
     }
 }

@@ -212,6 +212,7 @@ pub fn arrival(
     Ok(Some(plan.persist(
         store,
         email,
+        &super::owner_alerts::AlertSource::Mailbox,
         &super::owner_alerts::timezone(),
         now,
         delay,
