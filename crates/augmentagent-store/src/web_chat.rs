@@ -559,6 +559,32 @@ impl Store {
         })
     }
 
+    /// `thread.reset_session`: refused with `ThreadBusy` while the thread has
+    /// an unfinished turn; otherwise drops the native binding (resolving any
+    /// unresolved claim) so the next turn starts fresh with fallback history.
+    pub fn web_reset_session(&self, thread_id: &str) -> WebChatResult<WebThread> {
+        let now = now_millis();
+        self.web_tx(|conn| {
+            load_thread(conn, thread_id)?;
+            let open: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM web_turns WHERE thread_id = ?1
+                 AND status IN ('queued','running')",
+                [thread_id],
+                |r| r.get(0),
+            )?;
+            if open > 0 {
+                return Err(WebChatError::ThreadBusy);
+            }
+            conn.execute(
+                "UPDATE web_threads SET changed_at = ?2 WHERE id = ?1",
+                params![thread_id, now],
+            )?;
+            Ok(())
+        })?;
+        self.reset_surface_conversation(&web_conversation(thread_id))?;
+        self.web_thread(thread_id)
+    }
+
     /// Fallback history for `current_turn_id` (§5.1): messages before its
     /// owner row, oldest first, labelled by role, at most 50 messages and
     /// 16 KiB; one oversize message is cut to 16 KiB ending in `…`.

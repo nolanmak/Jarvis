@@ -338,3 +338,34 @@ fn web_chat_restart_sweep_fails_open_turns_and_resolves_only_pending_claims() {
         .claim_surface_turn(&web_turn_ref(&t.id, "resend"))
         .unwrap();
 }
+
+#[test]
+fn web_chat_reset_session_is_refused_while_busy_and_drops_the_binding() {
+    let (_dir, store) = store();
+    let t = store.web_create_thread(None).unwrap();
+    store
+        .bind_surface_conversation(&augmentagent_store::NativeConversation {
+            conversation: augmentagent_store::web_chat::web_conversation(&t.id),
+            provider: "claude".into(),
+            native_session_id: "s1".into(),
+            cwd: "/".into(),
+            uncertain: false,
+        })
+        .unwrap();
+    store.web_submit_turn(&t.id, "busy", "q").unwrap();
+    assert!(matches!(
+        store.web_reset_session(&t.id),
+        Err(WebChatError::ThreadBusy)
+    ));
+    store.web_end_turn("busy", WebTurnEnd::Cancelled).unwrap();
+    let reset = store.web_reset_session(&t.id).unwrap();
+    assert!(reset.changed_at >= t.changed_at);
+    assert!(store
+        .surface_conversation(&augmentagent_store::web_chat::web_conversation(&t.id))
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        store.web_reset_session("missing"),
+        Err(WebChatError::ThreadNotFound)
+    ));
+}
