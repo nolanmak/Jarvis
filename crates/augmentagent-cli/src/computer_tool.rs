@@ -9,7 +9,7 @@ pub fn configure(opts: &mut ReasonerOpts, ctx: &AuditCtx, root: &Path) {
     if !ctx.owner_authorized || ctx.session_id.is_empty() {
         return;
     }
-    let Some(channel) = ctx.channel_id else {
+    let Some(scope) = crate::web_turn_runner::tool_scope(ctx) else {
         return;
     };
     let Some(raw) = opts.settings_json.as_ref() else {
@@ -27,7 +27,7 @@ pub fn configure(opts: &mut ReasonerOpts, ctx: &AuditCtx, root: &Path) {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| state.join("worker.sock"));
     settings["mcpServers"]["computer"] = serde_json::json!({
-        "command":"node", "args":[root.join("sidecars/computer-use/mcp.mjs"),channel.get().to_string(),ctx.session_id],
+        "command":"node", "args":[root.join("sidecars/computer-use/mcp.mjs"),scope,ctx.session_id],
         "env":{"JARVIS_COMPUTER_SOCKET":socket,"JARVIS_COMPUTER_TOKEN_FILE":state.join("token")}
     });
     opts.settings_json = Some(settings.to_string());

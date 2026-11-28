@@ -274,6 +274,16 @@ pub fn trusted_request_id(value: &str) -> bool {
             return true;
         }
     }
+    // #2777 — a Jarvis Dashboard turn: `web:<thread_id>:<turn_id>`.
+    if let Some(rest) = value.strip_prefix("web:") {
+        let mut parts = rest.split(':');
+        let valid = |part: Option<&str>| {
+            part.is_some_and(|p| {
+                !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+        };
+        return valid(parts.next()) && valid(parts.next()) && parts.next().is_none();
+    }
     // #1288 — a Slack owner turn: `slack:<team>:<channel>:<ts>` (Slack IDs
     // are alphanumeric, a ts is digits and one dot).
     if let Some(rest) = value.strip_prefix("slack:") {
@@ -1130,6 +1140,10 @@ mod tests {
         assert!(!trusted_request_id("123:456; evil"));
         assert!(!trusted_request_id("loop:"));
         assert!(!trusted_request_id("person:123"));
+        assert!(trusted_request_id("web:0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b:turn-1"));
+        for bad in ["web:", "web:thread", "web:a:b:c", "web:a b:c", "web:a:"] {
+            assert!(!trusted_request_id(bad), "{bad}");
+        }
     }
 
     // #1288 — a Slack owner turn's audit ID (`slack:<team>:<event>`) is a

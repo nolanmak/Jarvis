@@ -110,7 +110,10 @@ pub(crate) fn configure_with(
     bin: &Path,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) {
-    if !ctx.owner_authorized || ctx.channel_id.is_none() || !valid_session(&ctx.session_id) {
+    if !ctx.owner_authorized
+        || crate::web_turn_runner::tool_scope(ctx).is_none()
+        || !valid_session(&ctx.session_id)
+    {
         return;
     }
     let url = lookup(URL_ENV).filter(|value| !value.trim().is_empty());
