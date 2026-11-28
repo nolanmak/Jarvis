@@ -316,6 +316,11 @@ pub struct SearchResponse {
     /// no hits means "the archive stopped here", not "nothing matched".
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale_platforms: Vec<String>,
+    /// Hit threads whose archive is missing messages the source counted but
+    /// never stored (#2608) → the gap, when known. Say "replies may be
+    /// missing; check the app", never "they did not reply".
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub incomplete_threads: std::collections::BTreeMap<String, Option<u64>>,
 }
 
 struct Sql {
@@ -830,6 +835,7 @@ pub fn search(
             unresolved,
             archive_newest_entry,
             stale_platforms,
+            incomplete_threads: Default::default(),
         });
     }
     let bound: Vec<&dyn augmentagent_store::rusqlite::ToSql> = params
@@ -861,6 +867,8 @@ pub fn search(
         .collect();
     let next_offset = (!q.latest && hits.len() == limit && (offset + limit) < total as usize)
         .then_some(offset + limit);
+    let incomplete_threads =
+        crate::archive::incomplete_threads(c, hits.iter().map(|h| h.thread_id.as_str()))?;
     Ok(SearchResponse {
         linkedin_coverage,
         hits,
@@ -871,6 +879,7 @@ pub fn search(
         unresolved,
         archive_newest_entry,
         stale_platforms,
+        incomplete_threads,
     })
 }
 
@@ -1256,6 +1265,33 @@ mod tests {
     fn with_stale_whatsapp_archive(s: &Store) {
         s.set_archive_newest_entry("whatsapp", Some("2025-11-01T08:00:00+00:00"))
             .unwrap();
+    }
+
+    /// #2608 — an outbound-only WhatsApp thread whose source store dropped
+    /// the replies must come back flagged, so recall says "replies may be
+    /// missing" instead of "they never replied".
+    #[test]
+    fn hits_in_an_incomplete_thread_carry_the_missing_replies_caveat() {
+        let (_d, _w, s) = fixture();
+        assert!(resp(&s, "in:whatsapp").incomplete_threads.is_empty());
+        s.set_archive_incomplete_threads(
+            "whatsapp",
+            &[("whatsapp-history:5555@lid".into(), Some(2)), ("whatsapp-history:other@lid".into(), None)],
+        )
+        .unwrap();
+        let r = resp(&s, "in:whatsapp");
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(
+            r.incomplete_threads.into_iter().collect::<Vec<_>>(),
+            [("whatsapp-history:5555@lid".to_string(), Some(2))],
+            "only threads among the hits are listed"
+        );
+        let json = serde_json::to_value(resp(&s, "in:whatsapp")).unwrap();
+        assert_eq!(json["incomplete_threads"]["whatsapp-history:5555@lid"], 2);
+        assert!(serde_json::to_value(resp(&s, "in:discord")).unwrap().get("incomplete_threads").is_none());
+        // A chat that caught up drops out on the next poll.
+        s.set_archive_incomplete_threads("whatsapp", &[]).unwrap();
+        assert!(resp(&s, "in:whatsapp").incomplete_threads.is_empty());
     }
 
     #[test]

@@ -844,7 +844,7 @@ fn receipt(seed: &ContextSeed, evidence: &EvidenceOutcome) -> Value {
             "message_id":r.result.get("message_id"),"path":r.result.get("path"),"sha256":r.result.get("sha256"),
             "platform":r.result.get("platform"),"timestamp":r.result.get("timestamp"),
             "next_offset":r.result.get("next_offset"),"archive_newest_entry":r.result.get("archive_newest_entry"),
-            "stale_platforms":r.result.get("stale_platforms"),"error":r.result.get("error"),
+            "stale_platforms":r.result.get("stale_platforms"),"incomplete_threads":r.result.get("incomplete_threads"),"error":r.result.get("error"),
             "index_health":r.result.get("index_health"),
         })).collect::<Vec<_>>(),
         "fact_sources":evidence.facts.iter().map(|f|&f.source_ids).collect::<Vec<_>>(),
