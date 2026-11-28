@@ -144,3 +144,83 @@ test("v1 stats parity with getStats", async () => {
     srv.close();
   }
 });
+
+function post(port, p, body, headers = {}) {
+  const data = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        port,
+        path: p,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(data),
+          ...headers,
+        },
+      },
+      (res) => {
+        let out = "";
+        res.on("data", (c) => (out += c));
+        res.on("end", () => resolve({ status: res.statusCode, body: out }));
+      }
+    );
+    req.on("error", reject);
+    req.end(data);
+  });
+}
+
+// #2707 (spec D5): Node must never flip an action's status by SQL. A web
+// "Approve" that only rewrote the row recorded a send that never happened.
+// The legacy route keeps field edits on a pending action and refuses any
+// other target status with use_real_approval.
+for (const target of ["sent", "rejected", "skipped", "approved", "failed"]) {
+  test(`POST /api/v1/actions/:id refuses status=${target} and leaves the row pending`, async () => {
+    const srv = await startServer();
+    const port = srv.address().port;
+    try {
+      const { getActionById } = require(path.join(__dirname, "..", "dist", "db.js"));
+      const id = getActions({ limit: 20, offset: 0, status: "pending" })[0].id;
+      const res = await post(
+        port,
+        `/api/v1/actions/${id}`,
+        { status: target, source: "web_push" },
+        { "x-api-key": "test-key-123" }
+      );
+      assert.strictEqual(res.status, 409);
+      assert.deepStrictEqual(JSON.parse(res.body), { error: "use_real_approval" });
+      assert.strictEqual(getActionById(id).status, "pending");
+    } finally {
+      srv.close();
+    }
+  });
+}
+
+test("POST /api/v1/actions/:id still accepts a pending recipient edit (draft-preview)", async () => {
+  const srv = await startServer();
+  const port = srv.address().port;
+  try {
+    const { getActionById } = require(path.join(__dirname, "..", "dist", "db.js"));
+    const id = getActions({ limit: 20, offset: 0, status: "pending" })[0].id;
+    const res = await post(
+      port,
+      `/api/v1/actions/${id}`,
+      { status: "pending", recipientEmail: "new@x.example.com", source: "dashboard_preview" },
+      { "x-api-key": "test-key-123" }
+    );
+    assert.strictEqual(res.status, 200);
+    const json = JSON.parse(res.body);
+    assert.strictEqual(json.status, "pending");
+    assert.strictEqual(json.recipientEmail, "new@x.example.com");
+    assert.strictEqual(getActionById(id).recipientEmail, "new@x.example.com");
+  } finally {
+    srv.close();
+  }
+});
+
+test("legacy /queue view is read-only: no Approve, Skip or Revise", () => {
+  const view = fs.readFileSync(path.join(__dirname, "..", "views", "queue.ejs"), "utf8");
+  assert.doesNotMatch(view, />\s*(Approve|Skip|Revise)\s*</);
+  assert.doesNotMatch(view, /method:\s*"POST"[\s\S]*\/api\/v1\/actions\//);
+  assert.doesNotMatch(view, /fetch\("\/api\/v1\/actions\/"/);
+});
