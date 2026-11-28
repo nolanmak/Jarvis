@@ -98,6 +98,33 @@ fn poll_records_the_archive_freshness_cursor() {
     );
 }
 
+/// #2608 — chats the exporter flags as missing messages are recorded per
+/// poll, and drop out once the flag clears.
+#[test]
+fn poll_records_incomplete_chats_and_clears_them_when_they_catch_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    bundle(tmp.path());
+    let store = Store::open(tmp.path().join("data.db")).unwrap();
+    poll_once(tmp.path(), &store).unwrap();
+    assert!(store.archive_incomplete_threads().unwrap().is_empty(), "old bundles carry no flag");
+
+    let path = tmp.path().join("conversations/index.json");
+    let mut index: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    index["15550000001@s.whatsapp.net"]["incomplete"] = json!(true);
+    index["15550000001@s.whatsapp.net"]["missing_messages"] = json!(3);
+    fs::write(&path, index.to_string()).unwrap();
+    poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(
+        store.archive_incomplete_threads().unwrap().into_iter().collect::<Vec<_>>(),
+        [("whatsapp-history:15550000001@s.whatsapp.net".to_string(), Some(3))]
+    );
+
+    index["15550000001@s.whatsapp.net"].as_object_mut().unwrap().remove("incomplete");
+    fs::write(&path, index.to_string()).unwrap();
+    poll_once(tmp.path(), &store).unwrap();
+    assert!(store.archive_incomplete_threads().unwrap().is_empty());
+}
+
 #[test]
 fn invalid_paths_and_missing_conversations_do_not_block_good_ones() {
     let tmp = tempfile::tempdir().unwrap();

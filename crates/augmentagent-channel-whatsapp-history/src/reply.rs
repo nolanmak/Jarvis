@@ -90,6 +90,10 @@ pub fn card_email(delta: &Delta, now_ms: i64, max_age: Duration) -> Option<Email
         })
         .collect();
     card.body = context_body(&shown);
+    if let Some(note) = crate::incomplete_note(conv) {
+        card.body.push_str("\n\n");
+        card.body.push_str(&note);
+    }
     if is_group(conv) {
         card.subject = format!("WhatsApp group: {}", conv.title);
     } else {
@@ -256,7 +260,10 @@ impl WhatsappReplier {
         anyhow::ensure!(self.store.is_whatsapp_inbound_allowed(jid)?, "reply cards are denied for this chat");
         let open = Delta { conversation: delta.conversation.clone(), entries: delta.entries.clone(), first_run: false };
         let card = card_email(&open, now_ms, Duration::from_secs(10 * 365 * 86_400))
-            .ok_or_else(|| anyhow::anyhow!("the newest message is yours or has no text; nothing to reply to"))?;
+            .ok_or_else(|| match crate::incomplete_note(&delta.conversation) {
+                Some(note) => anyhow::anyhow!("the newest stored message is yours or has no text. {note}"),
+                None => anyhow::anyhow!("the newest message is yours or has no text; nothing to reply to"),
+            })?;
         let drafter = CardDrafter {
             store: &self.store,
             reasoner: self.reasoner.as_ref(),
@@ -476,6 +483,34 @@ mod tests {
         let cards = f.broker.cards.lock().unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].2, "sure, Thursday works");
+    }
+
+    /// #2608 — a chat whose store dropped replies says so on the card, and
+    /// an owner-requested card on an outbound-only chat explains why there is
+    /// nothing to reply to instead of implying silence.
+    #[tokio::test]
+    async fn incomplete_chat_card_and_refusal_say_replies_may_be_missing() {
+        let mut conv = dm();
+        conv.incomplete = true;
+        conv.missing_messages = Some(2);
+        let d = delta(conv.clone(), vec![entry(DM, "are you around?", 1)], false);
+        let card = card_email(&d, now_ms(), DEFAULT_MAX_AGE).unwrap();
+        assert!(card.body.contains("Archive may be missing replies"), "{}", card.body);
+        assert!(card.body.contains("2 messages WhatsApp counted"));
+        assert!(card_email(&delta(dm(), vec![entry(DM, "hi", 1)], false), now_ms(), DEFAULT_MAX_AGE)
+            .unwrap()
+            .body
+            .find("Archive may be missing")
+            .is_none());
+
+        conv.missing_messages = None;
+        let f = fx();
+        f.store.allow_whatsapp_inbound(DM).unwrap();
+        let mine = delta(conv, vec![entry("me", "you there?", 1)], false);
+        ingest(&f.store, &mine);
+        let err = replier(&f, Scripted::new(&[])).card_requested(&mine, now_ms()).await.unwrap_err().to_string();
+        assert!(err.contains("check WhatsApp on your phone"), "{err}");
+        assert!(err.contains("only one side"), "{err}");
     }
 
     #[tokio::test]

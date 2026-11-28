@@ -46,6 +46,28 @@ pub fn newest_entries(
     Ok(out)
 }
 
+/// Which of `threads` the bundle exporter flagged as missing messages the
+/// source counted but never stored (#2608), with the gap when known. Recall
+/// must report these as "replies may be missing", not as silence.
+pub fn incomplete_threads<'a>(
+    c: &Connection,
+    threads: impl IntoIterator<Item = &'a str>,
+) -> augmentagent_store::rusqlite::Result<BTreeMap<String, Option<u64>>> {
+    let mut stmt =
+        c.prepare_cached("SELECT missing FROM archive_incomplete_threads WHERE thread_id = ?1")?;
+    let mut out = BTreeMap::new();
+    for thread in threads {
+        if out.contains_key(thread) {
+            continue;
+        }
+        let mut rows = stmt.query([thread])?;
+        if let Some(row) = rows.next()? {
+            out.insert(thread.to_string(), row.get::<_, Option<i64>>(0)?.map(|m| m as u64));
+        }
+    }
+    Ok(out)
+}
+
 /// Platforms whose archive ends strictly before the query's lower bound.
 /// An unbounded query (`lower_bound` of `None`) is never stale: a freshness
 /// signal that fires on every query is useless.

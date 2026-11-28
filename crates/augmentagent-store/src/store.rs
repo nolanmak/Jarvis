@@ -2216,6 +2216,20 @@ impl Store {
             [],
         )?;
 
+        // #2608 — threads whose bundle exporter says the source store is
+        // missing messages it counted (disappearing-message chats). Replaced
+        // wholesale per platform on every poll, so a chat that catches up
+        // drops out. `missing` is NULL when the gap size is unknown.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS archive_incomplete_threads (\
+                 thread_id     TEXT PRIMARY KEY,\
+                 platform      TEXT NOT NULL,\
+                 missing       INTEGER,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #80 — voice-capture Telegram long-poll cursor. Single-row table
         // keyed by a logical capture-bot id; stores the last acked update_id
         // so a daemon restart never re-ingests an already-transcribed memo.
@@ -4092,6 +4106,43 @@ impl Store {
             params![platform, newest_entry, now_millis()],
         )?;
         Ok(())
+    }
+
+    /// Replace `platform`'s incomplete-thread set (#2608) with `threads`
+    /// (thread id, messages missing when known).
+    pub fn set_archive_incomplete_threads(
+        &self,
+        platform: &str,
+        threads: &[(String, Option<u64>)],
+    ) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM archive_incomplete_threads WHERE platform = ?1",
+            params![platform],
+        )?;
+        let now = now_millis();
+        for (thread, missing) in threads {
+            tx.execute(
+                "INSERT OR REPLACE INTO archive_incomplete_threads \
+                     (thread_id, platform, missing, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![thread, platform, missing.map(|m| m as i64), now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Thread id → messages missing (None when unknown), every platform.
+    pub fn archive_incomplete_threads(
+        &self,
+    ) -> StoreResult<std::collections::BTreeMap<String, Option<u64>>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare("SELECT thread_id, missing FROM archive_incomplete_threads")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.map(|m| m as u64)))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
     }
 
     /// Archive freshness cursors, keyed by platform. A platform with no
