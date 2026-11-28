@@ -111,7 +111,7 @@ test("GET / renders the app shell with mobile viewport, bottom bar and legacy Mo
   // No thread selected: the threads pane is the phone default.
   assert.match(html, /<body[^>]*data-pane="threads"/);
   // Legacy pages live under "More".
-  const more = html.match(/<details class="j-menu"[\s\S]*?<\/details>/);
+  const more = html.match(/<details class="j-menu[^"]*">\s*<summary[^>]*aria-label="More pages"[\s\S]*?<\/details>/);
   assert.ok(more && />More</.test(more[0]), "More menu");
   for (const href of ["/dashboard", "/history", "/settings", "/queue", "/audit"]) {
     assert.ok(more[0].includes(`href="${href}"`), href);
@@ -141,7 +141,7 @@ test("GET /web/threads renders pinned then recent, and the archived toggle", asy
   const html = res.html;
   assert.match(html, /^<div id="threads"[^>]*hx-get="\/web\/threads\?archived=0&amp;active=t-old"/);
   assert.match(html, /hx-trigger="sse:threads_changed, jarvis:refresh"/);
-  const order = ["Pinned", "t-pin", "Recent", "t-new", "t-old"].map((s) => html.indexOf(s));
+  const order = ["Pinned", "thread=t-pin", "Recent", "thread=t-new", "thread=t-old"].map((s) => html.indexOf(s));
   assert.ok(order.every((i, k) => i >= 0 && (k === 0 || i > order[k - 1])), `order ${order}`);
   assert.ok(!html.includes("t-arc"));
   assert.ok(html.includes("Draft reply to &lt;b&gt;Sam&lt;/b&gt;"));

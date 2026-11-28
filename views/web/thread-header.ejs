@@ -1,0 +1,20 @@
+<header id="thread-header" class="j-head"<% if (locals.oob) { %> hx-swap-oob="true"<% } %>>
+  <div class="j-head-title">
+    <h1 id="thread-title"><%= thread ? thread.title : (missing ? 'Thread not found' : 'Jarvis') %></h1>
+    <% if (thread && (thread.pinned || thread.archived)) { %>
+    <p class="j-head-meta"><%= [thread.pinned && 'Pinned', thread.archived && 'Archived'].filter(Boolean).join(' · ') %></p>
+    <% } %>
+  </div>
+  <button type="button" class="j-btn" data-action="palette" aria-label="Search and commands (⌘K)" title="Search and commands (⌘K)"><%- include('icon', { name: 'search' }) %></button>
+  <% if (thread) { const id = encodeURIComponent(thread.id); %>
+  <details class="j-menu j-menu-right">
+    <summary class="j-btn" aria-label="Thread options"><%- include('icon', { name: 'more' }) %></summary>
+    <div class="j-menu-panel" role="menu">
+      <button type="button" role="menuitem" data-action="rename"><%- include('icon', { name: 'edit' }) %>Rename</button>
+      <button type="button" role="menuitem" hx-post="/web/threads/<%= id %>/set" hx-vals='{"pinned": <%= !thread.pinned %>}' hx-target="#threads" hx-swap="outerHTML"><%- include('icon', { name: 'pin' }) %><%= thread.pinned ? 'Unpin' : 'Pin' %></button>
+      <button type="button" role="menuitem" hx-post="/web/threads/<%= id %>/set" hx-vals='{"archived": <%= !thread.archived %>}' hx-target="#threads" hx-swap="outerHTML"><%- include('icon', { name: 'archive' }) %><%= thread.archived ? 'Unarchive' : 'Archive' %></button>
+    </div>
+  </details>
+  <% } %>
+  <button type="button" class="j-btn j-rail-toggle" data-action="toggle-rail" aria-label="Toggle approvals" title="Toggle approvals"><%- include('icon', { name: 'panel' }) %></button>
+</header>
