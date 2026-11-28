@@ -82,7 +82,7 @@ use augmentagent_channel_email::sigextract::{
     SignatureExtractor,
 };
 use augmentagent_channel_email::{
-    GmailChannel, GmailChannelConfig, OutboundObserver,
+    ComposeQueueConfig, GmailChannel, GmailChannelConfig, OutboundObserver,
 };
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
@@ -17190,6 +17190,8 @@ fn build_channel(
         poll_interval: Duration::from_secs(interval_secs),
         wiki_root,
         wiki_schema_path,
+        // #2389 — off unless AUGMENTAGENT_GMAIL_COMPOSE_QUEUE says otherwise.
+        compose_queue: ComposeQueueConfig::from_env(),
         ..Default::default()
     };
     let channel = GmailChannel::new(Arc::clone(&store), gmail, reasoner, broker, config);

@@ -5,6 +5,8 @@
 //! primitives (`Reasoner`, prompt builders, decision parsing, ingest) live in
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
+// #2389 — the durable parking lot for a throttled compose.
+pub mod compose_dispatch;
 mod draft_body;
 pub mod gmail;
 pub mod google;
@@ -26,6 +28,7 @@ pub use channel::{
     DEFAULT_POLL_SECS,
     DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,
 };
+pub use compose_dispatch::{compose_idem_key, ComposeQueueConfig, ComposeReplay, QueuedCompose};
 pub use inbound::{email_to_work_item, GmailInbound};
 pub use outbound::{
     classify_outbound, parse_rfc2822_or_ms, Classification, OutboundEvent, OutboundObserver,
