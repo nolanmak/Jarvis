@@ -234,6 +234,27 @@ fn ac01_last_chunk_may_carry_last_true_and_empty_partials_are_not_sent() {
     assert!(session.finish_stream(&turn, "").unwrap().is_none());
 }
 
+// Deduplication covers the whole concatenated answer, never a single chunk: a
+// sentence the agent repeats is spoken every time, and the automatic final
+// answer for the same turn is still suppressed once the stream closed.
+#[test]
+fn dedup_covers_the_whole_streamed_answer_so_repeated_chunks_are_each_spoken() {
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    let turn = turn(&mut session, "did it work");
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        frames.extend(session.speak_partial(&turn, "Yes. ").unwrap());
+    }
+    frames.extend(session.finish_stream(&turn, "Yes.").unwrap());
+    assert_eq!(frames.len(), 4, "every repeated chunk is sent: {frames:?}");
+    let tokens: Vec<&str> = frames.iter().map(|f| f["token"].as_str().unwrap()).collect();
+    assert_eq!(tokens, ["Yes. ", "Yes. ", "Yes. ", "Yes."]);
+    let last: Vec<bool> = frames.iter().map(|f| f["last"].as_bool().unwrap()).collect();
+    assert_eq!(last, [false, false, false, true]);
+    assert!(session.finish(&turn, "Yes. Yes. Yes. Yes.").unwrap().is_none());
+}
+
 // Agent-spoken `final` utterance suppresses the streamed automatic answer,
 // matching the existing speak() contract.
 #[test]
