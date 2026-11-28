@@ -54,6 +54,23 @@ pub fn display_sender(conv: &Conversation, sender: &str) -> String {
     }
 }
 
+/// The caveat for a chat whose source store is missing messages it counted
+/// (#2608): WhatsApp Desktop drops disappearing-message replies, so silence in
+/// the archive is not evidence the contact never replied.
+pub fn incomplete_note(conv: &Conversation) -> Option<String> {
+    if !conv.incomplete {
+        return None;
+    }
+    let gap = match conv.missing_messages {
+        Some(1) => "1 message WhatsApp counted was never stored".to_string(),
+        Some(n) => format!("{n} messages WhatsApp counted were never stored"),
+        None => "WhatsApp stored only one side of this chat".to_string(),
+    };
+    Some(format!(
+        "Archive may be missing replies in this chat ({gap}); check WhatsApp on your phone."
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub directory: PathBuf,
@@ -194,6 +211,14 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
             index.values().filter_map(|c| c.newest_entry.as_deref()),
         )
         .as_deref(),
+    )?;
+    store.set_archive_incomplete_threads(
+        "whatsapp",
+        &index
+            .values()
+            .filter(|c| c.incomplete && c.service == "WhatsApp")
+            .map(|c| (format!("{THREAD_PREFIX}{}", c.identifier), c.missing_messages))
+            .collect::<Vec<_>>(),
     )?;
     let mut report = Report::default();
     for (key, conv) in index {

@@ -1,5 +1,4 @@
-//! Autoship observation for the capability manifest, embedded from a
-//! `src/bin/` target.
+//! The capability manifest, embedded from a `src/bin/` target (#2343).
 //!
 //! `include_str!` resolves against the embedding file, so this path carries
 //! one directory level more than the copy in `tests/capability_inventory.rs`:
