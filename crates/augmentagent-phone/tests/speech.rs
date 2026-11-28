@@ -109,8 +109,43 @@ async fn ac09_streaming_transform_matches_whole_string_within_hold_back() {
     assert!(whole.contains("the release notes for this build"));
 }
 
+// AC9: closing a long link text may not push the hold-back past the bound.
+#[test]
+fn ac09_hold_back_stays_bounded_while_a_link_text_closes() {
+    for text_len in 0..MAX_HOLD_BACK + 4 {
+        let input = format!("see [{}](https://example.com/a) end", "a".repeat(text_len));
+        let whole = SpeechTextTransform::apply(&input);
+        let mut transform = SpeechTextTransform::new();
+        let mut streamed = String::new();
+        for c in input.chars() {
+            streamed.push_str(&transform.push(&c.to_string()));
+            let held = transform.held();
+            assert!(held <= MAX_HOLD_BACK, "hold-back {held} in {input:?}");
+        }
+        streamed.push_str(&transform.flush());
+        assert_eq!(streamed, whole, "input: {input:?}");
+        assert!(streamed.ends_with(" end"), "{streamed:?}");
+        assert_no_forbidden(&streamed);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, .. ProptestConfig::default() })]
+    #[test]
+    fn ac09_hold_back_is_bounded_on_every_tick(
+        input in "([A-Za-z0-9 \t.!?\\n#*`_\\-|>\\[\\]()~:/]|https?://|www\\.|```|\\]\\(|🎉){0,120}"
+    ) {
+        let whole = SpeechTextTransform::apply(&input);
+        let mut transform = SpeechTextTransform::new();
+        let mut streamed = String::new();
+        for c in input.chars() {
+            streamed.push_str(&transform.push(&c.to_string()));
+            let held = transform.held();
+            prop_assert!(held <= MAX_HOLD_BACK, "hold-back {} in {:?}", held, input);
+        }
+        streamed.push_str(&transform.flush());
+        prop_assert_eq!(streamed, whole);
+    }
     #[test]
     fn ac09_random_split_points_do_not_change_sanitized_output(
         input in "([A-Za-z0-9 .!?\\n#*`_\\-|>\\[\\]()~:/]|https?://|www\\.|```|\\]\\(|😀)*",
