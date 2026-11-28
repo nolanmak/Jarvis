@@ -1,0 +1,13 @@
+<% if (!entries.length) { %><p class="j-palette-empty">No matches</p><% } else { %>
+<div role="listbox" aria-label="Results">
+<% entries.forEach((e, i) => { const cls = `j-option${i === 0 ? ' is-active' : ''}`; %>
+  <% if (e.kind === 'thread') { %>
+  <a role="option" class="<%= cls %>" href="/?thread=<%= encodeURIComponent(e.id) %>"><%- include('icon', { name: 'chat' }) %><span class="j-option-label"><%= e.label %></span><span class="j-option-kind">Thread</span></a>
+  <% } else if (e.id === 'new-thread') { %>
+  <button type="button" role="option" class="<%= cls %>" data-action="new-thread"><%- include('icon', { name: 'plus' }) %><span class="j-option-label"><%= e.label %></span><kbd class="j-kbd">⌘N</kbd></button>
+  <% } else { %>
+  <a role="option" class="<%= cls %>" href="<%= e.href %>"><%- include('icon', { name: e.id === 'approvals' ? 'check' : 'external' }) %><span class="j-option-label"><%= e.label %></span><span class="j-option-kind">Page</span></a>
+  <% } %>
+<% }) %>
+</div>
+<% } %>
