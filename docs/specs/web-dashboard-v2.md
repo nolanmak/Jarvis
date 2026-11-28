@@ -1,4 +1,4 @@
-# Spec: Jarvis web dashboard v2 (chat-first, Discord alternative)
+# Spec: Jarvis Dashboard (chat-first, Discord alternative)
 
 Status: audited draft (rev 3) · Owner: nolanmak · Date: 2026-11-27
 Audit: rev 1 went through spec-interrogation Passes A (fresh eyes), B (conversation drift) and C
@@ -21,8 +21,8 @@ views) is an admin panel, and its `POST /api/ask` is not the brain that answers 
   edge. The app never checks the Access token.
 
 Goal: one web app, usable from any device, that is a better place than Discord to talk to Jarvis.
-It runs real Jarvis turns with session continuity and real approvals, behind serious auth. UX
-direction: T3 Code (thread sidebar, chat in the middle, a context rail, a keyboard-first palette).
+It runs real Jarvis turns with session continuity and real approvals, behind serious auth. Layout:
+thread sidebar, chat in the middle, an approvals rail, and a keyboard-first palette.
 
 ## 2. Decisions
 
@@ -350,8 +350,8 @@ semaphore). Storage is in `web_chat.rs` (§5.1).
   refetches.
 - ⌘K palette: a server-side fragment `/web/palette?q=` ranks actions (new thread, open approvals,
   legacy pages) and thread titles. The ranking is in `src/web/palette.logic.ts`.
-- Theme: dark by default, and the system light theme is respected. It is visually inspired by T3
-  Code's density and type. No T3 assets or branding are copied.
+- Theme: dark by default, and the system light theme is respected. Dense, keyboard-first, Jarvis
+  branding only.
 - PWA: add `public/icon-192.png` and `public/icon-512.png`. The manifest gets `start_url: "/"` and
   is linked with `crossorigin="use-credentials"` (so it loads behind Access). The service worker's
   cache version is bumped, and it becomes network-first for HTML and never caches redirects. No push (§8).
@@ -464,8 +464,8 @@ Ops (owner/human, not autoship):
   plumbing through the drafting tools. Until then cards live in the rail only.
 - **Tailscale Serve route.** Trigger: a Cloudflare outage or a latency complaint. It must not trust
   `Tailscale-User-*` headers on any listener cloudflared can reach.
-- **ACP adapter so T3 Code's clients can drive Jarvis.** Trigger: wanting T3's mobile apps. Cost:
-  an adapter over the §5.2 ops.
+- **ACP adapter so third-party agent clients can drive Jarvis.** Trigger: wanting an existing
+  mobile agent client. Cost: an adapter over the §5.2 ops.
 - **Voice in the browser.**
 
 ## 9. Non-goals (v1)
