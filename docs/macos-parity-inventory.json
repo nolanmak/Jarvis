@@ -2025,8 +2025,8 @@
     "evidence": null
   },
   {
-    "id": "route:dashboard:GET:/",
-    "source": "src/dashboard.ts",
+    "id": "route:web/fragments:GET:/",
+    "source": "src/web/fragments.ts",
     "linux_baseline": "Linux dashboard serves GET / with its current auth and response contract.",
     "macos_target": "Mac dashboard serves GET / with equivalent auth and response contract.",
     "prerequisites": [
@@ -2035,6 +2035,76 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
     "test_plan": "Exercise GET / in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:GET:/web/palette",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves GET /web/palette with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /web/palette with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /web/palette in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:GET:/web/threads",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves GET /web/threads with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /web/threads with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /web/threads in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/threads",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/threads with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/threads with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/threads in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/threads/:id/rename",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/threads/:id/rename with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/threads/:id/rename with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/threads/:id/rename in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/threads/:id/set",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/threads/:id/set with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/threads/:id/set with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/threads/:id/set in a native Mac and Linux dashboard fixture, including unauthorized access.",
     "status": "unverified",
     "evidence": null
   },
