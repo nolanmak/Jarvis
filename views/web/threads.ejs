@@ -1,0 +1,29 @@
+<div id="threads" class="j-threads" hx-get="/web/threads?archived=<%= archived ? 1 : 0 %>&amp;active=<%= encodeURIComponent(active) %>" hx-trigger="sse:threads_changed, jarvis:refresh" hx-swap="outerHTML">
+<%
+  const groups = archived
+    ? [{ label: 'Archived', items: threads }]
+    : [{ label: 'Pinned', items: threads.filter((t) => t.pinned) }, { label: 'Recent', items: threads.filter((t) => !t.pinned) }];
+%>
+<% groups.filter((g) => g.items.length).forEach((g) => { %>
+  <section class="j-group">
+    <h2 class="j-section"><%= g.label %></h2>
+    <% g.items.forEach((t) => { %>
+    <a class="j-thread" href="/?thread=<%= encodeURIComponent(t.id) %>"<% if (t.id === active) { %> aria-current="page"<% } %> data-title="<%= t.title.toLowerCase() %>">
+      <span class="j-thread-title"><%= t.title %></span>
+      <time class="j-thread-time" datetime="<%= new Date(t.updated_at).toISOString() %>"><%= shortTime(t.updated_at, now) %></time>
+    </a>
+    <% }) %>
+  </section>
+<% }) %>
+<% if (!threads.length) { %>
+  <div class="j-empty-list">
+    <p class="j-empty-title"><%= archived ? 'No archived threads' : 'No threads yet' %></p>
+    <% if (!archived) { %><p>Start one with <kbd class="j-kbd">⌘N</kbd> or the + button.</p><% } %>
+  </div>
+<% } %>
+  <p class="j-no-match" hidden>No threads match.</p>
+  <button type="button" class="j-link-btn" hx-get="/web/threads?archived=<%= archived ? 0 : 1 %>&amp;active=<%= encodeURIComponent(active) %>" hx-target="#threads" hx-swap="outerHTML">
+    <%- include('icon', { name: 'archive' }) %><span><%= archived ? 'Back to threads' : 'Archived threads' %></span>
+  </button>
+</div>
+<% if (locals.oobThread) { %><%- include('thread-header', { thread: oobThread, missing: false, oob: true }) %><% } %>

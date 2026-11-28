@@ -10,6 +10,12 @@ module.exports = {
       colors: {
         surface: { DEFAULT: "#1a1a2e", light: "#16213e", card: "#0f3460" },
         accent: { DEFAULT: "#e94560", soft: "#533483" },
+        // Jarvis Dashboard tokens; values live in tailwind.input.css (dark + light).
+        j: Object.fromEntries(
+          ["bg", "panel", "elev", "line", "fg", "muted", "faint", "accent", "solid", "danger", "ok", "warn"].map(
+            (k) => [k, `rgb(var(--j-${k}) / <alpha-value>)`],
+          ),
+        ),
       },
     },
   },

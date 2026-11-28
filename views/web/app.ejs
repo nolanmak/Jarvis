@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0e14" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="color-scheme" content="dark light">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Jarvis">
+  <title><%= thread ? `${thread.title} · Jarvis` : 'Jarvis' %></title>
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+  <link rel="icon" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/tailwind.css">
+  <script src="/vendor/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"></script>
+  <script src="/vendor/sse.min.js" integrity="sha384-A986SAtodyH8eg8x8irJnYUk7i9inVQqYigD6qZ9evobksGNIXfeFvDwLSHcp31N"></script>
+  <script src="/web.js" defer></script>
+</head>
+<body class="j-body" hx-ext="sse" sse-connect="/api/web/events" data-thread="<%= thread ? thread.id : '' %>" data-pane="<%= pane %>" data-rail="<%= pane === 'approvals' ? 'open' : 'auto' %>">
+  <div id="sse-bus" hidden hx-trigger="sse:changed"></div>
+  <div class="j-app">
+    <aside class="j-pane j-sidebar" data-pane-name="threads" aria-label="Threads">
+      <header class="j-head">
+        <a href="/" class="j-brand"><span class="j-mark" aria-hidden="true">J</span>Jarvis</a>
+        <details class="j-menu j-menu-right">
+          <summary class="j-btn" aria-label="More pages"><span class="j-more-label">More</span></summary>
+          <div class="j-menu-panel" role="menu">
+            <% legacyPages.forEach((p) => { %><a role="menuitem" href="<%= p.href %>"><%= p.label %></a><% }) %>
+            <% if (kbUrl) { %><a role="menuitem" href="<%= kbUrl %>" target="_blank" rel="noopener noreferrer">Knowledge base <%- include('icon', { name: 'external' }) %></a><% } %>
+          </div>
+        </details>
+        <button type="button" id="new-thread" class="j-btn j-btn-primary" hx-post="/web/threads" hx-target="#threads" hx-swap="outerHTML" aria-label="New thread (⌘N)" title="New thread (⌘N)"><%- include('icon', { name: 'plus' }) %></button>
+      </header>
+      <div class="j-search">
+        <%- include('icon', { name: 'search' }) %>
+        <input id="thread-search" type="search" placeholder="Search threads" aria-label="Search threads" autocomplete="off" enterkeyhint="search">
+      </div>
+      <div class="j-scroll">
+        <%- include('threads', locals) %>
+      </div>
+    </aside>
+
+    <main class="j-pane j-main" data-pane-name="chat" aria-label="Chat">
+      <%- include('thread-header', { thread, missing, oob: false }) %>
+      <div class="j-scroll j-chat-body">
+        <div class="j-empty">
+          <span class="j-mark j-mark-lg" aria-hidden="true">J</span>
+          <% if (thread) { %>
+            <p class="j-empty-title">Messages will appear here</p>
+            <p>This thread is ready.</p>
+          <% } else { %>
+            <p class="j-empty-title"><%= missing ? 'That thread does not exist' : 'What can Jarvis do for you?' %></p>
+            <p>Pick a thread or start a new one. Press <kbd class="j-kbd">⌘K</kbd> to jump anywhere.</p>
+            <button type="button" class="j-btn-text" data-action="new-thread"><%- include('icon', { name: 'plus' }) %>New thread</button>
+          <% } %>
+        </div>
+      </div>
+    </main>
+
+    <aside class="j-pane j-rail" data-pane-name="approvals" aria-label="Approvals">
+      <header class="j-head"><div class="j-head-title"><h1>Approvals</h1></div></header>
+      <div class="j-scroll">
+        <div class="j-empty"><p class="j-empty-title">Nothing to review</p><p>Drafts that need your approval show up here.</p></div>
+      </div>
+    </aside>
+  </div>
+
+  <nav class="j-tabbar" aria-label="Sections">
+    <button type="button" data-pane-target="threads"><%- include('icon', { name: 'list' }) %><span>Threads</span></button>
+    <button type="button" data-pane-target="chat"><%- include('icon', { name: 'chat' }) %><span>Chat</span></button>
+    <button type="button" data-pane-target="approvals"><%- include('icon', { name: 'check' }) %><span>Approvals</span></button>
+  </nav>
+
+  <div id="j-toast" class="j-toast" role="status" aria-live="polite"></div>
+
+  <dialog id="palette" class="j-dialog j-palette" aria-label="Search and commands">
+    <div class="j-search">
+      <%- include('icon', { name: 'search' }) %>
+      <input name="q" type="search" placeholder="Jump to a thread or page…" aria-label="Search" autocomplete="off" enterkeyhint="go"
+             hx-get="/web/palette" hx-trigger="input changed delay:80ms, jarvis:open" hx-target="#palette-results">
+    </div>
+    <div id="palette-results" class="j-palette-results"></div>
+  </dialog>
+
+  <% if (thread) { %>
+  <dialog id="rename-dialog" class="j-dialog">
+    <form hx-post="/web/threads/<%= encodeURIComponent(thread.id) %>/rename" hx-target="#threads" hx-swap="outerHTML" class="j-form">
+      <label for="rename-title" class="j-form-label">Rename thread</label>
+      <input id="rename-title" name="title" class="j-input" maxlength="120" required value="<%= thread.title %>">
+      <div class="j-form-actions">
+        <button type="button" class="j-btn-text" data-action="close-dialog">Cancel</button>
+        <button type="submit" class="j-btn-text j-btn-solid">Save</button>
+      </div>
+    </form>
+  </dialog>
+  <% } %>
+</body>
+</html>

@@ -72,6 +72,7 @@ import { requireApiKey } from "./apiV1";
 import { requireAuth } from "./security";
 import { createModelRouterRoutes } from "./modelRouterRoutes";
 import { createWebRoutes } from "./web/routes";
+import { createFragmentRoutes } from "./web/fragments";
 import { createSessionManager } from "./sessionProcesses";
 // Auto-update signature gate (security #298). Shared with the 5-min poller in
 // index.ts so both auto-update paths enforce the same owner-signature
@@ -154,6 +155,8 @@ router.use((_req, res, next) => {
 
 router.use(createModelRouterRoutes());
 router.use(createWebRoutes());
+// GET / serves the Jarvis Dashboard app (#2717); legacy pages sit under "More".
+router.use(createFragmentRoutes());
 
 function getComposioClient(): Composio | null {
   const apiKey = getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY;
@@ -239,10 +242,6 @@ async function getConfigStatus() {
 }
 
 // --- Page Routes ---
-
-router.get("/", (_req, res) => {
-  res.redirect("/dashboard");
-});
 
 router.get("/dashboard", (_req, res) => {
   const stats = getStats();
