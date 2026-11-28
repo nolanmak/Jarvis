@@ -29,6 +29,9 @@ mod phone_attention;
 mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
+// Jarvis Dashboard turns; the socket that drives it lands with #2711.
+#[allow(dead_code)]
+mod web_turn_runner;
 mod discord_phone;
 mod computer_tool;
 mod tabagent_handoff;
@@ -45,6 +48,8 @@ mod discord_phone_session_tests;
 mod whatsapp_phone_session_tests;
 #[cfg(test)]
 mod surface_conformance_tests;
+#[cfg(test)]
+mod web_turn_runner_tests;
 #[cfg(test)]
 mod calendar_approval_tests;
 #[cfg(test)]
