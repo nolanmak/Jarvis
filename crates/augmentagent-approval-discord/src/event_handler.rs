@@ -318,6 +318,36 @@ pub fn failed_turn_reply(error: &impl std::fmt::Display, interrupted: bool) -> S
     }
 }
 
+/// #2413 — the prefix of a hosted bank-link URL. A hosted link authorizes a
+/// bank connection for whoever opens it, so a generated reply carrying one is
+/// never posted. Mirrors
+/// `augmentagent_channel_core::outbound_scrub::HOSTED_LINK_URL` but kept local
+/// so the approval crate doesn't take a dependency on channel-core (the dep
+/// edge runs the other way); the test pins the two together.
+const HOSTED_LINK_URL: &str = "secure.plaid.com/";
+
+/// What we log and show for a reply [`HOSTED_LINK_URL`] made unsendable. The
+/// matched URL never reaches a log line, the notice, or the channel.
+const HOSTED_LINK_CLASSIFICATION: &str = "hosted_link_url";
+
+/// Name the condition that makes `answer` unsendable whole, if any. The whole
+/// reply goes rather than the line carrying the link: an answer with that line
+/// removed is still an answer written around handing the link over.
+fn unsendable_reply_classification(answer: &str) -> Option<&'static str> {
+    answer
+        .contains(HOSTED_LINK_URL)
+        .then_some(HOSTED_LINK_CLASSIFICATION)
+}
+
+/// #2413 — the owner-facing text for a withheld reply. It names the
+/// classification and nothing of what matched.
+fn withheld_reply_notice(classification: &str) -> String {
+    format!(
+        "This answer was withheld before posting: it carried a {classification} that must not \
+         be published to a channel. Ask again without it."
+    )
+}
+
 /// Where to post the notice for an interrupted turn: its channel, and the
 /// message to reply to when the turn is a text turn (`<channel>:<message>`).
 /// Any other turn ID (speech) gets a channel-level notice. `None` only when
@@ -930,6 +960,22 @@ impl EventHandler for Handler {
 
             match result {
                 Ok(answer) => {
+                    // #2413 — refuse the answer whole before any of it is
+                    // prepared, posted or spoken.
+                    if let Some(classification) = unsendable_reply_classification(&answer) {
+                        warn!(%channel_id, %msg_id, classification, "withheld generated reply");
+                        let mut notice = withheld_reply_notice(classification);
+                        if let Some(tag) = &yolo_tag {
+                            notice = format!("{tag}\n{notice}");
+                        }
+                        let builder = CreateMessage::new()
+                            .content(notice)
+                            .reference_message(MessageReference::from((channel_id, msg_id)));
+                        if let Err(post_err) = channel_id.send_message(&*http, builder).await {
+                            warn!("failed to post withheld-reply notice: {post_err}");
+                        }
+                        return;
+                    }
                     // #440 — pull `ATTACH:` markers out of the answer and
                     // deliver the referenced wiki files on the first chunk.
                     let (mut answer, attachments) =
@@ -3484,6 +3530,52 @@ mod tests {
             "wiki query failed: reasoner chain exhausted for FullAgentic: claude: attempted"
         );
     }
+
+    /// #2413 — a generated reply carrying a hosted bank-link URL is withheld
+    /// whole: the link authorizes a bank connection for whoever opens it, and
+    /// a reply with the line removed would still be an answer written around
+    /// handing it over. The notice names the classification and never the URL,
+    /// and the gate runs before the answer is prepared for delivery, so
+    /// nothing is posted and no reply text leaves this handler.
+    #[test]
+    fn reply_containing_hosted_link_url_is_refused() {
+        let answer = "Open https://secure.plaid.com/hl/session-token to connect your bank, \
+                      then say so here.";
+        let classification =
+            unsendable_reply_classification(answer).expect("the hosted link must be refused");
+        let notice = withheld_reply_notice(classification);
+        assert!(notice.contains(classification), "the notice must name the classification: {notice}");
+        assert!(!notice.contains("plaid"), "the notice echoed the URL: {notice}");
+        assert!(!notice.contains("session-token"), "the notice echoed the URL: {notice}");
+
+        for sendable in [
+            "Thursday at 2 works on my end.",
+            "The overview is at https://plaid.example.com/docs/hosted-link.",
+            "",
+        ] {
+            assert_eq!(unsendable_reply_classification(sendable), None, "{sendable:?}");
+        }
+
+        // The refusal precedes every outbound step of the answer path:
+        // delivery preparation, chunking, the post, and the voice bridge.
+        let src = include_str!("event_handler.rs");
+        let start = src.find("async fn message(&self, ctx: Context").expect("message handler");
+        let handler = &src[start..start + src[start..].find("\n    }\n").expect("handler end")];
+        let gate = handler
+            .find("unsendable_reply_classification(&answer)")
+            .expect("the answer path must carry the #2413 gate");
+        let deliver = handler.find("prepare_answer_delivery(").expect("answer delivery");
+        assert!(gate < deliver, "the #2413 gate must precede answer delivery");
+
+        // The literal is duplicated from channel-core (the dep edge runs the
+        // other way); pin them together so neither can drift.
+        assert!(
+            include_str!("../../augmentagent-channel-core/src/outbound_scrub.rs")
+                .contains(&format!("{HOSTED_LINK_URL:?}")),
+            "channel-core no longer classifies this hosted-link prefix"
+        );
+    }
+
     use augmentagent_docs::doc_command_for;
 
     #[test]
