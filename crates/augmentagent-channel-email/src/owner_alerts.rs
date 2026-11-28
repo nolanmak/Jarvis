@@ -127,6 +127,45 @@ pub async fn run_backfill<R: augmentagent_channel_core::Reasoner + 'static>(
     }
 }
 
+/// Where an assessed message's alert lives: its stable ID and the owner-facing
+/// link the notification points at. `Mailbox` derives both from the Gmail
+/// account and thread; another 1:1 surface supplies its own (#1648), so the
+/// assessor itself stays source-agnostic.
+#[derive(Debug, Clone, Default)]
+pub enum AlertSource {
+    #[default]
+    Mailbox,
+    Direct {
+        id: String,
+        url: String,
+    },
+}
+
+impl AlertSource {
+    fn resolve(&self, store: &Store, email: &Email) -> anyhow::Result<(String, String)> {
+        match self {
+            Self::Direct { id, url } => Ok((id.clone(), url.clone())),
+            Self::Mailbox => {
+                let mut source = reqwest::Url::parse("https://mail.google.com/mail/u/0/")?;
+                if let Some(address) = store
+                    .get_active_gmail_accounts()?
+                    .into_iter()
+                    .find(|a| Some(a.entity_id.as_str()) == email.account_entity_id.as_deref())
+                    .map(|a| a.email)
+                    .filter(|s| !s.is_empty())
+                {
+                    source.query_pairs_mut().append_pair("authuser", &address);
+                }
+                source.set_fragment(Some(&format!(
+                    "all/{}",
+                    email.thread_id.as_deref().unwrap_or(&email.message_id)
+                )));
+                Ok((format!("gmail:{}", email.message_id), source.into()))
+            }
+        }
+    }
+}
+
 pub fn persist_assessment(
     store: &Store,
     email: &Email,
@@ -139,6 +178,16 @@ pub fn persist_assessment_with_wiki(
     store: &Store,
     email: &Email,
     raw: &str,
+    wiki: Option<&std::path::Path>,
+    now: i64,
+) -> anyhow::Result<Option<String>> {
+    persist_assessment_with_source(store, email, raw, &AlertSource::Mailbox, wiki, now)
+}
+pub fn persist_assessment_with_source(
+    store: &Store,
+    email: &Email,
+    raw: &str,
+    source: &AlertSource,
     wiki: Option<&std::path::Path>,
     now: i64,
 ) -> anyhow::Result<Option<String>> {
@@ -191,7 +240,7 @@ pub fn persist_assessment_with_wiki(
         .unwrap_or(600)
         * 1000;
     let id = plan
-        .map(|p| p.persist(store, email, &zone, now, delay))
+        .map(|p| p.persist(store, email, source, &zone, now, delay))
         .transpose()?;
     store.mark_owner_alert_assessed(&email.message_id, now)?;
     Ok(id)
@@ -328,30 +377,17 @@ impl AlertPlan {
         &self,
         store: &Store,
         email: &Email,
+        source: &AlertSource,
         timezone: &str,
         now: i64,
         delay_ms: i64,
     ) -> anyhow::Result<String> {
-        let id = format!("gmail:{}", email.message_id);
-        let mut source = reqwest::Url::parse("https://mail.google.com/mail/u/0/")?;
-        if let Some(address) = store
-            .get_active_gmail_accounts()?
-            .into_iter()
-            .find(|a| Some(a.entity_id.as_str()) == email.account_entity_id.as_deref())
-            .map(|a| a.email)
-            .filter(|s| !s.is_empty())
-        {
-            source.query_pairs_mut().append_pair("authuser", &address);
-        }
-        source.set_fragment(Some(&format!(
-            "all/{}",
-            email.thread_id.as_deref().unwrap_or(&email.message_id)
-        )));
+        let (id, source_url) = source.resolve(store, email)?;
         let sender: String = email.from.chars().take(120).collect();
         let inserted = store.insert_owner_alert(
             &NewOwnerAlert {
                 id: &id,
-                source_url: source.as_str(),
+                source_url: &source_url,
                 sender: &sender,
                 action: &self.action,
                 reason: &self.reason,

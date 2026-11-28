@@ -10,6 +10,10 @@ repository.workspace = true
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+# #1648 — the owner-alert assessor (prompt context, evidence validation and
+# idempotent persistence) is shared with the email channel; Discord only
+# supplies its own alert source identity.
+augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
