@@ -56,6 +56,14 @@ pub struct Conversation {
     /// `false` when the owner is no longer an active member (left the group).
     #[serde(default)]
     pub active: Option<bool>,
+    /// The exporter's source store cannot hold the whole chat: it counted
+    /// messages it never stored, e.g. disappearing-message replies (#2608).
+    /// Readers say "replies may be missing", not "they never replied".
+    #[serde(default)]
+    pub incomplete: bool,
+    /// How many messages the source counted but never stored, when known.
+    #[serde(default)]
+    pub missing_messages: Option<u64>,
 }
 
 impl Conversation {
