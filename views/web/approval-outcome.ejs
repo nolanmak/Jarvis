@@ -1,0 +1,17 @@
+<% const tone = o.kind === 'failed' ? 'j-outcome-bad' : o.kind === 'manual_send_ready' ? 'j-outcome-manual' : 'j-outcome-ok'; %>
+<div class="j-outcome <%= tone %> j-outcome-<%= o.kind %>" role="status"<% if (tone === 'j-outcome-ok') { %> data-autodismiss<% } %>>
+  <div class="j-outcome-head">
+    <strong><%= o.kind === 'manual_send_ready' ? 'Not sent: send this yourself' : o.kind === 'failed' ? 'Failed' : 'Done' %></strong>
+    <button type="button" class="j-toast-close" data-action="dismiss" aria-label="Dismiss">×</button>
+  </div>
+  <p><%= o.summary %></p>
+  <% if (o.kind === 'failed' && o.message) { %><p class="j-outcome-detail"><%= o.message %></p><% } %>
+  <% if (o.kind === 'scheduled' && o.local) { %><p class="j-outcome-detail"><%= o.local %></p><% } %>
+  <% if (o.kind === 'manual_send_ready') { %>
+    <% if (o.text) { %><textarea class="j-input j-copy-text" readonly rows="4" aria-label="Message to send"><%= o.text %></textarea><% } %>
+    <div class="j-card-actions">
+      <% if (o.text) { %><button type="button" class="j-btn-text j-btn-solid" data-action="copy">Copy text</button><% } %>
+      <% if (o.link) { %><a class="j-btn-text" href="<%= o.link %>" target="_blank" rel="noopener noreferrer">Open <%- include('icon', { name: 'external' }) %></a><% } %>
+    </div>
+  <% } %>
+</div>

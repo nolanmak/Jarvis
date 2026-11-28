@@ -1,0 +1,29 @@
+<div id="approvals" class="j-approvals" hx-get="/web/approvals" hx-trigger="every 20s, jarvis:refresh" hx-swap="outerHTML">
+<% if (!actions.length) { %>
+  <div class="j-empty"><p class="j-empty-title">Nothing to review</p><p>Drafts that need your approval show up here, including ones drafted in Discord.</p></div>
+<% } %>
+<% actions.forEach((a) => { const id = encodeURIComponent(a.id); %>
+  <form class="j-card" data-action-id="<%= a.id %>" hx-post="/web/approvals/<%= id %>" hx-target="#approvals" hx-swap="outerHTML" hx-disabled-elt="find button">
+    <div class="j-card-head">
+      <span class="j-tag"><%= platformLabel(a.platform) %></span>
+      <span class="j-card-to">To <%= a.recipientEmail || a.fromEmail %></span>
+      <time class="j-card-time" datetime="<%= new Date(a.createdAt).toISOString() %>"><%= shortTime(a.createdAt, now) %></time>
+    </div>
+    <p class="j-card-subject"><%= a.subject %></p>
+    <% if (a.draftBody) { %><div class="j-card-preview" data-action="expand"><%- renderPlainText(a.draftBody) %></div><% } %>
+    <div class="j-card-actions">
+      <button type="submit" name="verb" value="approve" class="j-btn-text j-btn-solid">Approve</button>
+      <button type="submit" name="verb" value="skip" class="j-btn-text">Skip</button>
+      <button type="button" class="j-btn-text" data-action="revise">Revise</button>
+    </div>
+    <div class="j-revise" hidden>
+      <textarea name="note" class="j-input j-note" rows="2" placeholder="What should Jarvis change?" aria-label="Revision note"></textarea>
+      <button type="submit" name="verb" value="revise" class="j-btn-text j-btn-solid">Send note</button>
+    </div>
+  </form>
+<% }) %>
+</div>
+<% if (locals.oob) { %><%- include('approvals-count', { count: actions.length, oob: true }) %><%- include('approvals-count', { id: 'approvals-count-head', count: actions.length, oob: true }) %><% } %>
+<% if (locals.outcome) { %>
+<div hx-swap-oob="afterbegin:#approval-outcomes"><%- include('approval-outcome', { o: outcome }) %></div>
+<% } %>

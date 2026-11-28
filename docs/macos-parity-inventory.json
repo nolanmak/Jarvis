@@ -2165,6 +2165,34 @@
     "evidence": null
   },
   {
+    "id": "route:web/fragments:GET:/web/approvals",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves GET /web/approvals with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /web/approvals with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /web/approvals in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/approvals/:id",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/approvals/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/approvals/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/approvals/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "route:dashboard:GET:/api/actions",
     "source": "src/dashboard.ts",
     "linux_baseline": "Linux dashboard serves GET /api/actions with its current auth and response contract.",

@@ -70,7 +70,7 @@
   function refresh(selector) {
     document.querySelectorAll(selector).forEach(function (el) { htmx.trigger(el, "jarvis:refresh"); });
   }
-  body.addEventListener("htmx:sseOpen", function () { sseErrors = 0; refresh("#threads, #log"); });
+  body.addEventListener("htmx:sseOpen", function () { sseErrors = 0; refresh("#threads, #log, #approvals"); });
   body.addEventListener("htmx:sseError", function () { if (++sseErrors >= 3) location.reload(); });
   body.addEventListener("sse:changed", function (e) {
     var id = null;
@@ -132,6 +132,22 @@
     // A submitted dialog form (rename) closes its dialog on success.
     var dialog = e.detail.elt.tagName === "FORM" && e.detail.elt.closest("dialog");
     if (dialog && e.detail.successful) dialog.close();
+  });
+
+  // Approvals: the 20 s refetch waits while a card is being worked on, a failed
+  // resolve refetches the rail, and plain success outcomes fade after a while.
+  body.addEventListener("htmx:beforeRequest", function (e) {
+    var rail = e.detail.elt;
+    if (rail.id === "approvals" && (rail.contains(document.activeElement) || rail.querySelector(".j-revise:not([hidden])"))) e.preventDefault();
+  });
+  body.addEventListener("htmx:afterRequest", function (e) {
+    if (!e.detail.successful && e.detail.elt.classList.contains("j-card")) refresh("#approvals");
+  });
+  body.addEventListener("htmx:oobAfterSwap", function () {
+    document.querySelectorAll(".j-outcome[data-autodismiss]").forEach(function (o) {
+      o.removeAttribute("data-autodismiss");
+      setTimeout(function () { o.remove(); }, 10000);
+    });
   });
 
   // Thread search filters the loaded list; reapplied after each refetch.
@@ -217,6 +233,21 @@
       }
       case "close-dialog": return el.closest("dialog").close();
       case "dismiss-toast": document.getElementById("j-toast").innerHTML = ""; return;
+      case "dismiss": el.closest(".j-outcome").remove(); return;
+      case "expand": el.classList.add("is-open"); return;
+      case "revise": {
+        var panel = el.closest("form").querySelector(".j-revise");
+        panel.hidden = !panel.hidden;
+        if (!panel.hidden) panel.querySelector("textarea").focus();
+        return;
+      }
+      case "copy": {
+        var text = el.closest(".j-outcome").querySelector(".j-copy-text");
+        var done = function () { el.textContent = "Copied"; setTimeout(function () { el.textContent = "Copy text"; }, 2000); };
+        if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text.value).then(done);
+        else { text.select(); document.execCommand("copy"); done(); }
+        return;
+      }
     }
   });
 

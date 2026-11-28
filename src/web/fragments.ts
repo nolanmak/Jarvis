@@ -6,13 +6,16 @@
 import { Router, type Request, type Response } from "express";
 import type { WebThread } from "./daemonClient";
 import { DaemonError } from "./errors";
+import { renderPlainText } from "./markdown.logic";
 import { rankPalette, type PaletteAction } from "./palette.logic";
 import type { ReadDb } from "./readDb";
 import { clockTime, logRows } from "./logView";
 import {
   cancelTurn,
   createThread,
+  listApprovals,
   listThreads,
+  resolveApproval,
   resetSession,
   submitTurn,
   threadLog,
@@ -75,6 +78,17 @@ export function shortTime(ms: number, now: number = Date.now()): string {
   return d.getFullYear() === new Date(now).getFullYear() ? day : `${day}, ${d.getFullYear()}`;
 }
 
+const PLATFORMS: Readonly<Record<string, string>> = {
+  gmail: "Gmail", discord: "Discord", slack: "Slack", imessage: "iMessage", sms: "SMS",
+};
+// Schemes a manual-send link may use; anything else (javascript:, data:) is dropped.
+const SAFE_LINK = /^(https?:|mailto:|sms:|tel:)/i;
+
+function approvalsLocals() {
+  const { actions } = listApprovals();
+  return { actions, shortTime, now: Date.now(), renderPlainText, platformLabel: (p?: string) => PLATFORMS[p ?? "gmail"] ?? p };
+}
+
 /** htmx form posts send strings; the shared handlers want JSON booleans. */
 function formBool(value: unknown): boolean | undefined {
   if (value === undefined) return undefined;
@@ -128,6 +142,7 @@ export function createFragmentRoutes(opts: FragmentRoutesOptions = {}): Router {
     res.render("web/app", {
       ...sidebarLocals(db(), false, thread?.id ?? ""),
       ...(thread ? logLocals(db(), thread.id) : { rows: [], clockTime }),
+      ...approvalsLocals(),
       thread,
       missing: Boolean(requested && !thread),
       pane,
@@ -180,6 +195,18 @@ export function createFragmentRoutes(opts: FragmentRoutesOptions = {}): Router {
   router.post("/web/threads/:id/reset-session", handle(async (req, res) => {
     const { thread } = await resetSession(String(req.params.id));
     res.render("web/log", logLocals(db(), thread.id));
+  }));
+
+  router.get("/web/approvals", handle((_req, res) => {
+    res.render("web/approvals", { ...approvalsLocals(), oob: true });
+  }));
+
+  router.post("/web/approvals/:id", handle(async (req, res) => {
+    // An empty revise note box rides along with every verb; drop it.
+    const note = typeof req.body?.note === "string" && req.body.note.trim() ? req.body.note : undefined;
+    const { outcome } = await resolveApproval(String(req.params.id), { verb: req.body?.verb, note });
+    const link = outcome.link && SAFE_LINK.test(outcome.link) ? outcome.link : undefined;
+    res.render("web/approvals", { ...approvalsLocals(), oob: true, outcome: { ...outcome, link } });
   }));
 
   router.get("/web/palette", handle((req, res) => {
