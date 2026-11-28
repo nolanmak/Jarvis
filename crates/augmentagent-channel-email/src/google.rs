@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use augmentagent_auth::{default_store, CredentialStore};
 use augmentagent_store::Email;
 
-use crate::gmail::{split_recipient_entries, AttachmentMeta, GmailError};
+use crate::gmail::{
+    split_recipient_entries, AttachmentMeta, ComposeIdentity, DraftCandidate, GmailError,
+};
 
 /// Entity-id prefix that marks a Google-connected mailbox. Everything after
 /// it is the mailbox address, lower-cased.
@@ -227,6 +229,10 @@ pub struct DraftSpec<'a> {
     pub body: &'a str,
     pub thread_id: Option<&'a str>,
     pub attachments: &'a [LocalAttachment],
+    /// #2388 — the queued compose this draft is an attempt at, stamped into
+    /// [`crate::gmail::COMPOSE_KEY_HEADER`]. `None` for an ordinary draft,
+    /// which stays header-free.
+    pub compose_key: Option<&'a str>,
 }
 
 struct CachedToken {
@@ -882,6 +888,51 @@ impl GoogleGmail {
         draft_id_of(&v)
     }
 
+    /// #2388 — the drafts that could be the compose `identity` describes:
+    /// the target thread's drafts when it has one, otherwise the ones the
+    /// recipient-and-subject query returned. Each is fetched as metadata,
+    /// the only format that carries [`crate::gmail::COMPOSE_KEY_HEADER`].
+    pub async fn compose_draft_candidates(
+        &self,
+        email: &str,
+        identity: &ComposeIdentity<'_>,
+    ) -> Result<Vec<DraftCandidate>, GmailError> {
+        let mut query = vec![("maxResults", "100".to_string())];
+        if let Some(q) = crate::gmail::compose_candidate_query(identity) {
+            query.push(("q", q));
+        }
+        let listed = self.get_required(email, "users/me/drafts", &query).await?;
+        let ids: Vec<String> = listed
+            .get("drafts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|d| {
+                d.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let mut candidates = Vec::new();
+        for id in ids {
+            if candidates.len() >= crate::gmail::MAX_DRAFT_CANDIDATES {
+                break;
+            }
+            let path = format!("users/me/drafts/{id}");
+            let Some(v) = self
+                .get(email, &path, &[("format", "metadata".to_string())])
+                .await?
+            else {
+                continue;
+            };
+            match crate::gmail::draft_candidate(&v) {
+                Some(c) if c.could_be(identity) => candidates.push(c),
+                _ => {}
+            }
+        }
+        Ok(candidates)
+    }
+
     /// `drafts.update` — a real in-place update, so the id is unchanged.
     pub async fn update_draft(
         &self,
@@ -1114,6 +1165,12 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
     if !threading.references.is_empty() {
         out.push_str("References: ");
         out.push_str(&threading.references);
+        out.push_str("\r\n");
+    }
+    if let Some(key) = spec.compose_key {
+        out.push_str(crate::gmail::COMPOSE_KEY_HEADER);
+        out.push_str(": ");
+        out.push_str(&encode_header_value(key));
         out.push_str("\r\n");
     }
     out.push_str("MIME-Version: 1.0\r\n");
@@ -1646,6 +1703,7 @@ mod tests {
             body: "line one\r\nline two — with a dash",
             thread_id: Some("t1"),
             attachments: &[],
+            compose_key: None,
         };
         let threading = Threading {
             in_reply_to: "<abc@mail.example.com>".into(),
@@ -2003,6 +2061,77 @@ mod tests {
         assert!(mime.contains("References: <root@x> <latest@x>\r\n"), "{mime}");
         let thread_get = fake.seen().into_iter().find(|s| s.line.contains("/threads/t1")).unwrap();
         assert!(thread_get.line.contains("format=metadata"));
+    }
+
+    // ---- #2388: the compose key on the direct Gmail path ----
+
+    #[tokio::test]
+    async fn only_a_queued_compose_draft_carries_the_compose_key_header() {
+        let fake = FakeGoogle::start(vec![
+            token_route("at-1"),
+            ("POST", "/users/me/drafts", 200, r#"{"id":"d-1","message":{"id":"dm1"}}"#.into()),
+        ])
+        .await;
+        let g = client_with_token(&fake, Some(stored(MAILBOX)));
+        let spec = DraftSpec {
+            to: "dana@example.com",
+            subject: "Ground floor",
+            body: "Body text",
+            ..Default::default()
+        };
+
+        g.create_draft(MAILBOX, DraftSpec { compose_key: Some("key-abc"), ..spec }).await.unwrap();
+        g.create_draft(MAILBOX, spec).await.unwrap();
+
+        let posts: Vec<String> = fake
+            .seen()
+            .into_iter()
+            .filter(|s| s.line.starts_with("POST") && s.line.contains("/drafts"))
+            .map(|s| decode_raw(&s.body))
+            .collect();
+        let header = format!("{}: key-abc\r\n", crate::gmail::COMPOSE_KEY_HEADER);
+        assert!(posts[0].contains(&header), "{}", posts[0]);
+        assert!(
+            !posts[1].contains(crate::gmail::COMPOSE_KEY_HEADER),
+            "an ordinary draft stays header-free: {}",
+            posts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_candidates_keep_the_target_thread_and_read_the_key_header() {
+        let key = "key-abc";
+        let drafts_get = |id: &str, thread: &str| {
+            serde_json::json!({"id": id, "message": {"id": format!("m-{id}"), "threadId": thread, "payload": {
+                "headers": [
+                    {"name": "To", "value": "dana@example.com"},
+                    {"name": "Subject", "value": "Ground floor"},
+                    {"name": crate::gmail::COMPOSE_KEY_HEADER, "value": key},
+                ]}}})
+            .to_string()
+        };
+        let fake = FakeGoogle::start(vec![
+            token_route("at-1"),
+            ("GET", "/users/me/drafts/d-here", 200, drafts_get("d-here", "t-1")),
+            ("GET", "/users/me/drafts/d-elsewhere", 200, drafts_get("d-elsewhere", "t-9")),
+            ("GET", "/users/me/drafts?", 200, r#"{"drafts":[{"id":"d-here"},{"id":"d-elsewhere"}]}"#.into()),
+        ])
+        .await;
+        let g = client_with_token(&fake, Some(stored(MAILBOX)));
+        let entity = entity_id_for(MAILBOX);
+        let identity = ComposeIdentity {
+            entity_id: &entity,
+            thread_id: Some("t-1"),
+            to: "dana@example.com",
+            subject: "Ground floor",
+            body: "Body text",
+        };
+
+        let found = g.compose_draft_candidates(MAILBOX, &identity).await.unwrap();
+        assert_eq!(found.len(), 1, "only the target thread's draft is a candidate: {found:?}");
+        assert_eq!(found[0].draft_id, "d-here");
+        assert_eq!(found[0].thread_id.as_deref(), Some("t-1"));
+        assert_eq!(found[0].compose_key.as_deref(), Some(key));
     }
 
     #[tokio::test]

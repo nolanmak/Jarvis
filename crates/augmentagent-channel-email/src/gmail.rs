@@ -156,6 +156,74 @@ pub trait GmailApi: Send + Sync {
             .await
     }
 
+    /// Create the draft of a queued compose attempt (#2388), stamping
+    /// `compose_key` into the [`COMPOSE_KEY_HEADER`] MIME header so a later
+    /// attempt at the same compose finds this draft instead of writing a
+    /// second one.
+    ///
+    /// Default impl drops the key and delegates to [`create_draft`] so test
+    /// fakes keep compiling; the transports override it.
+    async fn create_keyed_draft(
+        &self,
+        entity_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        compose_key: &str,
+    ) -> Result<String, GmailError> {
+        let _ = compose_key;
+        self.create_draft(entity_id, to, subject, body, thread_id)
+            .await
+    }
+
+    /// The drafts that could be the compose `identity` describes (#2388):
+    /// the target thread's drafts when it has one, otherwise the drafts
+    /// addressed to the same recipients under the same subject. Narrowing
+    /// only — whether any of them IS this compose is
+    /// [`reconcile_compose_draft`]'s decision.
+    ///
+    /// Default impl finds nothing, so a fake that doesn't model drafts
+    /// reconciles as [`DraftReconciliation::Absent`] and leaves creation to
+    /// the caller, exactly as before #2388.
+    async fn find_compose_drafts(
+        &self,
+        entity_id: &str,
+        identity: &ComposeIdentity<'_>,
+    ) -> Result<Vec<DraftCandidate>, GmailError> {
+        let _ = (entity_id, identity);
+        Ok(Vec::new())
+    }
+
+    /// Whether the compose `identity` describes already has a draft in the
+    /// mailbox (#2388).
+    ///
+    /// A candidate is adopted only when it carries exactly this compose's
+    /// [`COMPOSE_KEY_HEADER`] value: matching recipients and subject are how
+    /// candidates are found, never why one is reused. Duplicate keys and a
+    /// failed lookup are reported apart from "no draft yet" because neither
+    /// can be fixed by trying again — see [`DraftReconciliation`].
+    async fn reconcile_compose_draft(
+        &self,
+        entity_id: &str,
+        identity: &ComposeIdentity<'_>,
+    ) -> DraftReconciliation {
+        let key = compose_key(identity);
+        let found = match self.find_compose_drafts(entity_id, identity).await {
+            Ok(found) => found,
+            Err(e) => return DraftReconciliation::LookupFailed(e.to_string()),
+        };
+        let mut keyed: Vec<DraftCandidate> = found
+            .into_iter()
+            .filter(|c| c.compose_key.as_deref() == Some(key.as_str()))
+            .collect();
+        match keyed.len() {
+            0 => DraftReconciliation::Absent,
+            1 => DraftReconciliation::Adopted(keyed.remove(0)),
+            _ => DraftReconciliation::Ambiguous(keyed),
+        }
+    }
+
     /// Replace an existing draft's content. Returns the NEW draft id — the
     /// old id is invalid afterwards.
     ///
@@ -858,34 +926,12 @@ impl ComposioClient {
                         body,
                         thread_id,
                         attachments: &local,
+                        compose_key: None,
                     },
                 )
                 .await;
         }
-        let recipients = split_recipients(to);
-        let (first, rest) = recipients
-            .split_first()
-            .ok_or_else(|| GmailError::Invalid(format!("no recipient address in {to:?}")))?;
-        let mut args = serde_json::json!({
-            "recipient_email": first,
-            "subject": subject,
-            "body": crate::draft_body::plaintext(body),
-            "is_html": false,
-        });
-        if !rest.is_empty() {
-            args["extra_recipients"] = serde_json::json!(rest);
-        }
-        let cc: Vec<String> = cc.iter().flat_map(|s| split_recipients(s)).collect();
-        if !cc.is_empty() {
-            args["cc"] = serde_json::json!(cc);
-        }
-        let bcc: Vec<String> = bcc.iter().flat_map(|s| split_recipients(s)).collect();
-        if !bcc.is_empty() {
-            args["bcc"] = serde_json::json!(bcc);
-        }
-        if let Some(t) = thread_id {
-            args["thread_id"] = serde_json::Value::String(t.to_string());
-        }
+        let mut args = draft_args(to, subject, body, thread_id, cc, bcc)?;
         if attachments.len() > 1 {
             // GMAIL_CREATE_EMAIL_DRAFT's `attachment` argument is a single
             // object; dropping the rest silently would send less than asked.
@@ -904,14 +950,81 @@ impl ComposioClient {
             });
         }
         let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
-        const DRAFT_ID_KEYS: &[&str] = &["draft_id", "draftId", "id"];
-        if let Some(id) = find_string_field(&v, DRAFT_ID_KEYS) {
-            return Ok(id);
+        draft_id_of_response(&v)
+    }
+
+    /// [`GmailApi::create_keyed_draft`] on the Composio transport (#2388).
+    ///
+    /// Composio's `GMAIL_CREATE_EMAIL_DRAFT` has no raw-MIME input, so the
+    /// compose key goes in as an `extra_headers` argument — the same
+    /// forward-hook stance [`crate::outbound::ACTION_ID_HEADER`] takes for
+    /// the send path. A Google-connected mailbox builds the MIME itself and
+    /// therefore carries the header for certain; on the Composio path a tool
+    /// shape that drops it degrades to pre-#2388 behaviour (the lookup finds
+    /// nothing and the compose is drafted), never to a wrong adoption.
+    pub async fn create_compose_draft(
+        &self,
+        entity_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        compose_key: &str,
+    ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g
+                .create_draft(
+                    &email,
+                    crate::google::DraftSpec {
+                        to,
+                        subject,
+                        body,
+                        thread_id,
+                        compose_key: Some(compose_key),
+                        ..Default::default()
+                    },
+                )
+                .await;
         }
-        Err(GmailError::Decode(format!(
-            "missing draft id in response: {}",
-            serde_json::to_string(&v).unwrap_or_default()
-        )))
+        let mut args = draft_args(to, subject, body, thread_id, &[], &[])?;
+        args["extra_headers"] = serde_json::json!({ COMPOSE_KEY_HEADER: compose_key });
+        let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
+        draft_id_of_response(&v)
+    }
+
+    /// [`GmailApi::find_compose_drafts`] on the Composio transport (#2388).
+    /// `GMAIL_LIST_DRAFTS` in verbose mode is the only Composio tool that
+    /// returns a draft's headers, which is where the compose key lives.
+    pub async fn compose_draft_candidates(
+        &self,
+        entity_id: &str,
+        identity: &ComposeIdentity<'_>,
+    ) -> Result<Vec<DraftCandidate>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.compose_draft_candidates(&email, identity).await;
+        }
+        // No inline user_id — see resolve_thread_id for why.
+        let mut args = serde_json::json!({
+            "max_results": 100,
+            "verbose": true,
+        });
+        if let Some(q) = compose_candidate_query(identity) {
+            args["query"] = serde_json::Value::String(q);
+        }
+        let v = self.execute("GMAIL_LIST_DRAFTS", entity_id, args).await?;
+        let drafts = v
+            .pointer("/data/drafts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(drafts
+            .iter()
+            .filter_map(draft_candidate)
+            .filter(|c| c.could_be(identity))
+            .take(MAX_DRAFT_CANDIDATES)
+            .collect())
     }
 
     /// `update_draft` (create replacement + delete old) with an optional
@@ -948,6 +1061,7 @@ impl ComposioClient {
                         body,
                         thread_id,
                         attachments: &local,
+                        compose_key: None,
                     },
                 )
                 .await;
@@ -1320,6 +1434,253 @@ fn thread_subject(messages: &[Email]) -> ThreadSubject {
         .copied()
         .unwrap_or(first);
     ThreadSubject::Original(oldest.subject.clone())
+}
+
+/// The `GMAIL_CREATE_EMAIL_DRAFT` arguments shared by the ordinary and the
+/// keyed draft paths. `to` may carry several addresses; Composio takes one
+/// `recipient_email` plus an `extra_recipients` array (#439).
+fn draft_args(
+    to: &str,
+    subject: &str,
+    body: &str,
+    thread_id: Option<&str>,
+    cc: &[String],
+    bcc: &[String],
+) -> Result<serde_json::Value, GmailError> {
+    let recipients = split_recipients(to);
+    let (first, rest) = recipients
+        .split_first()
+        .ok_or_else(|| GmailError::Invalid(format!("no recipient address in {to:?}")))?;
+    let mut args = serde_json::json!({
+        "recipient_email": first,
+        "subject": subject,
+        "body": crate::draft_body::plaintext(body),
+        "is_html": false,
+    });
+    if !rest.is_empty() {
+        args["extra_recipients"] = serde_json::json!(rest);
+    }
+    let cc: Vec<String> = cc.iter().flat_map(|s| split_recipients(s)).collect();
+    if !cc.is_empty() {
+        args["cc"] = serde_json::json!(cc);
+    }
+    let bcc: Vec<String> = bcc.iter().flat_map(|s| split_recipients(s)).collect();
+    if !bcc.is_empty() {
+        args["bcc"] = serde_json::json!(bcc);
+    }
+    if let Some(t) = thread_id {
+        args["thread_id"] = serde_json::Value::String(t.to_string());
+    }
+    Ok(args)
+}
+
+fn draft_id_of_response(v: &serde_json::Value) -> Result<String, GmailError> {
+    const DRAFT_ID_KEYS: &[&str] = &["draft_id", "draftId", "id"];
+    find_string_field(v, DRAFT_ID_KEYS).ok_or_else(|| {
+        GmailError::Decode(format!(
+            "missing draft id in response: {}",
+            serde_json::to_string(v).unwrap_or_default()
+        ))
+    })
+}
+
+// ----- #2388: compose identity, its key, and draft reconciliation ----------
+
+/// The MIME header a queued compose stamps its idempotency key into, so a
+/// retried attempt recognises the draft it already created.
+pub const COMPOSE_KEY_HEADER: &str = "X-AugmentAgent-Compose-Key";
+
+/// How many candidate drafts a lookup will consider. A mailbox holding more
+/// drafts than this for one thread/subject is already ambiguous, and the
+/// walk is per-draft on the Google transport.
+pub(crate) const MAX_DRAFT_CANDIDATES: usize = 10;
+
+/// Everything that decides whether two queued compose attempts are the same
+/// draft (#2388).
+#[derive(Debug, Clone, Copy)]
+pub struct ComposeIdentity<'a> {
+    pub entity_id: &'a str,
+    /// The thread the compose replies on; `None` for a fresh compose.
+    pub thread_id: Option<&'a str>,
+    pub to: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+}
+
+/// `sha256(entity, thread?, recipients, subject, sha256(body))`, hex — the
+/// value a queued compose puts in [`COMPOSE_KEY_HEADER`].
+///
+/// The body rides in as its own digest, so the key never carries draft text
+/// into a MIME header, a log line or an issue comment. Fields are
+/// length-prefixed and an absent thread gets its own tag (as
+/// `augmentagent_autonomy::idem_key` does it), so no two different
+/// identities collide by concatenation.
+///
+/// Recipients fold to a sorted, de-duplicated, lower-cased set of bare
+/// addresses and the subject through [`normalize_subject`]: the same compose
+/// re-queued from a differently formatted header keys the same and therefore
+/// does not draft twice.
+pub fn compose_key(identity: &ComposeIdentity<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    hash_field(&mut h, identity.entity_id.trim());
+    match compose_thread(identity) {
+        Some(thread) => {
+            h.update([1u8]);
+            hash_field(&mut h, thread);
+        }
+        None => h.update([0u8]),
+    }
+    hash_field(&mut h, &compose_recipients(identity.to).join(","));
+    hash_field(&mut h, &normalize_subject(identity.subject));
+    let body = Sha256::digest(crate::draft_body::plaintext(identity.body).as_bytes());
+    hash_field(&mut h, &hex::encode(body));
+    hex::encode(h.finalize())
+}
+
+fn hash_field(h: &mut sha2::Sha256, value: &str) {
+    use sha2::Digest;
+    h.update((value.len() as u64).to_be_bytes());
+    h.update(value.as_bytes());
+}
+
+/// The identity's thread, or `None` when it names none — a blank thread id
+/// is no thread, not a thread called "".
+fn compose_thread<'a>(identity: &ComposeIdentity<'a>) -> Option<&'a str> {
+    identity
+        .thread_id
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Recipients in the form two equivalent compose attempts agree on: bare
+/// addresses, lower-cased, sorted and de-duplicated.
+fn compose_recipients(to: &str) -> Vec<String> {
+    let mut addrs: Vec<String> = split_recipients(to)
+        .iter()
+        .map(|a| a.to_lowercase())
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+/// The provider-side narrowing for a candidate search: `None` when the
+/// identity names a thread (neither transport can query drafts by thread, so
+/// that filter is applied to the listing itself), otherwise a recipient and
+/// subject query.
+///
+/// A hint only — both transports re-check every candidate with
+/// [`DraftCandidate::could_be`], so a provider that ignores the query stays
+/// correct, just slower.
+pub(crate) fn compose_candidate_query(identity: &ComposeIdentity<'_>) -> Option<String> {
+    if compose_thread(identity).is_some() {
+        return None;
+    }
+    let mut terms: Vec<String> = compose_recipients(identity.to)
+        .iter()
+        .map(|a| format!("to:{a}"))
+        .collect();
+    let subject = normalize_subject(identity.subject);
+    if !subject.is_empty() {
+        terms.push(format!("subject:\"{}\"", subject.replace('"', "")));
+    }
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+/// A draft a compose-key lookup is considering adopting (#2388).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftCandidate {
+    pub draft_id: String,
+    /// The thread the draft replies on; `None` for a standalone draft (Gmail
+    /// gives those a thread of their own, `threadId` == message id).
+    pub thread_id: Option<String>,
+    /// The draft's `To` header as the provider returned it.
+    pub to: String,
+    pub subject: String,
+    /// The [`COMPOSE_KEY_HEADER`] value the draft carries, when it has one.
+    pub compose_key: Option<String>,
+}
+
+impl DraftCandidate {
+    /// Whether this draft is worth reading the compose key of: it sits on the
+    /// identity's thread, or — for a compose with no thread — goes to the same
+    /// recipients under the same subject.
+    ///
+    /// Narrowing only. Adoption needs the exact [`COMPOSE_KEY_HEADER`] value
+    /// (see [`GmailApi::reconcile_compose_draft`]), because a draft matching
+    /// on subject and recipients can just as well be one the owner typed.
+    pub fn could_be(&self, identity: &ComposeIdentity<'_>) -> bool {
+        match compose_thread(identity) {
+            Some(thread) => self.thread_id.as_deref() == Some(thread),
+            None => {
+                compose_recipients(&self.to) == compose_recipients(identity.to)
+                    && normalize_subject(&self.subject) == normalize_subject(identity.subject)
+            }
+        }
+    }
+}
+
+/// What a compose-key lookup found in the mailbox (#2388).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftReconciliation {
+    /// No draft carries this compose key: the attempt may create one.
+    Absent,
+    /// Exactly one draft carries it: adopt that draft rather than drafting a
+    /// second copy of the same compose.
+    Adopted(DraftCandidate),
+    /// Several drafts carry it. Retrying cannot make the mailbox
+    /// unambiguous, so the attempt stops and a human picks.
+    Ambiguous(Vec<DraftCandidate>),
+    /// The mailbox could not be searched, so whether a draft already exists
+    /// is unknown: creating one risks the duplicate the key exists to
+    /// prevent, and this attempt cannot resolve that by repeating itself.
+    LookupFailed(String),
+}
+
+/// One `GMAIL_LIST_DRAFTS` / `drafts.get` entry as a [`DraftCandidate`].
+/// `None` when the payload carries no draft id to adopt.
+pub(crate) fn draft_candidate(draft: &serde_json::Value) -> Option<DraftCandidate> {
+    let draft_id = draft
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let message = draft.get("message");
+    let message_id = message
+        .and_then(|m| m.get("id"))
+        .and_then(serde_json::Value::as_str);
+    let thread_id = message
+        .and_then(|m| m.get("threadId").or_else(|| m.get("thread_id")))
+        .and_then(serde_json::Value::as_str);
+    Some(DraftCandidate {
+        draft_id,
+        // A standalone draft's thread is its own message: treat it as no
+        // thread, the way `get_draft_thread_id` does.
+        thread_id: match (message_id, thread_id) {
+            (Some(m), Some(t)) if m != t => Some(t.to_string()),
+            _ => None,
+        },
+        to: payload_header(message, "To"),
+        subject: payload_header(message, "Subject"),
+        compose_key: Some(payload_header(message, COMPOSE_KEY_HEADER)).filter(|v| !v.is_empty()),
+    })
+}
+
+/// The first `payload.headers` entry matching `name`, case-insensitively —
+/// Gmail emits `Cc`, Composio has been seen relaying `CC`.
+fn payload_header(message: Option<&serde_json::Value>, name: &str) -> String {
+    message
+        .and_then(|m| m.pointer("/payload/headers"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|h| {
+            let n = h.get("name").and_then(serde_json::Value::as_str)?;
+            let v = h.get("value").and_then(serde_json::Value::as_str)?;
+            (n.eq_ignore_ascii_case(name) && !v.trim().is_empty()).then(|| v.trim().to_string())
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3663,6 +4024,27 @@ impl GmailApi for ComposioClient {
     ) -> Result<String, GmailError> {
         self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, &[], cc, &[])
             .await
+    }
+
+    async fn create_keyed_draft(
+        &self,
+        entity_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        compose_key: &str,
+    ) -> Result<String, GmailError> {
+        self.create_compose_draft(entity_id, to, subject, body, thread_id, compose_key)
+            .await
+    }
+
+    async fn find_compose_drafts(
+        &self,
+        entity_id: &str,
+        identity: &ComposeIdentity<'_>,
+    ) -> Result<Vec<DraftCandidate>, GmailError> {
+        self.compose_draft_candidates(entity_id, identity).await
     }
 
     async fn send_draft(
