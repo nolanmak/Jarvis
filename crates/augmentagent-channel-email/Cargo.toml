@@ -25,7 +25,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-md-5 = "0.11"
+md-5 = "0.10"
 chrono = { workspace = true }
 # #1573 — Gmail REST bodies and `raw` drafts are base64url; message gets fan
 # out with a bounded concurrency.

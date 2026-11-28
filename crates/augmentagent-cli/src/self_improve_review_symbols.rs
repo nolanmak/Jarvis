@@ -118,7 +118,7 @@ impl<'ast> Visit<'ast> for Changed<'_> {
             .iter()
             .any(|range| *range.start() <= end && *range.end() >= start)
         {
-            if let Some((_, path, _)) = &item.trait_ {
+            if let Some((path, _)) = &item.trait_ {
                 if let Some(part) = path.segments.last() {
                     let name: String = part.ident.to_string().trim_start_matches("r#").into();
                     self.public.insert(name.clone());

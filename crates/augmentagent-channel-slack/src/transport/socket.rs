@@ -649,7 +649,7 @@ impl SocketModeClient {
                                     frame["payload"] = p;
                                 }
                             }
-                            if let Err(e) = writer.send(Message::Text(frame.to_string())).await {
+                            if let Err(e) = writer.send(Message::Text(frame.to_string().into())).await {
                                 break SessionEnd::Reconnect(redact(&format!("ack write failed: {e}")));
                             }
                             self.metrics.bump(&self.metrics.acked);
@@ -681,7 +681,7 @@ impl SocketModeClient {
                             "no frame for {:?}; socket presumed dead", self.config.dead_after
                         ));
                     }
-                    if let Err(e) = writer.send(Message::Ping(Vec::new())).await {
+                    if let Err(e) = writer.send(Message::Ping(Default::default())).await {
                         break SessionEnd::Reconnect(redact(&format!("ping write failed: {e}")));
                     }
                 }

@@ -392,9 +392,9 @@ mod tests {
                 .unwrap(),
         );
         let (mut relay, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        relay.send(Message::Text(serde_json::json!({"type":"setup","accountSid":"AC-local","callSid":sid,"sessionId":"VX-local"}).to_string())).await.unwrap();
+        relay.send(Message::Text(serde_json::json!({"type":"setup","accountSid":"AC-local","callSid":sid,"sessionId":"VX-local"}).to_string().into())).await.unwrap();
         for n in 0..3 {
-            relay.send(Message::Text(serde_json::json!({"type":"prompt","voicePrompt":format!("local phone turn {n}"),"last":true}).to_string())).await.unwrap();
+            relay.send(Message::Text(serde_json::json!({"type":"prompt","voicePrompt":format!("local phone turn {n}"),"last":true}).to_string().into())).await.unwrap();
             let output = tokio::time::timeout(std::time::Duration::from_secs(3), relay.next())
                 .await
                 .unwrap()

@@ -182,7 +182,8 @@ fn hello() -> Message {
     Message::Text(
         json!({"type": "hello", "connection_info": {"app_id": "A00000001"}, "num_connections": 1,
             "debug_info": {"host": "applink-test", "approximate_connection_time": 3600}})
-        .to_string(),
+        .to_string()
+        .into(),
     )
 }
 
@@ -201,14 +202,16 @@ fn message_envelope(envelope_id: &str, event_id: &str, retry_attempt: u32) -> Me
                     "text": "hi", "ts": "1700000000.000100"}
             }
         })
-        .to_string(),
+        .to_string()
+        .into(),
     )
 }
 
 fn disconnect(reason: &str) -> Message {
     Message::Text(
         json!({"type": "disconnect", "reason": reason, "debug_info": {"host": "wss-test"}})
-            .to_string(),
+            .to_string()
+            .into(),
     )
 }
 
@@ -426,16 +429,22 @@ async fn unknown_and_malformed_frames_do_not_drop_the_connection() {
         .unwrap();
     server
         .send(Message::Text(
-            json!({"type": "events_api", "payload": {}}).to_string(),
+            json!({"type": "events_api", "payload": {}})
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
-    server.send(Message::Binary(vec![1, 2, 3])).await.unwrap();
+    server
+        .send(Message::Binary(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
     // Unknown envelope kind with an id: ack it, surface it as Unknown.
     server
         .send(Message::Text(
             json!({"envelope_id": "env-0001", "type": "future_kind", "payload": {"x": 1}})
-                .to_string(),
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
@@ -444,7 +453,8 @@ async fn unknown_and_malformed_frames_do_not_drop_the_connection() {
         .send(Message::Text(
             json!({"envelope_id": "env-0002", "type": "events_api", "payload": {
                 "team_id": "T00000001", "event_id": "Ev00000002", "event": {"type": "never_seen"}}})
-            .to_string(),
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -502,7 +512,7 @@ async fn ack_carries_the_response_payload_when_slack_accepts_one() {
             json!({"envelope_id": "env-0001", "type": "slash_commands", "accepts_response_payload": true,
                 "payload": {"command": "/jarvis", "text": "status", "user_id": "U00000001",
                     "team_id": "T00000001", "channel_id": "C00000001", "trigger_id": "1.2.abc"}})
-            .to_string(),
+            .to_string().into(),
         ))
         .await
         .unwrap();

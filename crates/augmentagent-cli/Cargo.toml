@@ -103,7 +103,7 @@ serde_json = { workspace = true }
 serde_path_to_error = "0.1.20"
 uuid = { workspace = true }
 dashmap = { workspace = true }
-sha2 = "0.11.0"
+sha2 = "0.10.9"
 # #1 — `status` subcommand probes the dashboard's `/api/v1/stats` for proof
 # of life. Workspace `reqwest` is `default-features = false` + `rustls-tls`,
 # so this pulls in no openssl. The dep is re-asserted here (rather than
@@ -144,6 +144,6 @@ mockito = "1"
 # Same version the workspace already resolves (serenity, the Slack crate).
 tokio-tungstenite = "0.29"
 # Phone callback signatures in the offline daemon adapter test.
-hmac = "0.13"
-sha1 = "0.11"
+hmac = "0.12"
+sha1 = "0.10"
 base64 = "0.23"

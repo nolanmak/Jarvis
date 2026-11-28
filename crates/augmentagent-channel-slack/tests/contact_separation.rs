@@ -293,7 +293,8 @@ async fn accept(servers: &mut mpsc::UnboundedReceiver<ServerSocket>) -> ServerSo
         .expect("connector alive");
     ws.send(Message::Text(
         json!({"type": "hello", "connection_info": {"app_id": "A00000001"}, "num_connections": 1})
-            .to_string(),
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();
@@ -302,7 +303,9 @@ async fn accept(servers: &mut mpsc::UnboundedReceiver<ServerSocket>) -> ServerSo
 
 /// Send an envelope and wait for its ack (acked = persisted).
 async fn deliver(ws: &mut ServerSocket, frame: &Value) {
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     loop {
         let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await

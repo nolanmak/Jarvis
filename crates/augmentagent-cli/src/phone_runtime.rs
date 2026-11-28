@@ -491,9 +491,9 @@ mod tests {
                     .unwrap(),
             );
             let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-            socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-fixture","callSid":"CA-fixture","sessionId":"VX-fixture"}).to_string())).await.unwrap();
+            socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-fixture","callSid":"CA-fixture","sessionId":"VX-fixture"}).to_string().into())).await.unwrap();
             for n in 0..3 {
-                socket.send(Message::Text(json!({"type":"prompt","voicePrompt":format!("phone turn {n}"),"last":true}).to_string())).await.unwrap();
+                socket.send(Message::Text(json!({"type":"prompt","voicePrompt":format!("phone turn {n}"),"last":true}).to_string().into())).await.unwrap();
                 let reply = tokio::time::timeout(Duration::from_secs(5), socket.next())
                     .await
                     .unwrap()
