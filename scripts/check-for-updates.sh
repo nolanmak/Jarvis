@@ -611,8 +611,16 @@ fi
 
 log "update available: $LOCAL -> $REMOTE"
 
-# What changed? Decide whether each side needs a rebuild.
-CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
+# What changed? Decide whether each side needs a rebuild. Judge from the last
+# commit the artifacts were built from, not just HEAD: a deferred build (e.g.
+# storage busy) pulls without advancing the stamp, and diffing only
+# HEAD..origin on the next tick would skip that pull's changes for good. Every
+# decision below (Rust, dashboard, sidecars, sync scripts) uses this range.
+BASE=$LOCAL
+if [ -n "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$LOCAL" 2>/dev/null; then
+  BASE=$BUILT
+fi
+CHANGED_FILES=$(git diff --name-only "$BASE" "$REMOTE")
 NEEDS_REBUILD=0
 NEEDS_DASHBOARD_REBUILD=0
 NEEDS_COMPUTER_REBUILD=0
