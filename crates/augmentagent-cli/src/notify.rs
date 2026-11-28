@@ -298,8 +298,8 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Replies, interaction responses and Discord-only posts ---------------
     // #1396's interrupted-turn notice stays `REPLY`: it posts in the owner
     // channel the dead turn came from, referencing the owner's own message.
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 11, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 9, REPLY, "query answers, command replies, interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 12, REPLY, "query answers, command replies, redraft, interrupted-turn and withheld-reply notices (#2413)"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 10, REPLY, "query answers, command replies, interrupted-turn and withheld-reply notices (#2413)"),
     p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 2, REPLY, "yolo thread gate: unreadable-registry notice and the reply to an owner command that does not run in a yolo thread (#2219)"),
     p("yolo_thread_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 4, REPLY, "yolo thread gate notices, and the intro and could-not-register messages posted in a new yolo thread (#2219)"),
     p("relay_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 1, REPLY, "refusal of a command relayed through a trusted webhook"),
