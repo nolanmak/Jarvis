@@ -133,6 +133,12 @@ mod slicing;
 #[path = "self_improve_preflight_retry.rs"]
 mod preflight_retry;
 
+#[path = "self_improve_stale_loop.rs"]
+mod stale_loop;
+#[cfg(test)]
+#[path = "self_improve_stale_loop_tests.rs"]
+mod stale_loop_tests;
+
 #[path = "self_improve_provider_readiness.rs"]
 pub(crate) mod provider_readiness;
 
@@ -1128,6 +1134,14 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
             continue;
         }
+        if stale_loop::skip_as_stale_red_main(&iss.body) {
+            info!(issue=iss.number,"skip: red-main issue while main is green; resolved, never worked");
+            continue;
+        }
+        if stale_loop::holds(iss.number,chrono::Utc::now().timestamp_millis()) {
+            info!(issue=iss.number,"skip: inside a deterministic-refusal backoff (#2610)");
+            continue;
+        }
         // An open GitHub issue can outlive its completed workflow. Do not
         // spend another selection turn on work the claim gate cannot restart.
         match owner_controls.terminal(&repository,iss.number) {
@@ -1612,11 +1626,47 @@ fn criteria_pr_section(criteria: &[String]) -> String {
     if criteria.is_empty() {
         return String::new();
     }
-    let items: Vec<String> = criteria.iter().map(|c| format!("- {c}")).collect();
+    // #2610: a criterion that is not one trimmed line (the plan lane's
+    // fallback is the whole owner request, e.g. an auto-filed red-main body)
+    // cannot survive the bullet form. Its bullet is display only; the exact
+    // list rides in a machine-readable comment the resume reads back.
+    let exact = criteria.iter().any(|c| !criterion_is_one_line(c));
+    let items: Vec<String> = criteria
+        .iter()
+        .map(|c| if criterion_is_one_line(c) {
+            format!("- {c}")
+        } else {
+            format!("- {}", c.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+        .collect();
+    let encoded = if exact { format!("{}\n", encoded_criteria_line(criteria)) } else { String::new() };
     format!(
-        "\n\n## Acceptance criteria (from the scoping pass)\n{}",
+        "\n\n## Acceptance criteria (from the scoping pass)\n{encoded}{}",
         items.join("\n")
     )
+}
+
+/// #2610 — the machine-readable criteria line. JSON keeps newlines escaped,
+/// and escaping every `-` keeps `-->` inside a criterion from ending the
+/// comment early (a red-main body carries `<!-- red-main -->`).
+const ENCODED_CRITERIA_PREFIX: &str = "<!-- autoship-criteria-json: ";
+const ENCODED_CRITERIA_SUFFIX: &str = " -->";
+
+fn criterion_is_one_line(criterion: &str) -> bool {
+    !criterion.is_empty() && !criterion.contains(['\n', '\r']) && criterion.trim() == criterion
+}
+
+fn encoded_criteria_line(criteria: &[String]) -> String {
+    let json = serde_json::to_string(criteria).expect("a list of strings serializes");
+    format!("{ENCODED_CRITERIA_PREFIX}{}{ENCODED_CRITERIA_SUFFIX}", json.replace('-', "\\u002d"))
+}
+
+fn decode_criteria_line(line: &str) -> Option<Result<Vec<String>>> {
+    let json = line.strip_prefix(ENCODED_CRITERIA_PREFIX)?;
+    Some(json.strip_suffix(ENCODED_CRITERIA_SUFFIX)
+        .context("owner acceptance criteria encoding is truncated; refusing partial requirements")
+        .and_then(|json| serde_json::from_str(json)
+            .context("owner acceptance criteria encoding is malformed; refusing partial requirements")))
 }
 
 /// Preserve acceptance authority verbatim. Bounds refuse the entire input;
@@ -1633,6 +1683,17 @@ fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
         .iter()
         .rposition(|line| line.trim().starts_with("## Acceptance criteria"))
         .unwrap_or(0);
+    // #2610: an exact encoded list right under the heading is authoritative;
+    // its bullets are display only.
+    let heading = lines.get(start).is_some_and(|line| line.trim().starts_with("## Acceptance criteria"));
+    let encoded = lines.iter().skip(start + 1).find(|line| !line.trim().is_empty())
+        .filter(|_| heading).and_then(|line| decode_criteria_line(line.trim()));
+    if let Some(decoded) = encoded {
+        out = decoded?;
+        anyhow::ensure!(out.iter().all(|item| !item.trim().is_empty()),
+            "owner acceptance criteria encoding carries an empty requirement; refusing partial requirements");
+        return bounded_criteria(out);
+    }
     for line in &lines[start..] {
         let t = line.trim();
         if t.starts_with("## Acceptance criteria") {
@@ -1655,6 +1716,10 @@ fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
         anyhow::ensure!(t.starts_with('#'),"owner acceptance criteria contain an unparsed line; refusing partial requirements");
         break;
     }
+    bounded_criteria(out)
+}
+
+fn bounded_criteria(out: Vec<String>) -> Result<Vec<String>> {
     anyhow::ensure!(out.len()<=128 && out.iter().all(|item|item.len()<=4096)
         && out.iter().map(String::len).sum::<usize>()<=32*1024,
         "owner acceptance criteria exceed bounded contract capacity; explicit decomposition is required");
@@ -2970,6 +3035,18 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
 
 fn acceptance_owner_request(issue:&Issue)->String {
     format!("GitHub issue #{}: {}\n\n{}",issue.number,issue.title,issue.body)
+}
+
+/// #2610 — the plan lane's criterion when the scoping pass wrote none. An
+/// auto-filed red-main body is diagnostics, not requirements: its one
+/// requirement is a green main, said on one line so it round-trips through
+/// the PR body within the contract bounds.
+fn plan_fallback_criterion(issue:&Issue,owner_request:&str)->String {
+    if is_red_main_issue(&issue.body) {
+        return format!("The required CI failure reported in #{} ({}) is fixed at its cause, so main is green again; \
+            no required check, test or assertion is removed or weakened.",issue.number,issue.title.trim());
+    }
+    owner_request.to_owned()
 }
 
 fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
@@ -4328,6 +4405,14 @@ async fn find_resumable_draft(
         }
     }
     retries.extend(plan.tiers.keys().copied());
+    // #2610: a draft whose issue is backing off a deterministic refusal is
+    // not handed out again until the backoff ends.
+    let backoff = stale_loop::load(&stale_loop::path());
+    adopted.retain(|candidate| {
+        let held = candidate.source_issue.is_some_and(|issue| backoff.holds(issue, now));
+        if held { info!(pr=candidate.pr, issue=?candidate.source_issue, "skip: draft inside a deterministic-refusal backoff"); }
+        !held
+    });
     let select = |cursor| {
         if let Some(finishing) = adoption::select_finishing(&adopted, &ledger, utc_day_now(), only, &retries, &plan.tiers) {
             return Some(finishing);
@@ -8708,6 +8793,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     };
     note_current_issue(0); // This run has not committed to an issue yet (#954).
+    stale_loop::note_main_green(false);
     // #2467: with the global daily model budget spent, start no paid work.
     // The merge sweep and finalize run on their own tick and keep going.
     if !dry_run {
@@ -8739,7 +8825,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let lane = lane_from_env();
     let red_main_issue: Option<Issue> = if let Some(issue)=selected_issue {Some(issue)} else { match main_is_red(repo_root).await {
         Err(reason) => return Ok(RunReport::held(format!("optional main diagnostic deferred: {reason}"))),
-        Ok(None) => None,
+        Ok(None) => {
+            // #2610: main is green on its required checks, so any open
+            // red-main issue is for a red that is gone: close it and its
+            // draft, and the picker never works one.
+            stale_loop::note_main_green(true);
+            stale_loop::close_stale_red_main(repo_root, dry_run).await;
+            None
+        }
         Ok(Some(red)) => {
             let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
             let what = if red.failing.is_empty() {
@@ -9127,7 +9220,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     if plan_mode {
         // #2464: one scope call is enough. Bind the plan, criteria and
         // allowed paths and go straight to the build.
-        if criteria.is_empty() { criteria.push(owner_request.clone()); }
+        if criteria.is_empty() { criteria.push(plan_fallback_criterion(&issue,&owner_request)); }
         let scoped_plan = plan_proof::Plan::from_scope(&owner_request, scope.as_ref(), &criteria);
         workflow_guard.bind_plan(&scoped_plan)?;
         workflow_guard.transition(crate::autoship_workflow::Stage::Build, "plan_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
@@ -11983,6 +12076,8 @@ pub struct AutoPrLoop {
     /// Where the fair-scheduling state persists (#1532); injectable for the
     /// same reason as `counter_path`.
     fair_path: PathBuf,
+    /// #2610: deterministic-refusal backoff per issue; injectable like the rest.
+    refusal_path: PathBuf,
     /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
     clock: LoopClock,
 }
@@ -12975,6 +13070,7 @@ impl AutoPrLoop {
             counter_path: daily_counter_path(),
             workflow_path: workflow::path(),
             fair_path: fair_sched_path(),
+            refusal_path: stale_loop::path(),
             clock: Arc::new(chrono::Utc::now),
         })
     }
@@ -13002,6 +13098,7 @@ impl AutoPrLoop {
             counter_path: state.join("autopr-daily-runs.json"),
             workflow_path: state.join("autopr-workflow.sqlite3"),
             fair_path: state.join("autopr-fair.json"),
+            refusal_path: state.join("autopr-refusal-backoff.json"),
             clock: Arc::new(chrono::Utc::now),
         }
     }
@@ -13324,6 +13421,16 @@ impl AutoPrLoop {
                 // fairness before idle/held controls whether this tick stops.
                 // Keep one debt-accounting site next to compute settlement:
                 // paid resumes owe the issue lane a turn; paid builds settle up.
+                // #2610: a refusal that does not change between ticks backs
+                // the issue off (and parks it after a few); progress clears it.
+                match &outcome {
+                    Ok(report) if report.billed && !report.held => stale_loop::record_progress(&self.refusal_path, stale_loop::current_issue()),
+                    Err(error) if error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_none() => {
+                        stale_loop::record_failed_tick(&self.repo_root, &self.refusal_path, stale_loop::current_issue(),
+                            error, (self.clock)().timestamp_millis()).await;
+                    }
+                    _ => {}
+                }
                 if let Ok(report) = &outcome {
                     if report.billed {
                         FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
