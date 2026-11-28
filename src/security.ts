@@ -9,7 +9,8 @@
 // src/dashboard-server.ts) and both routers (UI + /api/v1) share one
 // implementation:
 //
-//   - getBindHost():        bind 127.0.0.1 by default, AUGMENTAGENT_BIND_HOST knob.
+//   - getBindHost():        bind 127.0.0.1 by default, AUGMENTAGENT_BIND_HOST knob;
+//                           refuses non-loopback unless AUGMENTAGENT_ALLOW_PUBLIC_BIND=1.
 //   - getDashboardPort():   single source for the port.
 //   - resolveApiKey():      fail-closed local mode — load or generate+persist a
 //                           key on first run and log it once.
@@ -35,10 +36,29 @@ export function getDashboardPort(): number {
   return parseInt(process.env.DASHBOARD_PORT || "3000", 10);
 }
 
-/** Bind 127.0.0.1 by default; overridable for split-mode behind a reverse
- *  proxy/TLS. Never silently binds 0.0.0.0 just because PORT was set. */
+/** Bind 127.0.0.1 by default. A non-loopback AUGMENTAGENT_BIND_HOST throws
+ *  unless AUGMENTAGENT_ALLOW_PUBLIC_BIND=1 is set. */
+// D8: cloudflared reaches the app over loopback, so a non-loopback bind is a
+// config mistake that exposes the dashboard to the LAN. Fail loudly at startup.
+function isLoopbackHost(host: string): boolean {
+  if (host.toLowerCase() === "localhost" || host === "::1") return true;
+  const octets = host.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)
+  );
+}
+
 export function getBindHost(): string {
-  return process.env.AUGMENTAGENT_BIND_HOST || DEFAULT_HOST;
+  const host = process.env.AUGMENTAGENT_BIND_HOST || DEFAULT_HOST;
+  if (isLoopbackHost(host) || process.env.AUGMENTAGENT_ALLOW_PUBLIC_BIND === "1") {
+    return host;
+  }
+  throw new Error(
+    `Refusing to bind non-loopback host "${host}". Set AUGMENTAGENT_BIND_HOST to ` +
+      `127.0.0.1 (or ::1/localhost), or set AUGMENTAGENT_ALLOW_PUBLIC_BIND=1 to override.`
+  );
 }
 
 // --- API key: fail-closed local mode -------------------------------------

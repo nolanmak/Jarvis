@@ -167,7 +167,7 @@ If the new laptop gives you trouble, cut back:
 With both machines on the tailnet:
 
 - **Shell in**: `ssh <your-user>@<new-laptop-tailnet-hostname>`. You can `tail` logs, restart the daemon, `git pull` manually.
-- **Dashboard in a browser**: the Express dashboard binds `0.0.0.0:3000` by default. From anywhere on the tailnet, `http://<new-laptop-hostname>.<tailnet>.ts.net:3000` loads it.
+- **Dashboard in a browser**: the Express dashboard binds `127.0.0.1:3000` and refuses a non-loopback `AUGMENTAGENT_BIND_HOST` unless `AUGMENTAGENT_ALLOW_PUBLIC_BIND=1` is set. Reach it remotely through the Cloudflare tunnel, or an SSH port forward (`ssh -L 3000:127.0.0.1:3000 <host>`).
 - **macOS firewall**: if it's on, allow incoming connections for `node` in System Settings → Network → Firewall. Without this the dashboard is only reachable from localhost on the new laptop.
 - **File transfer**: `tailscale file cp ./some-file <hostname>:` is easier than scp for quick snapshots.
 
