@@ -118,7 +118,7 @@ test("the app shell renders the rail and the approvals count in the bottom bar",
 });
 
 const OUTCOMES = {
-  approved: { kind: "approved", summary: "Sent to riley@vendor.example." },
+  approved: { kind: "approved", summary: "Sent to riley@vendor.example" },
   revised: { kind: "revised", summary: "Revised; a new draft is pending." },
   scheduled: { kind: "scheduled", summary: "Scheduled.", local: "Mon 9:00 AM" },
   failed: { kind: "failed", summary: "Send failed.", message: "SMTP 550 mailbox unavailable" },
