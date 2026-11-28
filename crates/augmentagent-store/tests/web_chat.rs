@@ -44,12 +44,12 @@ fn web_chat_thread_create_rename_set_get_list() {
             Err(WebChatError::BadRequest(_))
         ));
     }
-    assert!(store.web_rename_thread(&t.id, &"é".repeat(120)).is_ok());
+    let before = store.web_rename_thread(&t.id, &"é".repeat(120)).unwrap();
 
     let set = store.web_set_thread(&t.id, Some(true), Some(true)).unwrap();
     assert!(set.pinned && set.archived);
     assert_eq!(
-        set.updated_at, renamed.updated_at,
+        set.updated_at, before.updated_at,
         "pin/archive is not activity"
     );
     let again = store.web_set_thread(&t.id, Some(true), None).unwrap();
