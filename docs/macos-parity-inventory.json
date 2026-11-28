@@ -2109,6 +2109,62 @@
     "evidence": null
   },
   {
+    "id": "route:web/fragments:GET:/web/threads/:id/log",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves GET /web/threads/:id/log with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /web/threads/:id/log with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /web/threads/:id/log in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/threads/:id/reset-session",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/threads/:id/reset-session with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/threads/:id/reset-session with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/threads/:id/reset-session in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/threads/:id/turns",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/threads/:id/turns with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/threads/:id/turns with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/threads/:id/turns in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:web/fragments:POST:/web/turns/:id/cancel",
+    "source": "src/web/fragments.ts",
+    "linux_baseline": "Linux dashboard serves POST /web/turns/:id/cancel with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /web/turns/:id/cancel with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /web/turns/:id/cancel in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "route:dashboard:GET:/api/actions",
     "source": "src/dashboard.ts",
     "linux_baseline": "Linux dashboard serves GET /api/actions with its current auth and response contract.",
