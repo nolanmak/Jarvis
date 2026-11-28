@@ -29,7 +29,7 @@ md-5 = "0.10"
 chrono = { workspace = true }
 # #1573 — Gmail REST bodies and `raw` drafts are base64url; message gets fan
 # out with a bounded concurrency.
-base64 = "0.22"
+base64 = "0.23"
 futures = { workspace = true }
 
 # Dangercat git dep deferred: repo is private; see root Cargo.toml note.

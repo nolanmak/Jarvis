@@ -334,7 +334,8 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
 fn hello() -> Message {
     Message::Text(
         json!({"type": "hello", "connection_info": {"app_id": "A00000001"}, "num_connections": 1})
-            .to_string(),
+            .to_string()
+            .into(),
     )
 }
 
@@ -385,7 +386,7 @@ impl Server {
 
     async fn send(&mut self, frame: &Value) {
         self.ws
-            .send(Message::Text(frame.to_string()))
+            .send(Message::Text(frame.to_string().into()))
             .await
             .unwrap();
     }

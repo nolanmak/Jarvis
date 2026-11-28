@@ -19,7 +19,7 @@ sha2 = "0.10.9"
 augmentagent-auth = { path = "../augmentagent-auth" }
 
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

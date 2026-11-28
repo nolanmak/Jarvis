@@ -30,14 +30,17 @@ http = "1"
 aws-config = "1"
 aws-credential-types = "1"
 aws-sigv4 = "1"
-aws-sdk-kms = "1"
+# Default features minus `rustls`: that one adds the legacy hyper-0.14
+# connector (rustls 0.21, h2 0.3, rustls-webpki 0.101, all with open
+# RUSTSEC advisories). `default-https-client` is the rustls 0.23 client.
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 # CryptoJS/OpenSSL-EVP compatible entry-content crypto (pure Rust, no
 # openssl linkage): Salted__ header, MD5 EVP_BytesToKey, AES-256-CBC.
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.8"
 
 sha2 = "0.10"

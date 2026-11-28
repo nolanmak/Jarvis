@@ -455,7 +455,7 @@ fn parse_arxiv_atom(xml: &str) -> Vec<Paper> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 if tag == "entry" {
                     in_entry = true;
                     cur = Paper::default();
@@ -464,7 +464,7 @@ fn parse_arxiv_atom(xml: &str) -> Vec<Paper> {
             }
             Ok(Event::Text(e)) => {
                 if in_entry {
-                    let txt = e.xml_content().unwrap_or_default().to_string();
+                    let txt = e.xml10_content().to_string();
                     match cur_tag.as_str() {
                         "id" => cur.id.push_str(&txt),
                         "title" => cur.title.push_str(&txt),
@@ -475,7 +475,7 @@ fn parse_arxiv_atom(xml: &str) -> Vec<Paper> {
                 }
             }
             Ok(Event::End(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 if tag == "entry" {
                     in_entry = false;
                     // The raw <id> is an abs URL; keep it and derive the

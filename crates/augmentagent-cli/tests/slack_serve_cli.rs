@@ -241,7 +241,9 @@ async fn fake_socket() -> FakeSocket {
             };
             let hello = json!({"type": "hello", "num_connections": 1,
                 "connection_info": {"app_id": "A00000001"}});
-            ws.send(Message::Text(hello.to_string())).await.unwrap();
+            ws.send(Message::Text(hello.to_string().into()))
+                .await
+                .unwrap();
             loop {
                 tokio::select! {
                     _ = &mut kill_rx => {
@@ -249,7 +251,7 @@ async fn fake_socket() -> FakeSocket {
                         return;
                     }
                     frame = send_rx.recv() => match frame {
-                        Some(f) => ws.send(Message::Text(f.to_string())).await.unwrap(),
+                        Some(f) => ws.send(Message::Text(f.to_string().into())).await.unwrap(),
                         None => return,
                     },
                     incoming = ws.next() => match incoming {

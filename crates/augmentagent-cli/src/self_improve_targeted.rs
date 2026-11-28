@@ -1010,6 +1010,9 @@ else:raise Exception('unexpected request '+repr(a))
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::targeted::tests::explicit_targets_are_authorized_and_bound_before_execution","--nocapture"])
             .env_remove("AUGMENTAGENT_NATIVE_VM_POLICY")
+            // The whole tick future runs unboxed on the test thread; in debug
+            // builds it sits just under the 2 MiB default and overflows on Linux.
+            .env("RUST_MIN_STACK", "8388608")
             .env(CHILD,root).env("GH_BIN",gh).env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
             .env("XDG_STATE_HOME",root.join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("state/workflow.db"))
             .output().unwrap();
@@ -1131,6 +1134,8 @@ else: raise Exception('unexpected request '+repr(a))
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "self_improve::targeted::tests::bound_target_lifecycle_settles_without_failing_the_tick", "--nocapture"])
             .env_remove("AUGMENTAGENT_NATIVE_VM_POLICY")
+            // See explicit_targets_are_authorized_and_bound_before_execution.
+            .env("RUST_MIN_STACK", "8388608")
             .env(CHILD, root).env("GH_BIN", gh).env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner")
             .env("XDG_STATE_HOME", root.join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.join("state/workflow.db"))
             .output().unwrap();

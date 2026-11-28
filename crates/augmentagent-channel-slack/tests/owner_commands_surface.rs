@@ -288,7 +288,7 @@ impl Server {
             .expect("connector alive");
         ws.send(Message::Text(
             json!({"type": "hello", "connection_info": {"app_id": "A00000001"}, "num_connections": 1})
-                .to_string(),
+                .to_string().into(),
         ))
         .await
         .unwrap();
@@ -298,7 +298,7 @@ impl Server {
     /// Send a frame and wait for its ack (acked = persisted).
     async fn deliver(&mut self, frame: &Value) {
         self.ws
-            .send(Message::Text(frame.to_string()))
+            .send(Message::Text(frame.to_string().into()))
             .await
             .unwrap();
         let want = frame["envelope_id"].as_str().unwrap().to_string();

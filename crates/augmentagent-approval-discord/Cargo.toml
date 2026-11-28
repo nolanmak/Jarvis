@@ -35,6 +35,9 @@ serenity = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
+# Held at 0.21: voice_bridge hands these messages to serenity 0.12's
+# ShardMessenger::websocket_message, which takes tungstenite 0.21's Message.
+# Move with serenity, not independently.
 tokio-tungstenite = "0.21"
 libc = "0.2"
 uuid = { workspace = true }

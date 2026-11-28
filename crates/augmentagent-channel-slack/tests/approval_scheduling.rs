@@ -1200,7 +1200,8 @@ async fn a_non_owner_click_on_a_notice_is_rejected_and_changes_nothing() {
         .unwrap();
     ws.send(Message::Text(
         json!({"type": "hello", "connection_info": {"app_id": "A00000001"}, "num_connections": 1})
-            .to_string(),
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();
@@ -1215,7 +1216,9 @@ async fn a_non_owner_click_on_a_notice_is_rejected_and_changes_nothing() {
         None,
         &h.click_ts(),
     );
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     until("the stranger is refused", || {
         h.ephemerals().iter().any(|e| e.text == REJECTION_REPLY)
             || h.web
