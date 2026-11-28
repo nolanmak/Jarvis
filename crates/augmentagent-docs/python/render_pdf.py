@@ -76,6 +76,23 @@ def inline(node):
     return result
 
 
+def page_rows(cells, width, height, blank):
+    """Chop cells taller than one page into successive rows, so a table row
+    larger than the frame paginates instead of losing the text past its end."""
+    columns = []
+    for cell in cells:
+        pieces = []
+        while cell.wrap(width, height)[1] > height:
+            parts = cell.split(width, height)
+            if len(parts) != 2:
+                break
+            pieces.append(parts[0])
+            cell = parts[1]
+        columns.append(pieces + [cell])
+    return [[column[index] if index < len(column) else blank() for column in columns]
+            for index in range(max(map(len, columns)))]
+
+
 def render_pdf(source):
     if not source.strip():
         raise ValueError('cannot render an empty document')
@@ -100,6 +117,7 @@ def render_pdf(source):
     root = TreeParser(md.convert(source)).root
     story = []
     width = letter[0] - 108 - 12  # default frame padding
+    frame = letter[1] - 108  # usable height between the page margins
 
     def paragraph(text, style=body):
         return Paragraph(text or '&#160;', style)
@@ -129,8 +147,17 @@ def render_pdf(source):
                 rows = [[paragraph(inline(cell)) for cell in row] for row in child.iter('tr')]
                 if rows:
                     count = max(map(len, rows))
-                    rows = [row + [''] * (count - len(row)) for row in rows]
-                    table = LongTable(rows, colWidths=[width / count] * count, repeatRows=1, splitInRow=1, hAlign='LEFT')
+                    rows = [row + [paragraph('') for _ in range(count - len(row))] for row in rows]
+                    cell_width = width / count - 12  # LEFTPADDING + RIGHTPADDING
+                    # Rows are chopped to fit beneath the repeated header, which
+                    # is only repeated while every page can still carry a row.
+                    # The 12 pt allowance covers cell padding and grid lines.
+                    header = max(cell.wrap(cell_width, frame)[1] for cell in rows[0]) + 12
+                    repeat = 1 if 2 * header <= frame else 0
+                    rows = [page_rows(row, cell_width, frame - 12 - repeat * header, lambda: paragraph(''))
+                            for row in rows]
+                    table = LongTable([row for group in rows for row in group], colWidths=[width / count] * count,
+                                      repeatRows=repeat, splitInRow=1, hAlign='LEFT')
                     table.setStyle(TableStyle([
                         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e5e7eb')),
                         ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#9ca3af')),

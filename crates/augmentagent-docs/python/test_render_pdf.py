@@ -35,8 +35,17 @@ class RenderPdfTests(unittest.TestCase):
         self.assertGreater(text.count('\f'), 2)
 
     def test_table_row_taller_than_a_page_keeps_all_text(self):
-        md = '| Evidence |\n| --- |\n| ' + 'Long detail. ' * 2000 + 'FINAL CELL |'
-        self.assertIn('FINAL CELL', extracted(render_pdf(md)))
+        md = '| Evidence |\n| --- |\n| ' + ' '.join(f'Detail{i}.' for i in range(2500)) + ' FinalCell |'
+        text = extracted(render_pdf(md))
+        self.assertGreater(text.count('\f'), 2)
+        for expected in ['Detail0.', 'Detail1250.', 'Detail2499.', 'FinalCell']:
+            self.assertIn(expected, text)
+
+    def test_table_header_taller_than_a_page_keeps_all_text(self):
+        md = '| ' + ' '.join(f'Heading{i}.' for i in range(2500)) + ' FinalHeading |\n| --- |\n| Evidence row |'
+        text = extracted(render_pdf(md))
+        for expected in ['Heading0.', 'Heading2499.', 'FinalHeading', 'Evidence row']:
+            self.assertIn(expected, text)
 
     def test_numbered_list_preserves_starting_number(self):
         text = extracted(render_pdf('7. Seventh exhibit\n8. Eighth exhibit'))
