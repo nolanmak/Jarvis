@@ -4,7 +4,9 @@ use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn columns(conn: &Connection, table: &str, wanted: &[&str]) -> Vec<Option<String>> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
     let present = statement
         .query_map([], |row| row.get::<_, String>(1))
         .unwrap()
@@ -12,7 +14,12 @@ fn columns(conn: &Connection, table: &str, wanted: &[&str]) -> Vec<Option<String
         .unwrap();
     wanted
         .iter()
-        .map(|name| present.iter().find(|column| column.as_str() == *name).cloned())
+        .map(|name| {
+            present
+                .iter()
+                .find(|column| column.as_str() == *name)
+                .cloned()
+        })
         .collect()
 }
 

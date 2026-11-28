@@ -54,7 +54,9 @@ async fn import_items_syncs_only_new_items_and_exports_wiki() {
     store.add_item("sandbox", "new-item", "Household").unwrap();
     store.add_item("sandbox", "other-item", "Other").unwrap();
     let vault = MemoryVault::default();
-    vault.put("sandbox/item/new-item", "fixture-access").unwrap();
+    vault
+        .put("sandbox/item/new-item", "fixture-access")
+        .unwrap();
     let reindexed = Cell::new(0);
     let reindex = |_: &FinanceStore, root: &Path| {
         assert_eq!(root, wiki.as_path());
@@ -81,9 +83,11 @@ async fn import_items_syncs_only_new_items_and_exports_wiki() {
     assert_eq!(status[1]["status"], "linked");
     assert!(status[1]["synced_at"].is_null());
     assert_eq!(reindexed.get(), 1);
-    assert!(std::fs::read_to_string(wiki.join("finance/plaid-sandbox.md"))
-        .unwrap()
-        .contains("plaid-sandbox-2026-09.md"));
+    assert!(
+        std::fs::read_to_string(wiki.join("finance/plaid-sandbox.md"))
+            .unwrap()
+            .contains("plaid-sandbox-2026-09.md")
+    );
 }
 #[tokio::test]
 async fn complete_then_import_marks_item_ok_with_synced_at() {
@@ -169,7 +173,9 @@ async fn import_reschedules_when_history_not_ready() {
     let mut store = FinanceStore::open(&dir.path().join("data.db")).unwrap();
     store.add_item("sandbox", "new-item", "Household").unwrap();
     let vault = MemoryVault::default();
-    vault.put("sandbox/item/new-item", "fixture-access").unwrap();
+    vault
+        .put("sandbox/item/new-item", "fixture-access")
+        .unwrap();
     import_items(
         &Client::for_test(&server.uri()),
         &mut store,
@@ -185,7 +191,10 @@ async fn import_reschedules_when_history_not_ready() {
     assert_eq!(attempt, 1);
     assert!(due.is_some());
     let now = chrono::Utc::now();
-    assert!(store.history_retries_due("sandbox", now).unwrap().is_empty());
+    assert!(store
+        .history_retries_due("sandbox", now)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         store
             .history_retries_due("sandbox", now + chrono::Duration::minutes(3))

@@ -262,11 +262,11 @@ async fn new_item_first_sync_not_ready_then_historical_complete() {
     let (attempt, due) = s.history_retry("sandbox", "item").unwrap();
     assert_eq!(attempt, 1);
     let due = due.expect("first retry scheduled");
-    let delay = chrono::DateTime::parse_from_rfc3339(&due)
-        .unwrap()
-        .to_utc()
-        - chrono::Utc::now();
-    assert!(delay.num_seconds() > 60 && delay.num_seconds() <= 120, "{due}");
+    let delay = chrono::DateTime::parse_from_rfc3339(&due).unwrap().to_utc() - chrono::Utc::now();
+    assert!(
+        delay.num_seconds() > 60 && delay.num_seconds() <= 120,
+        "{due}"
+    );
     // The schedule lives in SQLite, so a restart resumes the same slot.
     drop(s);
     let mut s = FinanceStore::open(&db).unwrap();

@@ -65,7 +65,11 @@ fn due(s: &Session, now: DateTime<Utc>) -> Result<bool> {
         Some(created) => (now - instant(created)?).num_seconds() < POLL_FAST_WINDOW_SECS,
         None => false,
     };
-    let interval = if fresh { POLL_FAST_SECS } else { POLL_SLOW_SECS };
+    let interval = if fresh {
+        POLL_FAST_SECS
+    } else {
+        POLL_SLOW_SECS
+    };
     Ok((now - instant(polled)?).num_seconds() >= interval)
 }
 pub fn date(value: &str) -> Result<()> {
@@ -234,7 +238,12 @@ impl FinanceStore {
         Ok(())
     }
     /// Items already linked to this institution, excluding `item` itself.
-    pub fn institution_items(&self, env: &str, institution: &str, item: &str) -> Result<Vec<String>> {
+    pub fn institution_items(
+        &self,
+        env: &str,
+        institution: &str,
+        item: &str,
+    ) -> Result<Vec<String>> {
         let mut q=self.conn.prepare("SELECT id FROM finance_items WHERE env=?1 AND institution_id=?2 AND id<>?3 ORDER BY id")?;
         let ids = q
             .query_map(params![env, institution, item], |r| r.get(0))?

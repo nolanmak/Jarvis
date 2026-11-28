@@ -272,14 +272,7 @@ async fn connect_records_expiry_and_pending_state() {
     let client = Client::for_test(&server.uri());
     let store = FinanceStore::memory().unwrap();
     let vault = MemoryVault::default();
-    let id = start(
-        &server,
-        &client,
-        &store,
-        &vault,
-        "2099-01-01T00:00:00Z",
-    )
-    .await;
+    let id = start(&server, &client, &store, &vault, "2099-01-01T00:00:00Z").await;
     let session = store.session("sandbox", &id).unwrap();
     assert_eq!(session.state, "pending");
     assert!(!session.complete);
@@ -347,9 +340,10 @@ async fn poll_session_expired_never_calls_exchange() {
     let id = start(&server, &client, &store, &vault, "2020-01-01T00:00:00Z").await;
     response(&server,"/link/token/get",json!({"link_sessions":[{"results":{"item_add_results":[{"public_token":"fixture-public"}]}}]})).await;
     Mock::given(path("/item/public_token/exchange"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"item_id":"fixture-item","access_token":"fixture-access"}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"item_id":"fixture-item","access_token":"fixture-access"})),
+        )
         .expect(0)
         .mount(&server)
         .await;
@@ -362,7 +356,10 @@ async fn poll_session_expired_never_calls_exchange() {
     assert_eq!(store.session("sandbox", &id).unwrap().state, "expired");
     assert!(store.status("sandbox").unwrap().is_empty());
     // Expired sessions are never due again, so nothing re-polls them.
-    assert!(store.due_sessions("sandbox", Utc::now()).unwrap().is_empty());
+    assert!(store
+        .due_sessions("sandbox", Utc::now())
+        .unwrap()
+        .is_empty());
 }
 #[tokio::test]
 async fn linked_item_records_institution_and_flags_duplicate() {
@@ -370,7 +367,9 @@ async fn linked_item_records_institution_and_flags_duplicate() {
     let client = Client::for_test(&server.uri());
     let store = FinanceStore::memory().unwrap();
     let vault = MemoryVault::default();
-    store.add_item("sandbox", "existing-item", "Household").unwrap();
+    store
+        .add_item("sandbox", "existing-item", "Household")
+        .unwrap();
     store
         .set_institution("sandbox", "existing-item", "ins_fixture")
         .unwrap();
@@ -420,7 +419,13 @@ async fn legacy_session_without_expiry_is_not_polled() {
         )
         .unwrap();
     let store = FinanceStore::open(&db).unwrap();
-    assert!(store.due_sessions("sandbox", Utc::now()).unwrap().is_empty());
-    assert!(store.expire_sessions("sandbox", Utc::now()).unwrap().is_empty());
+    assert!(store
+        .due_sessions("sandbox", Utc::now())
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .expire_sessions("sandbox", Utc::now())
+        .unwrap()
+        .is_empty());
     assert_eq!(store.session("sandbox", &id).unwrap().state, "pending");
 }
