@@ -1,6 +1,7 @@
 // #45 — PWA Web Push subscription endpoint test. Asserts subscribe persists
 // to the shared pwa_subscriptions table (same one the Rust store uses) and
-// that malformed bodies are rejected.
+// that malformed bodies are rejected. #2706: the push routes need auth, so
+// requests carry the dashboard API key.
 
 const test = require("node:test");
 const assert = require("node:assert");
@@ -12,7 +13,7 @@ const fs = require("node:fs");
 const tmpDb = path.join(os.tmpdir(), `aa-push-${process.pid}.db`);
 process.env.AUGMENTAGENT_DB = tmpDb;
 process.env.MODE = "local";
-delete process.env.AUGMENTAGENT_API_KEY;
+process.env.AUGMENTAGENT_API_KEY = "synthetic-push-key";
 
 const express = require("express");
 const { initDb, listPushSubscriptions } = require(path.join(
@@ -41,7 +42,10 @@ function post(port, p, body) {
         port,
         path: p,
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer synthetic-push-key",
+        },
       },
       (res) => {
         let b = "";
