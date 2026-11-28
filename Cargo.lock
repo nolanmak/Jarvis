@@ -1072,6 +1072,7 @@ dependencies = [
  "augmentagent-store",
  "augmentagent-test-support",
  "augmentagent-wiki",
+ "autoship-contract",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1383,6 +1384,15 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "autoship-contract"
+version = "0.1.0"
+source = "git+https://github.com/nolanmak/autoship.git?branch=main#9bcc89743c92a0a102385c81cb6bd662e334aeea"
+dependencies = [
+ "anyhow",
+ "serde",
+]
 
 [[package]]
 name = "aws-config"
