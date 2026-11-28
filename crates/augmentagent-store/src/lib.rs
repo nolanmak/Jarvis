@@ -45,6 +45,8 @@ pub mod surface_commands;
 pub mod surface_health;
 // #1297 — per-conversation reply mode (text or spoken) behind `voice on|off`.
 pub mod surface_reply_modes;
+// Jarvis Dashboard chat threads, turns and messages (web-dashboard-v2 §5.1).
+pub mod web_chat;
 
 pub use imessage::{
     ImessageOutboxItem, ImessageOutboxStatus, ImessageSendOutcome, ImessageTargetKind,
