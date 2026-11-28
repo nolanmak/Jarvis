@@ -75,9 +75,11 @@
     </main>
 
     <aside class="j-pane j-rail" data-pane-name="approvals" aria-label="Approvals">
-      <header class="j-head"><div class="j-head-title"><h1>Approvals</h1></div></header>
+      <header class="j-head"><div class="j-head-title"><h1>Approvals <%- include('approvals-count', { id: 'approvals-count-head', count: actions.length, oob: false }) %></h1></div>
+        <button type="button" class="j-btn j-rail-toggle" data-action="toggle-rail" aria-label="Hide approvals" title="Hide approvals">×</button></header>
       <div class="j-scroll">
-        <div class="j-empty"><p class="j-empty-title">Nothing to review</p><p>Drafts that need your approval show up here.</p></div>
+        <div id="approval-outcomes" class="j-outcomes"></div>
+        <%- include('approvals', { ...locals, oob: false, outcome: null }) %>
       </div>
     </aside>
   </div>
@@ -85,7 +87,7 @@
   <nav class="j-tabbar" aria-label="Sections">
     <button type="button" data-pane-target="threads"><%- include('icon', { name: 'list' }) %><span>Threads</span></button>
     <button type="button" data-pane-target="chat"><%- include('icon', { name: 'chat' }) %><span>Chat</span></button>
-    <button type="button" data-pane-target="approvals"><%- include('icon', { name: 'check' }) %><span>Approvals</span></button>
+    <button type="button" data-pane-target="approvals"><%- include('icon', { name: 'check' }) %><span>Approvals</span><%- include('approvals-count', { count: actions.length, oob: false }) %></button>
   </nav>
 
   <div id="j-toast" class="j-toast" role="status" aria-live="polite"></div>
