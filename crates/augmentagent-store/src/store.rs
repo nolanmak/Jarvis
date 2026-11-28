@@ -1163,6 +1163,7 @@ impl Store {
         crate::owner_reply::migrate(conn)?;
         crate::phone::migrate(conn)?;
         crate::local_chat::migrate(conn)?;
+        crate::web_chat::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
