@@ -39,6 +39,12 @@ pub fn web_audit_ctx(thread_id: &str, turn_id: &str) -> AuditCtx {
     }
 }
 
+/// Run `f` as part of web turn `thread_id`, so channel-scoped tools bind to
+/// the web thread (#2777).
+pub async fn in_web_turn<F: std::future::Future>(_thread_id: &str, f: F) -> F::Output {
+    f.await
+}
+
 pub struct WebTurnRunner {
     store: Arc<Store>,
     handler: Arc<dyn QueryHandler>,

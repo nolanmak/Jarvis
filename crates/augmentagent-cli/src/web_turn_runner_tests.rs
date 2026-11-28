@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::surface_conformance_tests::{isolated, querier};
-use crate::web_turn_runner::{web_audit_ctx, WebTurnRunner};
+use crate::web_turn_runner::{in_web_turn, web_audit_ctx, WebTurnRunner};
 use augmentagent_channel_core::providers::ProviderKind;
 use augmentagent_channel_core::surface_conformance::{
     native_session_conformance, ConformanceAdapter, RecordingNativeProvider,
@@ -170,17 +170,28 @@ fn surface(opts: &ReasonerOpts) -> BTreeSet<String> {
     out
 }
 
-/// T1: a web turn gets the Discord owner turn's tools and owner rules, minus
-/// the Discord-channel-scoped ones listed here (and phone tools, which need
-/// a phone transport scope neither turn has).
+/// T1 (#2777): a web turn gets exactly the tools, MCP servers, env and brief
+/// of a Discord owner turn. The channel-scoped tools bind to the web thread
+/// instead of a Discord channel. Not compared: phone tools (no phone
+/// transport scope on either turn), voice (needs a Discord voice channel) and
+/// the Discord origin notifier sink.
 #[tokio::test]
-async fn web_audit_ctx_matches_a_discord_owner_turn_minus_channel_tools() {
+async fn web_turns_get_the_discord_owner_tool_surface() {
     let Some(root) = isolated(
-        "web_turn_runner_tests::web_audit_ctx_matches_a_discord_owner_turn_minus_channel_tools",
+        "web_turn_runner_tests::web_turns_get_the_discord_owner_tool_surface",
         "WEB_TURN_T1_ROOT",
     ) else {
         return;
     };
+    // Make every channel-scoped tool attachable.
+    std::fs::create_dir_all(root.join("sidecars/computer-use")).unwrap();
+    std::fs::write(root.join("sidecars/computer-use/mcp.mjs"), "").unwrap();
+    let token = root.join("tabagent.token");
+    std::fs::write(&token, "token-for-tests\n").unwrap();
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    std::env::set_var("AUGMENTAGENT_TABAGENT_TOKEN_FILE", &token);
+    std::env::set_var("NEWSLETTERBUDDY_URL", "http://127.0.0.1:9");
+
     let captured = Arc::new(Mutex::new(Vec::new()));
     let mut handler = querier(
         &root,
@@ -200,33 +211,44 @@ async fn web_audit_ctx_matches_a_discord_owner_turn_minus_channel_tools() {
         channel_id: Some(serenity::model::id::ChannelId::new(2)),
         owner_authorized: true,
     };
+    augmentagent_approval_discord::interaction::owner_history(true, handler.answer(&discord, "hi"))
+        .await
+        .unwrap();
     let web = web_audit_ctx("thread", "turn");
-    for ctx in [&discord, &web] {
-        augmentagent_approval_discord::interaction::owner_history(true, handler.answer(ctx, "hi"))
-            .await
-            .unwrap();
-    }
+    in_web_turn(
+        "thread",
+        augmentagent_approval_discord::interaction::owner_history(true, handler.answer(&web, "hi")),
+    )
+    .await
+    .unwrap();
+    // A bare web-shaped context outside a web turn gets none of them.
+    handler.answer(&web, "hi").await.unwrap();
+
     let calls = captured.lock().unwrap();
-    let (discord_opts, web_opts) = (&calls[0], &calls[1]);
-    let (d, w) = (surface(discord_opts), surface(web_opts));
+    let (discord_opts, web_opts, bare) = (&calls[0], &calls[1], &calls[2]);
+    let d = surface(discord_opts);
+    for tool in [
+        "mcp computer",
+        "mcp tabagent",
+        "mcp model",
+        "env NEWSLETTERBUDDY_REQUEST_ID",
+    ] {
+        assert!(d.contains(tool), "fixture did not attach {tool}: {d:?}");
+        assert!(
+            !surface(bare).contains(tool),
+            "{tool} without a web turn scope"
+        );
+    }
+    let w = surface(web_opts);
     let missing: Vec<&String> = d.difference(&w).collect();
     let extra: Vec<&String> = w.difference(&d).collect();
-    assert!(extra.is_empty(), "web gained {extra:?}");
-    // Channel-scoped: the model switch writes the Discord channel's model
-    // selection (the web has no model picker in v1). Computer use, the
-    // browser tool, owner compute and newsletter tools are channel-scoped
-    // the same way but are not attachable in this fixture.
-    assert_eq!(missing, ["mcp model", "tool mcp__model__switch_model"]);
-    // Same owner rules and brief, minus the model tool's own paragraph.
-    let prompt = &discord_opts.system_prompt;
-    let start = prompt
-        .find("\nJarvis model control:")
-        .expect("model tool paragraph");
-    let end = start + 1 + prompt[start + 1..].find('\n').unwrap() + 1;
-    let expected = format!("{}{}", &prompt[..start], &prompt[end..]);
     assert!(
-        web_opts.system_prompt == expected,
-        "web brief differs beyond the model tool"
+        missing.is_empty() && extra.is_empty(),
+        "discord-only {missing:?}, web-only {extra:?}"
+    );
+    assert!(
+        web_opts.system_prompt == discord_opts.system_prompt,
+        "same brief and owner rules"
     );
     assert_eq!(web_opts.session_id.as_deref(), Some("web:thread:turn"));
     assert!(
@@ -235,6 +257,21 @@ async fn web_audit_ctx_matches_a_discord_owner_turn_minus_channel_tools() {
             .iter()
             .any(|t| t.contains("approvals history")),
         "approval history is owner-private context on the web too"
+    );
+    // The tools are keyed on the web thread, not a Discord channel.
+    let settings: serde_json::Value =
+        serde_json::from_str(web_opts.settings_json.as_deref().unwrap()).unwrap();
+    assert_eq!(settings["mcpServers"]["computer"]["args"][1], "web:thread");
+    let model_args = settings["mcpServers"]["model"]["args"].to_string();
+    assert!(
+        model_args.contains("\"--channel\",\"web:thread\""),
+        "{model_args}"
+    );
+    assert!(
+        settings["mcpServers"]["tabagent"]["env"]
+            .get(crate::tabagent_handoff::CHANNEL_ENV)
+            .is_none(),
+        "no Discord handoff channel for a web turn"
     );
 }
 
