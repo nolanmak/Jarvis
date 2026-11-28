@@ -414,6 +414,11 @@ async fn issue_preparation_preserves_lost_checkout_identity_before_git_reconstru
 /// #2349 — enroll a synthetic workflow checkout at `stage`, then lose the path.
 async fn lost_checkout_fixture(root: &Path, state: &Path, number: u64, stage: crate::autoship_workflow::Stage)
     -> (String, PathBuf, String, crate::autoship_workflow::Snapshot) {
+    lost_checkout_fixture_at(root, state, number, stage, "scope_policy_changed", "rescope_executable_acceptance").await
+}
+
+async fn lost_checkout_fixture_at(root: &Path, state: &Path, number: u64, stage: crate::autoship_workflow::Stage,
+    reason: &str, action: &str) -> (String, PathBuf, String, crate::autoship_workflow::Snapshot) {
     use crate::autoship_workflow::{NextAction, RecoveryContext, WorkflowStore};
     let id = format!("fixture/repo#{number}");
     let candidate = candidate_parent(root).await.unwrap().join(format!("current-issue-{number}"));
@@ -432,7 +437,7 @@ async fn lost_checkout_fixture(root: &Path, state: &Path, number: u64, stage: cr
         binding: binding.clone()}, 4).unwrap();
     let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
     cp.stage = stage;
-    cp.next = NextAction {reason: "scope_policy_changed".into(), action: "rescope_executable_acceptance".into(), eligible_at_ms: 0};
+    cp.next = NextAction {reason: reason.into(), action: action.into(), eligible_at_ms: 0};
     store.checkpoint(&lease, &cp, 5).unwrap();
     store.release(&lease, 6).unwrap();
     git(root, &["worktree", "remove", "--force", candidate.to_str().unwrap()]);
@@ -541,4 +546,101 @@ async fn scope_stage_lost_checkout_with_unpublished_commits_keeps_hold() {
     let store = WorkflowStore::open(&state).unwrap();
     assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
     assert!(!store.events(&id).unwrap().iter().any(|e| e.1 == "checkout_continuity_reestablished"));
+}
+
+/// #2612 — commit a branch tip that is not on main.
+fn unpublished_commit(root: &Path, branch: &str) -> String {
+    let tree = git(root, &["rev-parse", &format!("{branch}^{{tree}}")]);
+    let work = git(root, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit-tree", &tree, "-p", branch, "-m", "unpublished"]);
+    git(root, &["update-ref", &format!("refs/heads/{branch}"), &work]);
+    work
+}
+
+/// #2612 — 2026-11-27 Legion: 21 workflows at build / plan_registered (planned,
+/// never built, no PR, branch still on the main commit they were planned
+/// from) lost their checkout to disk prune ("clean merged worktree") and were
+/// held forever. The plan lives in the store; nothing physical is lost, so
+/// the picker selects the row and preparation re-establishes it from current
+/// main with the checkpoint and plan unchanged.
+#[tokio::test]
+async fn planned_unbuilt_lost_checkout_is_selectable_and_reestablished() {
+    use crate::autoship_workflow::{Stage, WorkflowStore};
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    let (id, candidate, branch, before) =
+        lost_checkout_fixture_at(root.path(), &state, 21, Stage::Build, "plan_registered", "build").await;
+    let old_head = before.checkpoint.binding.head.clone();
+    std::fs::write(root.path().join("code"), "advanced main").unwrap();
+    git(root.path(), &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "advance"]);
+    git(root.path(), &["fetch", "-q", "origin", "main"]);
+    let main = git(root.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(main, old_head);
+
+    let controls = workflow::FreshIssueControls::open_at(&state).unwrap();
+    controls.selection_checkout("fixture/repo", 21)
+        .expect("planned-unbuilt work with a lost checkout must be selectable");
+    let (issues, held) = (vec![picker_issue(21), picker_issue(2500)], Default::default());
+    let order: Vec<u64> = picker_fairness::candidates(issues, &held, &controls, "fixture/repo", chrono::Utc::now().timestamp_millis())
+        .unwrap().into_iter().map(|issue| issue.number).collect();
+    assert_eq!(order.first(), Some(&21), "the planned row must be built first: {order:?}");
+    drop(controls);
+
+    recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await
+        .expect("planned-unbuilt work must re-establish continuity instead of holding forever");
+    assert_eq!(git(&candidate, &["rev-parse", "HEAD"]), main);
+    assert_eq!(git(&candidate, &["symbolic-ref", "--short", "HEAD"]), branch);
+    let store = WorkflowStore::open(&state).unwrap();
+    assert_eq!(store.snapshot(&id).unwrap().unwrap(), before, "re-establishment rewrote the checkpoint or plan");
+    let audits: Vec<_> = store.events(&id).unwrap().into_iter().filter(|e| e.1 == "checkout_continuity_reestablished").collect();
+    assert_eq!(audits.len(), 1, "missing or duplicate continuity audit");
+    let payload: serde_json::Value = serde_json::from_str(&audits[0].2).unwrap();
+    assert_eq!(payload["checkpoint"]["next"]["reason"], "plan_registered");
+    assert_eq!(payload["previous"]["branch_head"], old_head);
+    assert_eq!(payload["current"]["base"], main);
+    checkout_identity::check_recorded(&state, &id, &candidate, "fixture/repo", &branch).unwrap();
+}
+
+/// #2612 — a planned row whose branch carries commits that are not on main
+/// keeps the #2224 hold: not selectable, not reset, no audit, no checkout.
+/// Held rows cannot be built, so they do not count toward the #2530
+/// planned-unbuilt bound and new planning is not blocked.
+#[tokio::test]
+async fn planned_unbuilt_lost_checkout_with_unpublished_commits_stays_held() {
+    use crate::autoship_workflow::{Stage, WorkflowStore};
+    let root = repository();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().canonicalize().unwrap().join("workflow.db");
+    let mut held = Vec::new();
+    for number in [31, 32, 33] {
+        let (id, candidate, branch, before) =
+            lost_checkout_fixture_at(root.path(), &state, number, Stage::Build, "plan_registered", "build").await;
+        let work = unpublished_commit(root.path(), &branch);
+        held.push((number, id, candidate, branch, before, work));
+    }
+    let controls = workflow::FreshIssueControls::open_at(&state).unwrap();
+    for (number, ..) in &held {
+        let error = controls.selection_checkout("fixture/repo", *number).expect_err("unpublished work became selectable");
+        assert!(error.downcast_ref::<checkout_identity::Hold>().is_some_and(|h| h.reason_code == "checkout_identity_changed"), "{error:#}");
+    }
+    let issues = vec![picker_issue(31), picker_issue(32), picker_issue(33), picker_issue(2500)];
+    let order: Vec<u64> = picker_fairness::candidates(issues, &Default::default(), &controls, "fixture/repo", chrono::Utc::now().timestamp_millis())
+        .unwrap().into_iter().map(|issue| issue.number).collect();
+    assert_eq!(order, vec![2500], "held planned rows must be skipped without holding new planning");
+    drop(controls);
+
+    for (_, id, candidate, branch, before, work) in held {
+        let result = recovery::prepare_issue_at(&state, root.path(), &candidate, &id, "fixture/repo", &branch).await;
+        assert!(result.is_err(), "branch with unpublished commits was replaced");
+        assert_eq!(git(root.path(), &["rev-parse", &branch]), work);
+        assert!(!candidate.exists(), "failed preparation left an unauthorized replacement");
+        let store = WorkflowStore::open(&state).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(), before);
+        assert!(!store.events(&id).unwrap().iter().any(|e| e.1 == "checkout_continuity_reestablished"));
+    }
+}
+
+fn picker_issue(number: u64) -> RestIssue {
+    RestIssue {number, title: "Synthetic widget".into(), body: "Synthetic request".into(),
+        author: "fixture-owner".into(), association: "OWNER".into(), research_filed: false}
 }

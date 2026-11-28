@@ -38,6 +38,28 @@ pub enum MergeReleaseProof {
         merge_commit: String,
         merged_at: String,
     },
+    /// The authoritative PR read showed this exact PR still open and unmerged
+    /// after dispatch. A merged PR never reopens, so the dispatch provably did
+    /// not merge when either the head moved past the `expectedHeadOid` it was
+    /// bound to, or the journaled response is GitHub's refusal of the mutation.
+    RemoteOpenUnmerged {
+        node: String,
+        pr: u64,
+        observed_head: String,
+        response_sha256: Option<String>,
+    },
+}
+
+/// GitHub's refusal of `mergePullRequest` (e.g. "required status checks are
+/// expected") is a GraphQL execution error: `data.mergePullRequest` is null.
+/// Alone it is not release proof; it is only used with a later remote read
+/// that shows the same PR still open and unmerged.
+pub fn merge_response_refused(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value["errors"].as_array().is_some_and(|errors| !errors.is_empty())
+        && value.pointer("/data/mergePullRequest").is_some_and(|v| v.is_null())
 }
 
 /// GraphQL request errors precede execution. Execution errors instead include
@@ -489,6 +511,52 @@ impl WorkflowStore {
                         && merge_request_not_executed(&raw),
                     "journal does not prove a pre-execution request rejection"
                 );
+            }
+            MergeReleaseProof::RemoteOpenUnmerged {
+                node: remote_node,
+                pr: remote_pr,
+                observed_head,
+                response_sha256,
+            } => {
+                ensure!(
+                    classification == "not-merged"
+                        && state == "dispatched"
+                        && remote_node == &node
+                        && *remote_pr == pr
+                        && matches!(observed_head.len(), 40 | 64)
+                        && observed_head.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "open unmerged observation does not match this dispatch"
+                );
+                let raw: Option<String> = tx
+                    .query_row(
+                        "SELECT response FROM merge_transport_response WHERE operation=?1",
+                        [&op.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(digest) = response_sha256 {
+                    let raw = raw.as_deref().context("refusal proof lacks journaled response")?;
+                    ensure!(
+                        *digest == format!("{:x}", Sha256::digest(raw.as_bytes()))
+                            && merge_response_refused(raw),
+                        "journal does not prove GitHub refused the merge"
+                    );
+                } else {
+                    ensure!(
+                        observed_head != &op.binding.head,
+                        "same-head open observation cannot release an uncertain dispatch"
+                    );
+                }
+                if let Some(raw) = raw {
+                    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+                    ensure!(
+                        value
+                            .pointer("/data/mergePullRequest/pullRequest/state")
+                            .and_then(|v| v.as_str())
+                            != Some("MERGED"),
+                        "remote observation contradicts original accepted response"
+                    );
+                }
             }
             MergeReleaseProof::DifferentMergedHead {
                 node: remote_node,

@@ -602,14 +602,14 @@ const HOST_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 /// `128 + n` exit code (#1779) while reporting our stop as `128 + SIGTERM`.
 fn stopped_through_cleanup(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
-    // The supervisor dying of a signal is read as our own, because cleanup
-    // escalates its SIGTERM to a SIGKILL of the supervisor itself when the
-    // receipt does not land in time. A host stop of the whole group reaches
-    // us the same way, so the two are indistinguishable here; attributing the
-    // ambiguous status to the stop we know we just sent keeps cleanup from
-    // reporting itself as a host stop. A stop that preceded cleanup is
-    // already classified from the un-reaped status, before the group drops.
-    if status.signal().is_some() {
+    // The supervisor dying of SIGTERM or SIGKILL is read as our own, because
+    // cleanup escalates its SIGTERM to a SIGKILL of the supervisor itself
+    // when the receipt does not land in time. A host stop of the whole group
+    // reaches us the same way, so those two are indistinguishable here;
+    // attributing the ambiguous status to the stop we know we just sent keeps
+    // cleanup from reporting itself as a host stop. Cleanup sends nothing
+    // else, so a supervisor that died of another host stop still names it.
+    if matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)) {
         return None;
     }
     interrupted_by_signal(status).filter(|signal| *signal != libc::SIGTERM)
@@ -1106,7 +1106,15 @@ impl ClaudeCliReasoner {
             self.call_once(opts, user_message, capture, clean.clone()),
         )
         .await;
-        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+        // #1788 — a host stop takes the supervisor with the CLI (a deploy
+        // restart SIGKILLs the whole unit cgroup), so the cleanup receipt it
+        // would have published never lands. The signal already accounts for
+        // the missing receipt and stops the chain on its own, so keep it:
+        // reporting unverified cleanup instead hides the cause behind a
+        // reconciliation that cannot resolve anything.
+        let host_stopped = matches!(&outcome, Ok(Err(CallError::Other(error)))
+            if matches!(ReasonerError::find_in(error), Some(ReasonerError::Interrupted { .. })));
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) && !host_stopped {
             return Err(CallError::Other(
                 ReasonerError::CleanupUncertain {
                     provider: "claude".into(),
@@ -6057,6 +6065,48 @@ exit 1
         assert_host_stop(&reasoner.call(&dummy_opts(), "x").await.unwrap_err());
     }
 
+    /// #1788 — the deploy restart's cgroup kill takes the supervisor with the
+    /// CLI, so the cleanup receipt it would have published never lands. The
+    /// signal already accounts for the missing receipt and stops the chain by
+    /// itself: the call must reach the chain as the host stop it was, not as
+    /// unverified cleanup, which names a reconciliation nothing can perform.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_when_its_supervisor_dies_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-cgroup-killed", "cat >/dev/null\nkill -KILL $PPID\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_host_stop(&reasoner.call(&dummy_opts(), "x").await.unwrap_err());
+    }
+
+    /// #1788 — both halves of that rule on the unreceipted path. A host stop
+    /// the supervisor cannot trap keeps its own signal, and a supervisor that
+    /// died of anything else still reports unverified cleanup: only the stop
+    /// we can name accounts for the receipt that never arrived.
+    #[tokio::test]
+    async fn an_unreceipted_cleanup_keeps_a_host_stop_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = |name: &'static str, signal: &'static str| {
+            let bin = stub_cli(&dir, name, &format!("cat >/dev/null\nkill -{signal} $PPID\n"));
+            async move {
+                ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) }
+                    .call(&dummy_opts(), "x").await.unwrap_err()
+            }
+        };
+        let hungup = call("fake-claude-cgroup-hungup", "HUP").await;
+        assert!(
+            matches!(ReasonerError::find_in(&hungup), Some(ReasonerError::Interrupted { signal: 1, .. })),
+            "{hungup:#}"
+        );
+        // A crashed supervisor (SIGSEGV) is not a host stop, so nothing
+        // explains the missing receipt: the chain must still stop for
+        // reconciliation rather than blame a restart that never happened.
+        let crashed = call("fake-claude-supervisor-crashed", "SEGV").await;
+        assert!(
+            matches!(ReasonerError::find_in(&crashed), Some(ReasonerError::CleanupUncertain { .. })),
+            "{crashed:#}"
+        );
+    }
+
     /// #1788 — cleanup stops the group itself, so afterwards only a signal we
     /// never send still names a host stop: the supervisor forwards the CLI's
     /// own SIGKILL as `128 + 9`, reports our SIGTERM as `128 + 15`, and dies
@@ -6070,6 +6120,14 @@ exit 1
         assert_eq!(stopped_through_cleanup(&status("exit 143").await), None);
         assert_eq!(stopped_through_cleanup(&status("kill -KILL $$").await), None);
         assert_eq!(stopped_through_cleanup(&status("exit 1").await), None);
+        // Cleanup sends SIGTERM and escalates to SIGKILL; it never sends
+        // SIGHUP or SIGINT, so a supervisor that died of one names a host
+        // stop as surely as a forwarded `128 + n` exit code does.
+        assert_eq!(stopped_through_cleanup(&status("exit 129").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("exit 130").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -HUP $$").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("kill -INT $$").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -SEGV $$").await), None);
     }
 
     /// #1788 — the CLI is SIGKILLed mid tool call, so its unmatched intent
