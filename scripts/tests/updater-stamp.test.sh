@@ -120,6 +120,39 @@ for storage_code in 73 75 76; do
   rm -rf "$TMP"
 done
 
+# A deferred Rust build must not be forgotten by the next pull. The 11:20
+# tick pulled a crates/ change and deferred its build (storage busy, stamp
+# left at the last built commit). The 11:25 tick diffed only HEAD..origin,
+# saw no crates/ change, skipped the build and stamped a commit whose Rust
+# never deployed. Changes are judged from the last built commit instead.
+make_case
+BASE_SHA=$(git -C "$TMP/work" rev-parse HEAD)
+mkdir -p "$(dirname "$STAMP_FILE")"
+echo "$BASE_SHA" > "$STAMP_FILE"                     # base is deployed
+export STORAGE_CODE=75
+run_updater 1
+unset STORAGE_CODE
+[ "$(cat "$STAMP_FILE")" = "$BASE_SHA" ] && ok "deferred build keeps the last built stamp" \
+  || bad "deferred build keeps the last built stamp" "stamp: $(cat "$STAMP_FILE")"
+# The next merge touches no Rust.
+git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -q --allow-empty -m 'docs only'
+mkdir -p "$TMP/work/docs" && echo note > "$TMP/work/docs/note.md"
+git -C "$TMP/work" add docs/note.md
+git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm 'docs change'
+git -C "$TMP/work" push -q origin HEAD:main
+git -C "$TMP/work" reset -q --hard HEAD~2              # deploy checkout still at the deferred pull
+: > "$TMP/state/augmentagent/update.log"
+run_updater 1; rc=$?
+if grep -q 'rebuilding rust' "$TMP/state/augmentagent/update.log"; then
+  ok "a later pull with no Rust change still builds the deferred Rust change"
+else
+  bad "a later pull with no Rust change still builds the deferred Rust change" \
+    "$(grep -E 'rust|update' "$TMP/state/augmentagent/update.log" | tail -n 4)"
+fi
+[ "$rc" -eq 0 ] && [ "$(cat "$STAMP_FILE")" = "$(git -C "$TMP/work" rev-parse origin/main)" ] \
+  && ok "the stamp then names the deployed head" || bad "the stamp then names the deployed head" "rc=$rc stamp=$(cat "$STAMP_FILE")"
+rm -rf "$TMP"
+
 # A renderer install failure must stop deployment before restart/stamping.
 make_case
 export PDF_INSTALL_FAIL=1
