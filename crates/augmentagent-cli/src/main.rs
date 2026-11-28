@@ -52,6 +52,8 @@ mod surface_conformance_tests;
 #[cfg(test)]
 mod web_turn_runner_tests;
 #[cfg(test)]
+mod web_surface_action_tests;
+#[cfg(test)]
 mod calendar_approval_tests;
 #[cfg(test)]
 mod calendar_live_tests;
@@ -4103,7 +4105,9 @@ async fn main() -> Result<()> {
                     Arc::new(wiki_querier(build_reasoner(), wiki,
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), web_store, false))
                         as Arc<dyn QueryHandler>
-                }, shutdown.clone()) {
+                }, approver.clone().map(|approver| Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
+                    "web", approver as Arc<dyn ApprovalActionHandler>, card_surfaces.clone()))
+                    as Arc<dyn ApprovalActionHandler>), shutdown.clone()) {
                     tasks.push(worker);
                 }
             }
