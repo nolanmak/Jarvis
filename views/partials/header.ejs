@@ -9,7 +9,10 @@
        unstyled). Built from tailwind.input.css + tailwind.config.js via
        `npm run tailwind:build`; served by express.static from /public. -->
   <link rel="stylesheet" href="/tailwind.css" />
-  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <!-- htmx and its SSE extension are vendored; versions and hashes are in
+       public/vendor/VERSIONS.md. -->
+  <script src="/vendor/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"></script>
+  <script src="/vendor/sse.min.js" integrity="sha384-A986SAtodyH8eg8x8irJnYUk7i9inVQqYigD6qZ9evobksGNIXfeFvDwLSHcp31N"></script>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
   <nav class="border-b border-gray-800 bg-gray-900/80 backdrop-blur sticky top-0 z-50">

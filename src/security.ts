@@ -326,18 +326,16 @@ export function hostOriginGuard(req: Request, res: Response, next: NextFunction)
 
 // --- Content-Security-Policy ---------------------------------------------
 //
-// Strict policy. The EJS views load htmx from unpkg, so that origin is allowed
-// explicitly under script-src (per #297: "allow the unpkg origin explicitly in
-// CSP" when self-hosting isn't trivial). 'unsafe-inline' is permitted for style
-// only because the views use inline style attributes; scripts are otherwise
-// locked to 'self' + unpkg. To self-host later, drop unpkg here and vendor the
-// htmx bundle into public/.
+// Strict policy. htmx and its SSE extension are vendored into public/vendor/
+// (see public/vendor/VERSIONS.md), so scripts load from 'self' only.
+// 'unsafe-inline' is permitted for style only because the views use inline
+// style attributes.
 export function contentSecurityPolicy(_req: Request, res: Response, next: NextFunction): void {
   res.setHeader(
     "Content-Security-Policy",
     [
       "default-src 'self'",
-      "script-src 'self' https://unpkg.com",
+      "script-src 'self'",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data:",
       "connect-src 'self'",
