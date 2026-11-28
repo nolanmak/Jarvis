@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Credentialed so the manifest loads behind the Access login. -->
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
   <title>AugmentAgent</title>
   <!-- Self-hosted Tailwind (replaces the in-browser Play CDN that was failing
        to load behind some networks/ad-blockers, leaving the dashboard

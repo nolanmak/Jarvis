@@ -1,8 +1,10 @@
 {
-  "name": "AugmentAgent Approvals",
-  "short_name": "AA Approvals",
-  "description": "Approve, revise or skip drafted replies on the go (#45).",
-  "start_url": "/queue",
+  "name": "Jarvis Dashboard",
+  "short_name": "Jarvis",
+  "description": "Chat with Jarvis and review its drafted actions.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0b0f17",
   "theme_color": "#0b0f17",
@@ -11,13 +13,13 @@
       "src": "/icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
       "src": "/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ]
 }
