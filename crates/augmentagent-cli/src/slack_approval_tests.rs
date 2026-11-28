@@ -11,13 +11,13 @@ use augmentagent_store::{ActionStatus, Email, Store};
 
 const TEAM: &str = "T00000009";
 
-fn store() -> (tempfile::TempDir, Arc<Store>) {
+pub(crate) fn store() -> (tempfile::TempDir, Arc<Store>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("data.db")).unwrap());
     (dir, store)
 }
 
-fn pending_slack_reply(store: &Store) -> String {
+pub(crate) fn pending_slack_reply(store: &Store) -> String {
     let email = Email {
         message_id: "slack:C00000009:1700000000.000100".into(),
         thread_id: Some("C00000009".into()),
@@ -46,7 +46,7 @@ fn pending_slack_reply(store: &Store) -> String {
         .unwrap()
 }
 
-fn approver(store: Arc<Store>, composio: &str) -> crate::ReplyApprover {
+pub(crate) fn approver(store: Arc<Store>, composio: &str) -> crate::ReplyApprover {
     let mut approver = crate::test_support::approver_with_store(store);
     let auth = SlackAuth {
         entity_id: "entity-test".into(),
@@ -63,7 +63,7 @@ fn approver(store: Arc<Store>, composio: &str) -> crate::ReplyApprover {
     approver
 }
 
-async fn send_mock(server: &mut mockito::ServerGuard, hits: usize) -> mockito::Mock {
+pub(crate) async fn send_mock(server: &mut mockito::ServerGuard, hits: usize) -> mockito::Mock {
     server
         .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
         .with_status(200)
@@ -73,7 +73,7 @@ async fn send_mock(server: &mut mockito::ServerGuard, hits: usize) -> mockito::M
         .await
 }
 
-fn status(store: &Store, id: &str) -> String {
+pub(crate) fn status(store: &Store, id: &str) -> String {
     store
         .get_action_with_email(id)
         .unwrap()

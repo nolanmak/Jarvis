@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use augmentagent_approval_discord::{ApprovalActionHandler, ApprovalActionOutcome};
 use augmentagent_store::web_chat::{WebChatError, WebThread};
 use augmentagent_store::Store;
 use serde::Deserialize;
@@ -17,6 +18,9 @@ use crate::web_turn_runner::WebTurnRunner;
 pub struct WebSurface {
     store: Arc<Store>,
     runner: Arc<WebTurnRunner>,
+    /// `SyncingActionHandler::new("web", …)` around serve's approver; `None`
+    /// when serve has no approver (approvals then answer `internal`).
+    actions: Option<Arc<dyn ApprovalActionHandler>>,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +46,12 @@ enum Op {
     },
     #[serde(rename = "turn.cancel")]
     TurnCancel { turn_id: String },
+    #[serde(rename = "action.resolve")]
+    ActionResolve {
+        action_id: String,
+        verb: String,
+        note: Option<String>,
+    },
 }
 
 /// The thread object the dashboard client expects (`WebThread` in
@@ -69,8 +79,16 @@ fn refusal(error: WebChatError) -> OpError {
 }
 
 impl WebSurface {
-    pub fn new(store: Arc<Store>, runner: Arc<WebTurnRunner>) -> Self {
-        Self { store, runner }
+    pub fn new(
+        store: Arc<Store>,
+        runner: Arc<WebTurnRunner>,
+        actions: Option<Arc<dyn ApprovalActionHandler>>,
+    ) -> Self {
+        Self {
+            store,
+            runner,
+            actions,
+        }
     }
 
     fn run(&self, op: Op) -> Result<Value, WebChatError> {
@@ -98,6 +116,7 @@ impl WebSurface {
                 let status = self.runner.cancel(&turn_id)?;
                 json!({"turn_id": turn_id, "status": status.as_str()})
             }
+            Op::ActionResolve { .. } => unreachable!("action.resolve is dispatched async"),
         })
     }
 }
@@ -110,7 +129,116 @@ impl WebOps for WebSurface {
         }
         let op: Op = serde_json::from_value(args)
             .map_err(|_| OpError::new("bad_request", "unknown op or invalid arguments"))?;
+        if let Op::ActionResolve {
+            action_id,
+            verb,
+            note,
+        } = op
+        {
+            let Some(actions) = &self.actions else {
+                return Err(OpError::new("internal", "approvals are not available"));
+            };
+            return resolve_action(actions.as_ref(), &action_id, &verb, note.as_deref()).await;
+        }
         self.run(op).map_err(refusal)
+    }
+}
+
+/// `action.resolve` (§5.2.2): approve, skip or revise (with a non-empty
+/// note) through the real handler; exactly-once is the store's CAS.
+pub async fn resolve_action(
+    actions: &dyn ApprovalActionHandler,
+    action_id: &str,
+    verb: &str,
+    note: Option<&str>,
+) -> Result<Value, OpError> {
+    if action_id.is_empty() {
+        return Err(OpError::new("bad_request", "action_id is required"));
+    }
+    let outcome = match verb {
+        "approve" => actions.approve(action_id).await,
+        "skip" => actions.skip(action_id).await,
+        "revise" => match note.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(note) => actions.revise(action_id, note).await,
+            None => return Err(OpError::new("bad_request", "revise needs a note")),
+        },
+        _ => {
+            return Err(OpError::new(
+                "bad_request",
+                "verb must be approve, skip or revise",
+            ))
+        }
+    };
+    web_outcome_json(&outcome).map(|outcome| json!({ "outcome": outcome }))
+}
+
+/// The one mapping from a handler outcome to the dashboard's
+/// `{kind, summary}` (plus `text`/`link`, `local` or `message` where §5.2.2
+/// allows). `AlreadyResolved` and `NotFound` are refusals.
+pub fn web_outcome_json(outcome: &ApprovalActionOutcome) -> Result<Value, OpError> {
+    use ApprovalActionOutcome as O;
+    let plain = |kind: &str, summary: String| Ok(json!({"kind": kind, "summary": summary}));
+    match outcome {
+        O::NotFound => Err(OpError::new("action_not_found", "no such action")),
+        O::AlreadyResolved { status, .. } => Err(OpError::new(
+            "already_resolved",
+            format!("already resolved ({status})"),
+        )),
+        O::Approved => plain("approved", "Approved and sent.".into()),
+        O::CalendarCreated {
+            already_existed, ..
+        } => plain(
+            "calendar_created",
+            if *already_existed {
+                "The calendar event already existed.".into()
+            } else {
+                "Calendar event created.".into()
+            },
+        ),
+        O::CalendarResponded {
+            response, summary, ..
+        } => plain(
+            "calendar_responded",
+            format!("Responded {response} to {summary}."),
+        ),
+        O::CalendarRescheduled {
+            summary,
+            when,
+            already_there,
+            ..
+        } => plain(
+            "calendar_rescheduled",
+            if *already_there {
+                format!("{summary} was already at {when}.")
+            } else {
+                format!("{summary} moved to {when}.")
+            },
+        ),
+        O::DocumentSigned { .. } => plain("document_signed", "Document signed.".into()),
+        O::ManualSendReady { text, link } => Ok(json!({
+            "kind": "manual_send_ready",
+            "summary": "Not sent: send this yourself.",
+            "text": text,
+            "link": link,
+        })),
+        O::Skipped => plain("skipped", "Skipped.".into()),
+        O::Revised { .. } => plain(
+            "revised",
+            "Revised: a new draft is waiting for approval.".into(),
+        ),
+        O::Scheduled { local, .. } => Ok(json!({
+            "kind": "scheduled",
+            "summary": format!("Scheduled for {local}."),
+            "local": local,
+        })),
+        O::Unscheduled => plain("unscheduled", "Back in the queue.".into()),
+        O::CancelledSchedule => plain("cancelled_schedule", "Scheduled send cancelled.".into()),
+        O::Recomposed => plain("recomposed", "Draft restored for approval.".into()),
+        O::Failed { message } => Ok(json!({
+            "kind": "failed",
+            "summary": "Failed: the action is still pending.",
+            "message": message,
+        })),
     }
 }
 
@@ -120,6 +248,7 @@ pub fn start(
     wiki: Option<&PathBuf>,
     store: Arc<Store>,
     query: impl FnOnce(PathBuf) -> Arc<dyn augmentagent_approval_discord::QueryHandler>,
+    actions: Option<Arc<dyn ApprovalActionHandler>>,
     stop: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let Some(value) = std::env::var_os("AUGMENTAGENT_WEB_SOCKET") else {
@@ -158,7 +287,7 @@ pub fn start(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let handler = query(wiki.clone());
     let runner = WebTurnRunner::new(Arc::clone(&store), handler, cwd.display().to_string());
-    let surface = Arc::new(WebSurface::new(store, runner));
+    let surface = Arc::new(WebSurface::new(store, runner, actions));
     tracing::info!(socket = %path.display(), "Jarvis Dashboard web surface listening");
     Some(tokio::spawn(async move {
         if let Err(error) = listener.serve(surface, stop.clone()).await {
@@ -198,7 +327,7 @@ mod tests {
             Arc::new(handler),
             root.display().to_string(),
         );
-        let surface = WebSurface::new(Arc::clone(&store), runner);
+        let surface = WebSurface::new(Arc::clone(&store), runner, None);
 
         let created = call(&surface, json!({"v":1,"op":"thread.create"})).await;
         assert_eq!(created["ok"], true);
