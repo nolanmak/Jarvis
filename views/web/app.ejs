@@ -45,18 +45,33 @@
     <main class="j-pane j-main" data-pane-name="chat" aria-label="Chat">
       <%- include('thread-header', { thread, missing, oob: false }) %>
       <div class="j-scroll j-chat-body">
+        <% if (thread) { %>
+          <%- include('log', locals) %>
+        <% } else { %>
         <div class="j-empty">
           <span class="j-mark j-mark-lg" aria-hidden="true">J</span>
-          <% if (thread) { %>
-            <p class="j-empty-title">Messages will appear here</p>
-            <p>This thread is ready.</p>
-          <% } else { %>
-            <p class="j-empty-title"><%= missing ? 'That thread does not exist' : 'What can Jarvis do for you?' %></p>
-            <p>Pick a thread or start a new one. Press <kbd class="j-kbd">⌘K</kbd> to jump anywhere.</p>
-            <button type="button" class="j-btn-text" data-action="new-thread"><%- include('icon', { name: 'plus' }) %>New thread</button>
-          <% } %>
+          <p class="j-empty-title"><%= missing ? 'That thread does not exist' : 'What can Jarvis do for you?' %></p>
+          <p>Pick a thread or start a new one. Press <kbd class="j-kbd">⌘K</kbd> to jump anywhere.</p>
+          <button type="button" class="j-btn-text" data-action="new-thread"><%- include('icon', { name: 'plus' }) %>New thread</button>
         </div>
+        <% } %>
       </div>
+      <% if (thread && thread.archived) { %>
+      <div class="j-composer-wrap"><p class="j-archived-note">Unarchive this thread to send.
+        <button type="button" class="j-chip" hx-post="/web/threads/<%= encodeURIComponent(thread.id) %>/set" hx-vals='{"archived": false}' hx-target="#threads" hx-swap="outerHTML" data-reload>Unarchive</button></p></div>
+      <% } else if (thread) { %>
+      <div class="j-composer-wrap">
+        <form id="composer" class="j-composer" hx-post="/web/threads/<%= encodeURIComponent(thread.id) %>/turns" hx-target="#log" hx-swap="outerHTML" hx-disabled-elt="find button">
+          <div id="composer-error" class="j-composer-error"></div>
+          <div class="j-composer-box">
+            <textarea name="text" rows="1" placeholder="Message Jarvis" aria-label="Message Jarvis" enterkeyhint="send" autocomplete="off"></textarea>
+            <input type="hidden" name="turn_id" value="">
+            <button type="submit" class="j-send" aria-label="Send"><%- include('icon', { name: 'send' }) %></button>
+          </div>
+          <p class="j-composer-hint"><kbd class="j-kbd">Enter</kbd> to send · <kbd class="j-kbd">Shift Enter</kbd> for a new line</p>
+        </form>
+      </div>
+      <% } %>
     </main>
 
     <aside class="j-pane j-rail" data-pane-name="approvals" aria-label="Approvals">
