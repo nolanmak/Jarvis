@@ -43,6 +43,24 @@ const BLOCK_TAGS: &[(&str, &str)] = &[
     ("resolved_asks_block", "resolved_asks"),
 ];
 
+/// Prefix of a Plaid hosted-link URL (#2413). A hosted link authorizes a bank
+/// connection on the owner's behalf for whoever opens it, so a body carrying
+/// one is not sendable at all — dropping the line would still publish a reply
+/// written around handing the link over.
+pub const HOSTED_LINK_URL: &str = "secure.plaid.com/";
+
+/// What we log and show for a body [`HOSTED_LINK_URL`] made unsendable. The
+/// matched URL itself never reaches a log line, an error, or a channel.
+pub const HOSTED_LINK_CLASSIFICATION: &str = "hosted_link_url";
+
+/// Name the condition that makes `body` unsendable whole, rather than
+/// scrubbable line by line. Log-safe: a classification name, never the text
+/// that matched.
+pub fn unsendable_classification(body: &str) -> Option<&'static str> {
+    body.contains(HOSTED_LINK_URL)
+        .then_some(HOSTED_LINK_CLASSIFICATION)
+}
+
 /// Does `line` both open and close `tag`, i.e. is it a whole block on one
 /// line?
 fn closes_on_same_line(line: &str, tag: &str) -> bool {
@@ -62,6 +80,10 @@ pub struct ScrubOutcome {
     pub markers: Vec<&'static str>,
     /// How many lines were dropped.
     pub dropped_lines: usize,
+    /// Set when the body carries something no line-level scrub can make safe
+    /// and the caller must refuse the write whole (#2413). The body is left as
+    /// the scrub left it; this is the log-safe name of what was found.
+    pub unsendable: Option<&'static str>,
 }
 
 impl ScrubOutcome {
@@ -91,6 +113,7 @@ impl ScrubOutcome {
 /// endings included: the prompt cache and the byte-equality tests on the
 /// other outbound scrubbers depend on an untouched passthrough.
 pub fn scrub_internal_context(body: &str) -> ScrubOutcome {
+    let unsendable = unsendable_classification(body);
     let mut markers: Vec<&'static str> = Vec::new();
     for (name, text) in LINE_MARKERS {
         if body.contains(text) {
@@ -107,6 +130,7 @@ pub fn scrub_internal_context(body: &str) -> ScrubOutcome {
             body: body.to_string(),
             markers,
             dropped_lines: 0,
+            unsendable,
         };
     }
 
@@ -145,6 +169,7 @@ pub fn scrub_internal_context(body: &str) -> ScrubOutcome {
         body: kept,
         markers,
         dropped_lines,
+        unsendable,
     }
 }
 
@@ -241,6 +266,36 @@ mod tests {
         assert!(out.is_clean());
         assert!(out.is_empty());
         assert_eq!(out.body, " \n");
+    }
+
+    /// #2413 — a hosted bank-link URL is a classification, not a scrub: the
+    /// name comes back, the body is left alone for the caller to refuse whole,
+    /// and the matched URL is nowhere in what the caller may log.
+    #[test]
+    fn a_hosted_link_url_is_classified_unsendable_without_echoing_it() {
+        let body = "Open https://secure.plaid.com/hl/session-token to connect your bank.\n";
+        assert_eq!(unsendable_classification(body), Some(HOSTED_LINK_CLASSIFICATION));
+        assert!(!HOSTED_LINK_CLASSIFICATION.contains("plaid"));
+
+        let out = scrub_internal_context(body);
+        assert_eq!(out.unsendable, Some(HOSTED_LINK_CLASSIFICATION));
+        assert_eq!(out.body, body);
+        assert!(out.is_clean());
+        assert_eq!(out.dropped_lines, 0);
+    }
+
+    /// Ordinary prose and ordinary links are not the hosted link: the gate
+    /// must not refuse every URL a reply happens to carry.
+    #[test]
+    fn normal_bodies_and_non_hosted_urls_carry_no_classification() {
+        for body in [
+            "Thursday at 2 works on my end.",
+            "The overview is at https://plaid.example.com/docs/hosted-link.",
+            "",
+        ] {
+            assert_eq!(unsendable_classification(body), None, "{body:?}");
+            assert_eq!(scrub_internal_context(body).unsendable, None, "{body:?}");
+        }
     }
 
     /// Block bounds: an unclosed block takes the rest of the body, a close tag

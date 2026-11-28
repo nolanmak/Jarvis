@@ -4,21 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0f17" />
-  <link rel="manifest" href="/manifest.json" />
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
   <link rel="stylesheet" href="/styles.css" />
   <title>AugmentAgent — Approvals</title>
   <style>
     body { background:#0b0f17; color:#e6edf3; font-family:system-ui,sans-serif; margin:0; padding:1rem; }
     .card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:1rem; margin:.75rem 0; }
-    .row { display:flex; gap:.5rem; margin-top:.75rem; }
-    button { flex:1; padding:.7rem; border:0; border-radius:8px; font-weight:600; }
-    .ok { background:#238636; color:#fff; } .skip { background:#6e7681; color:#fff; }
-    .rev { background:#9e6a03; color:#fff; }
+    a { color:#58a6ff; }
     h1 { font-size:1.1rem; } .muted { color:#8b949e; font-size:.85rem; }
   </style>
 </head>
 <body>
   <h1>Pending approvals</h1>
+  <p class="muted">Read-only. Approve, revise or skip from the approval card in
+    <a href="https://discord.com/app" target="_blank" rel="noopener">Discord</a>,
+    where the action really runs.</p>
   <p class="muted" id="status">Loading…</p>
   <div id="queue"></div>
 
@@ -50,47 +50,16 @@
       for (const a of actions) {
         const el = document.createElement("div");
         el.className = "card";
-        // #36: surface the recipient (To:) on the card with an editable input
-        // so the operator can redirect the reply before clicking Approve.
+        // #2707: read-only. Decisions go through the real approval handler
+        // (Discord), never a status write from this page.
         const to = a.recipientEmail || a.fromEmail || "";
         el.innerHTML =
           "<strong>" + escHtml(a.subject || "(no subject)") + "</strong>" +
           "<div class='muted'>From: " + escHtml(a.fromEmail || "") + "</div>" +
-          "<div style='margin-top:.5rem;display:flex;gap:.5rem;align-items:center'>" +
-            "<label class='muted' style='flex:0 0 auto'>To:</label>" +
-            "<input type='email' value='" + escHtml(to) + "' " +
-              "style='flex:1;padding:.4rem;border-radius:6px;border:1px solid #30363d;background:#0b0f17;color:#e6edf3' />" +
-          "</div>" +
-          "<pre style='white-space:pre-wrap'>" + escHtml(a.draftBody || "") + "</pre>" +
-          "<div class='row'>" +
-            "<button class='ok'>Approve</button>" +
-            "<button class='rev'>Revise</button>" +
-            "<button class='skip'>Skip</button>" +
-          "</div>";
-        const toInput = el.querySelector("input[type=email]");
-        const [ok, rev, skip] = el.querySelectorAll("button");
-        const currentTo = () => (toInput.value || "").trim();
-        ok.onclick = () => resolve(a.id, "sent", undefined, currentTo());
-        skip.onclick = () => resolve(a.id, "rejected");
-        rev.onclick = () => {
-          const fb = prompt("Revision feedback:");
-          if (fb) resolve(a.id, "pending", fb, currentTo());
-        };
+          "<div class='muted'>To: " + escHtml(to) + "</div>" +
+          "<pre style='white-space:pre-wrap'>" + escHtml(a.draftBody || "") + "</pre>";
         q.appendChild(el);
       }
-    }
-
-    async function resolve(id, status, feedback, recipientEmail) {
-      const body = { status, source: "web_push", errorMessage: feedback };
-      if (recipientEmail && recipientEmail.indexOf("@") > 0) {
-        body.recipientEmail = recipientEmail;
-      }
-      await fetch("/api/v1/actions/" + id, {
-        method: "POST",
-        headers: Object.assign({ "Content-Type": "application/json" }, headers),
-        body: JSON.stringify(body),
-      });
-      load();
     }
 
     // PWA + Web Push registration.
