@@ -370,8 +370,21 @@ fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
     (collect_files(&files, &root), manifest)
 }
 
+/// The preset callsites the `autoship_case` binary target reports out of its
+/// own `include_str!` of the manifest. Cargo builds the package's binaries
+/// before an integration test that names one, so reading this forces a focused
+/// `--test capability_inventory` run to compile that embed too: `src/bin/`
+/// resolves one directory level deeper than this `tests/` file, and an embed
+/// copied across without that level names no file and fails the build.
+fn autoship_case_callsites() -> BTreeSet<String> {
+    let observed = std::process::Command::new(env!("CARGO_BIN_EXE_autoship_case")).output().unwrap();
+    assert!(observed.status.success(), "autoship case failed: {}", String::from_utf8_lossy(&observed.stderr));
+    serde_json::from_slice(&observed.stdout).unwrap()
+}
+
 #[test]
 fn inventory_accounts_for_every_production_preset_and_wrapper() {
+    let embedded_callsites = autoship_case_callsites();
     let (found, manifest) = scan_workspace();
     let found: BTreeSet<String> = found.into_keys().collect();
     let entries = manifest["presets"].as_array().unwrap();
@@ -389,6 +402,7 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
         assert!(manifest["profiles"][profile].is_object(), "unknown permission profile: {profile}");
     }
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
+    assert_eq!(embedded_callsites, declared, "the autoship_case target embedded a different capability manifest");
 }
 
 /// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
