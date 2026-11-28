@@ -1,0 +1,45 @@
+<div id="log" class="j-log" hx-get="/web/threads/<%= encodeURIComponent(thread.id) %>/log" hx-trigger="jarvis:refresh" hx-swap="outerHTML">
+<% if (!rows.length) { %>
+  <div class="j-empty">
+    <span class="j-mark j-mark-lg" aria-hidden="true">J</span>
+    <p class="j-empty-title">Ask Jarvis anything</p>
+    <p>Jarvis can use your wiki, memory and tools. Drafts that need approval land in Approvals.</p>
+  </div>
+<% } %>
+<% const labels = { queued: 'Queued', running: 'Working', failed: 'Failed', cancelled: 'Cancelled' };
+   const pills = { queued: 'j-pill-queued', running: 'j-pill-running', failed: 'j-pill-failed', cancelled: 'j-pill-cancelled' }; %>
+<% rows.forEach((r) => { %>
+  <% if (r.owner) { %>
+  <div class="j-msg j-msg-owner" data-turn="<%= r.turnId %>">
+    <div class="j-bubble"><%= r.owner.text %></div>
+    <time class="j-msg-time"><%= clockTime(r.owner.created_at) %></time>
+  </div>
+  <% } %>
+  <% if (r.answerHtml !== null) { %>
+  <div class="j-msg j-msg-jarvis">
+    <span class="j-mark j-avatar" aria-hidden="true">J</span>
+    <div class="j-msg-body">
+      <div class="j-prose"><%- r.answerHtml %></div>
+      <time class="j-msg-time"><%= clockTime(r.answerAt) %></time>
+    </div>
+  </div>
+  <% } %>
+  <% if (r.turn) { %>
+  <div class="j-turn" data-status="<%= r.turn.status %>">
+    <span class="j-mark j-avatar" aria-hidden="true">J</span>
+    <div class="j-turn-body">
+      <div class="j-turn-line">
+        <span class="j-pill <%= pills[r.turn.status] %>"><span class="j-pill-dot"></span><%= labels[r.turn.status] %></span>
+        <% if (r.cancellable) { %>
+        <button type="button" class="j-chip" hx-post="/web/turns/<%= encodeURIComponent(r.turnId) %>/cancel" hx-vals="<%= JSON.stringify({ thread_id: thread.id }) %>" hx-target="#log" hx-swap="outerHTML">Cancel</button>
+        <% } %>
+        <% if (r.resettable) { %>
+        <button type="button" class="j-chip" hx-post="/web/threads/<%= encodeURIComponent(thread.id) %>/reset-session" hx-target="#log" hx-swap="outerHTML">Reset session</button>
+        <% } %>
+      </div>
+      <% if (r.turn.status === 'failed' && r.turn.error) { %><p class="j-turn-error"><%= r.turn.error %></p><% } %>
+    </div>
+  </div>
+  <% } %>
+<% }) %>
+</div>

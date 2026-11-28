@@ -8,7 +8,17 @@ import type { WebThread } from "./daemonClient";
 import { DaemonError } from "./errors";
 import { rankPalette, type PaletteAction } from "./palette.logic";
 import type { ReadDb } from "./readDb";
-import { createThread, listThreads, updateThread, webReadDb } from "./routes";
+import { clockTime, logRows } from "./logView";
+import {
+  cancelTurn,
+  createThread,
+  listThreads,
+  resetSession,
+  submitTurn,
+  threadLog,
+  updateThread,
+  webReadDb,
+} from "./routes";
 
 /** Legacy pages, kept at their URLs and reached from "More" and the palette. */
 export const LEGACY_PAGES: readonly PaletteAction[] = [
@@ -78,11 +88,19 @@ function sidebarLocals(db: ReadDb, archived: boolean, active: string) {
   return { threads, archived, active, shortTime, now: Date.now() };
 }
 
-function renderError(res: Response, err: unknown): void {
+function logLocals(db: ReadDb, threadId: string) {
+  const thread = db.getThread(threadId);
+  return { thread, rows: logRows(threadLog(db, threadId, {})), clockTime };
+}
+
+/**
+ * Errors land in the toast (or the composer) so a failed refetch never
+ * replaces its container. X-Jarvis-Error carries the code for web.js (D12).
+ */
+function renderError(res: Response, err: unknown, target = "#j-toast"): void {
   const e = err instanceof DaemonError ? err : new DaemonError("internal");
   if (!(err instanceof DaemonError)) console.error("[web] fragment failed:", err);
-  // Errors land in the toast so a failed refetch never replaces its container.
-  res.status(e.status).set({ "HX-Retarget": "#j-toast", "HX-Reswap": "innerHTML" });
+  res.status(e.status).set({ "HX-Retarget": target, "HX-Reswap": "innerHTML", "X-Jarvis-Error": e.code });
   res.render("web/error", { message: humanError(e) });
 }
 
@@ -109,6 +127,7 @@ export function createFragmentRoutes(opts: FragmentRoutesOptions = {}): Router {
     const pane = query(req, "pane") === "approvals" ? "approvals" : requested ? "chat" : "threads";
     res.render("web/app", {
       ...sidebarLocals(db(), false, thread?.id ?? ""),
+      ...(thread ? logLocals(db(), thread.id) : { rows: [], clockTime }),
       thread,
       missing: Boolean(requested && !thread),
       pane,
@@ -137,6 +156,31 @@ export function createFragmentRoutes(opts: FragmentRoutesOptions = {}): Router {
     pinned: formBool(req.body?.pinned),
     archived: formBool(req.body?.archived),
   })));
+
+  router.get("/web/threads/:id/log", handle((req, res) => {
+    res.render("web/log", logLocals(db(), String(req.params.id)));
+  }));
+
+  router.post("/web/threads/:id/turns", async (req, res) => {
+    const threadId = String(req.params.id);
+    try {
+      await submitTurn(threadId, req.body);
+    } catch (err) {
+      renderError(res, err, "#composer-error");
+      return;
+    }
+    handle((_req, r) => r.render("web/log", logLocals(db(), threadId)))(req, res);
+  });
+
+  router.post("/web/turns/:id/cancel", handle(async (req, res) => {
+    await cancelTurn(String(req.params.id));
+    res.render("web/log", logLocals(db(), String(req.body?.thread_id ?? "")));
+  }));
+
+  router.post("/web/threads/:id/reset-session", handle(async (req, res) => {
+    const { thread } = await resetSession(String(req.params.id));
+    res.render("web/log", logLocals(db(), thread.id));
+  }));
 
   router.get("/web/palette", handle((req, res) => {
     const threads = db().listThreads(false).map((t: WebThread) => ({ id: t.id, title: t.title, updatedAt: t.updated_at }));
