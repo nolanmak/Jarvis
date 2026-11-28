@@ -1938,7 +1938,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             loop_authored,
             mergeable,
             // Ratebudget: an unchanged not-green PR is not re-read.
-            checks_green: gh_budget::sweep_checks(pr, gh_budget::ci_fingerprint(row),
+            checks_green: gh_budget::sweep_checks(&repository, pr, gh_budget::ci_fingerprint(row),
                 gh_budget::below_floor(gh_budget::remaining(repo_root).await, gh_budget::floor()),
                 || checks_green(repo_root, pr)).await,
             review_approved: approval.reviewed,

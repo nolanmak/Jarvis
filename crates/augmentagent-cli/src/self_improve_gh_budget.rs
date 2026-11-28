@@ -216,7 +216,12 @@ where
 const VERDICT_TTL: Duration = Duration::from_secs(15 * 60);
 const LOW_BUDGET_VERDICT_TTL: Duration = Duration::from_secs(60 * 60);
 
-static SWEEP_VERDICTS: Mutex<Option<HashMap<u64, (String, Instant)>>> = Mutex::new(None);
+/// A reused verdict is keyed by the GitHub identity it was read from, as the
+/// repository name is: one `gh` endpoint, one repository, one PR. A PR number
+/// alone is not an identity — the sweep examines adopted PRs in repositories
+/// other than the checkout's, and PR numbers repeat across them.
+type VerdictKey = (String, String, u64);
+static SWEEP_VERDICTS: Mutex<Option<HashMap<VerdictKey, (String, Instant)>>> = Mutex::new(None);
 
 /// The CI-relevant state of a PR row from the shared inventory: head, base
 /// and every check's status and conclusion. `None` when any is missing, in
@@ -236,17 +241,18 @@ pub(super) fn ci_fingerprint(row: &serde_json::Value) -> Option<String> {
 /// verdict stands without a read. Only `Some(false)` is ever kept: a green
 /// verdict is always read fresh (and re-read before merge), and an unknown
 /// or deferred read (`None`, e.g. a spent quota) is never recorded as a fact.
-pub(super) async fn sweep_checks<F, Fut>(pr: u64, fingerprint: Option<String>, low: bool, read: F) -> Option<bool>
+pub(super) async fn sweep_checks<F, Fut>(repository: &str, pr: u64, fingerprint: Option<String>, low: bool, read: F) -> Option<bool>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<bool>>,
 {
+    let key: VerdictKey = (gh_bin(), repository.to_owned(), pr);
     let ttl = if low { LOW_BUDGET_VERDICT_TTL } else { VERDICT_TTL };
     if let Some(fingerprint) = &fingerprint {
         let verdicts = SWEEP_VERDICTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((seen, at)) = verdicts.as_ref().and_then(|v| v.get(&pr)) {
+        if let Some((seen, at)) = verdicts.as_ref().and_then(|v| v.get(&key)) {
             if seen == fingerprint && at.elapsed() < ttl {
-                info!(pr, "merge sweep: CI unchanged since a not-green read; skipping hosted CI read");
+                info!(pr, repository, "merge sweep: CI unchanged since a not-green read; skipping hosted CI read");
                 return Some(false);
             }
         }
@@ -257,9 +263,9 @@ where
     match (verdict, fingerprint) {
         (Some(false), Some(fingerprint)) => {
             if verdicts.len() >= 1_024 { verdicts.clear(); }
-            verdicts.insert(pr, (fingerprint, Instant::now()));
+            verdicts.insert(key, (fingerprint, Instant::now()));
         }
-        _ => { verdicts.remove(&pr); }
+        _ => { verdicts.remove(&key); }
     }
     verdict
 }
@@ -312,6 +318,8 @@ mod tests {
         assert!(!below_floor(None, 1_500), "an unreadable budget never stops polling");
     }
 
+    const REPO: &str = "owner/repo";
+
     fn row(head: &str, check: &str) -> serde_json::Value {
         serde_json::json!({"headRefOid": head, "baseRefOid": "b".repeat(40),
             "statusCheckRollup": [{"name": "rust", "status": check, "conclusion": null}]})
@@ -347,26 +355,46 @@ mod tests {
         let reads = AtomicUsize::new(0);
         let read = |verdict: Option<bool>| { let reads = &reads; move || async move { reads.fetch_add(1, Ordering::SeqCst); verdict } };
         let pending = ci_fingerprint(&row(&"a".repeat(40), "IN_PROGRESS"));
-        assert_eq!(sweep_checks(990_001, pending.clone(), false, read(Some(false))).await, Some(false));
-        assert_eq!(sweep_checks(990_001, pending.clone(), false, read(Some(true))).await, Some(false), "cache hit");
+        assert_eq!(sweep_checks(REPO, 990_001, pending.clone(), false, read(Some(false))).await, Some(false));
+        assert_eq!(sweep_checks(REPO, 990_001, pending.clone(), false, read(Some(true))).await, Some(false), "cache hit");
         assert_eq!(reads.load(Ordering::SeqCst), 1, "an unchanged pending PR costs no hosted read");
         // Any change in checks or head forces a fresh read.
         let done = ci_fingerprint(&row(&"a".repeat(40), "COMPLETED"));
-        assert_eq!(sweep_checks(990_001, done.clone(), false, read(Some(true))).await, Some(true));
+        assert_eq!(sweep_checks(REPO, 990_001, done.clone(), false, read(Some(true))).await, Some(true));
         assert_eq!(reads.load(Ordering::SeqCst), 2);
         // Green is never reused.
-        assert_eq!(sweep_checks(990_001, done.clone(), false, read(Some(true))).await, Some(true));
+        assert_eq!(sweep_checks(REPO, 990_001, done.clone(), false, read(Some(true))).await, Some(true));
         assert_eq!(reads.load(Ordering::SeqCst), 3, "a green verdict is always read fresh");
         // A deferred (rate-limited) read is never recorded as a fact.
         let other = ci_fingerprint(&row(&"c".repeat(40), "IN_PROGRESS"));
-        assert_eq!(sweep_checks(990_002, other.clone(), false, read(None)).await, None);
-        assert_eq!(sweep_checks(990_002, other.clone(), false, read(None)).await, None);
+        assert_eq!(sweep_checks(REPO, 990_002, other.clone(), false, read(None)).await, None);
+        assert_eq!(sweep_checks(REPO, 990_002, other.clone(), false, read(None)).await, None);
         assert_eq!(reads.load(Ordering::SeqCst), 5, "unknown is re-read, not cached as red");
         // Without a fingerprint nothing is reused.
-        sweep_checks(990_003, None, false, read(Some(false))).await;
-        sweep_checks(990_003, None, false, read(Some(false))).await;
+        sweep_checks(REPO, 990_003, None, false, read(Some(false))).await;
+        sweep_checks(REPO, 990_003, None, false, read(Some(false))).await;
         assert_eq!(reads.load(Ordering::SeqCst), 7);
         assert_eq!(ci_fingerprint(&serde_json::json!({"headRefOid": "a"})), None);
+    }
+
+    /// A reused verdict is a fact about one pull request, and a PR number is
+    /// only a pull request within one repository. Keyed by the number alone,
+    /// the not-green verdict of one repository's PR answered for another
+    /// repository's PR of the same number: the sweep skipped the hosted read
+    /// that would have found it green, and held a mergeable PR for the TTL.
+    #[tokio::test]
+    async fn a_not_green_verdict_never_answers_for_another_repository() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = AtomicUsize::new(0);
+        let read = |verdict: Option<bool>| { let reads = &reads; move || async move { reads.fetch_add(1, Ordering::SeqCst); verdict } };
+        let pending = ci_fingerprint(&row(&"d".repeat(40), "IN_PROGRESS"));
+        assert_eq!(sweep_checks("owner/alpha", 991_001, pending.clone(), false, read(Some(false))).await, Some(false));
+        assert_eq!(sweep_checks("owner/beta", 991_001, pending.clone(), false, read(Some(true))).await, Some(true),
+            "another repository's PR of the same number is its own read");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(sweep_checks("owner/alpha", 991_001, pending.clone(), false, read(Some(true))).await, Some(false),
+            "and the verdict it does hold still stands");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
