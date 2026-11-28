@@ -853,6 +853,23 @@ This is different from the wiki's own Meeting log, which records gcal
 attendance and RSVP only and is structurally stripped of event content. These
 files are the content.
 
+**Phone calls are here too.** Recorded iPhone calls land in the same folder as
+`meetings/YYYY-MM-DD-call-with-<name>-<id8>.md`, with `tags: [phone-call]`,
+the other party under `attendees:` and their number in `call_remote_handle:`.
+Turns read `[HH:MM:SS] Me: …` / `[HH:MM:SS] <name>: …`, so "Me" is the user.
+
+**Reviewing a period** ("review my meetings last week", "what did I commit to
+in calls this month"): filenames start with the date, so `Glob` the range
+(`meetings/2026-11-1[6-9]-*.md`, `meetings/2026-11-2[0-2]-*.md`). A week can
+be well over 100k tokens of transcript, so don't read it all at once:
+
+1. Read each meeting's `*.summary.md` sidecar when there is one; otherwise the
+   frontmatter and the summary at the top of the `.md` (above `## Transcript`).
+2. Open the full transcript only for the meetings, or the parts of a meeting,
+   the question needs. Use `Grep` with `-n` and read the lines around a hit
+   rather than the whole file.
+3. Answer per meeting, with date and title, and cite `fotw:<id>` for each.
+
 The clone is read-only, and the scope guard enforces exactly that: `Read`,
 `Grep` and `Glob` are allowed under the transcript directory, while `Write`
 and `Edit` stay wiki-only. Never write there: FlyOnTheWall owns that repo and

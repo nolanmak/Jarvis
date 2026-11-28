@@ -176,6 +176,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(value["Label"], "org.augmentagent.apple-notes-sync")
         self.assertTrue(value["StandardOutPath"].endswith("apple-notes-sync.log"))
 
+    def test_calls_job_gets_its_own_label_script_and_log(self):
+        args = ["--out", "/private/transcripts", "--summarize", "--commit"]
+        value = schedule.make_plist(args, 5, self.root, job="calls")
+        self.assertEqual(value["Label"], "org.augmentagent.apple-call-recordings")
+        self.assertTrue(value["ProgramArguments"][1].endswith("calls.py"))
+        self.assertEqual(value["ProgramArguments"][2:], args)
+        self.assertTrue(value["StandardOutPath"].endswith("apple-call-recordings.log"))
+        self.assertIn(str(self.root / ".local/bin"), value["EnvironmentVariables"]["PATH"].split(":"))
+
+    def test_install_pins_absolute_paths_for_the_calls_job(self):
+        out = self.root / "transcripts"
+        with patch.object(schedule.sys, "platform", "darwin"), \
+             patch.object(schedule.sys, "argv", ["schedule.py", "--job", "calls", "--", "--out", str(out), "--commit"]), \
+             patch.object(schedule.Path, "home", return_value=self.root), \
+             patch.object(schedule.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            schedule.main()
+        plist = self.root / "Library/LaunchAgents/org.augmentagent.apple-call-recordings.plist"
+        argv = plistlib.loads(plist.read_bytes())["ProgramArguments"][2:]
+        self.assertEqual(argv[0], "--commit")
+        self.assertEqual(argv[argv.index("--out") + 1], str(out.resolve()))
+        self.assertIn("--db", argv)
+        self.assertIn("--state", argv)
+        self.assertFalse((self.root / f"Library/LaunchAgents/{schedule.LABEL}.plist").exists())
+
+    def test_pinned_paths_are_stripped_by_position(self):
+        argv = ["--out", "relative/dir", "--commit", "--db=~/x.sqlite", "--state", "s.json"]
+        self.assertEqual(schedule.strip_options(argv, ["--out", "--db", "--state"]), ["--commit"])
+
     def test_uninstall_only_removes_own_schedule(self):
         plist = self.root / f"Library/LaunchAgents/{schedule.LABEL}.plist"
         plist.parent.mkdir(parents=True)
