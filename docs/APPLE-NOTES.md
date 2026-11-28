@@ -140,6 +140,54 @@ tail -n 30 "$HOME/Library/Logs/augmentagent/apple-notes-sync.log"
 Uninstall with `python3 scripts/apple-notes/schedule.py --uninstall`; the
 exported notes are retained.
 
+## Call recordings (iPhone)
+
+iOS 18.1+ records a phone call when you tap the record button on the call
+screen. Every party hears a "this call is being recorded" notice. Notes saves
+the recording in a **Call Recordings** folder. The transcript is stored in the
+recording attachment's `ZMERGEABLEDATA1`, not in the note body, so the notes
+export above only shows it as an `[attachment: audio/mp4 …]` line.
+`calls.py` decodes that transcript. See the docstring of
+`scripts/apple-notes/call_recordings.py` for the layout. It writes each call
+in FlyOnTheWall's meeting format, so the agent's existing transcript channel
+ingests it like a recorded meeting:
+
+```sh
+git clone https://github.com/<you>/<transcripts-repo>.git ~/Transcripts   # the FlyOnTheWall repo
+python3 scripts/apple-notes/calls.py --out ~/Transcripts --summarize --settle-minutes 0   # look first
+python3 scripts/apple-notes/schedule.py --job calls -- --out ~/Transcripts --summarize --commit
+```
+
+- Each call becomes `meetings/YYYY-MM-DD-call-with-<name>-<id8>.md` with
+  `id: "call-<recording uuid>"`, `tags: [phone-call]`, `disclosed: true`, the
+  other party as the single attendee, and their number in `call_remote_handle`.
+  The transcript lists speaker turns as `[HH:MM:SS] Me: …` /
+  `[HH:MM:SS] <name>: …`. The name comes from the recording title iOS writes
+  ("Call with <contact>").
+- Summary: Apple's own summary when Apple Intelligence wrote one. Otherwise,
+  with `--summarize`, `claude -p` (default `--model sonnet`) writes a summary
+  and action items from the transcript. Without either, the file has no
+  summary and the wiki gets only the title and date, but the transcript can
+  still be read.
+- A call is exported once its note has been unchanged for `--settle-minutes`
+  (default 5). The phone delivers the transcript in pieces, and the agent
+  ingests each meeting id once. A failing summarizer defers the call to the
+  next run, and after 3 failures the call is exported without a summary.
+- Transcripts and summaries go through the same secret scrubber as notes.
+  Locked notes, Recently Deleted, and ordinary voice memos (no call handle)
+  are skipped.
+- `--commit` adds and commits only the files this run wrote. It pulls with a
+  merge, never a rebase, before pushing. FlyOnTheWall writes its own files in
+  the same repository through the GitHub API, and this exporter never edits
+  them. State (what was exported, content hashes) lives in
+  `~/.local/share/augmentagent/apple-call-recordings.json`, outside the repo.
+- Log: `~/Library/Logs/augmentagent/apple-call-recordings.log`. Uninstall
+  with `schedule.py --job calls --uninstall`.
+
+On the agent host nothing new is needed: `augmentagent transcripts sync` (the
+10-minute systemd timer) pulls the repo and ingests the call. The ask path
+reads the full transcript under `AUGMENTAGENT_TRANSCRIPTS_DIR`.
+
 ## Connect the agent
 
 Set in the agent's `.env`:
