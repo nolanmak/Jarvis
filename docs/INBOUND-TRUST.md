@@ -1,7 +1,7 @@
 # Inbound trust: keeping spam, scams and injected instructions away from agents that act
 
-Status: draft spec v2, 2026-11-27 (v1 audited: fresh-eyes pass + 44-seam
-check). Owner: Nolan. Scope: iMessage (incl. SMS/RCS rows in the same
+Status: draft spec v2.1, 2026-11-27 (v1 audited: fresh-eyes pass + 44-seam
+check; OT-1 and OT-2 answered by the owner). Owner: Nolan. Scope: iMessage (incl. SMS/RCS rows in the same
 archive) and Gmail inbound content. Other platforms: see N3.
 
 ## 1. Problem
@@ -264,9 +264,14 @@ Success is measured by the per-stage tests in §8.
   keep them with a link check.**
   - Scheduled-loop presets: remove every send/DM/comment/post/compose and
     calendar invite tool (Glossary list), and remove wiki Write/Edit. Loops
-    may create approval cards and drafts. WebFetch stays only if OT-1 says
-    so. Enforced in the preset (structural); stage-5 test asserts the tools
-    are absent.
+    may create approval cards and drafts. Enforced in the preset
+    (structural); stage-5 test asserts the tools are absent.
+  - Loops keep WebFetch and WebSearch (OT-1, resolved 2026-11-27: research
+    loops must open links). A PreToolUse hook installed in the reasoner's
+    `settings_json` for every acting preset denies a WebFetch whose URL host
+    appears in `link_provenance` for the session at rank below `known`
+    (D12). The hook runs outside the model and reads the table, so it is
+    structural for hosts Jarvis has seen; see R7 for the rest.
   - Owner chat keeps its tools. Send commands refuse a body containing a
     URL whose provenance (D12) is below `known` in the current session,
     and wiki Write/Edit is refused for content citing such a URL.
@@ -327,6 +332,11 @@ Success is measured by the per-stage tests in §8.
 - R4. Owner chat sends without a card; the owner's presence is the approval.
   Bounded by D12's link refusal.
 - R5. tabagent page content is ungated (N6).
+- R7. Exfiltration by WebFetch to a host the model rebuilt from text the
+  gate did not record as a URL (e.g. "evil dot example" spelled out). The
+  D10 hook only knows hosts recorded in `link_provenance`. Bounded by
+  defanging and by loops having no send tools. Ends when OT-4 lands or
+  loops that read messages lose WebFetch.
 - R6. `owner_replied` can be earned by replying "STOP" (Appendix A excludes
   one-word and opt-out replies; other short replies still count).
 
@@ -334,8 +344,8 @@ Success is measured by the per-stage tests in §8.
 
 | Id | Question | Blocks | Owner / trigger | Load-bearing |
 |---|---|---|---|---|
-| OT-1 | Do scheduled loops keep WebFetch/WebSearch? (Sends and wiki write are removed per D10 regardless.) | D10, stage 5 | Nolan, before stage 5 | yes |
-| OT-2 | Gmail `CATEGORY_UPDATES` / `CATEGORY_FORUMS`: default `bulk` (receipts, shipping, groups get no drafts). Override per sender via D15. Confirm default. | D3, stage 2 | Nolan, before stage 2; default applies if unanswered | yes |
+| OT-1 | ~~Do scheduled loops keep WebFetch/WebSearch?~~ **Resolved 2026-11-27:** keep both, with the D10 provenance hook (R7). | — | — | — |
+| OT-2 | ~~Updates/Forums default?~~ **Resolved 2026-11-27:** `bulk` by default; promote senders with `trust release`. | — | — | — |
 | OT-3 | Scrub existing wiki pages written from now-low-trust messages? | R3 | after stage 4 | no |
 | OT-4 | Per-message content scan (credential asks, injection phrasing) for `trusted`/`known`/`bulk` | R1, R2 | after 30 days of D15 data | no |
 | OT-5 | Make raw message-text types private outside `trust` so the compiler enforces D7 | D7 backstop strength | after stage 4 | no |
@@ -359,8 +369,12 @@ Success is measured by the per-stage tests in §8.
    D13; D14. Exit: per path, a `scam` fixture never appears in the captured
    prompt and is marked processed; an `unknown` fixture appears defanged.
 5. **Agents.** D9 (incl. CLI reads under `AUGMENTAGENT_AGENT_SESSION`),
-   D10 per OT-1, D11, D12 send refusal. Exit: loop preset lacks send and
-   wiki tools; owner-chat send with a below-known URL is refused; autonomy
+   D10 (incl. the WebFetch provenance hook), D11, D12 send refusal. First
+   verify the reasoner's `settings_json` can install a PreToolUse hook for
+   the Claude CLI and the Codex fallback (if Codex cannot, loops on Codex
+   lose WebFetch). Exit: loop preset lacks send and wiki tools; a loop
+   WebFetch to a host from a below-known message is denied and one to an
+   unrelated host succeeds; owner-chat send with a below-known URL is refused; autonomy
    draft with such a URL becomes a card; calendar `send_details` still
    auto-sends.
 6. **Owner surface.** D15. Exit: CLI tests; release/revoke logged and
