@@ -17,3 +17,7 @@ see [the publication checklist](docs/PUBLISH.md) before promoting the repository
 ## Optional OmniRoute service
 
 The explicit gateway installer downloads the pinned [OmniRoute npm package](https://www.npmjs.com/package/omniroute), licensed under [MIT](https://github.com/diegosouzapw/OmniRoute/blob/v3.8.52/LICENSE). The version and sha512 integrity are in `scripts/omniroute.pin`. Its dependencies retain their respective licenses in the installed runtime; no gateway runtime is vendored into this repository.
+
+## Vendored htmx
+
+`public/vendor/` contains unmodified copies of [htmx](https://www.npmjs.com/package/htmx.org) and its [SSE extension](https://www.npmjs.com/package/htmx-ext-sse), both licensed under the BSD Zero Clause License. Versions and SRI hashes are in `public/vendor/VERSIONS.md`.

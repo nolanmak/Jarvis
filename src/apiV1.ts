@@ -200,8 +200,14 @@ v1.get("/actions/:id", (req, res) => {
   res.json(action);
 });
 
-// POST /api/v1/actions/:id — mutate status (approve/skip/etc) from a remote
+// POST /api/v1/actions/:id — field edits on a pending action from a remote
 // surface. Publishes a cross-surface event (#47).
+//
+// #2707 (spec D5): the only accepted target status is "pending". Approving or
+// skipping here used to flip the row by SQL without running the action, so it
+// recorded outcomes that never happened. Real decisions go through the
+// approval handler (Discord / the web rail); anything else gets 409
+// use_real_approval.
 //
 // #36: also accepts `recipientEmail` so the dashboard / PWA / Discord webhook
 // can swap the "To:" address before approval. Validated against a minimal
@@ -215,6 +221,10 @@ v1.post("/actions/:id", (req, res) => {
   const { status, draftBody, errorMessage, recipientEmail, source } = req.body || {};
   if (!status) {
     res.status(400).json({ error: "body.status is required" });
+    return;
+  }
+  if (status !== "pending") {
+    res.status(409).json({ error: "use_real_approval" });
     return;
   }
   if (recipientEmail !== undefined && !isPlausibleEmail(recipientEmail)) {
@@ -234,10 +244,10 @@ v1.post("/actions/:id", (req, res) => {
   // route must not silently disarm it.
   let resolved: boolean;
   try {
-    resolved = resolveActionIfPending(req.params.id, status as ActionStatus, {
-    draftBody,
-    errorMessage,
-    recipientEmail,
+    resolved = resolveActionIfPending(req.params.id, "pending", {
+      draftBody,
+      errorMessage,
+      recipientEmail,
     });
   } catch (error) {
     if (!(error instanceof OwnerDecisionConflict)) throw error;
@@ -251,7 +261,7 @@ v1.post("/actions/:id", (req, res) => {
     });
     return;
   }
-  publishStatusChange(req.params.id, status, source || "api_v1");
+  publishStatusChange(req.params.id, "pending", source || "api_v1");
   res.json(getActionById(req.params.id));
 });
 
@@ -314,6 +324,10 @@ apiV1Router.use("/api/v1", v1);
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "";
 
 const pwa = Router();
+
+// #2706: the queue page and push endpoints need the same auth as the rest of
+// the dashboard. Path-scoped so routes after this router are unaffected.
+pwa.use(["/queue", "/api/push"], requireAuth);
 
 // Installable PWA queue view. Deep-linkable via ?action=<id> (the service
 // worker focuses here on notification click).

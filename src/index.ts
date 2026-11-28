@@ -23,6 +23,7 @@ import {
   hostOriginGuard,
   contentSecurityPolicy,
   loginPageHandler,
+  assertAccessConfig,
   loginSubmitHandler,
 } from "./security";
 import type { Email } from "./types";
@@ -115,6 +116,8 @@ function startDashboard(): void {
 
   // Ensure auth is initialized (generates+persists+logs a key on first run).
   resolveApiKey();
+  // #2708: refuse to start on partial AUGMENTAGENT_CF_ACCESS_* config.
+  assertAccessConfig();
 
   // #297: DNS-rebinding (Host allow-list) + CSRF (Origin/Referer) guard, plus
   // strict CSP/security headers, applied to EVERY route before any handler —
