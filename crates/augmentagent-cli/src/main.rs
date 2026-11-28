@@ -739,7 +739,9 @@ enum Cmd {
     /// Rotate and compress the state dir's logs and append-only sinks
     /// (#1413): anything at `AUGMENTAGENT_LOG_ROTATE_MB` (default 50) or
     /// not rotated since last month. Rotated files are kept for
-    /// `AUGMENTAGENT_LOG_KEEP_MONTHS` (default 3).
+    /// `AUGMENTAGENT_LOG_KEEP_MONTHS` (default 3). The same pass covers the
+    /// scheduled-sync job logs (#1431) at `AUGMENTAGENT_SYNC_LOG_ROTATE_MB`
+    /// (default 10), keeping `AUGMENTAGENT_SYNC_LOG_KEEP` archives (default 5).
     LogRotate {
         /// Report what would happen; change nothing.
         #[arg(long, default_value_t = false)]
@@ -3228,6 +3230,12 @@ async fn main() -> Result<()> {
     }
     if let Cmd::ComputeTool = cli.cmd { return compute_tool::serve(); }
     let _ = dotenvy::dotenv();
+    // #2422 — the iMessage poll loop resolves DM senders through the wiki
+    // identity index. Export `--wiki-dir` here, before anything spawns,
+    // instead of threading it through every poll signature.
+    if let Some(dir) = &cli.wiki_dir {
+        std::env::set_var(augmentagent_channel_imessage::WIKI_DIR_ENV, dir);
+    }
     // Send tracing to stderr so JSON-mode subcommands (consumed by the
     // dashboard via shell-out) don't get their stdout polluted with log
     // lines. Production systemd captures both streams to log files; in dev

@@ -589,6 +589,71 @@ pub fn interrupted_error(provider: &str, signal: i32) -> anyhow::Error {
     anyhow::Error::new(ReasonerError::Interrupted { provider: provider.to_string(), signal })
 }
 
+/// #1788 — how long a failing call waits for the status that names a host
+/// stop. The supervisor that owns the CLI's descriptors outlives the CLI it
+/// reaps by a moment, and a turn that is already failing can afford that
+/// moment; a stop landing later than this is our own cleanup's by then.
+const HOST_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// #1788 — the host stop in a status our own cleanup reaped. Cleanup stops
+/// the group itself — a SIGTERM to the supervisor, escalated to SIGKILL if it
+/// does not acknowledge — so afterwards only a signal we never send still
+/// names a host stop: the supervisor forwards the CLI's own death as its
+/// `128 + n` exit code (#1779) while reporting our stop as `128 + SIGTERM`.
+fn stopped_through_cleanup(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    // The supervisor dying of SIGTERM or SIGKILL is read as our own, because
+    // cleanup escalates its SIGTERM to a SIGKILL of the supervisor itself
+    // when the receipt does not land in time. A host stop of the whole group
+    // reaches us the same way, so those two are indistinguishable here;
+    // attributing the ambiguous status to the stop we know we just sent keeps
+    // cleanup from reporting itself as a host stop. Cleanup sends nothing
+    // else, so a supervisor that died of another host stop still names it.
+    if matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)) {
+        return None;
+    }
+    interrupted_by_signal(status).filter(|signal| *signal != libc::SIGTERM)
+}
+
+/// #1788 — a host stop breaks the CLI's pipes, so the first thing to fail can
+/// be our own prompt write or a stdout read, long before any exit status is
+/// read. The broken pipe has already ended the call: wait for the status that
+/// names the stop before reporting a provider outage for a stopped host. The
+/// turn is lost either way, so a CLI still running is stopped here and the
+/// status cleanup reaps is read too — a host stop that raced our own.
+/// Any other pipe failure keeps the IO error it had.
+async fn pipe_io_failure(
+    provider: &str,
+    child: &mut tokio::process::Child,
+    group: crate::process_tree::ProcessGroup,
+    error: std::io::Error,
+) -> anyhow::Error {
+    let waited = tokio::time::timeout(HOST_STOP_WAIT, child.wait()).await.ok().and_then(Result::ok);
+    let stopped = match waited.as_ref() {
+        // Already reaped: this status is the whole story. A reaped status is
+        // cached, so stopping the group and waiting again cannot name a
+        // different stop than the one that is already in hand.
+        Some(status) => interrupted_by_signal(status),
+        // Still running past the wait, so no status names anything yet.
+        None => {
+            drop(group);
+            tokio::time::timeout(HOST_STOP_WAIT, child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .as_ref()
+                .and_then(stopped_through_cleanup)
+        }
+    };
+    match stopped {
+        Some(signal) => {
+            warn!("{provider} stopped by signal {signal}");
+            interrupted_error(provider, signal)
+        }
+        None => anyhow::Error::new(error),
+    }
+}
+
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
 /// classification (#656): a missing binary is `Local` (failing over from it
 /// is fine, latching is not); everything else — connection failures, non-zero
@@ -1041,7 +1106,15 @@ impl ClaudeCliReasoner {
             self.call_once(opts, user_message, capture, clean.clone()),
         )
         .await;
-        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+        // #1788 — a host stop takes the supervisor with the CLI (a deploy
+        // restart SIGKILLs the whole unit cgroup), so the cleanup receipt it
+        // would have published never lands. The signal already accounts for
+        // the missing receipt and stops the chain on its own, so keep it:
+        // reporting unverified cleanup instead hides the cause behind a
+        // reconciliation that cannot resolve anything.
+        let host_stopped = matches!(&outcome, Ok(Err(CallError::Other(error)))
+            if matches!(ReasonerError::find_in(error), Some(ReasonerError::Interrupted { .. })));
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) && !host_stopped {
             return Err(CallError::Other(
                 ReasonerError::CleanupUncertain {
                     provider: "claude".into(),
@@ -1492,8 +1565,16 @@ impl ClaudeCliReasoner {
         if let Some(mut stdin) = child.stdin.take() {
             // #1626 — from the first byte on, the CLI may have the turn.
             if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
-            stdin.write_all(user_message.as_bytes()).await?;
-            stdin.shutdown().await?;
+            let submitted = async {
+                stdin.write_all(user_message.as_bytes()).await?;
+                stdin.shutdown().await
+            }
+            .await;
+            if let Err(error) = submitted {
+                return Err(CallError::Other(
+                    pipe_io_failure("claude", &mut child, process_group, error).await,
+                ));
+            }
             if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
         }
 
@@ -1540,7 +1621,20 @@ impl ClaudeCliReasoner {
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            // #1788 — a host stop breaks the CLI's stdout mid line, so the
+            // read can fail before any exit status is waited for. The stop is
+            // what ended the call; only a stream that fails with the CLI
+            // still running is a stream fault.
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(CallError::Other(
+                        pipe_io_failure("claude", &mut child, process_group, error).await,
+                    ))
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -1578,8 +1672,18 @@ impl ClaudeCliReasoner {
                 // The supervisor owns detached descendants and publishes the
                 // same checked cleanup receipt used by watchdog/caller aborts.
                 // Do not turn a capacity refusal into another provider retry.
+                // #1788 — a host stop may have ended the CLI already, in
+                // which case the stop is what happened, not our refusal. The
+                // refused CLI is still stopped first, with no grace period to
+                // start another tool call in; the status that stop reaps is
+                // then read before the refusal is reported, since it still
+                // names a host stop our own SIGTERM cannot have caused.
                 drop(process_group);
-                let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
+                let reaped=tokio::time::timeout(HOST_STOP_WAIT,child.wait()).await.ok().and_then(Result::ok);
+                if let Some(signal) = reaped.as_ref().and_then(stopped_through_cleanup) {
+                    warn!("claude stopped by signal {signal}");
+                    return Err(CallError::Other(interrupted_error("claude", signal)));
+                }
                 pending_tool_uses.clear();
                 if let Some(logger)=&audit_logger {logger.drain_checked().await?;}
                 refused.fail("claude",audit_logger.as_ref())?;
@@ -1627,6 +1731,18 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        // #1788 — classify a host stop (deploy restart, OOM kill) from the
+        // status itself, before cleanup accounting or the audit drain can
+        // fail first and put their own error in its place: a call the host
+        // killed mid tool use fails both. Cleanup still happens — the
+        // supervisor reaps descendants as the group drops, and the unmatched
+        // intent tickets stay durable orphan evidence.
+        if let Some(signal) = interrupted_by_signal(&status) {
+            warn!("claude stopped by signal {signal}");
+            let _ = process_group.resource_outcome("claude", audit_logger.as_ref());
+            // #1774 — typed so the chain neither latches nor fails over.
+            return Err(CallError::Other(interrupted_error("claude", signal)));
+        }
         let resources = process_group.resource_outcome("claude", audit_logger.as_ref());
         drop(process_group);
         resources?;
@@ -1643,11 +1759,6 @@ impl ClaudeCliReasoner {
                 let _ = err.read_to_string(&mut stderr_buf).await;
             }
             warn!("claude exited {status:?}: {stderr_buf}");
-            // #1774 — a host kill (deploy restart) is not a provider
-            // failure: typed so the chain neither latches nor fails over.
-            if let Some(signal) = interrupted_by_signal(&status) {
-                return Err(CallError::Other(interrupted_error("claude", signal)));
-            }
             if is_cli_api_error(&final_text) {
                 // The request was refused, so the session itself is intact:
                 // release it rather than letting the dropped lease mark the
@@ -5928,6 +6039,232 @@ exit 1
         let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
         assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:#}");
+    }
+
+    /// #1788 — one host stop, asserted the way the fallback chain reads it:
+    /// typed, named, and never a provider failure worth latching.
+    fn assert_host_stop(err: &anyhow::Error) {
+        let typed = ReasonerError::find_in(err).expect("typed for the fallback chain");
+        assert!(
+            matches!(typed, ReasonerError::Interrupted { provider, signal: 9 } if provider == "claude"),
+            "{err:#}"
+        );
+        assert!(!typed.is_provider_side(), "a host stop never latches claude");
+    }
+
+    /// #1788 — the reported case verbatim: the CLI is SIGKILLed (a deploy
+    /// restart's cgroup kill, the OOM killer) and the call reaches the chain
+    /// as a host stop, not as a provider outage. #1779 already pinned the
+    /// classification for this stub; what is asserted here on top of it is
+    /// the half the title names — the stop must not latch claude.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_not_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-sigkilled", "cat >/dev/null\nkill -KILL $$\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_host_stop(&reasoner.call(&dummy_opts(), "x").await.unwrap_err());
+    }
+
+    /// #1788 — the deploy restart's cgroup kill takes the supervisor with the
+    /// CLI, so the cleanup receipt it would have published never lands. The
+    /// signal already accounts for the missing receipt and stops the chain by
+    /// itself: the call must reach the chain as the host stop it was, not as
+    /// unverified cleanup, which names a reconciliation nothing can perform.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_when_its_supervisor_dies_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-cgroup-killed", "cat >/dev/null\nkill -KILL $PPID\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_host_stop(&reasoner.call(&dummy_opts(), "x").await.unwrap_err());
+    }
+
+    /// #1788 — both halves of that rule on the unreceipted path. A host stop
+    /// the supervisor cannot trap keeps its own signal, and a supervisor that
+    /// died of anything else still reports unverified cleanup: only the stop
+    /// we can name accounts for the receipt that never arrived.
+    #[tokio::test]
+    async fn an_unreceipted_cleanup_keeps_a_host_stop_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = |name: &'static str, signal: &'static str| {
+            let bin = stub_cli(&dir, name, &format!("cat >/dev/null\nkill -{signal} $PPID\n"));
+            async move {
+                ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) }
+                    .call(&dummy_opts(), "x").await.unwrap_err()
+            }
+        };
+        let hungup = call("fake-claude-cgroup-hungup", "HUP").await;
+        assert!(
+            matches!(ReasonerError::find_in(&hungup), Some(ReasonerError::Interrupted { signal: 1, .. })),
+            "{hungup:#}"
+        );
+        // A crashed supervisor (SIGSEGV) is not a host stop, so nothing
+        // explains the missing receipt: the chain must still stop for
+        // reconciliation rather than blame a restart that never happened.
+        let crashed = call("fake-claude-supervisor-crashed", "SEGV").await;
+        assert!(
+            matches!(ReasonerError::find_in(&crashed), Some(ReasonerError::CleanupUncertain { .. })),
+            "{crashed:#}"
+        );
+    }
+
+    /// #1788 — cleanup stops the group itself, so afterwards only a signal we
+    /// never send still names a host stop: the supervisor forwards the CLI's
+    /// own SIGKILL as `128 + 9`, reports our SIGTERM as `128 + 15`, and dies
+    /// of the signal itself when our cleanup has to escalate.
+    #[tokio::test]
+    async fn only_a_signal_we_never_send_is_a_host_stop_after_cleanup() {
+        async fn status(script: &str) -> std::process::ExitStatus {
+            tokio::process::Command::new("bash").arg("-c").arg(script).status().await.unwrap()
+        }
+        assert_eq!(stopped_through_cleanup(&status("exit 137").await), Some(9));
+        assert_eq!(stopped_through_cleanup(&status("exit 143").await), None);
+        assert_eq!(stopped_through_cleanup(&status("kill -KILL $$").await), None);
+        assert_eq!(stopped_through_cleanup(&status("exit 1").await), None);
+        // Cleanup sends SIGTERM and escalates to SIGKILL; it never sends
+        // SIGHUP or SIGINT, so a supervisor that died of one names a host
+        // stop as surely as a forwarded `128 + n` exit code does.
+        assert_eq!(stopped_through_cleanup(&status("exit 129").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("exit 130").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -HUP $$").await), Some(1));
+        assert_eq!(stopped_through_cleanup(&status("kill -INT $$").await), Some(2));
+        assert_eq!(stopped_through_cleanup(&status("kill -SEGV $$").await), None);
+    }
+
+    /// #1788 — the CLI is SIGKILLed mid tool call, so its unmatched intent
+    /// ticket makes the post-exit audit drain fail too. The host stop is
+    /// what happened: observe it before the drain failure can take its
+    /// place and be classified as a provider outage.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_even_when_the_audit_drain_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let use_event = serde_json::json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","id":"killed-mid-call","name":"Bash","input":{"command":"true"}}]}});
+        let bin = stub_cli(&dir, "fake-claude-killed-mid-tool",
+            &format!("cat >/dev/null\nprintf '%s\\n' '{use_event}'\nkill -KILL $$\n"));
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = Arc::new(AuditLogger::protected(
+            dir.path().join("logs/audit.jsonl"),
+            dir.path().join("anchors/anchor.json"),
+            &[],
+        ).unwrap());
+        let mut opts = dummy_opts();
+        opts.audit_logger = Some(logger.clone());
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_host_stop(&reasoner.call(&opts, "x").await.unwrap_err());
+        assert!(logger.protected_health().is_err(), "the dropped intent ticket must stay evidence");
+    }
+
+    /// #1788 — the CLI is SIGKILLed before it reads the prompt, so the first
+    /// thing that fails is our own stdin write (EPIPE), not the wait. The
+    /// host stop still ended the call: it must not reach the chain as a bare
+    /// IO error, which classifies as a provider outage.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_when_the_prompt_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-killed-before-reading", "kill -KILL $$\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        // Larger than the pipe buffer, so the write cannot finish into a
+        // reader that died without ever reading.
+        let prompt = "x".repeat(512 * 1024);
+        assert_host_stop(&reasoner.call(&dummy_opts(), &prompt).await.unwrap_err());
+    }
+
+    /// #1788 — the stream read fails before any exit status is waited for.
+    /// The host stop still ended the call, whether it lands with the failed
+    /// read or only a while after it, so a bare IO error must not reach the
+    /// chain, where the classifier reads it as a provider outage.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_when_the_stream_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, script) in [
+            // Invalid UTF-8 fails the line reader where a truncated stream
+            // would merely end it.
+            ("fake-claude-killed-mid-line", "cat >/dev/null\nprintf '\\377\\n'\nkill -KILL $$\n"),
+            // The stop lands well after the read failed: the status naming it
+            // exists only once it is waited for.
+            ("fake-claude-killed-after-mid-line", "cat >/dev/null\nprintf '\\377\\n'\nsleep 0.7\nkill -KILL $$\n"),
+        ] {
+            let bin = stub_cli(&dir, name, script);
+            let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+            let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+            assert_host_stop(&err);
+        }
+    }
+
+    /// #1788 — the other half of the stream rule: a pipe failure the host did
+    /// not cause keeps the IO error it had. Classifying every stream fault as
+    /// a host stop would hide real provider trouble from the chain, which has
+    /// to keep treating a broken CLI as a provider outage.
+    #[tokio::test]
+    async fn a_stream_fault_without_a_host_stop_stays_a_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-bad-byte", "cat >/dev/null\nprintf '\\377\\n'\nexit 1\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(
+            matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+            "{err:#}"
+        );
+    }
+
+    /// #1788 — a readiness refusal and a host stop land together: the CLI is
+    /// SIGKILLed before it terminates the refused tool result, so the daemon
+    /// reads that line only once the supervisor has reaped the CLI and
+    /// reported its death. The stop is what ended the call — reporting the
+    /// refusal instead would blame our own capacity for a killed host, and
+    /// the refusal itself stays covered by
+    /// `protected_claude_yields_on_first_build_readiness_refusal_preserving_edits`.
+    #[tokio::test]
+    async fn a_sigkilled_claude_is_interrupted_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let use_event = serde_json::json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","id":"blocked-build","name":"mcp__jarvis__Bash","input":{"command":"cargo test"}}]}});
+        let result_event = serde_json::json!({"type":"user","message":{"content":[{
+            "type":"tool_result","tool_use_id":"blocked-build","is_error":true,
+            "content":"JARVIS_READINESS:build_scratch_space SYNTHETIC_DIAGNOSTIC"}]}});
+        let bin = stub_cli(&dir, "fake-claude-refused-then-killed",
+            &format!("cat >/dev/null\nprintf '%s\\n' '{use_event}'\nprintf '%s' '{result_event}'\nkill -KILL $$\n"));
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = Arc::new(AuditLogger::protected(
+            dir.path().join("logs/audit.jsonl"),
+            dir.path().join("anchors/anchor.json"),
+            &[],
+        ).unwrap());
+        let mut opts = dummy_opts();
+        opts.audit_logger = Some(logger);
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        assert_host_stop(&reasoner.call(&opts, "x").await.unwrap_err());
+    }
+
+    /// #1788 — the reported case through the chain the daemon actually calls:
+    /// a SIGKILLed CLI must neither latch claude (the cooldown file outlives
+    /// this daemon process) nor fail over into the dying unit.
+    #[tokio::test]
+    async fn a_sigkilled_claude_neither_latches_nor_fails_over() {
+        struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Reasoner for Counted {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("must not run inside a dying unit".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-sigkilled-chain", "cat >/dev/null\nkill -KILL $$\n");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let latch = crate::cooldown::CooldownLatch::at(dir.path().join("cooldowns.json"));
+        let chain = crate::fallback::FallbackReasoner::for_tests(
+            vec![
+                (crate::providers::ProviderKind::Claude,
+                    Arc::new(ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) }) as Arc<dyn Reasoner>),
+                (crate::providers::ProviderKind::Codex,
+                    Arc::new(Counted(calls.clone())) as Arc<dyn Reasoner>),
+            ],
+            latch.clone(),
+        );
+        assert_host_stop(&chain.call(&dummy_opts(), "triage this").await.unwrap_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "a host stop must not fail over");
+        assert!(latch.latched_until("claude").is_none(), "a host stop must not latch claude");
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the

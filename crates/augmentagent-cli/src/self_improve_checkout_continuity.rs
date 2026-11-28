@@ -1,9 +1,16 @@
 //! #2349 — scope-stage work whose recorded checkout path no longer exists
 //! re-establishes continuity from current main under the current identity.
 //! Nothing physical remains to preserve, and a scope step starts from the
-//! request rather than prior worktree bytes. Build/review-stage work, present
-//! but replaced checkouts and branches carrying unpublished commits keep the
-//! #2224 hold and the explicit owner recovery path.
+//! request rather than prior worktree bytes.
+//! #2612 — the same holds for planned-but-unbuilt work (`build /
+//! plan_registered`, no evidence): the plan lives in the workflow store and
+//! the build never produced output. Disk prune removes such checkouts as
+//! "clean merged" (their branch sits on an old main commit), which left 21
+//! planned rows held forever and, through the #2530 planned-unbuilt bound,
+//! stopped all new planning.
+//! Other build/review-stage work, present but replaced checkouts, attached
+//! PRs and branches carrying unpublished commits keep the #2224 hold and the
+//! explicit owner recovery path (`augmentagent autopr readopt`).
 use super::*;
 use crate::autoship_workflow::checkout_continuity::{reestablishable, EVENT};
 use crate::autoship_workflow::{Snapshot, WorkflowStore};
@@ -41,6 +48,11 @@ fn inspect(store: &WorkflowStore, state: &Path, id: &str, repository: &str) -> R
     let Some(lost) = checkout_identity::lost_recorded(state, id, &context.worktree, &snapshot.branch)? else {
         return Ok(None);
     };
+    // Same store-side refusals as the audited write: a row preparation would
+    // refuse is never selected, so it cannot cost a tick on every pick.
+    if store.checkout_continuity_refusal(&snapshot, chrono::Utc::now().timestamp_millis())?.is_some() {
+        return Ok(None);
+    }
     Ok(Some(Plan { snapshot, lost }))
 }
 
@@ -152,6 +164,7 @@ pub(super) async fn reestablish(state: &Path, root: &Path, worktree: &Path, id: 
         anyhow::ensure!(ok, "checkout branch could not move to current main");
     }
     checkout_identity::supersede_lost(&plan.lost, &archive)?;
-    info!(workflow = id, base = %base, "checkout continuity re-established for scope-stage work from current main");
+    info!(workflow = id, base = %base, stage = ?plan.snapshot.checkpoint.stage,
+        "checkout continuity re-established from current main; checkpoint and plan kept");
     Ok(())
 }

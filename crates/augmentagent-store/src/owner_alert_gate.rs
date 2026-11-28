@@ -75,6 +75,27 @@ pub fn selector_matches(selector: &str, sender: &str, person_slugs: &[String]) -
         selector.eq_ignore_ascii_case(sender)
     }
 }
+/// `true` when the owner's priority list selects a person the wiki identity
+/// index resolved, matched only through that person's slug and declared email
+/// identities — never through a bare handle, so an unresolved DM sender can
+/// never be elevated (#2422). Specificity, and a `routine` mute winning an
+/// equal-specificity tie, follow the email gate's ranking in `classify`.
+pub fn person_is_priority(priorities: &[(String, Urgency)], slug: &str, emails: &[String]) -> bool {
+    let slugs = [slug.to_string()];
+    let senders: Vec<String> = emails.iter().map(|e| bare_sender(e)).collect();
+    priorities
+        .iter()
+        .filter(|(s, _)| {
+            selector_matches(s, "", &slugs) || senders.iter().any(|e| selector_matches(s, e, &slugs))
+        })
+        .max_by_key(|(s, u)| {
+            let specificity =
+                if s.starts_with("domain:") { 1 } else if s.starts_with("person:") { 2 } else { 3 };
+            (specificity, u8::from(*u == Urgency::Routine))
+        })
+        .is_some_and(|(_, level)| *level != Urgency::Routine)
+}
+
 pub fn urgency(value: &str) -> Urgency {
     match value {
         "high" => Urgency::High,

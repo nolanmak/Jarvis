@@ -3,6 +3,8 @@
 Fixture chat.db is built in-memory with the subset of Apple's schema the
 sync reads, so tests run without Full Disk Access or real message data.
 """
+import contextlib
+import io
 import json
 import time
 import sqlite3
@@ -718,6 +720,65 @@ class TestDrainUploads(unittest.TestCase):
         still = drain_uploads(items, "b", lambda p, b, k: False,
                               exists=lambda p: True, workers=4)
         self.assertEqual([i["key"] for i in still], [f"k{i}" for i in range(6)])
+
+
+class TestCollapsedUploadFailures(unittest.TestCase):
+    """#1431 — a hot error loop (every attachment denied the same way, every
+    run) once wrote 426k identical lines into a 112 MB sync log. One line per
+    distinct cause, with a count; a second, different problem stays visible."""
+
+    def drain(self, items, uploader):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            drain_uploads(items, "b", uploader, exists=lambda p: True, workers=1)
+        return [line for line in stderr.getvalue().splitlines() if line]
+
+    def items(self, count):
+        return [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(count)]
+
+    def test_one_line_with_a_count_for_repeats_of_one_cause(self):
+        def boom(path, bucket, key):
+            raise OSError("Operation not permitted")
+
+        lines = self.drain(self.items(50), boom)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("50", lines[0])
+        self.assertIn("Operation not permitted", lines[0])
+        self.assertIn("k0", lines[0], "the first key is named so the cause can be traced")
+
+    def test_distinct_causes_each_get_their_own_line(self):
+        def boom(path, bucket, key):
+            raise OSError(f"cause-{key}")
+
+        lines = self.drain(self.items(50), boom)
+        self.assertEqual(len(lines), 50, lines)
+
+    def test_a_second_different_cause_is_not_hidden_by_the_majority(self):
+        def boom(path, bucket, key):
+            raise OSError("bucket is gone" if key == "k7" else "Operation not permitted")
+
+        lines = self.drain(self.items(50), boom)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(any("bucket is gone" in line for line in lines))
+
+    def test_a_run_without_failures_writes_nothing(self):
+        self.assertEqual(self.drain(self.items(50), lambda p, b, k: True), [])
+
+    def test_an_uploader_that_reports_its_own_cause_is_collapsed_too(self):
+        # The 426k-line spam came from the uploader's own non-zero-exit line,
+        # not from a raised exception: it reports through the drain instead.
+        def upload(path, bucket, key, report=None):
+            report("exit 1: no Full Disk Access")
+            return False
+
+        lines = self.drain(self.items(50), upload)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("50", lines[0])
+
+    def test_a_silent_false_result_is_requeued_without_a_line(self):
+        # No cause to report: the drain does not invent one.
+        self.assertEqual(self.drain(self.items(3), lambda p, b, k: False), [])
+
 
 class TestUploadableFilter(unittest.TestCase):
     """Link-preview payloads are metadata, not media worth storing."""
