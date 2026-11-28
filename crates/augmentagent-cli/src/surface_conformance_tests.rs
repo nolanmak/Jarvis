@@ -29,7 +29,7 @@ use std::sync::Mutex;
 
 /// Re-run `test` in a child with a private selection file and state dir.
 /// Returns the fixture root when already inside the child.
-fn isolated(test: &str, marker: &str) -> Option<PathBuf> {
+pub(crate) fn isolated(test: &str, marker: &str) -> Option<PathBuf> {
     if let Ok(root) = std::env::var(marker) {
         return Some(PathBuf::from(root));
     }
@@ -57,7 +57,7 @@ fn isolated(test: &str, marker: &str) -> Option<PathBuf> {
     None
 }
 
-fn querier(root: &Path, provider: &Arc<RecordingNativeProvider>) -> WikiQuerier {
+pub(crate) fn querier(root: &Path, provider: &Arc<RecordingNativeProvider>) -> WikiQuerier {
     let wiki = root.join("wiki");
     std::fs::create_dir_all(&wiki).unwrap();
     WikiQuerier {

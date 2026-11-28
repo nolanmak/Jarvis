@@ -92,6 +92,8 @@ mod review_recovery_tests;
 mod review_recovery;
 #[path = "self_improve_nightly_review.rs"]
 mod nightly_review;
+#[path = "self_improve_stale_prs.rs"]
+mod stale_prs;
 #[cfg(test)]
 #[path = "self_improve_manual_pr_routing_tests.rs"]
 mod manual_pr_routing_tests;
@@ -13145,6 +13147,16 @@ impl AutoPrLoop {
                     result = nightly_review::run_if_due(&canary_root) => {
                         if let Err(error) = result {
                             warn!("autoship nightly review incomplete: {error:#}");
+                        }
+                    }
+                }
+                // PRs idle for two days get a merge / continue / close
+                // verdict on the same hourly scheduler.
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    result = stale_prs::run_if_due(&canary_root) => {
+                        if let Err(error) = result {
+                            warn!("autoship stale PR sweep incomplete: {error:#}");
                         }
                     }
                 }
