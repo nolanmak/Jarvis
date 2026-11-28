@@ -79,14 +79,23 @@ export function shortTime(ms: number, now: number = Date.now()): string {
 }
 
 const PLATFORMS: Readonly<Record<string, string>> = {
-  gmail: "Gmail", discord: "Discord", slack: "Slack", imessage: "iMessage", sms: "SMS",
+  gmail: "Gmail", email: "Email", discord: "Discord", slack: "Slack", imessage: "iMessage", sms: "SMS",
+  whatsapp: "WhatsApp", telegram: "Telegram", linkedin: "LinkedIn", instagram: "Instagram", twitter: "X",
+  reddit: "Reddit", gcal: "Calendar", calendar: "Calendar", calendly: "Calendly", luma: "Luma",
+  partiful: "Partiful", meetup: "Meetup", notion: "Notion", linear: "Linear", github: "GitHub",
 };
+
+/** Product name for an action's platform id; unknown ids are capitalized, never shown raw. */
+export function platformLabel(p?: string): string {
+  const id = p || "gmail";
+  return PLATFORMS[id] ?? id.charAt(0).toUpperCase() + id.slice(1);
+}
 // Schemes a manual-send link may use; anything else (javascript:, data:) is dropped.
 const SAFE_LINK = /^(https?:|mailto:|sms:|tel:)/i;
 
 function approvalsLocals() {
   const { actions } = listApprovals();
-  return { actions, shortTime, now: Date.now(), renderPlainText, platformLabel: (p?: string) => PLATFORMS[p ?? "gmail"] ?? p };
+  return { actions, shortTime, now: Date.now(), renderPlainText, platformLabel };
 }
 
 /** htmx form posts send strings; the shared handlers want JSON booleans. */
