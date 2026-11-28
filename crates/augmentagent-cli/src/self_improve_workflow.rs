@@ -138,10 +138,11 @@ impl FreshIssueControls {
             anyhow::ensure!(context.workflow==id && context.repository.eq_ignore_ascii_case(repository)
                 && context.binding==snapshot.checkpoint.binding,"selection checkout context differs");
             let Err(error)=checkout_identity::check_recorded(&self.state,&id,&context.worktree,repository,&snapshot.branch) else {return Ok(())};
-            // #2349 — scope-stage work whose recorded checkout path is gone is
-            // selectable; productive preparation re-establishes continuity.
+            // #2349/#2612 — scope-stage or planned-unbuilt work whose recorded
+            // checkout path is gone is selectable; productive preparation
+            // re-establishes continuity.
             if checkout_continuity::selectable(store,&self.state,&id,repository,&error) {
-                info!(issue,reason=%error,"checkout continuity lost on scope-stage work; select to re-establish from current main");
+                info!(issue,reason=%error,"checkout continuity lost on work with nothing to preserve; select to re-establish from current main");
                 return Ok(());
             }
             Err(error)
