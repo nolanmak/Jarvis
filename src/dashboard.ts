@@ -71,6 +71,7 @@ import {
 import { requireApiKey } from "./apiV1";
 import { requireAuth } from "./security";
 import { createModelRouterRoutes } from "./modelRouterRoutes";
+import { createWebRoutes } from "./web/routes";
 import { createSessionManager } from "./sessionProcesses";
 // Auto-update signature gate (security #298). Shared with the 5-min poller in
 // index.ts so both auto-update paths enforce the same owner-signature
@@ -152,6 +153,7 @@ router.use((_req, res, next) => {
 });
 
 router.use(createModelRouterRoutes());
+router.use(createWebRoutes());
 
 function getComposioClient(): Composio | null {
   const apiKey = getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY;
