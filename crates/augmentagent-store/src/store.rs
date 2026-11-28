@@ -115,6 +115,106 @@ pub struct SurfaceTurnState {
     pub resolution: Option<SurfaceTurnResolution>,
 }
 
+/// #2387 — where one durably queued Gmail compose stands. `Landed`, `GaveUp`
+/// and `Unknown` are terminal: a sweep never attempts them again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeQueueStatus {
+    Queued,
+    Retrying,
+    Landed,
+    GaveUp,
+    Unknown,
+}
+
+impl ComposeQueueStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Retrying => "retrying",
+            Self::Landed => "landed",
+            Self::GaveUp => "gave_up",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Public so a caller reading the column through its own query rejects a
+    /// value this build cannot act on rather than guessing.
+    pub fn parse(value: &str) -> StoreResult<Self> {
+        Ok(match value {
+            "queued" => Self::Queued,
+            "retrying" => Self::Retrying,
+            "landed" => Self::Landed,
+            "gave_up" => Self::GaveUp,
+            "unknown" => Self::Unknown,
+            other => {
+                return Err(StoreError::InvalidInput(format!(
+                    "unknown compose queue status {other}"
+                )))
+            }
+        })
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Queued | Self::Retrying)
+    }
+}
+
+/// #2387 — one parked compose in the durable retry queue. `payload` is the
+/// serialized draft, opaque to the store; `retry_after_ms` is the upstream
+/// retry-after boundary, not a poll interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeQueueRow {
+    pub entity: String,
+    pub payload: String,
+    pub retry_after_ms: i64,
+    pub attempt: i64,
+    pub idem_key: String,
+    pub status: ComposeQueueStatus,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// #2387 — a compose to park when in-loop retries are exhausted. Lands as
+/// `queued` with `attempt` 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewComposeQueueEntry {
+    pub entity: String,
+    pub payload: String,
+    pub retry_after_ms: i64,
+    pub idem_key: String,
+}
+
+const COMPOSE_QUEUE_COLS: &str = "entity, payload, retry_after, attempt, idem_key, status, created_at, updated_at";
+
+fn row_to_compose_queue(r: &rusqlite::Row) -> rusqlite::Result<ComposeQueueRow> {
+    let status: String = r.get(5)?;
+    Ok(ComposeQueueRow {
+        entity: r.get(0)?,
+        payload: r.get(1)?,
+        retry_after_ms: r.get(2)?,
+        attempt: r.get(3)?,
+        idem_key: r.get(4)?,
+        status: ComposeQueueStatus::parse(&status).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.to_string().into())
+        })?,
+        created_at_ms: r.get(6)?,
+        updated_at_ms: r.get(7)?,
+    })
+}
+
+/// #2387 — a compare-and-swap whose expected status is terminal would have to
+/// reopen a settled compose, which is a caller bug rather than a lost race, so
+/// it is refused instead of reported as a missed swap.
+fn reject_terminal_expectation(idem_key: &str, expected: ComposeQueueStatus) -> StoreResult<()> {
+    if expected.is_retryable() {
+        return Ok(());
+    }
+    Err(StoreError::InvalidInput(format!(
+        "compose queue row {idem_key} is terminal in {}; terminal rows are never reattempted",
+        expected.as_str()
+    )))
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2815,7 +2915,147 @@ impl Store {
         crate::slack_ingest::migrate(conn)?;
         conn.execute_batch(include_str!("linkedin_archive.sql"))?;
 
+        // #2387 — durable Gmail compose queue: a compose parked when the
+        // in-loop 429 backoff (#1493) is exhausted. `retry_after` is both the
+        // next-attempt boundary and the lease deadline of an attempt in
+        // flight, so one row is never swept twice at once. Plus the receipt
+        // that authorizes exactly one approval-card post per compose key. Mirrored
+        // in Node's initDb; additive and idempotent. The CHECK stops a status
+        // the sweep would not know whether to retry from reaching the file.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gmail_compose_queue (\
+                 entity      TEXT NOT NULL,\
+                 payload     TEXT NOT NULL,\
+                 retry_after INTEGER NOT NULL,\
+                 attempt     INTEGER NOT NULL DEFAULT 0,\
+                 idem_key    TEXT NOT NULL UNIQUE,\
+                 status      TEXT NOT NULL CHECK (status IN ('queued', 'retrying', 'landed', 'gave_up', 'unknown')),\
+                 created_at  INTEGER NOT NULL,\
+                 updated_at  INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_gmail_compose_queue_due \
+                 ON gmail_compose_queue(status, retry_after);\
+             CREATE TABLE IF NOT EXISTS approval_card_post_receipts (\
+                 idem_key  TEXT PRIMARY KEY,\
+                 posted_at INTEGER NOT NULL\
+             );",
+        )?;
+
         Ok(())
+    }
+
+    /// #2387 — park a throttled compose for a later attempt. `false` means
+    /// `idem_key` is already queued and the stored row wins, so a repeated
+    /// 429 for the same draft can neither add a second entry nor revive a row
+    /// that already landed or gave up.
+    pub fn enqueue_gmail_compose(&self, entry: &NewComposeQueueEntry, now_ms: i64) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let inserted = guard.execute(
+            &format!(
+                "INSERT INTO gmail_compose_queue ({COMPOSE_QUEUE_COLS}) \
+                 VALUES (?1, ?2, ?3, 0, ?4, 'queued', ?5, ?5) \
+                 ON CONFLICT(idem_key) DO NOTHING"
+            ),
+            params![entry.entity, entry.payload, entry.retry_after_ms, entry.idem_key, now_ms],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// #2387 — the queued compose for `idem_key`, whatever state it is in.
+    pub fn gmail_compose(&self, idem_key: &str) -> StoreResult<Option<ComposeQueueRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let sql = format!("SELECT {COMPOSE_QUEUE_COLS} FROM gmail_compose_queue WHERE idem_key = ?1");
+        Ok(guard.query_row(&sql, params![idem_key], row_to_compose_queue).optional()?)
+    }
+
+    /// #2387 — rows a sweep may attempt at `now_ms`: queued or retrying with
+    /// their retry-after boundary reached, oldest first; never terminal rows.
+    pub fn due_gmail_composes(&self, now_ms: i64) -> StoreResult<Vec<ComposeQueueRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(&format!(
+            "SELECT {COMPOSE_QUEUE_COLS} FROM gmail_compose_queue \
+             WHERE status IN ('queued', 'retrying') AND retry_after <= ?1 ORDER BY retry_after, idem_key"
+        ))?;
+        let rows = stmt.query_map(params![now_ms], row_to_compose_queue)?.collect::<rusqlite::Result<Vec<_>>>();
+        Ok(rows?)
+    }
+
+    /// #2387 — compare-and-swap a row into `retrying` for one attempt and
+    /// lease it for `lease_ms` by pushing `retry_after` to `now_ms +
+    /// lease_ms`. Only the caller holding the expected `(status, attempt)` of
+    /// a row that is actually due wins, so a sweeper reading the
+    /// `(retrying, attempt + 1)` state the winner just wrote still cannot take
+    /// a compose that is in flight — the lease holds the row out of
+    /// [`Self::due_gmail_composes`] and out of reach of a competing claim
+    /// until it lapses, and a lapsed lease is what returns an attempt whose
+    /// process died to the rotation. `false` leaves the row untouched. A
+    /// terminal `expected` is rejected outright: no claim can revive a settled
+    /// compose, and a non-positive `lease_ms` is rejected because it would
+    /// leave the claimed row immediately reclaimable.
+    pub fn claim_gmail_compose(
+        &self,
+        idem_key: &str,
+        expected: ComposeQueueStatus,
+        expected_attempt: i64,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> StoreResult<bool> {
+        reject_terminal_expectation(idem_key, expected)?;
+        if lease_ms <= 0 {
+            return Err(StoreError::InvalidInput(format!(
+                "compose queue claim of {idem_key} needs a positive lease, got {lease_ms}ms"
+            )));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let claimed = guard.execute(
+            "UPDATE gmail_compose_queue \
+             SET status = 'retrying', attempt = attempt + 1, retry_after = ?4 + ?5, updated_at = ?4 \
+             WHERE idem_key = ?1 AND status = ?2 AND attempt = ?3 AND retry_after <= ?4",
+            params![idem_key, expected.as_str(), expected_attempt, now_ms, lease_ms],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    /// #2387 — compare-and-swap a row to its outcome under the same
+    /// `(status, attempt)` guard as [`Self::claim_gmail_compose`], but with no
+    /// due check: the lease holder settles its own row while that row is held
+    /// out of the rotation. A `retry_after_ms` of `None` keeps the stored
+    /// boundary — for a claimed row that is its lease deadline, so a re-park
+    /// that wants an earlier next attempt passes `Some`.
+    /// A terminal `expected` is rejected, so `landed`, `gave_up` and
+    /// `unknown` are the last word on a compose whatever `next` asks for.
+    pub fn transition_gmail_compose(
+        &self,
+        idem_key: &str,
+        expected: ComposeQueueStatus,
+        expected_attempt: i64,
+        next: ComposeQueueStatus,
+        retry_after_ms: Option<i64>,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        reject_terminal_expectation(idem_key, expected)?;
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE gmail_compose_queue \
+             SET status = ?4, retry_after = COALESCE(?5, retry_after), updated_at = ?6 \
+             WHERE idem_key = ?1 AND status = ?2 AND attempt = ?3",
+            params![idem_key, expected.as_str(), expected_attempt, next.as_str(), retry_after_ms, now_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// #2387 — claim the single approval-card post allowed for `idem_key`,
+    /// across processes and reopens. A later caller gets `false` rather than
+    /// an error, so a retry that adopts an already-landed draft stays quiet
+    /// instead of posting a second card.
+    pub fn claim_approval_card_post(&self, idem_key: &str, now_ms: i64) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let inserted = guard.execute(
+            "INSERT INTO approval_card_post_receipts (idem_key, posted_at) VALUES (?1, ?2) \
+             ON CONFLICT(idem_key) DO NOTHING",
+            params![idem_key, now_ms],
+        )?;
+        Ok(inserted == 1)
     }
 
     /// Insert email if new. Returns `true` when the row did not previously exist.
