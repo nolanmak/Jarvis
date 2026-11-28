@@ -230,6 +230,7 @@ fn independent_review_is_exact_head_and_late_response_is_fenced() {
         mergeable: Some(true),
         checks_green: Some(true),
         review_approved: approval.reviewed,
+        review_mode: crate::autoship_review::ReviewMode::PreMerge,
         policy: MergePolicy {
             automerge_enabled: true,
             complexity: Complexity::Simple,

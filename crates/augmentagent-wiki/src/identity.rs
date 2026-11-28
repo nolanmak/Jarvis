@@ -34,6 +34,10 @@ pub struct Identities {
     pub twitter: Option<String>,
     #[serde(default)]
     pub slack: Option<String>,
+    /// Telegram user ids (#1643). Numeric and multi-valued — the same person
+    /// can message the bot from a second account.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub telegram: Vec<String>,
     /// WhatsApp JIDs (#1009). Multi-valued — a person's number JID
     /// (`<number>@s.whatsapp.net`) and their `@lid` alias commonly coexist.
     /// Lenient like the other list fields: a legacy bare scalar still parses.
@@ -95,6 +99,7 @@ impl Identities {
             "discord" => self.discord.as_deref() == Some(id),
             "twitter" => self.twitter.as_deref() == Some(id),
             "slack" => self.slack.as_deref() == Some(id),
+            "telegram" => self.telegram.iter().any(|h| h == id),
             "whatsapp" => self.whatsapp.iter().any(|h| h == id),
             "instagram" => self.instagram.iter().any(|h| h == id),
             "phone" => {
@@ -479,6 +484,17 @@ mod tests {
         let index = IdentityIndex::build(&layout).unwrap();
         assert!(index.lookup("discord", "999").is_some());
         assert!(index.lookup("discord", "000").is_none());
+    }
+
+    #[test]
+    fn lookup_by_telegram_matches_any_declared_user_id() {
+        let (_d, layout) = layout_with_pages(&[(
+            "bob",
+            "kind: person\nkey: bob\nidentities:\n  telegram: [\"55501\", \"55502\"]",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("telegram", "55502").is_some());
+        assert!(index.lookup("telegram", "55503").is_none());
     }
 
     #[test]

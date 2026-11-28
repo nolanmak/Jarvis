@@ -1,0 +1,61 @@
+# From github-ci-security (private): the Ship Systems ci-runner security checks,
+# on GitHub-hosted runners. Edit the copy in that repo and re-run apply.sh rather
+# than editing this file in place, so every repo stays on the same policy.
+#
+#   gitleaks       blocking. Make `gitleaks` a required check on main.
+#   Security scan  osv, shai-hulud, semgrep, zizmor; advisory at first. Promote
+#                  a tool by deleting it from SCAN_REPORT_ONLY once its backlog
+#                  is clear, one tool at a time.
+#
+# Public repo rules this file keeps: GitHub-hosted runners only (never
+# self-hosted: a fork's PR would run on your machine), `pull_request` never
+# `pull_request_target`, read-only token, no secrets, actions pinned by SHA.
+name: security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # New advisories land against code that has not changed.
+  schedule:
+    - cron: "23 13 * * 1"
+  workflow_dispatch:
+# A new push to a PR cancels that PR's older run; a push to main, a schedule or
+# a manual run never cancels anything (Jarvis's reviewed policy, kept verbatim
+# so its ci-contract check accepts this file).
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks reads the whole history of HEAD.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-verified gitleaks
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id security/gitleaks/1"
+      - name: Scan this branch's full history
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id security/gitleaks/2"
+
+  scan:
+    name: Security scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified scanners
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id security/scan/1"
+      - name: Run the scans
+        env:
+          # zizmor's online audits, read-only with this job's permissions.
+          GH_TOKEN: ${{ github.token }}
+          SCAN_REPORT_ONLY: osv shai-hulud semgrep zizmor
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id security/scan/2"

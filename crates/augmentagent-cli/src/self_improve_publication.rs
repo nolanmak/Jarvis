@@ -621,6 +621,37 @@ pub(super) fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str,
     })
 }
 
+/// A dispatched merge GitHub provably did not perform: the exact PR (node,
+/// number, base repository) is still open with `merged == false`, and either
+/// its head moved past the dispatched `expectedHeadOid` or the journaled
+/// response is GitHub's refusal. A lost response at the same head stays
+/// ambiguous and returns `None`.
+pub(super) fn remote_open_unmerged_proof(
+    record: &crate::autoship_workflow::MergeDispatchRecord,
+    remote: &serde_json::Value,
+    journal: Option<&str>,
+) -> Option<crate::autoship_workflow::MergeReleaseProof> {
+    use sha2::{Digest, Sha256};
+    let observed = remote["head"]["sha"].as_str()?;
+    let identity = record.state == "dispatched"
+        && remote["state"].as_str() == Some("open")
+        && remote["merged"].as_bool() == Some(false)
+        && remote["number"].as_u64() == Some(record.pr)
+        && remote["node_id"].as_str() == Some(record.node.as_str())
+        && remote["base"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(&record.repository))
+        && matches!(observed.len(), 40 | 64) && observed.bytes().all(|b| b.is_ascii_hexdigit());
+    if !identity { return None; }
+    let refused = journal.filter(|raw| crate::autoship_workflow::merge_response_refused(raw));
+    let moved = observed != record.operation.binding.head;
+    if !moved && refused.is_none() { return None; }
+    Some(crate::autoship_workflow::MergeReleaseProof::RemoteOpenUnmerged {
+        node: record.node.clone(),
+        pr: record.pr,
+        observed_head: observed.into(),
+        response_sha256: refused.map(|raw| format!("{:x}", Sha256::digest(raw.as_bytes()))),
+    })
+}
+
 pub(super) fn marker_merge_receipt(
     record: &crate::autoship_workflow::MergeDispatchRecord,
     remote: &serde_json::Value,
@@ -673,6 +704,13 @@ async fn recover_dispatched_merge(
     // and immutable merge commit; missing/contradictory proof stays pending.
     let raw = github.call(&["api", &format!("repos/{repository}/pulls/{pr}")]).await?;
     let remote: serde_json::Value = serde_json::from_str(&raw)?;
+    let journal = store.merge_response(operation, repository, pr)?.map(|(raw, _)| raw);
+    if let Some(proof) = remote_open_unmerged_proof(record, &remote, journal.as_deref()) {
+        store.resolve_merge_without_debit(operation, "not-merged", "autoship", &proof,
+            chrono::Utc::now().timestamp_millis())?;
+        warn!(operation=%operation_id, pr, "merge dispatch provably not performed; allowance slot released");
+        return Ok(None);
+    }
     anyhow::ensure!(remote["merged"] == true
         && remote["number"].as_u64() == Some(pr)
         && remote["node_id"].as_str() == Some(record.node.as_str())
@@ -1101,6 +1139,97 @@ mod tests {
         assert_eq!(store.merge_allowance(now,5).unwrap().pending,0);
         assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
         assert!(github.calls.is_empty());
+    }
+
+    // Regression (#2570): GitHub refused the merge with an execution error
+    // ("4 of 4 required status checks are expected"), then the PR head moved
+    // and it stayed open. The pending dispatch held a slot forever.
+    #[tokio::test]
+    async fn refused_merge_on_open_unmerged_pr_releases_its_pending_slot() {
+        use crate::autoship_workflow::{WorkflowStore, Binding};
+        let refused = r#"{"data":{"mergePullRequest":null},"errors":[{"type":"UNPROCESSABLE","path":["mergePullRequest"],"locations":[{"line":1,"column":83}],"message":"4 of 4 required status checks are expected."}]}"#;
+        let dispatched = "4".repeat(40);
+        let moved = "d".repeat(40);
+        // (journal, remote state, remote merged, remote head, released?)
+        for (name, journal, state, merged, remote_head, released) in [
+            ("refused+moved", Some(refused), "open", false, moved.as_str(), true),
+            ("refused+same-head", Some(refused), "open", false, dispatched.as_str(), true),
+            ("lost-response+moved", None, "open", false, moved.as_str(), true),
+            ("lost-response+same-head", None, "open", false, dispatched.as_str(), false),
+            ("refused+merged", Some(refused), "closed", true, moved.as_str(), false),
+            ("refused+closed-unmerged-unknown", Some(refused), "closed", false, dispatched.as_str(), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+            let binding = Binding { head:dispatched.clone(),contract:"contract".into(),evidence_hash:"proof".into() };
+            store.register("owner/repo#12","fixture",binding.clone(),now).unwrap();
+            let lease = store.claim("owner/repo#12","fixture",now,60_000).unwrap().unwrap();
+            store.attach_pr(&lease,12,now).unwrap();
+            let op = store.begin_operation(&lease,OperationKind::MergePr,&binding,now).unwrap();
+            store.reserve_merge(&lease,&op,"owner/repo",12,"PR_fixture",now,1).unwrap();
+            store.dispatch_marked_merge(&lease,&op,now,1).unwrap();
+            if let Some(raw) = journal { store.record_merge_response(&op,raw,now).unwrap(); }
+            store.release(&lease,now).unwrap();
+            let before = store.merge_allowance(now,1).unwrap();
+            assert_eq!((before.pending,before.available),(1,0),"{name}: stuck state holds the only slot");
+            let remote = serde_json::json!({"node_id":"PR_fixture","number":12,"state":state,"merged":merged,
+                "head":{"sha":remote_head},"base":{"repo":{"full_name":"Owner/Repo"}},
+                "merge_commit_sha":if merged {serde_json::Value::from("a".repeat(40))} else {serde_json::Value::Null},
+                "merged_by":null,"merged_at":null});
+            let mut github = MergeFake { replies:VecDeque::from([Ok(remote.to_string())]),calls:vec![] };
+            assert_eq!(reconcile_merge_records(&mut github,&mut store,"owner/repo").await.unwrap(),0,"{name}: never a confirmed merge");
+            let after = store.merge_allowance(now,1).unwrap();
+            assert_eq!(after.confirmed,0,"{name}: refusal is never debited");
+            if released {
+                assert_eq!((after.pending,after.available),(0,1),"{name}: provable non-merge releases the slot");
+                let record = store.merge_dispatch(&op.id).unwrap().unwrap();
+                assert_eq!(record.state,"released");
+                let decision: serde_json::Value = serde_json::from_str(record.resolution.as_deref().unwrap()).unwrap();
+                assert_eq!(decision["classification"],"not-merged");
+                assert_eq!(decision["proof"]["kind"],"remote_open_unmerged");
+                // Idempotent: nothing pending, so no further reads or writes.
+                let mut idle = MergeFake { replies:VecDeque::new(),calls:vec![] };
+                assert_eq!(reconcile_merge_records(&mut idle,&mut store,"owner/repo").await.unwrap(),0);
+                assert!(idle.calls.is_empty());
+            } else {
+                assert_eq!((after.pending,after.available),(1,0),"{name}: ambiguous dispatch keeps its slot");
+            }
+            assert!(github.calls.iter().all(|call| call.first().is_some_and(|v| v=="api") && call.get(1).is_some_and(|v|v.starts_with("repos/owner/repo/"))),
+                "{name}: recovery stays read-only");
+        }
+    }
+
+    #[test]
+    fn open_unmerged_release_proof_cannot_be_forged_for_an_ambiguous_dispatch() {
+        use crate::autoship_workflow::{WorkflowStore, Binding, MergeReleaseProof};
+        let dispatched = "4".repeat(40);
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let binding = Binding { head:dispatched.clone(),contract:"contract".into(),evidence_hash:"proof".into() };
+        store.register("owner/repo#12","fixture",binding.clone(),now).unwrap();
+        let lease = store.claim("owner/repo#12","fixture",now,60_000).unwrap().unwrap();
+        store.attach_pr(&lease,12,now).unwrap();
+        let op = store.begin_operation(&lease,OperationKind::MergePr,&binding,now).unwrap();
+        store.reserve_merge(&lease,&op,"owner/repo",12,"PR_fixture",now,1).unwrap();
+        store.dispatch_marked_merge(&lease,&op,now,1).unwrap();
+        let accepted = mutation_response().to_string();
+        store.record_merge_response(&op,&accepted,now).unwrap();
+        store.release(&lease,now).unwrap();
+        let digest = |raw:&str| { use sha2::{Digest,Sha256}; format!("{:x}",Sha256::digest(raw.as_bytes())) };
+        for (classification, proof) in [
+            // Same head with no refusal: a lost response may have merged.
+            ("not-merged", MergeReleaseProof::RemoteOpenUnmerged { node:"PR_fixture".into(),pr:12,observed_head:dispatched.clone(),response_sha256:None }),
+            // A journaled accepted (MERGED) response is not a refusal.
+            ("not-merged", MergeReleaseProof::RemoteOpenUnmerged { node:"PR_fixture".into(),pr:12,observed_head:dispatched.clone(),response_sha256:Some(digest(&accepted)) }),
+            ("not-merged", MergeReleaseProof::RemoteOpenUnmerged { node:"PR_fixture".into(),pr:12,observed_head:"d".repeat(40),response_sha256:None }),
+            ("not-merged", MergeReleaseProof::RemoteOpenUnmerged { node:"OTHER".into(),pr:12,observed_head:"d".repeat(40),response_sha256:None }),
+            ("manual", MergeReleaseProof::RemoteOpenUnmerged { node:"PR_fixture".into(),pr:12,observed_head:"d".repeat(40),response_sha256:None }),
+        ] {
+            assert!(store.resolve_merge_without_debit(&op,classification,"autoship",&proof,now).is_err(),"{proof:?}");
+            assert_eq!(store.merge_allowance(now,1).unwrap().pending,1);
+        }
     }
 
     #[tokio::test]

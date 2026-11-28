@@ -21,6 +21,8 @@ pub mod codex_tools;
 mod native_tool_readiness;
 pub mod cooldown;
 pub mod decision;
+// #2422 — default-off, per-platform "a new DM arrived" owner-alert policy.
+pub mod dm_alert;
 pub mod draft_context;
 pub mod draft_evidence;
 pub mod draft_workflow;

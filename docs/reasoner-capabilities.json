@@ -831,6 +831,17 @@
       "provider_conformance": "Deterministic promotion and executable oracle checks; live native replay remains required for rubric promotion."
     },
     {
+      "callsite": "crates/augmentagent-cli/src/self_improve_nightly_review.rs::reviewer_opts",
+      "permission_profile": "text",
+      "output_contract": "One FINDING line per post-merge defect, or exactly NO FINDINGS; findings are filed as issues by the caller, never by the reviewer",
+      "model_tier": "preserved",
+      "tier_rationale": "Wraps codex_review_opts, preserving its pinned native Codex review model while removing tools, additional directories and inherited environment.",
+      "conformance": [
+        "self_improve::nightly_review::tests::reviewer_opts_carry_the_protected_workflow_policy"
+      ],
+      "provider_conformance": "Deterministic protected-policy and no-host-scope coverage; the live nightly post-merge pass is not provider-verified."
+    },
+    {
       "callsite": "crates/augmentagent-cli/src/self_improve_adjudication_windows.rs::select_inner",
       "permission_profile": "text",
       "output_contract": "Exact immutable source windows for final adjudication; verified offsets and explicit unlocated findings, never code-change or merge authority",
