@@ -35,7 +35,10 @@
   // app (composer, bottom bar) stays above the on-screen keyboard.
   var vv = window.visualViewport;
   function fit() {
-    document.documentElement.style.setProperty("--app-h", (vv ? vv.height : window.innerHeight) + "px");
+    var h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--app-h", h + "px");
+    // The on-screen keyboard is up: give its space to the log, not the bottom bar.
+    body.classList.toggle("kb-open", window.innerHeight - h > 120);
     if (vv && vv.offsetTop) window.scrollTo(0, 0);
   }
   if (vv) { vv.addEventListener("resize", fit); vv.addEventListener("scroll", fit); }
@@ -75,9 +78,54 @@
     if (id && id === body.dataset.thread) refresh("#log");
   });
 
-  // A created thread opens at its pushed URL.
+  // Composer (D12): the turn_id survives retries of the same text. It is
+  // re-minted after a 2xx, after a 4xx other than 409 turn_conflict, and on edit.
+  var composer = document.getElementById("composer");
+  var input = composer && composer.querySelector("textarea");
+  var turnId = composer && composer.querySelector("[name=turn_id]");
+  var chat = document.querySelector(".j-chat-body");
+  function grow() { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; }
+  if (composer) {
+    turnId.value = uuidv7();
+    input.addEventListener("input", function () { turnId.value = uuidv7(); grow(); });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); composer.requestSubmit(); }
+    });
+    composer.addEventListener("htmx:confirm", function (e) {
+      if (!input.value.trim() || input.readOnly) e.preventDefault();
+    });
+    // Read-only rather than disabled while sending, so the focus and the
+    // on-screen keyboard stay put.
+    composer.addEventListener("htmx:beforeRequest", function () { input.readOnly = true; });
+    // Tapping Send keeps focus (and the keyboard) on the textarea.
+    composer.querySelector(".j-send").addEventListener("mousedown", function (e) { e.preventDefault(); });
+    if (!phone.matches && !document.querySelector(".j-msg")) input.focus();
+  }
+  function scrollToEnd() { if (chat) chat.scrollTop = chat.scrollHeight; }
+  scrollToEnd();
+  var stick = true;
+  body.addEventListener("htmx:beforeSwap", function (e) {
+    if (chat && e.detail.target.id === "log") stick = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+  });
+  body.addEventListener("htmx:afterSettle", function (e) {
+    if (e.detail.target.id === "log" && stick) scrollToEnd();
+  });
+
   body.addEventListener("htmx:afterRequest", function (e) {
     var xhr = e.detail.xhr;
+    if (composer && e.detail.elt === composer) {
+      var code = xhr.getResponseHeader("X-Jarvis-Error");
+      input.readOnly = false;
+      if (e.detail.successful) {
+        input.value = "";
+        grow();
+        document.getElementById("composer-error").innerHTML = "";
+        stick = true;
+      }
+      if (e.detail.successful || (xhr.status >= 400 && xhr.status < 500 && code !== "turn_conflict")) turnId.value = uuidv7();
+    }
+    if (e.detail.elt.hasAttribute("data-reload") && e.detail.successful) location.reload();
+    // A created thread opens at its pushed URL.
     if (e.detail.elt.id === "new-thread" && e.detail.successful && xhr.getResponseHeader("HX-Push-Url")) {
       location.assign(xhr.getResponseHeader("HX-Push-Url"));
     }

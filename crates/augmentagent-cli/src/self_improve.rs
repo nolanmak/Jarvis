@@ -13160,6 +13160,25 @@ impl AutoPrLoop {
                         }
                     }
                 }
+                // The reviewer lease is refused while a shipping workflow holds
+                // one, which at the top of a busy hour is always. A due pass
+                // retries between ticks until the next hourly turn.
+                for _ in 0..stale_prs::RETRIES_PER_HOUR {
+                    if !stale_prs::pending() { break; }
+                    tokio::select! {
+                        _ = canary_stop.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(stale_prs::RETRY_INTERVAL) => {}
+                    }
+                    if gh_budget::low(&canary_root, "stale PR sweep").await { continue; }
+                    tokio::select! {
+                        _ = canary_stop.cancelled() => return Ok(()),
+                        result = stale_prs::run_if_due(&canary_root) => {
+                            if let Err(error) = result {
+                                warn!("autoship stale PR sweep incomplete: {error:#}");
+                            }
+                        }
+                    }
+                }
             }
         };
         let shipping = self.run_with(shutdown, move || {

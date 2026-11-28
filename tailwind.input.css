@@ -178,6 +178,66 @@
   .j-form-label { font-weight: 600; }
   .j-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
+  /* Message log */
+  .j-log { max-width: 760px; margin: 0 auto; padding: 20px 16px 8px; min-height: 100%; display: flex; flex-direction: column; gap: 14px; }
+  .j-log > .j-empty { flex: 1; }
+  .j-msg { display: flex; gap: 12px; min-width: 0; animation: j-fade .2s ease-out; }
+  .j-msg-owner { flex-direction: column; align-items: flex-end; gap: 4px; margin-top: 10px; }
+  .j-bubble { max-width: min(85%, 600px); padding: 10px 14px; border-radius: 18px 18px 6px 18px; white-space: pre-wrap;
+    overflow-wrap: anywhere; background: rgb(var(--j-accent) / .16); color: rgb(var(--j-fg)); }
+  .j-msg-time { font-size: 11px; color: rgb(var(--j-faint)); font-variant-numeric: tabular-nums; }
+  .j-msg-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .j-avatar { width: 26px; height: 26px; border-radius: 8px; font-size: 13px; flex: none; margin-top: 2px; }
+  .j-avatar::after { right: 4px; bottom: 5px; width: 4px; height: 4px; }
+  .j-turn { display: flex; gap: 12px; align-items: flex-start; animation: j-fade .2s ease-out; }
+  .j-turn-body { flex: 1; min-width: 0; padding-top: 2px; }
+  .j-turn-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .j-turn-error { margin-top: 6px; font-size: 14px; color: rgb(var(--j-muted)); overflow-wrap: anywhere; }
+  .j-pill { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; background: rgb(var(--j-elev)); color: rgb(var(--j-muted)); }
+  .j-pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .j-pill-running { color: rgb(var(--j-accent)); background: rgb(var(--j-accent) / .12); }
+  .j-pill-running .j-pill-dot { animation: j-pulse 1.2s ease-in-out infinite; }
+  .j-pill-failed { color: rgb(var(--j-danger)); background: rgb(var(--j-danger) / .12); }
+  .j-chip { display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px; border-radius: 999px; font-size: 14px; font-weight: 550;
+    color: rgb(var(--j-fg)); border: 1px solid rgb(var(--j-line)); transition: background .12s, transform .08s; }
+  .j-chip:hover { background: rgb(var(--j-elev)); }
+  .j-chip:active { transform: scale(.96); }
+
+  /* Markdown answers: everything wraps or scrolls inside its own box. */
+  .j-prose { overflow-wrap: anywhere; line-height: 1.6; }
+  .j-prose > * + * { margin-top: .7em; }
+  .j-prose ul, .j-prose ol { padding-left: 1.3em; }
+  .j-prose ul { list-style: disc; } .j-prose ol { list-style: decimal; }
+  .j-prose li + li { margin-top: .25em; }
+  .j-prose a { color: rgb(var(--j-accent)); text-decoration: underline; text-underline-offset: 2px; }
+  .j-prose strong { font-weight: 650; }
+  .j-prose code { font: .88em/1.5 ui-monospace, "SF Mono", Menlo, monospace; padding: .1em .35em; border-radius: 5px; background: rgb(var(--j-elev)); }
+  .j-prose pre { overflow-x: auto; padding: 12px 14px; border-radius: 10px; background: rgb(var(--j-panel)); border: 1px solid rgb(var(--j-line)); }
+  .j-prose pre code { padding: 0; background: none; white-space: pre; overflow-wrap: normal; }
+  .j-prose .attachment { font-size: 14px; color: rgb(var(--j-muted)); font-style: italic; }
+
+  /* Composer: pinned to the bottom of the chat pane inside the dvh layout. */
+  .j-composer-wrap { flex: none; padding: 8px 12px 10px; background: linear-gradient(to bottom, rgb(var(--j-bg) / 0), rgb(var(--j-bg)) 30%); }
+  .j-composer { max-width: 760px; margin: 0 auto; }
+  .j-composer-box { display: flex; align-items: flex-end; gap: 8px; padding: 6px 6px 6px 14px; border-radius: 22px;
+    background: rgb(var(--j-elev)); border: 1px solid rgb(var(--j-line)); transition: border-color .12s; }
+  .j-composer-box:focus-within { border-color: rgb(var(--j-accent) / .55); }
+  .j-composer textarea { flex: 1; min-width: 0; max-height: 40dvh; padding: 7px 0; resize: none; border: 0; outline: none;
+    background: transparent; color: rgb(var(--j-fg)); font: inherit; font-size: 16px; line-height: 1.45; }
+  .j-composer textarea::placeholder { color: rgb(var(--j-faint)); }
+  .j-body .j-composer textarea:focus-visible { outline: none; }
+  .j-composer textarea:read-only { opacity: .6; }
+  .j-send { display: grid; place-items: center; width: 44px; height: 44px; flex: none; border-radius: 50%;
+    background: rgb(var(--j-solid)); color: #fff; transition: opacity .12s, transform .08s; }
+  .j-send:disabled { opacity: .45; }
+  .j-send:active { transform: scale(.94); }
+  .j-composer-hint { display: none; margin-top: 6px; text-align: center; font-size: 12px; color: rgb(var(--j-faint)); }
+  .j-composer-error:not(:empty) { margin-bottom: 8px; }
+  .j-composer-error .j-toast-msg { box-shadow: none; border: 1px solid rgb(var(--j-line)); border-left: 3px solid rgb(var(--j-danger)); animation: none; }
+  .j-archived-note { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; color: rgb(var(--j-muted)); }
+  .kb-open .j-tabbar { display: none; }
+
   /* Tablet and desktop: all panes side by side; the rail is collapsible. */
   @media (min-width: 768px) {
     .j-app { grid-template: minmax(0, 1fr) / 280px minmax(0, 1fr) auto; }
@@ -188,6 +248,8 @@
     .j-tabbar { display: none; }
     .j-toast { bottom: 20px; }
     .j-dialog { margin-top: 12vh; }
+    .j-composer-wrap { padding: 8px 24px 14px; }
+    .j-log { padding: 28px 24px 8px; gap: 16px; }
   }
   @media (min-width: 768px) and (max-width: 1199px) {
     [data-rail="auto"] .j-rail { display: none; }
@@ -200,6 +262,8 @@
     .j-thread + .j-thread { margin-top: 1px; }
     .j-head { min-height: 52px; }
     .j-body { font-size: 14px; }
+    .j-composer-hint { display: block; }
+    .j-chip { min-height: 32px; padding: 0 12px; font-size: 13px; }
     .j-menu-panel > *, .j-option, .j-link-btn { min-height: 38px; font-size: 14px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -207,4 +271,5 @@
   }
 }
 @keyframes j-pop { from { opacity: 0; transform: translateY(-4px) scale(.98); } }
+@keyframes j-pulse { 50% { opacity: .35; } }
 @keyframes j-fade { from { opacity: 0; transform: translateY(4px); } }
