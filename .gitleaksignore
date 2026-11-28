@@ -1,0 +1,20 @@
+# gitleaks findings reviewed 2026-11-25 and judged not secrets. One fingerprint
+# (commit:file:rule:line) each, so a new occurrence is still flagged.
+# fixed test UUID used as a loop-email reference
+0f31e2174d01ae0a89f264917132be1a23d2c78d:crates/augmentagent-channel-email/src/channel.rs:generic-api-key:2543
+# fixed test UUID used as a loop-email reference
+0f31e2174d01ae0a89f264917132be1a23d2c78d:crates/augmentagent-store/src/loop_options.rs:generic-api-key:366
+# fake sk-live value in a test
+282d002ac703156fb28c4407a235912614d76278:crates/augmentagent-cli/src/web/tests.rs:generic-api-key:332
+# Claude's public native OAuth client id, not a credential
+cd6f34af75b9cdef7495892d1900d552681cb770:scripts/test-native-provider-vm.py:generic-api-key:489
+# fake JWT ('e30' = {}) in a test
+ad365b32d34aad903c02113084d950a385dcd103:crates/augmentagent-channel-core/src/fallback.rs:generic-api-key:1514
+# fixture verification key in a test
+0fa16ceca3402d6955bbf2229249835ede6510a7:crates/augmentagent-phone/tests/config.rs:generic-api-key:8
+# a storage key that is a file path, not a secret
+b2c53d3bdf6f55f1b052d7dbe54547da88c725ad:crates/augmentagent-cli/src/main.rs:generic-api-key:12474
+# fake Discord token in a test
+1114dd3a3b4c9532c2af036b3d4f279f190d280f:crates/augmentagent-channel-discord-dm/src/auth.rs:generic-api-key:8
+# made-up Discord id in a test
+b6dc298858a207372632efe4cfd46def4c380362:crates/augmentagent-wiki/src/identity.rs:discord-client-id:231

@@ -90,6 +90,8 @@ mod recovered_edits_tests;
 mod review_recovery_tests;
 #[path = "self_improve_review_recovery.rs"]
 mod review_recovery;
+#[path = "self_improve_nightly_review.rs"]
+mod nightly_review;
 #[cfg(test)]
 #[path = "self_improve_manual_pr_routing_tests.rs"]
 mod manual_pr_routing_tests;
@@ -130,6 +132,12 @@ mod slicing;
 
 #[path = "self_improve_preflight_retry.rs"]
 mod preflight_retry;
+
+#[path = "self_improve_stale_loop.rs"]
+mod stale_loop;
+#[cfg(test)]
+#[path = "self_improve_stale_loop_tests.rs"]
+mod stale_loop_tests;
 
 #[path = "self_improve_provider_readiness.rs"]
 pub(crate) mod provider_readiness;
@@ -1013,6 +1021,34 @@ impl std::error::Error for RecoveryHistoryUnavailable {}
 /// Completes on an empty page. Malformed responses and bound exhaustion fail
 /// closed; partial inventories cannot prove absence. Deduplicate rows shifted
 /// between pages by concurrent issue creation.
+/// Ratebudget: the paginated REST open-issue listing (seven-plus pages) is
+/// shared by issue selection, red-main lookup and legacy readmission within
+/// one tick, instead of each paging it again. A write clears it.
+async fn open_issue_rest_inventory(repo_root: &Path) -> Result<serde_json::Value> {
+    let gh = gh_bin();
+    let key = format!("rest-open-issues\0{}\0{gh}", repo_root.display());
+    let raw = gh_budget::tick_read(key, || async {
+        let json = fetch_issue_pages(|page| {
+            let gh = gh.clone();
+            async move {
+                let path = format!(
+                    "repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}\
+                     &sort=created&direction=desc&page={page}"
+                );
+                let (ok, stdout, stderr) = run(&gh, &["api", &path], repo_root).await?;
+                if !ok {
+                    bail!("gh api issues failed: {stderr}");
+                }
+                serde_json::from_str(&stdout).context("parse gh api issues")
+            }
+        })
+        .await?;
+        Ok(json.to_string())
+    })
+    .await?;
+    serde_json::from_str(&raw).context("parse shared open-issue inventory")
+}
+
 async fn fetch_issue_pages<F, Fut>(mut fetch: F) -> Result<serde_json::Value>
 where
     F: FnMut(u32) -> Fut,
@@ -1047,7 +1083,6 @@ where
 /// other ingress paths; untrusted sources require explicit owner approval.
 async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let allowlist = trusted_authors(repo_root).await;
-    let gh = gh_bin();
     // #653 — no label gate: every open issue is considered (newest first, up
     // to MAX_ISSUE_PAGES pages) and the stage-1 scoping pass decides
     // fixability itself. Issues it judges not-fixable get the gave-up label
@@ -1064,21 +1099,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // #1517 — paginated: one page of 50 made every issue older than the
     // newest 50 invisible to the loop forever, including everything `autopr
     // readmit` hands back.
-    let issues = fetch_issue_pages(|page| {
-        let gh = gh.clone();
-        async move {
-            let path = format!(
-                "repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}\
-                 &sort=created&direction=desc&page={page}"
-            );
-            let (ok, stdout, stderr) = run(&gh, &["api", &path], repo_root).await?;
-            if !ok {
-                bail!("gh api issues failed: {stderr}");
-            }
-            serde_json::from_str(&stdout).context("parse gh api issues")
-        }
-    })
-    .await?;
+    let issues = open_issue_rest_inventory(repo_root).await?;
 
     // #787 — human-filed issues first, newest-first within each group. The
     // research pipeline files 3/day and the daily cap is 3, so strict
@@ -1111,6 +1132,14 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     for iss in candidates {
         if owner_controls.paused(&repository,iss.number)? {
             info!(issue=iss.number,"skip: owner-paused; leave intent and accounting unchanged");
+            continue;
+        }
+        if stale_loop::skip_as_stale_red_main(&iss.body) {
+            info!(issue=iss.number,"skip: red-main issue while main is green; resolved, never worked");
+            continue;
+        }
+        if stale_loop::holds(iss.number,chrono::Utc::now().timestamp_millis()) {
+            info!(issue=iss.number,"skip: inside a deterministic-refusal backoff (#2610)");
             continue;
         }
         // An open GitHub issue can outlive its completed workflow. Do not
@@ -1597,11 +1626,47 @@ fn criteria_pr_section(criteria: &[String]) -> String {
     if criteria.is_empty() {
         return String::new();
     }
-    let items: Vec<String> = criteria.iter().map(|c| format!("- {c}")).collect();
+    // #2610: a criterion that is not one trimmed line (the plan lane's
+    // fallback is the whole owner request, e.g. an auto-filed red-main body)
+    // cannot survive the bullet form. Its bullet is display only; the exact
+    // list rides in a machine-readable comment the resume reads back.
+    let exact = criteria.iter().any(|c| !criterion_is_one_line(c));
+    let items: Vec<String> = criteria
+        .iter()
+        .map(|c| if criterion_is_one_line(c) {
+            format!("- {c}")
+        } else {
+            format!("- {}", c.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+        .collect();
+    let encoded = if exact { format!("{}\n", encoded_criteria_line(criteria)) } else { String::new() };
     format!(
-        "\n\n## Acceptance criteria (from the scoping pass)\n{}",
+        "\n\n## Acceptance criteria (from the scoping pass)\n{encoded}{}",
         items.join("\n")
     )
+}
+
+/// #2610 — the machine-readable criteria line. JSON keeps newlines escaped,
+/// and escaping every `-` keeps `-->` inside a criterion from ending the
+/// comment early (a red-main body carries `<!-- red-main -->`).
+const ENCODED_CRITERIA_PREFIX: &str = "<!-- autoship-criteria-json: ";
+const ENCODED_CRITERIA_SUFFIX: &str = " -->";
+
+fn criterion_is_one_line(criterion: &str) -> bool {
+    !criterion.is_empty() && !criterion.contains(['\n', '\r']) && criterion.trim() == criterion
+}
+
+fn encoded_criteria_line(criteria: &[String]) -> String {
+    let json = serde_json::to_string(criteria).expect("a list of strings serializes");
+    format!("{ENCODED_CRITERIA_PREFIX}{}{ENCODED_CRITERIA_SUFFIX}", json.replace('-', "\\u002d"))
+}
+
+fn decode_criteria_line(line: &str) -> Option<Result<Vec<String>>> {
+    let json = line.strip_prefix(ENCODED_CRITERIA_PREFIX)?;
+    Some(json.strip_suffix(ENCODED_CRITERIA_SUFFIX)
+        .context("owner acceptance criteria encoding is truncated; refusing partial requirements")
+        .and_then(|json| serde_json::from_str(json)
+            .context("owner acceptance criteria encoding is malformed; refusing partial requirements")))
 }
 
 /// Preserve acceptance authority verbatim. Bounds refuse the entire input;
@@ -1618,6 +1683,17 @@ fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
         .iter()
         .rposition(|line| line.trim().starts_with("## Acceptance criteria"))
         .unwrap_or(0);
+    // #2610: an exact encoded list right under the heading is authoritative;
+    // its bullets are display only.
+    let heading = lines.get(start).is_some_and(|line| line.trim().starts_with("## Acceptance criteria"));
+    let encoded = lines.iter().skip(start + 1).find(|line| !line.trim().is_empty())
+        .filter(|_| heading).and_then(|line| decode_criteria_line(line.trim()));
+    if let Some(decoded) = encoded {
+        out = decoded?;
+        anyhow::ensure!(out.iter().all(|item| !item.trim().is_empty()),
+            "owner acceptance criteria encoding carries an empty requirement; refusing partial requirements");
+        return bounded_criteria(out);
+    }
     for line in &lines[start..] {
         let t = line.trim();
         if t.starts_with("## Acceptance criteria") {
@@ -1640,6 +1716,10 @@ fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
         anyhow::ensure!(t.starts_with('#'),"owner acceptance criteria contain an unparsed line; refusing partial requirements");
         break;
     }
+    bounded_criteria(out)
+}
+
+fn bounded_criteria(out: Vec<String>) -> Result<Vec<String>> {
     anyhow::ensure!(out.len()<=128 && out.iter().all(|item|item.len()<=4096)
         && out.iter().map(String::len).sum::<usize>()<=32*1024,
         "owner acceptance criteria exceed bounded contract capacity; explicit decomposition is required");
@@ -1868,14 +1948,22 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // #2458: after GitHub merged main into the approved head, the
         // approval recorded at that head reaches the merge commit through
         // the durable update. Resolved before any gate reads approval.
+        let review_mode = crate::autoship_review::ReviewMode::current();
         let carry = match (record.as_ref(), head_sha.as_deref()) {
             (Some(opened), Some(head)) if opened.pr == pr && head != opened.head =>
                 finalize::carried(&workflow::path(), &repository, pr, &opened.head, head),
             _ => None,
-        };
+        // #2588: a nightly review park leaves the record behind the bound head;
+        // the workflow's own pending update then anchors the carry.
+        }.or_else(|| match head_sha.as_deref() {
+            Some(head) if review_mode == crate::autoship_review::ReviewMode::Nightly =>
+                finalize::pending_for_binding(&workflow::path(), &repository, pr, branch, head),
+            _ => None,
+        });
         let approval_head = carry.as_ref().map(|c| c.origin_head.clone()).or_else(|| head_sha.clone());
         let approval = recorded_approval(record.as_ref(), pr, approval_head.as_deref());
-        if !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
+        if review_mode == crate::autoship_review::ReviewMode::PreMerge
+            && !dry_run && !approval.reviewed && head_is_ours(row, owner.as_deref()) == Some(true) {
             if let Some(head) = head_sha.as_deref() {
                 if let Err(error) = review_recovery::observe(&workflow::path(), &repository, issue, pr, branch, head,
                     record.as_ref(), chrono::Utc::now().timestamp_millis()) {
@@ -1888,13 +1976,17 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
         // examined PRs are not yet approved.
         let ours = head_is_ours(row, owner.as_deref());
         let loop_authored = loop_authored(body, issue, pr, approval_head.as_deref(), record.as_ref())
-            || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue));
+            || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue))
+            // #2574: a review park can leave the record behind the pushed
+            // head; the sweep lease then requires the workflow's own binding.
+            || (review_mode == crate::autoship_review::ReviewMode::Nightly
+                && nightly_loop_owned(body, issue, pr, record.as_ref()));
         let mergeable = match row.get("mergeable").and_then(serde_json::Value::as_str) {
             Some("MERGEABLE") => Some(true),
             Some("CONFLICTING") => Some(false),
             _ => None,
         };
-        if let Some(why) = sweep_local_skip(pr, ours, loop_authored, mergeable, approval.reviewed) {
+        if let Some(why) = sweep_local_skip(pr, ours, loop_authored, mergeable, approval.reviewed, review_mode) {
             info!("merge sweep skipped {why}");
             continue;
         }
@@ -1908,8 +2000,12 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             ours,
             loop_authored,
             mergeable,
-            checks_green: checks_green(repo_root, pr).await,
+            // Ratebudget: an unchanged not-green PR is not re-read.
+            checks_green: gh_budget::sweep_checks(pr, gh_budget::ci_fingerprint(row),
+                gh_budget::below_floor(gh_budget::remaining(repo_root).await, gh_budget::floor()),
+                || checks_green(repo_root, pr)).await,
             review_approved: approval.reviewed,
+            review_mode,
             policy: MergePolicy {
                 automerge_enabled: automerge_enabled_value(
                     std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
@@ -1943,7 +2039,13 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
             },
         };
         let candidate_head = head_sha.clone();
-        match sweep_verdict(&candidate) {
+        // #2583: a red draft behind main gets judged as if green, but only so
+        // it can take the main-update step below; it is never merged red.
+        let heal = finalize::heal_by_main_update(
+            review_mode == crate::autoship_review::ReviewMode::Nightly,
+            candidate.checks_green, finalize::merge_state(row));
+        let judged = if heal { SweepCandidate { checks_green: Some(true), ..candidate.clone() } } else { candidate.clone() };
+        match sweep_verdict(&judged) {
             SweepVerdict::Skip(why) => {
                 // Said, not swallowed: a silent skip is indistinguishable from
                 // the sweep being broken.
@@ -1980,7 +2082,7 @@ async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<
                 // #2458: green but BEHIND main under strict protection. Merge
                 // main in with a merge commit; checks rerun on it and a later
                 // tick merges it once green. No worker slot, no model call.
-                if finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
+                if heal || finalize::step(candidate.checks_green, finalize::merge_state(row)) == finalize::Step::UpdateBranch {
                     let main = match sweep_lease.validate_for_main_update(repo_root, pr, &head).await {
                         Ok(main) => main,
                         Err(error) => { warn!(pr, "merge sweep cannot update stale or unowned candidate: {error:#}"); continue; }
@@ -2265,6 +2367,11 @@ struct Approval {
 /// Claude approval satisfied the Codex-only overrides, and the body also
 /// carries model output that can say anything.
 fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
+    // #2574: a deferred verdict approves only while review is nightly; it
+    // never satisfies the Codex-only owner overrides.
+    if let Some(v) = verdict.filter(|v| v.backend == crate::autoship_review::NIGHTLY_DEFERRED) {
+        return Approval { reviewed: v.diff_ok && v.system_ok && review_nightly(), codex: false };
+    }
     let Some(v) = verdict.filter(|v| v.backend == "native" && !v.model.is_empty()) else {
         return Approval::default();
     };
@@ -2280,6 +2387,16 @@ fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
         reviewed: v.diff_ok && v.system_ok,
         codex: v.diff_ok && v.system_ok && v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
     }
+}
+
+fn review_nightly() -> bool {
+    crate::autoship_review::ReviewMode::nightly()
+}
+
+/// #2574 — what the loop records in place of a pre-merge independent verdict.
+fn deferred_verdict() -> RecordedVerdict {
+    let d = crate::autoship_review::NIGHTLY_DEFERRED;
+    RecordedVerdict { provider: d.into(), backend: d.into(), model: d.into(), diff_ok: true, system_ok: true, structured: None }
 }
 
 /// #1076 — the only approval the merge sweep may act on: the verdict the loop
@@ -2562,6 +2679,14 @@ fn loop_authored(
         && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
 }
 
+/// #2574 — provenance without the reviewed-head match: this box opened exactly
+/// this PR and the body carries the loop's signature. Head custody is then
+/// enforced by the sweep lease (workflow binding, or the recorded head).
+fn nightly_loop_owned(body: &str, issue: u64, pr: u64, opened_here: Option<&OpenedPr>) -> bool {
+    opened_here.is_some_and(|rec| rec.pr == pr)
+        && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+}
+
 /// #1029 — every input the auto-merge decision takes, in one place.
 ///
 /// Extracted so the fresh path and the merge sweep share ONE policy. Two
@@ -2637,6 +2762,8 @@ struct SweepCandidate {
     checks_green: Option<bool>,
     /// #1076 — the loop recorded an approving independent verdict for this head.
     review_approved: bool,
+    /// #2574 — `Nightly` merges on green without a pre-merge review.
+    review_mode: crate::autoship_review::ReviewMode,
     policy: MergePolicy,
 }
 
@@ -2654,7 +2781,7 @@ enum SweepVerdict {
 /// verdict applies them. The sweep checks these before reading CI, the diff
 /// or the issue, so an unapproved PR costs no GitHub reads.
 fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable: Option<bool>,
-    review_approved: bool) -> Option<String> {
+    review_approved: bool, mode: crate::autoship_review::ReviewMode) -> Option<String> {
     let skip = |why: &str| Some(format!("PR #{pr}: {why}"));
     if ours != Some(true) {
         return skip("not ours — the loop only finishes work it opened (#1006)");
@@ -2672,15 +2799,36 @@ fn sweep_local_skip(pr: u64, ours: Option<bool>, loop_authored: bool, mergeable:
         Some(false) => return skip("confirmed conflict with main; exact-head integration required"),
         Some(true) => {},
     }
-    if !review_approved {
+    if !review_approved && mode == crate::autoship_review::ReviewMode::PreMerge {
         return skip("no approving independent review recorded by the loop for this head");
     }
     None
 }
 
+/// #2574/#2578 — the merge policy under `AUTOSHIP_REVIEW_MODE=nightly`.
+///
+/// The owner moved independent review after the merge, so green required
+/// checks stand in for it. The gates that only an independent (Codex)
+/// approval could release go with it: the review requirement itself, the
+/// complexity band, and the receipt gate. The receipt gate guards
+/// live-behaviour paths (prompts/skills, the reasoner, email send paths, the
+/// governor, Discord approval loops), not credentials; secret, auth, keyring,
+/// `.env` and lockfile diffs are refused earlier by `is_blast_radius` and never
+/// reach a PR. Everything else stays: the automerge switch, research-filed
+/// issues, and author eligibility. An unreadable diff is still refused by the
+/// caller before this runs.
+fn nightly_merge_policy(p: &MergePolicy) -> MergePolicy {
+    MergePolicy {
+        reviews_approved: true,
+        complexity: Complexity::Simple,
+        receipt_gated_file: None,
+        ..p.clone()
+    }
+}
+
 fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
-    if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved) {
+    if let Some(why) = sweep_local_skip(c.pr, c.ours, c.loop_authored, c.mergeable, c.review_approved, c.review_mode) {
         return SweepVerdict::Skip(why);
     }
     if c.checks_green != Some(true) {
@@ -2700,7 +2848,11 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
              path is unknown; no override applies to an unknown",
         );
     }
-    if !may_automerge(&c.policy) {
+    let policy = match c.review_mode {
+        crate::autoship_review::ReviewMode::PreMerge => c.policy.clone(),
+        crate::autoship_review::ReviewMode::Nightly => nightly_merge_policy(&c.policy),
+    };
+    if !may_automerge(&policy) {
         return skip("the merge policy withholds it (complexity, receipt gate, or author)");
     }
     SweepVerdict::Merge
@@ -2883,6 +3035,18 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
 
 fn acceptance_owner_request(issue:&Issue)->String {
     format!("GitHub issue #{}: {}\n\n{}",issue.number,issue.title,issue.body)
+}
+
+/// #2610 — the plan lane's criterion when the scoping pass wrote none. An
+/// auto-filed red-main body is diagnostics, not requirements: its one
+/// requirement is a green main, said on one line so it round-trips through
+/// the PR body within the contract bounds.
+fn plan_fallback_criterion(issue:&Issue,owner_request:&str)->String {
+    if is_red_main_issue(&issue.body) {
+        return format!("The required CI failure reported in #{} ({}) is fixed at its cause, so main is green again; \
+            no required check, test or assertion is removed or weakened.",issue.number,issue.title.trim());
+    }
+    owner_request.to_owned()
 }
 
 fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
@@ -4241,6 +4405,14 @@ async fn find_resumable_draft(
         }
     }
     retries.extend(plan.tiers.keys().copied());
+    // #2610: a draft whose issue is backing off a deterministic refusal is
+    // not handed out again until the backoff ends.
+    let backoff = stale_loop::load(&stale_loop::path());
+    adopted.retain(|candidate| {
+        let held = candidate.source_issue.is_some_and(|issue| backoff.holds(issue, now));
+        if held { info!(pr=candidate.pr, issue=?candidate.source_issue, "skip: draft inside a deterministic-refusal backoff"); }
+        !held
+    });
     let select = |cursor| {
         if let Some(finishing) = adoption::select_finishing(&adopted, &ledger, utc_day_now(), only, &retries, &plan.tiers) {
             return Some(finishing);
@@ -4466,6 +4638,9 @@ impl IndependentReview {
 
     /// One-line outcome for logs, the dry-run message, and the PR body.
     fn status(&self) -> String {
+        if self.is_deferred() {
+            return "deferred to the nightly post-merge review".into();
+        }
         if !self.available {
             return match &self.why_unavailable {
                 Some(why) => format!("unavailable ({})", why.headline()),
@@ -4491,6 +4666,25 @@ impl IndependentReview {
 
     /// #1488 — Stage 4 never ran because the run parked first. Not a
     /// verdict, and never an approval.
+    /// #2574: review deferred to the nightly post-merge pass. No model call.
+    fn deferred() -> Self {
+        Self {
+            provider: None,
+            model: Some(crate::autoship_review::NIGHTLY_DEFERRED.into()),
+            available: true,
+            diff_ok: true,
+            system_ok: true,
+            notes: String::new(),
+            why_unavailable: None,
+            structured: None,
+        }
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.available && self.provider.is_none()
+            && self.model.as_deref() == Some(crate::autoship_review::NIGHTLY_DEFERRED)
+    }
+
     fn not_run(reason: String) -> Self {
         Self {
             provider: None,
@@ -4524,6 +4718,9 @@ impl IndependentReview {
     fn recorded_verdict(&self) -> Option<RecordedVerdict> {
         if !self.available {
             return None;
+        }
+        if self.is_deferred() {
+            return Some(deferred_verdict());
         }
         Some(RecordedVerdict {
             provider: self.provider?.name().to_string(),
@@ -4789,6 +4986,10 @@ async fn independent_review_with_context(
     workflow: Option<&workflow::WorkflowGuard>,
     acceptance_evidence: Option<(&acceptance::PreparedAcceptance, &acceptance::CandidateReceiptReference)>,
 ) -> IndependentReview {
+    // #2574: merge on green; the nightly pass reviews what merged.
+    if review_nightly() {
+        return IndependentReview::deferred();
+    }
     // Unknown origins need a protected workflow/adoption context before any
     // environment or provider access. Ownership is never inferred from prose.
     if workflow.is_none() {
@@ -5825,15 +6026,7 @@ enum RedMainPlan {
 async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
     let title = red_main_title(red);
     let gh = gh_bin();
-    let listing = fetch_issue_pages(|page| {
-        let gh=gh.clone();
-        async move {
-            let path=format!("repos/{{owner}}/{{repo}}/issues?state=open&per_page=100&sort=created&direction=desc&page={page}");
-            let (ok,out,error)=run(&gh,&["api",&path],repo_root).await?;
-            anyhow::ensure!(ok,"red-main issue lookup failed: {error}");
-            serde_json::from_str(&out).context("red-main issue inventory malformed")
-        }
-    }).await;
+    let listing = open_issue_rest_inventory(repo_root).await.context("red-main issue lookup failed");
     let json=match listing {
         Ok(json)=>json,
         Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
@@ -7891,7 +8084,7 @@ async fn resume_draft_pr(
             &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
         // #2464: no episode ladder in plan mode; review rounds and the #2452
         // cap bound the work.
-        let episode_session = if let Some(prepared_acceptance) = prepared_slot.as_ref() {
+        let episode_session = if let Some(prepared_acceptance) = prepared_slot.as_ref().filter(|_| !independent.is_deferred()) {
         let evaluated = episode::evaluate(&mut workflow,&independent,
             prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
         match &evaluated.decision {
@@ -8600,6 +8793,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         }
     };
     note_current_issue(0); // This run has not committed to an issue yet (#954).
+    stale_loop::note_main_green(false);
     // #2467: with the global daily model budget spent, start no paid work.
     // The merge sweep and finalize run on their own tick and keep going.
     if !dry_run {
@@ -8631,7 +8825,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let lane = lane_from_env();
     let red_main_issue: Option<Issue> = if let Some(issue)=selected_issue {Some(issue)} else { match main_is_red(repo_root).await {
         Err(reason) => return Ok(RunReport::held(format!("optional main diagnostic deferred: {reason}"))),
-        Ok(None) => None,
+        Ok(None) => {
+            // #2610: main is green on its required checks, so any open
+            // red-main issue is for a red that is gone: close it and its
+            // draft, and the picker never works one.
+            stale_loop::note_main_green(true);
+            stale_loop::close_stale_red_main(repo_root, dry_run).await;
+            None
+        }
         Ok(Some(red)) => {
             let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
             let what = if red.failing.is_empty() {
@@ -9019,7 +9220,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     if plan_mode {
         // #2464: one scope call is enough. Bind the plan, criteria and
         // allowed paths and go straight to the build.
-        if criteria.is_empty() { criteria.push(owner_request.clone()); }
+        if criteria.is_empty() { criteria.push(plan_fallback_criterion(&issue,&owner_request)); }
         let scoped_plan = plan_proof::Plan::from_scope(&owner_request, scope.as_ref(), &criteria);
         workflow_guard.bind_plan(&scoped_plan)?;
         workflow_guard.transition(crate::autoship_workflow::Stage::Build, "plan_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
@@ -9553,7 +9754,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             }
             let mut episode_session = None;
             if findings_override.is_none() {
-                if let (Some(review), Some(prepared_acceptance)) = (independent.as_ref(), prepared_slot.as_ref()) {
+                if let (Some(review), Some(prepared_acceptance)) = (independent.as_ref().filter(|r| !r.is_deferred()), prepared_slot.as_ref()) {
                     let evaluated = episode::evaluate(&mut workflow_guard,review,
                         prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
                     match &evaluated.decision {
@@ -11875,6 +12076,8 @@ pub struct AutoPrLoop {
     /// Where the fair-scheduling state persists (#1532); injectable for the
     /// same reason as `counter_path`.
     fair_path: PathBuf,
+    /// #2610: deterministic-refusal backoff per issue; injectable like the rest.
+    refusal_path: PathBuf,
     /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
     clock: LoopClock,
 }
@@ -12398,6 +12601,8 @@ impl AttemptRecord {
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
         ("acceptance infrastructure unavailable", "acceptance verifier infrastructure"),
+        // #2572 — main moved its CI policy past the pinned controller.
+        ("controller rollout pending", "controller CI policy rollout pending"),
         ("shared ci prerequisite unavailable", "shared CI environment prerequisite"),
         ("storage busy:", "storage busy"),
         ("build storage busy; retry admission", "storage busy"),
@@ -12865,6 +13070,7 @@ impl AutoPrLoop {
             counter_path: daily_counter_path(),
             workflow_path: workflow::path(),
             fair_path: fair_sched_path(),
+            refusal_path: stale_loop::path(),
             clock: Arc::new(chrono::Utc::now),
         })
     }
@@ -12892,6 +13098,7 @@ impl AutoPrLoop {
             counter_path: state.join("autopr-daily-runs.json"),
             workflow_path: state.join("autopr-workflow.sqlite3"),
             fair_path: state.join("autopr-fair.json"),
+            refusal_path: state.join("autopr-refusal-backoff.json"),
             clock: Arc::new(chrono::Utc::now),
         }
     }
@@ -12928,6 +13135,16 @@ impl AutoPrLoop {
                     result = review_canary_if_due() => {
                         if let Err(error) = result {
                             warn!("autoship review canary incomplete: {error:#}");
+                        }
+                    }
+                }
+                // #2574: the daily post-merge review shares this hourly,
+                // claim-once-per-day scheduler.
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    result = nightly_review::run_if_due(&canary_root) => {
+                        if let Err(error) = result {
+                            warn!("autoship nightly review incomplete: {error:#}");
                         }
                     }
                 }
@@ -13204,6 +13421,16 @@ impl AutoPrLoop {
                 // fairness before idle/held controls whether this tick stops.
                 // Keep one debt-accounting site next to compute settlement:
                 // paid resumes owe the issue lane a turn; paid builds settle up.
+                // #2610: a refusal that does not change between ticks backs
+                // the issue off (and parks it after a few); progress clears it.
+                match &outcome {
+                    Ok(report) if report.billed && !report.held => stale_loop::record_progress(&self.refusal_path, stale_loop::current_issue()),
+                    Err(error) if error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_none() => {
+                        stale_loop::record_failed_tick(&self.repo_root, &self.refusal_path, stale_loop::current_issue(),
+                            error, (self.clock)().timestamp_millis()).await;
+                    }
+                    _ => {}
+                }
                 if let Ok(report) = &outcome {
                     if report.billed {
                         FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
@@ -17248,6 +17475,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             mergeable: Some(true),
             checks_green: Some(true),
             review_approved: true,
+            review_mode: crate::autoship_review::ReviewMode::PreMerge,
             policy: policy(Complexity::Medium),
         };
         assert_eq!(sweep_verdict(&ready), SweepVerdict::Merge);
@@ -17279,6 +17507,119 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         refuse(|c| c.policy.reviews_approved = false, "policy");
     }
 
+    /// #2574 — nightly mode merges a green, unreviewed loop-owned draft;
+    /// pre-merge mode still refuses it; red, pending, unknown, conflicting,
+    /// foreign or policy-withheld drafts never merge in either mode.
+    #[test]
+    fn nightly_mode_merges_green_unreviewed_drafts_and_pre_merge_does_not() {
+        use crate::autoship_review::ReviewMode::{Nightly, PreMerge};
+        let mut unreviewed = policy(Complexity::Medium);
+        unreviewed.reviews_approved = false;
+        unreviewed.codex_approved = false;
+        let draft = SweepCandidate {
+            pr: 2574, issue: 2270, ours: Some(true), loop_authored: true,
+            mergeable: Some(true), checks_green: Some(true), review_approved: false,
+            review_mode: Nightly, policy: unreviewed,
+        };
+        assert_eq!(sweep_verdict(&draft), SweepVerdict::Merge, "nightly: green + unreviewed merges");
+        let pre = SweepCandidate { review_mode: PreMerge, ..draft.clone() };
+        assert!(matches!(sweep_verdict(&pre), SweepVerdict::Skip(why) if why.contains("no approving independent review")));
+        for mode in [Nightly, PreMerge] {
+            for checks in [Some(false), None] {
+                let red = SweepCandidate { review_mode: mode, checks_green: checks, ..draft.clone() };
+                assert!(matches!(sweep_verdict(&red), SweepVerdict::Skip(_)), "{mode:?} {checks:?}");
+            }
+            for mutate in [
+                (|c: &mut SweepCandidate| c.mergeable = None) as fn(&mut SweepCandidate),
+                |c| c.mergeable = Some(false),
+                |c| c.ours = Some(false),
+                |c| c.loop_authored = false,
+                |c| c.policy.automerge_enabled = false,
+                |c| c.policy.research_filed = true,
+                |c| c.policy.issue_author = "a-stranger".into(),
+                |c| c.policy.receipt_gated_file = Some(UNREADABLE_DIFF.into()),
+            ] {
+                let mut c = SweepCandidate { review_mode: mode, review_approved: true, ..draft.clone() };
+                c.policy.reviews_approved = true;
+                mutate(&mut c);
+                assert!(matches!(sweep_verdict(&c), SweepVerdict::Skip(_)), "{mode:?}");
+            }
+        }
+    }
+
+    /// #2578 — nightly: green required checks stand in for the Codex approval
+    /// that complexity and receipt-gated paths needed, so a hard or
+    /// receipt-gated green loop draft merges. Pre-merge still withholds both.
+    #[test]
+    fn nightly_merges_complex_and_receipt_gated_green_drafts_pre_merge_does_not() {
+        use crate::autoship_review::ReviewMode::{Nightly, PreMerge};
+        let mut unreviewed = policy(Complexity::Simple);
+        unreviewed.reviews_approved = false;
+        unreviewed.codex_approved = false;
+        let draft = SweepCandidate {
+            pr: 2564, issue: 1788, ours: Some(true), loop_authored: true,
+            mergeable: Some(true), checks_green: Some(true), review_approved: false,
+            review_mode: Nightly, policy: unreviewed,
+        };
+        let mut hard = draft.clone();
+        hard.policy.complexity = Complexity::Hard;
+        let mut gated = draft.clone();
+        gated.policy.receipt_gated_file = Some("crates/augmentagent-channel-core/src/reasoner.rs".into());
+        let mut both = hard.clone();
+        both.policy.receipt_gated_file = gated.policy.receipt_gated_file.clone();
+        for c in [&hard, &gated, &both] {
+            assert_eq!(sweep_verdict(c), SweepVerdict::Merge, "nightly merges on green: {:?}", c.policy);
+            // Pre-merge, even with a recorded non-Codex approval, still withholds.
+            let mut pre = SweepCandidate { review_mode: PreMerge, review_approved: true, ..c.clone() };
+            pre.policy.reviews_approved = true;
+            assert!(matches!(sweep_verdict(&pre), SweepVerdict::Skip(why) if why.contains("merge policy withholds")),
+                "pre-merge unchanged: {:?}", pre.policy);
+            // Nightly still needs green checks and the loop's own authorship.
+            let red = SweepCandidate { checks_green: Some(false), ..c.clone() };
+            assert!(matches!(sweep_verdict(&red), SweepVerdict::Skip(_)));
+            let mut foreign = c.clone();
+            foreign.policy.issue_author = "a-stranger".into();
+            assert!(matches!(sweep_verdict(&foreign), SweepVerdict::Skip(why) if why.contains("merge policy withholds")));
+        }
+    }
+
+    /// #2574 — the mode defaults to nightly; an unknown value fails closed.
+    #[test]
+    fn review_mode_defaults_to_nightly_and_unknown_fails_closed() {
+        use crate::autoship_review::ReviewMode;
+        assert_eq!(ReviewMode::parse(None), ReviewMode::Nightly);
+        assert_eq!(ReviewMode::parse(Some(" Nightly ")), ReviewMode::Nightly);
+        assert_eq!(ReviewMode::parse(Some("pre-merge")), ReviewMode::PreMerge);
+        assert_eq!(ReviewMode::parse(Some("nightyl")), ReviewMode::PreMerge);
+    }
+
+    /// #2574 — the deferred verdict approves only while the mode is nightly,
+    /// never unlocks the Codex-only overrides, and the lanes skip the model.
+    #[tokio::test]
+    async fn deferred_verdict_approves_only_in_nightly_mode() {
+        use crate::autoship_review::{ReviewMode, ReviewModeGuard};
+        let deferred = IndependentReview::deferred();
+        let record = OpenedPr { pr: 9, head: "a".repeat(40), verdict: deferred.recorded_verdict() };
+        {
+            let _mode = ReviewModeGuard::set(ReviewMode::Nightly);
+            assert!(deferred.approved() && !deferred.codex_approved());
+            assert!(recorded_approval(Some(&record), 9, Some(&"a".repeat(40))).reviewed);
+            assert_eq!(deferred.outcome(), ReviewOutcome::Approved);
+            assert!(deferred.notes.is_empty(), "no findings comment is posted");
+            let dir = tempfile::tempdir().unwrap();
+            let builder = augmentagent_channel_core::FallbackReasoner::for_tests(vec![],
+                augmentagent_channel_core::CooldownLatch::at(dir.path().join("cooldown.json")));
+            let issue = Issue { number: 1, title: "t".into(), body: String::new(), author: "o".into(),
+                author_trusted: true, research_filed: false };
+            let review = independent_review_with_context(&builder, &issue, dir.path().join("none"), &[],
+                true, "", 0, None, 0, None, None).await;
+            assert!(review.is_deferred(), "nightly mode never calls the independent reviewer");
+        }
+        let _mode = ReviewModeGuard::set(ReviewMode::PreMerge);
+        assert!(!deferred.approved(), "switching back to pre-merge revokes deferred approvals");
+        assert!(!recorded_approval(Some(&record), 9, Some(&"a".repeat(40))).reviewed);
+    }
+
     /// Codex: `head_is_ours` proves the head is in THIS repository, which is
     /// a weaker claim than "the loop opened this". A human can create
     /// `agent-fix/issue-N` here by hand, put two approval strings in the body,
@@ -17307,6 +17648,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             mergeable: Some(true),
             checks_green: Some(true),
             review_approved: true,
+            review_mode: crate::autoship_review::ReviewMode::PreMerge,
             policy: policy(Complexity::Simple),
         };
         match sweep_verdict(&stale) {
@@ -17767,6 +18109,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             mergeable: Some(true),
             checks_green: Some(true),
             review_approved: approval.reviewed,
+            review_mode: crate::autoship_review::ReviewMode::PreMerge,
             policy: p,
         }
     }
@@ -17965,6 +18308,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             mergeable: Some(true),
             checks_green: Some(true),
             review_approved: true,
+            review_mode: crate::autoship_review::ReviewMode::PreMerge,
             policy: policy(Complexity::Simple),
         };
         unknown.policy.receipt_gated_file = Some(UNREADABLE_DIFF.to_string());
@@ -19571,8 +19915,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn pick_issue(repo_root: &Path").expect("pick_issue");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        assert!(body.contains("fetch_issue_pages("), "paginated (#1519)");
-        assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
+        // The paginated listing is now shared per tick (#2584).
+        assert!(body.contains("open_issue_rest_inventory("), "shared inventory");
+        let start = src.find("async fn open_issue_rest_inventory(").expect("inventory");
+        let inventory = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        assert!(inventory.contains("fetch_issue_pages("), "paginated (#1519)");
+        assert!(!body.contains("per_page=50") && !inventory.contains("per_page=50"),
+            "the newest-50 window is gone");
     }
 
     #[test]

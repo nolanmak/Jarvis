@@ -113,6 +113,40 @@ def run_matches(run, repository, head, event, path):
             and str(run.get('repository', {}).get('full_name', '')).casefold() == repository.casefold())
 
 
+RATE_LIMITED = 'GitHub rate limit exceeded; hosted CI evidence deferred'
+
+
+def rate_limited(stderr):
+    text = (stderr or '').casefold()
+    return 'rate limit' in text or 'secondary rate' in text
+
+
+class Cache:
+    """Controller-held answers to reads that cannot change: file bytes at a
+    commit SHA, a PR's changed paths at an exact head/base pair, and the jobs
+    of a completed run attempt. The controller passes prior answers in and
+    keeps `updates`; mutable state (PR identity, run inventory, required
+    branch checks) is always read fresh. Policy hashes are still compared on
+    every observation, so a cached read never certifies anything by itself."""
+    def __init__(self, known=None):
+        self.known = dict(known or {})
+        self.updates = {}
+
+    @staticmethod
+    def key(kind, repository, ref, *rest):
+        if not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', str(ref)):
+            return None
+        return ':'.join([kind, repository.casefold(), str(ref), *map(str, rest)])
+
+    def get(self, key):
+        return self.known.get(key) if key else None
+
+    def put(self, key, value):
+        if key:
+            self.known[key] = value
+            self.updates[key] = value
+
+
 class GitHub:
     def __init__(self, binary):
         self.binary = binary
@@ -120,6 +154,9 @@ class GitHub:
     def api(self, endpoint):
         done = subprocess.run([self.binary, 'api', endpoint], capture_output=True, text=True, timeout=30)
         if done.returncode:
+            # A spent quota is not evidence about the PR: the caller defers.
+            if rate_limited(done.stderr):
+                raise ValueError(RATE_LIMITED)
             raise ValueError('GitHub evidence unavailable')
         return json.loads(done.stdout)
 
@@ -154,7 +191,8 @@ class GitHub:
         raise ValueError('GitHub evidence pagination incomplete')
 
 
-def evaluate(request, github):
+def evaluate(request, github, cache=None):
+    cache = cache if cache is not None else Cache()
     repository = request['repository']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
         raise ValueError('invalid repository')
@@ -169,22 +207,30 @@ def evaluate(request, github):
         raise ValueError('PR source identity unavailable')
     changed = []
     if pull:
-        files = github.pages(f'{prefix}/pulls/{pr}/files')
-        if len(files) != pull['changed_files'] or len(files) >= 3000:
-            raise ValueError('PR changed paths incomplete')
-        changed = [f['filename'] for f in files]
-        changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
+        key = cache.key('files', repository, head, pr, pull['base']['sha'])
+        changed = cache.get(key)
+        if not isinstance(changed, list):
+            files = github.pages(f'{prefix}/pulls/{pr}/files')
+            if len(files) != pull['changed_files'] or len(files) >= 3000:
+                raise ValueError('PR changed paths incomplete')
+            changed = [f['filename'] for f in files]
+            changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
+            cache.put(key, changed)
     else:
         if not on_main(github, prefix, head):
             raise ValueError('main source moved')
     if not pull:
         # The commit API exposes the diff to the first parent, including the
         # complete PR diff for the protected merge commits used by autoship.
-        files = github.pages(f'{prefix}/commits/{head}', 'files')
-        if len(files) >= 3000:
-            raise ValueError('main changed paths incomplete')
-        changed = [f['filename'] for f in files]
-        changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
+        key = cache.key('commitfiles', repository, head)
+        changed = cache.get(key)
+        if not isinstance(changed, list):
+            files = github.pages(f'{prefix}/commits/{head}', 'files')
+            if len(files) >= 3000:
+                raise ValueError('main changed paths incomplete')
+            changed = [f['filename'] for f in files]
+            changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
+            cache.put(key, changed)
     contract = request['contract']
     # Bind the actual executed workflow and helper bytes to controller policy.
     # Changes to CI policy wait for a reviewed controller rollout, rather than
@@ -199,10 +245,15 @@ def evaluate(request, github):
         refs.add(pull['base']['sha'])
     for ref in refs:
         for path, expected in policy.items():
-            content = github.api(f'{prefix}/contents/{path}?ref={ref}')
-            if content.get('encoding') != 'base64' or content.get('type') != 'file':
-                raise ValueError('CI policy source unavailable')
-            if hashlib.sha256(base64.b64decode(content['content'])).hexdigest() != expected:
+            key = cache.key('contents', repository, ref, path)
+            digest = cache.get(key)
+            if not isinstance(digest, str):
+                content = github.api(f'{prefix}/contents/{path}?ref={ref}')
+                if content.get('encoding') != 'base64' or content.get('type') != 'file':
+                    raise ValueError('CI policy source unavailable')
+                digest = hashlib.sha256(base64.b64decode(content['content'])).hexdigest()
+                cache.put(key, digest)
+            if digest != expected:
                 raise ValueError('CI policy changed; reviewed controller rollout required')
     expected = expected_jobs(contract, changed, event)
     # These two always run and cannot disappear with path filters.
@@ -227,7 +278,14 @@ def evaluate(request, github):
             continue
         run = max(runs, key=lambda r: r['id'])
         # filter=latest includes the newest incarnation of each job.
-        jobs = github.pages(f"{prefix}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs')
+        # A completed attempt's jobs are final; a re-run is a new attempt.
+        key = cache.key('jobs', repository, head, run['id'], run.get('run_attempt'))
+        jobs = cache.get(key)
+        if not isinstance(jobs, list):
+            jobs = github.pages(f"{prefix}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs')
+            if run.get('status') == 'completed' and jobs and all(j.get('status') == 'completed' for j in jobs):
+                cache.put(key, [{k: j.get(k) for k in ('id', 'name', 'status', 'conclusion', 'html_url',
+                                                       'run_id', 'head_sha', 'run_attempt')} for j in jobs])
         if any(j.get('run_id') != run['id'] or j.get('head_sha') != head
                or not isinstance(j.get('run_attempt'), int)
                or not 1 <= j['run_attempt'] <= run['run_attempt'] for j in jobs):
@@ -247,8 +305,8 @@ def evaluate(request, github):
     if pull:
         done = subprocess.run([github.binary, 'pr', 'checks', str(pr), '--repo', repository,
                                '--required', '--json', 'name,state'], capture_output=True, text=True, timeout=30)
-        if done.returncode not in (0, 1, 8):
-            raise ValueError('required branch checks unavailable')
+        if done.returncode not in (0, 1, 8) or (done.returncode and rate_limited(done.stderr)):
+            raise ValueError(RATE_LIMITED if rate_limited(done.stderr) else 'required branch checks unavailable')
         checks = json.loads(done.stdout)
         if not checks:
             raise ValueError('required branch checks unavailable')
@@ -263,11 +321,15 @@ def evaluate(request, github):
 
 
 def main():
+    cache = Cache()
     try:
         request = json.load(sys.stdin)
-        result = evaluate(request, GitHub(request['gh']))
+        cache = Cache(request.get('cache') if isinstance(request.get('cache'), dict) else {})
+        result = evaluate(request, GitHub(request['gh']), cache)
     except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
         result = {'state': 'unknown', 'reason': str(error)}
+    # Immutable reads made before a deferral still save the next observation.
+    result['cache_updates'] = cache.updates
     print(json.dumps(result, separators=(',', ':')))
 
 

@@ -252,10 +252,7 @@ async fn sweep_inner(repo: &Path, provided: Option<&Value>, dry_run: bool) -> Re
     let inventory = if let Some(rows) = provided {
         rows.clone()
     } else {
-        fetch_issue_pages(|page|async move {
-            let (ok,raw,error)=run(&gh_bin(),&["api",&format!("repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}&sort=created&direction=desc&page={page}")],repo).await?;
-            anyhow::ensure!(ok,"legacy issue inventory unavailable: {}",truncate(&error,200));Ok(serde_json::from_str(&raw)?)
-        }).await?
+        open_issue_rest_inventory(repo).await.context("legacy issue inventory unavailable")?
     };
     let allowlist = trusted_authors(repo).await;
     let rows = inventory

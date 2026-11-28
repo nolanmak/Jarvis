@@ -30,6 +30,47 @@ pub(super) struct Evidence {
     pub reason: String,
     #[serde(default)]
     pub receipts: Vec<Value>,
+    /// Ratebudget: immutable reads the reader made (see `Cache` in the
+    /// reader). Kept in [`IMMUTABLE`] for later observations.
+    #[serde(default)]
+    pub cache_updates: serde_json::Map<String, Value>,
+}
+
+impl Evidence {
+    /// Evidence that was not read: deferred, never a verdict.
+    pub(super) fn deferred(reason: &str) -> Self {
+        Self { state: "unknown".into(), head: String::new(), failures: Vec::new(),
+            reason: reason.into(), receipts: Vec::new(), cache_updates: Default::default() }
+    }
+}
+
+/// Ratebudget: answers to reads that cannot change, handed back to the
+/// reader on every observation. Keys bind the repository and an exact commit
+/// SHA (or a completed run attempt), so a stale entry is impossible; the
+/// bound only limits memory. The reader still compares every policy hash.
+static IMMUTABLE: std::sync::Mutex<Option<serde_json::Map<String, Value>>> = std::sync::Mutex::new(None);
+const IMMUTABLE_BOUND: usize = 8_192;
+
+fn immutable_snapshot() -> serde_json::Map<String, Value> {
+    IMMUTABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().unwrap_or_default()
+}
+
+fn remember_immutable(updates: &serde_json::Map<String, Value>) {
+    if updates.is_empty() { return; }
+    let mut cache = IMMUTABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = cache.get_or_insert_with(Default::default);
+    if cache.len() + updates.len() > IMMUTABLE_BOUND { cache.clear(); }
+    cache.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+}
+
+/// An optional observation (CI repair diagnosis, integration wait): stands
+/// down inside the merge reserve and reports deferred evidence instead.
+pub(super) async fn observe_optional(root: &Path, pr: u64) -> Result<Evidence> {
+    let remaining = gh_budget::remaining(root).await;
+    match gh_budget::unless_reserved(remaining, "hosted CI diagnosis", || observe(root, Some(pr), None)).await {
+        Some(evidence) => evidence,
+        None => Ok(Evidence::deferred(gh_budget::RESERVED)),
+    }
 }
 
 /// This is a publication preflight, never a passing CI receipt. No candidate
@@ -47,6 +88,9 @@ pub(super) async fn preflight(
                 "index_tree":tree,"main":dependency.main,"shipping_authority":false}))?;
             return Err(dependency.into());
         }
+        if main_outpaces_controller(root).await {
+            return Err(error.context(CONTROLLER_ROLLOUT_PENDING));
+        }
         return Err(error);
     }
     audit.record_controller(
@@ -54,6 +98,19 @@ pub(super) async fn preflight(
         "backend":"github-actions", "shipping_authority":false}),
     )?;
     Err(AwaitingHostedCi.into())
+}
+
+/// #2572: origin/main itself fails this controller's reviewed CI policy, so
+/// no candidate can pass until the controller (the autoship pin) is rolled.
+/// `infra_failure_reason` reads this as a bounded wait, never a repair round.
+pub(super) const CONTROLLER_ROLLOUT_PENDING: &str =
+    "controller rollout pending: origin/main no longer matches this controller's reviewed CI policy; move the autoship pin";
+
+async fn main_outpaces_controller(root: &Path) -> bool {
+    match shared_ci::git(root, &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]).await {
+        Ok(main) => policy_check(root, main.trim()).await.is_err(),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +141,12 @@ async fn policy_check(root: &Path, tree: &str) -> Result<()> {
     .await?;
     let expected: std::collections::BTreeSet<_> = workflows.keys().map(String::as_str).collect();
     let actual: std::collections::BTreeSet<_> = actual.lines().collect();
+    // The inventory is compared against the contract compiled into the running
+    // controller, so once `main`'s set of workflows and the deployed binary
+    // disagree every candidate on top of `main` is refused here, whatever it
+    // changed. A branch whose `.github/workflows` and `scripts/ci-contract.json`
+    // match `main` byte for byte is never the cause: the remedy is rolling out
+    // a controller built from the reviewed `main`, not editing the candidate.
     anyhow::ensure!(
         actual == expected,
         "hosted CI workflow inventory changed; reviewed controller rollout required"
@@ -181,6 +244,7 @@ async fn observe_with(
     use tokio::io::AsyncWriteExt;
     let private = tempfile::tempdir()?;
     let request = serde_json::json!({"gh":gh,"repository":repository,"pr":pr,"head":head,
+        "cache":immutable_snapshot(),
         "contract":serde_json::from_str::<Value>(CONTRACT)?,
         "policy_files":{"scripts/ci-contract.py":format!("{:x}",Sha256::digest(RUNNER)),
             "scripts/ci-apt-install.py":format!("{:x}",Sha256::digest(APT_INSTALLER)),
@@ -207,7 +271,9 @@ async fn observe_with(
         output.status.success(),
         "GitHub CI evidence reader unavailable"
     );
-    serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")
+    let evidence: Evidence = serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")?;
+    remember_immutable(&evidence.cache_updates);
+    Ok(evidence)
 }
 
 pub(super) fn job_diagnostics(log: &str) -> String {
@@ -638,6 +704,52 @@ mod tests {
         let wrong=serde_json::json!([{"number":2054,"title":"main is red at abc1234: workspace does not build","body":format!("{RED_MAIN_MARKER}\n`abc1234different`"),"labels":[]}]);
         assert_eq!(red_main_repair_lookup(&wrong,&changed),None);
     }
+    /// Ratebudget regression: the second observation of an unchanged PR head
+    /// makes no policy-content or changed-path reads; the cache hit avoids
+    /// them. Mutable identity (PR, run inventory) is still read fresh.
+    #[tokio::test]
+    async fn second_observation_reuses_immutable_policy_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        let gh = dir.path().join("gh");
+        let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let head = "e".repeat(40);
+        let base = "f".repeat(40);
+        let script = format!(r#"#!/usr/bin/env python3
+import base64, json, sys
+args = sys.argv[1:]
+open({log:?}, 'a').write(' '.join(args) + '\n')
+if args[0] == 'pr':
+    print(json.dumps([{{'name': 'rust', 'state': 'PENDING'}}])); sys.exit(8)
+endpoint = args[1]
+if '/contents/' in endpoint:
+    path = endpoint.split('/contents/', 1)[1].split('?', 1)[0]
+    print(json.dumps({{'type': 'file', 'encoding': 'base64', 'content': base64.b64encode(open({repo:?} + '/' + path, 'rb').read()).decode()}}))
+elif '/files' in endpoint:
+    print(json.dumps([{{'filename': 'src/a.rs'}}]))
+elif '/actions/runs?' in endpoint:
+    print(json.dumps({{'total_count': 0, 'workflow_runs': []}}))
+elif '/pulls/' in endpoint:
+    print(json.dumps({{'head': {{'sha': {head:?}}}, 'base': {{'sha': {base:?}, 'ref': 'main', 'repo': {{'full_name': 'ratebudget/fixture'}}}}, 'state': 'open', 'changed_files': 1}}))
+else:
+    sys.exit(1)
+"#, log = log.to_str().unwrap());
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let observe = || observe_with(dir.path(), gh.to_str().unwrap(), "ratebudget/fixture", Some(7), None);
+        let first = observe().await.unwrap();
+        assert_eq!(first.state, "pending", "{}", first.reason);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("/contents/"), "{calls}");
+        std::fs::write(&log, "").unwrap();
+        let second = observe().await.unwrap();
+        assert_eq!(second.state, "pending", "{}", second.reason);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("/contents/") && !calls.contains("/files"), "cache hit still read: {calls}");
+        assert!(calls.contains("/actions/runs?") && calls.contains("pulls/7"), "{calls}");
+    }
+
     #[test]
     fn hosted_policy_covers_linux_missing_checks_reruns_and_exact_identity() {
         let result = std::process::Command::new("/usr/bin/python3")
@@ -790,6 +902,36 @@ mod tests {
         );
     }
 
+    /// #2572: #2566 added `.github/workflows/security.yml` to main while the
+    /// pinned worker still carried the older contract. Every candidate that
+    /// contained main then failed preflight with "workflow inventory changed",
+    /// and the gate spent repair rounds pushing empty commits for a failure
+    /// no candidate can fix. Main failing this controller's own policy is a
+    /// controller-rollout wait: bounded infrastructure, never a code repair,
+    /// and still never a passing gate.
+    #[tokio::test]
+    async fn main_ahead_of_the_controller_policy_is_a_rollout_wait_not_a_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        retained_policy_fixture(&root).await;
+        policy_git(&root, &["checkout", "-q", "-f", "main"]).await;
+        let workflow = root.join(".github/workflows/security-scan-fixture.yml");
+        std::fs::write(&workflow, "name: security\non: [pull_request]\n").unwrap();
+        let main = commit_policy_fixture(&root, "main adds a workflow the controller has not reviewed").await;
+        policy_git(&root, &["update-ref", "refs/remotes/origin/main", &main]).await;
+        policy_git(&root, &["checkout", "-q", "-b", "merged-candidate", &main]).await;
+        std::fs::write(root.join("product"), "fix merged with current main").unwrap();
+        policy_git(&root, &["add", "product"]).await;
+        let audit = test_resource_audit(directory.path());
+        let error = preflight(&root, &audit).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(error.downcast_ref::<AwaitingHostedCi>().is_none(), "stale controller must not grant verification: {text}");
+        assert!(error.downcast_ref::<MainPolicyReconciliation>().is_none(), "merging main cannot cure it: {text}");
+        assert_eq!(super::super::infra_failure_reason(&text), Some("controller CI policy rollout pending"),
+            "a controller behind main is a bounded wait: {text}");
+        assert!(!super::super::gate_repair_wanted(0, 3, &text, false), "no repair round for a controller rollout: {text}");
+    }
+
     #[tokio::test]
     async fn candidate_policy_edits_cannot_masquerade_as_inherited_drift() {
         use sha2::{Digest, Sha256};
@@ -817,6 +959,9 @@ mod tests {
             "candidate edits must not be called inherited policy"
         );
         assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());
+        // #2572: main still matches the controller, so the candidate's own
+        // edit is code the builder must answer for, never a rollout wait.
+        assert_eq!(super::super::infra_failure_reason(&format!("{error:#}")), None);
     }
     #[tokio::test]
     async fn unreviewed_main_policy_cannot_supply_reconciliation_authority() {

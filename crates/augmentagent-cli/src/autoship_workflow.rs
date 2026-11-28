@@ -144,7 +144,7 @@ pub use verification_retry::{VerificationDomain, HOSTED_CI_PENDING_REASON, RESCO
     RESCOPE_STOP_REASON, RESCOPE_STOP_REQUEST_EVIDENCE};
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
-pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
+pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed, merge_response_refused};
 pub use merge_escalation::UnresolvedMergeHold;
 pub use deployment_progress::{DeploymentOutcome, DeploymentReceipt};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
@@ -1238,8 +1238,13 @@ impl WorkflowStore {
                 }
             }
         }
+        // #2574: with review moved to the nightly pass, a review park's
+        // backoff no longer gates the free merge sweep (it still checks green).
+        let review_park_released = purpose == ClaimPurpose::MergeReconciliation
+            && crate::autoship_review::ReviewMode::nightly()
+            && crate::autoship_review::review_park(cp.stage == Stage::Review, &cp.next.reason);
         if leased > now_ms
-            || cp.next.eligible_at_ms > now_ms
+            || (cp.next.eligible_at_ms > now_ms && !review_park_released)
             || matches!(cp.stage, Stage::Merged | Stage::Retired)
         {
             return Ok(None);
@@ -2793,6 +2798,34 @@ mod tests {
         assert!(store.pending_operations(&lease.workflow).unwrap().is_empty());
         assert!(store.claim_productive(&lease.workflow,"command",30,1000).unwrap().is_none(),"completed operation hid uncertain merge dispatch");
         assert!(store.claim_reconciliation(&lease.workflow,"sweep",30,1000).unwrap().is_none(),"free claim bypassed uncertain dispatch");
+    }
+
+    /// #2574 — nightly mode releases a review park's backoff to the free
+    /// merge sweep, but never an owner hold, a retired workflow, a non-review
+    /// backoff, or pre-merge mode.
+    #[test]
+    fn nightly_releases_review_parks_to_the_sweep_but_not_holds() {
+        use crate::autoship_review::{ReviewMode, ReviewModeGuard};
+        let case = |mode: ReviewMode, stage: Stage, reason: &str, pause: bool| {
+            let _mode = ReviewModeGuard::set(mode);
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, lease) = setup(&dir.path().join("state.db"));
+            let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage = stage;
+            checkpoint.next = NextAction { reason: reason.into(), action: "x".into(), eligible_at_ms: 1_000_000 };
+            store.checkpoint(&lease, &checkpoint, 30).unwrap();
+            store.release(&lease, 31).unwrap();
+            if pause { store.set_owner_pause(&lease.workflow, "github:owner", 0, true, 32).unwrap(); }
+            store.claim_reconciliation(&lease.workflow, "sweep", 40, 1000).unwrap().is_some()
+        };
+        use ReviewMode::{Nightly, PreMerge};
+        assert!(case(Nightly, Stage::Review, "review-recovery-required", false));
+        assert!(case(Nightly, Stage::Scope, "review_attempts_exhausted_backoff", false));
+        assert!(case(Nightly, Stage::Review, "resource_capacity", false));
+        assert!(!case(Nightly, Stage::Build, "resource_capacity", false), "non-review capacity wait");
+        assert!(!case(Nightly, Stage::Review, "review-recovery-required", true), "owner hold");
+        assert!(!case(Nightly, Stage::Retired, "review-recovery-required", false), "retired");
+        assert!(!case(PreMerge, Stage::Review, "review-recovery-required", false), "pre-merge unchanged");
     }
 
     #[test]
