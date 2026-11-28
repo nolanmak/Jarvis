@@ -14,8 +14,10 @@
 //   - getDashboardPort():   single source for the port.
 //   - resolveApiKey():      fail-closed local mode — load or generate+persist a
 //                           key on first run and log it once.
-//   - requireAuth:          local browser access; key/session for other clients.
-//   - loginHandler:         exchanges a valid key for a session cookie.
+//   - requireAuth:          local browser access; key/session for other clients,
+//                           or key/Access JWT when Access mode is on (#2708).
+//   - loginHandler:         exchanges a valid key for a session cookie (off in
+//                           Access mode).
 //   - hostOriginGuard:      Host allow-list (anti DNS-rebinding) + Origin/Referer
 //                           allow-list on state-changing methods (anti CSRF).
 //   - contentSecurityPolicy: strict CSP header.
@@ -23,6 +25,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import { getConfig, setConfig } from "./db";
+import { accessConfigFromEnv, jwtKid, JwksCache, JwksUnavailableError, verifyAccessJwt, type AccessConfig } from "./web/cfAccess";
 
 export const MODE = (process.env.MODE || "local").toLowerCase();
 
@@ -186,9 +189,73 @@ function isLocalBrowser(req: Request): boolean {
   return true;
 }
 
+// --- Access mode (spec D6) -------------------------------------------------
+//
+// When AUGMENTAGENT_CF_ACCESS_{AUD,TEAM_DOMAIN,EMAILS} are all set, a request
+// needs a valid Cf-Access-Jwt-Assertion, the API key, or the loopback admit.
+// The session cookie and /login are off. Partial config refuses to start.
+
+/** Call at startup; throws on partial Access config. */
+export function assertAccessConfig(): void {
+  accessConfigFromEnv(process.env);
+}
+
+let accessJwks: { teamDomain: string; cache: JwksCache } | null = null;
+
+function jwksFor(teamDomain: string): JwksCache {
+  if (!accessJwks || accessJwks.teamDomain !== teamDomain) {
+    accessJwks = { teamDomain, cache: new JwksCache({ teamDomain }) };
+  }
+  return accessJwks.cache;
+}
+
+/** Drop cached Access keys (tests). */
+export function resetAccessJwksCache(): void {
+  accessJwks = null;
+}
+
+/** A rejected top-level navigation goes to the Access login; everything else
+ *  (API, htmx, SSE) gets 401 JSON so the page can reload through the login. */
+function rejectAccess(req: Request, res: Response, cfg: AccessConfig): void {
+  const navigate =
+    req.header("sec-fetch-mode") === "navigate" &&
+    !req.header("hx-request") &&
+    !(req.header("accept") || "").includes("text/event-stream");
+  if (navigate) {
+    const host = (req.header("host") || "").toLowerCase();
+    res.redirect(302, `https://${cfg.teamDomain}/cdn-cgi/access/login/${host}`);
+    return;
+  }
+  res.status(401).json({ error: "authentication required" });
+}
+
+function requireAccessJwt(req: Request, res: Response, next: NextFunction, cfg: AccessConfig): void {
+  const token = (req.header("cf-access-jwt-assertion") || "").trim();
+  const kid = token ? jwtKid(token) : null;
+  if (!kid) {
+    rejectAccess(req, res, cfg);
+    return;
+  }
+  jwksFor(cfg.teamDomain)
+    .keysFor(kid)
+    .then((keys) => {
+      if (verifyAccessJwt(token, { ...cfg, now: Date.now(), keys }).ok) next();
+      else rejectAccess(req, res, cfg);
+    })
+    .catch((err) => {
+      if (err instanceof JwksUnavailableError) {
+        console.warn(`[security] ${err.message}`);
+        res.status(503).json({ error: "access keys unavailable" });
+        return;
+      }
+      next(err);
+    });
+}
+
 /** Auth middleware applied to BOTH routers. Accepts a Bearer/x-api-key header
- *  (machine clients) OR a valid signed session cookie (browser). Fail-closed:
- *  remote and machine requests always need credentials; local browsers do not. */
+ *  (machine clients) OR a valid signed session cookie (browser), or in Access
+ *  mode a valid Access JWT instead of the cookie. Fail-closed: remote and
+ *  machine requests always need credentials; local browsers do not. */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (isLocalBrowser(req)) {
     next();
@@ -199,6 +266,12 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   const token = bearerToken(req);
   if (token && constantTimeEqual(token, key)) {
     next();
+    return;
+  }
+
+  const access = accessConfigFromEnv(process.env);
+  if (access) {
+    requireAccessJwt(req, res, next, access);
     return;
   }
 
@@ -224,6 +297,10 @@ export function loginPageHandler(req: Request, res: Response): void {
     res.redirect("/");
     return;
   }
+  if (accessConfigFromEnv(process.env)) {
+    res.status(404).json({ error: "cookie login is off in Access mode" });
+    return;
+  }
   res
     .status(200)
     .type("html")
@@ -240,6 +317,10 @@ export function loginPageHandler(req: Request, res: Response): void {
 }
 
 export function loginSubmitHandler(req: Request, res: Response): void {
+  if (accessConfigFromEnv(process.env)) {
+    res.status(404).json({ error: "cookie login is off in Access mode" });
+    return;
+  }
   const provided = String((req.body && req.body.key) || "").trim();
   const key = resolveApiKey();
   if (!provided || !constantTimeEqual(provided, key)) {
