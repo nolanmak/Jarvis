@@ -301,11 +301,13 @@ impl SpeechTextTransform {
             State::LinkText => {
                 if c == '\n' {
                     self.abandon(Some(c));
-                } else if c == ']' {
-                    self.held.push(c);
-                    self.state = State::LinkClose;
                 } else {
                     self.held.push(c);
+                    if c == ']' {
+                        self.state = State::LinkClose;
+                    }
+                    // The closing bracket counts against the bound too: a
+                    // `[text]` that does not fit is not a link we can buffer.
                     if self.held() > MAX_HOLD_BACK {
                         self.abandon(None);
                     }
