@@ -246,6 +246,52 @@ async fn posted_transaction_supersedes_pending_even_when_pending_arrives_on_late
 }
 
 #[tokio::test]
+async fn new_item_first_sync_not_ready_then_historical_complete() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("data.db");
+    let mut s = FinanceStore::open(&db).unwrap();
+    s.add_item("sandbox", "item", "Household").unwrap();
+    let mut initial = page(json!([transaction("one", json!(1))]), "p1", false);
+    initial["transactions_update_status"] = json!("INITIAL_UPDATE_COMPLETE");
+    reply(&server, "", initial).await;
+    sync_item(&client, &mut s, "sandbox", "item", "fixture-access")
+        .await
+        .unwrap();
+    let (attempt, due) = s.history_retry("sandbox", "item").unwrap();
+    assert_eq!(attempt, 1);
+    let due = due.expect("first retry scheduled");
+    let delay = chrono::DateTime::parse_from_rfc3339(&due).unwrap().to_utc() - chrono::Utc::now();
+    assert!(
+        delay.num_seconds() > 60 && delay.num_seconds() <= 120,
+        "{due}"
+    );
+    // The schedule lives in SQLite, so a restart resumes the same slot.
+    drop(s);
+    let mut s = FinanceStore::open(&db).unwrap();
+    assert_eq!(s.history_retry("sandbox", "item").unwrap(), (1, Some(due)));
+    assert!(s
+        .history_retries_due("sandbox", chrono::Utc::now())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.history_retries_due("sandbox", chrono::Utc::now() + chrono::Duration::minutes(3))
+            .unwrap(),
+        vec!["item".to_owned()]
+    );
+    reply(&server, "p1", page(json!([]), "done", false)).await;
+    sync_item(&client, &mut s, "sandbox", "item", "fixture-access")
+        .await
+        .unwrap();
+    assert_eq!(s.history_retry("sandbox", "item").unwrap(), (0, None));
+    assert!(s
+        .history_retries_due("sandbox", chrono::Utc::now() + chrono::Duration::days(1))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn bank_amounts_preserve_digits_beyond_binary_float_precision() {
     let server = MockServer::start().await;
     let client = Client::for_test(&server.uri());

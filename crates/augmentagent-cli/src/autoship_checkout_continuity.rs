@@ -6,19 +6,80 @@ use super::*;
 
 pub(crate) const EVENT: &str = "checkout_continuity_reestablished";
 
-/// Scope-stage steps that start from the request, not from prior worktree
-/// bytes. Build/review stages, attached PRs, verifier evidence recovery and
+/// Steps that need nothing from prior worktree bytes:
+/// - scope-stage steps start from the request;
+/// - #2612: a planned-but-unbuilt checkpoint (`build / plan_registered`,
+///   no evidence) has only its plan, which lives in the workflow store, not in
+///   the checkout. The build has not produced anything to preserve.
+///
+/// Any other build/review stage, attached PRs, verifier evidence recovery and
 /// acceptance escalation keep #2224's continuity hold and owner recovery path.
+/// Callers separately refuse a PR and a branch with unpublished commits.
 pub(crate) fn reestablishable(checkpoint: &Checkpoint) -> bool {
     matches!(
         (checkpoint.stage, checkpoint.next.action.as_str()),
         (Stage::Intake, "scope")
             | (Stage::Scope,
                 "scope" | "scope_request" | "retry_scope" | "rescope_executable_acceptance" | "await_capacity")
-    )
+    ) || planned_unbuilt(checkpoint)
+}
+
+/// #2612 — scope finished and bound a plan; the build never produced output.
+pub(crate) fn planned_unbuilt(checkpoint: &Checkpoint) -> bool {
+    checkpoint.stage == Stage::Build
+        && checkpoint.next.reason == "plan_registered"
+        && checkpoint.next.action == "build"
+        && checkpoint.evidence.is_empty()
+}
+
+/// Store-side refusals shared by the read-only picker hint and the audited
+/// write, so the picker never selects a row that preparation then refuses
+/// (which would cost a whole tick on every pick).
+fn refusal(conn: &Connection, expected: &Snapshot, now: i64) -> Result<Option<&'static str>> {
+    let current: Option<(String, i64, i64, String, Option<u64>)> = conn
+        .query_row(
+            "SELECT checkpoint,lease_until,generation,branch,pr FROM workflow WHERE id=?1",
+            [&expected.workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((raw, lease, generation, branch, pr)) = current else { return Ok(Some("workflow missing")) };
+    if lease > now {
+        return Ok(Some("live-workflow-lease"));
+    }
+    if !(generation == expected.generation
+        && branch == expected.branch
+        && pr.is_none()
+        && serde_json::from_str::<Checkpoint>(&raw)? == expected.checkpoint)
+    {
+        return Ok(Some("workflow changed during checkout continuity inspection"));
+    }
+    if !reestablishable(&expected.checkpoint) {
+        return Ok(Some("checkout continuity requires scope-stage or planned-unbuilt work"));
+    }
+    if owner_control::read(conn, &expected.workflow)?.is_some_and(|c| c.paused) {
+        return Ok(Some("explicit-owner-hold"));
+    }
+    let owner_recovery: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM active_checkout_recovery WHERE workflow=?1)",
+        [&expected.workflow],
+        |r| r.get(0),
+    )?;
+    if owner_recovery {
+        return Ok(Some("owner-checkout-recovery-active"));
+    }
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",[&expected.workflow],|r|r.get::<_,bool>(0))? {
+        return Ok(Some("pending-workflow-operation"));
+    }
+    Ok(None)
 }
 
 impl WorkflowStore {
+    /// Read-only: why the audited re-establishment would refuse right now.
+    pub(crate) fn checkout_continuity_refusal(&self, expected: &Snapshot, now: i64) -> Result<Option<&'static str>> {
+        refusal(&self.conn, expected, now)
+    }
+
     /// Record the audit before any Git or receipt change. Refuses a live lease,
     /// a changed workflow, an owner pause, owner recovery or pending operations.
     pub(crate) fn record_checkout_continuity_reestablished(
@@ -30,38 +91,10 @@ impl WorkflowStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, i64, i64, String, Option<u64>)> = tx
-            .query_row(
-                "SELECT checkpoint,lease_until,generation,branch,pr FROM workflow WHERE id=?1",
-                [&expected.workflow],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?;
-        let (raw, lease, generation, branch, pr) = current.context("workflow missing")?;
-        ensure!(lease <= now, "live-workflow-lease");
-        ensure!(
-            generation == expected.generation
-                && branch == expected.branch
-                && pr.is_none()
-                && serde_json::from_str::<Checkpoint>(&raw)? == expected.checkpoint,
-            "workflow changed during checkout continuity inspection"
-        );
-        ensure!(
-            reestablishable(&expected.checkpoint),
-            "checkout continuity requires a scope-stage workflow"
-        );
-        ensure!(
-            owner_control::read(&tx, &expected.workflow)?.is_none_or(|c| !c.paused),
-            "explicit-owner-hold"
-        );
-        let owner_recovery: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM active_checkout_recovery WHERE workflow=?1)",
-            [&expected.workflow],
-            |r| r.get(0),
-        )?;
-        ensure!(!owner_recovery, "owner-checkout-recovery-active");
-        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",[&expected.workflow],|r|r.get::<_,bool>(0))?,"pending-workflow-operation");
-        event(&tx, &expected.workflow, generation, EVENT, &payload.to_string(), now)?;
+        if let Some(reason) = refusal(&tx, expected, now)? {
+            anyhow::bail!(reason);
+        }
+        event(&tx, &expected.workflow, expected.generation, EVENT, &payload.to_string(), now)?;
         tx.commit()?;
         Ok(())
     }
@@ -105,6 +138,16 @@ mod tests {
         for action in ["await_original_evidence_recovery", "escalate_acceptance", "await_child_completion"] {
             assert!(!reestablishable(&cp(Stage::Scope, action)), "{action}");
         }
+        // #2612: planned-but-unbuilt work has nothing physical to preserve.
+        let planned = |stage, reason: &str, evidence: Vec<String>| Checkpoint {
+            stage, binding: binding(), evidence,
+            next: NextAction { reason: reason.into(), action: "build".into(), eligible_at_ms: 0 },
+        };
+        assert!(reestablishable(&planned(Stage::Build, "plan_registered", vec![])));
+        assert!(!reestablishable(&planned(Stage::Build, "plan_registered", vec!["build:candidate".into()])),
+            "a build with evidence must keep the hold");
+        assert!(!reestablishable(&planned(Stage::Build, "build_retry", vec![])));
+        assert!(!reestablishable(&planned(Stage::Verify, "plan_registered", vec![])));
     }
 
     #[test]

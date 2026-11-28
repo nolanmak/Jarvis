@@ -1,6 +1,8 @@
-use crate::{store::field, Client, FinanceStore};
+use crate::{
+    store::{field, instant},
+    Client, FinanceStore,
+};
 use anyhow::{bail, Context, Result};
-use rusqlite::params;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -82,55 +84,75 @@ pub async fn connect(
     if parsed.scheme() != "https" || parsed.host_str() != Some("secure.plaid.com") {
         bail!("unexpected Hosted Link host");
     }
+    // Without a usable expiry the session could be polled forever, so refuse
+    // to create it rather than record one that never retires.
+    let expires_at = instant(field(&response, "expiration")?)?;
     vault.put(
         &format!("{env}/session/{id}"),
         &json!({"link_token":link,"statements":statements}).to_string(),
     )?;
-    store.conn.execute(
-        "INSERT INTO finance_sessions(env,id,alias,update_item) VALUES(?1,?2,?3,?4)",
-        params![env, id, alias, update],
+    store.add_session(
+        env,
+        &id,
+        alias,
+        update,
+        expires_at,
+        response["request_id"].as_str(),
     )?;
     Ok(
         json!({"session_id":id,"url":url,"expiration":response["expiration"],"next":"Open the URL, authorize your bank, then run finance complete --session <session_id> within six hours."}),
     )
 }
-pub async fn complete(
+/// What a Hosted Link session is currently worth doing something about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// Not authorized yet; poll again until the Link token expires.
+    Pending,
+    /// Hosted Link closed without successful consent; the URL still works.
+    Exited,
+    /// Consent succeeded; these Items now have credentials in the vault.
+    Linked { items: Vec<String> },
+    /// The Link token expired; no public token is exchanged.
+    Expired,
+}
+pub async fn poll_session(
     client: &Client,
     store: &FinanceStore,
     vault: &dyn Vault,
     env: &str,
     session: &str,
-) -> Result<Value> {
-    let (alias, update, done): (String, Option<String>, bool) = store
-        .conn
-        .query_row(
-            "SELECT alias,update_item,complete FROM finance_sessions WHERE env=?1 AND id=?2",
-            params![env, session],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .context("unknown finance session")?;
-    if done {
-        return Ok(json!({"status":"already_completed"}));
+) -> Result<SessionOutcome> {
+    let record = store.session(env, session)?;
+    if record.complete {
+        return Ok(SessionOutcome::Linked { items: Vec::new() });
+    }
+    // Expiry decides before any token is loaded, so an expired session never
+    // reaches the exchange endpoint.
+    if let Some(expires) = record.expires_at.as_deref() {
+        if chrono::Utc::now() >= instant(expires)? {
+            store.expire_session(env, session)?;
+            return Ok(SessionOutcome::Expired);
+        }
     }
     let saved: Value = serde_json::from_str(&vault.get(&format!("{env}/session/{session}"))?)?;
     let link = field(&saved, "link_token")?;
     let response = client
         .call("/link/token/get", json!({"link_token":link}))
         .await?;
-    let sessions = response["link_sessions"].as_array().context(
-        "bank connection not complete; open Hosted Link and authorize your bank, then retry",
-    )?;
+    let Some(sessions) = response["link_sessions"].as_array() else {
+        return Ok(SessionOutcome::Pending);
+    };
     let mut items = Vec::new();
-    if let Some(item) = update {
+    if let Some(item) = record.update_item.as_deref() {
         // An exit or a finished timestamp alone is not proof of successful consent.
         let succeeded = sessions
             .iter()
             .any(|s| s.get("on_success").is_some_and(|v| v.is_object()));
         if !succeeded {
-            bail!("bank reconnection not complete; finish Hosted Link and retry");
+            return Ok(unauthorized(sessions));
         }
-        store.error(env, &item, "linked")?;
-        items.push(item);
+        store.error(env, item, "linked")?;
+        items.push(item.to_owned());
     } else {
         for s in sessions {
             let Some(results) = s
@@ -167,12 +189,27 @@ pub async fn complete(
                     &format!("{env}/item/{item}"),
                     field(&receipt, "access_token")?,
                 )?;
-                store.add_item(env, item, &alias)?;
+                store.add_item(env, item, &record.alias)?;
+                if let Some(institution) = result
+                    .pointer("/institution/institution_id")
+                    .and_then(Value::as_str)
+                {
+                    store.set_institution(env, item, institution)?;
+                    // A second connection to the same bank is kept and flagged;
+                    // only the owner may unlink one.
+                    if let Some(existing) = store
+                        .institution_items(env, institution, item)?
+                        .first()
+                        .map(String::as_str)
+                    {
+                        store.flag_duplicate(env, item, existing)?;
+                    }
+                }
                 items.push(item.into());
             }
         }
         if items.is_empty() {
-            bail!("bank connection not complete; finish Hosted Link and retry within six hours");
+            return Ok(unauthorized(sessions));
         }
     }
     if saved["statements"].as_bool() == Some(true) {
@@ -180,9 +217,41 @@ pub async fn complete(
             store.enable_statements(env, item)?;
         }
     }
-    store.conn.execute(
-        "UPDATE finance_sessions SET complete=1 WHERE env=?1 AND id=?2",
-        params![env, session],
-    )?;
-    Ok(json!({"status":"linked","items":items}))
+    store.finish_session(env, session)?;
+    Ok(SessionOutcome::Linked { items })
+}
+// Hosted Link that closed on its own is distinguishable from one never
+// opened; neither is terminal, so the session stays pending either way.
+fn unauthorized(sessions: &[Value]) -> SessionOutcome {
+    if sessions
+        .iter()
+        .any(|s| s.get("on_exit").is_some() || s.get("finished_at").is_some())
+    {
+        SessionOutcome::Exited
+    } else {
+        SessionOutcome::Pending
+    }
+}
+pub async fn complete(
+    client: &Client,
+    store: &FinanceStore,
+    vault: &dyn Vault,
+    env: &str,
+    session: &str,
+) -> Result<Value> {
+    if store.session(env, session)?.complete {
+        return Ok(json!({"status":"already_completed"}));
+    }
+    match poll_session(client, store, vault, env, session).await? {
+        SessionOutcome::Linked { items } => Ok(json!({"status":"linked","items":items})),
+        SessionOutcome::Pending => {
+            bail!("bank connection not complete; open Hosted Link and authorize your bank, then retry")
+        }
+        SessionOutcome::Exited => {
+            bail!("bank connection not complete; Hosted Link closed without authorizing — reopen the URL and retry")
+        }
+        SessionOutcome::Expired => {
+            bail!("finance session expired; run finance connect to start a new one")
+        }
+    }
 }

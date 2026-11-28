@@ -65,9 +65,10 @@ pub use models::{
     TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
+    ActionCodeModeFields, ActionWithEmail, BodyCompaction, ComposeQueueRow, ComposeQueueStatus,
+    DiscordConversation, InterruptedDiscordTurn,
     JournalSyncCursor, LoopFinding, LoopOccurrence, LoopOptions, loop_delivery_footer,
-    NativeConversation, PendingActionRow, whatsapp_default_coverable, MANUAL_SEND_PENDING,
+    NativeConversation, NewComposeQueueEntry, PendingActionRow, whatsapp_default_coverable, MANUAL_SEND_PENDING,
     MANUAL_SEND_UNCONFIRMED, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
