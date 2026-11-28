@@ -294,7 +294,7 @@ semaphore). Storage is in `web_chat.rs` (§5.1).
   refetches on an unknown `kid`, at most once per 60 s, and holds keys for 1 h. If the JWKS fetch
   fails and no cached key matches, the request gets 503 (fail closed). If only some of
   `AUGMENTAGENT_CF_ACCESS_{AUD,TEAM_DOMAIN,EMAILS}` are set, the dashboard refuses to start.
-  `TEAM_DOMAIN` is the full host, e.g. `royal-voice-826d.cloudflareaccess.com`. A rejected
+  `TEAM_DOMAIN` is the full host, e.g. `<team>.cloudflareaccess.com`. A rejected
   **top-level navigation** (`Sec-Fetch-Mode: navigate`) gets 302 to
   `https://<team-domain>/cdn-cgi/access/login/<host>`. Every other rejected request gets 401 JSON:
   API calls, htmx requests (`HX-Request`) and SSE (`Accept: text/event-stream`). `web.js` reloads
