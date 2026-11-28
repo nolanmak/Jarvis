@@ -27,7 +27,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 pub(super) const STALE_DAYS_ENV: &str = "AUTOSHIP_STALE_PR_DAYS";
 pub(super) const RELEASE_MANUAL_ENV: &str = "AUTOSHIP_STALE_PR_RELEASE_MANUAL";
 const DEFAULT_STALE_DAYS: i64 = 2;
-const MAX_PRS: usize = 10;
+/// Each verdict is one call against the daily observation cap the nightly
+/// review shares, so a pass takes at most half of the default cap.
+const MAX_PRS: usize = 6;
+/// A due pass that was deferred retries this often, until the next hourly tick.
+pub(super) const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+pub(super) const RETRIES_PER_HOUR: u32 = 11;
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 const MAX_ATTEMPTS_PER_DAY: u32 = 4;
 const MARKER: &str = "<!-- autoship:stale-pr-sweep -->";
@@ -394,6 +399,11 @@ where
 
 fn state_path() -> Result<PathBuf> {
     Ok(crate::build_storage::state_dir()?.join("autoship-stale-pr-sweep.json"))
+}
+
+/// A pass is due and has not completed: it was deferred or has yet to run.
+pub(super) fn pending() -> bool {
+    state_path().is_ok_and(|path| due(Utc::now(), &State::load(&path), stale_days()))
 }
 
 /// Scheduler entry: safe on every tick. Runs one pass every [`stale_days`]

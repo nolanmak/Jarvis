@@ -8,7 +8,7 @@ labelled `autoship-manual`, was never picked up again.
 ## Which PRs
 
 Same-repository PRs by a trusted author whose `updatedAt` is at least
-`AUTOSHIP_STALE_PR_DAYS` old, oldest number first, at most 10 per pass. Forks
+`AUTOSHIP_STALE_PR_DAYS` old, oldest number first, at most 6 per pass. Forks
 and untrusted authors are ignored, as for adoption.
 
 ## Outcomes
@@ -44,7 +44,9 @@ PR; the sweep never edits issue labels.
 ## Scheduling and spend
 
 The sweep shares the hourly scheduler with the nightly review. A pass is due
-when the interval has passed since the last completed pass, is skipped while
+when the interval has passed since the last completed pass. The reviewer lease
+is refused while a shipping workflow is active, so a due pass that was deferred
+retries every 5 minutes until it runs. A pass is skipped while
 the global model budget is exhausted, and makes one reviewer call per PR that
 still has commits to land. State is in `autoship-stale-pr-sweep.json` in the
 state directory. A pass in which every PR failed is not recorded as done and
