@@ -69,6 +69,11 @@ pub struct GmailChannelConfig {
     pub retry_min_gap: Duration,
     /// Max actions processed per retry tick (bounds a burst after an outage).
     pub retry_batch: i64,
+
+    /// #2389 — what happens to a compose whose in-loop 429 backoff is
+    /// exhausted. Disabled by default: the typed `RateLimited` stays the only
+    /// outcome.
+    pub compose_queue: crate::compose_dispatch::ComposeQueueConfig,
 }
 
 impl Default for GmailChannelConfig {
@@ -87,6 +92,7 @@ impl Default for GmailChannelConfig {
             retry_max_age: Duration::from_secs(24 * 60 * 60),
             retry_min_gap: Duration::from_secs(300),
             retry_batch: 10,
+            compose_queue: crate::compose_dispatch::ComposeQueueConfig::default(),
         }
     }
 }
@@ -103,6 +109,9 @@ pub struct PollOutcome {
     /// #222: emails classified as event-platform / signup-confirmation
     /// blasts — wiki ingest ran, but no draft and no Discord notice.
     pub ingest_only: usize,
+    /// #2389: composes parked in the durable retry queue this tick. Not
+    /// awaiting approval — no card is up for one of these yet.
+    pub compose_queued: usize,
     pub errors: usize,
 }
 
@@ -385,6 +394,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                                     outcome.awaiting_approval += 1
                                 }
                                 Some(DispatchOutcome::IngestOnly) => outcome.ingest_only += 1,
+                                Some(DispatchOutcome::Queued) => outcome.compose_queued += 1,
                                 None => {}
                             },
                             Err(e) => {
@@ -405,7 +415,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             + outcome.flagged
             + outcome.replied_dry_run
             + outcome.awaiting_approval
-            + outcome.ingest_only;
+            + outcome.ingest_only
+            + outcome.compose_queued;
         Ok(outcome)
     }
 
@@ -1708,6 +1719,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // so the card never renders half-parsed markup. A Gmail body has no
         // such luxury, so it gets the strict scrub on top.
         let gmail_body = augmentagent_approval_discord::strip_assumes_for_send(&human_draft);
+        let subject = reply_subject(&email.subject);
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
@@ -1716,7 +1728,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     entity_id,
                     &email.from,
                     &cc,
-                    &reply_subject(&email.subject),
+                    &subject,
                     &gmail_body,
                     email.thread_id.as_deref(),
                 )
@@ -1725,6 +1737,42 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(id) => {
                     self.store.set_action_draft_id(&action_id, &id)?;
                     id
+                }
+                // #2389 — the in-loop backoff (#1486) has already spent its
+                // attempts on this throttle, and the provider's boundary is
+                // further out than any of them could wait. With the queue on,
+                // park the compose there instead of losing it; only this one
+                // typed variant is parkable, every other compose failure is
+                // still the caller's error.
+                Err(crate::gmail::GmailError::RateLimited { retry_after_ms, retry_after, log_id })
+                    if self.config.compose_queue.enabled =>
+                {
+                    let queued = crate::compose_dispatch::enqueue_exhausted_compose(
+                        &self.store,
+                        &crate::compose_dispatch::ComposeReplay {
+                            version: crate::compose_dispatch::REPLAY_VERSION,
+                            entity_id: entity_id.to_string(),
+                            action_id: action_id.clone(),
+                            message_id: email.message_id.clone(),
+                            to: email.from.clone(),
+                            cc: cc.clone(),
+                            subject,
+                            body: gmail_body,
+                            draft_body: initial_draft,
+                            thread_id: email.thread_id.clone(),
+                            max_attempts: self.config.compose_queue.max_attempts,
+                            deadline_ms: now_millis()
+                                + self.config.compose_queue.deadline.as_millis() as i64,
+                        },
+                        retry_after_ms,
+                        now_millis(),
+                    )?;
+                    info!(
+                        action_id, idem_key = %queued.idem_key, fresh = queued.fresh,
+                        retry_after = %retry_after, log_id = %log_id,
+                        "compose throttled past its backoff; parked in the durable queue"
+                    );
+                    return Ok(Some(DispatchOutcome::Queued));
                 }
                 Err(e) => {
                     self.record_initial_failure(&action_id, &email, "create-draft", &format!("create_draft: {e}"))?;
@@ -2019,6 +2067,10 @@ pub enum DispatchOutcome {
     /// the organizer, event, attendees), but no draft was generated, no
     /// Discord approval card was queued, and no flag notice was posted.
     IngestOnly,
+    /// #2389: the compose was throttled past its in-loop backoff and parked
+    /// in the durable queue. No Gmail draft and no approval card yet — the
+    /// queue owns both once an attempt gets the draft in.
+    Queued,
 }
 
 // Silence dead_code warning for TRIAGE_SYSTEM constant which is exported for
@@ -5342,6 +5394,149 @@ Where: Microsoft Teams
                 assert_eq!(reasoner.0.load(Ordering::SeqCst), 1);
                 assert!(pf.recorded.lock().unwrap().is_empty());
             }
+        }
+    }
+
+    /// #2389 — a compose whose in-loop 429 backoff is exhausted.
+    mod compose_queue {
+        use super::*;
+        use crate::compose_dispatch::{compose_idem_key, ComposeQueueConfig, ComposeReplay};
+        use crate::gmail::GmailError;
+
+        const RETRY_AFTER_MS: i64 = 4_070_908_800_000;
+
+        /// Refuses every compose with the typed error the in-loop backoff
+        /// raises once it has spent its attempts.
+        struct ThrottledGmail;
+        #[async_trait]
+        impl GmailApi for ThrottledGmail {
+            async fn fetch_unread(&self, _e: &str, _l: u32) -> Result<Vec<Email>, GmailError> {
+                Ok(Vec::new())
+            }
+            async fn fetch_with_query(&self, _e: &str, _q: &str, _l: u32) -> Result<Vec<Email>, GmailError> {
+                Ok(Vec::new())
+            }
+            async fn create_draft(&self, _e: &str, _t: &str, _s: &str, _b: &str, _th: Option<&str>) -> Result<String, GmailError> {
+                Err(GmailError::RateLimited {
+                    retry_after_ms: RETRY_AFTER_MS,
+                    retry_after: "2099-01-01T00:00:00Z".into(),
+                    log_id: "synthetic-log".into(),
+                })
+            }
+            async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, GmailError> {
+                Ok(None)
+            }
+            async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {
+                Ok(())
+            }
+        }
+
+        fn throttled_email() -> Email {
+            Email {
+                message_id: "m-throttled".into(),
+                thread_id: Some("t-throttled".into()),
+                from: "person@example.com".into(),
+                to: "me@x.example.com".into(),
+                cc: String::new(),
+                subject: "quick q".into(),
+                body: "free Thursday?".into(),
+                ..threaded_inbound()
+            }
+        }
+
+        fn channel(
+            store: Arc<Store>,
+            broker: Arc<RecordingBroker>,
+            compose_queue: ComposeQueueConfig,
+        ) -> GmailChannel<ThrottledGmail, ScriptedReasoner> {
+            GmailChannel::new(
+                store,
+                Arc::new(ThrottledGmail),
+                Arc::new(ScriptedReasoner::new([])),
+                broker,
+                GmailChannelConfig {
+                    skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                    dry_run: false,
+                    compose_queue,
+                    ..Default::default()
+                },
+            )
+        }
+
+        /// Default (unset) configuration: the exhausted throttle is still the
+        /// caller's problem, carrying the provider's boundary, and nothing is
+        /// parked.
+        #[tokio::test]
+        async fn a_disabled_queue_still_surfaces_the_typed_rate_limit() {
+            let (store, _f) = tmp_store();
+            let email = throttled_email();
+            store.upsert_email(&email).unwrap();
+            let broker = Arc::new(RecordingBroker::default());
+            let ch = channel(Arc::clone(&store), Arc::clone(&broker), ComposeQueueConfig::default());
+
+            let err = ch
+                .dispatch_reply("acc1", email, "Thursday works.".into(), None)
+                .await
+                .expect_err("an exhausted throttle must stay an error when the queue is off");
+            assert!(
+                matches!(err.downcast_ref::<GmailError>(), Some(GmailError::RateLimited { retry_after_ms, .. }) if *retry_after_ms == RETRY_AFTER_MS),
+                "got: {err:#}"
+            );
+            assert!(store.due_gmail_composes(i64::MAX).unwrap().is_empty(), "nothing may be parked");
+            assert!(broker.posts.lock().unwrap().is_empty());
+            assert_eq!(store.email_retry_failures_since(0, 10).unwrap().len(), 1, "still a recorded dispatch failure");
+        }
+
+        /// Enabled: one row, the complete replay payload at the provider's own
+        /// boundary, and a repeat dispatch collides with it rather than
+        /// parking a second copy or carding the compose.
+        #[tokio::test]
+        async fn an_enabled_queue_parks_the_compose_once_without_an_approval_card() {
+            let (store, _f) = tmp_store();
+            let email = throttled_email();
+            store.upsert_email(&email).unwrap();
+            let broker = Arc::new(RecordingBroker::default());
+            let ch = channel(
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                ComposeQueueConfig { enabled: true, ..Default::default() },
+            );
+
+            let first = ch
+                .dispatch_reply("acc1", email.clone(), "Thursday works.".into(), None)
+                .await
+                .unwrap();
+            assert!(matches!(first, Some(DispatchOutcome::Queued)), "{first:?}");
+
+            let queued = store.due_gmail_composes(i64::MAX).unwrap();
+            assert_eq!(queued.len(), 1);
+            let row = queued[0].clone();
+            assert_eq!(row.entity, "acc1");
+            assert_eq!(row.retry_after_ms, RETRY_AFTER_MS, "the provider's boundary, not a poll interval");
+            assert_eq!(row.attempt, 0);
+            assert_eq!(row.status, augmentagent_store::ComposeQueueStatus::Queued);
+
+            let replay: ComposeReplay = serde_json::from_str(&row.payload).unwrap();
+            assert_eq!(replay.entity_id, "acc1");
+            assert_eq!(replay.message_id, email.message_id);
+            assert_eq!(replay.to, email.from);
+            assert_eq!(replay.subject, "Re: quick q");
+            assert_eq!(replay.body, "Thursday works.");
+            assert_eq!(replay.draft_body, "Thursday works.");
+            assert_eq!(replay.thread_id, email.thread_id);
+            assert_eq!(replay.max_attempts, 5);
+            assert!(replay.deadline_ms > now_millis(), "the deadline is ahead of the parking");
+            assert!(!replay.action_id.is_empty(), "the replay names the action row to card");
+            assert_eq!(row.idem_key, compose_idem_key(&replay));
+            assert_eq!(store.gmail_compose(&row.idem_key).unwrap(), Some(row.clone()));
+
+            let second = ch
+                .dispatch_reply("acc1", email, "Thursday works.".into(), None)
+                .await
+                .unwrap();
+            assert!(matches!(second, Some(DispatchOutcome::Queued)), "{second:?}");
+            assert_eq!(store.due_gmail_composes(i64::MAX).unwrap(), vec![row], "the original row wins");
+            assert!(broker.posts.lock().unwrap().is_empty(), "a parked compose is not approval-ready");
         }
     }
 
