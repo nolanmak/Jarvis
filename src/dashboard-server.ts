@@ -25,6 +25,7 @@ import {
   hostOriginGuard,
   contentSecurityPolicy,
   loginPageHandler,
+  assertAccessConfig,
   loginSubmitHandler,
 } from "./security";
 
@@ -41,6 +42,8 @@ function main(): void {
 
   // Ensure auth is initialized (generates+persists+logs a key on first run).
   resolveApiKey();
+  // #2708: refuse to start on partial AUGMENTAGENT_CF_ACCESS_* config.
+  assertAccessConfig();
 
   // #297: DNS-rebinding (Host allow-list) + CSRF (Origin/Referer) guard and
   // strict CSP/security headers, applied before any handler.
