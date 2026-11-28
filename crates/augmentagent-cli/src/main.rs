@@ -29,8 +29,9 @@ mod phone_attention;
 mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
-// Jarvis Dashboard turns; the socket that drives it lands with #2711.
-#[allow(dead_code)]
+// Jarvis Dashboard: socket transport, ops and turn runner.
+mod web_surface;
+mod web_surface_transport;
 mod web_turn_runner;
 mod discord_phone;
 mod computer_tool;
@@ -4092,6 +4093,18 @@ async fn main() -> Result<()> {
             if phone.is_none() {
                 if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
                     tasks.push(cleanup);
+                }
+            }
+
+            // Jarvis Dashboard socket: restart sweep, then listen.
+            if !dry_run {
+                let web_store = store.clone();
+                if let Some(worker) = web_surface::start(cli.wiki_dir.as_ref(), store.clone(), |wiki| {
+                    Arc::new(wiki_querier(build_reasoner(), wiki,
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), web_store, false))
+                        as Arc<dyn QueryHandler>
+                }, shutdown.clone()) {
+                    tasks.push(worker);
                 }
             }
 
