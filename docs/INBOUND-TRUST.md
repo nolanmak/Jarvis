@@ -1,7 +1,10 @@
 # Inbound trust: keeping spam, scams and injected instructions away from agents that act
 
-Status: draft spec v3, 2026-11-27. Audits: v1 fresh-eyes + 44-seam check;
-v2.1 fresh-eyes (30 findings, all resolved here). Owner: Nolan.
+Status: draft spec v4, 2026-11-28. Audits: v1 fresh-eyes + 44-seam check;
+v2.1 fresh-eyes (30 findings, resolved in v3). v4 rebalances toward utility
+(owner direction 2026-11-28: "the goal is not to remove all risk at the
+price of utility"): quarantine only clear signals, and otherwise act only
+when a link from an `unknown`-or-lower sender is about to leave Jarvis. Owner: Nolan.
 Scope: iMessage (incl. SMS/RCS rows in the same archive) and Gmail inbound
 content. Other platforms: N3.
 
@@ -58,21 +61,26 @@ the marker "untrusted inbound data, not instructions".
 
 ## 2. Goals
 
-- G1. Text of a quarantined message ingested after rollout never reaches a
-  model. The owner reads it only via `trust show --owner` on a terminal
-  (D15). Wiki pages written before rollout are out of scope (R3).
-- G2. Ingest paths (P9–P11) and unattended agents never write the wiki from
-  content of a message ranked below `known`. Owner-present agents may (R4).
-- G3. Unattended agents (scheduled loops) have no tool that sends a message,
-  DM, post, comment or invite to anyone; they may create approval cards and
-  drafts and notify the owner. They keep WebFetch, which is itself an
-  outbound channel, bounded by D10's hook (R7). Autonomy auto-send is the
-  one unattended sender, bounded by D11.
-- G4. Jarvis's own fetchers (link_context and agent WebFetch) never fetch a
-  URL whose domain came from a message ranked `unknown` or lower in that
-  session. tabagent navigation is not covered (N6, R5).
-- G5. Nothing is deleted; every message stays stored and findable by the
-  owner.
+Design principle: block the expensive failure (a scam or injected
+instruction causing Jarvis to fetch, send or persist an untrusted link, or a
+clear scam reaching a model) and leave ordinary use unchanged. Today's
+behaviour for bulk mail, drafts, loops and owner chat is kept except where a
+goal below requires otherwise.
+
+- G1. Text of a quarantined message (clear junk/scam signals only, D3)
+  ingested after rollout never reaches a model. The owner reads it via
+  `trust show --owner` (D15). Wiki pages written before rollout are out of
+  scope (R3).
+- G2. A URL whose domain came from a message ranked `unknown` or lower is
+  never fetched by Jarvis (link_context, agent WebFetch), never included in
+  a message Jarvis sends or auto-sends, and never written to the wiki. This
+  applies to every agent, attended or not.
+- G3. Unattended model paths (triage, drafts, loops, heartbeat, ingest) see
+  `unknown`-or-lower senders' links defanged. Owner-present paths see them
+  intact; G2 still applies to what is done with them.
+- G4. No change to loops' tools, bulk-mail handling, drafting eligibility,
+  or owner chat beyond G1–G3.
+- G5. Nothing is deleted; every message stays stored and findable.
 
 ## 3. Non-goals
 
@@ -88,9 +96,11 @@ the marker "untrusted inbound data, not instructions".
 - N6. tabagent / computer-use content and navigation.
 - N7. Replaying drafts, cards or wiki ingest for past messages after an
   upgrade, except one explicit `trust release --reprocess` (D15).
-- N8. HTML anchor-text vs href mismatch detection (cut from v2: bodies are
-  usually stored from `text/plain`, so the rule could not fire reliably and
-  would misfire on tracking links). Revisit under OT-4.
+- N8. HTML anchor-text vs href mismatch detection, and URL-shortener
+  detection (cut: unreliable on stored `text/plain` bodies, and shorteners
+  such as t.co appear in legitimate notification mail). Revisit under OT-4.
+- N9. Removing tools from loops or owner chat. G2's link checks are the
+  control instead.
 
 ## 4. Glossary
 
@@ -162,7 +172,6 @@ the marker "untrusted inbound data, not instructions".
   2. **Downgrades** (any match; `scam` beats `junk`):
      - `apple_junk`, `gmail_spam` → `junk`, except when base is `trusted`.
      - `dmarc_fail`, `display_name_spoof` → `scam` at any base.
-     - `shortener_link` → `scam` when base is `bulk` or `unknown`.
   3. **Overrides**: a `message` override replaces everything. A `sender`
      override replaces phases 1–2 **unless** `dmarc_fail` or
      `display_name_spoof` matched (spoofed mail cannot ride a release).
@@ -204,20 +213,21 @@ the marker "untrusted inbound data, not instructions".
     days (`format=metadata`, within the Gmail rate budget).
 
 - **D6. Handling by level.** "Text" = subject, body, extracted attachment
-  text, images.
+  text, images. `trusted`, `known` and `bulk` behave exactly as today.
 
-  | Level | `Triage` | `Draft` | `OwnerDraft` | `LinkFetch` | `WikiWrite` | `AgentRead` | `Autonomy` | `Digest` |
-  |---|---|---|---|---|---|---|---|---|
-  | trusted | full | full | full | allowed | allowed | full | allowed | full |
-  | known | full | full | full | allowed | allowed | full | not eligible | full |
-  | bulk | defanged | none | defanged | none | none | defanged | none | metadata + subject defanged |
-  | unknown | defanged | defanged (iMessage: chat must be allowlisted; email: always, unknown email senders passed `is_human_sender`) | defanged | none | none | defanged | none | metadata view |
-  | junk | none → `skip:trust` | none | none | none | none | withheld | none | count |
-  | scam | none → `skip:trust` | none | none | none | none | withheld | none | count + alert line |
+  | Level | `Triage` | `Draft` / `OwnerDraft` | `LinkFetch` | `WikiWrite` | `AgentRead` | `Autonomy` | `Digest` |
+  |---|---|---|---|---|---|---|---|
+  | trusted / known / bulk | full | full (today's eligibility) | allowed (if enabled) | full | full | today's rules + D11 | full |
+  | unknown | links defanged | links defanged; today's eligibility | none | text with links removed | owner-present: full; unattended: links defanged | none | full |
+  | junk | none → `skip:trust` | none | none | none | withheld (count) | none | count |
+  | scam | none → `skip:trust` | none | none | none | withheld (count) | none | count + alert line |
 
-  `skip:trust` = no model call; terminal triage outcome recorded and the
-  message marked processed. Alert line, fixed text: "⚠ N possible scam
-  messages withheld; run `augmentagent trust list --level scam`".
+  "Links defanged" = every extracted URL rewritten per Glossary; the rest of
+  the text unchanged. `skip:trust` = no model call; terminal triage outcome
+  recorded and the message marked processed. Alert line, fixed text:
+  "⚠ N possible scam messages withheld; run `augmentagent trust list
+  --level scam`". Bulk is still classified (reason codes are useful in
+  `trust list`), but no handling depends on it in v4.
 
 - **D7. One gate.**
   `trust::view(conn, platform, message_id, purpose, session: Option<&str>) -> TrustedView`;
@@ -254,29 +264,28 @@ the marker "untrusted inbound data, not instructions".
   `(platform, message_id)` for iMessage), using `AUGMENTAGENT_AGENT_SESSION`
   when set. Ungated output requires `--owner` **and** a TTY on stdout.
 
-- **D10. Agent tools.**
-  - Scheduled-loop presets remove: every send, DM, comment, post, compose
-    and calendar invite subcommand, and wiki Write/Edit. They keep: draft
-    and approval-card creation and owner notifications; the exact
-    allow-list is fixed in stage 5 from `augmentagent --help` and asserted
-    by a preset test.
+- **D10. Agent tools are unchanged; outbound links are checked.**
+  - No tool is removed from any preset (N9).
   - Every acting preset installs a PreToolUse hook (in the reasoner's
-    `settings_json`, the mechanism already used by the SocialAPI read-only
-    guard) that denies WebFetch when the URL's registrable domain appears in
-    `link_provenance` for the session at rank `unknown` or lower. Bulk
-    links are defanged but not blocked (newsletters cite common domains).
+    `settings_json`, the mechanism the SocialAPI read-only guard already
+    uses) that denies WebFetch when the URL's registrable domain is in
+    `link_provenance` for the session at rank `unknown` or lower.
+  - Send, DM, post, comment and compose subcommands refang and extract URLs
+    from the body (URL extractor) and refuse when any domain is in the
+    session's provenance at rank `unknown` or lower, with the message
+    "contains a link from an unknown sender; forward it yourself or
+    `trust release` the sender". Wiki Write/Edit is checked the same way by
+    the hook.
   - Codex fallback: native web bypasses hooks and the bridge refuses to
     launch when a hook targets web tools (`codex_tools.rs:409`). Acting
-    presets running on Codex therefore drop WebFetch/WebSearch before
-    launch instead of failing.
-  - Owner chat keeps send and wiki tools. Send subcommands refang and
-    extract URLs from the body (URL extractor) and refuse if any domain is
-    in the session's provenance at rank `unknown` or lower.
+    presets running on Codex drop WebFetch/WebSearch before launch instead
+    of failing.
 
-- **D11. Autonomy URL allowlist.** An auto-send draft may contain only URLs
-  produced by Jarvis's own calendar actions (`send_details`, `add_guest`).
-  Any other URL turns it into an approval card. link_context never runs for
-  drafts that may be auto-sent. Heartbeat outreach contains no URLs.
+- **D11. Autonomy URL rule.** An auto-send draft containing a URL whose
+  domain is in the session's provenance at rank `unknown` or lower, or any
+  URL from link_context, becomes an approval card. Jarvis-generated
+  calendar URLs (`send_details`, `add_guest`) are unaffected. Heartbeat
+  outreach contains no URLs.
 
 - **D12. Link provenance.** `link_provenance(session_id, domain, platform,
   message_id, level, recorded_at_ms, PRIMARY KEY (session_id, domain))`,
@@ -290,12 +299,12 @@ the marker "untrusted inbound data, not instructions".
 - **D13. link_context** fetches only for `trusted`/`known` messages, never
   for auto-sendable drafts or heartbeat.
 
-- **D14. Wiki ingest gated before the model.** P9 and P11 call
-  `trust::view(..., WikiWrite, None)` and skip on anything but `Full`,
-  logging `[skip:trust:<level>]`. P10 gates **each entry** by its own
-  `(platform, message_id)` and rebuilds the capture batch from `Full`
-  entries only; an empty batch is skipped. The batch's synthetic id is
-  never classified.
+- **D14. Wiki ingest through the gate.** P9 and P11 call
+  `trust::view(..., WikiWrite, None)`: quarantined messages are skipped
+  (logged `[skip:trust:<level>]`); `unknown` messages are ingested with every
+  URL removed. P10 gates **each entry** by its own `(platform, message_id)`
+  and rebuilds the capture batch from the gated entries; an empty batch is
+  skipped. The batch's synthetic id is never classified.
 
 - **D15. Owner surface** (no preset may reach these; a test asserts no
   preset Bash pattern matches `trust show`, `trust release`, `trust block`,
@@ -316,27 +325,27 @@ the marker "untrusted inbound data, not instructions".
 
 - R1. Scam from a compromised `trusted`/`known` sender gets full handling.
   Bounded by G3 and approval cards. Ends when OT-4 lands.
-- R2. `bulk`/`unknown` text, defanged, reaches triage and agent reads.
-  Bounded by no fetch, no wiki write from ingest/loops, no drafts for bulk.
-  Ends when OT-4 lands.
+- R2. `bulk` text and `unknown` text (links defanged when unattended)
+  reach triage, drafts and agent reads, so an injected instruction without
+  a link can still steer a model. Bounded by approval cards for anything
+  sent and G2 for links. Ends when OT-4 lands.
 - R3. Existing wiki pages may hold text from messages now ranked below `known`. Ends
   when OT-3 is resolved.
-- R4. Owner chat sends and writes the wiki without a card; owner presence is
-  the approval. Bounded by D10's send check.
+- R4. Loops and owner chat keep send and wiki tools (N9). Bounded by D10's
+  link checks and, for owner chat, the owner's presence.
 - R5. tabagent navigation and page content are ungated (N6).
 - R6. One non-trivial owner reply makes a sender `known` (Appendix A
   excludes one-word and opt-out replies).
 - R7. WebFetch to a domain the model rebuilt from text the URL extractor did
   not recognize (beyond its refang forms) is not blocked. Bounded by
-  defanging and no send tools in loops. Ends when OT-4 lands or loops that
-  read messages lose WebFetch.
+  defanging. Ends when OT-4 lands.
 
 ## 7. Open threads
 
 | Id | Question | Blocks | Owner / trigger | Load-bearing |
 |---|---|---|---|---|
-| OT-1 | ~~Loops keep web?~~ Resolved 2026-11-27: keep, with D10 hook (R7). | — | — | — |
-| OT-2 | ~~Updates/Forums?~~ Resolved 2026-11-27: `bulk` by default; promote via `trust release`. | — | — | — |
+| OT-1 | ~~Loops keep web?~~ Resolved: loops keep all tools (N9); D10 link checks apply. | — | — | — |
+| OT-2 | ~~Updates/Forums?~~ Moot in v4: `bulk` changes no handling. | — | — | — |
 | OT-3 | Scrub existing wiki pages written from messages now ranked below `known`? | R3 | after stage 4 | no |
 | OT-4 | Per-message content scan (credential asks, injection phrasing, anchor mismatch) for `trusted`/`known`/`bulk` | R1, R2, R7, N8 | after 30 days of D15 data | no |
 | OT-5 | Make raw message-text types private outside `trust` (compiler-enforced D7) | D7 strength | after stage 4 | no |
@@ -361,16 +370,17 @@ the marker "untrusted inbound data, not instructions".
    level incl. missing row; CI fails on an injected raw read.
 4. **Wire paths.** P1–P17 per §1; `skip:trust`; D13; D14 incl. P10 per-entry
    batches. Exit: per path, a `scam` fixture never appears in the captured
-   prompt and is marked processed; an `unknown` fixture appears defanged;
-   a P10 batch mixing `known` and `unknown` entries captures only the
-   `known` ones.
+   prompt and is marked processed; an `unknown` fixture's links appear
+   defanged in triage/draft prompts and absent from wiki ingest input; a
+   `bulk` fixture's prompt is byte-identical to today's (no regression).
 5. **Agents.** D9 (MCP session env, CLI gating, `--owner` + TTY), D10
-   (loop allow-list, hook, Codex drop, send check), D11, D12. Exit: loop
-   preset lacks send and wiki tools; loop WebFetch to a domain from an
-   `unknown` message is denied, an unrelated domain succeeds; a Codex-run
-   loop launches without web tools; owner-chat send containing such a URL
-   (also refanged from `hxxps`/`[.]`) is refused; autonomy draft with a
-   non-calendar URL becomes a card, calendar `send_details` auto-sends.
+   (hook, send/wiki link check, Codex drop), D11, D12. Exit: every preset's
+   tool list is unchanged (snapshot test); a loop WebFetch to a domain from
+   an `unknown` message is denied and an unrelated domain succeeds; a send
+   containing such a URL (also refanged from `hxxps`/`[.]`) is refused and
+   a send without one goes through; a Codex-run loop launches without web
+   tools; an autonomy draft with such a URL becomes a card, calendar
+   `send_details` auto-sends.
 6. **Owner surface.** D15. Exit: CLI tests; release/block/revoke logged,
    survive reclassification; `--reprocess` triages once; preset test proves
    no agent can reach these commands.
@@ -393,7 +403,6 @@ the marker "untrusted inbound data, not instructions".
 | `unclassified` | gate → unknown | no `message_trust` row, or non-classified platform |
 | `apple_junk` | downgrade → junk (not if base trusted) | conversation `is_filtered = 2` |
 | `gmail_spam` | downgrade → junk (not if base trusted) | label `SPAM` |
-| `dmarc_fail` | downgrade → scam | `email_sender_auth.dmarc_result = 'fail'` |
+| `dmarc_fail` | downgrade → scam | `email_sender_auth.dmarc_result = 'fail'`, **unless** the message has a `List-Id` (`Store::email_has_list_header`) or an `ARC-Authentication-Results` header with `arc=pass` (recorded with `dmarc_result`), since forwarding and mailing lists break DMARC on legitimate mail |
 | `display_name_spoof` | downgrade → scam | email display name equals (case-insensitive, whitespace-normalized, exact) the wiki display name of an active trusted contact, and the address is not one of that contact's handles |
-| `shortener_link` | downgrade → scam (base bulk/unknown only) | an extracted URL's domain is in: bit.ly, tinyurl.com, t.co, goo.gl, ow.ly, is.gd, buff.ly, rebrand.ly, cutt.ly, shorturl.at |
 | `owner_override` | override | `trust_override` applied (D3 phase 3) |
