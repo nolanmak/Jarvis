@@ -173,25 +173,7 @@ pub(crate) fn is_review_hold_reason(reason: &str) -> bool {
         | "review-evidence-budget" | "review-recovery-required")
 }
 
-/// Stable identity survives branch renames and changed heads. Repository must
-/// be the canonical owner/name returned by the trusted repository adapter.
-pub fn workflow_id(repo: &str, issue: u64) -> Result<String> {
-    ensure!(
-        !repo.trim().is_empty() && issue > 0,
-        "invalid workflow identity"
-    );
-    Ok(format!("{}#{issue}", repo.to_ascii_lowercase()))
-}
-
-/// PRs adopted without a source issue, or multiple PRs for one issue, each
-/// have their own identity. This key does not assert trust or approval.
-pub fn pr_workflow_id(repo: &str, pr: u64) -> Result<String> {
-    ensure!(
-        !repo.trim().is_empty() && pr > 0,
-        "invalid PR workflow identity"
-    );
-    Ok(format!("{}/pr/{pr}", repo.to_ascii_lowercase()))
-}
+pub use autoship_contract::{pr_workflow_id, workflow_id};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
