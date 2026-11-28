@@ -26,6 +26,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 md-5 = "0.10"
+# #2388 — compose idempotency keys are sha256 over the compose identity.
+sha2 = { workspace = true }
+hex = { workspace = true }
 chrono = { workspace = true }
 # #1573 — Gmail REST bodies and `raw` drafts are base64url; message gets fan
 # out with a bounded concurrency.
