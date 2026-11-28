@@ -84,3 +84,41 @@ fn cli_rejects_overlapping_sync() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("another finance operation"));
 }
+#[test]
+fn worker_tick_skips_when_finance_lock_held() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("data.db");
+    let store = FinanceStore::open(&db).unwrap();
+    store
+        .add_session(
+            "sandbox",
+            "fixture-session",
+            "Household",
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(6),
+            Some("fixture-request"),
+        )
+        .unwrap();
+    let lock = std::fs::File::create(root.path().join("data.finance.lock")).unwrap();
+    lock.lock().unwrap();
+    let out = cli(root.path(), &["finance", "worker-tick"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["status"], "skipped");
+    // Nothing was polled, imported or mutated while the lock was held.
+    assert!(store
+        .session("sandbox", "fixture-session")
+        .unwrap()
+        .last_polled_at
+        .is_none());
+    // Released, the same tick does reach the bank API — which is why the
+    // skip above is the lock's doing and not an empty queue.
+    lock.unlock().unwrap();
+    let out = cli(root.path(), &["finance", "worker-tick"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PLAID_CLIENT_ID missing"));
+}
