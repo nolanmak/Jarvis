@@ -101,15 +101,24 @@ pub(super) fn candidates(
         };
         // #2530: count planned work whether or not it is due; an owner-paused
         // row cannot be built, so it never blocks planning.
-        if planned_unbuilt(snapshot.as_ref()) && !controls.paused(repository,issue.number)? {planned+=1;}
-        observed.push((issue,snapshot));
+        // #2612: nor can a row held for checkout continuity. Counting 21 such
+        // rows held planning while every one of them was skipped, so autoship
+        // built nothing. The read is kept for the selection pass below.
+        let mut checkout=None;
+        if planned_unbuilt(snapshot.as_ref()) && !controls.paused(repository,issue.number)? {
+            match controls.selection_checkout(repository,issue.number) {
+                Err(error) if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some()=>return Err(error),
+                result=>{if result.is_ok() {planned+=1;} checkout=Some(result);}
+            }
+        }
+        observed.push((issue,snapshot,checkout));
     }
     let hold_planning=planned>=MAX_PLANNED_UNBUILT;
     if hold_planning {
         info!(planned,bound=MAX_PLANNED_UNBUILT,"planned-unbuilt bound reached; build before planning another issue");
     }
     let mut ranked=Vec::new();
-    for (issue,snapshot) in observed {
+    for (issue,snapshot,checkout) in observed {
         if hold_planning && !snapshot.as_ref().is_some_and(crate::autoship_workflow::resumes_existing_work) {
             // Summarized above; one line per skipped issue would flood the log.
             tracing::debug!(issue=issue.number,"skip: planning held until planned work is built");
@@ -125,7 +134,7 @@ pub(super) fn candidates(
             // Unknown workflow history must reach the canonical per-issue
             // reader, which retains its typed hold while considering peers.
             // Only a readable snapshot can justify a checkout-continuity skip.
-            if let Err(error)=controls.selection_checkout(repository,issue.number) {
+            if let Err(error)=checkout.unwrap_or_else(||controls.selection_checkout(repository,issue.number)) {
                 if error.downcast_ref::<workflow::SharedIssueHistoryUnavailable>().is_some() {return Err(error);}
                 warn!(issue=issue.number,reason=%error,
                     "skip: checkout continuity unavailable; preserve original evidence and consider eligible peers");
